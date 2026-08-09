@@ -1,0 +1,60 @@
+[package]
+name = "cap-tools"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+
+publish = false
+
+[lib]
+name = "cap_tools"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
+lru = { workspace = true }
+wasmparser = { workspace = true }
+wasmtime = { workspace = true }
+# Slice C — tool-invoke 主流程: WASI Preview 2 linker for in-WASM execute().
+wasmtime-wasi = { workspace = true }
+advance-runtime = { path = "../../runtime" }
+# Slice F — observability emit (EventBusEmit + Event) + runtime JSON-Schema gate.
+advance-shared-types = { path = "../../shared-types" }
+jsonschema = { workspace = true }
+# chrono workspace pin omits "clock"; Slice F event builders need Utc::now()
+# (mirrors cap-llm/Cargo.toml precedent).
+chrono = { workspace = true, features = ["clock"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+# Wave-11 Lane C — `tests/repetition_dispatch.rs` drives the REAL run-manager
+# `RepetitionGuard` (+ `RunManager`/`ensure_run` for genuine run resolution)
+# through the cap-tools dispatch. Acyclic: run-manager depends only on
+# shared-types, never on cap-tools.
+advance-run-manager = { path = "../../run-manager" }
+wat = { workspace = true }
+wit-component = { workspace = true }
+wit-parser = { workspace = true }
+# Slice J (V1-b) — `tests/callable_inventory.rs` e2e feeds the production reader
+# into the real `advance_context_engine::ContextAssemblerImpl` and sources the MCP
+# half via `cap_mcp::mcp_tool_entries_from_infos`. Kept in cap-tools/tests (NOT
+# context-engine/tests) to preserve context-engine's AC-01 dep-light posture
+# (no cap-mcp/cap-http in its manifest). `advance-shared-types` / `serde_json` /
+# `async-trait` are already normal [dependencies] (test-visible) — not re-added.
+advance-context-engine = { path = "../../context-engine" }
+cap-mcp = { path = "../cap-mcp" }
+# Slice V1-c — `tests/progressive_skill_e2e.rs` materializes a skill bundle
+# (cap-skills AdminPoolStorage + materialize_skill + extract_skill_summary) and
+# invokes its tool.wasm at L2. cap-skills does NOT depend on cap-tools → no cycle.
+cap-skills = { path = "../cap-skills" }
+# tempfile for the e2e's admin-pool + agent-local roots (already workspace-locked).
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

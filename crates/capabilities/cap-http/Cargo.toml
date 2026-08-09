@@ -1,0 +1,67 @@
+[package]
+name = "cap-http"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+
+publish = false
+
+[lib]
+name = "cap_http"
+path = "src/lib.rs"
+
+[dependencies]
+advance-shared-types = { path = "../../shared-types" }
+aho-corasick = { workspace = true }
+regex = { workspace = true }
+# Slice S3 (ADR 2026-07-22 / CONTRACT-233): anchored-DFA prefix-viability for the
+# Block/Redact hold + minimum_len for the overlap-window pin (T29). Both crates are
+# already in Cargo.lock transitively via the pinned regex =1.11.1; pinned here so the
+# resolved versions do not move (same discipline as the reqwest pin below).
+# LOCKSTEP: bump these together with any future regex bump, or the exact pins would
+# force a duplicated second copy of each crate in the graph.
+regex-automata = "=0.4.14"
+regex-syntax = "=0.8.10"
+unicode-normalization = { workspace = true }
+# Slice m012-C deps:
+async-trait = { workspace = true }
+base64 = { workspace = true }
+cap-secrets = { path = "../cap-secrets" }
+ipnet = { workspace = true }
+secrecy = { workspace = true }
+# Phase-3 kickoff (2026-06-06): build redacted observability-event payloads
+# (DefaultHttpSecurityChain emits http.*/security.*/secret.injected when an
+# EventBus is wired). serde_json::json! only — no new heavy dep.
+serde_json = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+# Slice m012-E dep: production HttpExecutor. rustls-tls (ring provider) avoids the
+# native-tls/openssl system dependency; no json/gzip/http2 (executor handles raw
+# HttpRequest/HttpResponse bytes and must not auto-decompress). Pinned to the version
+# already resolved transitively in Cargo.lock, so the version doesn't move; rustls-tls
+# adds the compiled rustls subtree (ring/rustls/hyper-rustls/tokio-rustls/webpki-roots)
+# plus some http3-gated optional-dep lock metadata (quinn) that stays uncompiled.
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+advance-shared-types = { path = "../../shared-types", features = ["test-support"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+zeroize = { workspace = true }
+# Wave-25A Order-2 CONTRACT-219 literal binding KAT and mock C218 role fixture.
+sha2 = { workspace = true }
+# Slice m012-E: loopback (127.0.0.1:0) mock HTTP server harness for the
+# ReqwestHttpExecutor real-executor e2e. Already a workspace dep (MODULE-019) so
+# this adds zero net-new Cargo.lock entries.
+axum = { workspace = true }
+
+[features]
+# S4 (ADR 2026-07-22): gated seam for `MockFixture::Stream` so that cap-llm's
+# integration tests (which enable the feature via dev-dep) can drive real
+# per-chunk permit release without affecting the ungated zero-await regression
+# for all other consumers. Cross-crate `#[cfg(test)]` is impossible for the
+# seam; the feature is enabled only by the consumer that needs the test seam.
+test-stream-gate = []
+
+[lints]
+workspace = true

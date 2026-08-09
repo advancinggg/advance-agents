@@ -1,0 +1,67 @@
+[package]
+name = "cap-lifecycle"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+
+publish = false
+
+[lib]
+name = "cap_lifecycle"
+path = "src/lib.rs"
+
+[dependencies]
+advance-shared-types = { path = "../../shared-types" }
+advance-runtime = { path = "../../runtime" }
+advance-database = { path = "../../database" }
+cap-grant = { path = "../cap-grant" }
+# m017-slice-l (AC-29 point 3): runnable-shape validation of the submitted binary
+# at submit-component admission, via the cap-tools validator (CONTRACT-163).
+cap-tools = { path = "../cap-tools" }
+# dev-task-cascade-subset (Part A): production terminate-cascade adapters call
+# these crates' EXISTING public APIs (messaging flush/deliver, run-manager
+# ensure/cancel). Both are cycle-free (neither depends on cap-lifecycle).
+advance-messaging = { path = "../../messaging" }
+advance-run-manager = { path = "../../run-manager" }
+# sat/pack-template-bridge (2026-06-15): PackTemplateResolver consumes the pack
+# registry (CONTRACT-170) read-only to resolve a pack-installed agent-template
+# into a TemplateContent. Cycle-free — advance-pack-manager has no cap-lifecycle
+# edge (its only path-deps are advance-shared-types + cap-tools). A single
+# [dependencies] entry (not a separate dev-dep) — the Installer test fixture in
+# tests/pack_template_resolver.rs reuses this prod dep.
+advance-pack-manager = { path = "../../services/pack-manager" }
+chrono = { workspace = true, features = ["clock"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+wasmtime = { workspace = true }
+tokio = { workspace = true }
+rusqlite = { workspace = true }
+# MODULE-005-AC-29 producer-boundary scan: hardened bounded read of workspace files
+# (unix O_NOFOLLOW | O_NONBLOCK open + handle-fstat, mirroring cap-fs's
+# meta_schema::read_schema_bounded). Workspace-pinned; already resolved for cap-fs.
+# Used via safe OpenOptionsExt::custom_flags — no unsafe (crate keeps forbid(unsafe_code)).
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+cap-fs = { path = "../cap-fs" }
+# M011-AC-29 hierarchy witness (Wave-17 Lane 3): the archive-on-cleanup +
+# parent-recall test drives the real cap-memory MemoryStore / level-2 archive
+# scan. Dev-only + acyclic — cap-memory does not depend on cap-lifecycle.
+cap-memory = { path = "../cap-memory" }
+# dev-task-cascade-subset (Part A): enable run-manager's test-only accessor
+# `snapshot_cancel_pending_for_test` for the RunManagerCascade real-effect test.
+# dev-only: production builds of cap-lifecycle never compile this feature.
+advance-run-manager = { path = "../../run-manager", features = ["__test-util"] }
+# m017-slice-l: synthesize runnable / tool-exports Component binaries in-test
+# (no committed fixture classifies as `runnable` per the validator's matcher).
+wit-component = { workspace = true }
+wit-parser = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,39 @@
+[package]
+name = "advance-context-engine"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MODULE-010 context-engine — Slice B: unified_search coordinator (AC-02), TaskRouter semantic routing + tie-break (AC-03/04), L0 3-step compression (AC-07), Tier 1b knowledge-map cap (AC-16), Tier 2 ⑬ Delegate list (AC-19). 6 crate-local async ports pending shared-types CONTRACT promotion (MODULE-010 §3.6). Builds on Slice A (AC-01/05/18/20)."
+
+publish = false
+
+[dependencies]
+advance-shared-types = { path = "../shared-types" }
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# `lru` (workspace-pinned) for the WarningQueue outer-keyspace LRU eviction
+# (CONTRACT-090 invariant 3 defense-in-depth + availability). Without LRU
+# the keyspace cap turned into a permanent denial-of-service for legitimate
+# agent_ids once 4096 distinct synthetic IDs saturated it.
+lru = { workspace = true }
+# `uuid` (workspace-pinned, v4) — Slice D: the canonical CONTRACT-180 `Event`
+# (shared-types) `id` invariant mandates UUID v4 / ULID and forbids sequential
+# integers / user-controlled strings. AC-12's `context.assembled` emission needs
+# `Event.id` + per-emit `Event.trace_id`. NOT a provider/HTTP/TLS crate, so
+# `tests/stateless.rs::cargo_manifest_excludes_provider_crates` (AC-01
+# statelessness guard) is unaffected.
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Slice B: integration-test doubles implement the 6 crate-local async port
+# traits, which carry `#[async_trait]`; implementing such a trait REQUIRES the
+# attribute macro on the impl too. The test target is a separate compilation
+# unit, so `async-trait` must be a dev-dependency (it is already a normal
+# dependency for `src/`, but that does not extend to the `tests/` crate).
+async-trait = { workspace = true }
+
+[lints]
+workspace = true

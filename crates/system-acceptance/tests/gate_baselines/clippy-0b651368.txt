@@ -1,0 +1,40 @@
+# BASELINE: cargo clippy --workspace --all-targets --locked -- -D warnings
+#
+# WORKSPACE tier, re-captured for lane m021-s7-capstone (Δ9 re-anchor).
+# Lane base:      0b651368  (throwaway scratchpad worktree, own target dir, 2026-08-02)
+# Observed exit:  101 — STILL RED AT BASE: -D warnings aborts at advance-shared-types
+#                 (34 errors), so most of the workspace (incl. every lane crate) is
+#                 never analysed by THIS tier; the lane-scoped tier above is the one
+#                 that can see this lane's code. Tier stays report-only.
+#
+# Reviewed vs the retired a6f029b9 baseline (25 ids -> 26): exactly ONE add —
+# error|inconsistent_digit_grouping|crates/database/src/recall.rs — main-history
+# drift outside this lane's edits (CAPSTONE touches only device-mesh/
+# system-acceptance/cli). No removals.
+#
+error|-|crates/shared-types/src/progress_lifecycle_recovery.rs|field `committed_at_ms` is never read	[x1]
+error|-|crates/shared-types/src/progress_lifecycle_recovery.rs|field `header` is never read	[x1]
+error|derivable_impls|crates/database/src/lib.rs|this `impl` can be derived	[x1]
+error|doc_lazy_continuation|crates/database/src/recall.rs|doc list item without indentation	[x3]
+error|doc_lazy_continuation|crates/shared-types/src/lib.rs|doc list item without indentation	[x6]
+error|doc_lazy_continuation|crates/shared-types/src/mailbox.rs|doc list item without indentation	[x6]
+error|doc_nested_refdefs|crates/shared-types/src/lib.rs|link reference defined in list item	[x4]
+error|enum_variant_names|crates/shared-types/src/progress_lifecycle_recovery.rs|all variants have the same prefix: `After`	[x1]
+error|explicit_auto_deref|crates/shared-types/src/turn_attribution.rs|deref which would be done by auto-deref	[x1]
+error|identity_op|crates/database/src/rebuild.rs|this operation has no effect	[x2]
+error|inconsistent_digit_grouping|crates/database/src/recall.rs|digits grouped inconsistently by underscores	[x1]
+error|large_enum_variant|crates/shared-types/src/contract218_previsible.rs|large size difference between variants	[x1]
+error|large_enum_variant|crates/shared-types/src/sensitive_observation.rs|large size difference between variants	[x1]
+error|manual_contains|crates/shared-types/src/security_validator.rs|using `contains()` instead of `iter().any()` is more efficient	[x1]
+error|manual_pattern_char_comparison|crates/shared-types/src/security_validator.rs|this manual char comparison can be written more succinctly	[x1]
+error|needless_borrow|crates/database/src/recall.rs|this expression creates a reference which is immediately dereferenced by the compiler	[x1]
+error|op_ref|crates/shared-types/src/contract218_previsible.rs|taken reference of right operand	[x2]
+error|op_ref|crates/shared-types/src/sensitive_observation.rs|taken reference of right operand	[x1]
+error|result_large_err|crates/shared-types/src/observation_identity.rs|the `Err`-variant returned from this function is very large	[x2]
+error|too_many_arguments|crates/database/src/handle.rs|this function has too many arguments (9/7)	[x1]
+error|too_many_arguments|crates/database/src/recall.rs|this function has too many arguments (9/7)	[x1]
+error|too_many_arguments|crates/shared-types/src/progress_card.rs|this function has too many arguments (8/7)	[x1]
+error|too_many_arguments|crates/shared-types/src/progress_lifecycle_recovery.rs|this function has too many arguments (10/7)	[x1]
+error|too_many_arguments|crates/shared-types/src/turn_attribution.rs|this function has too many arguments (9/7)	[x2]
+error|type_complexity|crates/shared-types/src/progress_lifecycle_recovery.rs|very complex type used. Consider factoring parts into `type` definitions	[x1]
+error|unnecessary_cast|crates/database/src/rebuild.rs|casting to the same type is unnecessary (`u64` -> `u64`)	[x1]

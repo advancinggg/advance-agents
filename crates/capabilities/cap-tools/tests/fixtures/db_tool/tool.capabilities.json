@@ -1,0 +1,6 @@
+{
+  "tool_id": "db",
+  "description": "in-wasm SQL tool (CREATE/INSERT/SELECT over an in-memory engine)",
+  "host_capabilities": [],
+  "note": "self-contained: the SQL engine runs entirely in guest wasm; the tool requests NO host capabilities (no db/sql/fs host import)."
+}

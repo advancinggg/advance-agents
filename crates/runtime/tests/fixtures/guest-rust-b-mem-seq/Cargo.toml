@@ -1,0 +1,30 @@
+[package]
+name = "guest-rust-b-mem-seq"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# /dev Track B (2026-06-04) — memory-lifecycle guest fixture for the
+# system-acceptance harness's `.caps([Cap::Memory])` witness of SYS-J-20.
+# On handle-message it drives the full lifecycle through the REAL versioned
+# agent-memory host fns (advance:runtime/agent-memory@0.1.0):
+#   remember -> recall(#1) -> forget -> recall(#2)
+# emitting memory.remember, two memory.recall (result_count 1 then 0), and
+# memory.forget — the event spine the harness witnesses for SYS-AC-060/061.
+# Excluded from the workspace (built for wasm32-unknown-unknown).
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

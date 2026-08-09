@@ -1,0 +1,193 @@
+# CI + supply-chain gate for the open-core `advance-agents` runtime.
+#
+# This is the repo's FIRST CI configuration (there was previously no `.github/`).
+# It fulfils the "SUPPLY CHAIN FOLLOW-UP" promise recorded in the workspace
+# `Cargo.toml` (~lines 344-358): every third-party dependency is exact-pinned
+# (`=x.y.z`), which deliberately blocks silent `cargo update` — including silent
+# CVE patches. The mitigation is this gate: `cargo deny` + `cargo audit` re-run on
+# every push/PR to `main`, so an advisory FIRES loudly and is cleared only by an
+# intentional, reviewed version-bump commit.
+#
+# Toolchain: pinned to 1.91.0 in `rust-toolchain.toml`. We never hardcode a Rust
+# version here — `actions-rust-lang/setup-rust-toolchain` reads the channel (and
+# the `rustfmt`/`clippy` components) straight out of that file, so a future bump
+# is a single-file diff that CI picks up automatically.
+#
+# Guest fixtures under `crates/runtime/tests/fixtures/guest-rust-*` are EXCLUDED
+# from the workspace and target `wasm32-unknown-unknown` (their compiled
+# `.core.wasm` outputs are committed and loaded as bytes at test time). Because
+# they are excluded and prebuilt, none of the workspace jobs below build them, so
+# no `rustup target add` is required. The commented step in `test`/`clippy` shows
+# how to add the target ONLY if you are rebuilding a fixture.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least privilege: the gate only needs to read the checked-out tree.
+permissions:
+  contents: read
+
+# Supersede an in-flight run when a ref is pushed again.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Exact-pin discipline: fail loudly rather than silently resolving a newer patch.
+  CARGO_NET_RETRY: "3"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Formatting — cheap, fails fast.
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (channel + components read from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Built-in caching disabled here; we run Swatinem/rust-cache explicitly below.
+          cache: false
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+  # ---------------------------------------------------------------------------
+  # Lints — deny all warnings so the tree stays clean.
+  # ---------------------------------------------------------------------------
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+      # The excluded guest fixtures (wasm32-unknown-unknown) are NOT workspace
+      # members, so `--all-targets` never touches them and no wasm target is
+      # needed. Uncomment ONLY if a job is changed to rebuild a fixture:
+      #   - run: rustup target add wasm32-unknown-unknown
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # Build — the whole workspace, lockfile-frozen.
+  # Heavy: bundled SQLite (rusqlite/bundled), vendored libgit2, and Wasmtime 43 +
+  # Cranelift all compile C/large Rust here, hence the generous timeout.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (--workspace --locked)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --workspace --locked
+        run: cargo build --workspace --locked
+
+  # ---------------------------------------------------------------------------
+  # Test — the FIRST true full-workspace baseline.
+  # Local development has only ever run per-crate suites because of an external
+  # (SanDisk) volume TCC throttle that makes concurrent workspace tests unsafe on
+  # the maintainer's machine. That is a LOCAL constraint only; GitHub's Linux
+  # runners have no such limit, so this job is the first time `cargo test
+  # --workspace` runs end to end. Timeout is intentionally generous.
+  # ---------------------------------------------------------------------------
+  test:
+    name: test (--workspace --locked)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+      # Guest fixtures are excluded + prebuilt (.core.wasm committed), so the
+      # workspace test run loads them as bytes and needs no wasm target. Add the
+      # target ONLY when rebuilding a fixture:
+      #   - run: rustup target add wasm32-unknown-unknown
+      - name: cargo test --workspace --locked
+        run: cargo test --workspace --locked
+      # Feature-gated suites: `advance-reply-tracker`'s integration tests
+      # (mode_dispatch, session_lifecycle, timeout_policy, deadlock_detection, …)
+      # all declare `required-features = ["test-helpers"]`. The workspace run above
+      # usually enables that feature via cross-crate unification (the `cli` crate's
+      # dev-dependency turns it on), but we run the suite explicitly so these
+      # witnesses are guaranteed to execute regardless of unification.
+      - name: cargo test -p advance-reply-tracker --features test-helpers --locked
+        run: cargo test -p advance-reply-tracker --features test-helpers --locked
+
+  # ---------------------------------------------------------------------------
+  # cargo-deny — the hard supply-chain gate.
+  # Policy (see deny.toml): `bans`, `licenses`, and `sources` are POSTURE
+  # INVARIANTS and hard-block the merge. `advisories` are EXPECTED to fire against
+  # the exact-pins and are surfaced (non-blocking) — a real fix is an intentional
+  # version-bump commit, not a CI override. That is why the two checks are split
+  # into a blocking step and a `continue-on-error` step.
+  # ---------------------------------------------------------------------------
+  deny:
+    name: cargo-deny (bans/licenses/sources = blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+      # Compiled from source with the pinned toolchain. A faster alternative is
+      # `taiki-e/install-action@cargo-deny` (prebuilt binary) if install time hurts.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo deny check bans licenses sources (BLOCKING)
+        run: cargo deny check bans licenses sources
+      - name: cargo deny check advisories (surface only, non-blocking)
+        run: cargo deny check advisories
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # cargo-audit — RustSec advisory scan.
+  # Non-blocking by design: advisories against the exact-pins are the EXPECTED
+  # steady state and must be visible without wedging every merge. Clear them with
+  # a deliberate bump commit (which flips this green again).
+  # ---------------------------------------------------------------------------
+  audit:
+    name: cargo-audit (surface advisories, non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit (non-blocking — advisories on exact-pins are expected)
+        run: cargo audit
+        continue-on-error: true
+      # Fulfils the third leg of the Cargo.toml supply-chain promise: surface pins
+      # that have a newer patch available, so bumps stay a conscious choice.
+      # `cargo-outdated` is optional tooling; keep informational and non-blocking.
+      - name: Install cargo-outdated
+        run: cargo install cargo-outdated --locked
+        continue-on-error: true
+      - name: cargo outdated -R (informational)
+        run: cargo outdated -R
+        continue-on-error: true

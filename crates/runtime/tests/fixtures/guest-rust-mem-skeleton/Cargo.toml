@@ -1,0 +1,27 @@
+[package]
+name = "guest-rust-mem-skeleton"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# /dev Slice BS-3 (2026-06-03) — J-01 skeleton guest: imports agent-fs (versioned
+# advance:runtime/agent-fs@0.1.0) and on handle-message writes one file via fs.write,
+# returning an empty action. Drives the system-acceptance harness witness of the
+# real fs.write -> cap-fs -> git Turn-commit spine. Excluded from the workspace
+# (built for wasm32-unknown-unknown).
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

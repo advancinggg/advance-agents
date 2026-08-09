@@ -1,0 +1,56 @@
+[package]
+name = "cap-skills"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+
+publish = false
+
+[lib]
+name = "cap_skills"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+# Slice C — async storage + host_fn dispatch + security scan + WIT Val
+# encode/decode.
+async-trait = { workspace = true }
+tokio = { workspace = true }
+regex = { workspace = true }
+aho-corasick = { workspace = true }
+serde = { workspace = true }
+serde_yml = { workspace = true }
+chrono = { workspace = true }
+# Slice C — pull canonical Provenance + TrustLevel + SkillInfo +
+# SkillStateReader from shared-types (CONTRACT-164 surfaces).
+advance-shared-types = { path = "../../shared-types" }
+# Slice C — HostRegistry + HostFunctionHandler + HostCallContext for the
+# agent-skills host_fn registration. wasmtime brings Val for the encoder.
+advance-runtime = { path = "../../runtime" }
+wasmtime = { workspace = true }
+# Slice C — DiskSkillStorage uses cap-fs AtomicWriter for atomic file writes.
+cap-fs = { path = "../cap-fs" }
+# Slice H (REQ-275 foundation) — SkillPersistenceCoordinator wraps the
+# advance-git CONTRACT-020 GitCommitQueue + EventBusEmit (from shared-types).
+advance-git = { path = "../../git" }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+# slice wave6-laneB (leg 3, 187) — the list/resolve-skill-candidate CONSUMER
+# host-fns read/resolve the cap-memory PRODUCER SkillCandidateStore over the SAME
+# `<ws>/.agent/memory/_skill_candidates.jsonl`, reusing its append-only state
+# machine + length-prefixed-sha256 candidate_id verbatim (no duplicate seam / id
+# drift). Acyclic: cap-memory has no path back to cap-skills.
+cap-memory = { path = "../cap-memory" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = { workspace = true }
+# Slice H — MockCommitQueue in cfg(test) needs to name git2::Oid in the
+# trait return shape and construct `Oid::zero()`. Production cap-skills code
+# never references git2 directly (commit shas propagate as String). Mirrors
+# crates/scheduler/auto-loop/Cargo.toml dev-dep precedent.
+git2 = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,66 @@
+[package]
+name = "advance-event-bus"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MODULE-019 observability EventBus — production async impl with bounded-channel fan-out, WebSocket /events, HTTP /query, CostTracker, and LeakDetector wiring on output paths."
+
+publish = false
+
+[dependencies]
+advance-shared-types = { path = "../shared-types" }
+advance-cost-tracker = { path = "../cost-tracker" }
+rusqlite.workspace = true
+r2d2.workspace = true
+r2d2_sqlite.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+chrono = { workspace = true, features = ["clock"] }
+thiserror.workspace = true
+# Slice m019-readapi (CONTRACT-185): boxed-future dyn-compatibility for the
+# ObservabilityReadApi trait's async methods (resume/query).
+async-trait.workspace = true
+# Slice m019-B: async runtime + bounded channels + cancellation tokens for
+# graceful shutdown of background writer / stats / server tasks.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "fs", "time", "signal", "macros", "sync", "io-util", "net"] }
+tokio-util.workspace = true
+futures.workspace = true
+# Slice m019-B: HTTP + WebSocket server (single axum router on port 8081).
+axum = { workspace = true, features = ["ws", "macros"] }
+tower-http = { workspace = true, features = ["limit", "trace"] }
+tower_governor.workspace = true
+bytes.workspace = true
+# Slice m019-B: LRU cache for stats_aggregator agent set (max 1000).
+lru.workspace = true
+# Slice m019-C: ULID-based event ids for the RetentionSweeper system emitter.
+ulid.workspace = true
+# Slice m019-E: consume CONTRACT-131 TriggerBusDispatch trait + WHITELIST slice from
+# MODULE-014. Cycle-free one-way edge — scheduler depends only on shared-types.
+advance-scheduler = { path = "../scheduler" }
+
+[target.'cfg(unix)'.dependencies]
+# libc — used only for O_NOFOLLOW custom_flags on Unix file_writer (round-1
+# adversarial Critical 1 fix; symlink TOCTOU defeat). Windows path uses
+# `OpenOptions::open` which does not follow reparse points by default.
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
+# Slice m019-B: in-process router invocation for axum-route tests (no TCP listener
+# needed; tower::ServiceExt::oneshot drives the router synchronously).
+tower = { workspace = true, features = ["util"] }
+tokio-tungstenite.workspace = true
+# Slice m012-finish: T09 LogOutput end-to-end test needs the real
+# DefaultLeakDetector (cap-http) wired through apply_scan_to_outbound
+# (this crate). One-way dev-dep; cap-http does NOT depend on event-bus.
+cap-http = { path = "../capabilities/cap-http" }
+# Slice m019-E: minimal HTTP client for AC-15 dashboard route tests.
+# Used by tests/slice_e.rs to GET /query/dashboard/:view without pulling
+# in a full reqwest dep.
+url.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,43 @@
+[package]
+name = "cap-fs"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+
+publish = false
+
+[lib]
+name = "cap_fs"
+path = "src/lib.rs"
+
+[dependencies]
+advance-runtime = { path = "../../runtime" }
+advance-shared-types = { path = "../../shared-types" }
+advance-database = { path = "../../database" }
+advance-git = { path = "../../git" }
+wasmtime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+uuid = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+walkdir = { workspace = true }
+
+# Hotreload pre-build (2026-06-10) — `O_NOFOLLOW | O_NONBLOCK` constants for
+# MetaSchemaWatcher's hardened schema-file open (`OpenOptionsExt::custom_flags`
+# is a safe API; no unsafe code). Workspace-pinned; adds exactly one
+# plan-marked `"libc",` line to this crate's Cargo.lock entry (prompt-sanctioned).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+rusqlite = { workspace = true }
+git2 = { workspace = true }
+
+[lints]
+workspace = true

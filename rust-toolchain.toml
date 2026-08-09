@@ -1,0 +1,12 @@
+[toolchain]
+# Pinned to a specific stable version. Floating "stable" is rejected because it
+# re-introduces an unreviewed supply-chain vector parallel to the serde/serde_json
+# exact-pin hardening in workspace Cargo.toml. Bumps MUST be intentional code diffs.
+#
+# Slice S (2026-04-15) bumped 1.83.0 → 1.91.0 because Wasmtime 43.0.0's
+# core crates (wasmtime-internal-core, wasmtime-wasi, etc.) explicitly
+# require rustc 1.91. ARCHITECTURE.md §8 Decision 16 locked Wasmtime 43.
+# Also satisfies indexmap 2.14+ edition2024 gate (Rust 1.85+).
+channel = "1.91.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,30 @@
+[package]
+name = "big-output"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Tool-exports fixture for SYS-AC-219 (oversized-result fail-closed). `execute("big")`
+# returns 2 MiB; the witness sets a REDUCED max_result_bytes cap (256 KiB) so this
+# output exceeds it and the host's result-size cap rejects it with
+# output-validation-failed (no truncation). The literal 16 MiB+ default is NOT used:
+# a 16 MiB+ result list<u8> traps/times out during the component Val-boundary lift
+# BEFORE the host size check (the §3.6(g) limitation that also deferred 64 MiB
+# SYS-AC-235), so the witness exercises the identical fail-closed check at a reduced
+# cap. Exports `advance:runtime/tool-exports@0.1.0`.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

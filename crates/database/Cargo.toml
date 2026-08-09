@@ -1,0 +1,30 @@
+[package]
+name = "advance-database"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+
+publish = false
+
+[dependencies]
+rusqlite.workspace = true
+r2d2.workspace = true
+r2d2_sqlite.workspace = true
+sqlite-vec.workspace = true
+thiserror.workspace = true
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+# Slice m004-D (2026-05-03): rebuild scanner deps — directory walker
+# + YAML / JSONL parsers + tags/sources JSON serialization.
+walkdir = { workspace = true }
+serde = { workspace = true }
+serde_yml = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

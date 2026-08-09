@@ -1,0 +1,70 @@
+[package]
+name = "cap-llm"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+
+publish = false
+
+[lib]
+name = "cap_llm"
+path = "src/lib.rs"
+
+[dependencies]
+advance-runtime = { path = "../../runtime" }
+advance-shared-types = { path = "../../shared-types" }
+async-trait = { workspace = true }
+wasmtime = { workspace = true }
+rand = { workspace = true }
+# tokio for runtime-side sleep + Mutex/RwLock in gateway retry/embed loops.
+# Round-3 W2 decision: production code uses tokio::time::sleep directly;
+# tests use #[tokio::test(start_paused = true)] + tokio::time::advance to
+# fast-forward virtual time without real sleeps.
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# chrono workspace pin omits "clock"; cap-llm needs Utc::now() in event builders.
+chrono = { workspace = true, features = ["clock"] }
+jsonschema = { workspace = true }
+uuid = { workspace = true }
+# futures-core for the Stream trait surface in LlmGatewayInternal::stream() signature.
+futures-core = { workspace = true }
+# Slice D: futures for stream::iter combinator backing the single-chunk
+# stream() impl (one ChatDelta { done: true, ... }). futures-core only
+# provides the trait surface.
+futures = { workspace = true }
+# url for Url::parse(endpoint).authority() in build_http_cap allowlist construction.
+url = { workspace = true }
+# Slice D: SHA-256 for OutputHash post-call repetition guard (CONTRACT-072
+# consumer path; §2.7 Repetition Guard Flow pins SHA-256 over ASCII-
+# whitespace-trimmed text).
+sha2 = { workspace = true }
+# Slice D: base64 encoding for VLM multimodal HTTP body — `data:image/png;
+# base64,...` data URIs constructed by vlm.rs (§2.7 VLM Flow).
+base64 = { workspace = true }
+# S4 (ADR 2026-07-22): cap-http for the pub canonical-text facade (per-char feed,
+# raw-offset map, bounded_pattern_window, canonical helpers) used by the decoded
+# release pipeline + production-parity detector injection. No cycle (cap-http does
+# not depend on cap-llm). The test-stream-gate feature is enabled via the dev-dep
+# re-declaration below so only cap-llm's tests get the gated mock seam.
+cap-http = { path = "../cap-http" }
+
+[dev-dependencies]
+# tokio test-util enables tokio::time::pause/advance — used by retry-loop tests
+# (T64/T65/T66/T74b/T74f/T81) to fast-forward virtual time without real sleeps.
+tokio = { workspace = true, features = ["test-util"] }
+# cap-http re-declared in dev-deps solely to enable the S4 test-stream-gate feature
+# for the gated MockFixture::Stream seam (cross-crate cfg(test) impossible).
+# The non-dev dep above provides the facade for production code.
+cap-http = { path = "../cap-http", features = ["test-stream-gate"] }
+cap-secrets = { path = "../cap-secrets" }
+# serde_yml for parsing the canonical RuntimeConfig YAML fixture in test_support/.
+serde_yml = { workspace = true }
+# zeroize for tests/integration_chain.rs SecretStore::new(Zeroizing<[u8;32]> master).
+zeroize = { workspace = true }
+# NO [features] block — test_support/ is #[cfg(test)] only. Sibling-crate consumption
+# of mocks is out of scope for Slice B-2.
+
+[lints]
+workspace = true

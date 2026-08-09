@@ -1,0 +1,21 @@
+docs/.spec-state/
+.dev-state/
+docs/.prd-state/
+target/
+target-*/
+**/*.rs.bk
+.DS_Store
+
+# Per-worktree /dev task prompt scratch file (leaks to main otherwise — see
+# project_parallel_slice_workflow memory). Each worktree gets its own copy
+# from the prompt-prep step; never tracked.
+DEV_TASK_PROMPT.md
+
+# /spec upgrade-template atomic-write residue (cleaned on success; left only on crash)
+docs/**/.spec-upgrade-tmp.*
+docs/**/.spec-upgrade-backup.*
+
+# Per-worktree /dev scratch prompt — must not be tracked (caused recurring merge conflicts across parallel slices)
+.dev-prompt.md
+crates/system-acceptance/sysac109-*/
+__pycache__/

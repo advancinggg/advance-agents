@@ -1,0 +1,37 @@
+[package]
+name = "guest-rust-evaluator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Wave-14 Lane B (2026-06-24) — runnable evaluator fixture for SYS-AC-201. Its
+# `run()` returns a JSON metric object `{"score": <N>}` so the production
+# `ExecutingComponentMetricReader` can really run it and parse `output_key`. Built
+# TWICE (committed as two distinct core modules) to bind the metric to the real
+# run (anti-fake-green): default → 0.95 (BREACHING for a `Gt 0.8` guardrail),
+# `--features low` → 0.40 (non-breaching). Targets the import-free `advance-host`
+# world (mirrors guest-rust-minimal) so the no-injector `instantiate_advance_host_async`
+# path links cleanly. Excluded from the workspace; built for wasm32-unknown-unknown;
+# the checked-in core modules are wrapped to Components at test/run time via the
+# reader's `encode_core_to_component` normalization.
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# `low` flips the returned score from the breaching 0.95 to the non-breaching 0.40,
+# producing the discriminator core module (built as a separate artifact).
+low = []
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

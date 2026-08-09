@@ -1,0 +1,53 @@
+[package]
+name = "advance-shared-types"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dependency-inversion traits and shared data types for the advance-agents runtime."
+
+publish = false
+
+[features]
+default = []
+# Integration fixtures that need to mint otherwise provider-only opaque values.
+# Production dependants must never enable this feature.
+test-support = []
+
+[dependencies]
+async-trait = { workspace = true }
+# Phase-3 kickoff (2026-06-06): `clock` enables `Utc::now()` for the
+# `Event::observability` constructor (library emitters in cap-http/cap-channel
+# build events without each carrying chrono/uuid). chrono `clock` is already
+# feature-unified ON across the workspace; adding it to this manifest makes the
+# constructor build in isolation too. Features are additive (kept: serde, std).
+chrono = { workspace = true, features = ["clock"] }
+chacha20poly1305 = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# Wave-25A Order-2 CONTRACT-218: canonical declaration/source digests,
+# authenticated opaque carriers, one-shot role derivation and constant-time
+# verification.  These are all already exact-pinned workspace dependencies.
+hkdf = { workspace = true }
+hmac = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+zeroize = { workspace = true }
+# Slice m012-C: url::Url::parse used in Allowlist::matches inherent impl
+# (security_validator.rs); kept dep-light (url is workspace-pinned at =2.5.8,
+# already pulled transitively).
+url = { workspace = true }
+# Phase-3 kickoff: `Event::observability` mints a v4 uuid event id (the repo
+# idiom — cap-grant/run-manager build events with `Uuid::new_v4()`).
+uuid = { workspace = true }
+
+[dev-dependencies]
+# Cargo builds integration tests as ordinary dependants.  A self dev-dependency
+# enables the fixture-only surface for tests without exposing it in production.
+advance-shared-types = { path = ".", features = ["test-support"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

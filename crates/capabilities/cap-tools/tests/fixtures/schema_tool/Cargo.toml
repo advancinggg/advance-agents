@@ -1,0 +1,26 @@
+[package]
+name = "schema-tool"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Tool-exports fixture declaring an input JSON schema, for SYS-AC-084 (input
+# schema-violation fails closed BEFORE execute runs). Exports
+# `advance:runtime/tool-exports@0.1.0`. Built for wasm32-unknown-unknown then
+# `wasm-tools component new`-converted (mirrors echo_tool).
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

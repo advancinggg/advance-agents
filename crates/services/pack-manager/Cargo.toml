@@ -1,0 +1,46 @@
+[package]
+name = "advance-pack-manager"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "advance-agents Pack system (MODULE-018): pack.yaml parser, 8-step install orchestrator, PackRegistry skeleton, MaterializeAction trait surface (CONTRACT-170, CONTRACT-171)."
+
+publish = false
+
+[dependencies]
+advance-shared-types = { path = "../../shared-types" }
+# m017-slice-l (AC-29 point 1): tool-exports validation of each skill bundle's
+# `tool.wasm` at install. The check itself is wasmparser-only, but cap-tools pulls
+# wasmtime/wasmtime-wasi/advance-runtime transitively — accepted per the slice plan
+# gate (Option A; wasmparser-only leaf-crate extraction deferred to a future slice).
+cap-tools = { path = "../../capabilities/cap-tools" }
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+# Slice D (2026-05-25): tarball extract codec for non-Local install source AC-05.
+# flate2 wraps the .tar.gz file; tar reads entries inside spawn_blocking.
+flate2 = { workspace = true }
+hex = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
+# m017-slice-l: synthesize tool-exports / runnable Component binaries in-test
+# (no committed runnable fixture classifies per the validator's matcher).
+wit-component = { workspace = true }
+wit-parser = { workspace = true }
+
+[lints]
+workspace = true

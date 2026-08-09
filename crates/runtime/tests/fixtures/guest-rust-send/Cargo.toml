@@ -1,0 +1,29 @@
+[package]
+name = "guest-rust-send"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# await-leg B-3 (2026-06-22) — dedicated guest fixture targeting
+# `world advance-host-with-capabilities` that IMPORTS + CALLS the agent-messaging
+# `send` host fn (the shared `guest-rust-with-caps` fixture is deliberately kept
+# send-free so its co-instantiating tests — fiber_suspend_resume / two_call_modes
+# — do not gain a `send` import that would fail their LinkerTypecheck). Used by
+# `crates/cli/tests/send_host_fn.rs`. Excluded from the workspace because guests
+# are built for wasm32-unknown-unknown.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

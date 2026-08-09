@@ -1,0 +1,78 @@
+[package]
+name = "advance-scheduler"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MODULE-014 scheduler crate — five driver types (agent-loop / cron / watcher / daemon / task), Trigger Bus dispatch, ComponentSubmitApi, SchedulerExtension. Slice A: foundation skeleton."
+
+publish = false
+
+[dependencies]
+advance-shared-types = { path = "../shared-types" }
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# Slice B: real driver loops use tokio::time::interval / sleep / select! +
+# tokio_util::sync::CancellationToken. Both already workspace-pinned.
+# Slice C: + "fs" feature for tokio::fs::* in output.rs::write_result_to_dir.
+tokio = { workspace = true, features = ["rt", "macros", "time", "sync", "fs"] }
+tokio-util = { workspace = true }
+# Slice B: derived error enums on hook.rs HookError + BootstrapError.
+thiserror = { workspace = true }
+# Slice D: ComponentRegistry SQLite persistence (AC-07). Workspace pins
+# rusqlite = "=0.32.1" with `bundled` feature already enabled.
+rusqlite = { workspace = true }
+# Slice D: chrono moves from [dev-dependencies] to [dependencies] because
+# types.rs::format_rfc3339_ms (ComponentInfo.created_at construction in
+# submit.rs) needs DateTime::from_timestamp_millis + to_rfc3339_opts. The
+# workspace pins chrono = "=0.4.38" with default-features=false +
+# features=["serde","std"]; the `clock` feature is NOT enabled in
+# [dependencies] (we don't use Utc::now() in prod — now_unix_ms uses
+# std::time::SystemTime directly). The dev dep below keeps `clock` for
+# existing Slice C test helpers.
+chrono = { workspace = true }
+# sched-triggers (trigger-chain product pre-build): webhook HMAC-SHA256 verify
+# core in webhook_hmac.rs. All four are workspace-pinned and already resolved in
+# Cargo.lock (via cap-secrets/cap-channel/cap-http); root Cargo.toml is untouched.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+subtle = { workspace = true }
+
+[features]
+# Backbone Step 4 — gates `AgentLoopDriverImpl::serve_n_turns`, the BOUNDED
+# multi-turn driver used ONLY by the system-acceptance harness + the scheduler's
+# own bounded-loop unit test. The production daemon spawns the infinite `serve`
+# (never `serve_n_turns`), so excluding the bounded loop from the shipped daemon
+# binary keeps an unbounded-`n` recv-blocking method out of production builds
+# (a targeted `cargo build -p advance-cli` does not enable this feature).
+test-support = ["advance-shared-types/test-support"]
+
+[dev-dependencies]
+advance-shared-types = { path = "../shared-types", features = ["test-support"] }
+# Slice C: + "fs" feature for AC-19 tempdir tests reading result.bin back.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "test-util", "fs"] }
+chrono = { workspace = true, features = ["clock"] }
+# Slice C: tempdirs for AC-19 result.bin atomic-write tests.
+tempfile = { workspace = true }
+zeroize = { workspace = true }
+
+# Backbone Step 4: the bounded-multi-turn unit test exercises the feature-gated
+# `serve_n_turns`, so it only compiles/runs when `test-support` is enabled. Under
+# `cargo test --workspace` (the /dev gate) the system-acceptance crate's
+# `advance-scheduler/test-support` request unifies the feature ON, so this test
+# runs there; a standalone `cargo test -p advance-scheduler` skips it.
+[[test]]
+name = "serve_n_turns_carries_state"
+required-features = ["test-support"]
+
+# MODULE-014-AC-25 (029): the trap-policy witness drives `serve_n_turns` to observe
+# the RestartPolicy-driven stop cell (Never → break, OnFailure/Always/None → continue),
+# so it is feature-gated like serve_n_turns_carries_state.
+[[test]]
+name = "agent_loop_trap_policy"
+required-features = ["test-support"]
+
+[lints]
+workspace = true

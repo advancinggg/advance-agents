@@ -1,0 +1,267 @@
+// CONTRACT-217 — canonical agent-lifecycle WIT interface (MODULE-005 §2.3, PRD §9.5).
+//
+// Lifted verbatim from PRD §9.5 (the frozen contract source-of-truth).
+// 22 functions. This WIT package is DISTINCT from agent-tools.wit
+// (CONTRACT-161) and references it nowhere — Sub-Agent (Delegate) dispatch
+// is `spawn-agent-from-template` + messaging, NEVER `tool-invoke`. See
+// MODULE-005 AC-23 (Callable Framework Layer-2 dispatch-path independence).
+
+package advance:runtime@0.2.0;
+
+interface agent-lifecycle {
+    /// Agent 管理 — 组织增长
+    spawn-child: func(config: child-agent-config) -> result<agent-id, spawn-error>;
+
+    /// Agent 管理 — 临时工
+    spawn-sub: func(config: sub-agent-config) -> result<agent-id, spawn-error>;
+
+    /// Agent 管理 — 子 agent 运维
+    init-child-workspace: func(child-id: string, files: list<file-entry>) -> result<_, lifecycle-error>;
+    rollback-child: func(child-id: string, version: string) -> result<_, lifecycle-error>;
+    rollback-child-to-checkpoint: func(child-id: string, label: string) -> result<_, lifecycle-error>;
+    list-child-checkpoints: func(child-id: string) -> result<list<checkpoint-entry>, lifecycle-error>;
+    terminate-child: func(child-id: string) -> result<_, lifecycle-error>;
+
+    /// 组件管理（动态创建 cron / daemon / watcher / task）
+    submit-component: func(config: component-submit-config) -> result<component-id, spawn-error>;
+    component-status: func(id: component-id) -> result<component-state, spawn-error>;
+    kill-component: func(id: component-id) -> result<_, spawn-error>;
+    list-components: func() -> result<list<component-info>, spawn-error>;
+
+    /// 命名检查点（底层是 git annotated tag，tag message = JSON 仅携带 paths）
+    checkpoint: func(label: string, paths: option<list<string>>) -> result<_, lifecycle-error>;
+    rollback-to-checkpoint: func(label: string) -> result<_, lifecycle-error>;
+    list-checkpoints: func() -> result<list<checkpoint-entry>, lifecycle-error>;
+
+    /// 运行统计（可观测性，见十五章）
+    self-stats: func() -> result<agent-stats, lifecycle-error>;
+    child-stats: func(child-id: string) -> result<agent-stats, lifecycle-error>;
+
+    /// Spawn agent from template (covers both sub and child)
+    spawn-agent-from-template: func(
+        kind: agent-kind,
+        template-ref: string,
+        target-path: option<string>,
+        overrides: option<template-overrides>,
+    ) -> result<agent-id, spawn-error>;
+
+    /// List visible agent templates
+    list-agent-templates: func() -> result<list<template-info>, spawn-error>;
+
+    /// Terminate any agent (generalizes terminate-child to cover sub as well)
+    terminate-agent: func(agent-id: string) -> result<_, lifecycle-error>;
+
+    /// === Task Decomposition (§4.2.2) ===
+
+    /// 提交或覆盖当前 task 的分解计划
+    submit-decomposition: func(task-id: string, plan: decomposition-plan) -> result<decomposition-receipt, decomposition-error>;
+
+    /// 用 subtask-id 更新状态
+    update-subtask-status: func(task-id: string, subtask-id: string, status: subtask-status, outcome: option<string>) -> result<_, decomposition-error>;
+
+    /// 读取当前分解计划
+    get-decomposition: func(task-id: string) -> result<option<decomposition-state>, decomposition-error>;
+
+    // ─── Types (PRD §9.5) ───────────────────────────────────────────────
+
+    type agent-id = string;
+    type component-id = string;
+
+    record file-entry { path: string, bytes: list<u8> }
+    record checkpoint-entry { label: string, agent: string, timestamp: string, valid: bool }
+
+    variant agent-kind { sub, child }
+
+    record child-agent-config {
+        id: string,
+        binary: list<u8>,
+        agents-md: string,
+        capabilities: list<cap-request>,
+        initial-grants: option<list<grant-draft>>,
+        preset: option<string>,
+    }
+    record sub-agent-config {
+        capabilities: list<cap-request>,
+        template-ref: option<string>,
+    }
+    record cap-request { capability: string, params: option<list<cap-param>> }
+    record cap-param { key: string, value: string }
+    record grant-draft { capability: string, params: list<cap-param>, ttl: grant-ttl }
+    variant grant-ttl { once, lifecycle, persistent, duration(u64), until(string) }
+
+    record component-submit-config {
+        id: string,
+        component-type: component-type,
+        binary: list<u8>,
+        capabilities: list<cap-request>,
+        output-dir: option<string>,
+        trigger: option<trigger-config>,
+        restart-policy: option<restart-policy>,
+        delay: option<duration>,
+        initial-grants: option<list<grant-draft>>,
+        preset: option<string>,
+        retry: option<retry-config>,
+        sensitive-params: list<string>,
+    }
+    variant component-type { cron, watcher, daemon, task }
+    // WIT forbids recursive value types. CONTRACT-217's recursive JSON shape
+    // is represented at the scheduler's eight-level admission bound rather
+    // than with an invalid self-reference. Every level has the same external
+    // tagged wire shape.
+    variant trigger-config {
+        schedule(string),
+        file-watch(string),
+        webhook(webhook-config),
+        any-of(list<trigger-config-depth-1>),
+        trigger-event(trigger-subscription),
+    }
+    variant trigger-config-depth-1 {
+        schedule(string), file-watch(string), webhook(webhook-config),
+        any-of(list<trigger-config-depth-2>), trigger-event(trigger-subscription),
+    }
+    variant trigger-config-depth-2 {
+        schedule(string), file-watch(string), webhook(webhook-config),
+        any-of(list<trigger-config-depth-3>), trigger-event(trigger-subscription),
+    }
+    variant trigger-config-depth-3 {
+        schedule(string), file-watch(string), webhook(webhook-config),
+        any-of(list<trigger-config-depth-4>), trigger-event(trigger-subscription),
+    }
+    variant trigger-config-depth-4 {
+        schedule(string), file-watch(string), webhook(webhook-config),
+        any-of(list<trigger-config-depth-5>), trigger-event(trigger-subscription),
+    }
+    variant trigger-config-depth-5 {
+        schedule(string), file-watch(string), webhook(webhook-config),
+        any-of(list<trigger-config-depth-6>), trigger-event(trigger-subscription),
+    }
+    variant trigger-config-depth-6 {
+        schedule(string), file-watch(string), webhook(webhook-config),
+        any-of(list<trigger-config-depth-7>), trigger-event(trigger-subscription),
+    }
+    variant trigger-config-depth-7 {
+        schedule(string), file-watch(string), webhook(webhook-config),
+        any-of(list<trigger-config-depth-8>), trigger-event(trigger-subscription),
+    }
+    variant trigger-config-depth-8 {
+        schedule(string), file-watch(string), webhook(webhook-config),
+        trigger-event(trigger-subscription),
+    }
+    record webhook-config { path: string, secret: option<string> }
+    record trigger-subscription {
+        event-type: string,
+        filter: option<trigger-filter>,
+        debounce-ms: option<u32>,
+    }
+    record trigger-filter {
+        id: option<string>,
+        parent-id: option<string>,
+        child-id: option<string>,
+        agent-id: option<string>,
+        run-id: option<string>,
+        component-id: option<string>,
+        capability: option<string>,
+        trigger-type: option<string>,
+        component-type: option<component-type>,
+        spawned-kind: option<spawned-kind>,
+        affected-paths: option<list<string>>,
+    }
+    variant spawned-kind { child, sub, component }
+    variant restart-policy { never, on-failure, always }
+    type duration = u64;
+    record retry-config {
+        llm-max-retries: option<u32>,
+        llm-base-delay-ms: option<u32>,
+        llm-max-delay-ms: option<u32>,
+        tool-max-retries: option<u32>,
+        tool-base-delay-ms: option<u32>,
+        tool-max-delay-ms: option<u32>,
+    }
+    variant component-state { pending, running, completed, failed(string), killed }
+    record component-info { id: component-id, component-type: string, created-at: string }
+
+    record agent-stats {
+        active-tasks: u32,
+        completed-tasks: u32,
+        avg-turns-per-task: f32,
+        avg-completion-time-hours: f32,
+        memory-entries: u32,
+        llm-tokens-24h: u64,
+        error-count-24h: u32,
+        last-active: string,
+    }
+
+    record template-overrides {
+        initial-prompt: option<string>,
+        model-override: option<string>,
+        max-turns: option<u32>,
+    }
+    record template-info {
+        name: string,
+        description: string,
+        version: string,
+    }
+
+    record decomposition-plan {
+        goal: string,
+        strategy: decomposition-strategy,
+        subtasks: list<subtask-spec>,
+    }
+    variant decomposition-strategy {
+        self-execute,
+        decompose,
+        delegate-single(delegation-target),
+    }
+    record delegation-target {
+        assignee: string,
+        template-ref: option<string>,
+        prompt: string,
+    }
+    record subtask-spec {
+        existing-id: option<string>,
+        title: string,
+        assignee: string,
+        template-ref: option<string>,
+        prompt: string,
+        depends-on: list<string>,
+    }
+    record decomposition-receipt { subtask-ids: list<subtask-id-mapping> }
+    record subtask-id-mapping { title: string, subtask-id: string }
+    variant subtask-status { pending, in-progress, completed, failed, skipped }
+    record decomposition-state {
+        goal: string,
+        strategy: decomposition-strategy,
+        subtasks: list<subtask-state>,
+    }
+    record subtask-state {
+        subtask-id: string,
+        title: string,
+        assignee: string,
+        depends-on: list<string>,
+        status: subtask-status,
+        outcome: option<string>,
+        orphaned: bool,
+    }
+
+    variant spawn-error {
+        capability-denied(string),
+        invalid-config(string),
+        resource-limit(string),
+        already-exists(string),
+        subset-violation(string),
+    }
+    variant lifecycle-error {
+        not-found(string),
+        permission-denied(string),
+        invalid-state(string),
+    }
+    variant decomposition-error {
+        task-not-found(string),
+        subtask-not-found(string),
+        duplicate-title(string),
+        duplicate-existing-id(string),
+        dependency-cycle(string),
+        unresolved-dependency(string),
+        permission-denied(string),
+    }
+}

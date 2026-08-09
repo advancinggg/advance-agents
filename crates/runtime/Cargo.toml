@@ -1,0 +1,65 @@
+[package]
+name = "advance-runtime"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "advance-agents runtime host implementation."
+
+publish = false
+
+[dependencies]
+advance-shared-types = { path = "../shared-types" }
+# Slice AE (2026-05-09) — bootstrap construction of the SqliteIndexHandle
+# (R2d2SqliteIndexHandle::new) at runtime startup per CONTRACT-030.
+advance-database = { path = "../database" }
+chrono = { workspace = true, features = ["clock"] }
+notify = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_bytes = { workspace = true }
+# Hotreload pre-build (2026-06-10) — promoted from [dev-dependencies]: the
+# `runtime.config_reloaded` emission seam in config.rs builds the
+# `sections_changed` Event payload via `serde_json::json!`. Lock-neutral
+# (already a workspace-pinned member of this crate's lock dependency union
+# via the prior dev-dep entry).
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+tokio = { workspace = true }
+# Slice S — first crate to consume the Wasmtime workspace pin. Feature set
+# locked at workspace Cargo.toml per ARCHITECTURE.md §8 Decision 16; no
+# per-crate overrides. Component Model async-proposal prohibition
+# (MODULE-001-AC-02 / MODULE-001:529) is enforced by OMITTING the
+# `component-model-async` Cargo feature from the workspace wasmtime entry —
+# no runtime toggle.
+wasmtime = { workspace = true }
+# Slice V — first crate to consume the wasmtime-wasi workspace pin (=43.0.1,
+# default-features = false, features = ["p2"]). Provides the WASI preview2
+# host implementation that ComponentCtx routes through via the WasiView impl
+# in capability_injector.rs.
+wasmtime-wasi = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Slice T — valid Component binary generation for integration tests.
+wat = { workspace = true }
+# (serde_json moved to [dependencies] by the hotreload pre-build, 2026-06-10 —
+# still visible to tests/component_spec.rs etc. through the normal-dep edge.)
+# Slice X — wrap hand-rolled core WAT modules into Component Model binaries via
+# wit_component::ComponentEncoder for the wit_dispatch.rs T36..T41 integration tests.
+# Pinned at workspace level to share wasmparser =0.245.1 with Wasmtime 43.0.1
+# (avoids duplicate-wasmparser dep graph; cargo deny duplicates clean).
+# `dummy-module` feature is enabled at the workspace level — produces stub guests
+# satisfying the WIT world (function bodies are `unreachable`).
+wit-component = { workspace = true }
+# Slice X — wit-parser direct dep for `Resolve` + `ManglingAndAbi`
+# (only DecodedWasm + decode + decode_reader are re-exported by wit-component).
+wit-parser = { workspace = true }
+
+[lints]
+workspace = true

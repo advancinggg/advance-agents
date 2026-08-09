@@ -1,0 +1,44 @@
+[package]
+name = "cap-grant"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+
+publish = false
+
+[lib]
+name = "cap_grant"
+path = "src/lib.rs"
+
+[dependencies]
+advance-shared-types = { path = "../../shared-types" }
+advance-database = { path = "../../database" }
+advance-runtime = { path = "../../runtime" }
+wasmtime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+uuid = { workspace = true }
+tokio = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+# `tokio` is NOT re-listed here — already in [dependencies] with the
+# workspace feature set (rt + macros + time + sync + …) which covers
+# both production sweeper.spawn and #[tokio::test] usage in the test
+# binaries. Cargo merges dev-deps into deps for tests, so a duplicate
+# entry would be redundant config; cap-fs's own duplication is
+# intentional for a different reason (its dev-deps activate test-only
+# features that production doesn't need).
+tempfile = { workspace = true }
+# Wave-20 — the BC-01..04 BudgetCheck-Deny witness drives a REAL
+# `InMemoryRunBudget` to genuine rounds-exhaustion (an independent oracle, not a
+# canned mock). Acyclic: run-manager has no cap-grant dependency. Dev-only —
+# production cap-grant never imports run-manager (it consumes the `RunBudget`
+# trait from advance-shared-types).
+advance-run-manager = { path = "../../run-manager" }
+
+[lints]
+workspace = true

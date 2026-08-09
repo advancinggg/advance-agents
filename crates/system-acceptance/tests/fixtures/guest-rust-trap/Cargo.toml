@@ -1,0 +1,29 @@
+[package]
+name = "guest-rust-trap"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# MAINLINE Wave-5 harvest (2026-06-21) — trapping guest for SYS-AC-029. Its
+# handle-message ALWAYS returns Err, which the production AgentLoopDriverImpl
+# run_turn_once treats as a trap-equivalent failure (TrapError::Crash) → handle_trap
+# → component.error + RestartPolicy. A REAL guest trap (NOT the harness mock
+# TrappingHandler). Excluded from the workspace (built for wasm32-unknown-unknown);
+# the checked-in core module is wrapped to a Component at test time via
+# build_agent::encode_core_to_component (same pattern as guest-rust-j01-skeleton).
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

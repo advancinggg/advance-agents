@@ -1,0 +1,9 @@
+# Slice m019-E (2026-05-15): `cargo xtask observability-lint` alias for
+# AC-14 host-function emit convention enforcement. The alias resolves
+# only when invoked from inside the workspace root or descendant dirs
+# (workspace-cwd-dependent — see MODULE-019 §3.6 item 20). CI runs that
+# invoke `cargo` from outside the workspace with `--manifest-path` must
+# call the binary directly:
+#   cargo run --package advance-observability-xtask --release -- observability-lint
+[alias]
+xtask = "run --package advance-observability-xtask --"

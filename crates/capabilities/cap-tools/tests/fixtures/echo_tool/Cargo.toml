@@ -1,0 +1,26 @@
+[package]
+name = "echo-tool"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Tool-exports fixture for cap-tools in-WASM integration tests
+# (SC-48/49/53/54/56) plus AC-26 / AC-20 L2 / AC-29 witnessing. Exports
+# `advance:runtime/tool-exports@0.1.0`. Excluded from the workspace because it
+# is built for wasm32-unknown-unknown then `wasm-tools component new`-converted.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

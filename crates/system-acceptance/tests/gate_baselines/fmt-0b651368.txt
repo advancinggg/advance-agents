@@ -1,0 +1,11 @@
+# BASELINE: cargo fmt --all --check  (file set, not a diff)
+#
+# Captured for lane m021-s7-capstone (SYS-J-67 CAPSTONE, Δ9 re-anchor).
+# Lane base:      0b651368   (measured by checking the base out into a throwaway
+#                             worktree and running fmt there, 2026-08-02)
+# Observed exit:  0  (CLEAN AT BASE — the CORE closure commit fixed the S4-track
+#                     fmt debt that made a6f029b9 red on 8 files)
+#
+# The frozen unformatted set is EMPTY: any unformatted file anywhere in the
+# workspace now fails the no-growth check outright, which is the strictest
+# possible form of this gate.

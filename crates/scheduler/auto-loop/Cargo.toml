@@ -1,0 +1,32 @@
+[package]
+name = "advance-scheduler-auto-loop"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MODULE-015 auto-mode crate (slice A) — CONTRACT-140 AutoLoopDriver trait + DefaultAutoLoopDriver, success_criteria parser, scheduler-layer checkpoint/rollback primitives (not yet an integrated flow — §4.7.7 sequencing is slice B), SchedulerExtension (CONTRACT-133) registration. Nested sub-crate per MODULE-015 §3.2."
+
+publish = false
+
+[dependencies]
+advance-shared-types = { path = "../../shared-types" }
+advance-scheduler = { path = ".." }
+advance-git = { path = "../../git" }
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "fs"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+tempfile = { workspace = true }
+# Test-only: tests/common builds initial commits + reads tag messages via
+# raw libgit2. Production code in this crate never imports git2 — Git access
+# goes through advance-git's CONTRACT-020/021/022 surface (MODULE-003 §1.1
+# boundary). The git2 dev-dep is the same pattern MODULE-003's own tests use.
+git2 = { workspace = true }
+
+[lints]
+workspace = true

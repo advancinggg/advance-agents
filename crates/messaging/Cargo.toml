@@ -1,0 +1,44 @@
+[package]
+name = "advance-messaging"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+
+publish = false
+
+[lib]
+name = "advance_messaging"
+path = "src/lib.rs"
+
+[dependencies]
+advance-runtime = { path = "../runtime" }
+advance-shared-types = { path = "../shared-types" }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+# notify-agent host-fn slice (2026-06-13) — Val type for WIT params/results in
+# src/host_fn.rs. Already transitive via advance-runtime (host_registry.rs uses
+# wasmtime::component::Val); promoting to a direct edge per reply-tracker/Cargo.toml
+# precedent. Zero new external transitive deps.
+wasmtime = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+advance-shared-types = { path = "../shared-types", features = ["test-support"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+async-trait = { workspace = true }
+rand = { workspace = true }
+tempfile = { workspace = true }
+zeroize = { workspace = true }
+# Wave-17 (2026-06-25) — MODULE-006-AC-01 WIT-parse witness
+# (tests/wit_agent_messaging_parse.rs): parse the shipped advance.wit + assert
+# the agent-messaging surface. Test-only, non-shipping (mirrors
+# run-manager/Cargo.toml's wit_presence.rs precedent). modified_contracts unaffected.
+wit-parser = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' ws: wss:; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
+  <title>Advance Console</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header><h1>Advance Console</h1><span id="connection">offline</span></header>
+  <main>
+    <section aria-labelledby="session-title">
+      <h2 id="session-title">Local operator session</h2>
+      <form id="login-form">
+        <label>Bootstrap code <input id="bootstrap-code" autocomplete="one-time-code" required></label>
+        <button type="submit">Connect</button>
+      </form>
+    </section>
+    <section aria-labelledby="history-title">
+      <h2 id="history-title">Task / run history</h2>
+      <form id="history-form">
+        <select id="history-kind" aria-label="History kind"><option value="tasks">Task</option><option value="runs">Run</option></select>
+        <input id="history-id" required aria-label="Task or run id">
+        <button type="submit">Load</button>
+      </form>
+      <div id="history" class="records" aria-live="polite"></div>
+    </section>
+    <section aria-labelledby="grants-title">
+      <h2 id="grants-title">Pending approvals</h2>
+      <button id="refresh-grants" type="button">Refresh</button>
+      <div id="grants" class="records" aria-live="polite"></div>
+    </section>
+    <section aria-labelledby="dashboard-title">
+      <h2 id="dashboard-title">Dashboard events</h2>
+      <div id="events" class="records" aria-live="polite"></div>
+    </section>
+  </main>
+  <template id="record-template"><article><span class="warning" hidden>control characters removed</span><pre></pre><div class="actions"></div></article></template>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

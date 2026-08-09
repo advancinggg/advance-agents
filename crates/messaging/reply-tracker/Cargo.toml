@@ -1,0 +1,124 @@
+[package]
+name = "advance-reply-tracker"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MODULE-007 await-orchestration: AwaitSessionManager (CONTRACT-060) + AwaitSession lifecycle + per-slot dispatch + error triage (slice m007-A) + AC-09 deadlock detection + AC-10 idle monitor + sync on_heartbeat idle-clock reset (slice m007-B). No fiber wiring / no orchestration.* event emission (slice C; out of this crate boundary)."
+
+publish = false
+
+[lib]
+name = "advance_reply_tracker"
+path = "src/lib.rs"
+
+[features]
+# **Adversarial round 2 fix (C2/W6)**: test-only helpers (`first_open_session_id_for_test`,
+# `on_idle_timeout_for_test`) are gated behind this feature so they do NOT ship in
+# release builds. `on_idle_timeout_for_test` is retained as a thin wrapper delegating
+# to the promoted real `idle::resolve_idle` body. Integration tests below declare
+# `required-features = ["test-helpers"]` so cargo test automatically enables it.
+test-helpers = []
+
+[dependencies]
+advance-shared-types = { path = "../../shared-types" }
+advance-messaging = { path = ".." }
+# Slice E (2026-05-24) — HostFunctionHandler trait + HostCallContext for
+# host_fn.rs handlers. Already transitive via advance-messaging; promoting to a
+# direct edge for explicit dep clarity. Adds one Cargo.lock line under
+# advance-reply-tracker; zero new external transitive deps.
+advance-runtime = { path = "../../runtime" }
+# Slice E (2026-05-24) — Val type for WIT params/results in host_fn.rs
+# handlers. Already transitive via advance-runtime; promoting to a direct
+# edge per cap-tools/Cargo.toml precedent.
+wasmtime = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util", "time"] }
+# Slice E (2026-05-24) — TEST-ONLY dep for T17z byte-parity assertion against
+# advance_event_bus::taxonomy::orchestration::AWAIT_PROGRESS. Production code
+# defines AWAIT_PROGRESS const locally in events.rs to avoid the event-bus
+# heavy deps (rusqlite, axum, tokio-util). Dev-dep does NOT propagate to
+# downstream consumers.
+advance-event-bus = { path = "../../event-bus" }
+# Slice G (Wave-19 Lane 3) — TEST-ONLY deps for the AC-19 ComponentFinished
+# resolution witness (`tests/component_finished_resolution.rs`): drive a REAL
+# `RunManager` (`complete_run` fires the CONTRACT-184 sink) + the real
+# `scheduler::write_result_to_dir` for the §2.3 caller-read leg. These are the
+# FIRST reply-tracker→run-manager / reply-tracker→scheduler edges; acyclic —
+# neither crate depends on reply-tracker. Dev-deps do NOT propagate downstream.
+advance-run-manager = { path = "../../run-manager" }
+advance-scheduler = { path = "../../scheduler" }
+tempfile = { workspace = true }
+zeroize = { workspace = true }
+
+[[test]]
+name = "session_lifecycle"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "mode_dispatch"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "timeout_policy"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "error_triage"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "deadlock_detection"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "idle_monitor"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "capability_config"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "session_tree"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "capability_max_depth"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "host_fn_handler"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "orchestration_events"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "run_suspend_sink"
+required-features = ["test-helpers"]
+
+# await-leg B-3 (2026-06-22) — the `send` ingress route witness uses
+# `session_count_for_test` (test-helpers-gated), same as host_fn_handler.
+[[test]]
+name = "send_ingress"
+required-features = ["test-helpers"]
+
+# Slice G (Wave-19 Lane 3) — the AC-19 ComponentFinished resolution witness uses
+# `session_count_for_test` for the deterministic parked-before-complete check
+# (replacing wall-clock sleeps; adversarial r10 flake fix).
+[[test]]
+name = "component_finished_resolution"
+required-features = ["test-helpers"]
+
+[lints]
+workspace = true

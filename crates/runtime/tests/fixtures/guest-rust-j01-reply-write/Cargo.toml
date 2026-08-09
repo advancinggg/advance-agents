@@ -1,0 +1,27 @@
+[package]
+name = "guest-rust-j01-reply-write"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Small-witness 2026-06-11 — J-01 reply+write guest: j01-skeleton copy whose
+# handle-message writes one file via agent-fs AND returns a reply action, so the
+# SYS-AC-003 "after the reply, the turn commit tree contains the write" clause is
+# witnessable on one turn. Excluded from the workspace
+# (built for wasm32-unknown-unknown).
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

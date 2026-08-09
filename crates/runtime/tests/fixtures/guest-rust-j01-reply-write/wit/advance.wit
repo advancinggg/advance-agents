@@ -1,0 +1,747 @@
+package advance:runtime@0.1.0;
+
+interface types {
+    record component-config {
+        id: string,
+        config-data: option<list<u8>>,
+        trigger-context: option<trigger-context>,
+    }
+
+    record trigger-context {
+        event-type: string,
+        timestamp: u64,
+        payload: list<u8>,
+        trigger-chain-id: string,
+        chain-depth: u32,
+    }
+
+    record run-result {
+        status: run-status,
+        output: option<list<u8>>,
+    }
+
+    variant run-status {
+        completed,
+        failed(string),
+    }
+
+    /// v1 minimal-payload shape — pending MODULE-006 messaging finalized record extension.
+    record message {
+        payload: list<u8>,
+    }
+
+    /// v1 minimal-payload shape — pending MODULE-005/006 finalized action ABI.
+    record action {
+        payload: list<u8>,
+    }
+
+    record action-result {
+        new-state: list<u8>,
+        actions: list<action>,
+    }
+}
+
+/// Message-driven component (Agent implements this interface).
+interface message-driven {
+    use types.{component-config, message, action-result};
+
+    init: func(config: component-config) -> result<list<u8>, string>;
+    handle-message: func(msg: message, state: list<u8>) -> result<action-result, string>;
+}
+
+/// Runnable component (Cron / Watcher / Daemon / Task implement this interface).
+interface runnable {
+    use types.{component-config, run-result};
+
+    run: func(config: component-config) -> result<run-result, string>;
+}
+
+/// LLM gateway WIT interface. Per MODULE-009 §1.4.1.
+///
+/// Slice C (2026-05-09): declares the `agent-llm` interface at the package level
+/// so guests can `import advance:runtime/agent-llm` from their own world definitions.
+/// NOT imported by `world advance-host` — MODULE-001-T42's "advance-host has zero
+/// function-bearing imports" architectural invariant must hold.
+///
+/// CapabilityInjector wires the registered handler against the linker via
+/// dynamic `LinkerInstance::func_new_async` (NOT via WIT-world bindgen). The
+/// host-side encoder/decoder in `cap-llm/src/host_fn.rs` produces / consumes
+/// `Val` values matching the type shapes declared here.
+interface agent-llm {
+    record llm-params {
+        model: option<string>,
+        temperature: option<f64>,
+        max-tokens: option<u32>,
+        stop-sequences: option<list<string>>,
+    }
+
+    record llm-request {
+        task-id: option<string>,
+        prompt: string,
+        params: option<llm-params>,
+        output-schema: option<string>,
+    }
+
+    record llm-response {
+        text: string,
+        model: string,
+        input-tokens: u64,
+        output-tokens: u64,
+        finish-reason: string,
+        parsed-output: option<list<u8>>,
+    }
+
+    type stream-handle = u64;
+
+    record stream-chunk {
+        delta: option<string>,
+        done: bool,
+        response: option<llm-response>,
+    }
+
+    variant llm-error {
+        model-not-available(string),
+        rate-limited(string),
+        context-too-long(string),
+        budget-exceeded(string),
+        provider-error(string),
+        structured-output-failed(string),
+        repetition-terminated(string),
+    }
+
+    generate: func(request: llm-request) -> result<llm-response, llm-error>;
+    %stream: func(request: llm-request) -> result<stream-handle, llm-error>;
+    poll-stream: func(handle: stream-handle) -> result<stream-chunk, llm-error>;
+}
+
+/// Local / WASM-tool ABI per MODULE-017 §1.3.4 + PRD §9.8. Slice m017-A
+/// (2026-05-11) declares the interface at the package level so guests
+/// can `import advance:runtime/agent-tools` from their own world
+/// definitions. NOT imported by `world advance-host` — MODULE-001-T42's
+/// "advance-host has zero function-bearing imports" invariant must hold.
+interface agent-tools {
+    record tool-info {
+        id: string,
+        description: string,
+        methods: list<method-info>,
+    }
+
+    record method-info {
+        name: string,
+        description: option<string>,
+        input-schema: option<string>,
+        output-schema: option<string>,
+        idempotent: option<bool>,
+    }
+
+    variant tool-error {
+        not-found(string),
+        method-not-found(string),
+        invocation-failed(string),
+        permission-denied(string),
+        input-validation-failed(string),
+        output-validation-failed(string),
+    }
+
+    tool-invoke: func(tool-id: string, method: string, params: list<u8>) -> result<list<u8>, tool-error>;
+    list-tools: func() -> result<list<tool-info>, tool-error>;
+}
+
+/// Tool WASM component contract per MODULE-017 §1.3.4 + PRD §9.8.1.
+/// Tool WASMs MUST export this interface; `describe` returns top-level
+/// metadata, `execute` dispatches method invocations.
+interface tool-exports {
+    use agent-tools.{method-info};
+
+    record tool-description {
+        description: string,
+        methods: list<method-info>,
+    }
+
+    describe: func() -> tool-description;
+    execute: func(method: string, params: list<u8>) -> result<list<u8>, string>;
+}
+
+/// MCP-client ABI per MODULE-017 §1.3.5 + PRD §9.11. Slice m017-B
+/// (2026-05-14) declares the interface at the package level so guests
+/// can `import advance:runtime/mcp-client` from their own world
+/// definitions. NOT imported by `world advance-host` — the M001-T47
+/// invariant ("advance-host has zero function-bearing imports") MUST
+/// hold. Host-side dispatch + host_fn handlers for the 7 methods land
+/// in Slice C; Slice B ships the WIT declaration + HTTP/SSE transport
+/// foundation only.
+interface mcp-client {
+    record mcp-server-info {
+        id: string,
+        description: string,
+    }
+
+    record mcp-tool-info {
+        name: string,
+        description: string,
+        server-id: string,
+    }
+
+    record mcp-prompt-info {
+        name: string,
+        description: string,
+        server-id: string,
+    }
+
+    record mcp-resource-info {
+        uri: string,
+        description: string,
+        server-id: string,
+    }
+
+    record cap-param {
+        key: string,
+        value: string,
+    }
+
+    variant mcp-error {
+        not-found(string),
+        tool-not-found(string),
+        transport-error(string),
+        permission-denied(string),
+        invalid-response(string),
+        server-error(string),
+    }
+
+    list-mcp-servers: func() -> result<list<mcp-server-info>, mcp-error>;
+    list-mcp-tools: func(server-id: string) -> result<list<mcp-tool-info>, mcp-error>;
+    list-mcp-prompts: func(server-id: string) -> result<list<mcp-prompt-info>, mcp-error>;
+    get-mcp-prompt: func(server-id: string, prompt-name: string, args: list<cap-param>) -> result<list<u8>, mcp-error>;
+    list-mcp-resources: func(server-id: string) -> result<list<mcp-resource-info>, mcp-error>;
+    read-mcp-resource: func(server-id: string, uri: string) -> result<list<u8>, mcp-error>;
+    invoke-mcp-tool: func(server-id: string, tool-name: string, params: list<u8>) -> result<list<u8>, mcp-error>;
+}
+
+/// Skill lifecycle ABI per MODULE-017 §1.3.1 + PRD §9.12. Slice m017-C
+/// (2026-05-15) declares the `agent-skills` interface at the package level
+/// so guests can `import advance:runtime/agent-skills` from their own world
+/// definitions. NOT imported by `world advance-host` — MODULE-001-T42/T47's
+/// "advance-host has zero function-bearing imports" invariant must hold.
+///
+/// CapabilityInjector wires the registered handler against the linker via
+/// dynamic `LinkerInstance::func_new_async` (NOT via WIT-world bindgen). The
+/// host-side encoder/decoder in `cap-skills/src/host_fn.rs` produces /
+/// consumes `Val` values matching the type shapes declared here. The
+/// `skill-error` variant projection from the 10-arm Rust `SkillError` to
+/// this 9-arm WIT shape lives in `cap-skills/src/error.rs` per
+/// MODULE-017 §2.8.
+///
+/// `content-too-large` is a PAYLOADLESS variant arm per PRD §9.12 line 3704
+/// — the only payloadless arm in the variant. The other 8 arms carry a
+/// `string` payload (fixed safe-class strings, redacted per SB-22
+/// discipline).
+interface agent-skills {
+    /// Skill draft handle returned from propose-skill-draft / propose-skill-patch.
+    /// Stable within the calling agent's territory; opaque to other agents.
+    type draft-id = string;
+
+    /// Stable skill identifier (matches `.agent/skills/{skill-id}/` directory
+    /// per MODULE-017 §2.5). Slice C maps `skill-id == skill-name` (Slice A
+    /// invariant preserved); a future slice may shift to ULID-keyed ids when
+    /// multi-agent name collisions need disambiguation.
+    type skill-id = string;
+
+    /// Skill provenance + trust classification surfaces — read-only via
+    /// SkillStateReader (CONTRACT-164), NOT mutated through this WIT.
+    /// Provenance is set at propose-skill-draft (always AgentCreated for
+    /// agent-originated drafts; admin-imported skills carry Imported).
+    /// Trust elevation is admin-only via the runtime-internal
+    /// `SkillStore::elevate_trust` API, NOT exposed as a WIT method.
+    enum skill-provenance {
+        agent-created,
+        imported,
+    }
+
+    enum skill-trust-level {
+        untrusted,
+        trusted,
+    }
+
+    /// Skill candidate emitted by MODULE-011 L6 consolidation
+    /// (deferred — Slice C surfaces an empty list until M011 L6 lands).
+    record skill-candidate {
+        candidate-id: string,
+        skill-name: string,
+        source-task-ids: list<string>,
+        timestamp: string,
+    }
+
+    /// Action the agent takes on resolving a candidate.
+    enum candidate-action {
+        accept,
+        dismiss,
+    }
+
+    /// Resolution outcome — when action=accept and a draft was created,
+    /// returns the new draft-id; for dismiss, returns the empty string.
+    record candidate-result {
+        candidate-id: string,
+        draft-id: string,
+    }
+
+    /// Per PRD §9.12 lines 3702-3712. `content-too-large` is the ONLY
+    /// payloadless arm; all others carry a `string` payload.
+    variant skill-error {
+        invalid-name(string),
+        content-too-large,
+        invalid-frontmatter(string),
+        name-conflict(string),
+        security-violation(string),
+        trust-violation(string),
+        invalid-target(string),
+        not-found(string),
+        internal(string),
+    }
+
+    /// Create a draft for a new skill. Validates name regex + content size +
+    /// frontmatter shape per the 6-check security scan (MODULE-017 §1.3.2).
+    /// Returns the draft-id (name-keyed per PRD §12.6.1 — calling twice with
+    /// the same name updates the same draft and returns the same id).
+    propose-skill-draft: func(name: string, content: string, tags: list<string>)
+        -> result<draft-id, skill-error>;
+
+    /// Propose a patch to an existing Active skill. The patched draft inherits
+    /// the parent's name + tags. Returns the new draft-id.
+    /// Returns trust-violation if the skill is Trusted.
+    propose-skill-patch: func(skill: skill-id, content: string, reason: string)
+        -> result<draft-id, skill-error>;
+
+    /// Replace the draft's content. Idempotent.
+    update-skill-draft: func(draft: draft-id, content: string)
+        -> result<_, skill-error>;
+
+    /// Promote the draft to Active. Runs the 6-check security scan and the
+    /// trust matrix gate. On success, increments version + archives the
+    /// prior Active (if any) to _skill_versions/.
+    activate-skill: func(draft: draft-id) -> result<skill-id, skill-error>;
+
+    /// Restore a prior version as the new Active. version must exist in
+    /// _skill_versions/{skill}/. Returns trust-violation per the matrix.
+    rollback-skill: func(skill: skill-id, version: u32) -> result<_, skill-error>;
+
+    /// Tombstone the skill (preserves history). Returns trust-violation per
+    /// the matrix (only AgentCreated+Untrusted is deletable).
+    delete-skill: func(skill: skill-id) -> result<_, skill-error>;
+
+    /// Enumerate L6-emitted skill candidates (deferred — Slice C returns []).
+    list-skill-candidates: func() -> result<list<skill-candidate>, skill-error>;
+
+    /// Resolve a candidate by id (accept → propose a draft from the candidate;
+    /// dismiss → mark resolved without creating a draft).
+    /// Returns not-found if the candidate-id is unknown.
+    resolve-skill-candidate: func(candidate-id: string, action: candidate-action)
+        -> result<candidate-result, skill-error>;
+}
+
+/// Run coordination ABI per MODULE-008 §2.3 + PRD §9.5.1. Slice m008-C
+/// (2026-05-15) declares the `agent-run` interface at the package level
+/// so guests can `import advance:runtime/agent-run` from their own world
+/// definitions. NOT imported by `world advance-host` — MODULE-001-T42's
+/// "advance-host has zero function-bearing imports" invariant must hold.
+///
+/// The Rust-side dispatcher lives in `crates/run-manager/src/wit_impl.rs`
+/// (AgentRunWitImpl). HostRegistry wiring (Val encoding/decoding into the
+/// wasmtime ComponentLinker via `register_agent_run`) is deferred to a
+/// future MODULE-001 / runtime integration slice — see MODULE-008 §3.6.
+interface agent-run {
+    /// Ensures that a task has exactly one live run; returns the existing
+    /// run-id if one is already live, else creates a new run.
+    ensure-run: func(task-id: string, config: run-config) -> result<run-id, run-error>;
+
+    /// Ends a round of iteration and updates budget counters. Runtime
+    /// enforces budgets only; it does not evaluate whether the business
+    /// goal is met. **Auto-mode exception (§4.7.7)**: an Auto run only
+    /// buffers `summary` / `metrics` and returns `continue-allowed` without
+    /// advancing the round counter; AutoLoopDriver is the sole round
+    /// advancer.
+    complete-round: func(run-id: run-id, %result: round-result) -> result<round-decision, run-error>;
+
+    /// Terminates the run with the given outcome.
+    complete-run: func(run-id: run-id, outcome: string) -> result<_, run-error>;
+
+    /// User or supervisor control overrides agent self-judgment.
+    /// `pause-run` / `cancel-run` can interrupt at the `await-replies`
+    /// boundary mid-turn (see §4.4).
+    pause-run: func(run-id: run-id, reason: option<string>) -> result<_, run-error>;
+    resume-run: func(run-id: run-id) -> result<_, run-error>;
+    cancel-run: func(run-id: run-id, reason: option<string>) -> result<_, run-error>;
+
+    /// Exposes the root_await pointer and session tree summary for audit
+    /// and CLI consumption.
+    run-status: func(run-id: run-id) -> result<run-state, run-error>;
+
+    type run-id = string;
+
+    record run-config {
+        token-limit: option<u64>,
+        cost-usd-limit: option<f64>,
+        rounds-limit: option<u32>,
+        retry-overrides: option<retry-config>,
+        repetition-guard: option<repetition-guard-config>,
+    }
+
+    record repetition-guard-config {
+        enabled: option<bool>,
+        window-size: option<u32>,
+        repeat-threshold: option<u32>,
+        action: option<string>,
+    }
+
+    record retry-config {
+        llm-max-retries: option<u32>,
+        llm-base-delay-ms: option<u32>,
+        llm-max-delay-ms: option<u32>,
+        tool-max-retries: option<u32>,
+        tool-base-delay-ms: option<u32>,
+        tool-max-delay-ms: option<u32>,
+    }
+
+    record round-result {
+        summary: option<string>,
+        metrics: list<metric-sample>,
+    }
+
+    record metric-sample {
+        name: string,
+        value: string,
+    }
+
+    variant round-decision {
+        continue-allowed,
+        blocked(string),
+    }
+
+    record run-state {
+        task-id: string,
+        controller-agent: string,
+        status: task-run-status,
+        iteration: u32,
+        root-await: option<string>,
+        await-tree: option<await-tree-summary>,
+        token-used: u64,
+        token-limit: option<u64>,
+        cost-usd: f64,
+        cost-usd-limit: option<f64>,
+        rounds-limit: option<u32>,
+    }
+
+    record await-tree-summary {
+        depth: u32,
+        total-sessions: u32,
+        pending-replies: u32,
+        sessions: list<session-summary>,
+    }
+
+    record session-summary {
+        session-id: string,
+        parent-session-id: option<string>,
+        agent-id: string,
+        mode: string,
+        expected: u32,
+        received: u32,
+        status: string,
+    }
+
+    variant task-run-status {
+        active,
+        suspended,
+        paused,
+        completed,
+        failed(string),
+        cancelled(string),
+    }
+
+    variant run-error {
+        not-found(string),
+        already-exists(string),
+        invalid-state(string),
+        budget-exceeded(string),
+        permission-denied(string),
+    }
+}
+
+/// Memory ABI per MODULE-011 §1.3.1 + PRD §9.4. Slice m011-B
+/// (2026-05-15) declares the `agent-memory` interface at the package
+/// level so guests can `import advance:runtime/agent-memory` from
+/// their own world definitions. NOT imported by `world advance-host`
+/// — the M001-T42 invariant ("advance-host has zero function-bearing
+/// imports") MUST hold.
+///
+/// Slice B implements all 5 host fns; `remember` / `recall` / `forget`
+/// have full bodies; `recall-at` uses a created_at filter on the
+/// in-memory store; `rollback-memory` drops in-process entries with
+/// created_at > timestamp (full git-backed rollback per MODULE-011
+/// AC-18 + CONTRACT-021 is deferred to a future slice).
+interface agent-memory {
+    remember: func(content: string, tags: list<string>) -> result<memory-id, memory-error>;
+    recall: func(query: string, limit: u32) -> result<list<memory-entry>, memory-error>;
+    forget: func(id: memory-id) -> result<_, memory-error>;
+    recall-at: func(query: string, timestamp: string, limit: u32) -> result<list<memory-entry>, memory-error>;
+    rollback-memory: func(timestamp: string) -> result<_, memory-error>;
+
+    type memory-id = string;
+
+    record memory-entry {
+        id: memory-id,
+        content: string,
+        tags: list<string>,
+        created-at: string,
+        score: option<f64>,
+        %type: option<string>,
+        status: option<string>,
+        task-origin: option<string>,
+    }
+
+    variant memory-error {
+        not-found(string),
+        storage-error(string),
+        limit-exceeded(string),
+    }
+}
+
+/// Messaging ABI per MODULE-006 §1.3.1 + PRD §9.2. Slice m006-A
+/// (2026-05-16) declares the M006-owned subset of `agent-messaging`
+/// (send + heartbeat with M006-owned `message-context` + `msg-error`
+/// types). `reply` (needs MessageTrace, slice B) and `await-replies`
+/// (needs MODULE-007 + canonical CONTRACT-060 types) land additively
+/// in their owning slices — appending methods to a WIT interface is
+/// wire-additive; only record field changes or method-signature changes
+/// break.
+///
+/// NOT imported by `world advance-host` — MODULE-001-T42's
+/// "advance-host has zero function-bearing imports" invariant must
+/// hold. CapabilityInjector wiring + AC-01 WIT structural test land in
+/// a follow-on slice (sibling pattern: MODULE-008 agent-run / MODULE-017
+/// agent-skills "declare-now, wire-later" host-fn split).
+///
+/// `msg-error` variant order matches the canonical Rust enum order at
+/// `crates/shared-types/src/mailbox.rs:141-147` so WIT ordinals align
+/// with Rust ordinals (wire stability under future additive variant
+/// changes). `mailbox-full` is payloadless — matches canonical Rust
+/// `MsgError::MailboxFull`; MODULE-006 §1.3.1 doc-text shows
+/// `mailbox-full(string)` which is a known doc-drift to be resolved
+/// by a future `/spec MODULE-006` rerun.
+interface agent-messaging {
+    record message-context {
+        task-id: option<string>,
+        run-id: option<string>,
+        execution-id: option<string>,
+    }
+
+    variant msg-error {
+        invalid-target(string),
+        mailbox-full,
+        circuit-breaker-open(string),
+        capability-denied(string),
+        invalid-payload(string),
+    }
+
+    send: func(target: string, payload: list<u8>, context: option<message-context>)
+        -> result<_, msg-error>;
+    heartbeat: func(progress: option<string>) -> result<_, msg-error>;
+
+    // Slice m007-A (2026-05-18): async/await fan-out coordination primitive.
+    // Wire-additive — preserves the slice-A "declare-now, wire-later" posture
+    // (see MODULE-007 §2.3). Host-fn handler + call_async fiber suspension are
+    // deferred to slice B. NOT imported by `world advance-host` —
+    // MODULE-001-T42's "advance-host has zero function-bearing imports"
+    // invariant must hold.
+    await-replies: func(requests: list<await-request>, options: await-options)
+        -> result<await-result, orchestration-error>;
+
+    variant await-request {
+        agent-request(agent-await-request),
+        component-finished(component-await-request),
+    }
+
+    record agent-await-request {
+        target: string,
+        payload: list<u8>,
+        correlation-id: string,
+        context: option<message-context>,
+    }
+
+    record component-await-request {
+        component-id: string,
+        correlation-id: string,
+    }
+
+    record await-options {
+        mode: await-mode,
+        idle-timeout-secs: option<u32>,
+        on-idle-timeout: timeout-policy,
+        keep-losers: bool,
+    }
+
+    variant await-mode { all-of, any-of }
+
+    variant timeout-policy { return-partial, fail }
+
+    record await-result {
+        replies: list<reply-result>,
+        completed-all: bool,
+    }
+
+    record reply-result {
+        correlation-id: string,
+        target: string,
+        status: reply-status,
+    }
+
+    variant reply-status {
+        success(list<u8>),
+        completed,
+        timed-out,
+        detached,
+        error(string),
+    }
+
+    variant orchestration-error {
+        capability-denied(string),
+        invalid-target(string),
+        deadlock-detected(string),
+        session-limit-exceeded(string),
+        session-closed(string),
+        idle-timeout-exceeded(string),
+    }
+}
+
+/// `notify` WIT interface (MODULE-006 §1.3.1 / CONTRACT-050). Slice B
+/// declares the interface; host_fn registration is deferred to a follow-on
+/// slice (identical "declare-now, wire-later" posture to `agent-messaging`).
+///
+/// NOT imported by `world advance-host` — the MODULE-001-T42 "advance-host
+/// has zero function-bearing imports" invariant must hold.
+///
+/// `notify-error` projects the MODULE-006 §2.3:483-488 canonical 4-variant
+/// Rust `NotifyError` (`crates/shared-types/src/mailbox.rs`). The former
+/// MODULE-006 §1.4.1 doc-text 5-variant divergence (incl. `invalid-context`
+/// / `circuit-breaker-open`) was RESOLVED by the 2026-06-12 `/spec`
+/// MODULE-006 doc-drift rerun: the 4-variant set here is canonical;
+/// breaker-open on notify surfaces maps to
+/// `capability-denied("breaker_open")`. Variant order matches the Rust enum
+/// order so WIT ordinals align with Rust ordinals.
+interface notify {
+    use agent-messaging.{message-context};
+
+    variant notify-error {
+        invalid-target(string),
+        mailbox-full,
+        capability-denied(string),
+        identity-unknown(string),
+    }
+
+    notify-agent: func(agent-id: string, payload: list<u8>, context: option<message-context>)
+        -> result<_, notify-error>;
+    notify-channel: func(channel-id: string, user-id: string, payload: list<u8>, context: option<message-context>)
+        -> result<_, notify-error>;
+}
+
+world advance-host {
+    export message-driven;
+    export runnable;
+}
+
+/// Slice m001-slice-bootstrap (2026-05-28) — sibling world to `advance-host`
+/// that imports `agent-messaging` so guest components can call `send` /
+/// `heartbeat` / `await-replies` host functions. `advance-host` itself
+/// stays import-free (T42 architectural guard preserved); this new world is
+/// the production target for `ComponentRuntime::instantiate_advance_host_with_capabilities_async`
+/// (component_loader.rs) which wires the imports via `CapabilityInjector::inject`.
+///
+/// `agent-messaging` is declared in the same package `advance:runtime@0.1.0`
+/// (lines 529-612 above) — single-package bindgen, no multi-path concern.
+///
+/// Future capability additions (agent-lifecycle / agent-run / etc.) extend
+/// this world additively (wire-compatible) OR ship a third world variant.
+/// The original `advance-host` world is the import-free architectural
+/// reference; T42 still fires LOUD on any import addition there.
+world advance-host-with-capabilities {
+    import agent-messaging;
+    export message-driven;
+    export runnable;
+}
+
+// --- appended for guest-rust-j01-skeleton (BS-3): agent-fs interface + fs-importing world ---
+interface agent-fs {
+    read: func(path: string) -> result<list<u8>, fs-error>;
+    write: func(path: string, data: list<u8>) -> result<_, fs-error>;
+    // `%list` escapes the WIT `list` keyword so a real wit-bindgen guest can import
+    // this interface (the function's component-model name is still "list", matching
+    // the host cap-fs registration). Discovered by the BS-3 skeleton guest — no guest
+    // had imported agent-fs before, so the unescaped keyword was never validated.
+    %list: func(path: string) -> result<list<entry>, fs-error>;
+    delete: func(path: string) -> result<_, fs-error>;
+    scan: func(path: string) -> result<scan-result, fs-error>;
+
+    read-slug: func(agent-id: string, slug: string, file: string) -> result<list<u8>, fs-error>;
+    list-slug: func(agent-id: string, slug: string) -> result<list<entry>, fs-error>;
+    scan-slug: func(agent-id: string, slug: string) -> result<scan-result, fs-error>;
+
+    read-child: func(child-id: string, path: string) -> result<list<u8>, fs-error>;
+    list-child: func(child-id: string, path: string) -> result<list<entry>, fs-error>;
+    scan-child: func(child-id: string, path: string) -> result<scan-result, fs-error>;
+
+    file-history: func(path: string) -> result<list<version-entry>, fs-error>;
+    read-at: func(path: string, version: string) -> result<list<u8>, fs-error>;
+    child-file-history: func(child-id: string, path: string) -> result<list<version-entry>, fs-error>;
+    read-child-at: func(child-id: string, path: string, version: string) -> result<list<u8>, fs-error>;
+    slug-file-history: func(agent-id: string, slug: string, file: string) -> result<list<version-entry>, fs-error>;
+
+    update-scope: func(path: string, description: string, tags: list<string>)
+        -> result<_, fs-error>;
+    update-entry-meta: func(path: string, entry-name: string, description: string,
+        tags: list<string>) -> result<_, fs-error>;
+
+    record scan-result {
+        scope: scope-meta,
+        children: list<child-meta>,
+    }
+    record scope-meta {
+        slug: option<string>,
+        description: string,
+        tags: list<string>,
+        status: option<string>,
+    }
+    record child-meta {
+        name: string,
+        description: string,
+        tags: list<string>,
+        is-dir: bool,
+        has-agent: bool,
+    }
+
+    variant fs-error {
+        not-found(string),
+        permission-denied(string),
+        invalid-path(string),
+        io-error(string),
+    }
+
+    record entry {
+        name: string,
+        is-dir: bool,
+        size: option<u64>,
+        modified: option<string>,
+    }
+    record version-entry {
+        version: string,
+        timestamp: string,
+        message: option<string>,
+    }
+}
+
+/// BS-3 skeleton world: imports agent-fs (provided dynamically by the host
+/// CapabilityInjector under the versioned namespace advance:runtime/agent-fs@0.1.0)
+/// and exports the same message-driven + runnable surface the host bindgen
+/// (advance-host-with-capabilities) looks up.
+world advance-host-fs {
+    import agent-fs;
+    export message-driven;
+    export runnable;
+}

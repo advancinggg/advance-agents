@@ -1,0 +1,27 @@
+[package]
+name = "guest-rust-d-grant"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# /dev Track D (2026-06-04) — grant system-acceptance guest: imports agent-grant
+# (versioned advance:runtime/agent-grant@0.1.0) and on handle-message dispatches a
+# small command grammar (req / revoke / delegate / narrow / apply-preset) to the
+# matching grant host fn, driving the resolver-walk + grant-store witnesses end-to-end
+# through a real wired turn. Excluded from the workspace (built for wasm32-unknown-unknown).
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

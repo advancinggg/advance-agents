@@ -1,0 +1,126 @@
+# cargo-deny configuration for the open-core `advance-agents` runtime.
+#
+# Paired with `.github/workflows/ci.yml`. This is the supply-chain gate promised
+# in the workspace `Cargo.toml` (~lines 344-358): every third-party dependency is
+# exact-pinned (`=x.y.z`), which blocks silent updates AND silent CVE patches, so
+# advisories are surfaced here and cleared only by intentional bump commits.
+#
+# CI policy split (see ci.yml):
+#   * `bans`, `licenses`, `sources`  -> BLOCKING posture invariants.
+#   * `advisories`                   -> surfaced, non-blocking (fire on exact-pins
+#                                       by design; a real fix is a bump commit).
+
+# The dependency graph cargo-deny reasons over. Defaults are used (all features /
+# all targets, dev-deps included) so the gate sees everything CI compiles.
+[graph]
+all-features = false
+
+# ---------------------------------------------------------------------------
+# advisories — RustSec database scan.
+# ---------------------------------------------------------------------------
+# Exact-pinning (`=x.y.z`) on the whole workspace means a freshly published CVE
+# will NOT be pulled in by a routine `cargo update`; instead this check FIRES on
+# the pinned version. That is intentional: clearing an advisory is a reviewed,
+# intentional version-bump commit — never a blanket ignore. Add an advisory ID to
+# `ignore` ONLY with a written rationale and, ideally, an expiry.
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# A yanked crate is a hard signal that the exact-pin needs an intentional bump.
+yanked = "deny"
+ignore = [
+    # e.g. { id = "RUSTSEC-0000-0000", reason = "…why safe…", expiry = "YYYY-MM-DD" }
+]
+
+# ---------------------------------------------------------------------------
+# licenses — allowlist of acceptable SPDX license expressions.
+# ---------------------------------------------------------------------------
+# NOTE (first run): this allowlist is the INTENDED set for the pure-Rust /
+# vendored posture. cargo-deny (version 2) denies anything not explicitly allowed,
+# so the FIRST CI run is expected to surface the exact license set present in the
+# resolved graph. Tighten this list DOWN to what the graph actually contains —
+# do not pad it with licenses that are not present. Known snag to expect: `ring`
+# (see [bans] below) ships a non-SPDX custom license and will be flagged here;
+# the real remediation is dropping `ring` from the graph, not adding an exception.
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception", # llvm-derived crates in the wasmtime/cranelift graph
+    "BSD-3-Clause",                   # ed25519-dalek / curve25519-dalek / x25519-dalek (dalek-cryptography)
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-3.0",                    # unicode-ident and friends (newer SPDX id)
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",              # notify (runtime file-watch); public-domain equivalent
+    "CDLA-Permissive-2.0",  # transitive data/spec crates in the resolved graph
+]
+# `exceptions` is where a single crate's odd-but-acceptable license is whitelisted
+# WITHOUT widening the global `allow` list. Left empty deliberately — populate only
+# after the first run shows a concrete, justified case, e.g.:
+#   { name = "ring", allow = ["LicenseRef-ring"] }   # only if `ring` is kept
+exceptions = []
+
+# ---------------------------------------------------------------------------
+# bans — lock the crypto / TLS supply-chain posture.
+# ---------------------------------------------------------------------------
+# Crypto posture is deliberately PURE-RUST: RustCrypto (aes-gcm, chacha20poly1305,
+# hmac, sha2, hkdf) — NEVER the `ring` backend. Storage crypto is vendored
+# (rusqlite `bundled` SQLite, git2 `vendored-libgit2`) so no system C crypto libs
+# leak into the graph. The denies below keep OpenSSL / system-TLS out for good.
+# (dalek/snow lived with product-side device-mesh and are no longer in this graph.)
+[bans]
+# Many crates legitimately appear at 2+ versions in the Wasmtime/Tokio graph
+# (rand, rand_core, syn, thiserror, hashbrown, getrandom, bitflags, rustix,
+# windows-*, …), so a hard `deny` here would fail immediately. Keep it a WARN.
+#
+# TODO(tighten): once the graph is audited, flip this to "deny" and add the
+# specific unavoidable duplicates to `skip` below. The workspace already engineers
+# `wasmparser` to a single version (Cargo.toml:98) — it is currently unified, so
+# no skip is needed for it yet; if a future wasmtime bump reintroduces the known
+# wasmparser duplicate, add `{ name = "wasmparser" }` to `skip`.
+multiple-versions = "warn"
+# A `*` version requirement on a crates.io dependency is a supply-chain hole.
+wildcards = "deny"
+# …but internal path deps (`advance-*`) are declared pathless (implicit `*`); allow
+# the wildcard ONLY for those local path crates.
+allow-wildcard-paths = true
+
+skip = [
+    # e.g. { name = "wasmparser" }  # only if a wasmtime bump reintroduces the dup
+]
+
+deny = [
+    # Lock out system-TLS / OpenSSL entirely (none are currently in the graph —
+    # these denies keep it that way).
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+
+    # DESIRED, but currently BLOCKED — do not uncomment yet:
+    # `ring` is NOT first-party here, but it IS presently in the graph transitively
+    # via `jsonschema 0.18.3 -> reqwest -> {rustls, quinn, hyper-rustls} -> ring`
+    # (reqwest is jsonschema's HTTP `$ref` resolver). Enabling this deny now would
+    # hard-fail the blocking `deny` job on day one. To reach the intended pure-Rust
+    # posture: drop the HTTP resolver from `jsonschema` in the workspace Cargo.toml
+    # (disable its reqwest-backed remote-ref feature, or swap to a
+    # resolve-file-only configuration), confirm `ring` leaves Cargo.lock, THEN
+    # uncomment the line below to enforce it permanently.
+    # { name = "ring", reason = "pure-Rust crypto posture: dalek/snow/RustCrypto, never ring" },
+]
+
+# ---------------------------------------------------------------------------
+# sources — where crates are allowed to come from.
+# ---------------------------------------------------------------------------
+# The OSS core is crates.io-ONLY: there are no git dependencies in Cargo.lock.
+# The one git dependency in the wider system is the PRIVATE `along`
+# repo's edge onto THIS repo — that lives in the product repo's own deny config,
+# not here. Keep this gate strict so a stray git/registry source is a hard fail.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

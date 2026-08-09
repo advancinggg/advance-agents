@@ -1,0 +1,210 @@
+[package]
+name = "advance-cli"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "advance CLI entry point."
+
+# Slice AG (2026-05-11) — add a `[lib]` target so integration tests in
+# `crates/cli/tests/*.rs` can import `advance_cli::wiring::wire_capabilities`
+# directly (binary-only crates can only invoke via `assert_cmd::cargo_bin`).
+# `src/main.rs` keeps the binary entry; `src/lib.rs` re-exports the modules.
+publish = false
+
+[lib]
+name = "advance_cli"
+path = "src/lib.rs"
+
+[features]
+default = []
+test-support = []
+
+[[bin]]
+name = "advance"
+path = "src/main.rs"
+
+[dependencies]
+advance-runtime = { path = "../runtime" }
+# MODULE-001-AC-20 (024): core->component encode for the deploy-component loader.
+# Leaf lib (anyhow + wit-component + clap; no advance-* deps -> cycle-free).
+build-agent = { path = "../build-agent" }
+clap = { workspace = true }
+# Slice AE (2026-05-09) — `advance start` parks on tokio::signal until
+# ctrl_c / SIGTERM. Features: `rt-multi-thread` (Tokio runtime in `start::run`),
+# `macros` (`#[tokio::main]`-style attributes are NOT used; this is for
+# `tokio::select!`), `signal` (signal listeners).
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }
+# /dev B3 (2026-06-15): the readiness-gated registry-walk (`runnable_walk.rs`)
+# passes a `tokio_util::sync::CancellationToken` into
+# `ComponentMaterializer::materialize`. tokio-util is already in the binary's
+# link graph transitively via advance-scheduler, so this direct dep adds no new
+# compiled code (the release `binary_size` gate is unaffected).
+tokio-util = { workspace = true }
+# /dev WS-A: in-process HTTP `POST /msg` inbound message source for `advance
+# start` (the e2e-spine inbound seam). Reuses the workspace axum pin (same one
+# event-bus uses); `axum::serve` needs a `tokio::net::TcpListener` (tokio "net").
+axum = { workspace = true }
+# Slice BS-3 (2026-06-03) — the CLI is the composition root for the scheduler
+# AgentLoopDriverImpl (the dep-cycle-blocked path AC-18's runtime-crate text
+# cannot take). `crate::agent_loop::build_agent_loop` is exercised by the
+# `system-acceptance` harness + the `sys_acceptance_full_turn` CLI witness, and
+# `advance start` constructs + drives it for a deployed component (D12 one-shot
+# boot load of `.agent/behavior.component.wasm`; AC-13-compliant — restart is the
+# mechanism, not a hot swap). agent_loop.rs holds a Wasmtime Store<ComponentCtx>
+# behind a tokio::sync::Mutex (→ tokio "sync"; → wasmtime promoted dev→prod) and
+# constructs the gate-only AgentActionDispatcherImpl (→ advance-messaging promoted
+# dev→prod). No cycle: scheduler/messaging depend on advance-runtime, not advance-cli.
+advance-scheduler = { path = "../scheduler" }
+# /dev Stage-D satellite (2026-06-19) — cli is the composition root for the
+# MODULE-015 auto-loop driver: build the DefaultAutoLoopDriver + its
+# AutoStateReader bridge, wire `RunManager::with_round_advancer`, and host the
+# EventBus/notify/PackRegistry adapters that keep the auto-loop crate free of
+# event-bus/messaging/pack-manager deps. cli is top-level → no cycle (auto-loop
+# deps advance-scheduler, NOT cli).
+advance-scheduler-auto-loop = { path = "../scheduler/auto-loop" }
+# /dev Stage-D satellite (2026-06-19) — the 201 evaluator-resolver bridge needs
+# `PackRegistry::resolve_pack_component` (CONTRACT-170); a DIRECT dep is required
+# to name `advance_pack_manager::` (it is only a transitive dep via cap-lifecycle
+# otherwise).
+advance-pack-manager = { path = "../services/pack-manager" }
+advance-messaging = { path = "../messaging" }
+advance-git = { path = "../git" }
+wasmtime = { workspace = true }
+# Slice AG (2026-05-11) — production cap-grant + cap-secrets + EventBus
+# wiring via `advance_cli::wiring::wire_capabilities`. CLI is the bridge
+# crate that combines `advance-runtime` (provides RuntimeHostBuilder) with
+# `cap-grant` (provides GrantCheckImpl) without introducing a
+# `runtime → cap-grant` cycle (cap-grant's wit_impl already depends on
+# advance-runtime). Cargo package names verified against each crate's
+# `[package].name` field.
+advance-database = { path = "../database" }
+advance-event-bus = { path = "../event-bus" }
+advance-client-api = { path = "../client-api" }
+# /dev Phase-3 kickoff (2026-06-06) — wire a real per-session RunManager budget
+# (RunManager::budget() + with_cost_tracker(bus.cost_tracker_query())) into the
+# cap-llm gateway, replacing NotWiredRunBudget; mint the session run_id producer
+# in the composition root. cli is top-level so this adds no dependency cycle.
+advance-run-manager = { path = "../run-manager" }
+advance-shared-types = { path = "../shared-types" }
+# await-leg B-2 (2026-06-22) — promoted from [dev-dependencies] to a prod dep for
+# the production messaging wiring (the `await_wiring.rs` RunManagerSuspendSink
+# adapter + wire_capabilities' declares_messaging chain that registers
+# await-replies/heartbeat). NO `test-helpers` feature in prod; the existing
+# [dev-dependencies] entry (with test-helpers, for fiber_suspend_resume.rs's
+# session_count_for_test) stays — the prod-dep + dev-dep-with-extra-feature pair
+# is the idiomatic Cargo pattern for a test-only feature. cli is top-level → no cycle.
+advance-reply-tracker = { path = "../messaging/reply-tracker" }
+# Backbone Step 2 (2026-06-07) — wire the real ContextAssemblerImpl into the
+# composition root via crate::context_wiring (the 11-port adapters + the
+# PublishingContextAssembler seam). context-engine is dep-light (shared-types
+# only); cli is top-level so this adds no cycle.
+advance-context-engine = { path = "../context-engine" }
+cap-grant = { path = "../capabilities/cap-grant" }
+cap-secrets = { path = "../capabilities/cap-secrets" }
+# Slice I (m017-slice-i, 2026-05-29) — `advance skill import` / `materialize`
+# subcommands wired to the cap-skills Path-A importer + admin-pool + materialize
+# library API. Transitively links advance-git→git2 (vendored-static, no system
+# zlib per workspace pin) into the binary; the release-mode binary_size test
+# (both clauses) is the static-linkage regression gate. serde_json parses the
+# `--mcp-descriptor` McpImportSpec JSON.
+cap-skills = { path = "../capabilities/cap-skills" }
+# Slice BS-1 (2026-06-01) — wire the remaining cap-* providers + real master
+# key into `wire_capabilities`. cap-http supplies the LlmGateway security chain
+# (+ the HttpExecutor trait for the fail-closed NotWired stub); cap-lifecycle
+# supplies AgentTreeStore for the cap-fs resolver. All consume-only (no provider
+# API change); cli is top-level so adding these introduces no dependency cycle.
+cap-llm = { path = "../capabilities/cap-llm" }
+cap-fs = { path = "../capabilities/cap-fs" }
+cap-tools = { path = "../capabilities/cap-tools" }
+cap-memory = { path = "../capabilities/cap-memory" }
+cap-http = { path = "../capabilities/cap-http" }
+cap-lifecycle = { path = "../capabilities/cap-lifecycle" }
+# /dev Phase-2 Step-3 (2026-06-05) — the daemon composition root wires the real
+# channel adapter: the shared /hooks listener + TransportSupervisor (verifier →
+# enqueue), the host pump (poll_host_pump → Message), and the in-host channel
+# egress (DaemonOutboundSink/ChannelEgress → OutboundTransport/HttpEgress). cli is top-level so
+# cli→cap-channel is cycle-free; cap-channel's AC-08 zero-edge constrains
+# cap-channel's OWN manifest, not cli's.
+cap-channel = { path = "../capabilities/cap-channel" }
+async-trait = { workspace = true }
+# /dev WS-A: `#[derive(Deserialize)]` for the POST /msg request body.
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+zeroize = { workspace = true }
+# Wave-25A CONTRACT-218 build-and-hold foundations: XChaCha-wrapped role roots
+# and OS-exclusive custody for the external monotonic anchor store.
+chacha20poly1305 = { workspace = true }
+fd-lock = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+rusqlite = { workspace = true }
+# SAT-B (slice satB-postproc): the production `LlmBatchExtractor` mints a unique
+# `MemoryEntry.id` per extracted knowledge item. Workspace-pinned (v4 feature
+# already enabled; cap-memory uses the same pin) — no root manifest edit.
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+# Integration tests import the library as an ordinary dependant.  Enable the
+# explicit fixture-only monotonic-record backends without exposing them in a
+# default/production `advance-cli` build.
+advance-cli = { path = ".", features = ["test-support"] }
+advance-shared-types = { path = "../shared-types", features = ["test-support"] }
+# Tee slice T3 (plan R8): the T120 turn-end-reap witness needs a stream that STAYS
+# IN-FLIGHT across a serve-loop turn, which only cap-http's gated mock stream
+# provides. Same prod-dep + dev-dep-with-extra-feature pair as advance-reply-tracker
+# below; the feature never reaches a production `advance-cli` build.
+cap-http = { path = "../capabilities/cap-http", features = ["test-stream-gate"] }
+# Opaque genesis/dependency fixtures are available only to integration tests.
+advance-scheduler = { path = "../scheduler", features = ["test-support"] }
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }
+# SAT-B (slice satB-postproc): the memory_extractor T51/T52 fake implements the
+# `LlmGatewayInternal::stream()` trait method, whose return type names
+# `futures_core::Stream`. Workspace-pinned (already cap-llm's prod dep).
+futures-core = { workspace = true }
+# /dev WS-A: `secrets_roundtrip` test resolves a value back through SecretStore
+# and reads it via `ExposeSecret`.
+secrecy = { workspace = true }
+# /dev Phase-3 kickoff (2026-06-06): budget_wiring.rs witnesses the production
+# budget mechanism (RunManager + CostTracker cost gate + rounds gate) on the same
+# component graph wiring.rs builds. (advance-run-manager + advance-event-bus +
+# advance-shared-types are already [dependencies] prod deps.)
+advance-cost-tracker = { path = "../cost-tracker" }
+# Slice AG (2026-05-11) — T-AG-05 needs `wasmtime::component::Linker`
+# to exercise `CapabilityInjector::inject` directly (strict L0 link
+# smoke per `wit_dispatch::T42`).
+# (wasmtime + advance-messaging promoted to [dependencies] by Slice BS-3 — still
+# reachable from tests via the prod dep; the dev entries were removed to avoid
+# duplicate-dependency declarations.)
+# Slice m001-slice-bootstrap (2026-05-28) — integration tests for AC-08 (CB
+# freeze/drain) + AC-17 (two call modes) + M007-AC-08/AC-14 (fiber suspend/
+# resume).
+advance-reply-tracker = { path = "../messaging/reply-tracker", features = ["test-helpers"] }
+async-trait = { workspace = true }
+wit-component = { workspace = true }
+# Slice BS-3 (2026-06-03) — git2 inspects the turn commit in the spike/full-turn
+# tests. (advance-git is now a [dependencies] prod dep — wiring.rs wires git_sync
+# into production — so it's removed from here to avoid a duplicate declaration.)
+git2 = { workspace = true }
+futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { workspace = true }
+
+[lints]
+workspace = true

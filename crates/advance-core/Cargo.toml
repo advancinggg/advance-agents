@@ -1,0 +1,49 @@
+[package]
+name = "advance-core"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stable embedding façade for the advance-agents OSS core — re-exports the supported public surface (docs/OPEN-CORE-BOUNDARY.md §5/§6). External consumers pin this one crate (git dep + tag) instead of the ~30 internal crates."
+
+# NOTE (pre-genesis): every dependency below carries an explicit `version` alongside
+# `path` so `cargo package -p advance-core --no-verify` resolves (path-only deps are
+# stripped at package time and would leave an unresolvable manifest). All versions are
+# workspace-unified at 0.1.0; the release tool bumps them together with
+# [workspace.package].version.
+
+publish = false
+
+[dependencies]
+# ── seam layer (dependency-inversion home) ─────────────────────────────────
+advance-shared-types = { path = "../shared-types", version = "0.1.0" }
+# ── runtime host ───────────────────────────────────────────────────────────
+advance-runtime = { path = "../runtime", version = "0.1.0" }
+# ── capability crates (11) ─────────────────────────────────────────────────
+cap-channel = { path = "../capabilities/cap-channel", version = "0.1.0" }
+cap-fs = { path = "../capabilities/cap-fs", version = "0.1.0" }
+cap-grant = { path = "../capabilities/cap-grant", version = "0.1.0" }
+cap-http = { path = "../capabilities/cap-http", version = "0.1.0" }
+cap-lifecycle = { path = "../capabilities/cap-lifecycle", version = "0.1.0" }
+cap-llm = { path = "../capabilities/cap-llm", version = "0.1.0" }
+cap-mcp = { path = "../capabilities/cap-mcp", version = "0.1.0" }
+cap-memory = { path = "../capabilities/cap-memory", version = "0.1.0" }
+cap-secrets = { path = "../capabilities/cap-secrets", version = "0.1.0" }
+cap-skills = { path = "../capabilities/cap-skills", version = "0.1.0" }
+cap-tools = { path = "../capabilities/cap-tools", version = "0.1.0" }
+# ── subsystem crates ───────────────────────────────────────────────────────
+advance-client-api = { path = "../client-api", version = "0.1.0" }
+advance-context-engine = { path = "../context-engine", version = "0.1.0" }
+advance-cost-tracker = { path = "../cost-tracker", version = "0.1.0" }
+advance-database = { path = "../database", version = "0.1.0" }
+advance-event-bus = { path = "../event-bus", version = "0.1.0" }
+advance-git = { path = "../git", version = "0.1.0" }
+advance-messaging = { path = "../messaging", version = "0.1.0" }
+advance-pack-manager = { path = "../services/pack-manager", version = "0.1.0" }
+advance-reply-tracker = { path = "../messaging/reply-tracker", version = "0.1.0" }
+advance-run-manager = { path = "../run-manager", version = "0.1.0" }
+advance-scheduler = { path = "../scheduler", version = "0.1.0" }
+advance-scheduler-auto-loop = { path = "../scheduler/auto-loop", version = "0.1.0" }
+
+[lints]
+workspace = true

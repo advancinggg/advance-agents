@@ -1,0 +1,131 @@
+[package]
+name = "system-acceptance"
+version.workspace = true
+repository.workspace = true
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# /dev Slice BS-3 (2026-06-03) — reusable, journey-agnostic system-acceptance
+# harness (the serial-gate deliverable the 10 parallel e2e tracks build on).
+# `SystemUnderTest` boots a wired in-process runtime in a temp git workspace,
+# injects an inbound message through the REAL messaging dispatcher, drives the
+# production agent loop (run_agent), and exposes event / git / file assertions.
+# Test-only infrastructure: NOT linked into the `advance` binary.
+
+[lib]
+
+[dependencies]
+advance-cli = { path = "../cli", features = ["test-support"] }
+advance-runtime = { path = "../runtime" }
+# Backbone Step 4: enable `test-support` so the harness `run_turns` can call the
+# gated bounded multi-turn driver `AgentLoopDriverImpl::serve_n_turns` (excluded
+# from the production daemon binary, which spawns the infinite `serve`).
+advance-scheduler = { path = "../scheduler", features = ["test-support"] }
+advance-messaging = { path = "../messaging" }
+advance-shared-types = { path = "../shared-types" }
+advance-event-bus = { path = "../event-bus" }
+advance-database = { path = "../database" }
+cap-fs = { path = "../capabilities/cap-fs" }
+cap-memory = { path = "../capabilities/cap-memory" }
+cap-http = { path = "../capabilities/cap-http" }
+cap-grant = { path = "../capabilities/cap-grant" }
+cap-skills = { path = "../capabilities/cap-skills" }
+cap-tools = { path = "../capabilities/cap-tools" }
+cap-llm = { path = "../capabilities/cap-llm" }
+cap-secrets = { path = "../capabilities/cap-secrets" }
+# HF fast-follow deps (2026-06-03): channel capture, in-process MCP, multi-agent
+# spawn (cap-lifecycle), await-replies (reply-tracker), and direct host-fn Vals.
+cap-channel = { path = "../capabilities/cap-channel" }
+cap-mcp = { path = "../capabilities/cap-mcp" }
+cap-lifecycle = { path = "../capabilities/cap-lifecycle" }
+advance-reply-tracker = { path = "../messaging/reply-tracker" }
+advance-git = { path = "../git" }
+advance-client-api = { path = "../client-api" }
+# Wave-12 (SYS-AC-122): the harness lib's `.with_tool_repetition_guard()` axis
+# builds a REAL `RepetitionGuard` mirroring production cli Step 7 (RunManager +
+# build_repetition_guard_from_config). run-manager deps only shared-types →
+# acyclic. (The dev-dependency below keeps `__test-util` for the existing
+# snapshot_status_for_test witness; cargo unions the features for test builds.)
+advance-run-manager = { path = "../run-manager" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+# Harvest-triggers slice (SYS-AC 098-114): `CancellationToken` for the in-harness
+# `drive_cron_fire` real-CronDriver tick (already a workspace dep via advance-scheduler;
+# +1 dependency edge, no new package version).
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+wit-component = { workspace = true }
+wasmtime = { workspace = true }
+git2 = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+# m021-s7-core Δ0: the SYS-J-67 rig recomputes the admission bounds digest with
+# `sha2` DIRECTLY rather than through a device-mesh helper, so the witness is an
+# INDEPENDENT recomputation of what the decoder checks. Routing it through a
+# shared production helper would make a bug in that helper invisible to the very
+# test that exists to catch it.
+sha2 = { workspace = true }
+rusqlite = { workspace = true }
+axum = { workspace = true }
+zeroize = { workspace = true }
+# grok-repass Item 2b: the loopback's gated-SSE serving is a streamed axum
+# body (futures::stream::unfold). Promoted from [dev-dependencies] — same
+# workspace pin already resolved in Cargo.lock (+1 edge, 0 new versions).
+futures = { workspace = true }
+
+[dev-dependencies]
+# `test-util` (additive, test-only) enables `#[tokio::test(start_paused = true)]` + `tokio::time::advance()`
+# for the reply-tracker idle-monitor virtual-clock tests (Track C sys_j52); the idle monitor is
+# explicitly designed for this (idle.rs docstring). No effect on non-test builds.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
+chrono = { workspace = true }
+# Smokes (tests/mode_*_smoke.rs) name types from these crates directly, matching
+# the README worked examples (the same crates the lib depends on).
+advance-shared-types = { path = "../shared-types" }
+advance-scheduler = { path = "../scheduler" }
+advance-reply-tracker = { path = "../messaging/reply-tracker" }
+cap-lifecycle = { path = "../capabilities/cap-lifecycle" }
+cap-channel = { path = "../capabilities/cap-channel" }
+cap-mcp = { path = "../capabilities/cap-mcp" }
+# Stage-A auto-bootstrap witness (SYS-J-09: 025/026/027/200): drive the REAL
+# auto-loop coordination method `DefaultAutoLoopDriver::consult_auto_bootstrap`
+# over a test-supplied applier (calling REAL cap_lifecycle::apply_auto_bootstrap)
+# + recording sink. The applier/sink/startup-invocation seams are MODULE-015 §3.8
+# documented cross-module deferrals this harness-wiring slice supplies test-side.
+advance-scheduler-auto-loop = { path = "../scheduler/auto-loop" }
+wasmtime = { workspace = true }
+async-trait = { workspace = true }
+# Track H (system-acceptance e2e witnesses, 2026-06-03): real run-manager budget /
+# recovery / repetition guard + real cost-tracker, driven test-local through public
+# APIs (no edits to src/lib.rs or src/llm_loopback.rs). wasmtime (above) supplies
+# `wasmtime::component::Val` for the cap-llm host-fn structured-output path (SYS-AC-130/229).
+# `__test-util` enables `RunManager::snapshot_status_for_test` — the SYS-AC-156
+# witness reads the descendant run's verbatim `Cancelled` post-state (sys_j49_cascade_real.rs).
+advance-run-manager = { path = "../run-manager", features = ["__test-util"] }
+advance-cost-tracker = { path = "../cost-tracker" }
+# Track I (SYS-J-29 pack-install witness): drive the REAL admin-side pack
+# installer end-to-end. Both already resolved in Cargo.lock (no NEW package
+# nodes/versions); the only lock change is +2 dependency edges on this crate.
+advance-pack-manager = { path = "../services/pack-manager" }
+semver = { workspace = true }
+# WS-B (2026-06-04): reuse the SINGLE core->component encode source (`build_agent::encode_core_to_component`)
+# in the loopback guest-turn witness (tests/mode_llm_guest_turn.rs), so the encoder that ships the
+# production `behavior.component.wasm` is the one the test proves `load_component`-acceptable.
+build-agent = { path = "../build-agent" }
+# harvest-obs slice (SYS-AC 133-145/232, 2026-06-10): drive the REAL event-bus
+# `query_api::query_router` in-process via tower::ServiceExt::oneshot over an
+# r2d2 pool (the event-bus crate's own tests/query_api.rs precedent). All three
+# are already workspace deps via event-bus — +3 dependency edges, zero new
+# package versions, root Cargo.toml untouched.
+tower = { workspace = true }
+r2d2 = { workspace = true }
+r2d2_sqlite = { workspace = true }
+# small-witness slice (SYS-AC 055/132, 2026-06-11): a real WebSocket CLIENT against
+# the real async EventBus /events endpoint, + StreamExt for frame reads. Both already
+# resolved in Cargo.lock via the event-bus crate's own usage (same workspace pins) —
+# zero new package versions, root Cargo.toml untouched.
+tokio-tungstenite = { workspace = true }
+
+[lints]
+workspace = true

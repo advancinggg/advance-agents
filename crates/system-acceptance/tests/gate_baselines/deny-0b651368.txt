@@ -1,0 +1,39 @@
+# BASELINE: cargo deny check bans licenses sources
+#
+# Captured for lane m021-s7-capstone (SYS-J-67 CAPSTONE, Δ9 re-anchor).
+# Lane base:      0b651368
+# Captured at:    0b651368 checked out in a throwaway scratchpad worktree, 2026-08-02
+# Observed exit:  6   (RED AT BASE: bans FAILED, licenses FAILED, sources ok)
+# Composition:    25 error[wildcard] + 2 error[rejected]
+#
+# Reviewed vs the retired a6f029b9 baseline: the identity set is IDENTICAL
+# (27 = 27, no adds, no removals). deny.toml governance debt remains a separate
+# adjudicated lane (open-core pre-cut); this tier stays report-only here.
+#
+rejected|notify-6.1.1|license CC0-1.0 not in deny.toml allow list	[x1]
+rejected|webpki-roots-1.0.7|license CDLA-Permissive-2.0 not in deny.toml allow list	[x1]
+wildcard|advance-client-api|path-dependency-wildcards	[x1]
+wildcard|advance-cli|path-dependency-wildcards	[x1]
+wildcard|advance-context-engine|path-dependency-wildcards	[x1]
+wildcard|advance-cost-tracker|path-dependency-wildcards	[x1]
+wildcard|advance-device-mesh|path-dependency-wildcards	[x1]
+wildcard|advance-event-bus|path-dependency-wildcards	[x1]
+wildcard|advance-git|path-dependency-wildcards	[x1]
+wildcard|advance-messaging|path-dependency-wildcards	[x1]
+wildcard|advance-pack-manager|path-dependency-wildcards	[x1]
+wildcard|advance-reply-tracker|path-dependency-wildcards	[x1]
+wildcard|advance-run-manager|path-dependency-wildcards	[x1]
+wildcard|advance-runtime|path-dependency-wildcards	[x1]
+wildcard|advance-scheduler-auto-loop|path-dependency-wildcards	[x1]
+wildcard|advance-scheduler|path-dependency-wildcards	[x1]
+wildcard|cap-channel|path-dependency-wildcards	[x1]
+wildcard|cap-fs|path-dependency-wildcards	[x1]
+wildcard|cap-grant|path-dependency-wildcards	[x1]
+wildcard|cap-http|path-dependency-wildcards	[x1]
+wildcard|cap-lifecycle|path-dependency-wildcards	[x1]
+wildcard|cap-llm|path-dependency-wildcards	[x1]
+wildcard|cap-mcp|path-dependency-wildcards	[x1]
+wildcard|cap-memory|path-dependency-wildcards	[x1]
+wildcard|cap-secrets|path-dependency-wildcards	[x1]
+wildcard|cap-skills|path-dependency-wildcards	[x1]
+wildcard|cap-tools|path-dependency-wildcards	[x1]

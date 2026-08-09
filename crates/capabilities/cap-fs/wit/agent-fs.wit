@@ -1,0 +1,81 @@
+package advance:runtime@0.1.0;
+
+interface agent-fs {
+    read: func(path: string) -> result<list<u8>, fs-error>;
+    write: func(path: string, data: list<u8>) -> result<_, fs-error>;
+    // `%list` escapes the WIT `list` keyword so a real wit-bindgen guest can import
+    // this interface (the function's component-model name is still "list", matching
+    // the host cap-fs registration). Discovered by the BS-3 skeleton guest — no guest
+    // had imported agent-fs before, so the unescaped keyword was never validated.
+    %list: func(path: string) -> result<list<entry>, fs-error>;
+    delete: func(path: string) -> result<_, fs-error>;
+    scan: func(path: string) -> result<scan-result, fs-error>;
+
+    read-slug: func(agent-id: string, slug: string, file: string) -> result<list<u8>, fs-error>;
+    list-slug: func(agent-id: string, slug: string) -> result<list<entry>, fs-error>;
+    scan-slug: func(agent-id: string, slug: string) -> result<scan-result, fs-error>;
+
+    read-child: func(child-id: string, path: string) -> result<list<u8>, fs-error>;
+    list-child: func(child-id: string, path: string) -> result<list<entry>, fs-error>;
+    scan-child: func(child-id: string, path: string) -> result<scan-result, fs-error>;
+
+    file-history: func(path: string) -> result<list<version-entry>, fs-error>;
+    read-at: func(path: string, version: string) -> result<list<u8>, fs-error>;
+    child-file-history: func(child-id: string, path: string) -> result<list<version-entry>, fs-error>;
+    read-child-at: func(child-id: string, path: string, version: string) -> result<list<u8>, fs-error>;
+    slug-file-history: func(agent-id: string, slug: string, file: string) -> result<list<version-entry>, fs-error>;
+
+    update-scope: func(path: string, description: string, tags: list<string>)
+        -> result<_, fs-error>;
+    update-entry-meta: func(path: string, entry-name: string, description: string,
+        tags: list<string>) -> result<_, fs-error>;
+
+    record scan-result {
+        scope: scope-meta,
+        children: list<child-meta>,
+    }
+    record scope-meta {
+        slug: option<string>,
+        description: string,
+        tags: list<string>,
+        status: option<string>,
+        // OKF entity `type` (ADR 2026-06-29 Decision 1). `%type` escapes the WIT
+        // `type` keyword (same escaping as `%list`). Appended LAST so the host's
+        // hand-built `Val::Record` order (entry.rs::scope_meta_to_val) and the
+        // positional test decoders are unchanged. `option` — `_scope.type`
+        // requiredness is an ADR Open Follow-up (auto-populated `collection`,
+        // not schema-required).
+        %type: option<string>,
+    }
+    record child-meta {
+        name: string,
+        description: string,
+        tags: list<string>,
+        is-dir: bool,
+        has-agent: bool,
+        // OKF entity `type` (ADR 2026-06-29 Decision 1). Appended LAST so the
+        // positional `fields[4]` = has-agent decoder contract is preserved.
+        // Always a non-empty discriminator (resolved via the defaults table /
+        // the scan `[pending]` fallback).
+        %type: string,
+    }
+
+    variant fs-error {
+        not-found(string),
+        permission-denied(string),
+        invalid-path(string),
+        io-error(string),
+    }
+
+    record entry {
+        name: string,
+        is-dir: bool,
+        size: option<u64>,
+        modified: option<string>,
+    }
+    record version-entry {
+        version: string,
+        timestamp: string,
+        message: option<string>,
+    }
+}

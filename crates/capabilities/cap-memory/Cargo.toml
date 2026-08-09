@@ -1,0 +1,53 @@
+[package]
+name = "cap-memory"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MODULE-011 memory-system Slice B+C: agent-memory WIT host bindings, LLM extraction pipeline (BatchExtractor + 10-min cooldown), in-memory MemoryStore (fact reconciliation + user-preference append-only). Slice C adds the L6 cross-task consolidation pipeline: the 6-step background runnable (CONTRACT-102 L6Handler), post-processor Step 9 hot-path trigger + observable two-phase single-flight lease, staleness probe (Step 1), self-contained pure-compute semantic clustering with cluster_id writeback + journal-based rollback (AC-34), synthesis 5-gate (AC-33), KnowledgeMap 500-token budget (AC-16), single-O(N) KnowledgeHealthSnapshot (AC-35), and admin list helpers (AC-36). The new internal seams (LeaseStore / StalenessProbe / L6Classifier / SynthesisGenerator / L6Committer / L6Emitter / BatchIdSource) stay inside cap-memory — not promoted to shared-types."
+
+publish = false
+
+[lib]
+name = "cap_memory"
+path = "src/lib.rs"
+
+[dependencies]
+advance-runtime = { path = "../../runtime" }
+advance-shared-types = { path = "../../shared-types" }
+async-trait = { workspace = true }
+# slice m011-mem-product (AC-21): sha256 candidate_id for the skill-candidate
+# state machine. Already a [workspace.dependencies] pin (=0.10.8) used by
+# cap-llm/cap-channel/cap-secrets/pack-manager — only the Cargo.lock cap-memory
+# entry churns, NO root manifest edit.
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+wasmtime = { workspace = true }
+# slice m011-memory-persist (AC-41): self-contained durable rusqlite SqliteIndex
+# (own 3 tables + BLOB embeddings, no sqlite-vec), mirroring crates/database's
+# r2d2 pool + PRAGMA pattern WITHOUT a compile-time edge on advance-database.
+# Workspace-pinned (rusqlite =0.32.1 bundled / r2d2 / r2d2_sqlite already resolved
+# by advance-database) — crate-local, no root manifest edit. NO chrono dep:
+# created_at/timestamps use the advance_shared_types::chrono re-export.
+rusqlite = { workspace = true }
+r2d2 = { workspace = true }
+r2d2_sqlite = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# Temp dirs/files for the persistence + rusqlite round-trip tests (AC-40/41)
+# and the SAT-B post-processor writeback tests (T54-T60).
+tempfile = { workspace = true }
+# YAML (de)serialization for the SAT-B writeback integration tests (parse the
+# written summary.yaml/turn-index.yaml; craft an invalid index for the
+# validate_invariants DoS-guard test). serde_yml is already a prod dep;
+# integration-test crates do not inherit prod deps, so it is declared here too.
+serde_yml = { workspace = true }
+
+[lints]
+workspace = true

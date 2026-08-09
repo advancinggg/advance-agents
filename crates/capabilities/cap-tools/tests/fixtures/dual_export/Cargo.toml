@@ -1,0 +1,27 @@
+[package]
+name = "dual-export"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Mutual-exclusion-violating fixture for SYS-AC-085: a component that exports
+# BOTH `advance:runtime/tool-exports` AND `advance:runtime/runnable`. The
+# cap-tools validator rejects it at cold load (failed-set), so it is hidden from
+# list-tools and tool-invoke returns not-found. Built for wasm32-unknown-unknown
+# then `wasm-tools component new`-converted.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

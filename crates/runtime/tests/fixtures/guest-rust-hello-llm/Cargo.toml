@@ -1,0 +1,31 @@
+[package]
+name = "guest-rust-hello-llm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# /dev WS-B (2026-06-04) — reference LLM guest: the FIRST real wit-bindgen guest that
+# imports `agent-llm` (versioned advance:runtime/agent-llm@0.1.0) and, on handle-message,
+# reads msg.payload as the prompt, calls the `agent-llm` `generate` host fn, and returns
+# the LLM response text as an action payload. Drives the guest -> CapabilityInjector ->
+# cap-llm gateway -> loopback round-trip (the guest-side half of MODULE-009-AC-17 that
+# §3.6.3 left as a future M001-coordinated hardening). Excluded from the workspace
+# (built for wasm32-unknown-unknown). Deployed via the `build-agent` core->component
+# encoder; the committed `../guest-rust-hello-llm.core.wasm` is wrapped to a Component at
+# test time.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

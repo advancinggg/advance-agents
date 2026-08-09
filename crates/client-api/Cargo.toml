@@ -1,0 +1,84 @@
+[package]
+name = "advance-client-api"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MODULE-020 client-api foundation (m020-s1): CONTRACT-190 PublicClientApi (versioned envelope, deterministic errors, cursor pagination, reserve-before-execute idempotency, version fail-closed), CONTRACT-193 ClientSessionAuth (sessions, local-first bootstrap, CSRF/CORS, loopback-only default bind), CONTRACT-192 ClientSdkContract (schemars-derived schema + hash manifest + conformance vectors). Transport-agnostic sync core; no provider legs."
+
+publish = false
+
+[features]
+# Tee T2 (CONTRACT-235): timing-override ctor + `effective_timing()` on `LlmDeltaHub` so
+# witnesses drive linger/cadence values without wall-clock sleeps. Precedent: crates/cli,
+# crates/shared-types, crates/scheduler self dev-dep feature unification.
+test-support = []
+
+[lib]
+name = "advance_client_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gen_client_sdk"
+path = "src/bin/gen_client_sdk.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# schemars: derive the CONTRACT-192 JSON Schema from the canonical DTOs so the artifact is
+# generated FROM the contract types (full type/enum/required/nested fidelity), not hand-authored.
+# Exact-pin per the workspace supply-chain discipline (latest stable resolved 2026-07-07).
+schemars = "=1.2.1"
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+# m020-s3 CONTRACT-191: LeakDetector trait + Event metadata types (no event-bus production dep).
+advance-shared-types = { path = "../shared-types" }
+# AEAD cursor tokens (AES-256-GCM) + zeroizing key material.
+aes-gcm = { workspace = true }
+zeroize = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+subtle = { workspace = true }
+rusqlite = { workspace = true }
+# RFC3339 `since` parse + UTC nanosecond normalization for stream identity.
+chrono = { workspace = true, features = ["clock"] }
+# Wave-25 public transport.  Every HTTP/WebSocket request is adapted back into
+# `ClientApi::handle`; axum owns sockets only and has no provider access.
+axum = { workspace = true, features = ["ws"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+url = { workspace = true }
+
+[dev-dependencies]
+# Self dev-dep: unifies `test-support` onto this crate's own test builds (in-crate `#[cfg(test)]`
+# units and integration tests alike) without shipping the feature in production builds.
+advance-client-api = { path = ".", features = ["test-support"] }
+serde_json = { workspace = true }
+# m020-s2 witness: real-provider test adapters drive ClientApi::handle() end-to-end against the
+# REAL host-side providers. These are dev-only — the client-api lib depends on NONE of them (the
+# provider ports are expressed in client-api DTOs + a client-api ProviderError). run-manager's
+# __test-util feature exposes the Suspended/Paused preconditions + status snapshots the AC-07
+# witness sets up before driving the real pause/resume/cancel transitions.
+advance-run-manager = { path = "../run-manager", features = ["__test-util"] }
+advance-messaging = { path = "../messaging" }
+advance-shared-types = { path = "../shared-types", features = ["test-support"] }
+advance-database = { path = "../database" }
+cap-tools = { path = "../capabilities/cap-tools" }
+cap-grant = { path = "../capabilities/cap-grant" }
+cap-skills = { path = "../capabilities/cap-skills" }
+# m020-s3: real EventBus + DefaultLeakDetector witnesses (dev-only; production free of event-bus).
+advance-event-bus = { path = "../event-bus" }
+cap-http = { path = "../capabilities/cap-http" }
+tempfile = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
+# Tee T2 witnesses: `#[tokio::test(start_paused = true)]` (T24 push-latency discipline) needs
+# tokio's test-util clock. Dev-only (resolver-2 keeps it off production builds).
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

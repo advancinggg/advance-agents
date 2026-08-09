@@ -1,0 +1,30 @@
+[package]
+name = "guest-rust-notify"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Wave-20 Lane `messagingabi` (2026-06-27) — dedicated guest fixture targeting
+# `world advance-host-with-capabilities` that IMPORTS + CALLS the `notify`
+# host fns (notify-agent / notify-channel). Mirrors `guest-rust-send`: because
+# the guest's core module actually CALLS notify, the encoded component IMPORTS
+# notify, so `instantiate_pre` requires the linker to provide it — exercising the
+# Wave-20 `register_typed_notify_agent` / `register_typed_notify_channel` injector
+# path. Used by `crates/cli/tests/notify_host_fn.rs` (M006-AC-02/AC-15).
+# Excluded from the workspace because guests are built for wasm32-unknown-unknown.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

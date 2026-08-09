@@ -1,0 +1,40 @@
+[package]
+name = "cap-secrets"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+
+publish = false
+
+[lib]
+name = "cap_secrets"
+path = "src/lib.rs"
+
+[dependencies]
+advance-runtime = { path = "../../runtime" }
+advance-shared-types = { path = "../../shared-types" }
+# wasmtime::component::Val is part of the HostFunctionHandler return-type boundary.
+# cap-secrets does NOT construct Engine/Store/Linker — those remain advance-runtime's
+# responsibility per MODULE-001 §1.1 architectural clarification.
+wasmtime = { workspace = true }
+secrecy = { workspace = true }
+zeroize = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+keyring = { workspace = true }
+hex = { workspace = true }
+# /dev WS-A: FileSecretStorage serializes ciphertext StoredSecret blobs to JSON
+# (hex-encoded via a private DTO; `hex` above does the byte<->string encoding).
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# /dev WS-A: FileSecretStorage tests write to throwaway temp dirs.
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

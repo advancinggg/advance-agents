@@ -1,0 +1,27 @@
+package advance:runtime@0.1.0;
+
+/// Tool WASM component contract (CONTRACT-163), mirroring the host's
+/// `advance:runtime/tool-exports@0.1.0` interface. Inlined (zero imports) so the
+/// produced component instantiates against any WASI linker.
+interface tool-exports {
+    record method-info {
+        name: string,
+        description: option<string>,
+        input-schema: option<string>,
+        output-schema: option<string>,
+        idempotent: option<bool>,
+    }
+
+    record tool-description {
+        description: string,
+        methods: list<method-info>,
+    }
+
+    describe: func() -> tool-description;
+    execute: func(method: string, params: list<u8>) -> result<list<u8>, string>;
+}
+
+/// Fixture world: exports `tool-exports`, imports nothing.
+world schema-tool {
+    export tool-exports;
+}

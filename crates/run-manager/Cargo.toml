@@ -1,0 +1,48 @@
+[package]
+name = "advance-run-manager"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MODULE-008 run-manager — Slice A + Slice B: Run state machine + pause/resume/cancel branches (a)+(b) + crash recovery via AwaitSessionRef + full 11-event PRD §15.3.4A lifecycle + RunBudget impl + RepetitionGuard impl with WarnThenTerminate Tier-3 inject wiring + AgentRunResolver trait."
+
+publish = false
+
+[dependencies]
+advance-shared-types = { path = "../shared-types" }
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["clock", "serde", "std"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+# Slice C — YAML persistence for `RunPersister` (AC-15).
+serde_yml = { workspace = true }
+# Slice C — `tempfile::NamedTempFile` for atomic-write of YAML files in the
+# production `RunPersister::persist` path. Workspace pin =3.15.0.
+tempfile = { workspace = true }
+thiserror.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[features]
+# Test-only helpers (`with_status_for_test`, `snapshot_*_for_test`,
+# `budget_state_snapshot`, `RunId::from_string`,
+# `snapshot_pause_pending_for_test`, `snapshot_cancel_pending_for_test`,
+# `with_root_await_for_test`). Compiled-out in release / non-test builds;
+# required for the crate's integration tests. The workspace-level
+# `cargo test -p advance-run-manager` invocation enables it via
+# dev-dependencies on the crate itself, so the test gate sees the helpers
+# but production consumers never compile them in.
+__test-util = []
+
+[dev-dependencies]
+advance-run-manager = { path = ".", features = ["__test-util"] }
+# Slice B: tokio runtime for #[tokio::test] async-method tests
+# (pause/cancel branch (a) + crash recovery + lock-drop-before-emit
+# ordering checks).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Slice C — wit-parser for AC-12 `tests/wit_presence.rs` invariant
+# (asserts `interface agent-run` is declared with 7 funcs in the host
+# `advance.wit`).
+wit-parser = { workspace = true }
+
+[lints]
+workspace = true

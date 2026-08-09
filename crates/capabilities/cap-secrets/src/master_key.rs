@@ -1,0 +1,176 @@
+//! Master-key loader + EntryProvider trait seam.
+//!
+//! AC-04: master key is `Zeroizing<[u8; 32]>` (ZeroizeOnDrop).
+//! AC-03: Keychain-primary + env-var fallback sequencing via
+//! `EntryProvider` trait seam. `DefaultEntryProvider` wraps
+//! `keyring::Entry`; tests inject `TestEntryProvider` to avoid touching
+//! the real OS credential store (keyring 2.3.3 exposes no per-test mock
+//! without a process-global `set_default_credential_builder` race).
+
+use zeroize::Zeroizing;
+
+use crate::error::SecretError;
+
+/// Default Keychain service name used by MasterKeyConfig::Keychain in
+/// AC-17-wired deployments. A future slice will map the runtime-config
+/// `SecretsConfig` into `MasterKeyConfig::Keychain { service:
+/// DEFAULT_KEYCHAIN_SERVICE.into(), ... }` unless the operator overrides.
+pub const DEFAULT_KEYCHAIN_SERVICE: &str = "advance-agents";
+
+/// Default Keychain account name (same rationale).
+pub const DEFAULT_KEYCHAIN_ACCOUNT: &str = "master-key";
+
+#[derive(Clone, Debug)]
+pub enum MasterKeyConfig {
+    /// Try OS Keychain first. On NotFound, fall back to the named env
+    /// var if provided; otherwise KeyLoad error.
+    Keychain {
+        service: String,
+        account: String,
+        fallback_env_var: Option<String>,
+    },
+    /// Only use the env var.
+    EnvVar(String),
+}
+
+/// Test seam over the OS credential store. `DefaultEntryProvider` wraps
+/// `keyring::Entry`; test code injects a mock impl to avoid touching the
+/// real store.
+pub trait EntryProvider: Send + Sync {
+    fn get_password(&self, service: &str, account: &str) -> Result<String, EntryError>;
+}
+
+#[derive(Debug, Clone)]
+pub enum EntryError {
+    Open(String),
+    NotFound(String),
+}
+
+impl std::fmt::Display for EntryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EntryError::Open(msg) => write!(f, "keychain entry open failed: {msg}"),
+            EntryError::NotFound(msg) => write!(f, "keychain entry not found: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for EntryError {}
+
+pub struct DefaultEntryProvider;
+
+impl EntryProvider for DefaultEntryProvider {
+    fn get_password(&self, service: &str, account: &str) -> Result<String, EntryError> {
+        let entry =
+            keyring::Entry::new(service, account).map_err(|e| EntryError::Open(e.to_string()))?;
+        entry.get_password().map_err(|e| match &e {
+            keyring::Error::NoEntry => EntryError::NotFound(format!("{service}/{account}")),
+            _ => EntryError::Open(e.to_string()),
+        })
+    }
+}
+
+pub fn load_master_key(
+    cfg: &MasterKeyConfig,
+    entries: &dyn EntryProvider,
+) -> Result<Zeroizing<[u8; 32]>, SecretError> {
+    // All intermediates wrapped in Zeroizing so key material is scrubbed
+    // on drop. zeroize 1.8 provides `impl Zeroize for String` and
+    // `impl<T: Zeroize> Zeroize for Vec<T>` — so `Zeroizing<String>` and
+    // `Zeroizing<Vec<u8>>` are both valid ZeroizeOnDrop wrappers.
+    let hex_str: Zeroizing<String> = match cfg {
+        MasterKeyConfig::Keychain {
+            service,
+            account,
+            fallback_env_var,
+        } => match entries.get_password(service, account) {
+            Ok(s) => Zeroizing::new(s),
+            Err(EntryError::NotFound(_)) => match fallback_env_var {
+                Some(var) => match std::env::var(var) {
+                    Ok(s) => Zeroizing::new(s),
+                    // VarError::NotUnicode(OsString) carries the env-var
+                    // bytes verbatim — do NOT echo them into the error
+                    // message (SECRETS_MASTER_KEY content = master key).
+                    Err(std::env::VarError::NotPresent) => {
+                        return Err(SecretError::KeyLoad(format!(
+                            "keychain NotFound; env var {var} also not set"
+                        )));
+                    }
+                    Err(std::env::VarError::NotUnicode(_)) => {
+                        return Err(SecretError::KeyLoad(format!(
+                            "keychain NotFound; env var {var} contains non-UTF-8 bytes"
+                        )));
+                    }
+                },
+                None => {
+                    return Err(SecretError::KeyLoad(
+                        "keychain NotFound; no fallback env var configured".into(),
+                    ));
+                }
+            },
+            Err(e) => {
+                // EntryError's Display carries only service/account names +
+                // opaque keyring error string — no key material.
+                return Err(SecretError::KeyLoad(format!("{e}")));
+            }
+        },
+        MasterKeyConfig::EnvVar(name) => match std::env::var(name) {
+            Ok(s) => Zeroizing::new(s),
+            Err(std::env::VarError::NotPresent) => {
+                return Err(SecretError::KeyLoad(format!("env var {name} not set")));
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                // See NotUnicode rationale above — do NOT echo env-var
+                // bytes into the error message.
+                return Err(SecretError::KeyLoad(format!(
+                    "env var {name} contains non-UTF-8 bytes"
+                )));
+            }
+        },
+    };
+    decode_to_key(&hex_str)
+}
+
+fn decode_to_key(hex_str: &Zeroizing<String>) -> Result<Zeroizing<[u8; 32]>, SecretError> {
+    // hex 0.4: `hex::decode(&str) -> Result<Vec<u8>, FromHexError>`.
+    // Expected input: 64 hex chars (32 bytes) — matches the established
+    // project convention (MODULE-001 runtime-config.yaml + PRD §secrets:
+    // "hex-encoded master key for non-Keychain environments"). Discard
+    // the FromHexError to keep Display free of any input-derived bytes.
+    let raw: Zeroizing<Vec<u8>> = Zeroizing::new(hex::decode(hex_str.as_str()).map_err(|_| {
+        SecretError::KeyLoad("hex decode failed (invalid input — expected 64 hex chars)".into())
+    })?);
+    if raw.len() != 32 {
+        return Err(SecretError::KeyLoad(format!(
+            "expected 32 bytes of master key, got {}",
+            raw.len()
+        )));
+    }
+    let mut key: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(raw.as_slice());
+    Ok(key)
+    // raw drops here; Zeroizing<Vec<u8>> zeros the 32-byte buffer.
+    // hex_str drops in the caller; Zeroizing<String> zeros the hex text.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroize::ZeroizeOnDrop;
+
+    // T04a: compile-time ZeroizeOnDrop trait-bound assertion.
+    #[test]
+    fn t04a_zeroizing_array_impls_zeroize_on_drop() {
+        fn assert_zod<T: ZeroizeOnDrop>() {}
+        assert_zod::<Zeroizing<[u8; 32]>>();
+    }
+
+    // T04b: runtime zeroize-function test on [u8; 32].
+    #[test]
+    fn t04b_zeroize_function_zeros_bytes() {
+        use zeroize::Zeroize;
+        let mut bytes: [u8; 32] = [0xab; 32];
+        bytes.zeroize();
+        assert_eq!(bytes, [0u8; 32]);
+    }
+}

@@ -1,0 +1,31 @@
+[package]
+name = "guest-rust-tool-invoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Wave-14 Lane C (SYS-AC-080) — L2 skill-tool invoke guest. Imports BOTH
+# agent-tools (tool-invoke of a skill-bundled tool.wasm) AND agent-fs (writing the
+# executed result bytes), via the `advance-host-tools-fs` world. `handle-message`
+# UNCONDITIONALLY calls tool-invoke("skill::echo-skill", "echo", PAYLOAD) and, on
+# Ok, fs.write's the executed bytes to "tool-result.bin" — so the witness can read
+# them back and assert against a real registry execute. On Err (e.g. the skill tool
+# was not bridged into the registry, or an unregistered tool-id) it writes nothing.
+# This is the first fixture that actually CALLS tool-invoke (others only DEFINE it).
+# Excluded from the workspace (built for wasm32-unknown-unknown).
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

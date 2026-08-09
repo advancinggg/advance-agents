@@ -1,0 +1,33 @@
+[package]
+name = "cap-mcp"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+
+publish = false
+
+[lib]
+name = "cap_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync", "process", "io-util", "macros"] }
+cap-http = { path = "../cap-http" }
+advance-shared-types = { path = "../../shared-types" }
+# Slice D — host_fn registration + Val encoding for the 7 mcp-client methods
+advance-runtime = { path = "../../runtime" }
+wasmtime = { workspace = true }
+# Slice D — input/output JSON-Schema validation on invoke-mcp-tool
+jsonschema = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "process", "io-util"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

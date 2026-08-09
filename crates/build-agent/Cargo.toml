@@ -1,0 +1,29 @@
+[package]
+name = "build-agent"
+version.workspace = true
+repository.workspace = true
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# /dev WS-B (2026-06-04) — the production core->component encode/deploy step. A standalone
+# host-side tool (NOT in the `advance` CLI): builds an agent guest crate to
+# wasm32-unknown-unknown, wraps the core module into a WASM Component via
+# `wit_component::ComponentEncoder` (the SAME encode `load_component` requires — previously
+# only in test code), and writes `<ws>/.agent/behavior.component.wasm`. The `encode_core_to_component`
+# library fn is the single encode source: the bin uses it, and the system-acceptance loopback
+# turn test reuses it (proving the produced component is `load_component`-acceptable).
+
+[lib]
+
+[[bin]]
+name = "build-agent"
+path = "src/main.rs"
+
+[dependencies]
+wit-component = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+[lints]
+workspace = true

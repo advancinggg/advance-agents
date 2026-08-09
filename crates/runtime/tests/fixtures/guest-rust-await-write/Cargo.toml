@@ -1,0 +1,31 @@
+[package]
+name = "guest-rust-await-write"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Wave-11 Lane A (SYS-AC-014/018/251) — await-park + fs-write guest. Imports BOTH
+# agent-messaging (await-replies) AND agent-fs (write), via the new
+# `advance-host-messaging-fs` world. `handle-message` dispatches on `state`:
+#   - "await-write": await-replies(AllOf, long idle) -> on Ok WRITE one file
+#     (-> a CommitType::Turn commit) [014]; on Err (session-closed) return WITHOUT
+#     writing (no commit) [018].
+#   - "await-partial": await-replies(ReturnPartial, short idle) -> resume on the
+#     real idle-timeout PartialTimeout, return witness state (no write) [251].
+# Excluded from the workspace (built for wasm32-unknown-unknown).
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

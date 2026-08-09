@@ -1,0 +1,27 @@
+[package]
+name = "guest-rust-with-caps"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Slice m001-slice-bootstrap (2026-05-28) — guest fixture targeting the NEW
+# `advance-host-with-capabilities` world (sibling to `advance-host`; imports
+# agent-messaging). Used by `crates/cli/tests/two_call_modes.rs` (AC-17) and
+# `crates/cli/tests/fiber_suspend_resume.rs` (M007-AC-08/AC-14). Excluded
+# from the workspace because guests are built for wasm32-unknown-unknown.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

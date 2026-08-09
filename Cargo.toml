@@ -1,0 +1,466 @@
+[workspace]
+members = ["crates/shared-types", "crates/runtime", "crates/cli", "crates/git", "crates/capabilities/cap-fs", "crates/capabilities/cap-secrets", "crates/capabilities/cap-http", "crates/capabilities/cap-llm", "crates/capabilities/cap-grant", "crates/capabilities/cap-memory", "crates/capabilities/cap-tools", "crates/capabilities/cap-skills", "crates/capabilities/cap-mcp", "crates/capabilities/cap-channel", "crates/capabilities/cap-lifecycle", "crates/database", "crates/event-bus", "crates/cost-tracker", "crates/messaging", "crates/messaging/reply-tracker", "crates/run-manager", "crates/scheduler", "crates/scheduler/auto-loop", "crates/context-engine", "crates/services/pack-manager", "crates/services/observability-xtask", "crates/system-acceptance", "crates/build-agent", "crates/client-api", "crates/advance-core"]
+exclude = ["crates/runtime/tests/fixtures/guest-rust-minimal", "crates/runtime/tests/fixtures/guest-rust-with-caps", "crates/runtime/tests/fixtures/guest-rust-j01-skeleton", "crates/runtime/tests/fixtures/guest-rust-mem-skeleton", "crates/runtime/tests/fixtures/guest-rust-hello-llm"]
+resolver = "2"
+
+[workspace.package]
+# Single source of truth for every member crate version (pre-genesis unification,
+# OPEN-CORE-PUBLISH-RUNBOOK §Pre-genesis #1). Members inherit via
+# `version.workspace = true`. Consumers pin releases by git tag (v0.1.0), so this
+# version and the genesis tag must move together.
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+# The public OSS remote (final name adjudicated 2026-08-07: the ORIGINAL URL is kept
+# for the public repo via the runbook's Option-2 delete-and-recreate path; the earlier
+# advance-agents-core repo is superseded). Members inherit via
+# `repository.workspace = true`; the product's git-dep + tag pin resolves here.
+repository = "https://github.com/advancinggg/advance-agents"
+
+[workspace.lints.clippy]
+# Pre-genesis lint policy (2026-08-07), inherited by every member via `[lints] workspace = true`.
+# CI runs `cargo clippy --workspace --all-targets -- -D warnings`: any lint NOT allowed below
+# fails the build, so NEW lint classes are gated from day one.
+#
+# ── Section 1: PERMANENT policy allows (deliberate house style; not debt) ──────────────
+# Contract-grade doc comments favor content over rustdoc list-indentation conventions;
+# re-wrapping hundreds of witnessed doc blocks is churn without safety value.
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+doc_nested_refdefs = "allow"
+empty_line_after_doc_comments = "allow"
+# Composition roots / wiring constructors legitimately take many injected ports.
+too_many_arguments = "allow"
+# `Arc<dyn Trait>` seam-heavy architecture produces complex types by design.
+type_complexity = "allow"
+# Test-local `Config { ..Default::default() }` then field tweaks is the house test idiom.
+field_reassign_with_default = "allow"
+# DTO/enum shapes are pinned by contracts; boxing advice would change witnessed layouts.
+large_enum_variant = "allow"
+result_large_err = "allow"
+# Some crates deliberately keep helper items below their #[cfg(test)] module.
+items_after_test_module = "allow"
+#
+# ── Section 2: BASELINE burn-down allows (frozen at the 2026-08-07 census) ─────────────
+# These fire at low counts (1–7 sites each) in code that carries pinned/witnessed
+# surfaces (witnessed / hash-pinned modules). Bulk `--fix`
+# churn is a worse risk than disclosed debt this close to genesis. Retire PER LINT in
+# ordinary post-genesis slices: delete the line here, fix every site it uncovers, land
+# with the module's own test floor. Do not add new entries without a recorded decision.
+approx_constant = "allow"
+assertions_on_constants = "allow"
+await_holding_lock = "allow" # REAL concurrency smell — burn down FIRST (its own review slice)
+bool_assert_comparison = "allow"
+bool_comparison = "allow"
+borrow_deref_ref = "allow"
+cloned_ref_to_slice_refs = "allow"
+collapsible_if = "allow"
+derivable_impls = "allow"
+drop_non_drop = "allow"
+duplicated_attributes = "allow"
+enum_variant_names = "allow"
+err_expect = "allow"
+expect_fun_call = "allow"
+explicit_auto_deref = "allow"
+get_first = "allow"
+identity_op = "allow"
+if_same_then_else = "allow"
+inconsistent_digit_grouping = "allow"
+int_plus_one = "allow"
+io_other_error = "allow"
+len_zero = "allow"
+let_and_return = "allow"
+manual_clamp = "allow"
+manual_contains = "allow"
+manual_div_ceil = "allow"
+manual_inspect = "allow"
+manual_is_multiple_of = "allow"
+manual_map = "allow"
+manual_pattern_char_comparison = "allow"
+manual_range_contains = "allow"
+manual_repeat_n = "allow"
+manual_split_once = "allow"
+map_entry = "allow"
+map_identity = "allow"
+match_like_matches_macro = "allow"
+mem_replace_option_with_some = "allow"
+needless_as_bytes = "allow"
+needless_borrow = "allow"
+needless_borrows_for_generic_args = "allow"
+needless_lifetimes = "allow"
+needless_match = "allow"
+needless_range_loop = "allow"
+never_loop = "allow"
+new_ret_no_self = "allow"
+redundant_closure = "allow"
+ok_expect = "allow"
+op_ref = "allow"
+option_as_ref_deref = "allow"
+ptr_arg = "allow"
+question_mark = "allow"
+redundant_pattern_matching = "allow"
+result_unit_err = "allow"
+should_implement_trait = "allow"
+single_char_add_str = "allow"
+single_component_path_imports = "allow"
+single_match = "allow"
+unnecessary_cast = "allow"
+unnecessary_get_then_check = "allow"
+unnecessary_lazy_evaluations = "allow"
+unnecessary_map_or = "allow"
+unnecessary_mut_passed = "allow"
+unnecessary_to_owned = "allow"
+useless_conversion = "allow"
+useless_format = "allow"
+useless_vec = "allow"
+while_let_loop = "allow"
+wrong_self_convention = "allow"
+
+[workspace.dependencies]
+# Exact version pins — supply-chain hardening. Cargo.lock still records the resolved
+# transitive graph, but pinning the direct deps prevents silent `cargo update` of serde
+# / serde_json to a newly-published minor or patch release without a code-review diff.
+# To upgrade, bump the exact version here and re-run `cargo update` intentionally.
+assert_cmd = "=2.0.16"
+# async-trait: macro-based erasure of `async fn in trait` to
+# `Pin<Box<dyn Future + Send + '_>>`, preserving Box<dyn>-safety. Slice AC v2
+# adoption for the 7 async traits in the shared-types inventory
+# (MailboxReader, PostProcessorHook, L6Handler, AgentActionDispatcher,
+# ContextAssembler, RoundAdvancer, AwaitSessionRef). Exact-pin per Slice A'
+# supply-chain discipline. Future migration to native dyn-safe `async fn in
+# trait` (when Rust stabilizes it for object-safety) is a single mechanical
+# refactor — no call-site changes required.
+async-trait = "=0.1.89"
+chrono = { version = "=0.4.38", default-features = false, features = ["serde", "std"] }
+clap = { version = "=4.5.28", features = ["derive"] }
+# git2 — libgit2 Rust bindings for MODULE-003 (Slice A). Features explicit:
+#   default-features = false drops `ssh` and `https` — MODULE-003 §1.7 security
+#   posture is local-only / in-process only; no network transport surface.
+#   `vendored-libgit2` compiles libgit2 from bundled source, eliminating a
+#   system-libgit2 supply-chain variable (consistent with Slice A' exact-pin
+#   discipline). See MODULE-003 §2.2 External Dependencies.
+git2 = { version = "=0.20.4", default-features = false, features = ["vendored-libgit2"] }
+# Slice m018-D (2026-05-25): MODULE-018 pack-manager workspace deps for non-Local
+# install source types (AC-05).
+# tar — POSIX tar archive reader/writer. Sync API consumed inside
+# `tokio::task::spawn_blocking` (matches M017 cap-skills git subprocess pattern).
+# Used by `crates/services/pack-manager/src/fetch.rs::fetch_tarball_to_temp` to
+# extract `.tar.gz`/`.tgz` pack sources with per-entry security validation
+# (type ∈ {Regular, Directory}; path traversal/absolute/null/backslash rejection;
+# 256 MiB total / 64 MiB per-entry / 65536 entry-count caps). Pure-Rust, minimal
+# transitive deps (filetime + libc on Unix).
+tar = "=0.4.44"
+# flate2 — gzip / deflate / zlib codec. Default backend is `miniz_oxide` pure-Rust
+# (no system zlib dep — consistent with `vendored-libgit2` supply-chain posture).
+# Used by `fetch_tarball_to_temp` to wrap the tarball file in
+# `flate2::read::GzDecoder<File>` before handing to `tar::Archive::new`. Pinned to
+# =1.1.9 (latest stable on crates.io as of 2026-05-25; revision-7 plan attempted
+# =1.0.36 which is a phantom version per `cargo update` rejection).
+flate2 = "=1.1.9"
+# indexmap pinned to 2.7.1 as a Slice A' supply-chain-discipline workspace
+# entry. Originally justified by serde_yml's transitive indexmap >=2.14.0
+# requiring edition2024 (not available on the then-pinned Rust 1.83.0);
+# Slice S's MSRV bump to Rust 1.91.0 removes that constraint but the exact
+# pin is kept as the supply-chain policy (no silent auto-bumps). No member
+# crate currently consumes this entry directly; Cargo.lock resolves
+# indexmap 2.14.0 via Wasmtime/hashbrown transitively. Kept as a policy
+# anchor for future direct use.
+indexmap = "=2.7.1"
+libc = "=0.2.185"
+# Wave-25A CONTRACT-218: OS-level exclusive custody for the external anchor and
+# role-allocation manifest. Already present transitively in Cargo.lock.
+fd-lock = "=4.0.4"
+notify = "=6.1.1"
+# rustix for openat2 + RESOLVE_NO_SYMLINKS on Linux 5.6+ — closes the parent-dir
+# TOCTOU gap between symlink_metadata check and open() that O_NOFOLLOW (leaf-only)
+# cannot cover. On macOS falls back to open() with O_NOFOLLOW|O_NONBLOCK.
+rustix = { version = "=0.38.44", default-features = false, features = ["std", "fs"] }
+# Slice m018-A (2026-05-11): MODULE-018 pack-manager workspace dep.
+# semver — SemVer 2.0 Version + VersionReq parser for pack.yaml `version` field
+# and `runtime-version` range validation (§19.4 / AC-04). Pinned =1.0.28 per Slice A'
+# supply-chain discipline; the version is already resolved transitively in Cargo.lock
+# (Cargo's own deps + Wasmtime). Promoting to direct workspace pin is a no-op vs the
+# resolved graph but makes the dep explicit and reviewable for future upgrades.
+semver = "=1.0.28"
+serde = { version = "=1.0.228", features = ["derive"] }
+# serde_bytes: compact encoding for Vec<u8> fields (e.g. ComponentSpec.binary per Slice T).
+# Default serde_json encodes Vec<u8> as a JSON array of integers (~3× overhead); serde_bytes
+# produces a borrowed byte-array representation that collapses to base64 under formats that
+# support it and to compact bytes under CBOR/bincode.
+serde_bytes = "=0.11.15"
+serde_json = "=1.0.149"
+serde_yml = "=0.0.12"
+predicates = "=3.1.3"
+parking_lot = "=0.12.5"
+tempfile = "=3.15.0"
+# wat: WebAssembly Text parser — dev-only. Used by Slice T tests to generate
+# valid Component Model binaries via wat::parse_str (Wasmtime 43's own test suite
+# uses this pattern). Slice T pinned =1.245.0; Slice X bumped to =1.245.1
+# (wit-component =0.245.1 requires wat ^1.245.1). Both pins share the wasm-tools
+# 0.245.x family so wasmparser stays unified at =0.245.1.
+wat = "=1.245.1"
+# wit-component: dev-only. Used by Slice X tests to wrap hand-rolled core WAT
+# modules into Component Model binaries via wit_component::ComponentEncoder
+# (the canonical-ABI lifts/lowers are auto-synthesized from the embedded WIT
+# metadata). Pinned to =0.245.1 to share the resolved wasmparser =0.245.1
+# family that Wasmtime 43.0.1 transitively pulls — pinning =0.246.x would
+# duplicate wasmparser in the dep graph and break `cargo deny duplicates`.
+wit-component = { version = "=0.245.1", features = ["dummy-module"] }
+# wit-parser: dev-only. Direct dep needed by Slice X tests because wit_component
+# only re-exports a small slice of wit_parser (DecodedWasm + decode + decode_reader);
+# the test fixture needs `wit_parser::Resolve` + `ManglingAndAbi` to drive
+# `wit_component::dummy_module`. Pinned to =0.245.1 to share the resolved
+# wasmparser =0.245.1 family.
+wit-parser = "=0.245.1"
+# wasmparser: Slice m017-B (2026-05-14) — promoted from transitive (resolved
+# via Wasmtime 43.0.1) to direct workspace.dependencies pin so cap-tools'
+# validator (validates tool-exports + runnable mutual exclusion at WASM
+# Component load time) can consume the `Parser` + `Payload::ComponentExportSection`
+# + `ComponentExternalKind` surface without version-drift risk. =0.245.1
+# matches the resolved transitive family (Wasmtime 43 + wit-component =0.245.1
+# + wit-parser =0.245.1); a direct pin keeps the resolver from bumping the
+# minor on a routine `cargo update`. cap-tools/src/validator.rs keeps
+# `wasmparser` types private to the module — `ValidationOutcome` + `ToolError`
+# are the only public surface.
+wasmparser = "=0.245.1"
+# Slice Y — guest-side WIT bindings generator. Consumed ONLY by the excluded fixture
+# crate `crates/runtime/tests/fixtures/guest-rust-minimal` (not by any workspace member).
+# Workspace-level pin exists for supply-chain discipline consistency (Slice A' pattern).
+# wit-bindgen 0.53.1 resolves to wit-component 0.245.1 / wit-parser 0.245.1 / wasmparser
+# 0.245.1, matching the Wasmtime 43 dep graph. Fail-fast verified by the fixture crate's
+# `cargo build --target wasm32-unknown-unknown --locked`.
+wit-bindgen = "=0.53.1"
+# tokio bumped 1.44.2 → 1.48.0 in Slice S: Wasmtime 43's wasmtime-wasi crate
+# requires tokio ^1.48 (cargo resolver failure at Slice S cargo check time).
+tokio = { version = "=1.48.0", features = ["rt", "fs", "time", "signal", "macros", "sync", "io-util", "net"] }
+# uuid pinned per Slice E (2026-04-22): consumed by `advance-git` for
+# `git.rollback` event ID generation (UUID v4 per shared-types event.rs:45
+# rustdoc "use UUID v4 or ULID" invariant). `v4` feature pulls
+# `getrandom` transitively; no network surface. Exact-pin per Slice A'
+# supply-chain discipline. `v5` (added 2026-06-20, Stage-F obs SLICE 1) is
+# SHA1 namespacing — internal to the uuid crate (pulls `sha1_smol`, no network) —
+# consumed by shared-types `chain_root_span_id` for deterministic handle-message
+# chain-root span ids.
+uuid = { version = "=1.11.0", features = ["v4", "v5"] }
+# Slice m004-D (2026-05-03): directory walker for IndexRebuild scanner.
+# Pure-Rust, MIT/Apache-2.0, ~3 transitive deps (same-file, winapi-only on
+# Windows). Symlink following is OFF by default; rebuild scanner uses the
+# default (no symlink follow) to avoid territory-escape vectors.
+walkdir = "=2.5.0"
+# Wasmtime 43 pinned per ARCHITECTURE.md §8 Decision 16 (user decision 2026-04-15).
+# default-features = false + explicit features list per Slice A' discipline.
+# Rationale for each feature:
+#   - "runtime": required for Engine/Store/Linker host-embedding (removed from defaults by
+#     default-features = false).
+#   - "component-model": WASM Component Model host support (PRD §3.4 + MODULE-001 §2.2).
+#   - "async": host-embedding async (Linker::func_wrap_async + call_async fiber suspension
+#     for MODULE-001-AC-14). Distinct from the Component Model `async` WIT proposal that
+#     MODULE-001-AC-02 / MODULE-001:529 prohibits.
+#   - "cranelift": JIT compiler backend. `winch` is structurally incompatible with
+#     Component Model + async on Wasmtime 43 (see MODULE-001 §3.6).
+# Fuel is NOT a Cargo feature — controlled at runtime via wasmtime::Config::consume_fuel
+# per the two-Engine architecture in Decision 16 Implication (i). cache/pooling features
+# deferred per Decision 16 (measurement-driven).
+# Feature names asserted against Wasmtime 43.0.0 published Cargo.toml; Slice S performs
+# fail-fast verification when the first member crate pulls the dep in.
+wasmtime = { version = "=43.0.1", default-features = false, features = ["runtime", "component-model", "async", "cranelift"] }
+# Slice m012-A (2026-04-25): cap-secrets workspace deps.
+# secrecy 0.8 wraps resolved-secret values in Secret<String> (Debug-hiding + zeroize on drop
+# via custom Drop; does NOT impl ZeroizeOnDrop marker trait — that's why the master key uses
+# zeroize::Zeroizing<[u8;32]> for compile-time verifiability).
+secrecy = "=0.8.0"
+# zeroize 1.8 — Zeroizing<T: Zeroize> wrapper with ZeroizeOnDrop marker (compile-time
+# proof that drop calls zeroize()). Direct-pinned even though secrecy pulls it transitively.
+zeroize = "=1.8.1"
+# HKDF-SHA256 key derivation (per-secret key from master + salt).
+hkdf = "=0.12.4"
+sha2 = "=0.10.8"
+# AES-256-GCM AEAD (confidentiality + authenticity for stored secrets).
+aes-gcm = "=0.10.3"
+# Wave-25A CONTRACT-218 role roots use XChaCha20-Poly1305 so every active
+# allocation has a distinct 192-bit nonce.
+chacha20poly1305 = "=0.10.1"
+# OS CSPRNG for nonce + salt material.
+rand = "=0.8.5"
+# macOS Keychain Services / Linux secret-service via keyring crate. Kept on 2.x series
+# (4.0.0-rc published 2025 but carries non-trivial API break; 2.3.3 is stable).
+keyring = "=2.3.3"
+# Hex encoding for SECRETS_MASTER_KEY env var — matches the existing project convention
+# documented in MODULE-001 §runtime-config.yaml line 1175 ("hex-encoded master key") and
+# PRD §secrets. Tiny stable crate (hex::decode signature unchanged since 0.3).
+hex = "=0.4.3"
+# Slice m016-B (2026-05-15): cap-channel HMAC-SHA256 webhook signature verification.
+# hmac 0.12 implements RFC 2104 over a digest::Digest (sha2::Sha256). Pure-Rust, leaf
+# crate, no allocator surface. Pinned per Slice A' supply-chain discipline.
+hmac = "=0.12.1"
+# subtle: constant-time byte comparison primitive used to compare HMAC tags. Without
+# this, a naïve `==` over the tag bytes leaks timing information — a webhook attacker
+# could iteratively learn the correct signature one byte at a time. `subtle::ConstantTimeEq`
+# resolves to a branch-free comparison in release builds. Pure-Rust, leaf crate.
+subtle = "=2.6.1"
+# Slice m012-B (2026-04-26): cap-http workspace deps.
+# aho-corasick — multi-pattern string matching (LeakDetector AC fast-path; PromptInjectionHelpers
+# injection-pattern AC fast-path). Pinned =1.1.3 per Slice A' supply-chain discipline (matches
+# MODULE-012 §2.2 floor). The 1.0 series introduced an incompatible builder API; 1.1.x preserves it.
+aho-corasick = "=1.1.3"
+# regex — precise pattern confirmation step (anchored find_at after AC match). Pinned =1.11.1
+# per Slice A' discipline (matches MODULE-012 §2.2 floor). Bytecode-cached patterns share the
+# global regex-syntax allocator, so duplicate-graph bloat is bounded.
+regex = "=1.11.1"
+# unicode-normalization — NFKC compatibility decomposition for security-bypass defense.
+# Slice m012-B adversarial R3: fullwidth (U+FF01..U+FF5E) + CJK compatibility small forms
+# (U+FE50..U+FE6F) + other NFKC-decomposable ASCII-equivalents bypass the ASCII-literal
+# regexes in INJECTION_PATTERNS / LEAK_PATTERNS unless normalized at scan time. Pure-Rust,
+# no_std-capable, ~200 KB. Pinned per Slice A' supply-chain discipline.
+unicode-normalization = "=0.1.24"
+# Slice m012-C (2026-04-27): cap-http HttpSecurityChain + SsrfGuard deps.
+# url — RFC 3986 URL parsing for SSRF host extraction + percent-encoding for
+# QueryParam credential injection. Pinned =2.5.8 (matches Cargo.lock-resolved
+# version + satisfies wasmtime-wasi 43.0.1 floor `>=2.5.7`).
+url = "=2.5.8"
+# ipnet — CIDR matching for SsrfGuard forbidden-network table. Pinned =2.12.0
+# (matches Cargo.lock-resolved version). Pure-Rust, no allocator surface.
+ipnet = "=2.12.0"
+# base64 — RFC 4648 §4 standard alphabet encoding for BasicAuth credential
+# injection (RFC 7617). Net-new dep; pinned =0.22.1 (latest stable major as of
+# 2026-04-27). Use `engine::general_purpose::STANDARD` (NOT URL_SAFE).
+base64 = "=0.22.1"
+# wasmtime-wasi default-features = false is load-bearing: defaults historically exposed
+# both `p1` (WASI preview1) and `p2` (WASI preview2) namespaces. Enumerating only
+# `p2` (the Cargo feature flag name on wasmtime-wasi 43) delivers Decision 16's
+# "WASI 0.2 only, no preview1 shim" intent. Slice L pinned `preview2` as an
+# unverified-at-plan-time best guess; Slice S verified and corrected to `p2`
+# (Bytecode Alliance published feature list for wasmtime-wasi =43.0.1 shows `p1`/`p2`,
+# no `preview2`).
+wasmtime-wasi = { version = "=43.0.1", default-features = false, features = ["p2"] }
+# Slice m009-B-2 (2026-04-30): cap-llm gateway internals workspace deps.
+# jsonschema — JSON Schema (Draft 2020-12 compatible) compile + validate.
+# Used by cap-llm's structured_output.rs (`try_parse_and_validate`) per
+# MODULE-009 §1.4.3 to validate LLM JSON responses against the per-call
+# `output_schema`. Pinned =0.18.3 per Slice A' supply-chain discipline.
+jsonschema = "=0.18.3"
+# futures-core — `Stream` trait surface (`Box<dyn Stream<Item = ...>>`) for
+# `LlmGatewayInternal::stream()` per CONTRACT-081 / MODULE-009 §2.3. Slice
+# B-2 stubs `stream()` with `Err(..."not implemented")`, but the trait
+# signature still imports the `Stream` trait — futures-core is required at
+# compile time. Pinned =0.3.31 per Slice A' supply-chain discipline.
+futures-core = "=0.3.31"
+# Slice m004-A (2026-05-01): crates/database workspace deps for MODULE-004 foundation
+# (CONTRACT-030 SqliteIndexHandle + schema migrations for 6 primary + 5 sqlite-vec
+# virtual tables + 5 indexes). Exact pins per Slice A' supply-chain discipline.
+#
+# rusqlite — SQLite Rust bindings. `bundled` compiles SQLite from vendored source
+# (consistent with git2's `vendored-libgit2` posture) and enables SQLITE_ENABLE_FTS5
+# in libsqlite3-sys's build.rs, so FTS5 is available without a separate feature flag.
+# NO `vtab` feature — the connection-pool customizer's `on_acquire` returns
+# `rusqlite::Error` directly via `execute_batch`'s `?` propagation.
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+# r2d2 — generic connection pool.
+r2d2 = "=0.8.10"
+# r2d2_sqlite — SQLite connection-manager adapter for r2d2. Pairs with rusqlite 0.32.x.
+r2d2_sqlite = "=0.25.0"
+# sqlite-vec — sqlite-vec Rust bindings. Exposes `extern "C" fn sqlite3_vec_init(...)`
+# only; we register it via `rusqlite::ffi::sqlite3_auto_extension(Some(transmute(...)))`
+# inside `Once::call_once` (process-global, runs once before any pool connection is
+# created). The integration pattern matches sqlite-vec's own integration tests +
+# alexgarcia.xyz/sqlite-vec/rust.html.
+sqlite-vec = "=0.1.7-alpha.2"
+# thiserror — derive macro for `DbError` variants. Pinned to lockfile-resolved 2.0.18.
+thiserror = "=2.0.18"
+# Slice m019-A (2026-05-03): crates/event-bus tests-only Cargo.toml AC-13 audit.
+# `toml` 0.8.23 is the first version compatible with the workspace's serde 1.0.228
+# pin (0.8.19 fails to compile due to a serde-trait-import refactor between
+# 0.8.19→0.8.23). default-features = false + features = ["parse"] excludes the
+# `display` serializer feature; Slice A only reads/inspects Cargo.toml strings.
+# Dev-dep only — must NOT enter any production binary; T_S A8 has a sentinel
+# assertion that event-bus's `[dependencies]`/`[build-dependencies]` do not
+# contain a `toml` key.
+toml = { version = "=0.8.23", default-features = false, features = ["parse"] }
+# Slice m019-B (2026-05-04): event-bus production deps.
+# axum — HTTP/WebSocket server with /events upgrade + /query/* GET routes mounted
+# on a single TcpListener per MODULE-019 §2.10. `ws` feature exposes WebSocket
+# upgrade extractor; `macros` enables `#[debug_handler]`. Pinned =0.8.9 to
+# satisfy axum-test 18.2.0's `^0.8.6` floor.
+axum = { version = "=0.8.9", features = ["ws", "macros"] }
+# tokio-tungstenite — WebSocket protocol for client-side integration tests
+# (M019 server uses axum's built-in WS, but client tests connect via this).
+tokio-tungstenite = "=0.27.0"
+# tower-http — middleware (request body limit + tracing layer). Pinned =0.6.8
+# matching Cargo.lock-resolved transitive (axum 0.8 pulls tower-http >= 0.6.0).
+tower-http = { version = "=0.6.8", features = ["limit", "trace"] }
+# tower_governor — per-IP request rate limiter (60 req/min default for /query API
+# per MODULE-019 §2.9 + §2.11). Round-1 W2 fix: tokio-util has no governor module;
+# tower_governor is the canonical Rust per-IP rate limiter for tower/axum.
+# crates.io canonical name uses underscore; package alias must match.
+tower_governor = "=0.7.0"
+# futures — combinators + utilities (futures::stream, FutureExt, StreamExt).
+# Slice B file_writer/db_indexer actor loops use Stream::next; ws_broadcaster uses
+# StreamExt::for_each. Pinned =0.3.31 matching Cargo.lock.
+futures = "=0.3.31"
+# bytes — already in Cargo.lock at 1.11.1 transitively (axum/hyper consumers).
+# Promoting to direct workspace pin per Round-1 C2 fix (was =1.10.1 in early plan
+# = downgrade risk; corrected to lockfile-resolved 1.11.1).
+bytes = "=1.11.1"
+# tokio-util — `CancellationToken` for graceful shutdown of background tasks.
+# `CancellationToken` is in `tokio_util::sync::CancellationToken`; on 0.7.13
+# the sync module is available under default features (no explicit feature flag).
+tokio-util = "=0.7.13"
+# tower — re-exported by axum but needed directly by tests for `ServiceExt::oneshot`
+# (in-process router invocation, no TCP listener needed). Pinned to lockfile-resolved
+# 0.5.x family.
+tower = { version = "=0.5.2", features = ["util"] }
+# lru — bounded LRU cache for stats_aggregator's per-agent tracker (max 1000
+# agents per Round-2 W6 / Round-3 W4). Small pure-Rust crate.
+lru = "=0.16.0"
+# Slice m019-C (2026-05-07): ulid for retention sweeper system-emitter event ids.
+# RetentionSweeper builds runtime.warning events with ULID-based id/trace_id/span_id
+# (per MODULE-019 §1.3.5; matches the "use UUID v4 or ULID" invariant in
+# shared-types/event.rs). Pinned =1.1.4 per Slice A' supply-chain discipline.
+ulid = "=1.1.4"
+
+# Release profile hardening: overflow-checks acts as a runtime safety net for the
+# RunBudget checked_add invariant that the type system cannot enforce. panic = "unwind"
+# (the default) is deliberately retained so a panic in one request does not terminate
+# the entire runtime process — downstream async executors can catch_unwind at task
+# boundaries and fail only the affected request. An earlier revision of this profile
+# set panic = "abort", but that amplified any unchecked arithmetic or deserialization
+# panic into full-process DoS and was reverted in Round 4 adversarial review.
+#
+# Known transitive dep note: `zmij` in Cargo.lock is a serde_json internal helper
+# (see crates.io/crates/zmij) pulled in by serde_json 1.0.149 for its numeric format
+# fast path. It is not a typosquat. Slice A' pins serde_json to =1.0.149 so the exact
+# transitive graph is reproducible.
+#
+# SUPPLY CHAIN FOLLOW-UP (tracked for a future slice, explicitly out of Slice A'
+# scope; scope expanded by Slice L to cover wasmtime + wasmtime-wasi): exact
+# pinning blocks silent updates but also blocks silent CVE patches, turning the
+# workspace into a stale-vulnerability liability if humans forget to bump. The
+# mitigation is a CI gate that re-runs on every main push:
+#   - `cargo audit` against RustSec advisory database
+#   - `cargo deny check advisories bans licenses sources`
+#   - `cargo outdated -R` to surface patch-available pins
+# The Slice A' scope does not include this tooling. It is the single highest-value
+# supply-chain follow-up once the runtime crates land and CI is configured.
+# Slice L (2026-04-15) adds wasmtime + wasmtime-wasi to the workspace table, which
+# is the largest single-dep blast radius in the workspace (expected ~hundreds of
+# transitive deps once resolved in Slice S). The supply-chain gate must cover
+# these as a priority once CI is configured.
+
+# Slice m019-E (2026-05-15): observability-xtask workspace deps.
+# syn — Rust AST parser. The observability lint walks `HostFunctionHandler::call`
+# bodies in cap-* crates and matches emit-eligible call patterns. `full` is required
+# for parse_file (parses full source files); `extra-traits` adds Eq/Hash/Debug on
+# AST nodes (needed for any future deduplication / cache); `visit` provides the
+# syn::visit::Visit trait used by the AST walker. Pinned =2.0.106 per Slice A'
+# supply-chain discipline (already present in Cargo.lock transitively via wasmtime).
+syn = { version = "=2.0.106", features = ["full", "extra-traits", "visit"] }
+# anyhow — ergonomic error wrapping for the xtask binary's main() Result.
+# Pinned =1.0.100 (lowest version satisfying wasmtime 43's `^1.0.100`
+# wasmtime-component-macro transitive floor). Workspace pin for discipline.
+anyhow = "=1.0.100"
+
+[profile.release]
+overflow-checks = true
+lto = "thin"
+codegen-units = 1
+strip = true

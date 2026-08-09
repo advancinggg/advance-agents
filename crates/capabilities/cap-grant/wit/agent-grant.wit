@@ -1,0 +1,72 @@
+package advance:runtime@0.1.0;
+
+interface agent-grant {
+    active-grants: func() -> result<list<grant-info>, grant-error>;
+    grant-status: func(capability: string) -> result<option<grant-info>, grant-error>;
+    request-capability: func(request: grant-request) -> result<grant-decision, grant-error>;
+    delegate-grant: func(target: string, draft: grant-draft) -> result<grant-id, grant-error>;
+    narrow-grant: func(target: string, grant-id: grant-id, new-params: list<cap-param>) -> result<grant-id, grant-error>;
+    revoke-grant: func(target: string, grant-id: grant-id) -> result<_, grant-error>;
+    apply-preset: func(target: string, preset-name: string) -> result<list<grant-id>, grant-error>;
+
+    type grant-id = string;
+
+    record grant-info {
+        id: grant-id,
+        grantee: string,
+        capability: string,
+        params: list<cap-param>,
+        ttl: grant-ttl,
+        issuer: string,
+        provenance: string,
+        status: grant-status,
+        created-at: string,
+        expires-at: option<string>,
+    }
+
+    record cap-param {
+        key: string,
+        value: string,
+    }
+
+    variant grant-ttl {
+        once,
+        lifecycle,
+        persistent,
+        duration(u64),
+        until(string),
+    }
+
+    variant grant-status {
+        active,
+        consumed,
+        expired,
+        revoked,
+    }
+
+    record grant-request {
+        capability: string,
+        params: option<list<cap-param>>,
+        justification: option<string>,
+    }
+
+    record grant-draft {
+        capability: string,
+        params: list<cap-param>,
+        ttl: grant-ttl,
+    }
+
+    variant grant-decision {
+        approved(grant-id),
+        denied(string),
+        pending,
+    }
+
+    variant grant-error {
+        not-found(string),
+        permission-denied(string),
+        subset-violation(string),
+        invalid-params(string),
+        preset-not-found(string),
+    }
+}

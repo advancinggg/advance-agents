@@ -1,0 +1,30 @@
+[package]
+name = "db-tool"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Wave-18 Lane 2 — the agent-facing DB tool (MODULE-017-AC-31 / REQ-160). Exports
+# `advance:runtime/tool-exports@0.1.0` (CONTRACT-163) and runs REAL SQL
+# (CREATE TABLE / INSERT / SELECT / WHERE) inside its OWN wasm sandbox over an
+# in-memory engine — NOT a host fn, NOT an echo. The engine is self-contained
+# (ZERO external crates) so the artifact builds deterministically for
+# wasm32-unknown-unknown with no network fetch / getrandom / WASI / C-toolchain
+# (mirrors the repo's existing `echo_tool` fixture pipeline). Excluded from the
+# workspace because it is built for wasm32 then `wasm-tools component new`-converted.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,33 @@
+package advance:runtime@0.1.0;
+
+/// Tool WASM component contract (CONTRACT-163), inlined (zero imports).
+interface tool-exports {
+    record method-info {
+        name: string,
+        description: option<string>,
+        input-schema: option<string>,
+        output-schema: option<string>,
+        idempotent: option<bool>,
+    }
+
+    record tool-description {
+        description: string,
+        methods: list<method-info>,
+    }
+
+    describe: func() -> tool-description;
+    execute: func(method: string, params: list<u8>) -> result<list<u8>, string>;
+}
+
+/// Minimal `runnable` interface — the validator matches the export-name prefix
+/// `advance:runtime/runnable#run` (not the full signature), so a bare `run` is
+/// enough to trip the mutual-exclusion check. Inlined to keep zero imports.
+interface runnable {
+    run: func() -> result<list<u8>, string>;
+}
+
+/// Mutual-exclusion VIOLATION: exports BOTH tool-exports AND runnable.
+world dual-export {
+    export tool-exports;
+    export runnable;
+}
