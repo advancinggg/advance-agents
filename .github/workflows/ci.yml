@@ -118,6 +118,9 @@ jobs:
         with:
           cache: false
       - uses: Swatinem/rust-cache@v2
+      # Grep-guard tests (e.g. sole_round_advancer_grep_guard) shell out to `rg`.
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       # Guest fixtures are excluded + prebuilt (.core.wasm committed), so the
       # workspace test run loads them as bytes and needs no wasm target. Add the
       # target ONLY when rebuilding a fixture:
