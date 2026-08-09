@@ -1,0 +1,335 @@
+# MODULE-019 Slice E (m019-slice-e, 2026-05-15) — observability lint allowlist.
+#
+# Each entry waives one `HostFunctionHandler` impl from the AC-14 lint's
+# emit-eligible call requirement. Schema:
+#   crate, struct          — identify the impl
+#   reason                 — non-empty human explanation
+#   delegated_to | pending_wiring_slice — EXACTLY ONE; XOR is enforced by lint
+#
+# `delegated_to` value: `<crate>::<module>::<function>` (3+ segments) naming
+# the actual emit-site. PR review enforces semantic truthfulness; lint only
+# checks shape.
+#
+# `pending_wiring_slice` value: one of `MODULE-NNN <ref>`, `m<NNN>-slice-<letter>`,
+# or `docs/<path>` (PR review enforces the referent exists).
+
+# ─── cap-llm ────────────────────────────────────────────────────────────────
+
+# AgentLlmGenerateHandler's `fn call` body delegates to gateway.generate()
+# at host_fn.rs:359. gateway.generate() emits llm.request/response/retry/error
+# via the emit_llm_* helpers in events.rs.
+[[handler]]
+crate = "cap-llm"
+struct = "AgentLlmGenerateHandler"
+reason = "Delegates to LlmGateway::generate; observability events emitted via emit_llm_request / emit_llm_response / emit_llm_retry / emit_llm_error helpers in cap-llm/src/events.rs (below the handler boundary)."
+delegated_to = "advance_cap_llm::gateway::LlmGateway::generate"
+
+# Stream + poll-stream: the S4 live path ships (2026-07-29, dev-task-s4-final).
+# Emission lives BELOW the handler boundary — llm.request at begin and the single
+# terminal llm.response/llm.error from the settlement winner inside the owner task
+# (cap-llm/src/gateway.rs + stream.rs::Settlement::finalize). poll-stream never
+# emits by design (MODULE-009 §2.7 invariant 6, Δ3), so neither handler body has an
+# emit-eligible call site. Delegated, mirroring the AgentLlmGenerateHandler row.
+[[handler]]
+crate = "cap-llm"
+struct = "AgentLlmStreamHandler"
+reason = "Emission is delegated below the handler boundary: llm.request is emitted in stream_begin_live before dispatch, and the single terminal record comes from Settlement::finalize in the owner task (cap-llm/src/stream.rs)."
+delegated_to = "advance_cap_llm::gateway::LlmGateway::stream_begin_live"
+
+[[handler]]
+crate = "cap-llm"
+struct = "AgentLlmPollStreamHandler"
+reason = "On the LIVE path poll-stream emits nothing by design (MODULE-009 §2.7 invariant 6, Δ3: the terminal record is published by the settlement winner at stream terminal, poll-independent). On the retained UNWIRED buffered path (Δ9) the deferred llm.response is emitted by LlmGateway::stream_finish, which the handler delegates to. Either way the handler body has no emit-eligible call site of its own."
+delegated_to = "advance_cap_llm::gateway::LlmGateway::stream_finish"
+
+# ─── cap-tools ───────────────────────────────────────────────────────────────
+#
+# (m017-slice-f, 2026-05-22) AgentToolsInvokeHandler + AgentToolsListHandler now
+# emit tool.invoke / tool.result / tool.error directly in their handler bodies
+# via `emitter.emit(...)`, so both entries were removed from this allowlist. See
+# MODULE-017 §2.7 (Slice F) + §3.7 (2026-05-22). No cap-tools waivers remain.
+
+# ─── cap-secrets ─────────────────────────────────────────────────────────────
+
+[[handler]]
+crate = "cap-secrets"
+struct = "SecretExistsHandler"
+reason = "Pending host-fn emit wiring — `secret-exists` is a read-only check; AC-01 'every host function emits' coverage of read-only secrets handlers tracked here. MODULE-012 cap-secrets slice owns the emit wiring."
+pending_wiring_slice = "MODULE-019 §3.6 item 1 (AC-01 cap-secrets pending coverage)"
+
+# m012-slice-e (2026-05-23) caller-dependency gated companion to SecretExistsHandler.
+# Wave-18 Lane-3 (2026-06-26): the gated handler IS now production-wired — cli
+# `register_secrets_capability` selects it via `register_agent_secrets_with_policy`
+# whenever `secrets.dependencies` is configured (MODULE-012-AC-15). This waiver
+# persists ONLY for the orthogonal AC-01 emit-coverage gap: `secret-exists` is a
+# read-only bool probe that emits no observability event (same as the permissive
+# SecretExistsHandler sibling), so it is waived from the "every host function emits"
+# lint regardless of wiring.
+[[handler]]
+crate = "cap-secrets"
+struct = "GatedSecretExistsHandler"
+reason = "AC-01 emit-coverage waiver (orthogonal to wiring). As of Wave-18 Lane-3 this gated handler IS production-wired (cli register_secrets_capability → register_agent_secrets_with_policy when secrets.dependencies is configured; MODULE-012-AC-15). It remains waived only because `secret-exists` is a read-only bool probe that emits no observability event — the same emit-coverage gap as the sibling SecretExistsHandler row at MODULE-019 §3.6 item 1; adding host-fn emit_* calls to either handler closes both rows at once."
+pending_wiring_slice = "MODULE-019 §3.6 item 1 (AC-01 cap-secrets pending coverage)"
+
+# ─── cap-grant ───────────────────────────────────────────────────────────────
+
+# ActiveGrantsHandler + GrantStatusHandler: read-only queries on GrantStore.
+# No mutation, no event emission. AC-01 ambiguous on whether read-only host
+# calls require emit; tracked as pending for clarity.
+[[handler]]
+crate = "cap-grant"
+struct = "ActiveGrantsHandler"
+reason = "Read-only `active-grants` query; no mutation or state change to emit. AC-01 coverage of read-only host calls tracked as pending — read-event emission semantics deferred to a cap-grant follow-up."
+pending_wiring_slice = "MODULE-019 §3.6 item 1 (AC-01 cap-grant read-only handlers)"
+
+[[handler]]
+crate = "cap-grant"
+struct = "GrantStatusHandler"
+reason = "Read-only `grant-status` query; same rationale as ActiveGrantsHandler."
+pending_wiring_slice = "MODULE-019 §3.6 item 1 (AC-01 cap-grant read-only handlers)"
+
+# RequestCapabilityHandler holds an Arc<dyn EventBusEmit> and forwards it to
+# ResolverChain::evaluate (wit_impl.rs:372). The chain is the emit-site for
+# grant.issued / grant.revoked / authz.checked / resolver.invoked events.
+[[handler]]
+crate = "cap-grant"
+struct = "RequestCapabilityHandler"
+reason = "Delegates to ResolverChain::evaluate which emits authz.checked / grant.issued / resolver.invoked / preset.applied events through the chain's evaluation steps (cap-grant/src/resolver.rs + check.rs + store.rs)."
+delegated_to = "advance_cap_grant::resolver::ResolverChain::evaluate"
+
+# DelegateGrantHandler delegates to GrantStore::delegate_grant which emits
+# grant.delegated.
+[[handler]]
+crate = "cap-grant"
+struct = "DelegateGrantHandler"
+reason = "Delegates to GrantStore::delegate_grant; emits grant.delegated through the store's mutation path."
+delegated_to = "advance_cap_grant::store::GrantStore::delegate_grant"
+
+# NarrowGrantHandler delegates to GrantStore::narrow which emits grant.narrowed.
+[[handler]]
+crate = "cap-grant"
+struct = "NarrowGrantHandler"
+reason = "Delegates to GrantStore::narrow; emits grant.narrowed through the store's mutation path."
+delegated_to = "advance_cap_grant::store::GrantStore::narrow"
+
+# RevokeGrantHandler delegates to GrantStore::revoke_grant which emits
+# grant.revoked.
+[[handler]]
+crate = "cap-grant"
+struct = "RevokeGrantHandler"
+reason = "Delegates to GrantStore::revoke_grant; emits grant.revoked through the store's mutation path."
+delegated_to = "advance_cap_grant::store::GrantStore::revoke_grant"
+
+# ApplyPresetHandler delegates to GrantStore::apply_preset (or similar) which
+# emits preset.applied.
+[[handler]]
+crate = "cap-grant"
+struct = "ApplyPresetHandler"
+reason = "Delegates to GrantStore::apply_preset; emits preset.applied through the store's mutation path."
+delegated_to = "advance_cap_grant::store::GrantStore::apply_preset"
+
+# ─── cap-skills ──────────────────────────────────────────────────────────────
+# (Added during m017-slice-c. Slice C lands 8 HostFunctionHandler impls for
+# the `agent-skills` WIT interface; per-handler observability emit wiring is
+# deferred to a future cap-skills slice. The skill state machine itself is
+# fully tested at the lifecycle layer; what's missing is the runtime-event
+# bridge (skill.proposed / skill.activated / skill.deleted).)
+
+[[handler]]
+crate = "cap-skills"
+struct = "ProposeSkillDraftHandler"
+reason = "Pending host-fn emit wiring — propose-skill-draft mutates SkillStore via DiskSkillStorage but no skill.proposed event is emitted yet."
+pending_wiring_slice = "MODULE-019 §3.6 item 1 (AC-01 cap-skills pending coverage)"
+
+[[handler]]
+crate = "cap-skills"
+struct = "ProposeSkillPatchHandler"
+reason = "Pending host-fn emit wiring — propose-skill-patch mutates SkillStore but no skill.patched event is emitted yet."
+pending_wiring_slice = "MODULE-019 §3.6 item 1 (AC-01 cap-skills pending coverage)"
+
+[[handler]]
+crate = "cap-skills"
+struct = "UpdateSkillDraftHandler"
+reason = "Pending host-fn emit wiring — update-skill-draft mutates draft content but no skill.draft_updated event is emitted yet."
+pending_wiring_slice = "MODULE-019 §3.6 item 1 (AC-01 cap-skills pending coverage)"
+
+[[handler]]
+crate = "cap-skills"
+struct = "ActivateSkillHandler"
+reason = "Pending host-fn emit wiring — activate-skill is the central skill-promotion path (security_scan + trust gate + sweep); skill.activated/skill.activation_failed events deferred to a follow-up cap-skills observability slice."
+pending_wiring_slice = "MODULE-019 §3.6 item 1 (AC-01 cap-skills pending coverage)"
+
+[[handler]]
+crate = "cap-skills"
+struct = "RollbackSkillHandler"
+reason = "Pending host-fn emit wiring — rollback-skill mutates active version but no skill.rolled_back event is emitted yet."
+pending_wiring_slice = "MODULE-019 §3.6 item 1 (AC-01 cap-skills pending coverage)"
+
+[[handler]]
+crate = "cap-skills"
+struct = "DeleteSkillHandler"
+reason = "Pending host-fn emit wiring — delete-skill tombstones the active record but no skill.deleted event is emitted yet."
+pending_wiring_slice = "MODULE-019 §3.6 item 1 (AC-01 cap-skills pending coverage)"
+
+[[handler]]
+crate = "cap-skills"
+struct = "ListSkillCandidatesHandler"
+reason = "Read-only `list-skill-candidates` query (Slice C stub returns empty — M011 L6 not wired). AC-01 coverage of read-only handlers tracked as pending."
+pending_wiring_slice = "MODULE-019 §3.6 item 1 (AC-01 cap-skills pending coverage)"
+
+[[handler]]
+crate = "cap-skills"
+struct = "ResolveSkillCandidateHandler"
+reason = "Read-only `resolve-skill-candidate` query (Slice C stub returns not-found). AC-01 coverage of read-only handlers tracked as pending."
+pending_wiring_slice = "MODULE-019 §3.6 item 1 (AC-01 cap-skills pending coverage)"
+
+# ─── cap-channel ────────────────────────────────────────────────────────────
+# (Added during m019-slice-e rebase onto current main. cap-channel m016-slice-b
+# landed 3 HostFunctionHandler impls that don't yet emit channel.* observability
+# events. Per-handler emit wiring is the responsibility of a future cap-channel
+# observability slice.)
+
+[[handler]]
+crate = "cap-channel"
+struct = "SubscribeHandler"
+reason = "Pending host-fn emit wiring — `subscribe` mutates SubscriptionManager state but no channel.subscribe event is emitted yet."
+pending_wiring_slice = "MODULE-016 channel observability follow-up (cap-channel m016 future slice)"
+
+[[handler]]
+crate = "cap-channel"
+struct = "PollRawHandler"
+reason = "Pending host-fn emit wiring — read-only `poll-raw`; AC-01 coverage of read-only handlers tracked here."
+pending_wiring_slice = "MODULE-016 channel observability follow-up (cap-channel m016 future slice)"
+
+[[handler]]
+crate = "cap-channel"
+struct = "SendRawHandler"
+reason = "Emission is transitive (the lint walks only the handler call body): `send-raw` delegates to OutboundDispatcher::dispatch → HttpEgress::send, which emits the redacted `channel.raw_sent` after a successful chain pass when the dispatcher is built via `new_with_event_bus` (lifecycle-harvest 2026-06-12, MODULE-016-AC-12 guest-path wiring); the plain `new` ctor stays bus-less and emits nothing."
+delegated_to = "advance_cap_channel::egress::HttpEgress::send"
+
+# ─── cap-lifecycle ───────────────────────────────────────────────────────────
+# (Added during m005-slice-c. cap-lifecycle landed a single shared
+# `LifecycleHandler` that dispatches by op-string across the agent-lifecycle
+# WIT surface — spawn-child / spawn-sub / spawn-agent-from-template /
+# rollback-child-to-checkpoint / list-child-checkpoints / terminate-child /
+# submit-component / component-status / kill-component / list-components /
+# checkpoint / rollback-to-checkpoint / list-checkpoints / self-stats /
+# child-stats / list-agent-templates / terminate-agent / submit-decomposition /
+# update-subtask-status / get-decomposition. Per-op agent.spawned /
+# agent.terminated / checkpoint.created / rollback.applied / decomposition.*
+# emission is deferred to a future cap-lifecycle observability slice that
+# wires MODULE-019 EventBus through AgentLifecycleBundle.)
+
+[[handler]]
+crate = "cap-lifecycle"
+struct = "LifecycleHandler"
+reason = "Mixed coverage, transitive through the free `dispatch` fn (the lint walks only the handler call body, so this entry must remain): submit-decomposition / update-subtask-status emit task.decomposed / task.subtask_updated (decomp-satellite 2026-06-10) — these decomposition emits are now factored into `wit_impl::dispatch_decomposition` (which `dispatch` calls; extracted Wave-12 Lane C 2026-06-23) — and terminate-child / terminate-agent emit lifecycle.terminate_child / lifecycle.terminate_agent (lifecycle-harvest 2026-06-12, MODULE-005-AC-28) via the bundle's EventBusEmit still inside `wit_impl::dispatch`. The remaining mutating ops (spawn-child / spawn-sub / spawn-agent-from-template / checkpoint / rollback-* / submit-component / kill-component) and read-only ops still emit nothing — their per-op events stay pending."
+pending_wiring_slice = "MODULE-005 observability follow-up (remaining ops: agent.spawned / checkpoint.created / rollback.applied per-op emits)"
+
+# 011 (Wave-11 Lane B, 2026-06-23) added the narrow production `SpawnHandler` —
+# `register_agent_spawn` registers spawn-child / spawn-sub / spawn-agent-from-template
+# over a `Spawner` (no full `AgentLifecycleBundle`, no EventBus). Its `fn call` body
+# dispatches via the shared `dispatch_spawn` free fn (the lint walks only the handler
+# call body), which emits nothing — exactly the SAME pending status the sibling
+# LifecycleHandler row documents for those same spawn ops (agent.spawned is a pending
+# MODULE-005 observability follow-up). Same pending_wiring_slice.
+[[handler]]
+crate = "cap-lifecycle"
+struct = "SpawnHandler"
+reason = "011 narrow spawn-only handler: dispatches spawn-child / spawn-sub / spawn-agent-from-template via the shared `dispatch_spawn` free fn (the lint walks only the handler call body). These spawn ops emit no per-op observability events yet (agent.spawned is pending), identical to the spawn ops the sibling LifecycleHandler row already documents — and SpawnHandler carries no EventBus (register_agent_spawn takes only a Spawner). The per-op spawn emit wiring is the same MODULE-005 observability follow-up that covers LifecycleHandler's spawn ops."
+pending_wiring_slice = "MODULE-005 observability follow-up (remaining ops: agent.spawned / checkpoint.created / rollback.applied per-op emits)"
+
+# Legacy-3 CONTRACT-217 split the production v0.2 component surface out of the
+# shared LifecycleHandler into this narrow handler. The handler intentionally
+# owns only WIT lifting/lowering and delegates the admitted production write to
+# the composition-root SchedulerSubmitBridge; durable observation publication
+# and CONTRACT-219 source refresh happen there after scheduler admission.
+[[handler]]
+crate = "cap-lifecycle"
+struct = "ComponentSubmitHandler"
+reason = "Legacy-3 CONTRACT-217 narrow component handler: the lint walks only HostFunctionHandler::call, which delegates through dispatch_component_submit and the ComponentSubmitGate port. The production registration binds that port to SchedulerSubmitBridge::submit_component_v2; the bridge performs scheduler admission, publishes the committed sensitive-name source, and refreshes the CONTRACT-219 observation projector. Keeping observation at that composition boundary avoids a duplicate or pre-commit WIT-boundary event. Read-only status/list operations intentionally emit nothing."
+delegated_to = "advance_cli::component_submit_bridge::SchedulerSubmitBridge::submit_component_v2"
+
+# Wave-12 Lane C (2026-06-23) added the narrow production `DecompositionHandler` —
+# `register_agent_decomposition` registers submit-decomposition / update-subtask-status /
+# get-decomposition over a `DecompositionStore` + an `EventBusEmit`. Its `fn call` body
+# dispatches via the shared `dispatch_decomposition` free fn (the lint walks only the
+# handler call body); submit-decomposition emits task.decomposed and update-subtask-status
+# emits task.subtask_updated through the injected EventBus inside that free fn (get is a
+# read-only query). The emit IS wired here (unlike SpawnHandler), so this row uses
+# `delegated_to` (the emitting free fn), NOT `pending_wiring_slice`.
+[[handler]]
+crate = "cap-lifecycle"
+struct = "DecompositionHandler"
+reason = "Wave-12 Lane C narrow decomposition-only handler: dispatches submit-decomposition / update-subtask-status / get-decomposition via the shared `dispatch_decomposition` free fn (the lint walks only the handler call body, so this entry is required). submit-decomposition emits task.decomposed and update-subtask-status emits task.subtask_updated through the injected EventBusEmit inside dispatch_decomposition; get-decomposition is a read-only query (no emit). Same emit path the sibling LifecycleHandler row documents for these 3 ops, now factored into dispatch_decomposition."
+delegated_to = "cap_lifecycle::wit_impl::dispatch_decomposition"
+
+# ─── cap-mcp ────────────────────────────────────────────────────────────────
+# (Added during m017-slice-d. cap-mcp Slice D landed the mcp-client WIT
+# host_fn dispatch (7 handlers split across capability dimensions:
+# 5 server-level handlers registered under `mcp.servers` + 2 tool-level
+# handlers registered under `mcp.tool-patterns`, per MODULE-017 AC-30 +
+# MODULE-013 §1.5 dimension intent). None of these emit `mcp.*`
+# observability events today; per-handler emit wiring is the responsibility
+# of a future cap-mcp observability slice that wires MODULE-019 EventBus
+# through `register_mcp_client` — tracked at MODULE-017 §3.6 item (l).)
+
+[[handler]]
+crate = "cap-mcp"
+struct = "ListMcpServersHandler"
+reason = "Pending host-fn emit wiring — read-only `list-mcp-servers` query returning McpClient::list_servers(); no mcp.servers_listed event emitted yet. AC-01 coverage of read-only mcp-client handlers tracked here."
+pending_wiring_slice = "MODULE-017 §3.6 item (l) (cap-mcp observability follow-up)"
+
+[[handler]]
+crate = "cap-mcp"
+struct = "ListMcpToolsHandler"
+reason = "Pending host-fn emit wiring — read-only `list-mcp-tools` query (per-server, filtered by tool-patterns); no mcp.tools_listed event emitted yet."
+pending_wiring_slice = "MODULE-017 §3.6 item (l) (cap-mcp observability follow-up)"
+
+[[handler]]
+crate = "cap-mcp"
+struct = "ListMcpPromptsHandler"
+reason = "Pending host-fn emit wiring — read-only `list-mcp-prompts` query; no mcp.prompts_listed event emitted yet."
+pending_wiring_slice = "MODULE-017 §3.6 item (l) (cap-mcp observability follow-up)"
+
+[[handler]]
+crate = "cap-mcp"
+struct = "GetMcpPromptHandler"
+reason = "Pending host-fn emit wiring — read-shaped `get-mcp-prompt` retrieves a prompt template with args; no mcp.prompt_fetched event emitted yet."
+pending_wiring_slice = "MODULE-017 §3.6 item (l) (cap-mcp observability follow-up)"
+
+[[handler]]
+crate = "cap-mcp"
+struct = "ListMcpResourcesHandler"
+reason = "Pending host-fn emit wiring — read-only `list-mcp-resources` query; no mcp.resources_listed event emitted yet."
+pending_wiring_slice = "MODULE-017 §3.6 item (l) (cap-mcp observability follow-up)"
+
+[[handler]]
+crate = "cap-mcp"
+struct = "ReadMcpResourceHandler"
+reason = "Pending host-fn emit wiring — read-only `read-mcp-resource` query fetches resource bytes by URI; no mcp.resource_read event emitted yet."
+pending_wiring_slice = "MODULE-017 §3.6 item (l) (cap-mcp observability follow-up)"
+
+[[handler]]
+crate = "cap-mcp"
+struct = "InvokeMcpToolHandler"
+reason = "Pending host-fn emit wiring — `invoke-mcp-tool` is the central mutating MCP path (schema-validates input, dispatches via http or stdio transport, schema-validates output); mcp.tool_invoked / mcp.tool_failed events not yet emitted. The 7-handler observability follow-on slice will add per-tool emission with tool_name + server_id + duration_ms + status fields."
+pending_wiring_slice = "MODULE-017 §3.6 item (l) (cap-mcp observability follow-up)"
+
+# ─── advance-reply-tracker (MODULE-007) ─────────────────────────────────────
+# (Added during m007-slice-e, 2026-05-24. AwaitRepliesHandler is the WIT
+# `agent-messaging::await-replies` host-fn handler, colocated with
+# AwaitSessionManagerImpl in reply-tracker per MODULE-007 §3.6 ADR-via-prose
+# entry — parallel-safety constraint forbids crates/messaging/src/ this slice.
+# HeartbeatHandler (sibling, NOT in this allowlist) emits orchestration.await_progress
+# directly in its handler body. AwaitRepliesHandler is a pure Val
+# encode/decode wrapper with NO event emission — the other orchestration.* events
+# tied to this WIT call emit from the MANAGER (not this handler), so this row stays
+# correct: the handler itself emits nothing. Wave-20: all 7 events now emit
+# in-boundary (from the manager); AC-17 flips at SUMMARY.)
+
+[[handler]]
+crate = "advance-reply-tracker"
+struct = "AwaitRepliesHandler"
+reason = "AwaitRepliesHandler is a pure Val encode/decode wrapper delegating to AwaitSessionManagerImpl::start_with_run; it emits no event from its own handler body. Wave-15 Lane A (2026-06-24): deadlock_rejected (SYS-AC-169) + await_idle_timeout (SYS-AC-252) ARE now emitted in-boundary — NOT from this handler, but from the manager admission path + the idle monitor (ManagerOptions.event_emitter; session-stable envelope, empty trace_id — MODULE-007 §3.8). await_progress is emitted by the sibling HeartbeatHandler. Wave-20 (2026-06-27): the other 4 orchestration.* events (await_started, await_satisfied, await_session_closed, reply_late) are now ALSO emitted from the MANAGER (admission / Completed-terminal / close / on_reply orphan paths) — NOT from this handler — so all 7 events emit in-boundary and AC-17 flips at SUMMARY. (This allowlist row remains correct: the handler itself does not emit; the observability-lint scans only cap-*/src HostFunctionHandler bodies, so the non-handler manager/idle emit sites are outside its scope.)"
+pending_wiring_slice = "docs/modules/MODULE-007-await-orchestration.md — permanent no-emit row by design: all 7 orchestration.* events emit from the manager; this handler stays a pure encode/decode wrapper"
