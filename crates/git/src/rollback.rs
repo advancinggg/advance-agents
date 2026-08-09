@@ -1302,19 +1302,19 @@ fn head_tree_for_removal(repo: &Repository) -> Result<Option<git2::Tree<'_>>, Ro
 /// excluded dir (`.agent/`, grandchild, hidden-runtime), or anything at/above
 /// the agent root. Best-effort: any read/remove error or non-empty dir stops
 /// the ascent.
-/// Remove workdir entries that block libgit2 from materializing a target path
-/// because of a file↔directory type conflict at a path prefix or leaf.
+/// Remove workdir FILE entries that block libgit2 from creating a TARGET
+/// directory beneath that path (HEAD file → TARGET directory shape change).
+/// Dir→file conflicts are left to force-checkout + the removal pass.
 fn clear_workdir_shape_conflicts(
     workdir: &Path,
     checkout_paths: &[PathBuf],
 ) -> Result<(), RollbackError> {
     for p in checkout_paths {
-        // Prefixes of a longer path must be directories. If a prefix is currently a
-        // file (HEAD file → TARGET directory under it), remove the file.
         let mut prefix = PathBuf::new();
         let comps: Vec<_> = p.components().collect();
         for (idx, comp) in comps.iter().enumerate() {
             prefix.push(comp.as_os_str());
+            // Only strict prefixes: the leaf itself is materialized by checkout.
             if idx + 1 == comps.len() {
                 break;
             }
@@ -1322,22 +1322,6 @@ fn clear_workdir_shape_conflicts(
             match std::fs::symlink_metadata(&abs) {
                 Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {
                     std::fs::remove_file(&abs).map_err(RollbackError::Io)?;
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(RollbackError::Io(e)),
-            }
-        }
-        // Leaf: if TARGET restores a blob (no longer checkout path is a strict
-        // child of `p`) but workdir has a directory there, remove the directory.
-        let has_child = checkout_paths
-            .iter()
-            .any(|other| other.starts_with(p) && other.as_path() != p.as_path());
-        if !has_child {
-            let abs = workdir.join(p);
-            match std::fs::symlink_metadata(&abs) {
-                Ok(meta) if meta.file_type().is_dir() => {
-                    std::fs::remove_dir_all(&abs).map_err(RollbackError::Io)?;
                 }
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
