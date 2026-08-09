@@ -4146,7 +4146,7 @@ struct PrivateToken {
 }
 
 impl TerminationOwnerReceipt {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     fn issue(
         key: &[u8; 32],
         tag: u8,
@@ -4195,7 +4195,7 @@ impl TerminationOwnerReceipt {
 }
 
 impl RetainedGcOwnerReceipt {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     fn issue(
         key: &[u8; 32],
         tag: u8,
@@ -4238,7 +4238,7 @@ impl RetainedGcOwnerReceipt {
 }
 
 impl PersistedKeyOwnerScanReceipt {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     fn issue(
         key: &[u8; 32],
         tag: u8,
