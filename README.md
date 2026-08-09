@@ -75,7 +75,7 @@ The workspace is 31 crates. Everything is dependency-inverted through `shared-ty
 
 | Path | Role |
 |---|---|
-| `crates/client-api/assets/console/` | Embedded reference web console over the client API. |
+| `clients/web-console/` | Embedded reference web console over the client API. |
 | `crates/client-api/sdk-artifacts/` | Generated CONTRACT-192 client SDK contract. |
 
 ## Build & test

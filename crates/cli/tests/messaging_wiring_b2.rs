@@ -26,7 +26,7 @@
 //! tests drive `wire_capabilities` directly over a `messaging:true` config and read the
 //! registry — they do not depend on `KNOWN_CAPABILITIES`.
 
-use advance_cli::wiring::wire_capabilities;
+use advance_cli::wiring::wire_capabilities_with_home_for_test;
 use advance_run_manager::RunConfig;
 use advance_runtime::bootstrap::RuntimeHostBuilder;
 use advance_runtime::host_registry::HostCallContext;
@@ -75,10 +75,20 @@ fn ensure_test_master_key() {
 
 /// Build a tempdir workspace with `.advance/runtime-config.yaml` + `.runtime/`
 /// scaffolding + a per-test `.agent/config.yaml`.
-fn fresh_workspace(agent_caps_yaml: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+fn fresh_workspace(
+    agent_caps_yaml: &str,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+) {
     ensure_test_master_key();
     let dir = tempfile::tempdir().expect("tempdir");
-    let workspace = std::fs::canonicalize(dir.path()).expect("canonicalize");
+    let home_dir = tempfile::tempdir().expect("home tempdir");
+    let workspace = std::fs::canonicalize(dir.path()).expect("canonicalize workspace");
+    let home = std::fs::canonicalize(home_dir.path()).expect("canonicalize home");
     std::fs::create_dir_all(workspace.join(".advance")).unwrap();
     std::fs::create_dir_all(workspace.join(".runtime")).unwrap();
     std::fs::create_dir_all(workspace.join(".runtime/events/jsonl")).unwrap();
@@ -86,7 +96,7 @@ fn fresh_workspace(agent_caps_yaml: &str) -> (tempfile::TempDir, PathBuf, PathBu
     let config_path = workspace.join(".advance/runtime-config.yaml");
     std::fs::write(&config_path, MINIMAL_RUNTIME_YAML).unwrap();
     std::fs::write(workspace.join(".agent/config.yaml"), agent_caps_yaml).unwrap();
-    (dir, workspace, config_path)
+    (dir, home_dir, workspace, home, config_path)
 }
 
 /// Bespoke `await-replies` WIT params: a single `component-finished` slot (which
@@ -135,9 +145,12 @@ fn assert_session_closed(v: &Val) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn t_b2_01_messaging_registration_is_live() {
-    let (_g, ws, cfg) = fresh_workspace("capabilities:\n  messaging: true\n  fs: true\n");
+    let (_g, _home_td, ws, home, cfg) =
+        fresh_workspace("capabilities:\n  messaging: true\n  fs: true\n");
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
-    let (host, _handles) = wire_capabilities(builder, &ws).await.expect("wire");
+    let (host, _handles) = wire_capabilities_with_home_for_test(builder, &ws, &home)
+        .await
+        .expect("wire");
 
     let specs = host.host_registry().lookup("messaging");
     let await_spec = specs.iter().find(|s| {
@@ -160,11 +173,12 @@ async fn t_b2_01_messaging_registration_is_live() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "GHA: wire_capabilities rejects progress-lifecycle path policy on runner temp paths; quarantine for post-genesis hardening"]
 async fn t_b2_02_handler_drives_suspend_on_park_then_cancel_closes() {
-    let (_g, ws, cfg) = fresh_workspace("capabilities:\n  messaging: true\n");
+    let (_g, _home_td, ws, home, cfg) = fresh_workspace("capabilities:\n  messaging: true\n");
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
-    let (host, handles) = wire_capabilities(builder, &ws).await.expect("wire");
+    let (host, handles) = wire_capabilities_with_home_for_test(builder, &ws, &home)
+        .await
+        .expect("wire");
 
     // Extract the SAME await-replies handler instance wiring registered (carrying
     // the production suspend sink) — driving this proves the registration is not inert.
@@ -247,9 +261,11 @@ async fn t_b2_02_handler_drives_suspend_on_park_then_cancel_closes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn t_b2_03_no_messaging_cap_not_registered() {
-    let (_g, ws, cfg) = fresh_workspace("capabilities:\n  fs: true\n");
+    let (_g, _home_td, ws, home, cfg) = fresh_workspace("capabilities:\n  fs: true\n");
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
-    let (host, _handles) = wire_capabilities(builder, &ws).await.expect("wire");
+    let (host, _handles) = wire_capabilities_with_home_for_test(builder, &ws, &home)
+        .await
+        .expect("wire");
     let specs = host.host_registry().lookup("messaging");
     assert!(
         specs.is_empty(),
@@ -258,9 +274,8 @@ async fn t_b2_03_no_messaging_cap_not_registered() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "GHA: wire_capabilities rejects progress-lifecycle path policy on runner temp paths; quarantine for post-genesis hardening"]
 async fn t_b2_04_run_manager_shares_agent_tree_for_descendant_cascade() {
-    let (_g, ws, cfg) = fresh_workspace(
+    let (_g, _home_td, ws, home, cfg) = fresh_workspace(
         "\
 capabilities:
   messaging: true
@@ -272,7 +287,9 @@ agents:
 ",
     );
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
-    let (_host, handles) = wire_capabilities(builder, &ws).await.expect("wire");
+    let (_host, handles) = wire_capabilities_with_home_for_test(builder, &ws, &home)
+        .await
+        .expect("wire");
 
     let root_run = handles
         .run_manager
@@ -323,9 +340,9 @@ agents:
 async fn t_b2_05_messaging_only_agent_wires_cleanly() {
     // No `fs` declared: exercises the new messaging-only construction path (the
     // hoisted AgentTreeStore is built for the dispatcher even without cap-fs).
-    let (_g, ws, cfg) = fresh_workspace("capabilities:\n  messaging: true\n");
+    let (_g, _home_td, ws, home, cfg) = fresh_workspace("capabilities:\n  messaging: true\n");
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
-    let (host, _handles) = wire_capabilities(builder, &ws)
+    let (host, _handles) = wire_capabilities_with_home_for_test(builder, &ws, &home)
         .await
         .expect("messaging-only wire must succeed (hoisted AgentTreeStore built without fs)");
     assert!(

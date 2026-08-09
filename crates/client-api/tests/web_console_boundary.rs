@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 fn asset(name: &str) -> String {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/console");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../clients/web-console");
     fs::read_to_string(root.join(name)).expect("Web Console asset")
 }
 

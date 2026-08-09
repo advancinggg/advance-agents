@@ -75,7 +75,7 @@ El workspace tiene 31 crates. Todo está invertido en dependencias a través de 
 
 | Ruta | Rol |
 |---|---|
-| `crates/client-api/assets/console/` | Consola web de referencia embebida sobre la client API. |
+| `clients/web-console/` | Consola web de referencia embebida sobre la client API. |
 | `crates/client-api/sdk-artifacts/` | Contrato SDK cliente CONTRACT-192 generado. |
 
 ## Compilar y probar

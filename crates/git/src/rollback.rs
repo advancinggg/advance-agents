@@ -1138,6 +1138,16 @@ fn do_rollback(
     // there is something to restore (the empty-target / removal-only case skips
     // it entirely).
     if !checkout_paths.is_empty() {
+        // Pre-clear file↔directory shape conflicts. Some libgit2/Linux combos
+        // fail force-checkout with `Exists: directory exists` when HEAD has a
+        // FILE at a path prefix of a TARGET directory (or the reverse). Remove
+        // the conflicting workdir entry before checkout so materialization can
+        // proceed; the subsequent force-checkout restores the target shape.
+        let workdir = repo.workdir().ok_or_else(|| RollbackError::NotFound {
+            what: "repository workdir".into(),
+        })?;
+        clear_workdir_shape_conflicts(workdir, &checkout_paths)?;
+
         let mut builder = CheckoutBuilder::new();
         builder.force();
         // CRITICAL (Slice B adversarial R16 C1): `CheckoutBuilder::path` feeds
@@ -1292,6 +1302,52 @@ fn head_tree_for_removal(repo: &Repository) -> Result<Option<git2::Tree<'_>>, Ro
 /// excluded dir (`.agent/`, grandchild, hidden-runtime), or anything at/above
 /// the agent root. Best-effort: any read/remove error or non-empty dir stops
 /// the ascent.
+/// Remove workdir entries that block libgit2 from materializing a target path
+/// because of a file↔directory type conflict at a path prefix or leaf.
+fn clear_workdir_shape_conflicts(
+    workdir: &Path,
+    checkout_paths: &[PathBuf],
+) -> Result<(), RollbackError> {
+    for p in checkout_paths {
+        // Prefixes of a longer path must be directories. If a prefix is currently a
+        // file (HEAD file → TARGET directory under it), remove the file.
+        let mut prefix = PathBuf::new();
+        let comps: Vec<_> = p.components().collect();
+        for (idx, comp) in comps.iter().enumerate() {
+            prefix.push(comp.as_os_str());
+            if idx + 1 == comps.len() {
+                break;
+            }
+            let abs = workdir.join(&prefix);
+            match std::fs::symlink_metadata(&abs) {
+                Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {
+                    std::fs::remove_file(&abs).map_err(RollbackError::Io)?;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(RollbackError::Io(e)),
+            }
+        }
+        // Leaf: if TARGET restores a blob (no longer checkout path is a strict
+        // child of `p`) but workdir has a directory there, remove the directory.
+        let has_child = checkout_paths
+            .iter()
+            .any(|other| other.starts_with(p) && other.as_path() != p.as_path());
+        if !has_child {
+            let abs = workdir.join(p);
+            match std::fs::symlink_metadata(&abs) {
+                Ok(meta) if meta.file_type().is_dir() => {
+                    std::fs::remove_dir_all(&abs).map_err(RollbackError::Io)?;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(RollbackError::Io(e)),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn prune_empty_parents(
     workdir: &Path,
     removed_rel: &Path,

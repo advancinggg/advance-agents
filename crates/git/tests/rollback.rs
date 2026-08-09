@@ -815,7 +815,6 @@ async fn t_removal_empty_target_domain_still_removes() {
 /// directory; the removal pass then sees `worker/a` is a directory and SKIPS it
 /// (the file is already gone) — no "is a directory" error.
 #[tokio::test]
-#[ignore = "libgit2 file↔dir conflict ordering fails on some Linux runners (Exists: directory exists); quarantine for post-genesis fix"]
 async fn t_removal_file_to_dir_conflict_restores() {
     let (_td, p) = bootstrap();
     // Target T: `worker/a` is a DIRECTORY (contains inner.md).

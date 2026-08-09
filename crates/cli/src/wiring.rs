@@ -825,7 +825,20 @@ pub async fn wire_capabilities(
     builder: RuntimeHostBuilder,
     workspace: &Path,
 ) -> Result<(RuntimeHost, WiringHandles), CliWiringError> {
-    wire_capabilities_inner(builder, workspace, None).await
+    wire_capabilities_inner(builder, workspace, None, None).await
+}
+
+/// Test seam: inject a canonical HOME so progress-lifecycle bootstrap does not
+/// share the process HOME (which races under `cargo test` parallelism and can
+/// trip `progress-lifecycle-path-policy-rejected` on runner temp layouts).
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub async fn wire_capabilities_with_home_for_test(
+    builder: RuntimeHostBuilder,
+    workspace: &Path,
+    home: &Path,
+) -> Result<(RuntimeHost, WiringHandles), CliWiringError> {
+    wire_capabilities_inner(builder, workspace, None, Some(home)).await
 }
 
 /// Production-composition witness entry point.  It preserves the complete
@@ -845,6 +858,7 @@ pub async fn wire_capabilities_with_channel_security_for_test(
         Some(crate::channels_boot::ChannelSecurityTestOverride::new(
             ssrf, executor,
         )),
+        None,
     )
     .await
 }
@@ -853,6 +867,7 @@ async fn wire_capabilities_inner(
     builder: RuntimeHostBuilder,
     workspace: &Path,
     channel_security_override: Option<crate::channels_boot::ChannelSecurityTestOverride>,
+    home_override: Option<&Path>,
 ) -> Result<(RuntimeHost, WiringHandles), CliWiringError> {
     // Step 1 — snapshot the agent config YAML ONCE.
     //
@@ -917,8 +932,18 @@ async fn wire_capabilities_inner(
                 .as_ref()
                 .expect("declares_messaging is included in needs_key");
             Some(
-                bootstrap_progress_lifecycle(&*key, workspace)
-                    .map_err(|error| CliWiringError::ProgressLifecycle(error.code()))?,
+                match home_override {
+                    Some(home) => {
+                        crate::progress_lifecycle_bootstrap::bootstrap_progress_lifecycle_with_home(
+                            &*key,
+                            workspace,
+                            Some(home),
+                            None,
+                        )
+                    }
+                    None => bootstrap_progress_lifecycle(&*key, workspace),
+                }
+                .map_err(|error| CliWiringError::ProgressLifecycle(error.code()))?,
             )
         } else {
             None

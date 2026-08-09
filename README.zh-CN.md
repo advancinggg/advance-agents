@@ -70,7 +70,7 @@ advance-core = { git = "https://github.com/advancinggg/advance-agents", tag = "v
 
 | 路径 | 职责 |
 |---|---|
-| `crates/client-api/assets/console/` | 嵌入的参考 Web 控制台（基于 client API）。 |
+| `clients/web-console/` | 嵌入的参考 Web 控制台（基于 client API）。 |
 | `crates/client-api/sdk-artifacts/` | 生成的 CONTRACT-192 客户端 SDK 契约。 |
 
 ## 构建与测试

@@ -37,9 +37,9 @@ use crate::request::{ClientRequest, Method};
 use crate::routes;
 use crate::ClientApi;
 
-const INDEX_HTML: &str = include_str!("../assets/console/index.html");
-const APP_JS: &str = include_str!("../assets/console/app.js");
-const STYLES_CSS: &str = include_str!("../assets/console/styles.css");
+const INDEX_HTML: &str = include_str!("../../../clients/web-console/index.html");
+const APP_JS: &str = include_str!("../../../clients/web-console/app.js");
+const STYLES_CSS: &str = include_str!("../../../clients/web-console/styles.css");
 
 const VERSION_HEADER: &str = "x-advance-api-version";
 const CSRF_HEADER: &str = "x-csrf-token";
