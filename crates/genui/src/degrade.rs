@@ -10,7 +10,14 @@ pub fn degrade_to_text(doc: &GenUiDocument, catalog: &dyn ComponentCatalog) -> S
         degrade_node(&mut out, node, catalog, 1);
     }
     if out.len() > MAX_OUTPUT_BYTES {
-        out.truncate(MAX_OUTPUT_BYTES - TRUNCATION_SUFFIX.len());
+        let target = MAX_OUTPUT_BYTES - TRUNCATION_SUFFIX.len();
+        let safe = out
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= target)
+            .last()
+            .unwrap_or(0);
+        out.truncate(safe);
         out.push_str(TRUNCATION_SUFFIX);
     }
     out

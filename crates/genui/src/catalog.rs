@@ -45,7 +45,7 @@ pub enum ConfirmVariant {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ActionRef {
     pub name: String,
-    #[serde(default)]
+    #[serde(default = "default_empty_object")]
     pub params: serde_json::Value,
     #[serde(default)]
     pub confirm: Option<ConfirmMetadata>,
@@ -57,6 +57,10 @@ pub enum ValidationOutcome {
     Valid,
     Degraded { fallback: String },
     Rejected { code: String, reason: String },
+}
+
+fn default_empty_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
 }
 
 pub trait ComponentCatalog: Send + Sync {
@@ -119,23 +123,40 @@ impl DefaultCatalog {
 
 const INJECTION_PATTERNS: &[&str] = &[
     "<script",
+    "<svg",
+    "<iframe",
+    "<embed",
+    "<object",
+    "<form",
+    "<base",
     "javascript:",
-    "onerror=",
-    "onload=",
-    "onclick=",
-    "onmouseover=",
-    "onfocus=",
-    "onblur=",
+    "vbscript:",
     "data:text/html",
     "data:text/javascript",
     "data:application/",
+    "data:image/svg+xml",
 ];
+
+fn has_event_handler_attr(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len().saturating_sub(4) {
+        if bytes[i] == b'o' && bytes[i + 1] == b'n' && bytes[i + 2].is_ascii_alphabetic() {
+            if let Some(eq_pos) = s[i + 2..].find('=') {
+                let between = &s[i + 2..i + 2 + eq_pos];
+                if between.len() <= 20 && between.chars().all(|c| c.is_ascii_alphabetic()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
 
 fn contains_injection(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::String(s) => {
             let lower = s.to_ascii_lowercase();
-            INJECTION_PATTERNS.iter().any(|p| lower.contains(p))
+            INJECTION_PATTERNS.iter().any(|p| lower.contains(p)) || has_event_handler_attr(&lower)
         }
         serde_json::Value::Array(arr) => arr.iter().any(contains_injection),
         serde_json::Value::Object(obj) => obj.values().any(contains_injection),
@@ -276,6 +297,13 @@ impl DefaultCatalog {
                 });
             }
         }
+        if node.component == "Button" {
+            if let Some(action_val) = node.props.get("action") {
+                if let Ok(action_ref) = serde_json::from_value::<ActionRef>(action_val.clone()) {
+                    self.validate_action(&action_ref)?;
+                }
+            }
+        }
         for child in &node.children {
             self.validate_tree(child)?;
         }
@@ -301,6 +329,15 @@ impl GenUiGate {
     pub fn admit(&self, doc: &GenUiDocument) -> Result<(), GenUiError> {
         if !self.enabled {
             return Err(GenUiError::Denied);
+        }
+        if !matches!(doc.protocol_version, crate::document::A2uiVersion::V0_9_1) {
+            return Err(GenUiError::InvalidProps {
+                component: "document".into(),
+                reason: format!(
+                    "unsupported protocol version: {:?}",
+                    doc.protocol_version
+                ),
+            });
         }
         doc.validate_size(self.max_document_bytes)?;
         validate_depth(&doc.root, 1)?;

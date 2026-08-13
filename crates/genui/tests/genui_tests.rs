@@ -254,6 +254,57 @@ fn depth_9_rejected() {
     }
 }
 
+// UTF-8 safe truncation
+#[test]
+fn degradation_truncation_safe_on_multibyte() {
+    let catalog = seed_catalog();
+    let long_content = "x".repeat(4000) + &"\u{1F600}".repeat(100);
+    let doc = GenUiDocument {
+        protocol_version: A2uiVersion::V0_9_1,
+        document_id: DocumentId("utf8-test".into()),
+        root: vec![ComponentNode {
+            component: "Text".into(),
+            props: json!({"content": long_content}),
+            children: vec![],
+        }],
+    };
+    let text = degrade_to_text(&doc, &catalog);
+    assert!(text.len() <= 4096, "degradation should be bounded");
+    assert!(text.ends_with("...(truncated)"), "should be truncated");
+}
+
+// Version validation
+#[test]
+fn unknown_version_rejected() {
+    let g = gate(true);
+    let doc = GenUiDocument {
+        protocol_version: A2uiVersion::Unknown("99.0.0".into()),
+        document_id: DocumentId("v99".into()),
+        root: vec![ComponentNode {
+            component: "Text".into(),
+            props: json!({"content": "hello"}),
+            children: vec![],
+        }],
+    };
+    assert!(g.admit(&doc).is_err(), "unknown version should be rejected");
+}
+
+// Button with non-catalog action rejected at document level
+#[test]
+fn button_non_catalog_action_rejected_in_document() {
+    let g = gate(true);
+    let doc = GenUiDocument {
+        protocol_version: A2uiVersion::V0_9_1,
+        document_id: DocumentId("bad-action".into()),
+        root: vec![ComponentNode {
+            component: "Button".into(),
+            props: json!({"label": "Hack", "action": {"name": "delete_everything"}}),
+            children: vec![],
+        }],
+    };
+    assert!(g.admit(&doc).is_err(), "button with non-catalog action should be rejected");
+}
+
 // Size validation
 #[test]
 fn size_within_limit_passes() {
