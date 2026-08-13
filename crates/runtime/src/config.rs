@@ -449,7 +449,7 @@ pub struct WasmConfig {
 /// routing: `id == "anthropic"` → `AnthropicMessages`, else `OpenAiChat`.
 /// Variant renames are EXPLICIT (not `rename_all`) because the ADR pins the
 /// exact wire spellings `openai-chat` / `openai-responses` /
-/// `anthropic-messages`.
+/// `anthropic-messages` / `local`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub enum ProviderBackend {

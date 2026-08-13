@@ -393,7 +393,7 @@ mod tests {
         let cfg: LlmProviderConfig = serde_json::from_value(serde_json::json!({
             "id": "local", "endpoint": "http://localhost:8080",
             "api-key-secret": "local-dummy", "model-aliases": {"llama": "llama-3.1-8b"},
-            "cost-per-mtoken-in": 0.0, "cost-per-mtoken-out": 0.0,
+            "cost-per-mtoken-in": 0.001, "cost-per-mtoken-out": 0.001,
             "backend": "local"
         }))
         .expect("local config must parse");

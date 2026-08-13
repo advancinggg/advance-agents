@@ -19,11 +19,17 @@ pub struct LocalAdapter {
     inner: OpenAiAdapter,
 }
 
-impl LocalAdapter {
-    pub fn new() -> Self {
+impl Default for LocalAdapter {
+    fn default() -> Self {
         Self {
             inner: OpenAiAdapter,
         }
+    }
+}
+
+impl LocalAdapter {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -75,7 +81,6 @@ impl ProviderAdapter for LocalAdapter {
 mod tests {
     use super::*;
     use advance_runtime::config::ProviderBackend;
-    use std::collections::HashMap;
 
     fn local_provider() -> ResolvedProvider {
         ResolvedProvider {
@@ -83,8 +88,8 @@ mod tests {
             endpoint: "http://localhost:8080".into(),
             api_key_secret: "local-dummy".into(),
             model: "llama-3.1-8b".into(),
-            cost_per_mtoken_in: 0.0,
-            cost_per_mtoken_out: 0.0,
+            cost_per_mtoken_in: 0.001,
+            cost_per_mtoken_out: 0.001,
             backend: ProviderBackend::Local,
             auth_scheme: None,
         }
