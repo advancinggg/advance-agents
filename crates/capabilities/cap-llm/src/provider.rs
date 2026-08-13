@@ -369,4 +369,34 @@ mod tests {
         assert_eq!(without_fields.backend, None);
         assert_eq!(without_fields.auth_scheme, None);
     }
+
+    #[test]
+    fn t_local_backend_serde_round_trip() {
+        let json = serde_json::json!("local");
+        let parsed: ProviderBackend = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, ProviderBackend::Local);
+        let serialized = serde_json::to_value(parsed).unwrap();
+        assert_eq!(serialized, serde_json::json!("local"));
+    }
+
+    #[test]
+    fn t_backend_of_explicit_local() {
+        let mut cfg = provider("my-local", &[("llama", "llama-3.1-8b")]);
+        cfg.backend = Some(ProviderBackend::Local);
+        assert_eq!(backend_of(&cfg), ProviderBackend::Local);
+        let resolved = make_resolved(&cfg, "llama-3.1-8b".into());
+        assert_eq!(resolved.backend, ProviderBackend::Local);
+    }
+
+    #[test]
+    fn t_local_config_parses() {
+        let cfg: LlmProviderConfig = serde_json::from_value(serde_json::json!({
+            "id": "local", "endpoint": "http://localhost:8080",
+            "api-key-secret": "local-dummy", "model-aliases": {"llama": "llama-3.1-8b"},
+            "cost-per-mtoken-in": 0.0, "cost-per-mtoken-out": 0.0,
+            "backend": "local"
+        }))
+        .expect("local config must parse");
+        assert_eq!(cfg.backend, Some(ProviderBackend::Local));
+    }
 }

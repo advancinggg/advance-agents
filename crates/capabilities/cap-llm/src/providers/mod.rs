@@ -18,6 +18,7 @@ use crate::provider::ResolvedProvider;
 use crate::providers::sse::{SseEvent, SseFrame};
 
 pub mod anthropic;
+pub mod local;
 pub mod openai;
 pub mod responses;
 pub mod sse;
@@ -100,6 +101,7 @@ pub fn select_adapter(backend: ProviderBackend) -> Box<dyn ProviderAdapter> {
         ProviderBackend::AnthropicMessages => Box::new(anthropic::AnthropicAdapter),
         ProviderBackend::OpenAiResponses => Box::new(responses::OpenAiResponsesAdapter),
         ProviderBackend::OpenAiChat => Box::new(openai::OpenAiAdapter),
+        ProviderBackend::Local => Box::new(local::LocalAdapter::new()),
     }
 }
 
@@ -122,7 +124,7 @@ pub(crate) fn credential_position_for(provider: &ResolvedProvider) -> Credential
         (None, ProviderBackend::AnthropicMessages) => CredentialPosition::CustomHeader {
             key: "x-api-key".into(),
         },
-        (None, ProviderBackend::OpenAiChat | ProviderBackend::OpenAiResponses) => {
+        (None, ProviderBackend::OpenAiChat | ProviderBackend::OpenAiResponses | ProviderBackend::Local) => {
             CredentialPosition::BearerToken
         }
     }
@@ -201,6 +203,16 @@ mod cred_tests {
             auth_header_for(&provider(ProviderBackend::OpenAiResponses, None)).0,
             "Authorization"
         );
+    }
+
+    #[test]
+    fn t_local_backend_default_credential_position() {
+        let local = provider(ProviderBackend::Local, None);
+        assert!(matches!(
+            credential_position_for(&local),
+            CredentialPosition::BearerToken
+        ));
+        assert_eq!(auth_header_for(&local).0, "Authorization");
     }
 }
 

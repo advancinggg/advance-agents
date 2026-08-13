@@ -19,7 +19,7 @@ use advance_shared_types::event::Event as BusEvent;
 use advance_shared_types::traits::EventBusEmit;
 use notify::event::{DataChange, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -450,7 +450,7 @@ pub struct WasmConfig {
 /// Variant renames are EXPLICIT (not `rename_all`) because the ADR pins the
 /// exact wire spellings `openai-chat` / `openai-responses` /
 /// `anthropic-messages`.
-#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub enum ProviderBackend {
     #[serde(rename = "openai-chat")]
@@ -459,6 +459,8 @@ pub enum ProviderBackend {
     OpenAiResponses,
     #[serde(rename = "anthropic-messages")]
     AnthropicMessages,
+    #[serde(rename = "local")]
+    Local,
 }
 
 /// Credential-position scheme, orthogonal to `ProviderBackend` (ADR 2026-07-22
