@@ -139,8 +139,12 @@ const INJECTION_PATTERNS: &[&str] = &[
 
 fn has_event_handler_attr(s: &str) -> bool {
     let bytes = s.as_bytes();
-    for i in 0..bytes.len().saturating_sub(4) {
+    for i in 0..bytes.len().saturating_sub(3) {
         if bytes[i] == b'o' && bytes[i + 1] == b'n' && bytes[i + 2].is_ascii_alphabetic() {
+            let in_tag_context = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'<');
+            if !in_tag_context {
+                continue;
+            }
             if let Some(eq_pos) = s[i + 2..].find('=') {
                 let between = &s[i + 2..i + 2 + eq_pos];
                 if between.len() <= 20 && between.chars().all(|c| c.is_ascii_alphabetic()) {
@@ -299,9 +303,12 @@ impl DefaultCatalog {
         }
         if node.component == "Button" {
             if let Some(action_val) = node.props.get("action") {
-                if let Ok(action_ref) = serde_json::from_value::<ActionRef>(action_val.clone()) {
-                    self.validate_action(&action_ref)?;
-                }
+                let action_ref: ActionRef = serde_json::from_value(action_val.clone())
+                    .map_err(|e| GenUiError::InvalidProps {
+                        component: "Button".into(),
+                        reason: format!("malformed action: {e}"),
+                    })?;
+                self.validate_action(&action_ref)?;
             }
         }
         for child in &node.children {
