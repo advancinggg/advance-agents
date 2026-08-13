@@ -187,6 +187,8 @@ pub struct RuntimeConfig {
     /// match the MODULE-012 §1.5 AC-17 criterion text.
     #[serde(default)]
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub genui: GenUiConfig,
 }
 
 /// /dev Phase-3 kickoff (2026-06-06) — per-run budget caps seeded into the live
@@ -828,6 +830,32 @@ pub struct SecurityConfig {
     pub action_validator: ActionValidatorConfig,
 }
 
+/// MODULE-023 GenUI configuration (CONTRACT-003 additive, default-OFF).
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct GenUiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(rename = "max-document-bytes", default = "default_max_document_bytes")]
+    pub max_document_bytes: usize,
+    #[serde(rename = "mcp-apps-enabled", default)]
+    pub mcp_apps_enabled: bool,
+}
+
+fn default_max_document_bytes() -> usize {
+    262_144
+}
+
+impl Default for GenUiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_document_bytes: default_max_document_bytes(),
+            mcp_apps_enabled: false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RuntimeConfigProvider trait (CONTRACT-003)
 // ---------------------------------------------------------------------------
@@ -877,7 +905,7 @@ pub const RUNTIME_CONFIG_RELOADED_EVENT_TYPE: &str = "runtime.config_reloaded";
 /// Names of the top-level `runtime-config.yaml` sections that differ between
 /// two parsed configs, in canonical kebab-case YAML spelling.
 ///
-/// Exhaustively destructures [`RuntimeConfig`] so that adding a 14th section
+/// Exhaustively destructures [`RuntimeConfig`] so that adding a 15th section
 /// without extending this diff is a COMPILE ERROR, not a silent payload gap.
 pub fn config_sections_changed(old: &RuntimeConfig, new: &RuntimeConfig) -> Vec<&'static str> {
     let RuntimeConfig {
@@ -895,6 +923,7 @@ pub fn config_sections_changed(old: &RuntimeConfig, new: &RuntimeConfig) -> Vec<
         channels,
         run_budget,
         security,
+        genui,
     } = old;
     let mut changed = Vec::new();
     if wasm != &new.wasm {
@@ -938,6 +967,9 @@ pub fn config_sections_changed(old: &RuntimeConfig, new: &RuntimeConfig) -> Vec<
     }
     if security != &new.security {
         changed.push("security");
+    }
+    if genui != &new.genui {
+        changed.push("genui");
     }
     changed
 }
@@ -1869,6 +1901,13 @@ fn validate_config(path: &Path, cfg: &RuntimeConfig) -> Result<(), ConfigError> 
     {
         return invalid(
             "security.action_validator.max_message_size must be in [1, 67108864] (64 MiB)",
+        );
+    }
+
+    // genui
+    if cfg.genui.max_document_bytes < 1024 || cfg.genui.max_document_bytes > 1_048_576 {
+        return invalid(
+            "genui.max-document-bytes must be in [1024, 1048576] (1 KiB to 1 MiB)",
         );
     }
 

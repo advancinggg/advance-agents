@@ -9,3 +9,34 @@ input, select, button { font: inherit; padding: .45rem .65rem; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; unicode-bidi: plaintext; }
 .warning { color: #b45309; font-weight: 650; }
 .actions { display: flex; gap: .5rem; }
+/* GenUI component styles */
+.genui-document { display: grid; gap: .75rem; }
+.genui-text { line-height: 1.5; }
+.genui-heading { margin: 0; }
+.genui-button { cursor: pointer; border-radius: .4rem; }
+.genui-button-primary { background: LinkText; color: Canvas; border: none; }
+.genui-button-destructive { background: #dc2626; color: #fff; border: none; }
+.genui-section { border: 1px solid color-mix(in srgb, CanvasText 15%, transparent); border-radius: .5rem; padding: .75rem; }
+.genui-row { display: flex; flex-wrap: wrap; }
+.genui-column { display: flex; flex-direction: column; }
+.genui-gap-sm { gap: .25rem; }
+.genui-gap-md { gap: .5rem; }
+.genui-gap-lg { gap: 1rem; }
+.genui-entity-card { border: 1px solid color-mix(in srgb, CanvasText 20%, transparent); border-radius: .5rem; padding: .75rem; display: flex; flex-direction: column; gap: .25rem; }
+.genui-entity-subtitle { opacity: .7; font-size: .9em; }
+.genui-data-table { overflow-x: auto; }
+.genui-data-table table { width: 100%; border-collapse: collapse; }
+.genui-data-table th, .genui-data-table td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 10%, transparent); }
+.genui-table-title { font-weight: 600; margin-bottom: .4rem; }
+.genui-empty { opacity: .6; text-align: center; }
+.genui-tree { list-style: none; padding-left: 1rem; }
+.genui-callout { padding: .6rem .8rem; border-radius: .4rem; border-left: 3px solid; }
+.genui-callout-info { border-color: #3b82f6; background: color-mix(in srgb, #3b82f6 8%, transparent); }
+.genui-callout-success { border-color: #22c55e; background: color-mix(in srgb, #22c55e 8%, transparent); }
+.genui-callout-warning { border-color: #f59e0b; background: color-mix(in srgb, #f59e0b 8%, transparent); }
+.genui-callout-error { border-color: #ef4444; background: color-mix(in srgb, #ef4444 8%, transparent); }
+.genui-stat { display: flex; flex-direction: column; gap: .15rem; }
+.genui-stat-label { font-size: .85em; opacity: .7; }
+.genui-stat-value { font-size: 1.4em; font-weight: 600; }
+.genui-stat-group { display: grid; gap: .75rem; }
+.genui-unknown, .genui-error, .genui-depth-exceeded { opacity: .5; font-style: italic; }

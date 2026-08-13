@@ -33,6 +33,7 @@ cap-skills = { path = "../capabilities/cap-skills", version = "0.1.0" }
 cap-tools = { path = "../capabilities/cap-tools", version = "0.1.0" }
 # ── subsystem crates ───────────────────────────────────────────────────────
 advance-client-api = { path = "../client-api", version = "0.1.0" }
+advance-genui = { path = "../genui", version = "0.1.0" }
 advance-context-engine = { path = "../context-engine", version = "0.1.0" }
 advance-cost-tracker = { path = "../cost-tracker", version = "0.1.0" }
 advance-database = { path = "../database", version = "0.1.0" }

@@ -1251,8 +1251,9 @@ fn ce_t18_non_object_payload() {
 fn ce_t20_table_has_29() {
     let _g = test_lock();
     let lits = advance_client_api::projection::accepted_event_literals();
-    assert_eq!(lits.len(), 29);
+    assert_eq!(lits.len(), 33);
     assert!(lits.contains(&"orchestration.await_progress"));
+    assert!(lits.contains(&"genui.emitted"));
     assert!(!lits.contains(&"task.created"));
 }
 

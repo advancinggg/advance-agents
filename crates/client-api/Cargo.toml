@@ -27,8 +27,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # schemars: derive the CONTRACT-192 JSON Schema from the canonical DTOs so the artifact is
 # generated FROM the contract types (full type/enum/required/nested fidelity), not hand-authored.
-# Exact-pin per the workspace supply-chain discipline (latest stable resolved 2026-07-07).
-schemars = "=1.2.1"
+schemars = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
@@ -36,6 +35,8 @@ uuid = { workspace = true }
 rand = { workspace = true }
 # m020-s3 CONTRACT-191: LeakDetector trait + Event metadata types (no event-bus production dep).
 advance-shared-types = { path = "../shared-types" }
+# MODULE-023 GenUI types for CONTRACT-192 schema generation.
+advance-genui = { path = "../genui", version = "0.1.0" }
 # AEAD cursor tokens (AES-256-GCM) + zeroizing key material.
 aes-gcm = { workspace = true }
 zeroize = { workspace = true }

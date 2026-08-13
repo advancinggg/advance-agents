@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/shared-types", "crates/runtime", "crates/cli", "crates/git", "crates/capabilities/cap-fs", "crates/capabilities/cap-secrets", "crates/capabilities/cap-http", "crates/capabilities/cap-llm", "crates/capabilities/cap-grant", "crates/capabilities/cap-memory", "crates/capabilities/cap-tools", "crates/capabilities/cap-skills", "crates/capabilities/cap-mcp", "crates/capabilities/cap-channel", "crates/capabilities/cap-lifecycle", "crates/database", "crates/event-bus", "crates/cost-tracker", "crates/messaging", "crates/messaging/reply-tracker", "crates/run-manager", "crates/scheduler", "crates/scheduler/auto-loop", "crates/context-engine", "crates/services/pack-manager", "crates/services/observability-xtask", "crates/system-acceptance", "crates/build-agent", "crates/client-api", "crates/advance-core"]
+members = ["crates/shared-types", "crates/runtime", "crates/cli", "crates/git", "crates/capabilities/cap-fs", "crates/capabilities/cap-secrets", "crates/capabilities/cap-http", "crates/capabilities/cap-llm", "crates/capabilities/cap-grant", "crates/capabilities/cap-memory", "crates/capabilities/cap-tools", "crates/capabilities/cap-skills", "crates/capabilities/cap-mcp", "crates/capabilities/cap-channel", "crates/capabilities/cap-lifecycle", "crates/database", "crates/event-bus", "crates/cost-tracker", "crates/messaging", "crates/messaging/reply-tracker", "crates/run-manager", "crates/scheduler", "crates/scheduler/auto-loop", "crates/context-engine", "crates/services/pack-manager", "crates/services/observability-xtask", "crates/system-acceptance", "crates/build-agent", "crates/client-api", "crates/genui", "crates/advance-core"]
 exclude = ["crates/runtime/tests/fixtures/guest-rust-minimal", "crates/runtime/tests/fixtures/guest-rust-with-caps", "crates/runtime/tests/fixtures/guest-rust-j01-skeleton", "crates/runtime/tests/fixtures/guest-rust-mem-skeleton", "crates/runtime/tests/fixtures/guest-rust-hello-llm"]
 resolver = "2"
 
@@ -333,6 +333,9 @@ base64 = "=0.22.1"
 # (Bytecode Alliance published feature list for wasmtime-wasi =43.0.1 shows `p1`/`p2`,
 # no `preview2`).
 wasmtime-wasi = { version = "=43.0.1", default-features = false, features = ["p2"] }
+# schemars — derive JSON Schema from Rust types (CONTRACT-192 pattern).
+# Promoted from client-api local pin to workspace level for genui + client-api.
+schemars = "=1.2.1"
 # Slice m009-B-2 (2026-04-30): cap-llm gateway internals workspace deps.
 # jsonschema — JSON Schema (Draft 2020-12 compatible) compile + validate.
 # Used by cap-llm's structured_output.rs (`try_parse_and_validate`) per

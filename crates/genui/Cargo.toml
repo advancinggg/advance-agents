@@ -1,0 +1,22 @@
+[package]
+name = "advance-genui"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MODULE-023 GenUI: A2UI document model (CONTRACT-220), vetted component catalog (CONTRACT-221), validation gate, degradation summarizer, and shared conformance corpus."
+
+publish = false
+
+[lib]
+name = "advance_genui"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+jsonschema = { workspace = true }
+
+[lints]
+workspace = true

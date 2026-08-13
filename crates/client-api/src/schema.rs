@@ -155,6 +155,31 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
             "LlmDeltaStreamRequest".to_string(),
             schema_value::<crate::deltas::LlmDeltaStreamRequest>(),
         );
+        // MODULE-023 GenUI DTOs (CONTRACT-220/221).
+        m.insert(
+            "GenUiDocument".to_string(),
+            schema_value::<advance_genui::GenUiDocument>(),
+        );
+        m.insert(
+            "ComponentNode".to_string(),
+            schema_value::<advance_genui::ComponentNode>(),
+        );
+        m.insert(
+            "CatalogEntry".to_string(),
+            schema_value::<advance_genui::CatalogEntry>(),
+        );
+        m.insert(
+            "ActionRef".to_string(),
+            schema_value::<advance_genui::ActionRef>(),
+        );
+        m.insert(
+            "ValidationOutcome".to_string(),
+            schema_value::<advance_genui::ValidationOutcome>(),
+        );
+        m.insert(
+            "GenUiError".to_string(),
+            schema_value::<advance_genui::GenUiError>(),
+        );
     }
 
     let schema = json!({

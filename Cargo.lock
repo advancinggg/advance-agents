@@ -88,6 +88,7 @@ dependencies = [
  "advance-client-api",
  "advance-database",
  "advance-event-bus",
+ "advance-genui",
  "advance-messaging",
  "advance-run-manager",
  "advance-shared-types",
@@ -142,6 +143,7 @@ dependencies = [
  "advance-cost-tracker",
  "advance-database",
  "advance-event-bus",
+ "advance-genui",
  "advance-git",
  "advance-messaging",
  "advance-pack-manager",
@@ -222,6 +224,16 @@ dependencies = [
  "tower_governor",
  "ulid",
  "url",
+]
+
+[[package]]
+name = "advance-genui"
+version = "0.1.0"
+dependencies = [
+ "jsonschema",
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

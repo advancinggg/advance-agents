@@ -329,7 +329,7 @@ fn valid_entity_ref(s: &str) -> bool {
     })
 }
 
-// ── Exact 29-row table ────────────────────────────────────────────────────────────────────
+// ── Exact 33-row table ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
 struct LeafSpec {
@@ -350,7 +350,6 @@ enum LeafKind {
     Enum(&'static [&'static str]),
     SessionId,
     EntityRef,
-    #[allow(dead_code)]
     StringScanned,
 }
 
@@ -386,6 +385,16 @@ const AUTO_HALTED: &[&str] = &[
     "safety-valve: max_cost_usd",
     "safety-valve: max_wall_time",
 ];
+const GENUI_CODES: &[&str] = &[
+    "denied",
+    "invalid_component",
+    "invalid_props",
+    "document_too_large",
+    "document_too_deep",
+    "invalid_action",
+    "surface_unavailable",
+    "bridge_violation",
+];
 
 fn table_spec(event_type: &str) -> Option<&'static EventSpec> {
     TABLE.iter().find(|s| s.literal == event_type)
@@ -396,7 +405,7 @@ pub fn is_accepted_event_type(event_type: &str) -> bool {
     table_spec(event_type).is_some()
 }
 
-/// Exact 29 accepted literals (for tests).
+/// Exact 33 accepted literals (for tests).
 pub fn accepted_event_literals() -> &'static [&'static str] {
     &[
         "run.created",
@@ -428,6 +437,10 @@ pub fn accepted_event_literals() -> &'static [&'static str] {
         "auto.iteration_crashed",
         "auto.degraded",
         "auto.halted",
+        "genui.emitted",
+        "genui.rejected",
+        "genui.action_dispatched",
+        "genui.degraded",
     ]
 }
 
@@ -833,5 +846,43 @@ static TABLE: &[EventSpec] = &[
             min_u32: None,
             max_u32: None,
         }],
+    },
+    // ── genui (MODULE-023) ──────────────────────────────────────────────
+    EventSpec {
+        literal: "genui.emitted",
+        priority: ClientEventPriority::Normal,
+        leaves: &[
+            LeafSpec { name: "document_id", kind: LeafKind::StringScanned, min_u32: None, max_u32: None },
+            LeafSpec { name: "component_count", kind: LeafKind::U32, min_u32: None, max_u32: None },
+            LeafSpec { name: "bytes", kind: LeafKind::U32, min_u32: None, max_u32: None },
+            LeafSpec { name: "document_json", kind: LeafKind::StringScanned, min_u32: None, max_u32: None },
+        ],
+    },
+    EventSpec {
+        literal: "genui.rejected",
+        priority: ClientEventPriority::Normal,
+        leaves: &[LeafSpec {
+            name: "code",
+            kind: LeafKind::Enum(GENUI_CODES),
+            min_u32: None,
+            max_u32: None,
+        }],
+    },
+    EventSpec {
+        literal: "genui.action_dispatched",
+        priority: ClientEventPriority::Normal,
+        leaves: &[
+            LeafSpec { name: "document_id", kind: LeafKind::StringScanned, min_u32: None, max_u32: None },
+            LeafSpec { name: "action", kind: LeafKind::StringScanned, min_u32: None, max_u32: None },
+            LeafSpec { name: "confirmed", kind: LeafKind::U32, min_u32: Some(0), max_u32: Some(1) },
+        ],
+    },
+    EventSpec {
+        literal: "genui.degraded",
+        priority: ClientEventPriority::Normal,
+        leaves: &[
+            LeafSpec { name: "surface", kind: LeafKind::StringScanned, min_u32: None, max_u32: None },
+            LeafSpec { name: "reason", kind: LeafKind::StringScanned, min_u32: None, max_u32: None },
+        ],
     },
 ];

@@ -107,16 +107,27 @@ function connectDashboard() {
   state.socket.addEventListener("open", () => {
     if (state.eventCursor) state.socket.send(JSON.stringify(state.eventCursor));
   });
-  state.socket.addEventListener("message", event => {
-    const envelope = JSON.parse(event.data);
-    if (envelope.error) throw new Error(envelope.error.message);
-    if (envelope.data?.cursor) {
-      state.eventCursor = {
-        stream_id: envelope.data.cursor.stream_id,
-        last_event_id: envelope.data.cursor.last_event_id,
-      };
-    }
-    for (const item of envelope.data?.events || []) render(document.querySelector("#events"), item);
+  state.socket.addEventListener("message", async event => {
+    try {
+      const envelope = JSON.parse(event.data);
+      if (envelope.error) { console.error(envelope.error.message); return; }
+      if (envelope.data?.cursor) {
+        state.eventCursor = {
+          stream_id: envelope.data.cursor.stream_id,
+          last_event_id: envelope.data.cursor.last_event_id,
+        };
+      }
+      for (const item of envelope.data?.events || []) {
+        if (item.event_type === "genui.emitted" && item.data?.document_json) {
+          try {
+            const { renderGenUiDocument } = await import("./genui-renderer.js");
+            renderGenUiDocument(document.querySelector("#genui"), item.data.document_json);
+          } catch (_e) { /* genui renderer unavailable — skip, don't break console */ }
+          continue;
+        }
+        render(document.querySelector("#events"), item);
+      }
+    } catch (e) { console.error("event handler error:", e); }
   });
   state.socket.addEventListener("close", () => {
     clearTimeout(state.reconnectTimer);
