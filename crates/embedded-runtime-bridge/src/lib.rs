@@ -12,6 +12,9 @@ pub mod embed;
 pub mod error;
 #[allow(unsafe_code)]
 pub mod ffi;
+
+// Re-export safe C ABI version for tests without needing unsafe in callers.
+pub use ffi::advance_bridge_abi_version;
 pub mod handle;
 pub mod lock_status;
 pub mod noop_bus;
