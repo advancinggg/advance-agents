@@ -35,6 +35,9 @@ pub use advance_shared_types as shared_types;
 // ── runtime host (Wasmtime host, L0 injection, breaker bus) ──────────────────────
 pub use advance_runtime as runtime;
 
+// ── CONTRACT-210 embed/supervise bridge (Wave-27 C210) ─────────────────────
+pub use advance_embedded_runtime_bridge as embedded_runtime_bridge;
+
 // ── capability crates (11) ────────────────────────────────────────────────────────
 pub use cap_channel;
 pub use cap_fs;

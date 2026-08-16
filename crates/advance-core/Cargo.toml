@@ -19,6 +19,7 @@ publish = false
 advance-shared-types = { path = "../shared-types", version = "0.1.0" }
 # ── runtime host ───────────────────────────────────────────────────────────
 advance-runtime = { path = "../runtime", version = "0.1.0" }
+advance-embedded-runtime-bridge = { path = "../embedded-runtime-bridge", version = "0.1.0" }
 # ── capability crates (11) ─────────────────────────────────────────────────
 cap-channel = { path = "../capabilities/cap-channel", version = "0.1.0" }
 cap-fs = { path = "../capabilities/cap-fs", version = "0.1.0" }

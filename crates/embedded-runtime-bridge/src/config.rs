@@ -1,0 +1,203 @@
+//! BridgeConfig and fail-closed validation.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::error::BridgeError;
+use crate::types::{BridgePlatform, CompositionMode, EngineMode};
+
+/// Public configuration for [`crate::start`].
+#[derive(Debug, Clone)]
+pub struct BridgeConfig {
+    pub platform: BridgePlatform,
+    pub engine_mode: EngineMode,
+    pub composition_mode: CompositionMode,
+    pub config_path: Option<PathBuf>,
+    pub supervise_command: Option<PathBuf>,
+    pub supervise_ready_marker: Option<String>,
+    pub supervise_ready_file: Option<PathBuf>,
+    pub supervise_ready_timeout: Option<Duration>,
+    /// Default true (MODULE-022). false = keep-available detach (macOS only).
+    pub supervise_kill_on_drop: bool,
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            platform: BridgePlatform::Mac,
+            engine_mode: EngineMode::Jit,
+            composition_mode: CompositionMode::Embed,
+            config_path: None,
+            supervise_command: None,
+            supervise_ready_marker: None,
+            supervise_ready_file: None,
+            supervise_ready_timeout: None,
+            supervise_kill_on_drop: true,
+        }
+    }
+}
+
+impl BridgeConfig {
+    pub fn ready_marker(&self) -> &str {
+        self.supervise_ready_marker
+            .as_deref()
+            .unwrap_or("advance: runtime ready")
+    }
+
+    pub fn ready_timeout(&self) -> Duration {
+        self.supervise_ready_timeout
+            .unwrap_or(Duration::from_secs(30))
+    }
+
+    /// Fail-closed validation (policy + platform matrix).
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        // Compiled-target mobile gate (cannot bypass via desktop enum).
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        {
+            if matches!(self.engine_mode, EngineMode::Jit) {
+                return Err(BridgeError::InvalidConfig(
+                    "compiled mobile target forbids EngineMode::Jit".into(),
+                ));
+            }
+            if matches!(self.composition_mode, CompositionMode::Supervise) {
+                return Err(BridgeError::InvalidConfig(
+                    "compiled mobile target forbids Supervise".into(),
+                ));
+            }
+        }
+
+        if matches!(
+            self.platform,
+            BridgePlatform::Ios | BridgePlatform::Android
+        ) {
+            if matches!(self.engine_mode, EngineMode::Jit) {
+                return Err(BridgeError::InvalidConfig(
+                    "iOS/Android require EngineMode::Interpreter".into(),
+                ));
+            }
+            if matches!(self.composition_mode, CompositionMode::Supervise) {
+                return Err(BridgeError::InvalidConfig(
+                    "iOS/Android forbid CompositionMode::Supervise".into(),
+                ));
+            }
+        }
+
+        if matches!(self.composition_mode, CompositionMode::Supervise)
+            && !self.supervise_kill_on_drop
+        {
+            // Keep-available: macOS host + Mac platform + ready_file + custom command.
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Err(BridgeError::InvalidConfig(
+                    "keep-available (kill_on_drop=false) requires macOS host".into(),
+                ));
+            }
+            #[cfg(target_os = "macos")]
+            {
+                if !matches!(self.platform, BridgePlatform::Mac) {
+                    return Err(BridgeError::InvalidConfig(
+                        "keep-available requires BridgePlatform::Mac".into(),
+                    ));
+                }
+                if self.supervise_ready_file.is_none() {
+                    return Err(BridgeError::InvalidConfig(
+                        "keep-available requires supervise_ready_file".into(),
+                    ));
+                }
+                if self.supervise_command.is_none() {
+                    return Err(BridgeError::InvalidConfig(
+                        "keep-available requires custom supervise_command (default advance has no ready-file protocol)".into(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Resolve config path under workspace.
+pub fn resolve_config_path(workspace: &Path, cfg: &BridgeConfig) -> PathBuf {
+    cfg.config_path
+        .clone()
+        .unwrap_or_else(|| workspace.join(".advance").join("runtime-config.yaml"))
+}
+
+/// Confine a path under workspace; reject escapes.
+pub fn confine_under_workspace(workspace: &Path, path: &Path) -> Result<PathBuf, BridgeError> {
+    let ws = workspace
+        .canonicalize()
+        .map_err(|e| BridgeError::InvalidWorkspace(format!("canonicalize workspace: {e}")))?;
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        ws.join(path)
+    };
+    // Reject .. components before canonicalize when possible.
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(BridgeError::InvalidConfig(
+            "path must not contain ..".into(),
+        ));
+    }
+    if joined.exists() {
+        let canon = joined
+            .canonicalize()
+            .map_err(|e| BridgeError::InvalidConfig(format!("canonicalize path: {e}")))?;
+        if !canon.starts_with(&ws) {
+            return Err(BridgeError::InvalidConfig(
+                "path escapes workspace".into(),
+            ));
+        }
+        Ok(canon)
+    } else {
+        // Parent must be under workspace.
+        if let Some(parent) = joined.parent() {
+            if parent.exists() {
+                let p = parent.canonicalize().map_err(|e| {
+                    BridgeError::InvalidConfig(format!("canonicalize parent: {e}"))
+                })?;
+                if !p.starts_with(&ws) {
+                    return Err(BridgeError::InvalidConfig(
+                        "path escapes workspace".into(),
+                    ));
+                }
+            } else if !joined.starts_with(&ws) {
+                return Err(BridgeError::InvalidConfig(
+                    "path escapes workspace".into(),
+                ));
+            }
+        }
+        Ok(joined)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn t01_ios_jit_invalid() {
+        let mut c = BridgeConfig::default();
+        c.platform = BridgePlatform::Ios;
+        c.engine_mode = EngineMode::Jit;
+        assert!(matches!(c.validate(), Err(BridgeError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn t02_android_supervise_invalid() {
+        let mut c = BridgeConfig::default();
+        c.platform = BridgePlatform::Android;
+        c.engine_mode = EngineMode::Interpreter;
+        c.composition_mode = CompositionMode::Supervise;
+        assert!(matches!(c.validate(), Err(BridgeError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn t03_mac_embed_jit_ok() {
+        let c = BridgeConfig::default();
+        assert!(c.validate().is_ok());
+    }
+}
