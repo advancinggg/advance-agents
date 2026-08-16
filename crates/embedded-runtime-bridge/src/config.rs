@@ -45,8 +45,17 @@ impl BridgeConfig {
     }
 
     pub fn ready_timeout(&self) -> Duration {
-        self.supervise_ready_timeout
-            .unwrap_or(Duration::from_secs(30))
+        const MAX: Duration = Duration::from_secs(300);
+        let d = self
+            .supervise_ready_timeout
+            .unwrap_or(Duration::from_secs(30));
+        if d > MAX {
+            MAX
+        } else if d.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            d
+        }
     }
 
     /// Fail-closed validation (policy + platform matrix).

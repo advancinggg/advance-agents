@@ -52,6 +52,10 @@ pub fn prepare_workspace(root: &Path) -> Result<PathBuf, BridgeError> {
     }
     // Reject a symlinked runtime.lock leaf if present.
     reject_symlink_path(&runtime.join("runtime.lock"))?;
+    reject_symlink_path(&root.join(".agent"))?;
+    reject_symlink_path(&root.join(".agent").join("config.yaml"))?;
+    // runtime.lock must be missing or a regular file (not FIFO/socket).
+    reject_non_regular_file(&runtime.join("runtime.lock"))?;
 
     Ok(root)
 }
@@ -63,6 +67,26 @@ fn reject_symlink_path(path: &Path) -> Result<(), BridgeError> {
             path.display()
         ))),
         Ok(_) | Err(_) => Ok(()), // missing is fine
+    }
+}
+
+fn reject_non_regular_file(path: &Path) -> Result<(), BridgeError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {
+            // symlink already rejected; allow regular file
+            if meta.file_type().is_symlink() {
+                return Err(BridgeError::InvalidWorkspace(format!(
+                    "symlink not allowed: {}",
+                    path.display()
+                )));
+            }
+            Ok(())
+        }
+        Ok(meta) if !meta.file_type().is_dir() => Err(BridgeError::InvalidWorkspace(format!(
+            "non-regular lock path not allowed: {}",
+            path.display()
+        ))),
+        Ok(_) | Err(_) => Ok(()),
     }
 }
 

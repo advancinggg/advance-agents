@@ -46,10 +46,24 @@ async fn start_supervise_inner(
     };
 
     if let Some(ref rf) = ready_file {
+        // Only auto-clear markers under workspace/.runtime/ with "ready" in the name.
+        let runtime_dir = workspace.join(".runtime");
+        let name_ok = rf
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_ascii_lowercase().contains("ready"))
+            .unwrap_or(false);
+        let under_runtime = rf.starts_with(&runtime_dir);
         if rf.exists() {
-            std::fs::remove_file(rf).map_err(|e| {
-                BridgeError::Supervise(format!("failed to clear ready_file before spawn: {e}"))
-            })?;
+            if under_runtime && name_ok && rf.is_file() {
+                std::fs::remove_file(rf).map_err(|e| {
+                    BridgeError::Supervise(format!("failed to clear ready_file before spawn: {e}"))
+                })?;
+            } else {
+                return Err(BridgeError::InvalidConfig(
+                    "supervise_ready_file must be a new path under .runtime/ with 'ready' in the name (refusing to delete arbitrary files)".into(),
+                ));
+            }
         }
     }
 
@@ -119,19 +133,32 @@ async fn start_supervise_inner(
             .stderr
             .take()
             .ok_or_else(|| BridgeError::Supervise("missing stderr".into()))?;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // Bounded queue: drop oldest on overflow (DoS resistance).
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
         let tx2 = tx.clone();
         let m1 = marker.clone();
         drain_tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let _ = tx.send(line);
+                let line = if line.len() > 4096 {
+                    line.chars().take(4096).collect()
+                } else {
+                    line
+                };
+                if tx.try_send(line).is_err() {
+                    // Drop line if full — still drain the pipe.
+                }
             }
         }));
         drain_tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let _ = tx2.send(line);
+                let line = if line.len() > 4096 {
+                    line.chars().take(4096).collect()
+                } else {
+                    line
+                };
+                let _ = tx2.try_send(line);
             }
         }));
         let deadline = spawn_at + timeout;
