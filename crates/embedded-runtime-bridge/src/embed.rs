@@ -41,7 +41,7 @@ async fn start_embed_inner(
     workspace: std::path::PathBuf,
     config: BridgeConfig,
 ) -> Result<BridgeHandle, BridgeError> {
-    let config_path = resolve_config_path(&workspace, &config);
+    let config_path = resolve_config_path(&workspace, &config)?;
     if !config_path.is_file() {
         return Err(BridgeError::Config(format!(
             "missing runtime-config.yaml at {}",

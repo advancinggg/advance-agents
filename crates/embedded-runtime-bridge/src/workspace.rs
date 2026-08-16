@@ -42,14 +42,28 @@ pub fn prepare_workspace(root: &Path) -> Result<PathBuf, BridgeError> {
 
     let advance = root.join(".advance");
     let runtime = root.join(".runtime");
+    reject_symlink_path(&advance)?;
+    reject_symlink_path(&runtime)?;
     if !advance.exists() {
         create_dir_private(&advance)?;
     }
     if !runtime.exists() {
         create_dir_private(&runtime)?;
     }
+    // Reject a symlinked runtime.lock leaf if present.
+    reject_symlink_path(&runtime.join("runtime.lock"))?;
 
     Ok(root)
+}
+
+fn reject_symlink_path(path: &Path) -> Result<(), BridgeError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(BridgeError::InvalidWorkspace(format!(
+            "symlink not allowed: {}",
+            path.display()
+        ))),
+        Ok(_) | Err(_) => Ok(()), // missing is fine
+    }
 }
 
 fn create_dir_private(path: &Path) -> Result<(), BridgeError> {

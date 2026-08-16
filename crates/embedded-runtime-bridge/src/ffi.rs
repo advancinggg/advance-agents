@@ -124,7 +124,10 @@ pub unsafe extern "C" fn advance_bridge_start(
     match result {
         Ok(Ok(())) => 0,
         Ok(Err(e)) => {
-            set_last_error(&e.redacted_message());
+            // redacted_message is char-safe; still inside no further panic risk
+            let msg = std::panic::catch_unwind(|| e.redacted_message())
+                .unwrap_or_else(|_| "error".into());
+            set_last_error(&msg);
             e.c_code()
         }
         Err(_) => {
@@ -142,11 +145,21 @@ pub unsafe extern "C" fn advance_bridge_stop(handle: *mut AdvanceBridgeHandle) -
         if handle.is_null() {
             return Err(BridgeError::InvalidArg);
         }
-        let h = unsafe { &mut *handle };
-        stop(h.handle.clone())
+        // Shared ref only — concurrent stop/health is safe (inner uses Mutex).
+        let h = unsafe { &*handle };
+        let cloned = h.handle.clone();
+        let res = stop(cloned);
+        let code = match &res {
+            Ok(()) => 0,
+            Err(e) => {
+                set_last_error(&e.redacted_message());
+                e.c_code()
+            }
+        };
+        Ok(code)
     });
     match result {
-        Ok(Ok(())) => 0,
+        Ok(Ok(code)) => code,
         Ok(Err(e)) => {
             set_last_error(&e.redacted_message());
             e.c_code()

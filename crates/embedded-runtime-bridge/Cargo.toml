@@ -16,7 +16,6 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 [dependencies]
 advance-runtime = { path = "../runtime", version = "0.1.0" }
 advance-shared-types = { path = "../shared-types", version = "0.1.0" }
-advance-database = { path = "../database", version = "0.1.0" }
 cap-grant = { path = "../capabilities/cap-grant", version = "0.1.0" }
 chrono = { workspace = true, features = ["clock"] }
 serde = { workspace = true, features = ["derive"] }

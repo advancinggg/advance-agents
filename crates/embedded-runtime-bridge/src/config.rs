@@ -116,11 +116,12 @@ impl BridgeConfig {
     }
 }
 
-/// Resolve config path under workspace.
-pub fn resolve_config_path(workspace: &Path, cfg: &BridgeConfig) -> PathBuf {
-    cfg.config_path
-        .clone()
-        .unwrap_or_else(|| workspace.join(".advance").join("runtime-config.yaml"))
+/// Resolve config path under workspace (confined).
+pub fn resolve_config_path(workspace: &Path, cfg: &BridgeConfig) -> Result<PathBuf, BridgeError> {
+    match &cfg.config_path {
+        Some(p) => confine_under_workspace(workspace, p),
+        None => Ok(workspace.join(".advance").join("runtime-config.yaml")),
+    }
 }
 
 /// Confine a path under workspace; reject escapes.

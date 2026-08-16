@@ -156,33 +156,67 @@ impl BridgeHandle {
     }
 }
 
-impl Drop for BridgeHandle {
+impl Drop for BridgeInner {
     fn drop(&mut self) {
-        // Only act when last Arc drops.
-        if Arc::strong_count(&self.inner) > 1 {
-            return;
-        }
-        let kill_on_drop = match &*self.inner.mode.lock().unwrap_or_else(|e| e.into_inner()) {
+        // Last Arc dropped — always cleanup here (no strong_count race).
+        let kill_on_drop = match &*self.mode.get_mut().unwrap_or_else(|e| e.into_inner()) {
             ModeState::Embed { .. } => true,
             ModeState::Supervise { kill_on_drop, .. } => *kill_on_drop,
         };
-        let _ = stop_inner(&self.inner, kill_on_drop);
+        // Reconstruct Arc-less stop path: mark stopped and tear down sync.
+        if self.stopped.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // Abort drains / take child under mode without Arc.
+        let mut drains = Vec::new();
+        let mut child = None;
+        let force = {
+            match self.mode.get_mut().unwrap_or_else(|e| e.into_inner()) {
+                ModeState::Embed { host, lock } => {
+                    *host = None;
+                    *lock = None;
+                    true
+                }
+                ModeState::Supervise {
+                    child: c,
+                    drain_tasks,
+                    kill_on_drop: k,
+                    ..
+                } => {
+                    drains = std::mem::take(drain_tasks);
+                    child = c.take();
+                    *k
+                }
+            }
+        };
+        let _ = kill_on_drop;
+        for t in drains {
+            t.abort();
+        }
+        if let Some(mut c) = child {
+            if force {
+                let _ = c.start_kill();
+                // Best-effort sync wait via block_on_global.
+                runtime_rt::block_on_global(async move {
+                    let _ = tokio::time::timeout(STOP_GRACE, c.wait()).await;
+                });
+            }
+        }
+        if self.reserved.swap(false, Ordering::SeqCst) {
+            registry::release(&self.workspace);
+        }
     }
 }
 
 fn stop_inner(inner: &Arc<BridgeInner>, force_reap: bool) -> Result<(), BridgeError> {
-    // Idempotent mark.
-    let already = inner.stopped.swap(true, Ordering::SeqCst);
-    if already && force_reap {
-        // Already stopped; still Ok.
-        return Ok(());
-    }
-    if already && !force_reap {
+    // Idempotent: only the first caller performs teardown.
+    if inner.stopped.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
 
+    let inner_for_reset = Arc::clone(inner);
     let inner = Arc::clone(inner);
-    runtime_rt::block_on_global(async move {
+    let result = runtime_rt::block_on_global(async move {
         // Extract resources under the mutex, then await without holding the guard.
         enum Pending {
             Embed,
@@ -237,7 +271,12 @@ fn stop_inner(inner: &Arc<BridgeInner>, force_reap: bool) -> Result<(), BridgeEr
             registry::release(&inner.workspace);
         }
         Ok(())
-    })
+    });
+    if result.is_err() {
+        // Allow a later stop attempt if teardown failed mid-flight.
+        inner_for_reset.stopped.store(false, Ordering::SeqCst);
+    }
+    result
 }
 
 /// Initial lifecycle default.

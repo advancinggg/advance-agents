@@ -47,11 +47,17 @@ async fn start_supervise_inner(
 
     if let Some(ref rf) = ready_file {
         if rf.exists() {
-            let _ = std::fs::remove_file(rf);
+            std::fs::remove_file(rf).map_err(|e| {
+                BridgeError::Supervise(format!("failed to clear ready_file before spawn: {e}"))
+            })?;
         }
     }
 
     let kill_on_drop = config.supervise_kill_on_drop;
+    let use_file_ready = ready_file.is_some();
+    // Pipe only when we need line readiness; file readiness uses null stdio so
+    // pipes never fill. Keep-available also uses null.
+    let pipe_stdio = kill_on_drop && !use_file_ready;
     let mut command = Command::new(&cmd_path);
     command
         .arg("start")
@@ -59,7 +65,7 @@ async fn start_supervise_inner(
         .arg(&workspace)
         .kill_on_drop(false);
 
-    if kill_on_drop {
+    if pipe_stdio {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
     } else {
         command.stdout(Stdio::null()).stderr(Stdio::null());
@@ -76,7 +82,7 @@ async fn start_supervise_inner(
 
     let mut drain_tasks = Vec::new();
     let readiness = if let Some(ref rf) = ready_file {
-        // File readiness
+        // File readiness: require post-spawn mtime (no fail-open on stale content).
         let rf = rf.clone();
         let deadline = spawn_at + timeout;
         loop {
@@ -91,13 +97,12 @@ async fn start_supervise_inner(
             }
             if rf.is_file() {
                 if let Ok(meta) = std::fs::metadata(&rf) {
-                    let fresh = meta
+                    let post_spawn = meta
                         .modified()
                         .ok()
                         .and_then(|m| m.duration_since(spawn_sys).ok())
-                        .is_some()
-                        || meta.len() > 0;
-                    if fresh && meta.len() > 0 {
+                        .is_some();
+                    if post_spawn && meta.len() > 0 {
                         break SuperviseReadiness::ReadyFile;
                     }
                 }
