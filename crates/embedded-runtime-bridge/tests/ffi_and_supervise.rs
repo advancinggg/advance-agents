@@ -1,8 +1,11 @@
 //! FFI smoke + supervise lifecycle with a stub ready-line binary.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::process::Command;
 
 use advance_embedded_runtime_bridge::{
@@ -10,6 +13,7 @@ use advance_embedded_runtime_bridge::{
     ADVANCE_BRIDGE_ABI_VERSION,
 };
 
+#[cfg(unix)]
 const MINIMAL_YAML: &str = r#"
 wasm:
   max_memory_pages: 1024
@@ -48,6 +52,7 @@ database:
   pool-size: 4
 "#;
 
+#[cfg(unix)]
 fn write_workspace() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = fs::canonicalize(dir.path()).unwrap();
@@ -62,6 +67,7 @@ fn write_workspace() -> (tempfile::TempDir, PathBuf) {
 }
 
 /// Stub that accepts `start --workspace X`, prints ready line, sleeps.
+#[cfg(unix)]
 fn write_ready_stub(dir: &std::path::Path) -> PathBuf {
     let path = dir.join("fake-advance");
     fs::write(
@@ -88,6 +94,7 @@ fn t13_ffi_abi_version() {
     assert_eq!(v, 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn t12_supervise_ready_line_start_stop() {
     let dir = tempfile::tempdir().unwrap();
@@ -108,6 +115,7 @@ fn t12_supervise_ready_line_start_stop() {
     stop(h).expect("stop");
 }
 
+#[cfg(unix)]
 #[test]
 fn t20_supervise_timeout_reaps() {
     let dir = tempfile::tempdir().unwrap();
@@ -156,9 +164,82 @@ fn header_exists_and_mentions_abi() {
     assert!(text.contains("advance_bridge_start"));
 }
 
-// Ensure shell is available for stub tests
+#[cfg(unix)]
 #[test]
 fn shell_available() {
     let st = Command::new("sh").arg("-c").arg("echo ok").status().unwrap();
     assert!(st.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn t34_ready_file_must_be_under_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_g, ws) = write_workspace();
+    let stub = write_ready_stub(dir.path());
+    let cfg = BridgeConfig {
+        platform: BridgePlatform::Mac,
+        engine_mode: EngineMode::Jit,
+        composition_mode: CompositionMode::Supervise,
+        supervise_command: Some(stub),
+        supervise_ready_file: Some(ws.join(".advance").join("not-ready.txt")),
+        supervise_kill_on_drop: true,
+        ..BridgeConfig::default()
+    };
+    let err = start(&ws, cfg).unwrap_err();
+    assert!(matches!(
+        err,
+        advance_embedded_runtime_bridge::BridgeError::InvalidConfig(_)
+    ));
+}
+
+/// Keep-available Drop must not release the process-local reservation.
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn t32_keep_available_drop_blocks_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_g, ws) = write_workspace();
+    let ready = ws.join(".runtime").join("daemon.ready");
+    let stub = dir.path().join("keep-advance");
+    fs::write(
+        &stub,
+        r#"#!/bin/sh
+ws=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--workspace" ]; then
+    shift
+    ws="$1"
+  else
+    shift
+  fi
+done
+echo $$ > "$ws/.runtime/keep.pid"
+printf ready > "$ws/.runtime/daemon.ready"
+exec sleep 60
+"#,
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&stub).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&stub, perms).unwrap();
+    let cfg = BridgeConfig {
+        platform: BridgePlatform::Mac,
+        engine_mode: EngineMode::Jit,
+        composition_mode: CompositionMode::Supervise,
+        supervise_command: Some(stub),
+        supervise_ready_file: Some(ready),
+        supervise_kill_on_drop: false,
+        supervise_ready_timeout: Some(std::time::Duration::from_secs(5)),
+        ..BridgeConfig::default()
+    };
+    let h = start(&ws, cfg.clone()).expect("keep-available start");
+    drop(h);
+    let err = start(&ws, cfg).unwrap_err();
+    assert!(matches!(
+        err,
+        advance_embedded_runtime_bridge::BridgeError::AlreadyRunning
+    ));
+    if let Ok(pid) = fs::read_to_string(ws.join(".runtime").join("keep.pid")) {
+        let _ = Command::new("kill").arg(pid.trim()).status();
+    }
 }

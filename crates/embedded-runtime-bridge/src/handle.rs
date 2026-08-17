@@ -146,6 +146,11 @@ impl BridgeHandle {
     }
 
     pub fn on_lifecycle(&self, input: BridgeLifecycleInput) -> Result<(), BridgeError> {
+        if let Some(pct) = input.battery_pct {
+            if pct > 100 {
+                return Err(BridgeError::InvalidArg);
+            }
+        }
         let mut g = self
             .inner
             .lifecycle
@@ -154,20 +159,18 @@ impl BridgeHandle {
         *g = input;
         Ok(())
     }
+
+    pub(crate) async fn stop_async_inner(self) -> Result<(), BridgeError> {
+        stop_inner_async(&self.inner, true).await
+    }
 }
 
 impl Drop for BridgeInner {
     fn drop(&mut self) {
         // Last Arc dropped — always cleanup here (no strong_count race).
-        let kill_on_drop = match &*self.mode.get_mut().unwrap_or_else(|e| e.into_inner()) {
-            ModeState::Embed { .. } => true,
-            ModeState::Supervise { kill_on_drop, .. } => *kill_on_drop,
-        };
-        // Reconstruct Arc-less stop path: mark stopped and tear down sync.
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
-        // Abort drains / take child under mode without Arc.
         let mut drains = Vec::new();
         let mut child = None;
         let force = {
@@ -189,94 +192,108 @@ impl Drop for BridgeInner {
                 }
             }
         };
-        let _ = kill_on_drop;
         for t in drains {
             t.abort();
         }
         if let Some(mut c) = child {
             if force {
                 let _ = c.start_kill();
-                // Best-effort sync wait via block_on_global.
                 runtime_rt::block_on_global(async move {
                     let _ = tokio::time::timeout(STOP_GRACE, c.wait()).await;
                 });
             }
+            // else: keep-available — Child drops without kill (Command.kill_on_drop=false).
         }
-        if self.reserved.swap(false, Ordering::SeqCst) {
+        // Keep-available must not release the process-local reservation, or a
+        // later start() in this process would double-spawn beside the live child.
+        if force && self.reserved.swap(false, Ordering::SeqCst) {
             registry::release(&self.workspace);
         }
     }
 }
 
 fn stop_inner(inner: &Arc<BridgeInner>, force_reap: bool) -> Result<(), BridgeError> {
-    // Idempotent: only the first caller performs teardown.
     if inner.stopped.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
-
     let inner_for_reset = Arc::clone(inner);
     let inner = Arc::clone(inner);
-    let result = runtime_rt::block_on_global(async move {
-        // Extract resources under the mutex, then await without holding the guard.
-        enum Pending {
-            Embed,
-            Reap(Child),
-            Detach(Child),
-            None,
-        }
-        let mut drains: Vec<JoinHandle<()>> = Vec::new();
-        let pending = {
-            let mut mode = inner
-                .mode
-                .lock()
-                .map_err(|_| BridgeError::Internal("mode lock".into()))?;
-            match &mut *mode {
-                ModeState::Embed { host, lock } => {
-                    *host = None;
-                    *lock = None;
-                    Pending::Embed
-                }
-                ModeState::Supervise {
-                    child,
-                    drain_tasks,
-                    kill_on_drop,
-                    ..
-                } => {
-                    drains = std::mem::take(drain_tasks);
-                    let c = child.take();
-                    if force_reap || *kill_on_drop {
-                        c.map(Pending::Reap).unwrap_or(Pending::None)
-                    } else {
-                        c.map(Pending::Detach).unwrap_or(Pending::None)
-                    }
-                }
-            }
-        };
-        for t in drains {
-            t.abort();
-        }
-        match pending {
-            Pending::Reap(mut c) => {
-                let _ = c.start_kill();
-                let _ = tokio::time::timeout(STOP_GRACE, c.wait()).await;
-                let _ = c.start_kill();
-                let _ = tokio::time::timeout(STOP_GRACE, c.wait()).await;
-            }
-            Pending::Detach(_c) => {
-                // Drop without kill (keep-available).
-            }
-            Pending::Embed | Pending::None => {}
-        }
-        if inner.reserved.swap(false, Ordering::SeqCst) {
-            registry::release(&inner.workspace);
-        }
-        Ok(())
-    });
+    let result = runtime_rt::block_on_global(async move { teardown(inner, force_reap).await });
     if result.is_err() {
-        // Allow a later stop attempt if teardown failed mid-flight.
         inner_for_reset.stopped.store(false, Ordering::SeqCst);
     }
     result
+}
+
+async fn stop_inner_async(inner: &Arc<BridgeInner>, force_reap: bool) -> Result<(), BridgeError> {
+    if inner.stopped.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let inner_for_reset = Arc::clone(inner);
+    let inner = Arc::clone(inner);
+    let result = teardown(inner, force_reap).await;
+    if result.is_err() {
+        inner_for_reset.stopped.store(false, Ordering::SeqCst);
+    }
+    result
+}
+
+async fn teardown(inner: Arc<BridgeInner>, force_reap: bool) -> Result<(), BridgeError> {
+    enum Pending {
+        Embed,
+        Reap(Child),
+        Detach(Child),
+        None,
+    }
+    let mut drains: Vec<JoinHandle<()>> = Vec::new();
+    let pending = {
+        let mut mode = inner
+            .mode
+            .lock()
+            .map_err(|_| BridgeError::Internal("mode lock".into()))?;
+        match &mut *mode {
+            ModeState::Embed { host, lock } => {
+                *host = None;
+                *lock = None;
+                Pending::Embed
+            }
+            ModeState::Supervise {
+                child,
+                drain_tasks,
+                kill_on_drop,
+                ..
+            } => {
+                drains = std::mem::take(drain_tasks);
+                let c = child.take();
+                if force_reap || *kill_on_drop {
+                    c.map(Pending::Reap).unwrap_or(Pending::None)
+                } else {
+                    c.map(Pending::Detach).unwrap_or(Pending::None)
+                }
+            }
+        }
+    };
+    for t in drains {
+        t.abort();
+    }
+    let release = !matches!(pending, Pending::Detach(_));
+    match pending {
+        Pending::Reap(mut c) => {
+            let _ = c.start_kill();
+            let _ = tokio::time::timeout(STOP_GRACE, c.wait()).await;
+            let _ = c.start_kill();
+            let _ = tokio::time::timeout(STOP_GRACE, c.wait()).await;
+        }
+        Pending::Detach(_c) => {
+            // Keep-available: child stays up. Do not release the process-local
+            // reservation so a second start in this process cannot double-spawn.
+        }
+        Pending::Embed | Pending::None => {}
+    }
+    if release && inner.reserved.swap(false, Ordering::SeqCst) {
+        registry::release(&inner.workspace);
+    }
+    Ok(())
 }
 
 /// Initial lifecycle default.

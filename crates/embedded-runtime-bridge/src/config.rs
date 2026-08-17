@@ -92,6 +92,15 @@ impl BridgeConfig {
         }
 
         if matches!(self.composition_mode, CompositionMode::Supervise)
+            && self.supervise_ready_file.is_some()
+            && self.supervise_command.is_none()
+        {
+            return Err(BridgeError::InvalidConfig(
+                "supervise_ready_file requires custom supervise_command".into(),
+            ));
+        }
+
+        if matches!(self.composition_mode, CompositionMode::Supervise)
             && !self.supervise_kill_on_drop
         {
             // Keep-available: macOS host + Mac platform + ready_file + custom command.

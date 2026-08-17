@@ -119,8 +119,10 @@ pub async fn health_async(handle: &BridgeHandle) -> Result<BridgeHealth, BridgeE
     handle.health()
 }
 
-/// Async stop.
+/// Async stop — hops to GLOBAL_RT so child wait stays runtime-affine.
 pub async fn stop_async(handle: BridgeHandle) -> Result<(), BridgeError> {
-    // stop uses block_on_global internally; call directly.
-    handle.stop()
+    runtime_rt::global_rt()
+        .spawn(async move { handle.stop_async_inner().await })
+        .await
+        .map_err(|e| BridgeError::Internal(format!("join: {e}")))?
 }

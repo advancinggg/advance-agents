@@ -237,6 +237,52 @@ fn t19_concurrent_reserve() {
 }
 
 #[test]
+fn t26b_battery_over_100_rejected() {
+    let (_g, ws) = write_workspace();
+    let h = start(&ws, embed_cfg()).unwrap();
+    let err = on_lifecycle(
+        &h,
+        BridgeLifecycleInput {
+            state: PlatformLifecycleState::Foreground,
+            battery_pct: Some(101),
+            network_class: None,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        advance_embedded_runtime_bridge::BridgeError::InvalidArg
+    ));
+    stop(h).unwrap();
+}
+
+#[test]
+fn t31b_ready_file_requires_command() {
+    let mut c = embed_cfg();
+    c.composition_mode = CompositionMode::Supervise;
+    c.supervise_ready_file = Some(std::path::PathBuf::from(".runtime/ready"));
+    c.supervise_command = None;
+    assert!(c.validate().is_err());
+}
+
+#[test]
+fn t35_stop_async_from_tokio() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (_g, ws) = write_workspace();
+        let h = advance_embedded_runtime_bridge::start_async(&ws, embed_cfg())
+            .await
+            .expect("start_async");
+        advance_embedded_runtime_bridge::stop_async(h)
+            .await
+            .expect("stop_async");
+    });
+}
+
+#[test]
 fn t31_keep_available_invalid_without_ready_file() {
     let mut c = embed_cfg();
     c.composition_mode = CompositionMode::Supervise;

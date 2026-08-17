@@ -2,14 +2,14 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-use crate::config::{confine_under_workspace, BridgeConfig};
+use crate::config::{confine_under_workspace, resolve_config_path, BridgeConfig};
 use crate::error::BridgeError;
 use crate::handle::{default_lifecycle, BridgeHandle, BridgeInner, ModeState};
 use crate::registry;
@@ -17,6 +17,7 @@ use crate::types::SuperviseReadiness;
 use crate::workspace::prepare_workspace;
 
 const STOP_GRACE: Duration = Duration::from_secs(5);
+const LINE_CAP: usize = 4096;
 
 /// Supervise start (must run on GLOBAL_RT).
 pub async fn start_supervise(
@@ -25,6 +26,7 @@ pub async fn start_supervise(
 ) -> Result<BridgeHandle, BridgeError> {
     config.validate()?;
     let workspace = prepare_workspace(workspace_root)?;
+    reject_nondefault_supervise_config(&workspace, &config)?;
     registry::reserve(workspace.clone())?;
 
     let result = start_supervise_inner(workspace.clone(), config).await;
@@ -34,34 +36,69 @@ pub async fn start_supervise(
     result
 }
 
+fn reject_nondefault_supervise_config(
+    workspace: &Path,
+    config: &BridgeConfig,
+) -> Result<(), BridgeError> {
+    if let Some(ref p) = config.config_path {
+        let resolved = confine_under_workspace(workspace, p)?;
+        let default = workspace.join(".advance").join("runtime-config.yaml");
+        let default_canon = default.canonicalize().unwrap_or(default);
+        if resolved != default_canon && resolved != workspace.join(".advance").join("runtime-config.yaml")
+        {
+            return Err(BridgeError::InvalidConfig(
+                "supervise ignores custom config_path; CLI start only loads <ws>/.advance/runtime-config.yaml"
+                    .into(),
+            ));
+        }
+    }
+    if config.supervise_ready_file.is_some() && config.supervise_command.is_none() {
+        return Err(BridgeError::InvalidConfig(
+            "supervise_ready_file requires custom supervise_command (default advance has no ready-file protocol)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_ready_file_shape(workspace: &Path, rf: &Path) -> Result<(), BridgeError> {
+    let runtime_dir = workspace.join(".runtime");
+    let name_ok = rf
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_ascii_lowercase().contains("ready"))
+        .unwrap_or(false);
+    let under_runtime = rf.starts_with(&runtime_dir);
+    if !(under_runtime && name_ok) {
+        return Err(BridgeError::InvalidConfig(
+            "supervise_ready_file must be under .runtime/ with 'ready' in the filename".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn start_supervise_inner(
     workspace: PathBuf,
     config: BridgeConfig,
 ) -> Result<BridgeHandle, BridgeError> {
     let cmd_path = resolve_command(&config)?;
     let ready_file = if let Some(ref rf) = config.supervise_ready_file {
-        Some(confine_under_workspace(&workspace, rf)?)
+        let confined = confine_under_workspace(&workspace, rf)?;
+        require_ready_file_shape(&workspace, &confined)?;
+        Some(confined)
     } else {
         None
     };
 
     if let Some(ref rf) = ready_file {
-        // Only auto-clear markers under workspace/.runtime/ with "ready" in the name.
-        let runtime_dir = workspace.join(".runtime");
-        let name_ok = rf
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.to_ascii_lowercase().contains("ready"))
-            .unwrap_or(false);
-        let under_runtime = rf.starts_with(&runtime_dir);
         if rf.exists() {
-            if under_runtime && name_ok && rf.is_file() {
+            if rf.is_file() {
                 std::fs::remove_file(rf).map_err(|e| {
                     BridgeError::Supervise(format!("failed to clear ready_file before spawn: {e}"))
                 })?;
             } else {
                 return Err(BridgeError::InvalidConfig(
-                    "supervise_ready_file must be a new path under .runtime/ with 'ready' in the name (refusing to delete arbitrary files)".into(),
+                    "supervise_ready_file exists and is not a regular file".into(),
                 ));
             }
         }
@@ -69,9 +106,7 @@ async fn start_supervise_inner(
 
     let kill_on_drop = config.supervise_kill_on_drop;
     let use_file_ready = ready_file.is_some();
-    // Pipe only when we need line readiness; file readiness uses null stdio so
-    // pipes never fill. Keep-available also uses null.
-    let pipe_stdio = kill_on_drop && !use_file_ready;
+    let pipe_stdio = !use_file_ready;
     let mut command = Command::new(&cmd_path);
     command
         .arg("start")
@@ -96,7 +131,6 @@ async fn start_supervise_inner(
 
     let mut drain_tasks = Vec::new();
     let readiness = if let Some(ref rf) = ready_file {
-        // File readiness: require post-spawn mtime (no fail-open on stale content).
         let rf = rf.clone();
         let deadline = spawn_at + timeout;
         loop {
@@ -104,27 +138,20 @@ async fn start_supervise_inner(
                 reap_child(&mut child).await;
                 return Err(BridgeError::SuperviseStartTimeout);
             }
+            if file_ready_fresh(&rf, spawn_sys) {
+                break SuperviseReadiness::ReadyFile;
+            }
             if let Ok(Some(status)) = child.try_wait() {
+                if file_ready_fresh(&rf, spawn_sys) {
+                    break SuperviseReadiness::ReadyFile;
+                }
                 return Err(BridgeError::Supervise(format!(
                     "child exited before ready: {status}"
                 )));
             }
-            if rf.is_file() {
-                if let Ok(meta) = std::fs::metadata(&rf) {
-                    let post_spawn = meta
-                        .modified()
-                        .ok()
-                        .and_then(|m| m.duration_since(spawn_sys).ok())
-                        .is_some();
-                    if post_spawn && meta.len() > 0 {
-                        break SuperviseReadiness::ReadyFile;
-                    }
-                }
-            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     } else {
-        // Line readiness with continuous drain
         let stdout = child
             .stdout
             .take()
@@ -133,38 +160,35 @@ async fn start_supervise_inner(
             .stderr
             .take()
             .ok_or_else(|| BridgeError::Supervise("missing stderr".into()))?;
-        // Bounded queue: drop oldest on overflow (DoS resistance).
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
-        let tx2 = tx.clone();
+        let seen = Arc::new(AtomicBool::new(false));
+        let s1 = Arc::clone(&seen);
+        let s2 = Arc::clone(&seen);
         let m1 = marker.clone();
+        let m2 = marker.clone();
         drain_tasks.push(tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let line = if line.len() > 4096 {
-                    line.chars().take(4096).collect()
-                } else {
-                    line
-                };
-                if tx.try_send(line).is_err() {
-                    // Drop line if full — still drain the pipe.
-                }
-            }
+            scan_limited_lines(stdout, &m1, &s1).await;
         }));
         drain_tasks.push(tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let line = if line.len() > 4096 {
-                    line.chars().take(4096).collect()
-                } else {
-                    line
-                };
-                let _ = tx2.try_send(line);
-            }
+            scan_limited_lines(stderr, &m2, &s2).await;
         }));
         let deadline = spawn_at + timeout;
-        let mut latched = false;
-        while Instant::now() < deadline {
+        loop {
+            if seen.load(Ordering::SeqCst) {
+                break SuperviseReadiness::DaemonReadyLine;
+            }
+            if Instant::now() > deadline {
+                for t in drain_tasks.drain(..) {
+                    t.abort();
+                }
+                reap_child(&mut child).await;
+                return Err(BridgeError::SuperviseStartTimeout);
+            }
             if let Ok(Some(status)) = child.try_wait() {
+                // Give drain tasks a beat to observe a last-line marker.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if seen.load(Ordering::SeqCst) {
+                    break SuperviseReadiness::DaemonReadyLine;
+                }
                 for t in drain_tasks.drain(..) {
                     t.abort();
                 }
@@ -172,30 +196,8 @@ async fn start_supervise_inner(
                     "child exited before ready: {status}"
                 )));
             }
-            while let Ok(line) = rx.try_recv() {
-                if line_contains_marker(&line, &m1) {
-                    latched = true;
-                    break;
-                }
-            }
-            if latched {
-                // Keep draining in background until exit (tasks already running).
-                break;
-            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        if !latched {
-            for t in drain_tasks.drain(..) {
-                t.abort();
-            }
-            reap_child(&mut child).await;
-            return Err(BridgeError::SuperviseStartTimeout);
-        }
-        // Continue draining remaining lines on existing tasks; spawn a no-op consumer.
-        drain_tasks.push(tokio::spawn(async move {
-            while rx.recv().await.is_some() {}
-        }));
-        SuperviseReadiness::DaemonReadyLine
     };
 
     let inner = Arc::new(BridgeInner {
@@ -212,6 +214,63 @@ async fn start_supervise_inner(
         reserved: AtomicBool::new(true),
     });
     Ok(BridgeHandle::new(inner))
+}
+
+fn file_ready_fresh(rf: &Path, spawn_sys: SystemTime) -> bool {
+    if !rf.is_file() {
+        return false;
+    }
+    let Ok(meta) = std::fs::metadata(rf) else {
+        return false;
+    };
+    let post_spawn = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(spawn_sys).ok())
+        .is_some();
+    post_spawn && meta.len() > 0
+}
+
+/// Read at most LINE_CAP bytes per line so a newline-free flood cannot grow without bound.
+async fn scan_limited_lines<R>(mut reader: R, marker: &str, seen: &AtomicBool)
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        match read_limited_line(&mut reader).await {
+            Ok(Some(line)) => {
+                if line_contains_marker(&line, marker) {
+                    seen.store(true, Ordering::SeqCst);
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+}
+
+async fn read_limited_line<R>(reader: &mut R) -> std::io::Result<Option<String>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = Vec::with_capacity(64);
+    let mut tmp = [0u8; 1];
+    loop {
+        let n = reader.read(&mut tmp).await?;
+        if n == 0 {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        if tmp[0] == b'\n' {
+            break;
+        }
+        if buf.len() < LINE_CAP {
+            buf.push(tmp[0]);
+        }
+        // Past LINE_CAP: keep consuming until newline/EOF without growing.
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
 fn resolve_command(config: &BridgeConfig) -> Result<PathBuf, BridgeError> {
@@ -254,6 +313,12 @@ async fn reap_child(child: &mut tokio::process::Child) {
     let _ = tokio::time::timeout(STOP_GRACE, child.wait()).await;
 }
 
+/// Silence unused import if resolve_config_path is kept for future CLI flags.
+#[allow(dead_code)]
+fn _cfg_path_hint(workspace: &Path, config: &BridgeConfig) -> Result<PathBuf, BridgeError> {
+    resolve_config_path(workspace, config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +329,9 @@ mod tests {
             "advance: runtime ready (workspace=foo)",
             "advance: runtime ready"
         ));
-        assert!(!line_contains_marker("still starting", "advance: runtime ready"));
+        assert!(!line_contains_marker(
+            "still starting",
+            "advance: runtime ready"
+        ));
     }
 }
