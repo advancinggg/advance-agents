@@ -195,8 +195,10 @@ impl Drop for BridgeInner {
         }
         if let Some(mut c) = child {
             if force {
+                // Signal before the helper-thread wait so a spawn failure
+                // cannot skip start_kill (SpawnGuard already does this).
+                let _ = c.start_kill();
                 runtime_rt::block_on_global_best_effort(async move {
-                    let _ = c.start_kill();
                     let _ = tokio::time::timeout(STOP_GRACE, c.wait()).await;
                     let _ = c.start_kill();
                     let _ = tokio::time::timeout(STOP_GRACE, c.wait()).await;
