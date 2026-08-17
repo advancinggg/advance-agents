@@ -24,9 +24,37 @@ pub fn reserve(workspace: PathBuf) -> Result<(), BridgeError> {
 }
 
 /// Release a previously reserved workspace.
-pub fn release(workspace: &PathBuf) {
+pub(crate) fn release(workspace: &PathBuf) {
     if let Ok(mut g) = registry().lock() {
         g.remove(workspace);
+    }
+}
+
+/// RAII reservation: released on drop unless [`Reservation::persist`] is called.
+/// Cancel of `start_async` after reserve therefore cannot leak the slot.
+pub(crate) struct Reservation {
+    path: Option<PathBuf>,
+}
+
+impl Reservation {
+    pub(crate) fn acquire(workspace: PathBuf) -> Result<Self, BridgeError> {
+        reserve(workspace.clone())?;
+        Ok(Self {
+            path: Some(workspace),
+        })
+    }
+
+    /// Transfer ownership to [`crate::handle::BridgeInner`]; Drop will not release.
+    pub(crate) fn persist(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            release(&p);
+        }
     }
 }
 

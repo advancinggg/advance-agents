@@ -50,6 +50,9 @@ pub fn embed_lock_heartbeat_ok(workspace: &Path) -> bool {
     let Some(snap) = parse_lock_file(&path) else {
         return false;
     };
+    if snap.pid == 0 {
+        return false;
+    }
     heartbeat_fresh(&snap.heartbeat_at)
 }
 

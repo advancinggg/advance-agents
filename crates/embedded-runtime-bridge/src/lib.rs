@@ -8,22 +8,22 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod config;
-pub mod embed;
+pub(crate) mod embed;
 pub mod error;
 #[allow(unsafe_code)]
 pub mod ffi;
 
 // Re-export safe C ABI version for tests without needing unsafe in callers.
 pub use ffi::advance_bridge_abi_version;
-pub mod handle;
-pub mod lock_status;
-pub mod noop_bus;
-pub mod profile;
-pub mod registry;
-pub mod runtime_rt;
-pub mod supervise;
+pub(crate) mod handle;
+pub(crate) mod lock_status;
+pub(crate) mod noop_bus;
+pub(crate) mod profile;
+pub(crate) mod registry;
+pub(crate) mod runtime_rt;
+pub(crate) mod supervise;
 pub mod types;
-pub mod workspace;
+pub(crate) mod workspace;
 
 pub use config::BridgeConfig;
 pub use error::BridgeError;

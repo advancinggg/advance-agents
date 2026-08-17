@@ -25,16 +25,25 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
+    block_on_global_best_effort(fut).expect("bridge helper thread")
+}
+
+/// Like [`block_on_global`] but never panics — for `Drop` paths.
+pub fn block_on_global_best_effort<F, T>(fut: F) -> Option<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
     if tokio::runtime::Handle::try_current().is_ok() {
         let rt = global_rt();
         std::thread::Builder::new()
             .name("advance-bridge-block".into())
             .spawn(move || rt.block_on(fut))
-            .expect("spawn bridge helper thread")
+            .ok()?
             .join()
-            .expect("bridge helper thread panicked")
+            .ok()
     } else {
-        global_rt().block_on(fut)
+        Some(global_rt().block_on(fut))
     }
 }
 

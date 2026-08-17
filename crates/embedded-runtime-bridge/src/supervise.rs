@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -27,11 +27,11 @@ pub async fn start_supervise(
     config.validate()?;
     let workspace = prepare_workspace(workspace_root)?;
     reject_nondefault_supervise_config(&workspace, &config)?;
-    registry::reserve(workspace.clone())?;
+    let reservation = registry::Reservation::acquire(workspace.clone())?;
 
-    let result = start_supervise_inner(workspace.clone(), config).await;
-    if result.is_err() {
-        registry::release(&workspace);
+    let result = start_supervise_inner(workspace, config).await;
+    if result.is_ok() {
+        reservation.persist();
     }
     result
 }
@@ -74,6 +74,13 @@ fn require_ready_file_shape(workspace: &Path, rf: &Path) -> Result<(), BridgeErr
             "supervise_ready_file must be under .runtime/ with 'ready' in the filename".into(),
         ));
     }
+    if let Some(parent) = rf.parent() {
+        if !parent.exists() {
+            return Err(BridgeError::InvalidConfig(
+                "supervise_ready_file parent directory must exist".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -91,17 +98,7 @@ async fn start_supervise_inner(
     };
 
     if let Some(ref rf) = ready_file {
-        if rf.exists() {
-            if rf.is_file() {
-                std::fs::remove_file(rf).map_err(|e| {
-                    BridgeError::Supervise(format!("failed to clear ready_file before spawn: {e}"))
-                })?;
-            } else {
-                return Err(BridgeError::InvalidConfig(
-                    "supervise_ready_file exists and is not a regular file".into(),
-                ));
-            }
-        }
+        clear_ready_file_if_regular(rf)?;
     }
 
     let kill_on_drop = config.supervise_kill_on_drop;
@@ -112,6 +109,7 @@ async fn start_supervise_inner(
         .arg("start")
         .arg("--workspace")
         .arg(&workspace)
+        .stdin(Stdio::null())
         .kill_on_drop(false);
 
     if pipe_stdio {
@@ -125,7 +123,6 @@ async fn start_supervise_inner(
         .map_err(|e| BridgeError::Supervise(format!("spawn: {e}")))?;
 
     let spawn_at = Instant::now();
-    let spawn_sys = SystemTime::now();
     let timeout = config.ready_timeout();
     let marker = config.ready_marker().to_string();
 
@@ -138,16 +135,32 @@ async fn start_supervise_inner(
                 reap_child(&mut child).await;
                 return Err(BridgeError::SuperviseStartTimeout);
             }
-            if file_ready_fresh(&rf, spawn_sys) {
-                break SuperviseReadiness::ReadyFile;
-            }
-            if let Ok(Some(status)) = child.try_wait() {
-                if file_ready_fresh(&rf, spawn_sys) {
-                    break SuperviseReadiness::ReadyFile;
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return Err(BridgeError::Supervise(format!(
+                        "child exited before ready: {status}"
+                    )));
                 }
-                return Err(BridgeError::Supervise(format!(
-                    "child exited before ready: {status}"
-                )));
+                Ok(None) => {
+                    if file_ready_regular(&rf) {
+                        match child.try_wait() {
+                            Ok(None) => break SuperviseReadiness::ReadyFile,
+                            Ok(Some(status)) => {
+                                return Err(BridgeError::Supervise(format!(
+                                    "child exited before ready: {status}"
+                                )));
+                            }
+                            Err(e) => {
+                                reap_child(&mut child).await;
+                                return Err(BridgeError::Supervise(format!("try_wait: {e}")));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    reap_child(&mut child).await;
+                    return Err(BridgeError::Supervise(format!("try_wait: {e}")));
+                }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -216,61 +229,61 @@ async fn start_supervise_inner(
     Ok(BridgeHandle::new(inner))
 }
 
-fn file_ready_fresh(rf: &Path, spawn_sys: SystemTime) -> bool {
-    if !rf.is_file() {
-        return false;
+fn clear_ready_file_if_regular(rf: &Path) -> Result<(), BridgeError> {
+    match std::fs::symlink_metadata(rf) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(BridgeError::InvalidConfig(
+            "supervise_ready_file must not be a symlink".into(),
+        )),
+        Ok(meta) if meta.file_type().is_file() => std::fs::remove_file(rf).map_err(|e| {
+            BridgeError::Supervise(format!("failed to clear ready_file before spawn: {e}"))
+        }),
+        Ok(_) => Err(BridgeError::InvalidConfig(
+            "supervise_ready_file exists and is not a regular file".into(),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(BridgeError::Supervise(format!(
+            "ready_file metadata: {e}"
+        ))),
     }
-    let Ok(meta) = std::fs::metadata(rf) else {
-        return false;
-    };
-    let post_spawn = meta
-        .modified()
-        .ok()
-        .and_then(|m| m.duration_since(spawn_sys).ok())
-        .is_some();
-    post_spawn && meta.len() > 0
 }
 
-/// Read at most LINE_CAP bytes per line so a newline-free flood cannot grow without bound.
+/// True when `rf` is a non-empty regular file (symlink_metadata, no follow).
+fn file_ready_regular(rf: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(rf) else {
+        return false;
+    };
+    meta.file_type().is_file() && meta.len() > 0
+}
+
+/// Read chunks; cap each line at LINE_CAP so a newline-free flood cannot grow without bound.
 async fn scan_limited_lines<R>(mut reader: R, marker: &str, seen: &AtomicBool)
 where
     R: AsyncRead + Unpin,
 {
+    let mut acc = Vec::with_capacity(256);
+    let mut tmp = [0u8; 4096];
     loop {
-        match read_limited_line(&mut reader).await {
-            Ok(Some(line)) => {
-                if line_contains_marker(&line, marker) {
+        let n = match reader.read(&mut tmp).await {
+            Ok(0) => {
+                if !acc.is_empty() && line_contains_marker(&String::from_utf8_lossy(&acc), marker) {
                     seen.store(true, Ordering::SeqCst);
                 }
+                break;
             }
-            Ok(None) | Err(_) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        for &b in &tmp[..n] {
+            if b == b'\n' {
+                if line_contains_marker(&String::from_utf8_lossy(&acc), marker) {
+                    seen.store(true, Ordering::SeqCst);
+                }
+                acc.clear();
+            } else if acc.len() < LINE_CAP {
+                acc.push(b);
+            }
         }
     }
-}
-
-async fn read_limited_line<R>(reader: &mut R) -> std::io::Result<Option<String>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = Vec::with_capacity(64);
-    let mut tmp = [0u8; 1];
-    loop {
-        let n = reader.read(&mut tmp).await?;
-        if n == 0 {
-            if buf.is_empty() {
-                return Ok(None);
-            }
-            break;
-        }
-        if tmp[0] == b'\n' {
-            break;
-        }
-        if buf.len() < LINE_CAP {
-            buf.push(tmp[0]);
-        }
-        // Past LINE_CAP: keep consuming until newline/EOF without growing.
-    }
-    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
 fn resolve_command(config: &BridgeConfig) -> Result<PathBuf, BridgeError> {

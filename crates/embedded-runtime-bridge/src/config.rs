@@ -91,6 +91,14 @@ impl BridgeConfig {
             }
         }
 
+        if let Some(ref m) = self.supervise_ready_marker {
+            if m.is_empty() {
+                return Err(BridgeError::InvalidConfig(
+                    "supervise_ready_marker must be non-empty".into(),
+                ));
+            }
+        }
+
         if matches!(self.composition_mode, CompositionMode::Supervise)
             && self.supervise_ready_file.is_some()
             && self.supervise_command.is_none()
@@ -172,22 +180,32 @@ pub fn confine_under_workspace(workspace: &Path, path: &Path) -> Result<PathBuf,
         }
         Ok(canon)
     } else {
-        // Parent must be under workspace.
-        if let Some(parent) = joined.parent() {
-            if parent.exists() {
-                let p = parent.canonicalize().map_err(|e| {
-                    BridgeError::InvalidConfig(format!("canonicalize parent: {e}"))
-                })?;
-                if !p.starts_with(&ws) {
-                    return Err(BridgeError::InvalidConfig(
-                        "path escapes workspace".into(),
-                    ));
-                }
-            } else if !joined.starts_with(&ws) {
-                return Err(BridgeError::InvalidConfig(
-                    "path escapes workspace".into(),
-                ));
+        // Resolve the nearest existing ancestor (never lexical-only starts_with)
+        // so an intermediate symlink cannot later escape the workspace.
+        let mut anc = joined.parent();
+        let mut existing = None;
+        while let Some(p) = anc {
+            if p.as_os_str().is_empty() {
+                break;
             }
+            if p.exists() {
+                existing = Some(p.to_path_buf());
+                break;
+            }
+            anc = p.parent();
+        }
+        let Some(existing) = existing else {
+            return Err(BridgeError::InvalidConfig(
+                "path has no existing ancestor".into(),
+            ));
+        };
+        let p = existing.canonicalize().map_err(|e| {
+            BridgeError::InvalidConfig(format!("canonicalize ancestor: {e}"))
+        })?;
+        if !p.starts_with(&ws) {
+            return Err(BridgeError::InvalidConfig(
+                "path escapes workspace".into(),
+            ));
         }
         Ok(joined)
     }

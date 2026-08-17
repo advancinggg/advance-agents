@@ -197,16 +197,21 @@ impl Drop for BridgeInner {
         }
         if let Some(mut c) = child {
             if force {
-                let _ = c.start_kill();
-                runtime_rt::block_on_global(async move {
+                runtime_rt::block_on_global_best_effort(async move {
+                    let _ = c.start_kill();
+                    let _ = tokio::time::timeout(STOP_GRACE, c.wait()).await;
+                    let _ = c.start_kill();
                     let _ = tokio::time::timeout(STOP_GRACE, c.wait()).await;
                 });
+            } else {
+                // Keep-available: do not kill; reap on GLOBAL_RT so the pid is not a zombie.
+                drop(runtime_rt::global_rt().spawn(async move {
+                    let _ = c.wait().await;
+                }));
             }
-            // else: keep-available — Child drops without kill (Command.kill_on_drop=false).
         }
-        // Keep-available must not release the process-local reservation, or a
-        // later start() in this process would double-spawn beside the live child.
-        if force && self.reserved.swap(false, Ordering::SeqCst) {
+        // Plan T30: detach releases the process-local reservation.
+        if self.reserved.swap(false, Ordering::SeqCst) {
             registry::release(&self.workspace);
         }
     }
@@ -276,7 +281,6 @@ async fn teardown(inner: Arc<BridgeInner>, force_reap: bool) -> Result<(), Bridg
     for t in drains {
         t.abort();
     }
-    let release = !matches!(pending, Pending::Detach(_));
     match pending {
         Pending::Reap(mut c) => {
             let _ = c.start_kill();
@@ -284,13 +288,16 @@ async fn teardown(inner: Arc<BridgeInner>, force_reap: bool) -> Result<(), Bridg
             let _ = c.start_kill();
             let _ = tokio::time::timeout(STOP_GRACE, c.wait()).await;
         }
-        Pending::Detach(_c) => {
-            // Keep-available: child stays up. Do not release the process-local
-            // reservation so a second start in this process cannot double-spawn.
+        Pending::Detach(mut c) => {
+            // Keep-available detach: no kill; background wait reaps the pid.
+            drop(tokio::spawn(async move {
+                let _ = c.wait().await;
+            }));
         }
         Pending::Embed | Pending::None => {}
     }
-    if release && inner.reserved.swap(false, Ordering::SeqCst) {
+    // Always release: explicit stop reaps; detach is plan T30 (registry free).
+    if inner.reserved.swap(false, Ordering::SeqCst) {
         registry::release(&inner.workspace);
     }
     Ok(())

@@ -13,7 +13,6 @@ use advance_embedded_runtime_bridge::{
     ADVANCE_BRIDGE_ABI_VERSION,
 };
 
-#[cfg(unix)]
 const MINIMAL_YAML: &str = r#"
 wasm:
   max_memory_pages: 1024
@@ -52,7 +51,6 @@ database:
   pool-size: 4
 "#;
 
-#[cfg(unix)]
 fn write_workspace() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = fs::canonicalize(dir.path()).unwrap();
@@ -193,17 +191,20 @@ fn t34_ready_file_must_be_under_runtime() {
     ));
 }
 
-/// Keep-available Drop must not release the process-local reservation.
-#[cfg(all(unix, target_os = "macos"))]
-#[test]
-fn t32_keep_available_drop_blocks_restart() {
-    let dir = tempfile::tempdir().unwrap();
-    let (_g, ws) = write_workspace();
-    let ready = ws.join(".runtime").join("daemon.ready");
-    let stub = dir.path().join("keep-advance");
+#[cfg(unix)]
+fn chmod_755(path: &std::path::Path) {
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+#[cfg(unix)]
+fn write_ready_file_stub(dir: &std::path::Path, name: &str, extra: &str) -> PathBuf {
+    let path = dir.join(name);
     fs::write(
-        &stub,
-        r#"#!/bin/sh
+        &path,
+        format!(
+            r#"#!/bin/sh
 ws=""
 while [ $# -gt 0 ]; do
   if [ "$1" = "--workspace" ]; then
@@ -213,15 +214,30 @@ while [ $# -gt 0 ]; do
     shift
   fi
 done
-echo $$ > "$ws/.runtime/keep.pid"
+{extra}
+"#
+        ),
+    )
+    .unwrap();
+    chmod_755(&path);
+    path
+}
+
+/// Plan T30: keep-available Drop detaches, child stays up, registry is free.
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn t30_keep_available_drop_releases_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_g, ws) = write_workspace();
+    let ready = ws.join(".runtime").join("daemon.ready");
+    let stub = write_ready_file_stub(
+        dir.path(),
+        "keep-advance",
+        r#"echo $$ > "$ws/.runtime/keep.pid"
 printf ready > "$ws/.runtime/daemon.ready"
 exec sleep 60
 "#,
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&stub).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub, perms).unwrap();
+    );
     let cfg = BridgeConfig {
         platform: BridgePlatform::Mac,
         engine_mode: EngineMode::Jit,
@@ -234,12 +250,162 @@ exec sleep 60
     };
     let h = start(&ws, cfg.clone()).expect("keep-available start");
     drop(h);
-    let err = start(&ws, cfg).unwrap_err();
-    assert!(matches!(
-        err,
-        advance_embedded_runtime_bridge::BridgeError::AlreadyRunning
-    ));
+    // Registry must be free (plan T30). Second start is allowed.
+    let h2 = start(&ws, cfg).expect("second start after detach");
     if let Ok(pid) = fs::read_to_string(ws.join(".runtime").join("keep.pid")) {
         let _ = Command::new("kill").arg(pid.trim()).status();
     }
+    stop(h2).expect("stop second");
+}
+
+/// Plan T32: pre-existing stale ready file is deleted; start waits for a new file.
+#[cfg(unix)]
+#[test]
+fn t32_stale_ready_file_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_g, ws) = write_workspace();
+    let ready = ws.join(".runtime").join("daemon.ready");
+    fs::write(&ready, b"stale").unwrap();
+    let stub = write_ready_file_stub(
+        dir.path(),
+        "fresh-advance",
+        r#"sleep 0.2
+printf ready > "$ws/.runtime/daemon.ready"
+exec sleep 60
+"#,
+    );
+    let cfg = BridgeConfig {
+        platform: BridgePlatform::Mac,
+        engine_mode: EngineMode::Jit,
+        composition_mode: CompositionMode::Supervise,
+        supervise_command: Some(stub),
+        supervise_ready_file: Some(ready.clone()),
+        supervise_kill_on_drop: true,
+        supervise_ready_timeout: Some(std::time::Duration::from_secs(5)),
+        ..BridgeConfig::default()
+    };
+    let h = start(&ws, cfg).expect("start after stale ready deleted");
+    let text = fs::read_to_string(&ready).unwrap();
+    assert_eq!(text, "ready");
+    stop(h).expect("stop");
+}
+
+/// Ready-file writer that exits immediately must not publish a live handle.
+#[cfg(unix)]
+#[test]
+fn t36_ready_file_then_exit_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_g, ws) = write_workspace();
+    let ready = ws.join(".runtime").join("daemon.ready");
+    let stub = write_ready_file_stub(
+        dir.path(),
+        "exit-advance",
+        r#"printf ready > "$ws/.runtime/daemon.ready"
+exit 0
+"#,
+    );
+    let cfg = BridgeConfig {
+        platform: BridgePlatform::Mac,
+        engine_mode: EngineMode::Jit,
+        composition_mode: CompositionMode::Supervise,
+        supervise_command: Some(stub),
+        supervise_ready_file: Some(ready),
+        supervise_kill_on_drop: true,
+        supervise_ready_timeout: Some(std::time::Duration::from_secs(5)),
+        ..BridgeConfig::default()
+    };
+    let err = start(&ws, cfg).unwrap_err();
+    assert!(matches!(
+        err,
+        advance_embedded_runtime_bridge::BridgeError::Supervise(_)
+            | advance_embedded_runtime_bridge::BridgeError::SuperviseStartTimeout
+    ));
+}
+
+/// Plan T30c: default Drop reaps the child.
+#[cfg(unix)]
+#[test]
+fn t30c_default_drop_reaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_g, ws) = write_workspace();
+    let stub = write_ready_stub(dir.path());
+    let cfg = BridgeConfig {
+        platform: BridgePlatform::Mac,
+        engine_mode: EngineMode::Jit,
+        composition_mode: CompositionMode::Supervise,
+        supervise_command: Some(stub),
+        supervise_kill_on_drop: true,
+        ..BridgeConfig::default()
+    };
+    let h = start(&ws, cfg).expect("start");
+    drop(h);
+}
+
+/// Plan T13 subset: invoke the C ABI from Rust (null args, buffer, start/stop/double-stop/free).
+#[test]
+fn t13_c_abi_lifecycle() {
+    use std::ffi::CString;
+    use advance_embedded_runtime_bridge::ffi::{
+        advance_bridge_free_handle, advance_bridge_health, advance_bridge_on_lifecycle,
+        advance_bridge_start, advance_bridge_stop, AdvanceBridgeHandle,
+    };
+
+    let rc = unsafe {
+        advance_bridge_start(
+            std::ptr::null(),
+            0,
+            0,
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 1);
+
+    let (_g, ws) = write_workspace();
+    let ws_c = CString::new(ws.to_str().unwrap()).unwrap();
+    let mut handle: *mut AdvanceBridgeHandle = std::ptr::null_mut();
+    let rc = unsafe {
+        advance_bridge_start(
+            ws_c.as_ptr(),
+            0,
+            0,
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            std::ptr::null(),
+            &mut handle,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert!(!handle.is_null());
+
+    let mut needed = 0usize;
+    let rc = unsafe { advance_bridge_health(handle, std::ptr::null_mut(), 0, &mut needed) };
+    assert_eq!(rc, 12);
+    assert!(needed > 1);
+
+    let mut buf = vec![0u8; needed];
+    let rc = unsafe {
+        advance_bridge_health(
+            handle,
+            buf.as_mut_ptr() as *mut std::os::raw::c_char,
+            buf.len(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let rc = unsafe { advance_bridge_on_lifecycle(handle, 0, 80, std::ptr::null()) };
+    assert_eq!(rc, 0);
+    let rc = unsafe { advance_bridge_on_lifecycle(handle, 0, 101, std::ptr::null()) };
+    assert_eq!(rc, 1);
+
+    assert_eq!(unsafe { advance_bridge_stop(handle) }, 0);
+    assert_eq!(unsafe { advance_bridge_stop(handle) }, 0);
+    unsafe { advance_bridge_free_handle(handle) };
 }

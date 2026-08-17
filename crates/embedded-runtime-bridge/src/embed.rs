@@ -28,11 +28,11 @@ pub async fn start_embed(
 ) -> Result<BridgeHandle, BridgeError> {
     config.validate()?;
     let workspace = prepare_workspace(workspace_root)?;
-    registry::reserve(workspace.clone())?;
+    let reservation = registry::Reservation::acquire(workspace.clone())?;
 
-    let result = start_embed_inner(workspace.clone(), config).await;
-    if result.is_err() {
-        registry::release(&workspace);
+    let result = start_embed_inner(workspace, config).await;
+    if result.is_ok() {
+        reservation.persist();
     }
     result
 }

@@ -266,6 +266,13 @@ fn t31b_ready_file_requires_command() {
 }
 
 #[test]
+fn t31c_empty_ready_marker_rejected() {
+    let mut c = embed_cfg();
+    c.supervise_ready_marker = Some(String::new());
+    assert!(c.validate().is_err());
+}
+
+#[test]
 fn t35_stop_async_from_tokio() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
