@@ -249,10 +249,12 @@ exec sleep 60
         ..BridgeConfig::default()
     };
     let h = start(&ws, cfg.clone()).expect("keep-available start");
+    let pid1 = fs::read_to_string(ws.join(".runtime").join("keep.pid")).ok();
     drop(h);
     // Registry must be free (plan T30). Second start is allowed.
     let h2 = start(&ws, cfg).expect("second start after detach");
-    if let Ok(pid) = fs::read_to_string(ws.join(".runtime").join("keep.pid")) {
+    let pid2 = fs::read_to_string(ws.join(".runtime").join("keep.pid")).ok();
+    for pid in [pid1, pid2].into_iter().flatten() {
         let _ = Command::new("kill").arg(pid.trim()).status();
     }
     stop(h2).expect("stop second");
@@ -310,6 +312,39 @@ exit 0
         composition_mode: CompositionMode::Supervise,
         supervise_command: Some(stub),
         supervise_ready_file: Some(ready),
+        supervise_kill_on_drop: true,
+        supervise_ready_timeout: Some(std::time::Duration::from_secs(5)),
+        ..BridgeConfig::default()
+    };
+    let err = start(&ws, cfg).unwrap_err();
+    assert!(matches!(
+        err,
+        advance_embedded_runtime_bridge::BridgeError::Supervise(_)
+            | advance_embedded_runtime_bridge::BridgeError::SuperviseStartTimeout
+    ));
+}
+
+/// Line-mode writer that prints the marker then exits must not publish a live handle.
+#[cfg(unix)]
+#[test]
+fn t36b_ready_line_then_exit_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_g, ws) = write_workspace();
+    let path = dir.path().join("exit-line-advance");
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+echo "advance: runtime ready (workspace=stub)"
+exit 0
+"#,
+    )
+    .unwrap();
+    chmod_755(&path);
+    let cfg = BridgeConfig {
+        platform: BridgePlatform::Mac,
+        engine_mode: EngineMode::Jit,
+        composition_mode: CompositionMode::Supervise,
+        supervise_command: Some(path),
         supervise_kill_on_drop: true,
         supervise_ready_timeout: Some(std::time::Duration::from_secs(5)),
         ..BridgeConfig::default()

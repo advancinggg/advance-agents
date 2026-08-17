@@ -13,6 +13,7 @@ use crate::config::{confine_under_workspace, resolve_config_path, BridgeConfig};
 use crate::error::BridgeError;
 use crate::handle::{default_lifecycle, BridgeHandle, BridgeInner, ModeState};
 use crate::registry;
+use crate::runtime_rt;
 use crate::types::SuperviseReadiness;
 use crate::workspace::prepare_workspace;
 
@@ -102,8 +103,8 @@ async fn start_supervise_inner(
     }
 
     let kill_on_drop = config.supervise_kill_on_drop;
-    let use_file_ready = ready_file.is_some();
-    let pipe_stdio = !use_file_ready;
+    // Plan: kill_on_drop true → piped + continuous drain; keep-available → null.
+    let pipe_stdio = kill_on_drop;
     let mut command = Command::new(&cmd_path);
     command
         .arg("start")
@@ -118,24 +119,38 @@ async fn start_supervise_inner(
         command.stdout(Stdio::null()).stderr(Stdio::null());
     }
 
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|e| BridgeError::Supervise(format!("spawn: {e}")))?;
+    // Reap on cancel / early return so start_async abort cannot orphan the child.
+    let mut guard = SpawnGuard::new(child);
 
     let spawn_at = Instant::now();
     let timeout = config.ready_timeout();
     let marker = config.ready_marker().to_string();
 
     let mut drain_tasks = Vec::new();
+    if pipe_stdio && ready_file.is_some() {
+        if let Some(stdout) = guard.child_mut().stdout.take() {
+            drain_tasks.push(tokio::spawn(async move {
+                drain_discard(stdout).await;
+            }));
+        }
+        if let Some(stderr) = guard.child_mut().stderr.take() {
+            drain_tasks.push(tokio::spawn(async move {
+                drain_discard(stderr).await;
+            }));
+        }
+    }
+
     let readiness = if let Some(ref rf) = ready_file {
         let rf = rf.clone();
         let deadline = spawn_at + timeout;
         loop {
             if Instant::now() > deadline {
-                reap_child(&mut child).await;
                 return Err(BridgeError::SuperviseStartTimeout);
             }
-            match child.try_wait() {
+            match guard.child_mut().try_wait() {
                 Ok(Some(status)) => {
                     return Err(BridgeError::Supervise(format!(
                         "child exited before ready: {status}"
@@ -143,7 +158,7 @@ async fn start_supervise_inner(
                 }
                 Ok(None) => {
                     if file_ready_regular(&rf) {
-                        match child.try_wait() {
+                        match guard.child_mut().try_wait() {
                             Ok(None) => break SuperviseReadiness::ReadyFile,
                             Ok(Some(status)) => {
                                 return Err(BridgeError::Supervise(format!(
@@ -151,25 +166,25 @@ async fn start_supervise_inner(
                                 )));
                             }
                             Err(e) => {
-                                reap_child(&mut child).await;
                                 return Err(BridgeError::Supervise(format!("try_wait: {e}")));
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    reap_child(&mut child).await;
                     return Err(BridgeError::Supervise(format!("try_wait: {e}")));
                 }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     } else {
-        let stdout = child
+        let stdout = guard
+            .child_mut()
             .stdout
             .take()
             .ok_or_else(|| BridgeError::Supervise("missing stdout".into()))?;
-        let stderr = child
+        let stderr = guard
+            .child_mut()
             .stderr
             .take()
             .ok_or_else(|| BridgeError::Supervise("missing stderr".into()))?;
@@ -186,33 +201,55 @@ async fn start_supervise_inner(
         }));
         let deadline = spawn_at + timeout;
         loop {
-            if seen.load(Ordering::SeqCst) {
-                break SuperviseReadiness::DaemonReadyLine;
-            }
             if Instant::now() > deadline {
                 for t in drain_tasks.drain(..) {
                     t.abort();
                 }
-                reap_child(&mut child).await;
                 return Err(BridgeError::SuperviseStartTimeout);
             }
-            if let Ok(Some(status)) = child.try_wait() {
-                // Give drain tasks a beat to observe a last-line marker.
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                if seen.load(Ordering::SeqCst) {
-                    break SuperviseReadiness::DaemonReadyLine;
+            match guard.child_mut().try_wait() {
+                Ok(Some(status)) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    for t in drain_tasks.drain(..) {
+                        t.abort();
+                    }
+                    return Err(BridgeError::Supervise(format!(
+                        "child exited before ready: {status}"
+                    )));
                 }
-                for t in drain_tasks.drain(..) {
-                    t.abort();
+                Ok(None) => {
+                    if seen.load(Ordering::SeqCst) {
+                        match guard.child_mut().try_wait() {
+                            Ok(None) => break SuperviseReadiness::DaemonReadyLine,
+                            Ok(Some(status)) => {
+                                for t in drain_tasks.drain(..) {
+                                    t.abort();
+                                }
+                                return Err(BridgeError::Supervise(format!(
+                                    "child exited before ready: {status}"
+                                )));
+                            }
+                            Err(e) => {
+                                for t in drain_tasks.drain(..) {
+                                    t.abort();
+                                }
+                                return Err(BridgeError::Supervise(format!("try_wait: {e}")));
+                            }
+                        }
+                    }
                 }
-                return Err(BridgeError::Supervise(format!(
-                    "child exited before ready: {status}"
-                )));
+                Err(e) => {
+                    for t in drain_tasks.drain(..) {
+                        t.abort();
+                    }
+                    return Err(BridgeError::Supervise(format!("try_wait: {e}")));
+                }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     };
 
+    let child = guard.into_child();
     let inner = Arc::new(BridgeInner {
         workspace,
         config,
@@ -227,6 +264,36 @@ async fn start_supervise_inner(
         reserved: AtomicBool::new(true),
     });
     Ok(BridgeHandle::new(inner))
+}
+
+/// Kills the child if start is cancelled or fails after spawn.
+struct SpawnGuard {
+    child: Option<tokio::process::Child>,
+}
+
+impl SpawnGuard {
+    fn new(child: tokio::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child.as_mut().expect("spawn guard armed")
+    }
+
+    fn into_child(mut self) -> tokio::process::Child {
+        self.child.take().expect("spawn guard armed")
+    }
+}
+
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.start_kill();
+            runtime_rt::block_on_global_best_effort(async move {
+                let _ = tokio::time::timeout(STOP_GRACE, c.wait()).await;
+            });
+        }
+    }
 }
 
 fn clear_ready_file_if_regular(rf: &Path) -> Result<(), BridgeError> {
@@ -253,6 +320,19 @@ fn file_ready_regular(rf: &Path) -> bool {
         return false;
     };
     meta.file_type().is_file() && meta.len() > 0
+}
+
+async fn drain_discard<R>(mut reader: R)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut tmp = [0u8; 4096];
+    loop {
+        match reader.read(&mut tmp).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
 }
 
 /// Read chunks; cap each line at LINE_CAP so a newline-free flood cannot grow without bound.
@@ -317,13 +397,6 @@ fn which_advance() -> Option<PathBuf> {
 
 pub fn line_contains_marker(line: &str, marker: &str) -> bool {
     line.contains(marker)
-}
-
-async fn reap_child(child: &mut tokio::process::Child) {
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(STOP_GRACE, child.wait()).await;
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(STOP_GRACE, child.wait()).await;
 }
 
 /// Silence unused import if resolve_config_path is kept for future CLI flags.
