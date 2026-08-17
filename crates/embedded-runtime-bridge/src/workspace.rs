@@ -66,7 +66,12 @@ fn reject_symlink_path(path: &Path) -> Result<(), BridgeError> {
             "symlink not allowed: {}",
             path.display()
         ))),
-        Ok(_) | Err(_) => Ok(()), // missing is fine
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(BridgeError::InvalidWorkspace(format!(
+            "metadata {}: {e}",
+            path.display()
+        ))),
     }
 }
 
@@ -91,12 +96,39 @@ fn reject_non_regular_file(path: &Path) -> Result<(), BridgeError> {
 }
 
 fn create_dir_private(path: &Path) -> Result<(), BridgeError> {
-    fs::create_dir_all(path)
-        .map_err(|e| BridgeError::InvalidWorkspace(format!("create_dir {}: {e}", path.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    // Recurse only through *missing* parents so existing system aliases
+    // (macOS `/var` → `/private/var`) are not rejected.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            create_dir_private(parent)?;
+        }
     }
-    Ok(())
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(BridgeError::InvalidWorkspace(format!(
+            "symlink not allowed: {}",
+            path.display()
+        ))),
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(BridgeError::InvalidWorkspace(format!(
+            "not a directory: {}",
+            path.display()
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|e| {
+                BridgeError::InvalidWorkspace(format!("create_dir {}: {e}", path.display()))
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+                    BridgeError::InvalidWorkspace(format!("chmod 0700 {}: {e}", path.display()))
+                })?;
+            }
+            reject_symlink_path(path)
+        }
+        Err(e) => Err(BridgeError::InvalidWorkspace(format!(
+            "metadata {}: {e}",
+            path.display()
+        ))),
+    }
 }

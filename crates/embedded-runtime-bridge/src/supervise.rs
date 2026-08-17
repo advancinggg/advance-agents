@@ -162,6 +162,11 @@ async fn start_supervise_inner(
                     )));
                 }
                 Ok(None) => {
+                    if !runtime_dir_is_real(&workspace) {
+                        return Err(BridgeError::InvalidWorkspace(
+                            "supervise .runtime must be a real directory".into(),
+                        ));
+                    }
                     if file_ready_regular(&rf) {
                         match guard.child_mut().try_wait() {
                             Ok(None) => break SuperviseReadiness::ReadyFile,
@@ -316,6 +321,14 @@ fn clear_ready_file_if_regular(rf: &Path) -> Result<(), BridgeError> {
         Err(e) => Err(BridgeError::Supervise(format!(
             "ready_file metadata: {e}"
         ))),
+    }
+}
+
+fn runtime_dir_is_real(workspace: &Path) -> bool {
+    let d = workspace.join(".runtime");
+    match std::fs::symlink_metadata(&d) {
+        Ok(meta) => meta.is_dir() && !meta.file_type().is_symlink(),
+        Err(_) => false,
     }
 }
 

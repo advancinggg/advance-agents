@@ -85,15 +85,27 @@ pub async fn start_async(
     let root = workspace_root.to_path_buf();
     let cfg = config;
     // Hop to GLOBAL_RT so host background tasks / child stay affine there.
-    runtime_rt::global_rt()
-        .spawn(async move {
-            match cfg.composition_mode {
-                CM::Embed => embed::start_embed(&root, cfg).await,
-                CM::Supervise => supervise::start_supervise(&root, cfg).await,
-            }
-        })
+    // Tokio 1.48 JoinHandle drop detaches (does not abort). Abort explicitly
+    // if the caller cancels so SpawnGuard / Reservation run.
+    let task = runtime_rt::global_rt().spawn(async move {
+        match cfg.composition_mode {
+            CM::Embed => embed::start_embed(&root, cfg).await,
+            CM::Supervise => supervise::start_supervise(&root, cfg).await,
+        }
+    });
+    let abort = task.abort_handle();
+    struct AbortOnCancel(tokio::task::AbortHandle);
+    impl Drop for AbortOnCancel {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let cancel = AbortOnCancel(abort);
+    let result = task
         .await
-        .map_err(|e| BridgeError::Internal(format!("join: {e}")))?
+        .map_err(|e| BridgeError::Internal(format!("join: {e}")))?;
+    std::mem::forget(cancel);
+    result
 }
 
 /// Stop handle (idempotent reap).

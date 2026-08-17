@@ -167,10 +167,9 @@ impl BridgeHandle {
 
 impl Drop for BridgeInner {
     fn drop(&mut self) {
-        // Last Arc dropped — always cleanup here (no strong_count race).
-        if self.stopped.swap(true, Ordering::SeqCst) {
-            return;
-        }
+        // Last Arc dropped. Always drain leftover resources even if `stopped`
+        // was set before teardown finished (panic / cancelled helper).
+        let _ = self.stopped.swap(true, Ordering::SeqCst);
         let mut drains = Vec::new();
         let mut child = None;
         let force = {

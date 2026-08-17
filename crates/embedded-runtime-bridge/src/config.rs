@@ -146,7 +146,10 @@ impl BridgeConfig {
 pub fn resolve_config_path(workspace: &Path, cfg: &BridgeConfig) -> Result<PathBuf, BridgeError> {
     match &cfg.config_path {
         Some(p) => confine_under_workspace(workspace, p),
-        None => Ok(workspace.join(".advance").join("runtime-config.yaml")),
+        None => confine_under_workspace(
+            workspace,
+            Path::new(".advance").join("runtime-config.yaml").as_path(),
+        ),
     }
 }
 

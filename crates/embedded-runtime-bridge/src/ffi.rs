@@ -122,7 +122,10 @@ pub unsafe extern "C" fn advance_bridge_start(
         Ok(())
     });
     match result {
-        Ok(Ok(())) => 0,
+        Ok(Ok(())) => {
+            set_last_error("");
+            0
+        }
         Ok(Err(e)) => {
             // redacted_message is char-safe; still inside no further panic risk
             let msg = std::panic::catch_unwind(|| e.redacted_message())
@@ -159,7 +162,12 @@ pub unsafe extern "C" fn advance_bridge_stop(handle: *mut AdvanceBridgeHandle) -
         Ok(code)
     });
     match result {
-        Ok(Ok(code)) => code,
+        Ok(Ok(code)) => {
+            if code == 0 {
+                set_last_error("");
+            }
+            code
+        }
         Ok(Err(e)) => {
             set_last_error(&e.redacted_message());
             e.c_code()
@@ -203,7 +211,10 @@ pub unsafe extern "C" fn advance_bridge_health(
         Ok(())
     });
     match result {
-        Ok(Ok(())) => 0,
+        Ok(Ok(())) => {
+            set_last_error("");
+            0
+        }
         Ok(Err(e)) => {
             set_last_error(&e.redacted_message());
             e.c_code()
@@ -255,7 +266,10 @@ pub unsafe extern "C" fn advance_bridge_on_lifecycle(
         on_lifecycle(&h.handle, input)
     });
     match result {
-        Ok(Ok(())) => 0,
+        Ok(Ok(())) => {
+            set_last_error("");
+            0
+        }
         Ok(Err(e)) => {
             set_last_error(&e.redacted_message());
             e.c_code()
