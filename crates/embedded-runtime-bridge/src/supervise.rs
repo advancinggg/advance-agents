@@ -69,18 +69,23 @@ fn require_ready_file_shape(workspace: &Path, rf: &Path) -> Result<(), BridgeErr
         .and_then(|n| n.to_str())
         .map(|n| n.to_ascii_lowercase().contains("ready"))
         .unwrap_or(false);
-    let under_runtime = rf.starts_with(&runtime_dir);
+    let parent = rf.parent().ok_or_else(|| {
+        BridgeError::InvalidConfig("supervise_ready_file has no parent".into())
+    })?;
+    if !parent.exists() {
+        return Err(BridgeError::InvalidConfig(
+            "supervise_ready_file parent directory must exist".into(),
+        ));
+    }
+    let parent_canon = parent.canonicalize().map_err(|e| {
+        BridgeError::InvalidConfig(format!("canonicalize ready_file parent: {e}"))
+    })?;
+    let runtime_canon = runtime_dir.canonicalize().unwrap_or(runtime_dir);
+    let under_runtime = parent_canon.starts_with(&runtime_canon);
     if !(under_runtime && name_ok) {
         return Err(BridgeError::InvalidConfig(
             "supervise_ready_file must be under .runtime/ with 'ready' in the filename".into(),
         ));
-    }
-    if let Some(parent) = rf.parent() {
-        if !parent.exists() {
-            return Err(BridgeError::InvalidConfig(
-                "supervise_ready_file parent directory must exist".into(),
-            ));
-        }
     }
     Ok(())
 }

@@ -292,6 +292,42 @@ exec sleep 60
     stop(h).expect("stop");
 }
 
+/// Ready-file must work when the caller passes a non-canonical workspace
+/// (macOS `/var` vs `/private/var`) and an absolute ready path next to it.
+#[cfg(unix)]
+#[test]
+fn t32b_ready_file_noncanonical_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = dir.path().to_path_buf();
+    fs::create_dir_all(raw.join(".advance")).unwrap();
+    fs::create_dir_all(raw.join(".runtime")).unwrap();
+    fs::write(
+        raw.join(".advance").join("runtime-config.yaml"),
+        MINIMAL_YAML,
+    )
+    .unwrap();
+    let stub = write_ready_file_stub(
+        dir.path(),
+        "noncanon-advance",
+        r#"printf ready > "$ws/.runtime/daemon.ready"
+exec sleep 60
+"#,
+    );
+    let ready = raw.join(".runtime").join("daemon.ready");
+    let cfg = BridgeConfig {
+        platform: BridgePlatform::Mac,
+        engine_mode: EngineMode::Jit,
+        composition_mode: CompositionMode::Supervise,
+        supervise_command: Some(stub),
+        supervise_ready_file: Some(ready),
+        supervise_kill_on_drop: true,
+        supervise_ready_timeout: Some(std::time::Duration::from_secs(5)),
+        ..BridgeConfig::default()
+    };
+    let h = start(&raw, cfg).expect("start with non-canonical workspace/ready path");
+    stop(h).expect("stop");
+}
+
 /// Ready-file writer that exits immediately must not publish a live handle.
 #[cfg(unix)]
 #[test]

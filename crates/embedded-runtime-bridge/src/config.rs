@@ -207,7 +207,13 @@ pub fn confine_under_workspace(workspace: &Path, path: &Path) -> Result<PathBuf,
                 "path escapes workspace".into(),
             ));
         }
-        Ok(joined)
+        // Rebuild from the canonical ancestor so later starts_with checks
+        // are not fooled by macOS /var → /private/var (or similar) aliases.
+        if let Ok(suffix) = joined.strip_prefix(&existing) {
+            Ok(p.join(suffix))
+        } else {
+            Ok(joined)
+        }
     }
 }
 
