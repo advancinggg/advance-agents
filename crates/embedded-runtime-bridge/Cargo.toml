@@ -1,0 +1,31 @@
+[package]
+name = "advance-embedded-runtime-bridge"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CONTRACT-210 EmbeddedRuntimeBridge — born-OSS embed/supervise surface for the shared runtime core (Wave-27 C210)."
+
+publish = false
+
+[lib]
+name = "advance_embedded_runtime_bridge"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+advance-runtime = { path = "../runtime", version = "0.1.0" }
+advance-shared-types = { path = "../shared-types", version = "0.1.0" }
+cap-grant = { path = "../capabilities/cap-grant", version = "0.1.0" }
+chrono = { workspace = true, features = ["clock"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "test-util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,140 @@
+//! CONTRACT-210 `EmbeddedRuntimeBridge` — born-OSS embed/supervise surface.
+//!
+//! Native shells and third parties compose the **same** M001 runtime core
+//! (`RuntimeHostBuilder` + `RuntimeLock` + real `GrantCheck`) without a
+//! product-private Wasmtime host.
+
+// FFI module requires `unsafe` for the documented C ABI; all other modules stay safe.
+#![deny(unsafe_op_in_unsafe_fn)]
+
+pub mod config;
+pub(crate) mod embed;
+pub mod error;
+#[allow(unsafe_code)]
+pub mod ffi;
+
+// Re-export safe C ABI version for tests without needing unsafe in callers.
+pub use ffi::advance_bridge_abi_version;
+pub(crate) mod handle;
+pub(crate) mod lock_status;
+pub(crate) mod noop_bus;
+pub(crate) mod profile;
+pub(crate) mod registry;
+pub(crate) mod runtime_rt;
+pub(crate) mod supervise;
+pub mod types;
+pub(crate) mod workspace;
+
+pub use config::BridgeConfig;
+pub use error::BridgeError;
+pub use handle::BridgeHandle;
+pub use types::{
+    BridgeHealth, BridgeLifecycleInput, BridgePlatform, CompositionMode, EmbeddedRuntimeBridge,
+    EngineMode, HostBackend, LockExclusivity, PlatformLifecycleState, RuntimeHostProfileView,
+    StorageProfile, SuperviseReadiness, ADVANCE_BRIDGE_ABI_VERSION, HEALTH_SCHEMA_VERSION,
+};
+
+use std::path::Path;
+
+use crate::types::CompositionMode as CM;
+
+/// Default implementation of [`EmbeddedRuntimeBridge`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultEmbeddedRuntimeBridge;
+
+impl EmbeddedRuntimeBridge for DefaultEmbeddedRuntimeBridge {
+    fn start(
+        &self,
+        workspace_root: &Path,
+        config: BridgeConfig,
+    ) -> Result<BridgeHandle, BridgeError> {
+        start(workspace_root, config)
+    }
+
+    fn stop(&self, handle: BridgeHandle) -> Result<(), BridgeError> {
+        stop(handle)
+    }
+
+    fn health(&self, handle: &BridgeHandle) -> Result<BridgeHealth, BridgeError> {
+        health(handle)
+    }
+
+    fn on_lifecycle(
+        &self,
+        handle: &BridgeHandle,
+        input: BridgeLifecycleInput,
+    ) -> Result<(), BridgeError> {
+        on_lifecycle(handle, input)
+    }
+}
+
+/// Sync start. Returns NestedRuntime if already inside Tokio (use [`start_async`]).
+pub fn start(workspace_root: impl AsRef<Path>, config: BridgeConfig) -> Result<BridgeHandle, BridgeError> {
+    if runtime_rt::in_tokio() {
+        return Err(BridgeError::NestedRuntime);
+    }
+    let root = workspace_root.as_ref().to_path_buf();
+    runtime_rt::block_on_global(async move { start_async(&root, config).await })
+}
+
+/// Async start — always drives embed/supervise work on GLOBAL_RT.
+pub async fn start_async(
+    workspace_root: &Path,
+    config: BridgeConfig,
+) -> Result<BridgeHandle, BridgeError> {
+    let root = workspace_root.to_path_buf();
+    let cfg = config;
+    // Hop to GLOBAL_RT so host background tasks / child stay affine there.
+    // Tokio 1.48 JoinHandle drop detaches (does not abort). Abort explicitly
+    // if the caller cancels so SpawnGuard / Reservation run.
+    let task = runtime_rt::global_rt().spawn(async move {
+        match cfg.composition_mode {
+            CM::Embed => embed::start_embed(&root, cfg).await,
+            CM::Supervise => supervise::start_supervise(&root, cfg).await,
+        }
+    });
+    let abort = task.abort_handle();
+    struct AbortOnCancel(tokio::task::AbortHandle);
+    impl Drop for AbortOnCancel {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let cancel = AbortOnCancel(abort);
+    let result = task
+        .await
+        .map_err(|e| BridgeError::Internal(format!("join: {e}")))?;
+    std::mem::forget(cancel);
+    result
+}
+
+/// Stop handle (idempotent reap).
+pub fn stop(handle: BridgeHandle) -> Result<(), BridgeError> {
+    handle.stop()
+}
+
+/// Health snapshot.
+pub fn health(handle: &BridgeHandle) -> Result<BridgeHealth, BridgeError> {
+    handle.health()
+}
+
+/// Lifecycle update.
+pub fn on_lifecycle(
+    handle: &BridgeHandle,
+    input: BridgeLifecycleInput,
+) -> Result<(), BridgeError> {
+    handle.on_lifecycle(input)
+}
+
+/// Async health (same as sync; provided for API symmetry).
+pub async fn health_async(handle: &BridgeHandle) -> Result<BridgeHealth, BridgeError> {
+    handle.health()
+}
+
+/// Async stop — hops to GLOBAL_RT so child wait stays runtime-affine.
+pub async fn stop_async(handle: BridgeHandle) -> Result<(), BridgeError> {
+    runtime_rt::global_rt()
+        .spawn(async move { handle.stop_async_inner().await })
+        .await
+        .map_err(|e| BridgeError::Internal(format!("join: {e}")))?
+}

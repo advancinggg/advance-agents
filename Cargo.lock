@@ -142,6 +142,7 @@ dependencies = [
  "advance-context-engine",
  "advance-cost-tracker",
  "advance-database",
+ "advance-embedded-runtime-bridge",
  "advance-event-bus",
  "advance-genui",
  "advance-git",
@@ -191,6 +192,21 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "walkdir",
+]
+
+[[package]]
+name = "advance-embedded-runtime-bridge"
+version = "0.1.0"
+dependencies = [
+ "advance-runtime",
+ "advance-shared-types",
+ "cap-grant",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
