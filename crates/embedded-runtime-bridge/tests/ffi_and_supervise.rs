@@ -174,7 +174,11 @@ fn header_exists_and_mentions_abi() {
 #[cfg(unix)]
 #[test]
 fn shell_available() {
-    let st = Command::new("sh").arg("-c").arg("echo ok").status().unwrap();
+    let st = Command::new("sh")
+        .arg("-c")
+        .arg("echo ok")
+        .status()
+        .unwrap();
     assert!(st.success());
 }
 
@@ -441,11 +445,11 @@ exec sleep 60
 /// Plan T13 subset: invoke the C ABI from Rust (null args, buffer, start/stop/double-stop/free).
 #[test]
 fn t13_c_abi_lifecycle() {
-    use std::ffi::CString;
     use advance_embedded_runtime_bridge::ffi::{
         advance_bridge_free_handle, advance_bridge_health, advance_bridge_on_lifecycle,
         advance_bridge_start, advance_bridge_stop, AdvanceBridgeHandle,
     };
+    use std::ffi::CString;
 
     let rc = unsafe {
         advance_bridge_start(

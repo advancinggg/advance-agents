@@ -42,7 +42,10 @@ impl GenUiDocument {
             })?
             .len();
         if bytes > max_bytes {
-            return Err(GenUiError::DocumentTooLarge { bytes, max: max_bytes });
+            return Err(GenUiError::DocumentTooLarge {
+                bytes,
+                max: max_bytes,
+            });
         }
         Ok(())
     }

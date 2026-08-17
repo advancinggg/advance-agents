@@ -1906,9 +1906,7 @@ fn validate_config(path: &Path, cfg: &RuntimeConfig) -> Result<(), ConfigError> 
 
     // genui
     if cfg.genui.max_document_bytes < 1024 || cfg.genui.max_document_bytes > 1_048_576 {
-        return invalid(
-            "genui.max-document-bytes must be in [1024, 1048576] (1 KiB to 1 MiB)",
-        );
+        return invalid("genui.max-document-bytes must be in [1024, 1048576] (1 KiB to 1 MiB)");
     }
 
     Ok(())

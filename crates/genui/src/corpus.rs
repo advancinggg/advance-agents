@@ -118,10 +118,7 @@ pub fn corpus_invalid_documents() -> Vec<(GenUiDocument, &'static str)> {
             doc(vec![node("Text", json!({"content": 42}))]),
             "wrong prop type",
         ),
-        (
-            doc(vec![node("Text", json!({}))]),
-            "missing required prop",
-        ),
+        (doc(vec![node("Text", json!({}))]), "missing required prop"),
         (
             doc(vec![node(
                 "Text",
@@ -158,10 +155,7 @@ pub fn corpus_invalid_documents() -> Vec<(GenUiDocument, &'static str)> {
             )]),
             "children on non-container",
         ),
-        (
-            build_deep_document(10),
-            "too deep nesting",
-        ),
+        (build_deep_document(10), "too deep nesting"),
     ]
 }
 
@@ -180,7 +174,10 @@ pub fn corpus_degradation_vectors() -> Vec<(GenUiDocument, &'static str)> {
             "Hello\n",
         ),
         (
-            doc(vec![node("Heading", json!({"content": "Title", "level": 2}))]),
+            doc(vec![node(
+                "Heading",
+                json!({"content": "Title", "level": 2}),
+            )]),
             "## Title\n",
         ),
         (
@@ -191,10 +188,7 @@ pub fn corpus_degradation_vectors() -> Vec<(GenUiDocument, &'static str)> {
             "[warning] Warning!\n",
         ),
         (
-            doc(vec![node(
-                "Stat",
-                json!({"label": "Count", "value": 7}),
-            )]),
+            doc(vec![node("Stat", json!({"label": "Count", "value": 7}))]),
             "Count: 7\n",
         ),
         (

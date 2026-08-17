@@ -124,9 +124,10 @@ pub(crate) fn credential_position_for(provider: &ResolvedProvider) -> Credential
         (None, ProviderBackend::AnthropicMessages) => CredentialPosition::CustomHeader {
             key: "x-api-key".into(),
         },
-        (None, ProviderBackend::OpenAiChat | ProviderBackend::OpenAiResponses | ProviderBackend::Local) => {
-            CredentialPosition::BearerToken
-        }
+        (
+            None,
+            ProviderBackend::OpenAiChat | ProviderBackend::OpenAiResponses | ProviderBackend::Local,
+        ) => CredentialPosition::BearerToken,
     }
 }
 

@@ -89,7 +89,10 @@ mod tests {
         assert_eq!(redact("Authorization: Bearer abc"), "redacted error");
         assert_eq!(redact("open secrets.json"), "redacted error");
         assert_eq!(redact("master-key-source"), "redacted error");
-        assert_eq!(redact("missing runtime-config.yaml"), "missing runtime-config.yaml");
+        assert_eq!(
+            redact("missing runtime-config.yaml"),
+            "missing runtime-config.yaml"
+        );
     }
 }
 

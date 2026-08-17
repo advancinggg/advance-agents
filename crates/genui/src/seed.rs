@@ -1,8 +1,6 @@
 use serde_json::json;
 
-use crate::catalog::{
-    ActionEntry, CatalogEntry, ConfirmMetadata, ConfirmVariant, DefaultCatalog,
-};
+use crate::catalog::{ActionEntry, CatalogEntry, ConfirmMetadata, ConfirmVariant, DefaultCatalog};
 
 pub fn seed_catalog() -> DefaultCatalog {
     DefaultCatalog::new(seed_components(), seed_actions())

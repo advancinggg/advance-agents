@@ -77,7 +77,10 @@ fn t06_embed_start_stop_health() {
     assert!(health.runtime_up);
     assert!(health.last_heartbeat_ok);
     assert_eq!(health.schema_version, HEALTH_SCHEMA_VERSION);
-    assert!(health.profile.supported_wit_versions.contains(&"0.1.0".into()));
+    assert!(health
+        .profile
+        .supported_wit_versions
+        .contains(&"0.1.0".into()));
     // JSON keys
     let json = serde_json::to_value(&health).unwrap();
     assert!(json.get("schema_version").is_some());
@@ -117,7 +120,11 @@ fn t07b_workspace_created_when_missing() {
     let ws = dir.path().join("new-ws");
     // prepare config after create via start's dir create — write config first parent
     fs::create_dir_all(ws.join(".advance")).unwrap();
-    fs::write(ws.join(".advance").join("runtime-config.yaml"), MINIMAL_YAML).unwrap();
+    fs::write(
+        ws.join(".advance").join("runtime-config.yaml"),
+        MINIMAL_YAML,
+    )
+    .unwrap();
     let h = start(&ws, embed_cfg()).expect("start");
     assert!(ws.join(".runtime").exists());
     stop(h).unwrap();

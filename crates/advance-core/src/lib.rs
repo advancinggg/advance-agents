@@ -53,11 +53,11 @@ pub use cap_tools;
 
 // ── subsystem crates ──────────────────────────────────────────────────────────────
 pub use advance_client_api as client_api;
-pub use advance_genui as genui;
 pub use advance_context_engine as context_engine;
 pub use advance_cost_tracker as cost_tracker;
 pub use advance_database as database;
 pub use advance_event_bus as event_bus;
+pub use advance_genui as genui;
 pub use advance_git as git;
 pub use advance_messaging as messaging;
 pub use advance_pack_manager as pack_manager;

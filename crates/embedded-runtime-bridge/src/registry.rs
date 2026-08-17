@@ -14,9 +14,9 @@ fn registry() -> &'static Mutex<HashSet<PathBuf>> {
 
 /// Reserve a workspace path; fails if already reserved.
 pub fn reserve(workspace: PathBuf) -> Result<(), BridgeError> {
-    let mut g = registry().lock().map_err(|_| {
-        BridgeError::Internal("registry lock poisoned".into())
-    })?;
+    let mut g = registry()
+        .lock()
+        .map_err(|_| BridgeError::Internal("registry lock poisoned".into()))?;
     if !g.insert(workspace) {
         return Err(BridgeError::AlreadyRunning);
     }
@@ -68,7 +68,10 @@ mod tests {
         let p = PathBuf::from("/tmp/bridge-registry-test-unique-c210");
         release(&p);
         reserve(p.clone()).unwrap();
-        assert!(matches!(reserve(p.clone()), Err(BridgeError::AlreadyRunning)));
+        assert!(matches!(
+            reserve(p.clone()),
+            Err(BridgeError::AlreadyRunning)
+        ));
         release(&p);
         reserve(p.clone()).unwrap();
         release(&p);

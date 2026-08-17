@@ -69,7 +69,10 @@ impl EmbeddedRuntimeBridge for DefaultEmbeddedRuntimeBridge {
 }
 
 /// Sync start. Returns NestedRuntime if already inside Tokio (use [`start_async`]).
-pub fn start(workspace_root: impl AsRef<Path>, config: BridgeConfig) -> Result<BridgeHandle, BridgeError> {
+pub fn start(
+    workspace_root: impl AsRef<Path>,
+    config: BridgeConfig,
+) -> Result<BridgeHandle, BridgeError> {
     if runtime_rt::in_tokio() {
         return Err(BridgeError::NestedRuntime);
     }
@@ -119,10 +122,7 @@ pub fn health(handle: &BridgeHandle) -> Result<BridgeHealth, BridgeError> {
 }
 
 /// Lifecycle update.
-pub fn on_lifecycle(
-    handle: &BridgeHandle,
-    input: BridgeLifecycleInput,
-) -> Result<(), BridgeError> {
+pub fn on_lifecycle(handle: &BridgeHandle, input: BridgeLifecycleInput) -> Result<(), BridgeError> {
     handle.on_lifecycle(input)
 }
 

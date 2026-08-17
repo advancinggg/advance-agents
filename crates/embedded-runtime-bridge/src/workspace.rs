@@ -10,9 +10,8 @@ use crate::error::BridgeError;
 /// Prepare workspace root: create if missing, reject file/symlink, create dirs.
 pub fn prepare_workspace(root: &Path) -> Result<PathBuf, BridgeError> {
     if root.exists() {
-        let meta = fs::symlink_metadata(root).map_err(|e| {
-            BridgeError::InvalidWorkspace(format!("metadata: {e}"))
-        })?;
+        let meta = fs::symlink_metadata(root)
+            .map_err(|e| BridgeError::InvalidWorkspace(format!("metadata: {e}")))?;
         if meta.file_type().is_symlink() {
             return Err(BridgeError::InvalidWorkspace(
                 "workspace root must not be a symlink".into(),

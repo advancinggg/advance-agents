@@ -94,9 +94,7 @@ impl BridgeHandle {
                     (up, need_hb, None, excl)
                 }
                 ModeState::Supervise {
-                    child,
-                    readiness,
-                    ..
+                    child, readiness, ..
                 } => {
                     let alive = if let Some(c) = child.as_mut() {
                         match c.try_wait() {

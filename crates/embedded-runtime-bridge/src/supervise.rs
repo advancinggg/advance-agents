@@ -45,7 +45,8 @@ fn reject_nondefault_supervise_config(
         let resolved = confine_under_workspace(workspace, p)?;
         let default = workspace.join(".advance").join("runtime-config.yaml");
         let default_canon = default.canonicalize().unwrap_or(default);
-        if resolved != default_canon && resolved != workspace.join(".advance").join("runtime-config.yaml")
+        if resolved != default_canon
+            && resolved != workspace.join(".advance").join("runtime-config.yaml")
         {
             return Err(BridgeError::InvalidConfig(
                 "supervise ignores custom config_path; CLI start only loads <ws>/.advance/runtime-config.yaml"
@@ -69,17 +70,17 @@ fn require_ready_file_shape(workspace: &Path, rf: &Path) -> Result<(), BridgeErr
         .and_then(|n| n.to_str())
         .map(|n| n.to_ascii_lowercase().contains("ready"))
         .unwrap_or(false);
-    let parent = rf.parent().ok_or_else(|| {
-        BridgeError::InvalidConfig("supervise_ready_file has no parent".into())
-    })?;
+    let parent = rf
+        .parent()
+        .ok_or_else(|| BridgeError::InvalidConfig("supervise_ready_file has no parent".into()))?;
     if !parent.exists() {
         return Err(BridgeError::InvalidConfig(
             "supervise_ready_file parent directory must exist".into(),
         ));
     }
-    let parent_canon = parent.canonicalize().map_err(|e| {
-        BridgeError::InvalidConfig(format!("canonicalize ready_file parent: {e}"))
-    })?;
+    let parent_canon = parent
+        .canonicalize()
+        .map_err(|e| BridgeError::InvalidConfig(format!("canonicalize ready_file parent: {e}")))?;
     let runtime_canon = runtime_dir.canonicalize().unwrap_or(runtime_dir);
     let under_runtime = parent_canon.starts_with(&runtime_canon);
     if !(under_runtime && name_ok) {
@@ -318,9 +319,7 @@ fn clear_ready_file_if_regular(rf: &Path) -> Result<(), BridgeError> {
             "supervise_ready_file exists and is not a regular file".into(),
         )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(BridgeError::Supervise(format!(
-            "ready_file metadata: {e}"
-        ))),
+        Err(e) => Err(BridgeError::Supervise(format!("ready_file metadata: {e}"))),
     }
 }
 

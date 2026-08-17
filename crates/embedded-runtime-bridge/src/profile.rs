@@ -60,7 +60,11 @@ pub fn build_profile(
     let host_backend = HostBackend::Cranelift;
     let non_fg = !matches!(lifecycle, PlatformLifecycleState::Foreground);
     let mobile = matches!(platform, BridgePlatform::Ios | BridgePlatform::Android);
-    let mut max = if non_fg { 0 } else { fg_max_concurrent(platform) };
+    let mut max = if non_fg {
+        0
+    } else {
+        fg_max_concurrent(platform)
+    };
     let mut available = runtime_up && !non_fg && max >= 1;
     if mobile && matches!(host_backend, HostBackend::Cranelift) {
         available = false;

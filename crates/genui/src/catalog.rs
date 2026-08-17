@@ -87,17 +87,20 @@ pub struct DefaultCatalog {
 }
 
 impl DefaultCatalog {
-    pub fn new(
-        entries: Vec<CatalogEntry>,
-        action_entries: Vec<ActionEntry>,
-    ) -> Self {
+    pub fn new(entries: Vec<CatalogEntry>, action_entries: Vec<ActionEntry>) -> Self {
         let components = entries
             .into_iter()
             .map(|e| {
                 let validator = JSONSchema::compile(&e.props_schema)
                     .expect("catalog prop schema must be valid JSON Schema");
                 let name = e.name.clone();
-                (name, CompiledEntry { entry: e, validator })
+                (
+                    name,
+                    CompiledEntry {
+                        entry: e,
+                        validator,
+                    },
+                )
             })
             .collect();
         let actions = action_entries
@@ -106,10 +109,19 @@ impl DefaultCatalog {
                 let validator = JSONSchema::compile(&a.params_schema)
                     .expect("action param schema must be valid JSON Schema");
                 let name = a.name.clone();
-                (name, CompiledAction { entry: a, validator })
+                (
+                    name,
+                    CompiledAction {
+                        entry: a,
+                        validator,
+                    },
+                )
             })
             .collect();
-        Self { components, actions }
+        Self {
+            components,
+            actions,
+        }
     }
 
     pub fn component_entries(&self) -> impl Iterator<Item = &CatalogEntry> {
@@ -141,7 +153,11 @@ fn has_event_handler_attr(s: &str) -> bool {
     let bytes = s.as_bytes();
     for i in 0..bytes.len().saturating_sub(3) {
         if bytes[i] == b'o' && bytes[i + 1] == b'n' && bytes[i + 2].is_ascii_alphabetic() {
-            let in_tag_context = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'<');
+            let in_tag_context = i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'<'
+                );
             if !in_tag_context {
                 continue;
             }
@@ -303,10 +319,12 @@ impl DefaultCatalog {
         }
         if node.component == "Button" {
             if let Some(action_val) = node.props.get("action") {
-                let action_ref: ActionRef = serde_json::from_value(action_val.clone())
-                    .map_err(|e| GenUiError::InvalidProps {
-                        component: "Button".into(),
-                        reason: format!("malformed action: {e}"),
+                let action_ref: ActionRef =
+                    serde_json::from_value(action_val.clone()).map_err(|e| {
+                        GenUiError::InvalidProps {
+                            component: "Button".into(),
+                            reason: format!("malformed action: {e}"),
+                        }
                     })?;
                 self.validate_action(&action_ref)?;
             }
@@ -340,10 +358,7 @@ impl GenUiGate {
         if !matches!(doc.protocol_version, crate::document::A2uiVersion::V0_9_1) {
             return Err(GenUiError::InvalidProps {
                 component: "document".into(),
-                reason: format!(
-                    "unsupported protocol version: {:?}",
-                    doc.protocol_version
-                ),
+                reason: format!("unsupported protocol version: {:?}", doc.protocol_version),
             });
         }
         doc.validate_size(self.max_document_bytes)?;

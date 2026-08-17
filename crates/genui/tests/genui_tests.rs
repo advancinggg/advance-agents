@@ -1,7 +1,9 @@
-use advance_genui::*;
 use advance_genui::corpus::*;
 use advance_genui::degrade::degrade_to_text;
-use advance_genui::document::{validate_depth, A2uiVersion, ComponentNode, DocumentId, GenUiDocument, MAX_DOCUMENT_BYTES};
+use advance_genui::document::{
+    validate_depth, A2uiVersion, ComponentNode, DocumentId, GenUiDocument, MAX_DOCUMENT_BYTES,
+};
+use advance_genui::*;
 use serde_json::json;
 
 fn gate(enabled: bool) -> GenUiGate {
@@ -13,7 +15,8 @@ fn gate(enabled: bool) -> GenUiGate {
 fn t01_valid_corpus_renders_through_catalog() {
     let g = gate(true);
     for (i, doc) in corpus_valid_documents().iter().enumerate() {
-        g.admit(doc).unwrap_or_else(|e| panic!("corpus doc {i} failed: {e}"));
+        g.admit(doc)
+            .unwrap_or_else(|e| panic!("corpus doc {i} failed: {e}"));
     }
 }
 
@@ -22,10 +25,7 @@ fn t01_valid_corpus_renders_through_catalog() {
 fn t02_catalog_gate_rejects_invalid() {
     let g = gate(true);
     for (doc, desc) in corpus_invalid_documents() {
-        assert!(
-            g.admit(&doc).is_err(),
-            "expected rejection for: {desc}"
-        );
+        assert!(g.admit(&doc).is_err(), "expected rejection for: {desc}");
     }
 }
 
@@ -41,7 +41,10 @@ fn t02_script_injection_rejected() {
             children: vec![],
         }],
     };
-    assert!(g.admit(&doc).is_err(), "case-insensitive script injection must be rejected");
+    assert!(
+        g.admit(&doc).is_err(),
+        "case-insensitive script injection must be rejected"
+    );
 }
 
 // T04: Degradation produces expected text (AC-04)
@@ -50,7 +53,11 @@ fn t04_degradation_corpus() {
     let catalog = seed_catalog();
     for (doc, expected) in corpus_degradation_vectors() {
         let text = degrade_to_text(&doc, &catalog);
-        assert_eq!(text, expected, "degradation mismatch for doc {:?}", doc.document_id);
+        assert_eq!(
+            text, expected,
+            "degradation mismatch for doc {:?}",
+            doc.document_id
+        );
     }
 }
 
@@ -80,11 +87,24 @@ fn t04_degradation_never_raw_json() {
 fn t06_seed_catalog_vocabulary() {
     let catalog = seed_catalog();
     let expected = [
-        "Text", "Heading", "Button", "Section", "Row", "Column",
-        "EntityCard", "DataTable", "TreeView", "Callout", "Stat", "StatGroup",
+        "Text",
+        "Heading",
+        "Button",
+        "Section",
+        "Row",
+        "Column",
+        "EntityCard",
+        "DataTable",
+        "TreeView",
+        "Callout",
+        "Stat",
+        "StatGroup",
     ];
     for name in &expected {
-        assert!(catalog.lookup(name).is_some(), "missing seed component: {name}");
+        assert!(
+            catalog.lookup(name).is_some(),
+            "missing seed component: {name}"
+        );
     }
 }
 
@@ -92,11 +112,19 @@ fn t06_seed_catalog_vocabulary() {
 fn t06_seed_actions_present() {
     let catalog = seed_catalog();
     let expected_actions = [
-        "navigate", "refresh_data", "copy_to_clipboard",
-        "open_entity", "approve_grant", "dismiss",
+        "navigate",
+        "refresh_data",
+        "copy_to_clipboard",
+        "open_entity",
+        "approve_grant",
+        "dismiss",
     ];
     for name in &expected_actions {
-        let action = ActionRef { name: name.to_string(), params: json!({}), confirm: None };
+        let action = ActionRef {
+            name: name.to_string(),
+            params: json!({}),
+            confirm: None,
+        };
         // non-catalog actions should fail, so these should at least not fail with "not in catalog"
         // (they may fail on params validation for actions that require params)
         let result = catalog.validate_action(&action);
@@ -114,8 +142,14 @@ fn t06_agent_vocabulary_nonempty() {
     let catalog = seed_catalog();
     let vocab = catalog.agent_vocabulary();
     assert!(vocab.contains("Text"), "vocabulary should mention Text");
-    assert!(vocab.contains("DataTable"), "vocabulary should mention DataTable");
-    assert!(vocab.contains("navigate"), "vocabulary should mention navigate action");
+    assert!(
+        vocab.contains("DataTable"),
+        "vocabulary should mention DataTable"
+    );
+    assert!(
+        vocab.contains("navigate"),
+        "vocabulary should mention navigate action"
+    );
 }
 
 // T07: GenUiGate enabled=false returns Denied (AC-07 mechanism)
@@ -133,7 +167,8 @@ fn t07_gate_denied_when_disabled() {
 fn t07_gate_passes_when_enabled() {
     let g = gate(true);
     let doc = corpus_valid_documents().into_iter().next().unwrap();
-    g.admit(&doc).expect("enabled gate should accept valid document");
+    g.admit(&doc)
+        .expect("enabled gate should accept valid document");
 }
 
 // T08: Action validation (AC-08)
@@ -145,7 +180,9 @@ fn t08_catalog_action_passes() {
         params: json!({"path": "/dashboard"}),
         confirm: None,
     };
-    catalog.validate_action(&action).expect("valid action should pass");
+    catalog
+        .validate_action(&action)
+        .expect("valid action should pass");
 }
 
 #[test]
@@ -188,7 +225,8 @@ fn t09_flag_honesty_disabled() {
 fn t09_flag_honesty_enabled() {
     let g = GenUiGate::new(true, MAX_DOCUMENT_BYTES, seed_catalog());
     let doc = corpus_valid_documents().into_iter().next().unwrap();
-    g.admit(&doc).expect("enabled=true should proceed to validation");
+    g.admit(&doc)
+        .expect("enabled=true should proceed to validation");
 }
 
 // T10: Schema round-trip (AC-10)
@@ -206,7 +244,10 @@ fn t10_error_roundtrip() {
     let errors = vec![
         GenUiError::Denied,
         GenUiError::InvalidComponent { name: "Foo".into() },
-        GenUiError::DocumentTooLarge { bytes: 300_000, max: 262_144 },
+        GenUiError::DocumentTooLarge {
+            bytes: 300_000,
+            max: 262_144,
+        },
         GenUiError::DocumentTooDeep { depth: 9, max: 8 },
     ];
     for err in errors {
@@ -302,14 +343,18 @@ fn button_non_catalog_action_rejected_in_document() {
             children: vec![],
         }],
     };
-    assert!(g.admit(&doc).is_err(), "button with non-catalog action should be rejected");
+    assert!(
+        g.admit(&doc).is_err(),
+        "button with non-catalog action should be rejected"
+    );
 }
 
 // Size validation
 #[test]
 fn size_within_limit_passes() {
     let doc = corpus_valid_documents().into_iter().next().unwrap();
-    doc.validate_size(MAX_DOCUMENT_BYTES).expect("small doc should pass size check");
+    doc.validate_size(MAX_DOCUMENT_BYTES)
+        .expect("small doc should pass size check");
 }
 
 #[test]

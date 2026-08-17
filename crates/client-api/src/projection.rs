@@ -343,10 +343,7 @@ struct LeafSpec {
 enum LeafKind {
     U32,
     U64,
-    FiniteF64 {
-        min: f64,
-        max: f64,
-    },
+    FiniteF64 { min: f64, max: f64 },
     Enum(&'static [&'static str]),
     SessionId,
     EntityRef,
@@ -852,10 +849,30 @@ static TABLE: &[EventSpec] = &[
         literal: "genui.emitted",
         priority: ClientEventPriority::Normal,
         leaves: &[
-            LeafSpec { name: "document_id", kind: LeafKind::StringScanned, min_u32: None, max_u32: None },
-            LeafSpec { name: "component_count", kind: LeafKind::U32, min_u32: None, max_u32: None },
-            LeafSpec { name: "bytes", kind: LeafKind::U32, min_u32: None, max_u32: None },
-            LeafSpec { name: "document_json", kind: LeafKind::StringScanned, min_u32: None, max_u32: None },
+            LeafSpec {
+                name: "document_id",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "component_count",
+                kind: LeafKind::U32,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "bytes",
+                kind: LeafKind::U32,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "document_json",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
         ],
     },
     EventSpec {
@@ -872,17 +889,42 @@ static TABLE: &[EventSpec] = &[
         literal: "genui.action_dispatched",
         priority: ClientEventPriority::Normal,
         leaves: &[
-            LeafSpec { name: "document_id", kind: LeafKind::StringScanned, min_u32: None, max_u32: None },
-            LeafSpec { name: "action", kind: LeafKind::StringScanned, min_u32: None, max_u32: None },
-            LeafSpec { name: "confirmed", kind: LeafKind::U32, min_u32: Some(0), max_u32: Some(1) },
+            LeafSpec {
+                name: "document_id",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "action",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "confirmed",
+                kind: LeafKind::U32,
+                min_u32: Some(0),
+                max_u32: Some(1),
+            },
         ],
     },
     EventSpec {
         literal: "genui.degraded",
         priority: ClientEventPriority::Normal,
         leaves: &[
-            LeafSpec { name: "surface", kind: LeafKind::StringScanned, min_u32: None, max_u32: None },
-            LeafSpec { name: "reason", kind: LeafKind::StringScanned, min_u32: None, max_u32: None },
+            LeafSpec {
+                name: "surface",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "reason",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
         ],
     },
 ];

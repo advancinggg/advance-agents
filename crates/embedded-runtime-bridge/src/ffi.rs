@@ -20,7 +20,8 @@ thread_local! {
 }
 
 fn set_last_error(msg: &str) {
-    let safe = CString::new(msg.replace('\0', "")).unwrap_or_else(|_| CString::new("error").unwrap());
+    let safe =
+        CString::new(msg.replace('\0', "")).unwrap_or_else(|_| CString::new("error").unwrap());
     LAST_ERROR.with(|e| *e.borrow_mut() = safe);
 }
 
@@ -194,8 +195,8 @@ pub unsafe extern "C" fn advance_bridge_health(
         }
         let h = unsafe { &*handle };
         let health = health(&h.handle)?;
-        let json = serde_json::to_string(&health)
-            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let json =
+            serde_json::to_string(&health).map_err(|e| BridgeError::Internal(e.to_string()))?;
         let needed = json.len() + 1;
         if !required_len_or_null.is_null() {
             unsafe { *required_len_or_null = needed };

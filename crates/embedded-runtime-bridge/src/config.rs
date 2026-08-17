@@ -75,10 +75,7 @@ impl BridgeConfig {
             }
         }
 
-        if matches!(
-            self.platform,
-            BridgePlatform::Ios | BridgePlatform::Android
-        ) {
+        if matches!(self.platform, BridgePlatform::Ios | BridgePlatform::Android) {
             if matches!(self.engine_mode, EngineMode::Jit) {
                 return Err(BridgeError::InvalidConfig(
                     "iOS/Android require EngineMode::Interpreter".into(),
@@ -177,9 +174,7 @@ pub fn confine_under_workspace(workspace: &Path, path: &Path) -> Result<PathBuf,
             .canonicalize()
             .map_err(|e| BridgeError::InvalidConfig(format!("canonicalize path: {e}")))?;
         if !canon.starts_with(&ws) {
-            return Err(BridgeError::InvalidConfig(
-                "path escapes workspace".into(),
-            ));
+            return Err(BridgeError::InvalidConfig("path escapes workspace".into()));
         }
         Ok(canon)
     } else {
@@ -202,13 +197,11 @@ pub fn confine_under_workspace(workspace: &Path, path: &Path) -> Result<PathBuf,
                 "path has no existing ancestor".into(),
             ));
         };
-        let p = existing.canonicalize().map_err(|e| {
-            BridgeError::InvalidConfig(format!("canonicalize ancestor: {e}"))
-        })?;
+        let p = existing
+            .canonicalize()
+            .map_err(|e| BridgeError::InvalidConfig(format!("canonicalize ancestor: {e}")))?;
         if !p.starts_with(&ws) {
-            return Err(BridgeError::InvalidConfig(
-                "path escapes workspace".into(),
-            ));
+            return Err(BridgeError::InvalidConfig("path escapes workspace".into()));
         }
         // Rebuild from the canonical ancestor so later starts_with checks
         // are not fooled by macOS /var → /private/var (or similar) aliases.
