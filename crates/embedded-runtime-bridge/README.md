@@ -47,6 +47,24 @@ Wasmtime host backend is a future runtime feature.
 - Rust: `start` / `stop` / `health` / `on_lifecycle` (+ async variants)
 - C ABI: `advance_bridge_start` / `_stop` / `_health` / `_on_lifecycle` / `_free_handle`
 
+### Health JSON (`schema_version` = 1)
+
+`advance_bridge_health` writes a NUL-terminated UTF-8 object. Snake_case enums:
+
+| Key | Meaning |
+|-----|---------|
+| `schema_version` | `1` |
+| `runtime_up` | host/child is live |
+| `last_heartbeat_ok` | embed lock heartbeat fresh, or `runtime_up` in supervise |
+| `composition_mode` | `embed` \| `supervise` |
+| `lock_exclusivity` | `runtime_lock` \| `process_local` |
+| `supervise_readiness` | `daemon_ready_line` \| `ready_file` \| omitted |
+| `profile.engine_mode` | `jit` \| `interpreter` |
+| `profile.host_backend` | `cranelift` |
+| `profile.agent_host_available` | honesty capacity |
+| `profile.max_concurrent_runs` | FG class or `0` if not foreground |
+| `profile.storage_profile` | `persistent` \| `bounded` \| `ephemeral` |
+
 ### Multi-start / double-stop
 
 - Same workspace, same process → `AlreadyRunning`

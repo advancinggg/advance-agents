@@ -273,6 +273,46 @@ fn t31c_empty_ready_marker_rejected() {
 }
 
 #[test]
+fn t23_drop_inside_current_thread_tokio() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (_g, ws) = write_workspace();
+        let h = advance_embedded_runtime_bridge::start_async(&ws, embed_cfg())
+            .await
+            .expect("start_async");
+        drop(h);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn t15_occupied_runtime_lock() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (_g, ws) = write_workspace();
+        let _lock = advance_runtime::runtime_lock::RuntimeLock::acquire(
+            &ws,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("hold lock");
+        let err = advance_embedded_runtime_bridge::start_async(&ws, embed_cfg())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            advance_embedded_runtime_bridge::BridgeError::AlreadyRunning
+        ));
+    });
+}
+
+#[test]
 fn t35_stop_async_from_tokio() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

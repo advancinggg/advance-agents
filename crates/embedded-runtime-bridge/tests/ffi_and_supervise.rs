@@ -74,8 +74,7 @@ fn write_ready_stub(dir: &std::path::Path) -> PathBuf {
 # consume args
 while [ $# -gt 0 ]; do shift; done
 echo "advance: runtime ready (workspace=stub)"
-# keep alive until killed
-sleep 60
+exec sleep 60
 "#,
     )
     .unwrap();
@@ -118,24 +117,19 @@ fn t12_supervise_ready_line_start_stop() {
 fn t20_supervise_timeout_reaps() {
     let dir = tempfile::tempdir().unwrap();
     let (_g, ws) = write_workspace();
-    // Stub never prints ready
-    let path = dir.path().join("silent-advance");
-    fs::write(
-        &path,
-        r#"#!/bin/sh
-sleep 60
+    let stub = write_ready_file_stub(
+        dir.path(),
+        "silent-advance",
+        r#"echo $$ > "$ws/.runtime/silent.pid"
+exec sleep 60
 "#,
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).unwrap();
+    );
     let cfg = BridgeConfig {
         platform: BridgePlatform::Mac,
         engine_mode: EngineMode::Jit,
         composition_mode: CompositionMode::Supervise,
-        supervise_command: Some(path),
-        supervise_ready_timeout: Some(std::time::Duration::from_millis(300)),
+        supervise_command: Some(stub),
+        supervise_ready_timeout: Some(std::time::Duration::from_millis(400)),
         supervise_kill_on_drop: true,
         ..BridgeConfig::default()
     };
@@ -145,6 +139,14 @@ sleep 60
         advance_embedded_runtime_bridge::BridgeError::SuperviseStartTimeout
             | advance_embedded_runtime_bridge::BridgeError::Supervise(_)
     ));
+    if let Ok(pid) = fs::read_to_string(ws.join(".runtime").join("silent.pid")) {
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!alive, "timed-out child must be reaped");
+    }
 }
 
 #[test]
@@ -157,9 +159,16 @@ fn t14_facade_types_reachable() {
 #[test]
 fn header_exists_and_mentions_abi() {
     let header = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("include/advance_bridge.h");
-    let text = fs::read_to_string(header).unwrap();
+    let text = fs::read_to_string(&header).unwrap();
     assert!(text.contains("ADVANCE_BRIDGE_ABI_VERSION"));
     assert!(text.contains("advance_bridge_start"));
+    #[cfg(unix)]
+    if let Ok(st) = Command::new("clang")
+        .args(["-fsyntax-only", "-x", "c", header.to_str().unwrap()])
+        .status()
+    {
+        assert!(st.success(), "header must compile as a C translation unit");
+    }
 }
 
 #[cfg(unix)]
@@ -399,7 +408,14 @@ exit 0
 fn t30c_default_drop_reaps() {
     let dir = tempfile::tempdir().unwrap();
     let (_g, ws) = write_workspace();
-    let stub = write_ready_stub(dir.path());
+    let stub = write_ready_file_stub(
+        dir.path(),
+        "drop-reap",
+        r#"echo "advance: runtime ready (workspace=stub)"
+echo $$ > "$ws/.runtime/reap.pid"
+exec sleep 60
+"#,
+    );
     let cfg = BridgeConfig {
         platform: BridgePlatform::Mac,
         engine_mode: EngineMode::Jit,
@@ -409,7 +425,17 @@ fn t30c_default_drop_reaps() {
         ..BridgeConfig::default()
     };
     let h = start(&ws, cfg).expect("start");
+    let pid = fs::read_to_string(ws.join(".runtime").join("reap.pid")).ok();
     drop(h);
+    if let Some(pid) = pid {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!alive, "default Drop must reap child");
+    }
 }
 
 /// Plan T13 subset: invoke the C ABI from Rust (null args, buffer, start/stop/double-stop/free).
@@ -479,4 +505,35 @@ fn t13_c_abi_lifecycle() {
     assert_eq!(unsafe { advance_bridge_stop(handle) }, 0);
     assert_eq!(unsafe { advance_bridge_stop(handle) }, 0);
     unsafe { advance_bridge_free_handle(handle) };
+}
+
+/// Plan T28: after the ready line, a flood of stdout must not hang start.
+#[cfg(unix)]
+#[test]
+fn t28_pipe_flood_after_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_g, ws) = write_workspace();
+    let stub = write_ready_file_stub(
+        dir.path(),
+        "flood-advance",
+        r#"echo "advance: runtime ready (workspace=stub)"
+i=0
+while [ $i -lt 2000 ]; do
+  echo "flood $i"
+  i=$((i+1))
+done
+exec sleep 60
+"#,
+    );
+    let cfg = BridgeConfig {
+        platform: BridgePlatform::Mac,
+        engine_mode: EngineMode::Jit,
+        composition_mode: CompositionMode::Supervise,
+        supervise_command: Some(stub),
+        supervise_kill_on_drop: true,
+        supervise_ready_timeout: Some(std::time::Duration::from_secs(5)),
+        ..BridgeConfig::default()
+    };
+    let h = start(&ws, cfg).expect("flood start");
+    stop(h).expect("stop");
 }

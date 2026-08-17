@@ -77,21 +77,20 @@ fn reject_symlink_path(path: &Path) -> Result<(), BridgeError> {
 
 fn reject_non_regular_file(path: &Path) -> Result<(), BridgeError> {
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {
-            // symlink already rejected; allow regular file
-            if meta.file_type().is_symlink() {
-                return Err(BridgeError::InvalidWorkspace(format!(
-                    "symlink not allowed: {}",
-                    path.display()
-                )));
-            }
-            Ok(())
-        }
-        Ok(meta) if !meta.file_type().is_dir() => Err(BridgeError::InvalidWorkspace(format!(
+        Ok(meta) if meta.file_type().is_symlink() => Err(BridgeError::InvalidWorkspace(format!(
+            "symlink not allowed: {}",
+            path.display()
+        ))),
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(_) => Err(BridgeError::InvalidWorkspace(format!(
             "non-regular lock path not allowed: {}",
             path.display()
         ))),
-        Ok(_) | Err(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(BridgeError::InvalidWorkspace(format!(
+            "lock metadata {}: {e}",
+            path.display()
+        ))),
     }
 }
 
@@ -114,9 +113,15 @@ fn create_dir_private(path: &Path) -> Result<(), BridgeError> {
             path.display()
         ))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path).map_err(|e| {
-                BridgeError::InvalidWorkspace(format!("create_dir {}: {e}", path.display()))
-            })?;
+            if let Err(ce) = fs::create_dir(path) {
+                if ce.kind() == std::io::ErrorKind::AlreadyExists {
+                    return create_dir_private(path);
+                }
+                return Err(BridgeError::InvalidWorkspace(format!(
+                    "create_dir {}: {ce}",
+                    path.display()
+                )));
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

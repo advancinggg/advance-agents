@@ -39,6 +39,12 @@ pub fn build_profile(
     battery_pct: Option<u8>,
     network_class: Option<String>,
 ) -> RuntimeHostProfileView {
+    // Compiled mobile target cannot be bypassed by passing BridgePlatform::Mac.
+    #[cfg(target_os = "ios")]
+    let platform = BridgePlatform::Ios;
+    #[cfg(target_os = "android")]
+    let platform = BridgePlatform::Android;
+
     let host_backend = HostBackend::Cranelift;
     let non_fg = !matches!(lifecycle, PlatformLifecycleState::Foreground);
     let mobile = matches!(platform, BridgePlatform::Ios | BridgePlatform::Android);

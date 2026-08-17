@@ -78,6 +78,21 @@ fn redact(s: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn t18_redact_secret_patterns() {
+        assert_eq!(redact("failed key=sk-abc"), "redacted error");
+        assert_eq!(redact("token=xyz"), "redacted error");
+        assert_eq!(redact("Authorization: Bearer abc"), "redacted error");
+        assert_eq!(redact("open secrets.json"), "redacted error");
+        assert_eq!(redact("master-key-source"), "redacted error");
+        assert_eq!(redact("missing runtime-config.yaml"), "missing runtime-config.yaml");
+    }
+}
+
 fn raw_truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()

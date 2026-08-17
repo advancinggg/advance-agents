@@ -70,16 +70,13 @@ impl BridgeHandle {
     }
 
     pub fn health(&self) -> Result<BridgeHealth, BridgeError> {
-        if self.inner.stopped.load(Ordering::SeqCst) {
-            // Still valid until drop if stop was called but handle lives.
-        }
         let lifecycle = self
             .inner
             .lifecycle
             .lock()
             .map_err(|_| BridgeError::Internal("lifecycle lock".into()))?
             .clone();
-        let (runtime_up, last_hb, readiness, lock_excl) = {
+        let (runtime_up, need_lock_hb, readiness, lock_excl) = {
             let mut mode = self
                 .inner
                 .mode
@@ -88,17 +85,13 @@ impl BridgeHandle {
             match &mut *mode {
                 ModeState::Embed { host, lock } => {
                     let up = host.is_some() && !self.inner.stopped.load(Ordering::SeqCst);
-                    let hb = if lock.is_some() && uses_runtime_lock() {
-                        lock_status::embed_lock_heartbeat_ok(&self.inner.workspace)
-                    } else {
-                        up
-                    };
+                    let need_hb = lock.is_some() && uses_runtime_lock();
                     let excl = if uses_runtime_lock() {
                         LockExclusivity::RuntimeLock
                     } else {
                         LockExclusivity::ProcessLocal
                     };
-                    (up, hb, None, excl)
+                    (up, need_hb, None, excl)
                 }
                 ModeState::Supervise {
                     child,
@@ -115,9 +108,15 @@ impl BridgeHandle {
                         false
                     };
                     let up = alive && !self.inner.stopped.load(Ordering::SeqCst);
-                    (up, up, Some(*readiness), LockExclusivity::ProcessLocal)
+                    (up, false, Some(*readiness), LockExclusivity::ProcessLocal)
                 }
             }
+        };
+        // Read the lock file *after* releasing mode so a FIFO/hang cannot wedge stop.
+        let last_hb = if need_lock_hb {
+            lock_status::embed_lock_heartbeat_ok(&self.inner.workspace)
+        } else {
+            runtime_up
         };
         let profile = build_profile(
             self.inner.config.platform,

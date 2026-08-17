@@ -17,6 +17,13 @@ pub struct LockSnapshot {
 
 /// Parse lock YAML written by RuntimeLock (key: value lines).
 pub fn parse_lock_file(path: &Path) -> Option<LockSnapshot> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() || meta.file_type().is_symlink() {
+        return None;
+    }
+    if meta.len() > 4096 {
+        return None;
+    }
     let content = fs::read_to_string(path).ok()?;
     let mut pid = None;
     let mut heartbeat_at = None;
@@ -41,7 +48,7 @@ pub fn heartbeat_fresh(heartbeat_at: &str) -> bool {
     let hb = dt.with_timezone(&Utc);
     let now = Utc::now();
     let age = now.signed_duration_since(hb);
-    age.num_seconds() >= 0 && (age.num_seconds() as u64) <= STALENESS.as_secs()
+    age.num_seconds() >= 0 && (age.num_seconds() as u64) < STALENESS.as_secs()
 }
 
 /// last_heartbeat_ok for embed with RuntimeLock held.
