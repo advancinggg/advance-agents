@@ -18,9 +18,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "advance-along-home"
+version = "0.1.0"
+dependencies = [
+ "advance-runtime",
+ "advance-shared-types",
+ "async-trait",
+ "cap-http",
+ "cap-llm",
+ "cap-secrets",
+ "chrono",
+ "hex",
+ "libc",
+ "rand 0.8.5",
+ "secrecy",
+ "serde",
+ "serde_yml",
+ "tempfile",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "advance-cli"
 version = "0.1.0"
 dependencies = [
+ "advance-along-home",
  "advance-cli",
  "advance-client-api",
  "advance-context-engine",
@@ -138,6 +161,7 @@ dependencies = [
 name = "advance-core"
 version = "0.1.0"
 dependencies = [
+ "advance-along-home",
  "advance-client-api",
  "advance-context-engine",
  "advance-cost-tracker",
@@ -1217,6 +1241,7 @@ dependencies = [
  "hex",
  "hkdf",
  "keyring",
+ "libc",
  "rand 0.8.5",
  "secrecy",
  "serde",

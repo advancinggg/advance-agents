@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use advance_runtime::config::ConfigError;
+use advance_runtime::config::RuntimeConfigProvider;
 use advance_runtime::runtime_lock::RuntimeLock;
 use advance_runtime::{BootstrapError, RuntimeHost, RuntimeHostBuilder};
 
@@ -320,14 +321,36 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
     // resolves by passing pre-snapshotted YAML bytes to cap-grant via the
     // Step-2 fix in `wiring.rs`. Surface any wiring failure with the
     // generic diagnostic.
-    let (_host, wiring_handles) = match crate::wiring::wire_capabilities(builder, &workspace).await
-    {
+    let (host, wiring_handles) = match crate::wiring::wire_capabilities(builder, &workspace).await {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("advance start: wiring failed: {e}");
             return ExitCode::from(1);
         }
     };
+
+    {
+        let pid = std::process::id();
+        let first = host
+            .config()
+            .llm_providers
+            .first()
+            .map(|p| p.id.clone())
+            .unwrap_or_default();
+        let _ = advance_along_home::write_selected_provider(&workspace, pid, &first);
+        let mut rx = host.config_watcher().subscribe();
+        let ws = workspace.clone();
+        tokio::spawn(async move {
+            while let Some(cfg) = rx.recv().await {
+                let id = cfg
+                    .llm_providers
+                    .first()
+                    .map(|p| p.id.clone())
+                    .unwrap_or_default();
+                let _ = advance_along_home::write_selected_provider(&ws, pid, &id);
+            }
+        });
+    }
 
     println!(
         "advance: runtime ready (workspace={})",
@@ -364,7 +387,7 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
         mgr.set_llm_stream_reaper(reaper.clone());
     }
     let agent_loop = match try_spawn_agent_loop(
-        &_host,
+        &host,
         &workspace,
         wiring_handles.event_bus_dyn.clone(),
         wiring_handles.run_manager.clone(),
@@ -579,8 +602,8 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
                 let registry = Arc::new(registry);
                 let factory: Arc<dyn RunnableHookFactory> = Arc::new(
                     WasmRunnableHookFactory::new(
-                        _host.component_runtime(),
-                        _host.capability_injector(),
+                        host.component_runtime(),
+                        host.capability_injector(),
                     )
                     .with_event_bus(Arc::clone(&wiring_handles.event_bus_dyn)),
                 );
@@ -588,7 +611,7 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
                 let probe: Arc<dyn RuntimeReadiness> = Arc::new(BootReadyProbe);
                 let file_source: Arc<dyn FileWatchSource> = Arc::new(BootNoopFileWatchSource);
                 let webhook_source: Arc<dyn WebhookSource> = Arc::new(BootNoopWebhookSource);
-                let breaker_bus = _host.circuit_breaker_bus();
+                let breaker_bus = host.circuit_breaker_bus();
                 match start_continuous_readiness_gated_walk_with_breaker_gate(
                     registry,
                     probe,

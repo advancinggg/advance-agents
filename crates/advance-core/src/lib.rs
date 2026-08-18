@@ -33,6 +33,7 @@
 pub use advance_shared_types as shared_types;
 
 // ── runtime host (Wasmtime host, L0 injection, breaker bus) ──────────────────────
+pub use advance_along_home as along_home;
 pub use advance_runtime as runtime;
 
 // ── CONTRACT-210 embed/supervise bridge (Wave-27 C210) ─────────────────────

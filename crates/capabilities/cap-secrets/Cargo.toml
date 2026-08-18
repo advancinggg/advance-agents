@@ -31,6 +31,9 @@ hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true }
 # /dev WS-A: FileSecretStorage tests write to throwaway temp dirs.

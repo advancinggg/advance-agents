@@ -82,6 +82,55 @@ impl LockData {
 // LockError
 // ---------------------------------------------------------------------------
 
+/// Read-only view of `{workspace}/.runtime/runtime.lock` (CONTRACT-243).
+/// Does not acquire or rewrite the lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockInspection {
+    Absent,
+    Live { pid: u32 },
+    Stale { pid: u32 },
+}
+
+/// Classify the lock without acquiring it. AC-06 acquire semantics are unchanged.
+pub fn inspect_lock(workspace: &Path) -> LockInspection {
+    let path = workspace.join(".runtime").join("runtime.lock");
+    let meta = match std::fs::symlink_metadata(&path) {
+        Err(_) => return LockInspection::Absent,
+        Ok(m) => m,
+    };
+    if !meta.file_type().is_file() || meta.len() > 4096 {
+        return LockInspection::Stale { pid: 0 };
+    }
+    let content = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let Ok(mut f) = opts.open(&path) else {
+            return LockInspection::Stale { pid: 0 };
+        };
+        let mut buf = String::new();
+        if std::io::Read::read_to_string(&mut f, &mut buf).is_err() || buf.len() > 4096 {
+            return LockInspection::Stale { pid: 0 };
+        }
+        buf
+    };
+    let Ok(existing) = LockData::from_yaml(&content) else {
+        return LockInspection::Stale { pid: 0 };
+    };
+    if is_pid_alive(existing.pid)
+        && platform_uid_matches(existing.pid, &existing.platform_uid)
+        && heartbeat_fresh(&existing.heartbeat_at)
+    {
+        LockInspection::Live { pid: existing.pid }
+    } else {
+        LockInspection::Stale { pid: existing.pid }
+    }
+}
+
 /// Errors from `RuntimeLock::acquire`.
 #[derive(Debug)]
 pub enum LockError {
@@ -138,27 +187,10 @@ impl RuntimeLock {
         tokio::fs::create_dir_all(&lock_dir).await?;
         let path = lock_dir.join("runtime.lock");
 
-        // Check existing lock
-        if path.exists() {
-            match tokio::fs::read_to_string(&path).await {
-                Ok(content) => match LockData::from_yaml(&content) {
-                    Ok(existing) => {
-                        if is_pid_alive(existing.pid)
-                            && platform_uid_matches(existing.pid, &existing.platform_uid)
-                            && heartbeat_fresh(&existing.heartbeat_at)
-                        {
-                            return Err(LockError::ActiveRuntime(existing.pid));
-                        }
-                        // Stale — fall through to overwrite
-                    }
-                    Err(_) => {
-                        // Malformed — treat as stale, overwrite
-                    }
-                },
-                Err(_) => {
-                    // Read error — treat as stale, overwrite
-                }
-            }
+        // Same leaf rules as inspect_lock (no follow / no FIFO hang / size cap).
+        match inspect_lock(workspace) {
+            LockInspection::Live { pid } => return Err(LockError::ActiveRuntime(pid)),
+            LockInspection::Absent | LockInspection::Stale { .. } => {}
         }
 
         // Write new claim
@@ -189,12 +221,22 @@ impl RuntimeLock {
                 use std::fs::OpenOptions;
                 use std::io::Write;
                 use std::os::unix::fs::OpenOptionsExt;
-                let mut f = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&path)?;
+                let mut opts = OpenOptions::new();
+                opts.write(true).create(true).truncate(true).mode(0o600);
+                opts.custom_flags(libc::O_NOFOLLOW);
+                let mut f = match opts.open(&path) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        // Replace a planted symlink / special file rather than follow it.
+                        let _ = std::fs::remove_file(&path);
+                        OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .custom_flags(libc::O_NOFOLLOW)
+                            .open(&path)?
+                    }
+                };
                 f.write_all(data.to_yaml().as_bytes())?;
             }
             #[cfg(not(unix))]

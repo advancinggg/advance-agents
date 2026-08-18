@@ -79,11 +79,28 @@ impl FileSecretStorage {
     ///   drop secrets).
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let path = path.into();
-        let cache = if path.exists() {
-            let bytes = Zeroizing::new(
-                fs::read(&path)
-                    .map_err(|e| StorageError::Backend(format!("read secrets file: {e}")))?,
-            );
+        let cache = if fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_file() && m.len() <= 1_048_576)
+            .unwrap_or(false)
+        {
+            let bytes = Zeroizing::new({
+                let mut opts = fs::OpenOptions::new();
+                opts.read(true);
+                #[cfg(unix)]
+                {
+                    opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                }
+                let mut f = opts
+                    .open(&path)
+                    .map_err(|e| StorageError::Backend(format!("read secrets file: {e}")))?;
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut f, &mut buf)
+                    .map_err(|e| StorageError::Backend(format!("read secrets file: {e}")))?;
+                if buf.len() > 1_048_576 {
+                    return Err(StorageError::Backend("secrets file too large".into()));
+                }
+                buf
+            });
             let doc: FileFormat = serde_json::from_slice(&bytes)
                 .map_err(|e| StorageError::Backend(format!("parse secrets file: {e}")))?;
             if doc.version != FORMAT_VERSION {
@@ -226,10 +243,20 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     let tmp = PathBuf::from(tmp_os);
 
     {
+        if let Ok(m) = fs::symlink_metadata(&tmp) {
+            if !m.file_type().is_file() {
+                fs::remove_file(&tmp).map_err(|e| {
+                    StorageError::Backend(format!("remove planted secrets tmp: {e}"))
+                })?;
+            }
+        }
         let mut opts = fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
-        opts.mode(0o600);
+        {
+            opts.mode(0o600);
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
         let mut f = opts
             .open(&tmp)
             .map_err(|e| StorageError::Backend(format!("open temp secrets file: {e}")))?;

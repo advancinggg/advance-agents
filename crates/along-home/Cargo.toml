@@ -1,0 +1,37 @@
+[package]
+name = "advance-along-home"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CONTRACT-243 Along-home first-open host library."
+
+publish = false
+
+[lib]
+name = "advance_along_home"
+path = "src/lib.rs"
+
+[dependencies]
+advance-runtime = { path = "../runtime" }
+advance-shared-types = { path = "../shared-types" }
+cap-secrets = { path = "../capabilities/cap-secrets" }
+cap-llm = { path = "../capabilities/cap-llm" }
+cap-http = { path = "../capabilities/cap-http" }
+tokio = { workspace = true }
+zeroize = { workspace = true }
+serde = { workspace = true }
+serde_yml = { workspace = true }
+libc = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+secrecy = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

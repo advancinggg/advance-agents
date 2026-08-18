@@ -19,6 +19,7 @@ pub mod component_spec;
 pub mod config;
 pub mod host_registry;
 pub mod runtime_lock;
+pub use runtime_lock::{inspect_lock, LockInspection};
 pub mod wit_bindings;
 
 // Top-level re-exports of the Slice T public surface.

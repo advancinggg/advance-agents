@@ -40,8 +40,9 @@ pub use host_fn::{
     SecretExistsHandler,
 };
 pub use master_key::{
-    load_master_key, DefaultEntryProvider, EntryError, EntryProvider, MasterKeyConfig,
-    DEFAULT_KEYCHAIN_ACCOUNT, DEFAULT_KEYCHAIN_SERVICE,
+    ensure_master_key, load_master_key, read_workspace_master_key, workspace_master_key_path,
+    DefaultEntryProvider, EntryError, EntryProvider, MasterKeyConfig, DEFAULT_KEYCHAIN_ACCOUNT,
+    DEFAULT_KEYCHAIN_SERVICE,
 };
 pub use storage::{InMemorySecretStorage, SecretStorage, StorageError, StoredSecret};
 pub use store::SecretStore;

@@ -70,7 +70,7 @@ fn run_set_inner(name: &str, workspace: Option<PathBuf>) -> Result<(), String> {
             cfg_path.display()
         )
     })?;
-    let key = crate::wiring::load_real_master_key(&cfg.secrets).map_err(|e| {
+    let key = crate::wiring::load_real_master_key(&workspace, &cfg.secrets).map_err(|e| {
         // Name the ACTUAL env var the config points at (env-var-name), which may
         // be customized from the SECRETS_MASTER_KEY default.
         format!(

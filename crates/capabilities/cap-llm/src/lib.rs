@@ -36,6 +36,7 @@ pub mod error;
 pub mod events;
 pub mod gateway;
 pub mod host_fn;
+pub mod preflight;
 pub mod provider;
 // `providers` is crate-internal: `ProviderAdapter::parse_chat_response`
 // returns the `pub(crate)` `ExecutionOutcome`, so the trait surface is
@@ -66,6 +67,9 @@ pub use gateway::{
 pub use host_fn::{
     register_agent_llm, register_agent_llm_with_turn_cost, AgentLlmGenerateHandler,
     AgentLlmPollStreamHandler, AgentLlmStreamHandler, AgentStreamReaper, ReapBatch,
+};
+pub use preflight::{
+    chat_preflight, DiscardEventBus, NoopRepetition, PreflightAllowBudget, StaticConfig,
 };
 pub use provider::{resolve_provider_and_model, ResolvedProvider};
 pub use retry::{

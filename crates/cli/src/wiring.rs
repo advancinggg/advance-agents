@@ -922,7 +922,7 @@ async fn wire_capabilities_inner(
     // journal/factory graph before EventBus, host registration, listeners, or
     // any other externally reachable runtime object exists.
     let mut master_key = if needs_key {
-        Some(load_real_master_key(&builder.config().secrets)?)
+        Some(load_real_master_key(workspace, &builder.config().secrets)?)
     } else {
         None
     };
@@ -2260,23 +2260,40 @@ async fn wire_capabilities_inner(
     // Final production visibility step: bind only after every fallible runtime
     // capability has composed. An unavailable loopback socket degrades the
     // optional public surface without exposing an unbound/raw fallback.
-    let client_api_server = match (
-        observability_read_api.as_ref(),
-        contract219_projector.as_ref(),
-        observation_carrier_store.as_ref(),
-    ) {
-        (Some(read), Some(projector), Some(carriers)) => {
-            let history = crate::client_api_adapters::Contract219HistoryAdapter::new(
-                Arc::clone(read),
-                Arc::clone(projector),
-                Arc::clone(carriers),
-            );
-            let events = crate::client_api_adapters::Contract185EventAdapter::new(
-                Arc::clone(read),
-                client_event_retention_days,
-            );
-            match (history, events) {
-                (Ok(history), Ok(events)) => {
+    // CONTRACT-243: bind whenever EventBus is up, even if C218/projector/carriers
+    // are None (fs+llm Landing homes and `advance init` without lifecycle).
+    let client_api_server = match observability_read_api.as_ref() {
+        Some(read) => {
+            let history_events = match (
+                contract219_projector.as_ref(),
+                observation_carrier_store.as_ref(),
+            ) {
+                (Some(projector), Some(carriers)) => {
+                    let history = crate::client_api_adapters::Contract219HistoryAdapter::new(
+                        Arc::clone(read),
+                        Arc::clone(projector),
+                        Arc::clone(carriers),
+                    );
+                    let events = crate::client_api_adapters::Contract185EventAdapter::new(
+                        Arc::clone(read),
+                        client_event_retention_days,
+                    );
+                    match (history, events) {
+                        (Ok(h), Ok(e)) => Some((h, e, Arc::clone(projector))),
+                        (Err(error), _) | (_, Err(error)) => {
+                            eprintln!("advance: Client API history/events unavailable: {error}");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let grant_approval_for_api = grant_approval_intake.clone();
+            match advance_client_api::ClientApiServer::bind_local_factory(0, move |address| {
+                let mut config = advance_client_api::ClientApiConfig::default();
+                config.allowed_origins = vec![format!("http://{address}")];
+                let mut api = advance_client_api::ClientApi::new(config);
+                if let Some((history, events, projector)) = history_events {
                     let history: Arc<dyn advance_client_api::BoundHistoryReadPort> =
                         Arc::new(history);
                     let events: Arc<dyn advance_client_api::ClientEventProvider> = Arc::new(events);
@@ -2287,65 +2304,49 @@ async fn wire_capabilities_inner(
                             Arc::new(advance_client_api::OsCursorEntropy),
                             client_event_retention_days,
                         ));
-                    let grants = grant_approval_intake.as_ref().map(|intake| {
+                    let grants = grant_approval_for_api.as_ref().map(|intake| {
                         Arc::new(crate::client_api_adapters::Contract219GrantAdapter::new(
                             Arc::clone(intake),
-                            Arc::clone(projector),
+                            Arc::clone(&projector),
                         ))
                             as Arc<dyn advance_client_api::BoundGrantApprovalPort>
                     });
-                    let redactor = projector.redactor();
-                    let detector = Arc::clone(&public_leak_detector);
-                    match advance_client_api::ClientApiServer::bind_local_factory(
-                        0,
-                        move |address| {
-                            let mut config = advance_client_api::ClientApiConfig::default();
-                            config.allowed_origins = vec![format!("http://{address}")];
-                            let api = advance_client_api::ClientApi::new(config)
-                                .with_bound_history_provider(history)
-                                .with_event_provider(events)
-                                .with_cursor_codec(cursor)
-                                .with_observation_redactor(redactor)
-                                .with_leak_detector(detector);
-                            let api = match grants {
-                                Some(grants) => api.with_bound_grant_provider(grants),
-                                None => api,
-                            };
-                            // Tee T2 (ClientApi side): inject the SAME hub the
-                            // gateway's delta_sink publishes into (constructed in
-                            // step 1 above, before the gateway). None when LLM is
-                            // not configured → delta surface returns module_unavailable.
-                            let api = match llm_delta_hub_opt.as_ref() {
-                                Some(hub) => api.with_llm_delta_hub(Arc::clone(hub)),
-                                None => api,
-                            };
-                            Arc::new(api)
-                        },
-                    )
-                    .await
-                    {
-                        Ok(server) => {
-                            eprintln!(
-                                "advance: Client API and Web Console listening at http://{}",
-                                server.local_addr()
-                            );
-                            Some(server)
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "advance: Client API unavailable (loopback bind failed): {error}"
-                            );
-                            None
-                        }
+                    api = api
+                        .with_bound_history_provider(history)
+                        .with_event_provider(events)
+                        .with_cursor_codec(cursor)
+                        .with_observation_redactor(projector.redactor())
+                        .with_leak_detector(Arc::clone(&public_leak_detector));
+                    if let Some(grants) = grants {
+                        api = api.with_bound_grant_provider(grants);
                     }
                 }
-                (Err(error), _) | (_, Err(error)) => {
-                    eprintln!("advance: Client API unavailable (event bridge failed): {error}");
+                if let Some(hub) = llm_delta_hub_opt.as_ref() {
+                    api = api.with_llm_delta_hub(Arc::clone(hub));
+                }
+                Arc::new(api)
+            })
+            .await
+            {
+                Ok(server) => {
+                    eprintln!(
+                        "advance: Client API and Web Console listening at http://{}",
+                        server.local_addr()
+                    );
+                    let _ = advance_along_home::write_client_api_discovery(
+                        workspace,
+                        std::process::id(),
+                        &format!("http://{}", server.local_addr()),
+                    );
+                    Some(server)
+                }
+                Err(error) => {
+                    eprintln!("advance: Client API unavailable (loopback bind failed): {error}");
                     None
                 }
             }
         }
-        _ => None,
+        None => None,
     };
 
     Ok((
@@ -2393,6 +2394,7 @@ async fn wire_capabilities_inner(
 /// keychain integration is deferred per MODULE-012 §3.6, so REQ-095 stays
 /// Partial).
 pub(crate) fn load_real_master_key(
+    workspace: &Path,
     secrets: &SecretsConfig,
 ) -> Result<Zeroizing<[u8; 32]>, CliWiringError> {
     let cfg = match secrets.master_key_source {
@@ -2403,6 +2405,11 @@ pub(crate) fn load_real_master_key(
             fallback_env_var: Some(secrets.env_var_name.clone()),
         },
     };
+    if let Some(key) =
+        cap_secrets::read_workspace_master_key(workspace).map_err(CliWiringError::MasterKey)?
+    {
+        return Ok(key);
+    }
     load_master_key(&cfg, &DefaultEntryProvider).map_err(CliWiringError::MasterKey)
 }
 

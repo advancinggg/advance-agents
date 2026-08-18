@@ -26,6 +26,7 @@ path = "src/main.rs"
 
 [dependencies]
 advance-runtime = { path = "../runtime" }
+advance-along-home = { path = "../along-home" }
 # MODULE-001-AC-20 (024): core->component encode for the deploy-component loader.
 # Leaf lib (anyhow + wit-component + clap; no advance-* deps -> cycle-free).
 build-agent = { path = "../build-agent" }

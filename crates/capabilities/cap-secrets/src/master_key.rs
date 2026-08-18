@@ -7,6 +7,7 @@
 //! the real OS credential store (keyring 2.3.3 exposes no per-test mock
 //! without a process-global `set_default_credential_builder` race).
 
+use rand::RngCore;
 use zeroize::Zeroizing;
 
 use crate::error::SecretError;
@@ -38,6 +39,14 @@ pub enum MasterKeyConfig {
 /// real store.
 pub trait EntryProvider: Send + Sync {
     fn get_password(&self, service: &str, account: &str) -> Result<String, EntryError>;
+    fn set_password(
+        &self,
+        _service: &str,
+        _account: &str,
+        _password: &str,
+    ) -> Result<(), EntryError> {
+        Err(EntryError::Open("set_password not supported".into()))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +76,14 @@ impl EntryProvider for DefaultEntryProvider {
             keyring::Error::NoEntry => EntryError::NotFound(format!("{service}/{account}")),
             _ => EntryError::Open(e.to_string()),
         })
+    }
+
+    fn set_password(&self, service: &str, account: &str, password: &str) -> Result<(), EntryError> {
+        let entry =
+            keyring::Entry::new(service, account).map_err(|e| EntryError::Open(e.to_string()))?;
+        entry
+            .set_password(password)
+            .map_err(|e| EntryError::Open(e.to_string()))
     }
 }
 
@@ -129,6 +146,147 @@ pub fn load_master_key(
         },
     };
     decode_to_key(&hex_str)
+}
+
+/// `{workspace}/.advance/master.key` — first-open mint + CLI fallback.
+pub fn workspace_master_key_path(workspace: &std::path::Path) -> std::path::PathBuf {
+    workspace.join(".advance").join("master.key")
+}
+
+pub fn read_workspace_master_key(
+    workspace: &std::path::Path,
+) -> Result<Option<Zeroizing<[u8; 32]>>, SecretError> {
+    let path = workspace_master_key_path(workspace);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    if !meta.file_type().is_file() || meta.len() > 128 {
+        return Err(SecretError::KeyLoad(
+            "master.key is not a regular file of expected size".into(),
+        ));
+    }
+    let raw = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut f = opts
+            .open(&path)
+            .map_err(|e| SecretError::KeyLoad(format!("read master.key: {e}")))?;
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut f, &mut buf)
+            .map_err(|e| SecretError::KeyLoad(format!("read master.key: {e}")))?;
+        if buf.len() > 128 {
+            return Err(SecretError::KeyLoad("master.key too large".into()));
+        }
+        buf
+    };
+    let hex_str = Zeroizing::new(raw.trim().to_string());
+    decode_to_key(&hex_str).map(Some)
+}
+
+/// Load existing key or mint one.
+///
+/// Order: valid workspace file → keychain (when configured) → env → mint.
+/// A present-but-invalid `master.key` fail-closes (does not overwrite).
+/// Recovered keychain/env keys are persisted to the file if it is missing.
+/// A freshly minted key is never written into the process-global keychain.
+pub fn ensure_master_key(
+    workspace: &std::path::Path,
+    cfg: &MasterKeyConfig,
+    entries: &dyn EntryProvider,
+) -> Result<Zeroizing<[u8; 32]>, SecretError> {
+    let path = workspace_master_key_path(workspace);
+    if std::fs::symlink_metadata(&path).is_ok() {
+        return read_workspace_master_key(workspace)?
+            .ok_or_else(|| SecretError::KeyLoad("master.key present but empty/unreadable".into()));
+    }
+    match try_existing_configured_key(cfg, entries) {
+        Ok(Some(key)) => {
+            persist_master_key_file_exclusive(workspace, &key)?;
+            return Ok(key);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            // Broken keychain + existing ciphertext: fail closed.
+            // Empty first-open home: mint a workspace file.
+            if workspace.join(".advance").join("secrets.json").is_file() {
+                return Err(e);
+            }
+        }
+    }
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    persist_master_key_file_exclusive(workspace, &bytes)?;
+    Ok(Zeroizing::new(bytes))
+}
+
+fn try_existing_configured_key(
+    cfg: &MasterKeyConfig,
+    entries: &dyn EntryProvider,
+) -> Result<Option<Zeroizing<[u8; 32]>>, SecretError> {
+    match cfg {
+        MasterKeyConfig::Keychain {
+            service,
+            account,
+            fallback_env_var,
+        } => match entries.get_password(service, account) {
+            Ok(s) => decode_to_key(&Zeroizing::new(s)).map(Some),
+            Err(EntryError::NotFound(_)) => match fallback_env_var {
+                Some(var) => match std::env::var(var) {
+                    Ok(s) => decode_to_key(&Zeroizing::new(s)).map(Some),
+                    Err(std::env::VarError::NotPresent) => Ok(None),
+                    Err(_) => Err(SecretError::KeyLoad(format!(
+                        "env var {var} contains non-UTF-8 bytes"
+                    ))),
+                },
+                None => Ok(None),
+            },
+            Err(e) => Err(SecretError::KeyLoad(format!("{e}"))),
+        },
+        MasterKeyConfig::EnvVar(name) => match std::env::var(name) {
+            Ok(s) => decode_to_key(&Zeroizing::new(s)).map(Some),
+            Err(_) => Ok(None),
+        },
+    }
+}
+
+fn persist_master_key_file_exclusive(
+    workspace: &std::path::Path,
+    key: &[u8; 32],
+) -> Result<(), SecretError> {
+    let dir = workspace.join(".advance");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| SecretError::KeyLoad(format!("create .advance: {e}")))?;
+    let path = workspace_master_key_path(workspace);
+    let hex = zeroize::Zeroizing::new(hex::encode(key));
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| SecretError::KeyLoad(format!("create master.key: {e}")))?;
+        f.write_all(hex.as_bytes())
+            .map_err(|e| SecretError::KeyLoad(format!("write master.key: {e}")))?;
+    }
+    #[cfg(not(unix))]
+    {
+        if path.exists() {
+            return Err(SecretError::KeyLoad("master.key already exists".into()));
+        }
+        std::fs::write(&path, hex.as_bytes())
+            .map_err(|e| SecretError::KeyLoad(format!("write master.key: {e}")))?;
+    }
+    Ok(())
 }
 
 fn decode_to_key(hex_str: &Zeroizing<String>) -> Result<Zeroizing<[u8; 32]>, SecretError> {

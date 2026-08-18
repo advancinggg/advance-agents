@@ -6,96 +6,15 @@
 //! Linux <5.6 and macOS fall back to the Slice F pathname-based flow.
 
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// Minimal `runtime-config.yaml` template that passes every Slice D validator
-/// rule with zero free-parameter failures. Carries BOTH an `anthropic` and an
-/// `openai` `llm-providers[]` entry (/dev WS-A) — each validator-compliant:
-/// `https` endpoint, distinct `id`, non-empty `api-key-secret` (a secret
-/// *reference* name, provisioned via `advance secrets set`, never inlined),
-/// `cost-per-mtoken-*` > 0, and the REQUIRED non-zero `rate-limit`. (MODULE-001
-/// §1.4.2's example notoriously omitted `rate-limit` on its OpenAI block, which
-/// the validator rejects — this template does not.)
-pub(crate) const MINIMAL_STARTER: &str = "\
-wasm:
-  max_memory_pages: 1024
-  epoch_interruption_ms: 100
-  fuel_enabled: false
+#[cfg(target_os = "linux")]
+use std::io::Write;
 
-llm-providers:
-  - id: anthropic
-    endpoint: https://api.anthropic.com
-    api-key-secret: anthropic-api-key
-    model-aliases:
-      sonnet: claude-sonnet-4-5
-    cost-per-mtoken-in: 3.00
-    cost-per-mtoken-out: 15.00
-    rate-limit:
-      requests-per-minute: 1000
-      tokens-per-minute: 400000
-  - id: openai
-    endpoint: https://api.openai.com
-    api-key-secret: openai-api-key
-    model-aliases:
-      gpt: gpt-4o
-    cost-per-mtoken-in: 2.50
-    cost-per-mtoken-out: 10.00
-    rate-limit:
-      requests-per-minute: 1000
-      tokens-per-minute: 400000
-
-cron:
-  max_jitter_ratio: 0.1
-
-git:
-  gc_interval_hours: 24
-  max_tracked_file_mb: 10
-
-secrets:
-  master-key-source: keychain
-  env-var-name: SECRETS_MASTER_KEY
-
-post-processor:
-  llm-model: sonnet-light
-  llm-failure-cooldown-seconds: 600
-
-# Slice AE (2026-05-09): per-workspace SQLite index handle. The block has
-# `#[serde(default)]` on the parent struct, so omitting it produces the same
-# values; explicit form here keeps `advance config check` output canonical.
-# Slice G (2026-05-09): adds wal-mode + embedding-dim + recall-max-depth for
-# AC-19 hot-reload coverage. Each subfield has its own `#[serde(default)]`
-# so omitting an individual line within a present `database:` block also
-# yields the canonical default.
-#
-# IMPORTANT: `wal-mode: false` issues `PRAGMA journal_mode = MEMORY` —
-# committed transactions are NOT crash-durable. Keep `true` in production.
-# The runtime emits a stderr warning at startup if you flip this to false.
-database:
-  db-path: \".runtime/index.db\"
-  pool-size: 4
-  wal-mode: true
-  embedding-dim: 768
-  recall-max-depth: 3
-";
-
-/// Starter `<workspace>/.agent/config.yaml` (/dev WS-A). Declares the agent's
-/// L0-active capability set under the top-level `capabilities:` mapping that
-/// both `cli::wiring::wire_capabilities` (which host fns to register) and
-/// `agent_config::active_capabilities` (which CapRequests the agent loop injects
-/// into the guest) read. `fs` + `llm` are the spine's minimum: `fs` so the agent
-/// can write its workspace, `llm` so the agent-llm host fns are linked into the
-/// guest's linker. A `true` value is L0-active; cap-grant emits a Grant per
-/// active entry. NOTE: because `llm: true` activates the secrets/llm chain,
-/// `advance start` will require a master key (`SECRETS_MASTER_KEY` env or OS
-/// keychain) — provision one and `advance secrets set <name>` before starting.
-pub(crate) const AGENT_CONFIG_STARTER: &str = "\
-capabilities:
-  fs: true
-  llm: true
-";
+/// Starter YAML lives in `advance-along-home` so create + `advance init` share it.
+#[cfg(target_os = "linux")]
+pub(crate) use advance_along_home::{AGENT_CONFIG_STARTER, MINIMAL_STARTER};
 
 pub fn run(path: PathBuf) -> ExitCode {
     match run_outer(&path) {
@@ -174,40 +93,15 @@ fn fallback_init(path: &Path) -> Result<PathBuf, String> {
         ));
     }
 
-    let mut dir_opts = fs::DirBuilder::new();
-    dir_opts.mode(0o700);
-    for sub in [".advance", ".runtime", ".agent"] {
-        let p = canonical.join(sub);
-        dir_opts
-            .create(&p)
-            .map_err(|e| format!("failed to create {}: {e}", p.display()))?;
-    }
+    advance_along_home::write_recognizable_home(&canonical)
+        .map_err(|e| format!("failed to scaffold recognizable home: {e}"))?;
 
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&cfg_path)
-        .map_err(|e| format!("failed to create {}: {e}", cfg_path.display()))?;
-    file.write_all(MINIMAL_STARTER.as_bytes())
-        .map_err(|e| format!("failed to write {}: {e}", cfg_path.display()))?;
-
-    // /dev WS-A: scaffold `<ws>/.agent/config.yaml` (capabilities: {fs, llm}).
-    // `.agent/` was just created above (and the leaf-exists guards refuse a
-    // re-init), so `create_new` + O_NOFOLLOW cannot collide with a pre-existing
-    // file or follow a symlink.
-    let agent_cfg_path = canonical.join(".agent").join("config.yaml");
-    let mut agent_file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&agent_cfg_path)
-        .map_err(|e| format!("failed to create {}: {e}", agent_cfg_path.display()))?;
-    agent_file
-        .write_all(AGENT_CONFIG_STARTER.as_bytes())
-        .map_err(|e| format!("failed to write {}: {e}", agent_cfg_path.display()))?;
+    let mk = cap_secrets::MasterKeyConfig::Keychain {
+        service: cap_secrets::DEFAULT_KEYCHAIN_SERVICE.into(),
+        account: cap_secrets::DEFAULT_KEYCHAIN_ACCOUNT.into(),
+        fallback_env_var: Some("SECRETS_MASTER_KEY".into()),
+    };
+    let _ = cap_secrets::ensure_master_key(&canonical, &mk, &cap_secrets::DefaultEntryProvider);
 
     Ok(canonical)
 }
@@ -318,6 +212,13 @@ fn try_linux_hardened(path: &Path) -> Result<String, TryLinuxErr> {
     agent_cfg_file
         .write_all(AGENT_CONFIG_STARTER.as_bytes())
         .map_err(|e| TryLinuxErr::Failed(format!("write .agent/config.yaml: {e}")))?;
+
+    let mk = cap_secrets::MasterKeyConfig::Keychain {
+        service: cap_secrets::DEFAULT_KEYCHAIN_SERVICE.into(),
+        account: cap_secrets::DEFAULT_KEYCHAIN_ACCOUNT.into(),
+        fallback_env_var: Some("SECRETS_MASTER_KEY".into()),
+    };
+    let _ = cap_secrets::ensure_master_key(&abs, &mk, &cap_secrets::DefaultEntryProvider);
 
     Ok(abs.display().to_string())
 }
