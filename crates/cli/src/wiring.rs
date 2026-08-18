@@ -2405,8 +2405,11 @@ pub(crate) fn load_real_master_key(
             fallback_env_var: Some(secrets.env_var_name.clone()),
         },
     };
-    if let Some(key) =
-        cap_secrets::read_workspace_master_key(workspace).map_err(CliWiringError::MasterKey)?
+    // Precedence must mirror cap_secrets::ensure_master_key: an explicitly
+    // configured key (env/keychain) wins over the workspace-minted file, so the
+    // whole set→resolve chain uses one key (cli/tests/secrets_roundtrip.rs).
+    if let Some(key) = cap_secrets::resolve_master_key(workspace, &cfg, &DefaultEntryProvider)
+        .map_err(CliWiringError::MasterKey)?
     {
         return Ok(key);
     }

@@ -191,9 +191,14 @@ pub fn read_workspace_master_key(
 
 /// Load existing key or mint one.
 ///
-/// Order: valid workspace file → keychain (when configured) → env → mint.
-/// A present-but-invalid `master.key` fail-closes (does not overwrite).
-/// Recovered keychain/env keys are persisted to the file if it is missing.
+/// Order: **explicitly configured source (keychain/env) → valid workspace file → mint.**
+/// An operator-provided key ALWAYS wins over a workspace-minted one — the pre-C243
+/// contract (`SECRETS_MASTER_KEY` drives the whole set→resolve chain, witnessed by
+/// `cli/tests/secrets_roundtrip.rs`) must keep holding after first-open bootstrap
+/// exists. A present-but-invalid `master.key` fail-closes (does not overwrite).
+/// A recovered configured key is persisted to the file if the file is missing; if
+/// the file exists with DIFFERENT bytes it is left untouched (explicit key wins for
+/// this process; changing keys is an operator action, never a silent overwrite).
 /// A freshly minted key is never written into the process-global keychain.
 pub fn ensure_master_key(
     workspace: &std::path::Path,
@@ -201,28 +206,52 @@ pub fn ensure_master_key(
     entries: &dyn EntryProvider,
 ) -> Result<Zeroizing<[u8; 32]>, SecretError> {
     let path = workspace_master_key_path(workspace);
-    if std::fs::symlink_metadata(&path).is_ok() {
-        return read_workspace_master_key(workspace)?
-            .ok_or_else(|| SecretError::KeyLoad("master.key present but empty/unreadable".into()));
-    }
+    let file_present = std::fs::symlink_metadata(&path).is_ok();
     match try_existing_configured_key(cfg, entries) {
         Ok(Some(key)) => {
-            persist_master_key_file_exclusive(workspace, &key)?;
+            if !file_present {
+                persist_master_key_file_exclusive(workspace, &key)?;
+            }
             return Ok(key);
         }
         Ok(None) => {}
         Err(e) => {
             // Broken keychain + existing ciphertext: fail closed.
-            // Empty first-open home: mint a workspace file.
+            // Empty first-open home: fall through to file / mint.
             if workspace.join(".advance").join("secrets.json").is_file() {
                 return Err(e);
             }
         }
     }
+    if file_present {
+        return read_workspace_master_key(workspace)?
+            .ok_or_else(|| SecretError::KeyLoad("master.key present but empty/unreadable".into()));
+    }
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     persist_master_key_file_exclusive(workspace, &bytes)?;
     Ok(Zeroizing::new(bytes))
+}
+
+/// Resolve WITHOUT minting: **explicitly configured source → workspace file → None.**
+/// The read-side twin of [`ensure_master_key`] — both must agree on precedence or a
+/// `secrets set` under an explicit env key and a daemon resolve would use different
+/// keys (the exact bug this order fixes).
+pub fn resolve_master_key(
+    workspace: &std::path::Path,
+    cfg: &MasterKeyConfig,
+    entries: &dyn EntryProvider,
+) -> Result<Option<Zeroizing<[u8; 32]>>, SecretError> {
+    match try_existing_configured_key(cfg, entries) {
+        Ok(Some(key)) => return Ok(Some(key)),
+        Ok(None) => {}
+        Err(e) => {
+            if workspace.join(".advance").join("secrets.json").is_file() {
+                return Err(e);
+            }
+        }
+    }
+    read_workspace_master_key(workspace)
 }
 
 fn try_existing_configured_key(
