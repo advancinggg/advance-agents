@@ -191,15 +191,22 @@ pub fn read_workspace_master_key(
 
 /// Load existing key or mint one.
 ///
-/// Order: **explicitly configured source (keychain/env) → valid workspace file → mint.**
-/// An operator-provided key ALWAYS wins over a workspace-minted one — the pre-C243
-/// contract (`SECRETS_MASTER_KEY` drives the whole set→resolve chain, witnessed by
-/// `cli/tests/secrets_roundtrip.rs`) must keep holding after first-open bootstrap
-/// exists. A present-but-invalid `master.key` fail-closes (does not overwrite).
-/// A recovered configured key is persisted to the file if the file is missing; if
-/// the file exists with DIFFERENT bytes it is left untouched (explicit key wins for
-/// this process; changing keys is an operator action, never a silent overwrite).
-/// A freshly minted key is never written into the process-global keychain.
+/// Order: **explicit env key → valid workspace file → keychain (Keychain source
+/// only) → mint.** Two constraints fix this order:
+/// - An operator-provided env key ALWAYS wins (the pre-C243 contract —
+///   `SECRETS_MASTER_KEY` drives the whole set→resolve chain, witnessed by
+///   `cli/tests/secrets_roundtrip.rs`). Reading env is side-effect-free.
+/// - The keychain probe is NOT side-effect-free (on macOS it can block on a system
+///   authorization dialog; on headless Linux the backend errors), so it runs only
+///   at true bootstrap: no env key AND no workspace file yet.
+///
+/// A present-but-invalid `master.key` fail-closes (does not overwrite). A recovered
+/// env/keychain key is persisted to the file if the file is missing; an existing
+/// file with DIFFERENT bytes is never silently overwritten (explicit key wins for
+/// the process; changing keys is an operator action). A freshly minted key is never
+/// written into the process-global keychain. An unavailable keychain backend
+/// fail-closes ONLY when ciphertext already exists and no other key source can
+/// serve it; an empty first-open home mints instead.
 pub fn ensure_master_key(
     workspace: &std::path::Path,
     cfg: &MasterKeyConfig,
@@ -207,25 +214,29 @@ pub fn ensure_master_key(
 ) -> Result<Zeroizing<[u8; 32]>, SecretError> {
     let path = workspace_master_key_path(workspace);
     let file_present = std::fs::symlink_metadata(&path).is_ok();
-    match try_existing_configured_key(cfg, entries) {
-        Ok(Some(key)) => {
-            if !file_present {
-                persist_master_key_file_exclusive(workspace, &key)?;
-            }
-            return Ok(key);
+    if let Some(key) = try_env_key(cfg)? {
+        if !file_present {
+            persist_master_key_file_exclusive(workspace, &key)?;
         }
-        Ok(None) => {}
-        Err(e) => {
-            // Broken keychain + existing ciphertext: fail closed.
-            // Empty first-open home: fall through to file / mint.
-            if workspace.join(".advance").join("secrets.json").is_file() {
-                return Err(e);
-            }
-        }
+        return Ok(key);
     }
     if file_present {
         return read_workspace_master_key(workspace)?
             .ok_or_else(|| SecretError::KeyLoad("master.key present but empty/unreadable".into()));
+    }
+    match try_keychain_key(cfg, entries) {
+        Ok(Some(key)) => {
+            persist_master_key_file_exclusive(workspace, &key)?;
+            return Ok(key);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            // Broken keychain + existing ciphertext + no other source: fail closed.
+            // Empty first-open home: mint a workspace file.
+            if workspace.join(".advance").join("secrets.json").is_file() {
+                return Err(e);
+            }
+        }
     }
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -233,7 +244,7 @@ pub fn ensure_master_key(
     Ok(Zeroizing::new(bytes))
 }
 
-/// Resolve WITHOUT minting: **explicitly configured source → workspace file → None.**
+/// Resolve WITHOUT minting: **explicit env key → workspace file → keychain → None.**
 /// The read-side twin of [`ensure_master_key`] — both must agree on precedence or a
 /// `secrets set` under an explicit env key and a daemon resolve would use different
 /// keys (the exact bug this order fixes).
@@ -242,44 +253,59 @@ pub fn resolve_master_key(
     cfg: &MasterKeyConfig,
     entries: &dyn EntryProvider,
 ) -> Result<Option<Zeroizing<[u8; 32]>>, SecretError> {
-    match try_existing_configured_key(cfg, entries) {
-        Ok(Some(key)) => return Ok(Some(key)),
-        Ok(None) => {}
+    if let Some(key) = try_env_key(cfg)? {
+        return Ok(Some(key));
+    }
+    if let Some(key) = read_workspace_master_key(workspace)? {
+        return Ok(Some(key));
+    }
+    match try_keychain_key(cfg, entries) {
+        Ok(k) => Ok(k),
         Err(e) => {
             if workspace.join(".advance").join("secrets.json").is_file() {
-                return Err(e);
+                Err(e)
+            } else {
+                Ok(None)
             }
         }
     }
-    read_workspace_master_key(workspace)
 }
 
-fn try_existing_configured_key(
+/// The side-effect-free leg: the configured env var (`EnvVar` source) or the
+/// fallback env var (`Keychain` source). Never touches the OS credential store.
+fn try_env_key(cfg: &MasterKeyConfig) -> Result<Option<Zeroizing<[u8; 32]>>, SecretError> {
+    let var = match cfg {
+        MasterKeyConfig::EnvVar(name) => Some(name),
+        MasterKeyConfig::Keychain {
+            fallback_env_var, ..
+        } => fallback_env_var.as_ref(),
+    };
+    match var {
+        Some(name) => match std::env::var(name) {
+            Ok(s) => decode_to_key(&Zeroizing::new(s)).map(Some),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(_) => Err(SecretError::KeyLoad(format!(
+                "env var {name} contains non-UTF-8 bytes"
+            ))),
+        },
+        None => Ok(None),
+    }
+}
+
+/// The credential-store leg — may block on an OS authorization dialog (macOS) or
+/// error on headless backends, so callers only reach it at true bootstrap.
+fn try_keychain_key(
     cfg: &MasterKeyConfig,
     entries: &dyn EntryProvider,
 ) -> Result<Option<Zeroizing<[u8; 32]>>, SecretError> {
     match cfg {
+        MasterKeyConfig::EnvVar(_) => Ok(None),
         MasterKeyConfig::Keychain {
-            service,
-            account,
-            fallback_env_var,
+            service, account, ..
         } => match entries.get_password(service, account) {
             Ok(s) => decode_to_key(&Zeroizing::new(s)).map(Some),
-            Err(EntryError::NotFound(_)) => match fallback_env_var {
-                Some(var) => match std::env::var(var) {
-                    Ok(s) => decode_to_key(&Zeroizing::new(s)).map(Some),
-                    Err(std::env::VarError::NotPresent) => Ok(None),
-                    Err(_) => Err(SecretError::KeyLoad(format!(
-                        "env var {var} contains non-UTF-8 bytes"
-                    ))),
-                },
-                None => Ok(None),
-            },
+            Err(EntryError::NotFound(_)) => Ok(None),
             Err(e) => Err(SecretError::KeyLoad(format!("{e}"))),
-        },
-        MasterKeyConfig::EnvVar(name) => match std::env::var(name) {
-            Ok(s) => decode_to_key(&Zeroizing::new(s)).map(Some),
-            Err(_) => Ok(None),
         },
     }
 }
