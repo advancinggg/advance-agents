@@ -1050,4 +1050,172 @@ database:
             "the un-built default must be the NotWired sink (headless zero-cost clause)"
         );
     }
+
+    /// T120-id — production hub WS identity. Reuses `handles.client_api_server`
+    /// (already bound to the production hub). Publishes known Begin/Delta/Terminal
+    /// through `handles.llm_gateway.delta_sink()` and asserts the WS page text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t120_production_hub_ws_identity() {
+        use advance_client_api::{
+            ClientEnvelope, ClientSession, LlmDeltaWirePage, Platform, Principal, Scope,
+            CLIENT_WS_PROTOCOL,
+        };
+        use futures::{SinkExt, StreamExt};
+        use serde_json::{json, Value};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::http::header::{ORIGIN, SEC_WEBSOCKET_PROTOCOL};
+        use tokio_tungstenite::tungstenite::Message;
+
+        const TOKEN: &str = "t120-id-operator";
+        const KEY: &str = "t120-id-stream";
+        const TEXT: &str = "hello tee identity";
+
+        let (_tmp, workspace, config_path) = fresh_workspace();
+        let builder = RuntimeHostBuilder::new(&config_path, &workspace)
+            .await
+            .expect("runtime host builder");
+        let (_host, handles) = wire_capabilities(builder, &workspace)
+            .await
+            .expect("production wire_capabilities");
+        let gateway = handles
+            .llm_gateway
+            .as_ref()
+            .expect("wire_capabilities builds the production gateway");
+        assert!(
+            gateway.delta_sink().is_wired(),
+            "production delta sink must be wired"
+        );
+        let server = handles
+            .client_api_server
+            .as_ref()
+            .expect("production ClientApiServer");
+        server.api().sessions().insert(
+            TOKEN.to_string(),
+            ClientSession {
+                session_id: "t120-id-session".into(),
+                principal: Principal::operator("operator"),
+                platform: Platform::Web,
+                scopes: Scope::operator_default(),
+                csrf_token: Some("t120-id-csrf".into()),
+                expires_at: u64::MAX,
+            },
+            0,
+        );
+        let origin = format!("http://{}", server.local_addr());
+        let port = server.local_addr().port();
+
+        let sink = gateway.delta_sink();
+        sink.publish(LlmDeltaEvent {
+            agent_id: Arc::from("t120-id-agent"),
+            stream_key: Arc::from(KEY),
+            frame: LlmDeltaFrame::Begin {
+                run_id: Some("run-t120-id".into()),
+                task_id: None,
+            },
+        });
+        sink.publish(LlmDeltaEvent {
+            agent_id: Arc::from("t120-id-agent"),
+            stream_key: Arc::from(KEY),
+            frame: LlmDeltaFrame::Delta {
+                seq: 0,
+                text: TEXT.to_string(),
+            },
+        });
+        sink.publish(LlmDeltaEvent {
+            agent_id: Arc::from("t120-id-agent"),
+            stream_key: Arc::from(KEY),
+            frame: LlmDeltaFrame::Terminal {
+                seq: 1,
+                reason: LlmTerminalReason::Completed,
+                usage: None,
+            },
+        });
+
+        let mut request = format!("ws://127.0.0.1:{port}/client/llm/deltas/stream")
+            .into_client_request()
+            .unwrap();
+        let protocols = format!("{CLIENT_WS_PROTOCOL}, advance.bearer.{TOKEN}");
+        request
+            .headers_mut()
+            .insert(SEC_WEBSOCKET_PROTOCOL, protocols.parse().unwrap());
+        request
+            .headers_mut()
+            .insert(ORIGIN, origin.parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("ws connect");
+
+        let seed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(t))) => return t.to_string(),
+                    Some(Ok(Message::Ping(b))) => {
+                        ws.send(Message::Pong(b)).await.ok();
+                    }
+                    other => panic!("unexpected seed frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("seed timeout");
+        let seed_env: ClientEnvelope<Value> = serde_json::from_str(&seed).unwrap();
+        assert!(seed_env.is_ok(), "seed errored: {:?}", seed_env.error);
+        assert_eq!(
+            seed_env.data.as_ref().and_then(|d| d.get("subscribed")),
+            Some(&json!(true))
+        );
+
+        ws.send(Message::Text(
+            json!({ "stream_key": KEY }).to_string().into(),
+        ))
+        .await
+        .expect("send_frame");
+
+        let mut concat = String::new();
+        let mut saw_terminal = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let text = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(t))) => return Some(t.to_string()),
+                        Some(Ok(Message::Ping(b))) => {
+                            if ws.send(Message::Pong(b)).await.is_err() {
+                                return None;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None => return None,
+                        Some(Ok(_)) => {}
+                        Some(Err(_)) => return None,
+                    }
+                }
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(text) = text else {
+                continue;
+            };
+            let envelope: ClientEnvelope<Value> = serde_json::from_str(&text).unwrap();
+            assert!(
+                envelope.is_ok(),
+                "delta frame errored: {:?}",
+                envelope.error
+            );
+            let page: LlmDeltaWirePage = serde_json::from_value(envelope.data.unwrap()).unwrap();
+            assert!(
+                !page.absent || !page.deltas.is_empty(),
+                "absent empty page is not incrementality"
+            );
+            for d in &page.deltas {
+                concat.push_str(&d.text);
+            }
+            if page.terminal.is_some() {
+                saw_terminal = true;
+                break;
+            }
+        }
+        assert!(saw_terminal, "terminal marker on production hub WS");
+        assert_eq!(concat, TEXT, "page text equals published delta");
+    }
 }

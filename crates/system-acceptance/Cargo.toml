@@ -41,7 +41,7 @@ cap-mcp = { path = "../capabilities/cap-mcp" }
 cap-lifecycle = { path = "../capabilities/cap-lifecycle" }
 advance-reply-tracker = { path = "../messaging/reply-tracker" }
 advance-git = { path = "../git" }
-advance-client-api = { path = "../client-api" }
+advance-client-api = { path = "../client-api", features = ["test-support"] }
 # Wave-12 (SYS-AC-122): the harness lib's `.with_tool_repetition_guard()` axis
 # builds a REAL `RepetitionGuard` mirroring production cli Step 7 (RunManager +
 # build_repetition_guard_from_config). run-manager deps only shared-types →

@@ -41,7 +41,8 @@ use advance_shared_types::capability::BudgetDecision;
 use advance_shared_types::repetition::{OutputHash, RepetitionDecision, ToolCallSignature};
 use advance_shared_types::security_validator::{LeakDetector, SsrfGuard};
 use advance_shared_types::traits::{
-    EventBusEmit, HttpStreamingChain, RepetitionGuardCheck, RunBudget,
+    EventBusEmit, HttpStreamingChain, LlmDeltaEvent, LlmDeltaFrame, LlmDeltaSink,
+    RepetitionGuardCheck, RunBudget,
 };
 use cap_http::rate_limit::{AlwaysAllow, RateLimiter};
 use cap_http::{
@@ -57,6 +58,106 @@ use zeroize::Zeroizing;
 const PROVIDER_HOST: &str = "harness-llm.test";
 /// The secret name the provider's `api-key-secret` references (seeded in the store).
 const API_KEY_SECRET: &str = "harness-llm-api-key";
+
+/// Harness-only CONTRACT-234 wrapper: forwards every frame to an inner
+/// [`advance_client_api::LlmDeltaHub`] and records `event.stream_key` on
+/// `Begin` plus guest-visible `Delta` texts. Gateway holds this as
+/// `dyn LlmDeltaSink`; Client API holds the inner hub.
+pub struct CapturingDeltaSink {
+    inner: Arc<advance_client_api::LlmDeltaHub>,
+    begins: Mutex<Vec<String>>,
+    deltas: Mutex<Vec<String>>,
+    begin_notify: tokio::sync::Notify,
+}
+
+impl CapturingDeltaSink {
+    pub fn new(inner: Arc<advance_client_api::LlmDeltaHub>) -> Self {
+        Self {
+            inner,
+            begins: Mutex::new(Vec::new()),
+            deltas: Mutex::new(Vec::new()),
+            begin_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn inner_hub(&self) -> Arc<advance_client_api::LlmDeltaHub> {
+        Arc::clone(&self.inner)
+    }
+
+    pub fn captured_stream_keys(&self) -> Vec<String> {
+        self.begins.lock().expect("capturing begins").clone()
+    }
+
+    pub fn recorded_delta_texts(&self) -> Vec<String> {
+        self.deltas.lock().expect("capturing deltas").clone()
+    }
+
+    pub async fn wait_begin_key(&self, timeout: Duration) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(key) = self
+                .begins
+                .lock()
+                .expect("capturing begins")
+                .first()
+                .cloned()
+            {
+                return Some(key);
+            }
+            // Subscribe *then* re-check so a Begin published in the gap
+            // cannot be lost (`notify_waiters` only wakes already-enabled waiters).
+            let notified = self.begin_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(key) = self
+                .begins
+                .lock()
+                .expect("capturing begins")
+                .first()
+                .cloned()
+            {
+                return Some(key);
+            }
+            match tokio::time::timeout_at(deadline, notified).await {
+                Ok(()) => {}
+                Err(_) => {
+                    return self
+                        .begins
+                        .lock()
+                        .expect("capturing begins")
+                        .first()
+                        .cloned();
+                }
+            }
+        }
+    }
+}
+
+impl LlmDeltaSink for CapturingDeltaSink {
+    fn publish(&self, event: LlmDeltaEvent) {
+        match &event.frame {
+            LlmDeltaFrame::Begin { .. } => {
+                self.begins
+                    .lock()
+                    .expect("capturing begins")
+                    .push(event.stream_key.to_string());
+                self.begin_notify.notify_waiters();
+            }
+            LlmDeltaFrame::Delta { text, .. } => {
+                self.deltas
+                    .lock()
+                    .expect("capturing deltas")
+                    .push(text.clone());
+            }
+            LlmDeltaFrame::Terminal { .. } => {}
+        }
+        self.inner.publish(event);
+    }
+
+    fn is_wired(&self) -> bool {
+        true
+    }
+}
 
 /// A single-200 convenience script: the assistant text the mock returns plus token counts.
 /// Retained for back-compat (`.llm(LlmMode::Loopback(LoopbackScript::reply(..)))`); for
@@ -376,6 +477,8 @@ pub struct LoopbackLlm {
     /// gateway streams through, so fault witnesses can drive
     /// `execute_streaming` directly (the struct held no chain before).
     chain: Arc<dyn HttpStreamingChain>,
+    /// SYS-J-72 opt-in tee wrapper. `None` on the historical `start()` path.
+    tee_sink: Option<Arc<CapturingDeltaSink>>,
 }
 
 impl Drop for LoopbackLlm {
@@ -470,6 +573,11 @@ impl LoopbackLlm {
         Arc::clone(&self.chain)
     }
 
+    /// SYS-J-72: the capturing tee wrapper, if `start_with_tee` was used.
+    pub fn capturing_sink(&self) -> Option<Arc<CapturingDeltaSink>> {
+        self.tee_sink.clone()
+    }
+
     /// The loopback's chat-completions URL. The hostname is DNS-mapped to
     /// `127.0.0.1:realport` by the executor override (`realport` itself is
     /// private; this is the supported way to address the mock directly).
@@ -495,6 +603,46 @@ impl LoopbackLlm {
         repetition: Option<Arc<dyn RepetitionGuardCheck>>,
         event_bus: Arc<dyn EventBusEmit>,
         default_agent_id: String,
+    ) -> Self {
+        Self::start_inner(
+            responses,
+            budget,
+            repetition,
+            event_bus,
+            default_agent_id,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::start`], but tees post-scan frames into `hub` via
+    /// [`CapturingDeltaSink`]. Keeps `.with_live_streaming`.
+    pub async fn start_with_tee(
+        responses: Vec<ScriptedResponse>,
+        budget: Option<Arc<dyn RunBudget>>,
+        repetition: Option<Arc<dyn RepetitionGuardCheck>>,
+        event_bus: Arc<dyn EventBusEmit>,
+        default_agent_id: String,
+        hub: Arc<advance_client_api::LlmDeltaHub>,
+    ) -> Self {
+        Self::start_inner(
+            responses,
+            budget,
+            repetition,
+            event_bus,
+            default_agent_id,
+            Some(hub),
+        )
+        .await
+    }
+
+    async fn start_inner(
+        responses: Vec<ScriptedResponse>,
+        budget: Option<Arc<dyn RunBudget>>,
+        repetition: Option<Arc<dyn RepetitionGuardCheck>>,
+        event_bus: Arc<dyn EventBusEmit>,
+        default_agent_id: String,
+        tee_hub: Option<Arc<advance_client_api::LlmDeltaHub>>,
     ) -> Self {
         // 1. Loopback axum mock on an ephemeral port. The chat handler RECORDS the inbound
         //    request headers (credential-injection witness) and serves the scripted FIFO.
@@ -612,17 +760,20 @@ impl LoopbackLlm {
         // drive the REAL live owner/poll path over the loopback's TCP SSE mode.
         let streaming_chain: Arc<dyn HttpStreamingChain> = chain.clone();
         let streaming_chain_handle: Arc<dyn HttpStreamingChain> = chain.clone();
-        let gateway = Arc::new(
-            LlmGateway::new(
-                cfg_provider_dyn,
-                chain,
-                budget,
-                event_bus,
-                rep_guard,
-                default_agent_id,
-            )
-            .with_live_streaming(streaming_chain, leak_gateway),
-        );
+        let tee_sink = tee_hub.map(|hub| Arc::new(CapturingDeltaSink::new(hub)));
+        let mut gateway = LlmGateway::new(
+            cfg_provider_dyn,
+            chain,
+            budget,
+            event_bus,
+            rep_guard,
+            default_agent_id,
+        )
+        .with_live_streaming(streaming_chain, leak_gateway);
+        if let Some(sink) = tee_sink.as_ref() {
+            gateway = gateway.with_delta_sink(sink.clone() as Arc<dyn LlmDeltaSink>);
+        }
+        let gateway = Arc::new(gateway);
 
         LoopbackLlm {
             gateway,
@@ -632,6 +783,7 @@ impl LoopbackLlm {
             cfg_provider,
             realport,
             chain: streaming_chain_handle,
+            tee_sink,
         }
     }
 }

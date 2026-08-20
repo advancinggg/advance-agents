@@ -921,6 +921,10 @@ pub struct SystemUnderTestBuilder {
     grant_chain: GrantChain,
     events: EventSink,
     llm: LlmMode,
+    /// SYS-J-72: opt-in CONTRACT-234/235 tee + Client API bind. Default false.
+    with_delta_tee: bool,
+    /// Optional hub timing override used only when `with_delta_tee` is set.
+    delta_tee_timing: Option<advance_client_api::DeltaTiming>,
     agent_id: String,
     // HF-2 resilience knobs (default None → loopback gateway uses AllowAllBudget /
     // NoOpRepetitionGuard; only meaningful when `.llm(Loopback*)` is set).
@@ -1205,6 +1209,8 @@ impl Default for SystemUnderTestBuilder {
             grant_chain: GrantChain::Supervised,
             events: EventSink::Capturing,
             llm: LlmMode::Off,
+            with_delta_tee: false,
+            delta_tee_timing: None,
             agent_id: AGENT_ID.to_string(),
             budget: None,
             repetition: None,
@@ -1382,6 +1388,21 @@ impl SystemUnderTestBuilder {
     /// Configure a deterministic LLM loopback backend (implies the `llm` cap).
     pub fn llm(mut self, mode: LlmMode) -> Self {
         self.llm = mode;
+        self
+    }
+    /// SYS-J-72: inject `LlmDeltaHub` into the loopback gateway, retain the
+    /// turn-end reaper, bind a loopback Client API, and attach
+    /// `ReapTurnObserver`. Requires `.llm(Loopback*)`. Does **not** add
+    /// `Cap::Llm` — callers still set `.caps(&[Cap::Llm, ...])`.
+    pub fn with_delta_tee(mut self) -> Self {
+        self.with_delta_tee = true;
+        self
+    }
+    /// Like [`Self::with_delta_tee`], with a hub timing override (`LlmDeltaHub::with_timing`).
+    /// J72-307a uses default 15 s `reauth_max_age` — do not shrink it for the first-page wait.
+    pub fn with_delta_tee_timing(mut self, timing: advance_client_api::DeltaTiming) -> Self {
+        self.with_delta_tee = true;
+        self.delta_tee_timing = Some(timing);
         self
     }
     /// Override the agent routing id (default [`AGENT_ID`]).
@@ -2360,6 +2381,10 @@ impl SystemUnderTestBuilder {
         // HF-2: thread the harness bus + the optional budget/repetition knobs into the
         // loopback gateway. `Loopback` is the single-200 back-compat case (converted to a
         // one-element script); `LoopbackScripted` carries the FIFO script directly.
+        if self.with_delta_tee && matches!(self.llm, LlmMode::Off) {
+            panic!(".with_delta_tee() requires a loopback LLM");
+        }
+        let mut llm_stream_reaper: Option<Arc<cap_llm::AgentStreamReaper>> = None;
         let llm = match self.llm {
             LlmMode::Off => None,
             LlmMode::Loopback(script) => {
@@ -2368,27 +2393,33 @@ impl SystemUnderTestBuilder {
                     script.prompt_tokens,
                     script.completion_tokens,
                 )];
-                let lp = llm_loopback::LoopbackLlm::start(
+                let (lp, reaper) = boot_loopback_for_sut(
                     responses,
                     self.budget.clone(),
                     self.repetition.clone(),
                     bus_dyn.clone(),
                     self.agent_id.clone(),
+                    &*registry,
+                    self.with_delta_tee,
+                    self.delta_tee_timing,
                 )
                 .await;
-                cap_llm::register_agent_llm(&*registry, lp.gateway.clone());
+                llm_stream_reaper = reaper;
                 Some(lp)
             }
             LlmMode::LoopbackScripted(responses) => {
-                let lp = llm_loopback::LoopbackLlm::start(
+                let (lp, reaper) = boot_loopback_for_sut(
                     responses,
                     self.budget.clone(),
                     self.repetition.clone(),
                     bus_dyn.clone(),
                     self.agent_id.clone(),
+                    &*registry,
+                    self.with_delta_tee,
+                    self.delta_tee_timing,
                 )
                 .await;
-                cap_llm::register_agent_llm(&*registry, lp.gateway.clone());
+                llm_stream_reaper = reaper;
                 Some(lp)
             }
         };
@@ -2859,6 +2890,16 @@ impl SystemUnderTestBuilder {
             None
         };
         let mut driver = build_agent_loop(store.clone(), message_handler, loop_bus, outbound);
+        if let Some(reaper) = llm_stream_reaper.clone() {
+            driver =
+                driver.with_turn_observer(Arc::new(advance_cli::reap::CompositeTurnObserver::new(
+                    vec![Arc::new(advance_cli::reap::ReapTurnObserver::for_agent(
+                        reaper,
+                        self.agent_id.clone(),
+                        self.agent_id.clone(),
+                    ))],
+                )));
+        }
         if let Some((run_manager, run_config, cell)) = grant_run_bootstrap {
             driver = driver.with_run_bootstrap(Arc::new(RunManagerBootstrap {
                 run_manager,
@@ -3385,6 +3426,34 @@ impl SystemUnderTestBuilder {
             node_drivers
         };
 
+        let pump_exits: Arc<Mutex<Vec<advance_client_api::DeltaPumpExit>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let client_api_server = if self.with_delta_tee {
+            let hub = llm
+                .as_ref()
+                .and_then(|lp| lp.capturing_sink())
+                .expect("with_delta_tee starts capturing sink")
+                .inner_hub();
+            let exits = pump_exits.clone();
+            let observer: advance_client_api::DeltaPumpExitObserver = Arc::new(move |exit| {
+                exits.lock().expect("pump exits").push(exit);
+            });
+            Some(
+                advance_client_api::ClientApiServer::bind_local_factory(0, move |address| {
+                    let mut config = advance_client_api::ClientApiConfig::default();
+                    config.allowed_origins = vec![format!("http://{address}")];
+                    let api = advance_client_api::ClientApi::new(config)
+                        .with_llm_delta_hub(hub.clone())
+                        .with_delta_pump_observer(observer.clone());
+                    Arc::new(api)
+                })
+                .await
+                .expect("client api bind"),
+            )
+        } else {
+            None
+        };
+
         SystemUnderTest {
             workspace_root,
             agent_id: self.agent_id,
@@ -3424,7 +3493,54 @@ impl SystemUnderTestBuilder {
             _breaker_subscriber: breaker_subscriber,
             _queue: queue,
             _tempdir: tempdir,
+            client_api_server,
+            pump_exits,
+            llm_stream_reaper,
         }
+    }
+}
+
+async fn boot_loopback_for_sut(
+    responses: Vec<llm_loopback::ScriptedResponse>,
+    budget: Option<Arc<dyn RunBudget>>,
+    repetition: Option<Arc<dyn RepetitionGuardCheck>>,
+    bus: Arc<dyn EventBusEmit>,
+    agent_id: String,
+    registry: &dyn HostRegistry,
+    with_delta_tee: bool,
+    delta_tee_timing: Option<advance_client_api::DeltaTiming>,
+) -> (
+    llm_loopback::LoopbackLlm,
+    Option<Arc<cap_llm::AgentStreamReaper>>,
+) {
+    if with_delta_tee {
+        let det: Arc<dyn LeakDetector> = Arc::new(cap_http::DefaultLeakDetector::new());
+        let hold: advance_client_api::DeltaHoldSplit =
+            Arc::new(|buf: &[u8], max_canonical: usize| {
+                cap_http::canonical_facade::decoded_hold_split(buf, max_canonical)
+            });
+        let clock: Arc<dyn advance_client_api::Clock> = Arc::new(advance_client_api::SystemClock);
+        let hub = Arc::new(match delta_tee_timing {
+            Some(timing) => advance_client_api::LlmDeltaHub::with_timing(
+                Some(det),
+                Some(hold),
+                clock,
+                None,
+                timing,
+            ),
+            None => advance_client_api::LlmDeltaHub::new(Some(det), Some(hold), clock, None),
+        });
+        let lp = llm_loopback::LoopbackLlm::start_with_tee(
+            responses, budget, repetition, bus, agent_id, hub,
+        )
+        .await;
+        let reaper = cap_llm::register_agent_llm_with_turn_cost(registry, lp.gateway.clone(), None);
+        (lp, Some(reaper))
+    } else {
+        let lp =
+            llm_loopback::LoopbackLlm::start(responses, budget, repetition, bus, agent_id).await;
+        cap_llm::register_agent_llm(registry, lp.gateway.clone());
+        (lp, None)
     }
 }
 
@@ -4043,6 +4159,9 @@ pub struct SystemUnderTest {
     _breaker_subscriber: BreakerSubscriber,
     _queue: Arc<advance_git::DefaultGitCommitQueue>,
     _tempdir: tempfile::TempDir,
+    client_api_server: Option<advance_client_api::ClientApiServer>,
+    pump_exits: Arc<Mutex<Vec<advance_client_api::DeltaPumpExit>>>,
+    llm_stream_reaper: Option<Arc<cap_llm::AgentStreamReaper>>,
 }
 
 /// Sched-harvest 1A (SYS-AC-110): the REAL submitter-grant subset gate — the
@@ -4576,6 +4695,26 @@ impl SystemUnderTest {
     /// delivered (coherent) reply through the real action-dispatch outbound seam.
     pub fn delivered_replies(&self) -> Vec<Vec<u8>> {
         self.captured_replies.lock().unwrap().clone()
+    }
+
+    /// SYS-J-72: bound Client API, if `.with_delta_tee()` was set.
+    pub fn client_api_server(&self) -> Option<&advance_client_api::ClientApiServer> {
+        self.client_api_server.as_ref()
+    }
+
+    /// SYS-J-72: capturing tee wrapper (Begin keys + recorded Deltas).
+    pub fn capturing_sink(&self) -> Option<Arc<llm_loopback::CapturingDeltaSink>> {
+        self.llm.as_ref().and_then(|lp| lp.capturing_sink())
+    }
+
+    /// SYS-J-72: retained stream reaper.
+    pub fn llm_stream_reaper(&self) -> Option<Arc<cap_llm::AgentStreamReaper>> {
+        self.llm_stream_reaper.clone()
+    }
+
+    /// SYS-J-72: WS pump-exit log (factory-installed observer).
+    pub fn pump_exits(&self) -> Vec<advance_client_api::DeltaPumpExit> {
+        self.pump_exits.lock().expect("pump exits").clone()
     }
 
     /// Backbone Step 4 — every outbound `/v1/chat/completions` request body the
