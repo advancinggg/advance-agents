@@ -217,6 +217,10 @@ mod tests {
             retry_default: None,
             backend: None,
             auth_scheme: None,
+            backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
+            embedding_model: None,
+            sidecar: None,
+            profile_id: None,
         };
         resolve_provider_and_model(&[cfg], Some("a")).unwrap()
     }

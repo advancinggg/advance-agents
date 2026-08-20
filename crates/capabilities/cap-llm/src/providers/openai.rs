@@ -192,8 +192,12 @@ impl ProviderAdapter for OpenAiAdapter {
         text: &str,
     ) -> Result<HttpRequest, LlmError> {
         let url = format!("{}/v1/embeddings", provider.endpoint.trim_end_matches('/'));
+        let model = provider
+            .embedding_model
+            .as_deref()
+            .unwrap_or(OPENAI_EMBED_MODEL);
         let body = json!({
-            "model": OPENAI_EMBED_MODEL,
+            "model": model,
             "input": text,
         });
         let body_bytes = serde_json::to_vec(&body)
@@ -531,6 +535,8 @@ mod tests {
             cost_per_mtoken_out: 10.0,
             backend: advance_runtime::config::ProviderBackend::OpenAiChat,
             auth_scheme: None,
+            backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
+            embedding_model: None,
         }
     }
 

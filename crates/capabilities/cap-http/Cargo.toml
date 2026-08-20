@@ -42,7 +42,7 @@ url = { workspace = true }
 # already resolved transitively in Cargo.lock, so the version doesn't move; rustls-tls
 # adds the compiled rustls subtree (ring/rustls/hyper-rustls/tokio-rustls/webpki-roots)
 # plus some http3-gated optional-dep lock metadata (quinn) that stays uncompiled.
-reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
 
 [dev-dependencies]
 advance-shared-types = { path = "../../shared-types", features = ["test-support"] }

@@ -155,6 +155,51 @@ pub fn build_llm_gateway(
     default_agent_id: String,
     delta_sink: Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
 ) -> Arc<LlmGateway> {
+    let catalog = cap_llm::ModelProfileCatalog::new();
+    let mut holds: Vec<Arc<cap_llm::SupervisedChild>> = Vec::new();
+    let mut registry = advance_shared_types::inference::InferenceBackendRegistry::new();
+    for p in config.current().llm_providers.iter() {
+        if p.backend_class != advance_runtime::config::InferenceBackendClass::Local {
+            continue;
+        }
+        let Some(sc) = p.sidecar.as_ref() else {
+            registry.insert(
+                p.id.clone(),
+                Arc::new(advance_shared_types::inference::NotWiredInferenceBackend),
+            );
+            continue;
+        };
+        let sup = cap_llm::backend_local::ProcessSupervisor {
+            command: sc.command.clone(),
+            args: sc.args.clone(),
+        };
+        match sup.spawn() {
+            Ok((handoff, child)) => {
+                let child = Arc::new(child);
+                holds.push(Arc::clone(&child));
+                registry.insert(
+                    p.id.clone(),
+                    Arc::new(cap_llm::backend_local::SidecarClient {
+                        policy: Arc::new(cap_http::DefaultLocalInferenceTransport),
+                        supervisor: Arc::new(cap_llm::backend_local::OwnedHandoffSupervisor {
+                            handoff,
+                            child,
+                        }),
+                        provider_id: p.id.clone(),
+                        embedding_model: p.embedding_model.clone(),
+                    }),
+                );
+            }
+            Err(e) => {
+                registry.insert(
+                    p.id.clone(),
+                    Arc::new(cap_llm::backend_local::FailedSpawnBackend {
+                        reason: e.to_string(),
+                    }),
+                );
+            }
+        }
+    }
     Arc::new(install_live_streaming(
         LlmGateway::new(
             config,
@@ -164,7 +209,10 @@ pub fn build_llm_gateway(
             repetition,
             default_agent_id,
         )
-        .with_delta_sink(delta_sink),
+        .with_delta_sink(delta_sink)
+        .with_inference_backends(registry)
+        .with_sidecar_holds(holds)
+        .with_catalog(catalog),
         streaming_chain,
         decoded_detector,
     ))
@@ -2012,12 +2060,15 @@ async fn wire_capabilities_inner(
         // identical to the gateway's (one security chain, one config). Threaded into
         // `build_live_post_processor`, which installs the `VlmDescriptionIndexer` into
         // the live post-processor Step-3.
-        let vlm: Arc<dyn VlmExtractor> = Arc::new(LlmGatewayVlm::new(
-            builder.config_watcher(),
-            chain.clone(),
-            event_bus_dyn.clone(),
-            DEFAULT_AGENT_ID.to_string(),
-        ));
+        let vlm: Arc<dyn VlmExtractor> = Arc::new(
+            LlmGatewayVlm::new(
+                builder.config_watcher(),
+                chain.clone(),
+                event_bus_dyn.clone(),
+                DEFAULT_AGENT_ID.to_string(),
+            )
+            .with_catalog(cap_llm::ModelProfileCatalog::new()),
+        );
         vlm_extractor = Some(vlm);
         // S4 final (2026-07-29, dev-task-s4-final): live streaming re-wired via
         // `install_live_streaming` below — the chain (with its stream executor

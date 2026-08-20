@@ -611,6 +611,8 @@ mod tests {
             cost_per_mtoken_out: 10.0,
             backend: ProviderBackend::OpenAiResponses,
             auth_scheme: None,
+            backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
+            embedding_model: None,
         }
     }
 

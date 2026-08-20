@@ -140,6 +140,7 @@ pub mod context;
 pub mod contract218_previsible;
 pub mod cost;
 pub mod event;
+pub mod inference;
 pub mod mailbox;
 pub mod memory;
 pub mod observation_identity;

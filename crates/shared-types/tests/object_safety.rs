@@ -97,6 +97,16 @@ fn traits_are_object_safe() {
     // Wave-23 (RememberContentPolicy).
     assert_send_sync::<Box<dyn RememberContentPolicy>>();
 
+    // CONTRACT-236 / CONTRACT-238 (local-endpoint-s1). Ports are Send+Sync;
+    // stream traits are Send-only (HttpBodyStream precedent — do not
+    // assert_send_sync on InferenceStream / LocalBodyStream).
+    let _inference_port: fn(Box<dyn InferenceBackendPort>) = |_| {};
+    let _inference_stream: fn(Box<dyn InferenceStream>) = |_| {};
+    let _local_policy: fn(Box<dyn LocalInferenceTransportPolicy>) = |_| {};
+    let _local_body: fn(Box<dyn LocalBodyStream>) = |_| {};
+    assert_send_sync::<Box<dyn InferenceBackendPort>>();
+    assert_send_sync::<Box<dyn LocalInferenceTransportPolicy>>();
+
     // L6RunnableSpec is a Send+Sync struct (trait-object field Arc<dyn L6Handler>
     // is Send+Sync; other fields are String which are Send+Sync).
     assert_send_sync::<advance_shared_types::memory::L6RunnableSpec>();

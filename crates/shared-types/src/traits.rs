@@ -28,6 +28,9 @@ use crate::repetition::{OutputHash, RepetitionDecision, ToolCallSignature};
 pub use crate::agent_tree::{AgentTreeReader, AgentTreeSnapshot};
 pub use crate::await_session::AwaitSessionRef;
 pub use crate::context::ContextAssembler;
+pub use crate::inference::{
+    InferenceBackendPort, InferenceStream, LocalBodyStream, LocalInferenceTransportPolicy,
+};
 pub use crate::mailbox::{AgentActionDispatcher, MailboxReader};
 pub use crate::memory::{L6Handler, PostProcessorHook};
 pub use crate::producer_boundary::{RememberContentPolicy, RememberDecision};

@@ -23,6 +23,7 @@ pub mod prompt_injection;
 // Slice C modules
 pub mod credential_injection;
 pub mod executor;
+pub mod local_transport;
 pub mod rate_limit;
 pub mod security_chain;
 pub mod ssrf;
@@ -48,6 +49,7 @@ pub use executor::{
 // chunks are PRE-scan transport bytes — the only sanctioned consumer is
 // `DefaultHttpSecurityChain::execute_streaming`'s scanning wrapper, and
 // keeping the front door narrow makes accidental raw consumption harder.
+pub use local_transport::DefaultLocalInferenceTransport;
 pub use rate_limit::{DefaultRateLimiter, RateLimiter};
 pub use security_chain::DefaultHttpSecurityChain;
 pub use ssrf::{DefaultSsrfGuard, MockResolver, RealResolver, Resolver};

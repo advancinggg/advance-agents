@@ -40,6 +40,8 @@ mod tests {
             cost_per_mtoken_out: 0.600,
             backend: advance_runtime::config::ProviderBackend::OpenAiChat,
             auth_scheme: None,
+            backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
+            embedding_model: None,
         }
     }
 

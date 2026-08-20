@@ -451,7 +451,8 @@ pub struct WasmConfig {
 /// routing: `id == "anthropic"` → `AnthropicMessages`, else `OpenAiChat`.
 /// Variant renames are EXPLICIT (not `rename_all`) because the ADR pins the
 /// exact wire spellings `openai-chat` / `openai-responses` /
-/// `anthropic-messages` / `local`.
+/// `anthropic-messages`. The additive `local` backend *class* is
+/// [`InferenceBackendClass`], not a fourth dialect (MODULE-009-AC-21/AC-23).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub enum ProviderBackend {
@@ -461,8 +462,26 @@ pub enum ProviderBackend {
     OpenAiResponses,
     #[serde(rename = "anthropic-messages")]
     AnthropicMessages,
+}
+
+/// Backend class dimension (ADR 2026-07-29 D1). Orthogonal to [`ProviderBackend`].
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub enum InferenceBackendClass {
+    #[default]
+    #[serde(rename = "cloud-http")]
+    CloudHttp,
     #[serde(rename = "local")]
     Local,
+}
+
+/// Supervised sidecar command for a `local` backend-class provider.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SidecarSpec {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 /// Credential-position scheme, orthogonal to `ProviderBackend` (ADR 2026-07-22
@@ -481,32 +500,122 @@ pub enum AuthScheme {
 }
 
 #[derive(Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "LlmProviderConfigRaw")]
 pub struct LlmProviderConfig {
     pub id: String,
+    /// Connect URL for `cloud-http`. Ignored as a connect target for `local`
+    /// (C238 uses the supervision hand-off). Empty string is allowed on local.
     pub endpoint: String,
     /// Secret *reference name* (not the actual key). Redacted in `Debug` output to
     /// prevent accidental leakage via panic messages or log statements.
-    #[serde(rename = "api-key-secret")]
     pub api_key_secret: String,
-    #[serde(rename = "model-aliases")]
     pub model_aliases: HashMap<String, String>,
-    #[serde(rename = "cost-per-mtoken-in")]
     pub cost_per_mtoken_in: f64,
-    #[serde(rename = "cost-per-mtoken-out")]
     pub cost_per_mtoken_out: f64,
-    #[serde(rename = "rate-limit", default)]
     pub rate_limit: Option<RateLimit>,
-    #[serde(rename = "retry-default", default)]
     pub retry_default: Option<RetryDefaults>,
     /// Wire-protocol family (ADR 2026-07-22 D4). `None` → resolver-side
     /// inference byte-compatible with historical id-based routing.
-    #[serde(default)]
     pub backend: Option<ProviderBackend>,
     /// Credential-position override (ADR 2026-07-22 fork f). `None` → the
     /// backend's default credential position.
-    #[serde(rename = "auth-scheme", default)]
     pub auth_scheme: Option<AuthScheme>,
+    pub backend_class: InferenceBackendClass,
+    pub embedding_model: Option<String>,
+    pub sidecar: Option<SidecarSpec>,
+    pub profile_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LlmProviderConfigRaw {
+    id: String,
+    #[serde(default)]
+    endpoint: String,
+    #[serde(rename = "api-key-secret")]
+    api_key_secret: String,
+    #[serde(rename = "model-aliases")]
+    model_aliases: HashMap<String, String>,
+    #[serde(rename = "cost-per-mtoken-in")]
+    cost_per_mtoken_in: f64,
+    #[serde(rename = "cost-per-mtoken-out")]
+    cost_per_mtoken_out: f64,
+    #[serde(rename = "rate-limit", default)]
+    rate_limit: Option<RateLimit>,
+    #[serde(rename = "retry-default", default)]
+    retry_default: Option<RetryDefaults>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(rename = "auth-scheme", default)]
+    auth_scheme: Option<AuthScheme>,
+    #[serde(rename = "backend-class", default)]
+    backend_class: Option<InferenceBackendClass>,
+    #[serde(rename = "embedding-model", default)]
+    embedding_model: Option<String>,
+    #[serde(default)]
+    sidecar: Option<SidecarSpec>,
+    #[serde(rename = "profile-id", default)]
+    profile_id: Option<String>,
+}
+
+impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
+    type Error = String;
+
+    fn try_from(raw: LlmProviderConfigRaw) -> Result<Self, Self::Error> {
+        let mut backend_class = raw
+            .backend_class
+            .unwrap_or(InferenceBackendClass::CloudHttp);
+        let mut backend: Option<ProviderBackend> = None;
+        if let Some(s) = raw.backend.as_deref() {
+            match s {
+                "local" => {
+                    if raw.backend_class == Some(InferenceBackendClass::CloudHttp) {
+                        return Err(
+                            "backend-class: cloud-http is incompatible with backend: local".into(),
+                        );
+                    }
+                    backend_class = InferenceBackendClass::Local;
+                    backend = Some(ProviderBackend::OpenAiChat);
+                }
+                "openai-chat" => backend = Some(ProviderBackend::OpenAiChat),
+                "openai-responses" => backend = Some(ProviderBackend::OpenAiResponses),
+                "anthropic-messages" => backend = Some(ProviderBackend::AnthropicMessages),
+                other => {
+                    return Err(format!("unknown llm-providers[].backend value {other:?}"));
+                }
+            }
+        }
+        if backend_class == InferenceBackendClass::Local {
+            if matches!(
+                backend,
+                Some(ProviderBackend::AnthropicMessages | ProviderBackend::OpenAiResponses)
+            ) {
+                return Err(
+                    "backend-class: local is incompatible with backend: anthropic-messages or openai-responses"
+                        .into(),
+                );
+            }
+            if backend.is_none() {
+                backend = Some(ProviderBackend::OpenAiChat);
+            }
+        }
+        Ok(Self {
+            id: raw.id,
+            endpoint: raw.endpoint,
+            api_key_secret: raw.api_key_secret,
+            model_aliases: raw.model_aliases,
+            cost_per_mtoken_in: raw.cost_per_mtoken_in,
+            cost_per_mtoken_out: raw.cost_per_mtoken_out,
+            rate_limit: raw.rate_limit,
+            retry_default: raw.retry_default,
+            backend,
+            auth_scheme: raw.auth_scheme,
+            backend_class,
+            embedding_model: raw.embedding_model,
+            sidecar: raw.sidecar,
+            profile_id: raw.profile_id,
+        })
+    }
 }
 
 impl fmt::Debug for LlmProviderConfig {
@@ -522,6 +631,10 @@ impl fmt::Debug for LlmProviderConfig {
             .field("retry_default", &self.retry_default)
             .field("backend", &self.backend)
             .field("auth_scheme", &self.auth_scheme)
+            .field("backend_class", &self.backend_class)
+            .field("embedding_model", &self.embedding_model)
+            .field("sidecar", &self.sidecar)
+            .field("profile_id", &self.profile_id)
             .finish()
     }
 }
@@ -1594,51 +1707,64 @@ fn validate_config(path: &Path, cfg: &RuntimeConfig) -> Result<(), ConfigError> 
     let mut seen_ids = std::collections::HashSet::new();
     for p in &cfg.llm_providers {
         check_nonempty("llm-providers[].id", &p.id)?;
-        check_nonempty("llm-providers[].endpoint", &p.endpoint)?;
+        if p.backend_class != InferenceBackendClass::Local {
+            check_nonempty("llm-providers[].endpoint", &p.endpoint)?;
+        }
         check_nonempty("llm-providers[].api-key-secret", &p.api_key_secret)?;
         if !seen_ids.insert(&p.id) {
             return invalid("duplicate llm-providers[].id (provider-shadowing attack surface)");
         }
         // Endpoint must be https:// except for localhost/127.0.0.1 (dev proxies).
+        // Local-class entries do not use endpoint as the connect target (C238
+        // hand-off); skip the URL check so a placeholder or empty string is fine.
         // Cleartext http:// to external hosts would expose LLM prompts (potentially
         // PII/secrets) to on-path interception. Bare prefix matching is unsafe —
         // `http://localhost.evil.example` starts with `http://localhost` but
         // resolves to an external host (R15 finding). Parse host boundary strictly.
-        let ok = if let Some(rest) = p.endpoint.strip_prefix("https://") {
-            !rest.is_empty()
-        } else if let Some(rest) = p.endpoint.strip_prefix("http://") {
-            // Per RFC 3986 URL semantics, `@` separates userinfo from host:
-            // `http://user@realhost/path`. If `@` appears before `/`, skip past
-            // it to find the real host. `http://localhost@evil.example` would
-            // otherwise bypass the localhost check (R16 finding).
-            let authority_end = rest.find('/').unwrap_or(rest.len());
-            let authority = &rest[..authority_end];
-            let host_region = match authority.rfind('@') {
-                Some(i) => &authority[i + 1..],
-                None => authority,
-            };
-            // Strip port (:NNNN) from host, handling IPv6 brackets.
-            let host = if host_region.starts_with('[') {
-                // IPv6: [::1]:8080 → [::1]
-                match host_region.find(']') {
-                    Some(i) => &host_region[..=i],
-                    None => host_region, // malformed; reject below
+        if p.backend_class == InferenceBackendClass::Local {
+            // endpoint is not the connect target
+            if let Some(sc) = &p.sidecar {
+                if !std::path::Path::new(&sc.command).is_absolute() {
+                    return invalid("llm-providers[].sidecar.command must be an absolute path");
                 }
-            } else {
-                match host_region.find(':') {
-                    Some(i) => &host_region[..i],
-                    None => host_region,
-                }
-            };
-            host == "localhost" || host == "127.0.0.1" || host == "[::1]"
+            }
         } else {
-            false
-        };
-        if !ok {
-            return invalid(
+            let ok = if let Some(rest) = p.endpoint.strip_prefix("https://") {
+                !rest.is_empty()
+            } else if let Some(rest) = p.endpoint.strip_prefix("http://") {
+                // Per RFC 3986 URL semantics, `@` separates userinfo from host:
+                // `http://user@realhost/path`. If `@` appears before `/`, skip past
+                // it to find the real host. `http://localhost@evil.example` would
+                // otherwise bypass the localhost check (R16 finding).
+                let authority_end = rest.find('/').unwrap_or(rest.len());
+                let authority = &rest[..authority_end];
+                let host_region = match authority.rfind('@') {
+                    Some(i) => &authority[i + 1..],
+                    None => authority,
+                };
+                // Strip port (:NNNN) from host, handling IPv6 brackets.
+                let host = if host_region.starts_with('[') {
+                    // IPv6: [::1]:8080 → [::1]
+                    match host_region.find(']') {
+                        Some(i) => &host_region[..=i],
+                        None => host_region, // malformed; reject below
+                    }
+                } else {
+                    match host_region.find(':') {
+                        Some(i) => &host_region[..i],
+                        None => host_region,
+                    }
+                };
+                host == "localhost" || host == "127.0.0.1" || host == "[::1]"
+            } else {
+                false
+            };
+            if !ok {
+                return invalid(
                 "llm-providers[].endpoint must be https:// (http:// only for bare localhost/127.0.0.1/[::1] host)",
             );
-        }
+            }
+        } // cloud-http URL check
         if !p.cost_per_mtoken_in.is_finite() || p.cost_per_mtoken_in <= 0.0 {
             return invalid(
                 "llm-providers[].cost-per-mtoken-in must be finite and > 0 (0 disables cost caps)",

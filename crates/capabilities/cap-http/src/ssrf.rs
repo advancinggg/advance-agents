@@ -455,3 +455,44 @@ fn normalize_host(host: &str) -> String {
     let lc = host.to_ascii_lowercase();
     lc.strip_suffix('.').unwrap_or(&lc).to_string()
 }
+
+#[cfg(test)]
+mod t31_table_pin {
+    use super::*;
+    use crate::local_transport::DefaultLocalInferenceTransport;
+    use advance_shared_types::inference::SidecarHandoff;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    /// MODULE-012-T31 — forbidden table is byte/row-identical with C238 present.
+    #[test]
+    fn t31_forbidden_table_rows() {
+        let table = build_forbidden_table();
+        let pin: Vec<(&str, CidrClass)> = vec![
+            ("169.254.169.254/32", CidrClass::CloudMetadata),
+            ("fd00:ec2::254/128", CidrClass::CloudMetadata),
+            ("10.0.0.0/8", CidrClass::PrivateIpv4),
+            ("172.16.0.0/12", CidrClass::PrivateIpv4),
+            ("192.168.0.0/16", CidrClass::PrivateIpv4),
+            ("127.0.0.0/8", CidrClass::Loopback),
+            ("0.0.0.0/8", CidrClass::Loopback),
+            ("169.254.0.0/16", CidrClass::LinkLocal),
+            ("::1/128", CidrClass::Loopback),
+            ("::/96", CidrClass::Loopback),
+            ("fc00::/7", CidrClass::UniqueLocalIpv6),
+            ("fe80::/10", CidrClass::LinkLocal),
+        ];
+        assert_eq!(table.len(), pin.len());
+        for (i, (net, class)) in table.iter().enumerate() {
+            assert_eq!(net.to_string(), pin[i].0, "row {i} cidr");
+            assert_eq!(*class, pin[i].1, "row {i} class");
+        }
+        // Constructing the C238 policy must not mutate the table.
+        let _policy = DefaultLocalInferenceTransport;
+        let _h = SidecarHandoff {
+            pid: 0,
+            loopback: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+        };
+        let again = build_forbidden_table();
+        assert_eq!(table.len(), again.len());
+    }
+}

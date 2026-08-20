@@ -11,10 +11,15 @@ publish = false
 name = "cap_llm"
 path = "src/lib.rs"
 
+[[bin]]
+name = "local-sidecar-fixture"
+path = "src/bin/local-sidecar-fixture.rs"
+
 [dependencies]
 advance-runtime = { path = "../../runtime" }
 advance-shared-types = { path = "../../shared-types" }
 async-trait = { workspace = true }
+libc = { workspace = true }
 wasmtime = { workspace = true }
 rand = { workspace = true }
 # tokio for runtime-side sleep + Mutex/RwLock in gateway retry/embed loops.

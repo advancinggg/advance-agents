@@ -17,7 +17,9 @@
 
 use std::fmt;
 
-use advance_runtime::config::{AuthScheme, LlmProviderConfig, ProviderBackend};
+use advance_runtime::config::{
+    AuthScheme, InferenceBackendClass, LlmProviderConfig, ProviderBackend,
+};
 
 use crate::error::LlmError;
 
@@ -42,6 +44,8 @@ pub struct ResolvedProvider {
     /// Credential-position override (ADR 2026-07-22 fork f). `None` → the
     /// backend default (see `providers::credential_position_for`).
     pub auth_scheme: Option<AuthScheme>,
+    pub backend_class: InferenceBackendClass,
+    pub embedding_model: Option<String>,
 }
 
 impl fmt::Debug for ResolvedProvider {
@@ -55,6 +59,8 @@ impl fmt::Debug for ResolvedProvider {
             .field("cost_per_mtoken_out", &self.cost_per_mtoken_out)
             .field("backend", &self.backend)
             .field("auth_scheme", &self.auth_scheme)
+            .field("backend_class", &self.backend_class)
+            .field("embedding_model", &self.embedding_model)
             .finish()
     }
 }
@@ -150,6 +156,8 @@ pub(crate) fn make_resolved(p: &LlmProviderConfig, model: String) -> ResolvedPro
         cost_per_mtoken_out: p.cost_per_mtoken_out,
         backend: backend_of(p),
         auth_scheme: p.auth_scheme,
+        backend_class: p.backend_class,
+        embedding_model: p.embedding_model.clone(),
     }
 }
 
@@ -174,6 +182,10 @@ mod tests {
             retry_default: None,
             backend: None,
             auth_scheme: None,
+            backend_class: InferenceBackendClass::CloudHttp,
+            embedding_model: None,
+            sidecar: None,
+            profile_id: None,
         }
     }
 
@@ -371,32 +383,42 @@ mod tests {
     }
 
     #[test]
-    fn t_local_backend_serde_round_trip() {
-        let json = serde_json::json!("local");
-        let parsed: ProviderBackend = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed, ProviderBackend::Local);
-        let serialized = serde_json::to_value(parsed).unwrap();
-        assert_eq!(serialized, serde_json::json!("local"));
-    }
-
-    #[test]
-    fn t_backend_of_explicit_local() {
-        let mut cfg = provider("my-local", &[("llama", "llama-3.1-8b")]);
-        cfg.backend = Some(ProviderBackend::Local);
-        assert_eq!(backend_of(&cfg), ProviderBackend::Local);
-        let resolved = make_resolved(&cfg, "llama-3.1-8b".into());
-        assert_eq!(resolved.backend, ProviderBackend::Local);
-    }
-
-    #[test]
-    fn t_local_config_parses() {
+    fn t_local_backend_yaml_maps_to_class() {
         let cfg: LlmProviderConfig = serde_json::from_value(serde_json::json!({
-            "id": "local", "endpoint": "http://localhost:8080",
+            "id": "local", "endpoint": "",
             "api-key-secret": "local-dummy", "model-aliases": {"llama": "llama-3.1-8b"},
             "cost-per-mtoken-in": 0.001, "cost-per-mtoken-out": 0.001,
             "backend": "local"
         }))
-        .expect("local config must parse");
-        assert_eq!(cfg.backend, Some(ProviderBackend::Local));
+        .expect("backend: local must parse as class");
+        assert_eq!(cfg.backend, Some(ProviderBackend::OpenAiChat));
+        assert_eq!(cfg.backend_class, InferenceBackendClass::Local);
+        let resolved = make_resolved(&cfg, "llama-3.1-8b".into());
+        assert_eq!(resolved.backend, ProviderBackend::OpenAiChat);
+        assert_eq!(resolved.backend_class, InferenceBackendClass::Local);
+    }
+
+    #[test]
+    fn t116_unknown_field_rejected() {
+        let err = serde_json::from_value::<LlmProviderConfig>(serde_json::json!({
+            "id": "openai", "endpoint": "https://a.example",
+            "api-key-secret": "s", "model-aliases": {},
+            "cost-per-mtoken-in": 0.0, "cost-per-mtoken-out": 0.0,
+            "unknown-knob": true
+        }));
+        assert!(err.is_err(), "deny_unknown_fields must reject unknown-knob");
+    }
+
+    #[test]
+    fn t128_provider_backend_three_members() {
+        // Compile-time: a match without a fourth arm is exhaustive.
+        fn count(b: ProviderBackend) -> u8 {
+            match b {
+                ProviderBackend::OpenAiChat => 1,
+                ProviderBackend::OpenAiResponses => 2,
+                ProviderBackend::AnthropicMessages => 3,
+            }
+        }
+        assert_eq!(count(ProviderBackend::OpenAiChat), 1);
     }
 }

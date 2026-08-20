@@ -259,6 +259,8 @@ mod tests {
             cost_per_mtoken_out: 15.0,
             backend: advance_runtime::config::ProviderBackend::AnthropicMessages,
             auth_scheme: None,
+            backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
+            embedding_model: None,
         }
     }
 
@@ -802,6 +804,8 @@ mod stream_tests {
             cost_per_mtoken_out: 15.0,
             backend: ProviderBackend::AnthropicMessages,
             auth_scheme: None,
+            backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
+            embedding_model: None,
         }
     }
 

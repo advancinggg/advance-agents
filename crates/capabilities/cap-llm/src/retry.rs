@@ -90,6 +90,13 @@ mod test_audit_adv1 {
         assert!(!classify_retryable(&LlmError::ProviderError(
             "endpoint url must not contain user-info, query, or fragment".into()
         )));
+        assert!(
+            !classify_retryable(&LlmError::ProviderError("ssrf blocked".into())),
+            "SsrfBlocked must stay non-retryable"
+        );
+        assert!(!classify_retryable(&LlmError::ProviderError(
+            "local transport: sidecar dead".into()
+        )));
     }
 }
 
@@ -473,6 +480,10 @@ mod tests {
             retry_default: rd,
             backend: None,
             auth_scheme: None,
+            backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
+            embedding_model: None,
+            sidecar: None,
+            profile_id: None,
         }
     }
 

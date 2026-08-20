@@ -77,6 +77,7 @@ pub trait ProviderAdapter: Send + Sync {
     /// Round-3 W6 fix: gateway's `select_embedding_provider` skips providers
     /// whose adapter advertises `false`. Default `true`; only `AnthropicAdapter`
     /// overrides to `false` (Anthropic ships no native embedding endpoint).
+    #[allow(dead_code)]
     fn supports_embedding(&self) -> bool {
         true
     }
@@ -101,7 +102,6 @@ pub fn select_adapter(backend: ProviderBackend) -> Box<dyn ProviderAdapter> {
         ProviderBackend::AnthropicMessages => Box::new(anthropic::AnthropicAdapter),
         ProviderBackend::OpenAiResponses => Box::new(responses::OpenAiResponsesAdapter),
         ProviderBackend::OpenAiChat => Box::new(openai::OpenAiAdapter),
-        ProviderBackend::Local => Box::new(local::LocalAdapter::new()),
     }
 }
 
@@ -124,10 +124,9 @@ pub(crate) fn credential_position_for(provider: &ResolvedProvider) -> Credential
         (None, ProviderBackend::AnthropicMessages) => CredentialPosition::CustomHeader {
             key: "x-api-key".into(),
         },
-        (
-            None,
-            ProviderBackend::OpenAiChat | ProviderBackend::OpenAiResponses | ProviderBackend::Local,
-        ) => CredentialPosition::BearerToken,
+        (None, ProviderBackend::OpenAiChat | ProviderBackend::OpenAiResponses) => {
+            CredentialPosition::BearerToken
+        }
     }
 }
 
@@ -162,6 +161,8 @@ mod cred_tests {
             cost_per_mtoken_out: 0.0,
             backend,
             auth_scheme: auth,
+            backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
+            embedding_model: None,
         }
     }
 
@@ -207,8 +208,8 @@ mod cred_tests {
     }
 
     #[test]
-    fn t_local_backend_default_credential_position() {
-        let local = provider(ProviderBackend::Local, None);
+    fn t_openai_chat_default_credential_position() {
+        let local = provider(ProviderBackend::OpenAiChat, None);
         assert!(matches!(
             credential_position_for(&local),
             CredentialPosition::BearerToken

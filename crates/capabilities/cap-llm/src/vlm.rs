@@ -40,7 +40,6 @@ use crate::error::LlmError;
 use crate::gateway::{
     build_http_cap, map_http_err_to_llm, ChatMessage, ChatParams, ChatRole, LlmGatewayInternal,
 };
-use crate::provider::resolve_provider_and_model;
 
 /// MODULE-009 §2.3 CONTRACT-082 — file-content variants the VlmExtractor
 /// handles. Slice D shape: struct variants `Image`/`VideoFrame`/`Audio` carry
@@ -70,6 +69,7 @@ pub struct LlmGatewayVlm {
     #[allow(dead_code)]
     event_bus: Arc<dyn EventBusEmit>,
     default_agent_id: String,
+    catalog: Arc<crate::catalog::ModelProfileCatalog>,
 }
 
 impl LlmGatewayVlm {
@@ -84,7 +84,21 @@ impl LlmGatewayVlm {
             chain,
             event_bus,
             default_agent_id,
+            catalog: Arc::new(crate::catalog::ModelProfileCatalog::new()),
         }
+    }
+
+    pub fn with_catalog(mut self, catalog: crate::catalog::ModelProfileCatalog) -> Self {
+        self.catalog = Arc::new(catalog);
+        self
+    }
+
+    pub fn with_shared_catalog(
+        mut self,
+        catalog: Arc<crate::catalog::ModelProfileCatalog>,
+    ) -> Self {
+        self.catalog = catalog;
+        self
     }
 }
 
@@ -96,13 +110,26 @@ impl VlmExtractor for LlmGatewayVlm {
         // surface; downstream caller M011 can wrap this with a custom impl
         // that selects providers per content type — Slice D ships the
         // simple default-first path).
-        let resolved = resolve_provider_and_model(&cfg.llm_providers, None)?;
+        let need = crate::capability::CapabilityNeed {
+            tools: false,
+            output_schema: false,
+            image: true,
+            prompt_tokens_est: None,
+            max_tokens: None,
+        };
+        let resolved =
+            crate::capability::walk_eligible(&cfg.llm_providers, None, &self.catalog, &need)?;
         let provider_cfg = cfg
             .llm_providers
             .iter()
             .find(|p| p.id == resolved.id)
             .ok_or_else(|| LlmError::ModelNotAvailable("resolved provider missing in cfg".into()))?
             .clone();
+        if resolved.backend_class == advance_runtime::config::InferenceBackendClass::Local {
+            return Err(LlmError::ProviderError(
+                "unsupported capability: image".into(),
+            ));
+        }
         let http_cap = build_http_cap(&resolved, &provider_cfg)?;
 
         // Adversarial-R1 C2 fix — fragile string-equality `id == "anthropic"`
@@ -535,6 +562,95 @@ mod tests {
             body_str.contains("\"url\":\"data:image/png;base64,"),
             "body should have correct data URI prefix"
         );
+    }
+
+    #[tokio::test]
+    async fn t129_vlm_skips_text_only_local_onto_cloud() {
+        use std::collections::HashMap;
+
+        use advance_runtime::config::{InferenceBackendClass, LlmProviderConfig, ProviderBackend};
+
+        let mut aliases = HashMap::new();
+        aliases.insert("llama".into(), "llama".into());
+        let local = LlmProviderConfig {
+            id: "local".into(),
+            endpoint: String::new(),
+            api_key_secret: "dummy".into(),
+            model_aliases: aliases,
+            cost_per_mtoken_in: 0.001,
+            cost_per_mtoken_out: 0.001,
+            rate_limit: None,
+            retry_default: None,
+            backend: Some(ProviderBackend::OpenAiChat),
+            auth_scheme: None,
+            backend_class: InferenceBackendClass::Local,
+            embedding_model: None,
+            sidecar: None,
+            profile_id: None,
+        };
+        let mut cfg = fixture_runtime_config();
+        cfg.llm_providers.insert(0, local);
+        let chain = vlm_chain_with_scripted_text("cloud-vision");
+        let vlm = Arc::new(LlmGatewayVlm::new(
+            Arc::new(MockRuntimeConfigProvider::new(cfg)),
+            chain.clone(),
+            Arc::new(MockEventBusEmit::default()),
+            "test-agent".into(),
+        ));
+        let png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        let res = vlm
+            .extract_description(&FileContent::Image {
+                bytes: png,
+                mime: "image/png".into(),
+            })
+            .await
+            .expect("walker must skip local and use cloud");
+        assert_eq!(res, "cloud-vision");
+        assert_eq!(chain.call_log.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn t129_vlm_local_only_is_unsupported_image() {
+        use std::collections::HashMap;
+
+        use advance_runtime::config::{InferenceBackendClass, LlmProviderConfig, ProviderBackend};
+
+        let mut aliases = HashMap::new();
+        aliases.insert("llama".into(), "llama".into());
+        let local = LlmProviderConfig {
+            id: "local".into(),
+            endpoint: String::new(),
+            api_key_secret: "dummy".into(),
+            model_aliases: aliases,
+            cost_per_mtoken_in: 0.001,
+            cost_per_mtoken_out: 0.001,
+            rate_limit: None,
+            retry_default: None,
+            backend: Some(ProviderBackend::OpenAiChat),
+            auth_scheme: None,
+            backend_class: InferenceBackendClass::Local,
+            embedding_model: None,
+            sidecar: None,
+            profile_id: None,
+        };
+        let mut cfg = fixture_runtime_config();
+        cfg.llm_providers = vec![local];
+        let chain = Arc::new(MockHttpSecurityChain::default());
+        let vlm = LlmGatewayVlm::new(
+            Arc::new(MockRuntimeConfigProvider::new(cfg)),
+            chain.clone(),
+            Arc::new(MockEventBusEmit::default()),
+            "test-agent".into(),
+        );
+        let err = vlm
+            .extract_description(&FileContent::Image {
+                bytes: b"x".to_vec(),
+                mime: "image/png".into(),
+            })
+            .await
+            .expect_err("local-only has no image");
+        assert!(format!("{err}").contains("unsupported capability"), "{err}");
+        assert!(chain.call_log.lock().unwrap().is_empty());
     }
 
     // T10a: dispatch text → gateway.chat

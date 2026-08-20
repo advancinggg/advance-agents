@@ -31,6 +31,9 @@
 //!
 //! See MODULE-009 §3.7 Change History for slice context.
 
+pub mod backend_local;
+pub mod capability;
+pub mod catalog;
 pub mod cost;
 pub mod error;
 pub mod events;
@@ -55,8 +58,16 @@ pub(crate) mod executor;
 pub(crate) mod stream;
 
 #[cfg(test)]
+mod local_endpoint_tests;
+
+#[cfg(test)]
 mod test_support;
 
+pub use backend_local::{
+    FailedSpawnBackend, OwnedHandoffSupervisor, ProcessSupervisor, SidecarClient,
+    StaticHandoffSupervisor, SupervisedChild,
+};
+pub use catalog::ModelProfileCatalog;
 pub use cost::compute_cost;
 pub use error::LlmError;
 pub use events::{LLM_ERROR, LLM_REQUEST, LLM_RESPONSE, LLM_RETRY};
