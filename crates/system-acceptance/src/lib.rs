@@ -131,7 +131,16 @@ use advance_shared_types::mailbox::{
     AgentAction, DispatchError, Message, MessageContext, MessageKind,
 };
 use advance_shared_types::outbound::DeliveryReport;
+use advance_shared_types::repetition::{OutputHash, RepetitionDecision, ToolCallSignature};
 use advance_shared_types::traits::{EventBusEmit, GrantCheck, RepetitionGuardCheck, RunBudget};
+use cap_http::DefaultPromptInjectionHelpers;
+use cap_tools::web::{
+    agent_tool_infos, project_callable_tool_entries, strip_unissued_citations,
+    CompositeToolRegistry, EvidenceIdStore, FixtureProvider, HostToolRegistry,
+    OfflineDenyingGrantCheck, WebFamilyConfig, WebFamilyDispatcher, WebFamilyParts,
+};
+
+pub use advance_shared_types::web_search::WebRunMode;
 use cap_fs::{
     agent_id_for_m004, register_agent_fs, Adv003GitSync, Db030SqliteSync, DefaultAtomicWriter,
     DefaultVirtualPathResolver, GitSync, MetaMaintainer, MetaSchemaLoader, MetaSchemaWatcher,
@@ -1199,6 +1208,9 @@ pub struct SystemUnderTestBuilder {
     with_recall_corpus: bool,
     /// Wave-20 Lane `search` (SYS-AC-009): the DUAL-PATH (dense + sparse FTS5) recall axis.
     with_dual_recall_corpus: bool,
+    /// SYS-J-75: opt-in CONTRACT-239 web.* family (default None → existing
+    /// `register_agent_tools*` path, byte-identical).
+    web_family: Option<WebRunMode>,
 }
 
 impl Default for SystemUnderTestBuilder {
@@ -1256,6 +1268,7 @@ impl Default for SystemUnderTestBuilder {
             with_decomposition: false,
             with_recall_corpus: false,
             with_dual_recall_corpus: false,
+            web_family: None,
         }
     }
 }
@@ -1765,6 +1778,14 @@ impl SystemUnderTestBuilder {
         self
     }
 
+    /// SYS-J-75: register the production `web.search` / `web.extract` family
+    /// (`register_agent_tools_for_web` + in-repo `FixtureProvider`) on this SUT.
+    /// Default-off. Requires `Cap::Tools`.
+    pub fn with_web_family(mut self, mode: WebRunMode) -> Self {
+        self.web_family = Some(mode);
+        self
+    }
+
     /// Harvest-triggers slice (SYS-AC 098-114): wire the REAL scheduler trigger
     /// subsystems into the SUT — a `TriggerBusDispatchImpl` (max-chain-depth 10), a
     /// registry-backed `InMemoryComponentSubmitApi` (quota 20) over a SQLite
@@ -2083,6 +2104,12 @@ impl SystemUnderTestBuilder {
                 ".with_tool_grant_filter() is mutually exclusive with GrantMode::Real (the axis owns its dedicated GrantStore for the tools-grant filter)"
             );
         }
+        if self.web_family.is_some() {
+            assert!(
+                self.caps.contains(&Cap::Tools),
+                ".with_web_family() requires Cap::Tools"
+            );
+        }
         // Wave-13 (SYS-AC-172) axis guards (fail loud).
         if self.with_decomposition {
             assert!(
@@ -2206,6 +2233,10 @@ impl SystemUnderTestBuilder {
         // registry so a test observes the SAME cache (`cache_len`/`list`) the
         // `tool-invoke` host-fn drives. `None` unless `Cap::Tools`.
         let mut tool_registry_opt: Option<Arc<cap_tools::LazyToolRegistry>> = None;
+        let mut evidence_ids_opt: Option<Arc<EvidenceIdStore>> = None;
+        let mut web_mode_opt: Option<WebRunMode> = None;
+        let mut web_principal_opt: Option<String> = None;
+        let mut web_grant_opt: Option<Arc<dyn GrantCheck>> = None;
 
         // --- pre-runtime capability registrations ---
         if self.caps.contains(&Cap::Fs) {
@@ -2680,7 +2711,7 @@ impl SystemUnderTestBuilder {
         let breaker: Arc<dyn CircuitBreakerBus> = Arc::new(DefaultCircuitBreakerBus::new());
         let injector = Arc::new(CapabilityInjector::new(
             registry.clone(),
-            grant_check,
+            grant_check.clone(),
             breaker.clone(),
         ));
 
@@ -2709,7 +2740,73 @@ impl SystemUnderTestBuilder {
             let tools = Arc::new(cap_tools::LazyToolRegistry::new_with_engine(
                 tools_cfg, engine,
             ));
-            if self.with_tool_repetition_guard {
+            if let Some(mode) = self.web_family {
+                const WEB_CFG_PRINCIPAL: &str = "j75-web-cfg-secret";
+                let host = Arc::new(HostToolRegistry::new());
+                if mode != WebRunMode::Offline {
+                    for info in agent_tool_infos() {
+                        host.register(info).await;
+                    }
+                }
+                let composite = Arc::new(CompositeToolRegistry {
+                    host,
+                    wasm: tools.clone(),
+                });
+                let evidence = Arc::new(EvidenceIdStore::new());
+                let mut web_cfg = WebFamilyConfig::default();
+                web_cfg.mode = mode;
+                web_cfg.principal = WEB_CFG_PRINCIPAL.to_string();
+                let dispatcher = if mode == WebRunMode::Offline {
+                    None
+                } else {
+                    Some(Arc::new(WebFamilyDispatcher::from_parts(WebFamilyParts {
+                        chain: None,
+                        helpers: Some(Arc::new(DefaultPromptInjectionHelpers::default())),
+                        web: web_cfg,
+                        tools: advance_runtime::config::ToolsConfig::default(),
+                        evidence_ids: evidence.clone(),
+                        provider: Arc::new(FixtureProvider::default()),
+                    })))
+                };
+                let web_grant: Arc<dyn GrantCheck> = Arc::new(OfflineDenyingGrantCheck {
+                    inner: grant_check.clone(),
+                    offline: mode == WebRunMode::Offline,
+                });
+                let repetition: Arc<dyn RepetitionGuardCheck> = if self.with_tool_repetition_guard {
+                    let rm = advance_run_manager::RunManager::new_arc(bus_dyn.clone());
+                    let bare_id = AGENT_ID.strip_prefix("agent:").unwrap_or(AGENT_ID);
+                    rm.ensure_run(
+                        "task-rep-122",
+                        bare_id,
+                        advance_run_manager::RunConfig::default(),
+                    )
+                    .expect("ensure_run for the tool-guard resolver");
+                    let guard = Arc::new(
+                        rm.build_repetition_guard_from_config(
+                            &advance_run_manager::RepetitionGuardConfig::default(),
+                        )
+                        .with_prompt_injection_helpers(Arc::new(
+                            DefaultPromptInjectionHelpers::default(),
+                        )),
+                    );
+                    tool_guard = Some(guard.clone());
+                    guard
+                } else {
+                    Arc::new(HarnessNoopRepetitionGuard)
+                };
+                cap_tools::register_agent_tools_for_web(
+                    &*registry,
+                    composite as Arc<dyn cap_tools::ToolRegistry>,
+                    bus_dyn.clone(),
+                    repetition,
+                    web_grant.clone(),
+                    dispatcher,
+                );
+                evidence_ids_opt = Some(evidence);
+                web_mode_opt = Some(mode);
+                web_principal_opt = Some(WEB_CFG_PRINCIPAL.to_string());
+                web_grant_opt = Some(web_grant);
+            } else if self.with_tool_repetition_guard {
                 // Wave-12 (SYS-AC-122): mirror production cli Step 7 — a REAL guard
                 // from the canonical defaults + PIH, late-bound to the per-turn
                 // assembler below. A RunManager over the SUT bus resolves run_id;
@@ -2885,6 +2982,7 @@ impl SystemUnderTestBuilder {
         let outbound: Option<Arc<dyn OutboundActionSink>> = if self.reply_capture {
             Some(Arc::new(CapturingOutboundSink {
                 replies: captured_replies.clone(),
+                evidence: evidence_ids_opt.clone(),
             }))
         } else {
             None
@@ -2967,14 +3065,23 @@ impl SystemUnderTestBuilder {
                         .with_tools_grant_reader(reader),
                     )
                 } else {
+                    let mut wasm = vec![ToolEntry {
+                        // Hyphenless name: the Tier-2 tool-name sanitizer maps '-' → '_',
+                        // so a hyphenless fixture name renders verbatim for a clean witness.
+                        name: "wasmtool".to_string(),
+                        description: "echo tool".to_string(),
+                        params_schema: serde_json::json!({"properties": {"text": {}}}),
+                    }];
+                    if let Some(g) = &web_grant_opt {
+                        wasm.extend(project_callable_tool_entries(
+                            vec![],
+                            None,
+                            Some(g.as_ref()),
+                            &self.agent_id,
+                        ));
+                    }
                     Arc::new(cap_tools::CallableInventory::new(
-                        vec![ToolEntry {
-                            // Hyphenless name: the Tier-2 tool-name sanitizer maps '-' → '_',
-                            // so a hyphenless fixture name renders verbatim for a clean witness.
-                            name: "wasmtool".to_string(),
-                            description: "echo tool".to_string(),
-                            params_schema: serde_json::json!({"properties": {"text": {}}}),
-                        }],
+                        wasm,
                         vec![McpToolEntry {
                             name: "mcptool".to_string(),
                             description: "search tool".to_string(),
@@ -3496,6 +3603,9 @@ impl SystemUnderTestBuilder {
             client_api_server,
             pump_exits,
             llm_stream_reaper,
+            evidence_ids: evidence_ids_opt,
+            web_mode: web_mode_opt,
+            web_principal: web_principal_opt,
         }
     }
 }
@@ -3587,6 +3697,7 @@ fn build_resolver_chain(
 /// not the dispatch path.
 struct CapturingOutboundSink {
     replies: Arc<Mutex<Vec<Vec<u8>>>>,
+    evidence: Option<Arc<EvidenceIdStore>>,
 }
 
 #[async_trait::async_trait]
@@ -3598,9 +3709,27 @@ impl OutboundActionSink for CapturingOutboundSink {
         actions: &[AgentAction],
     ) -> Result<DeliveryReport, DispatchError> {
         if let Some(a) = actions.first() {
-            self.replies.lock().unwrap().push(a.payload.clone());
+            let payload = if let Some(ids) = &self.evidence {
+                strip_unissued_citations(&a.payload, ids)
+            } else {
+                a.payload.clone()
+            };
+            self.replies.lock().unwrap().push(payload);
         }
         Ok(DeliveryReport::empty())
+    }
+}
+
+/// Default-off no-op for `.with_web_family()` when the repetition-guard axis
+/// is not set. The cap-tools `NoopRepetitionGuard` is private.
+struct HarnessNoopRepetitionGuard;
+
+impl RepetitionGuardCheck for HarnessNoopRepetitionGuard {
+    fn record_tool_call(&self, _agent_id: &str, _sig: ToolCallSignature) -> RepetitionDecision {
+        RepetitionDecision::Pass
+    }
+    fn record_output(&self, _agent_id: &str, _output_hash: OutputHash) -> RepetitionDecision {
+        RepetitionDecision::Pass
     }
 }
 
@@ -4162,6 +4291,9 @@ pub struct SystemUnderTest {
     client_api_server: Option<advance_client_api::ClientApiServer>,
     pump_exits: Arc<Mutex<Vec<advance_client_api::DeltaPumpExit>>>,
     llm_stream_reaper: Option<Arc<cap_llm::AgentStreamReaper>>,
+    evidence_ids: Option<Arc<EvidenceIdStore>>,
+    web_mode: Option<WebRunMode>,
+    web_principal: Option<String>,
 }
 
 /// Sched-harvest 1A (SYS-AC-110): the REAL submitter-grant subset gate — the
@@ -4695,6 +4827,21 @@ impl SystemUnderTest {
     /// delivered (coherent) reply through the real action-dispatch outbound seam.
     pub fn delivered_replies(&self) -> Vec<Vec<u8>> {
         self.captured_replies.lock().unwrap().clone()
+    }
+
+    /// SYS-J-75: shared evidence-id store the web dispatcher and reply strip share.
+    pub fn evidence_ids(&self) -> Option<&Arc<EvidenceIdStore>> {
+        self.evidence_ids.as_ref()
+    }
+
+    /// SYS-J-75: `WebRunMode` when `.with_web_family()` was set.
+    pub fn web_mode(&self) -> Option<WebRunMode> {
+        self.web_mode
+    }
+
+    /// SYS-J-75: `WebFamilyConfig.principal` sentinel (`j75-web-cfg-secret`).
+    pub fn web_principal(&self) -> Option<&str> {
+        self.web_principal.as_deref()
     }
 
     /// SYS-J-72: bound Client API, if `.with_delta_tee()` was set.
