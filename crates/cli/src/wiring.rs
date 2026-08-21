@@ -60,7 +60,8 @@ use advance_shared_types::security_validator::{
     HttpRequest, HttpResponse, RedirectCheck, SsrfGuard,
 };
 use advance_shared_types::traits::{
-    EventBusEmit, HttpStreamingChain, LeakDetector, RepetitionGuardCheck, RunBudget,
+    EventBusEmit, GrantCheck, HttpStreamingChain, LeakDetector, RepetitionGuardCheck, RunBudget,
+    ToolsGrantReader,
 };
 use cap_fs::{
     register_agent_fs, Adv003GitSync, DefaultAtomicWriter, DefaultVirtualPathResolver, GitSync,
@@ -72,6 +73,7 @@ use cap_grant::{
     ChannelApprovalError, ChannelApprovalPort, ChannelApprovalRequest, ChannelResolver,
     GrantApprovalIntake, GrantStore, ParentApprovalResolver, PresetRegistry, Resolver,
     ResolverChain, SubsetAutoApproveResolver, SubsetValidator, SubsetValidatorImpl,
+    ToolsGrantReaderImpl,
 };
 use cap_http::{
     DefaultHttpSecurityChain, DefaultLeakDetector, DefaultPromptInjectionHelpers, ExecutorError,
@@ -93,6 +95,7 @@ use crate::progress_lifecycle_bootstrap::{
     bootstrap_progress_lifecycle, ProgressLifecycleBootstrapStaging,
 };
 use crate::reply::ReplyRegistry;
+use advance_shared_types::web_search::WebRunMode;
 use cap_llm::{register_agent_llm_with_turn_cost, LlmGateway, LlmGatewayVlm, VlmExtractor};
 use cap_memory::{
     register_agent_memory_with_git_and_policy, L6CursorStore, MemoryGitRestore, MemoryStore,
@@ -105,8 +108,13 @@ use cap_secrets::{
     DEFAULT_KEYCHAIN_SERVICE,
 };
 use cap_skills::provider::{SingleAgentSkillStoreProvider, SkillStoreProvider};
+use cap_tools::web::{
+    agent_tool_infos, CompositeToolRegistry, EvidenceIdStore, FixtureProvider, HostToolRegistry,
+    OfflineDenyingGrantCheck, WebFamilyConfig, WebFamilyDispatcher, WebFamilyParts,
+};
 use cap_tools::{
-    register_agent_tools_with_guard, LazyRegistryConfig, LazyToolRegistry, ToolRegistry,
+    register_agent_tools_for_web, register_agent_tools_with_guard, LazyRegistryConfig,
+    LazyToolRegistry, ToolRegistry,
 };
 use zeroize::Zeroizing;
 
@@ -672,6 +680,11 @@ pub struct WiringHandles {
     /// `Some` iff `.agent/config.yaml` declares `tools` (the same `declares_tools`
     /// gate that registers cap-tools); `None` → no tool-path guard to late-bind.
     pub repetition_guard: Option<Arc<RepetitionGuard>>,
+    pub tool_registry: Option<Arc<dyn ToolRegistry>>,
+    pub web_status: Option<advance_shared_types::web_search::WebRunStatus>,
+    pub evidence_ids: Arc<EvidenceIdStore>,
+    pub tools_grant_reader: Option<Arc<dyn ToolsGrantReader>>,
+    pub web_grant: Option<Arc<dyn GrantCheck>>,
 }
 
 #[cfg(feature = "test-support")]
@@ -948,6 +961,9 @@ async fn wire_capabilities_inner(
     let declares_grant = declares("grant");
     let declares_llm = declares("llm");
     let declares_tools = declares("tools");
+    let declares_web = declares("web");
+    let web_cfg_snapshot = builder.config().web.clone();
+    let evidence_ids = Arc::new(EvidenceIdStore::new());
     // await-leg B-2 (2026-06-22): gate the production messaging chain (await-replies
     // + heartbeat host-fns + the suspend sink). await-leg B-4a (2026-06-22) flipped
     // `"messaging"` INTO `agent_config::KNOWN_CAPABILITIES`, so a `messaging`-declaring
@@ -1418,6 +1434,7 @@ async fn wire_capabilities_inner(
             event_bus_dyn.clone(),
             runtime_config.security.action_validator.max_message_size,
             None,
+            Arc::clone(&evidence_ids),
         ) {
             Ok(activation) => Some(activation),
             Err(error) => {
@@ -2243,6 +2260,8 @@ async fn wire_capabilities_inner(
     // per-agent `ContextAssembler` into the guard (the Tier-3 inject sink). `None`
     // when the agent declares no `tools` cap (nothing to late-bind).
     let mut repetition_guard_handle: Option<Arc<RepetitionGuard>> = None;
+    let mut tool_registry_handle: Option<Arc<dyn ToolRegistry>> = None;
+    let mut web_grant_handle: Option<Arc<dyn GrantCheck>> = None;
     if declares_tools {
         let tools_cfg = LazyRegistryConfig::from(&host.config().tools);
         let engine = host.component_runtime().tool_engine_handle();
@@ -2262,7 +2281,37 @@ async fn wire_capabilities_inner(
         if let Some(root) = skills_root.as_deref() {
             let _registered = register_skill_tools(&tools_concrete, root).await;
         }
-        let tools: Arc<dyn ToolRegistry> = tools_concrete;
+        let host_slots = Arc::new(HostToolRegistry::new());
+        let web_family_active = declares_web && web_cfg_snapshot.mode != WebRunMode::Offline;
+        let dispatcher = if web_family_active {
+            for info in agent_tool_infos() {
+                host_slots.register(info).await;
+            }
+            let family_cfg = WebFamilyConfig {
+                mode: web_cfg_snapshot.mode,
+                provider_id: web_cfg_snapshot.provider.clone(),
+                provider_allowlist: web_cfg_snapshot.provider_allowlist.clone(),
+                pinned_hosts: web_cfg_snapshot.pinned_hosts.clone(),
+                tenant: web_cfg_snapshot.tenant.clone(),
+                principal: web_cfg_snapshot.principal.clone(),
+                kb_index_cutoff: web_cfg_snapshot.kb_index_cutoff.clone(),
+            };
+            Some(Arc::new(WebFamilyDispatcher::from_parts(WebFamilyParts {
+                chain: None,
+                helpers: Some(Arc::new(DefaultPromptInjectionHelpers::default())),
+                web: family_cfg,
+                tools: host.config().tools.clone(),
+                evidence_ids: Arc::clone(&evidence_ids),
+                provider: Arc::new(FixtureProvider::default()),
+            })))
+        } else {
+            None
+        };
+        let composite: Arc<dyn ToolRegistry> = Arc::new(CompositeToolRegistry {
+            host: host_slots,
+            wasm: Arc::clone(&tools_concrete),
+        });
+        let tools: Arc<dyn ToolRegistry> = composite;
         // Wave-11 Lane C — feed the production tool-dispatch repetition guard
         // (closes the orphan `record_tool_call`). One process-global
         // `RepetitionGuard` from the canonical defaults (window 10 / threshold
@@ -2285,12 +2334,29 @@ async fn wire_capabilities_inner(
                 .build_repetition_guard_from_config(&RepetitionGuardConfig::default())
                 .with_prompt_injection_helpers(Arc::new(DefaultPromptInjectionHelpers::default())),
         );
-        register_agent_tools_with_guard(
-            &*host.host_registry(),
-            tools,
-            event_bus_dyn.clone(),
-            guard.clone(),
-        );
+        tool_registry_handle = Some(Arc::clone(&tools));
+        if declares_web {
+            let web_grant: Arc<dyn GrantCheck> = Arc::new(OfflineDenyingGrantCheck {
+                inner: cap_grant.grant_check.clone(),
+                offline: web_cfg_snapshot.mode == WebRunMode::Offline,
+            });
+            web_grant_handle = Some(Arc::clone(&web_grant));
+            register_agent_tools_for_web(
+                &*host.host_registry(),
+                tools,
+                event_bus_dyn.clone(),
+                guard.clone(),
+                web_grant,
+                dispatcher,
+            );
+        } else {
+            register_agent_tools_with_guard(
+                &*host.host_registry(),
+                tools,
+                event_bus_dyn.clone(),
+                guard.clone(),
+            );
+        }
         repetition_guard_handle = Some(guard);
     }
 
@@ -2400,6 +2466,8 @@ async fn wire_capabilities_inner(
         None => None,
     };
 
+    let tools_grant_reader: Option<Arc<dyn ToolsGrantReader>> =
+        Some(Arc::new(ToolsGrantReaderImpl::new(cap_grant.store.clone())));
     Ok((
         host,
         WiringHandles {
@@ -2434,6 +2502,14 @@ async fn wire_capabilities_inner(
             skills_root,
             skill_turn_runtime: skill_turn_runtime_handle,
             repetition_guard: repetition_guard_handle,
+            tool_registry: tool_registry_handle,
+            web_status: Some(advance_shared_types::web_search::WebRunStatus {
+                mode: web_cfg_snapshot.mode,
+                index_cutoff: web_cfg_snapshot.kb_index_cutoff.clone(),
+            }),
+            evidence_ids: Arc::clone(&evidence_ids),
+            tools_grant_reader,
+            web_grant: web_grant_handle,
         },
     ))
 }

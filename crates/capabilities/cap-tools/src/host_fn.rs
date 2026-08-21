@@ -21,9 +21,12 @@ use std::time::Instant;
 use advance_runtime::host_registry::{
     HostCallContext, HostCallError, HostFunctionHandler, HostFunctionSpec, HostRegistry,
 };
+use advance_shared_types::capability::GrantDecision;
 use advance_shared_types::repetition::{RepetitionDecision, ToolCallSignature};
-use advance_shared_types::traits::{EventBusEmit, RepetitionGuardCheck};
+use advance_shared_types::traits::{EventBusEmit, GrantCheck, RepetitionGuardCheck};
 use wasmtime::component::Val;
+
+use crate::web::{check_web_grant, is_web_tool_id, web_tool_visible, WebFamilyDispatcher};
 
 use crate::events::{tool_error_event, tool_invoke_event, tool_result_event, ToolEventContext};
 use crate::registry::{MethodInfo, ToolError, ToolInfo, ToolRegistry};
@@ -101,6 +104,57 @@ pub fn register_agent_tools_with_guard(
         handler: Arc::new(AgentToolsListHandler { tools, emitter }),
         idempotent: true,
     });
+}
+
+/// CONTRACT-239 registrar. 3-arg/4-arg signatures stay byte-identical.
+pub fn register_agent_tools_for_web(
+    registry: &dyn HostRegistry,
+    tools: Arc<dyn ToolRegistry>,
+    emitter: Arc<dyn EventBusEmit>,
+    repetition_guard: Arc<dyn RepetitionGuardCheck>,
+    web_grant: Arc<dyn GrantCheck>,
+    dispatcher: Option<Arc<WebFamilyDispatcher>>,
+) {
+    registry.register(HostFunctionSpec {
+        capability: CAPABILITY.to_string(),
+        namespace: NAMESPACE.to_string(),
+        name: "tool-invoke".to_string(),
+        handler: Arc::new(WebAwareInvokeHandler {
+            tools: Arc::clone(&tools),
+            emitter: Arc::clone(&emitter),
+            repetition_guard,
+            web_grant: Arc::clone(&web_grant),
+            dispatcher: dispatcher.clone(),
+        }),
+        idempotent: false,
+    });
+    registry.register(HostFunctionSpec {
+        capability: CAPABILITY.to_string(),
+        namespace: NAMESPACE.to_string(),
+        name: "list-tools".to_string(),
+        handler: Arc::new(WebAwareListHandler {
+            tools,
+            emitter,
+            web_grant,
+            dispatcher,
+        }),
+        idempotent: true,
+    });
+}
+
+pub struct WebAwareInvokeHandler {
+    pub tools: Arc<dyn ToolRegistry>,
+    pub emitter: Arc<dyn EventBusEmit>,
+    pub repetition_guard: Arc<dyn RepetitionGuardCheck>,
+    pub web_grant: Arc<dyn GrantCheck>,
+    pub dispatcher: Option<Arc<WebFamilyDispatcher>>,
+}
+
+pub struct WebAwareListHandler {
+    pub tools: Arc<dyn ToolRegistry>,
+    pub emitter: Arc<dyn EventBusEmit>,
+    pub web_grant: Arc<dyn GrantCheck>,
+    pub dispatcher: Option<Arc<WebFamilyDispatcher>>,
 }
 
 /// `tool-invoke(tool-id, method, params) -> result<list<u8>, tool-error>`.
@@ -315,6 +369,174 @@ impl HostFunctionHandler for AgentToolsListHandler {
             emitter.emit(tool_invoke_event(&ev_ctx, "", LIST_METHOD));
             let start = Instant::now();
             let infos = tools.list().await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+            emitter.emit(tool_result_event(
+                &ev_ctx,
+                "",
+                LIST_METHOD,
+                duration_ms,
+                infos.len(),
+            ));
+            let listed: Vec<Val> = infos.iter().map(encode_tool_info).collect();
+            Ok(vec![Val::Result(Ok(Some(Box::new(Val::List(listed)))))])
+        })
+    }
+}
+
+impl HostFunctionHandler for WebAwareInvokeHandler {
+    fn call(
+        &self,
+        ctx: HostCallContext,
+        params: Vec<Val>,
+        _results_len: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
+        let tools = Arc::clone(&self.tools);
+        let emitter = Arc::clone(&self.emitter);
+        let repetition_guard = Arc::clone(&self.repetition_guard);
+        let web_grant = Arc::clone(&self.web_grant);
+        let dispatcher = self.dispatcher.clone();
+        let ev_ctx = event_ctx(&ctx);
+        let agent_id = ctx.agent_id.clone();
+        Box::pin(async move {
+            let decoded = match decode_invoke_params(&params) {
+                Ok(d) => d,
+                Err(err) => {
+                    let (error_type, message) = tool_error_class(&err);
+                    emitter.emit(tool_error_event(&ev_ctx, "", error_type, message));
+                    return Ok(vec![encode_tool_error(&err)]);
+                }
+            };
+            emitter.emit(tool_invoke_event(
+                &ev_ctx,
+                &decoded.tool_id,
+                &decoded.method,
+            ));
+            let sig = ToolCallSignature {
+                tool_id: decoded.tool_id.clone(),
+                method: decoded.method.clone(),
+                params_hash: params_signature_hash(&decoded.params),
+            };
+            if let RepetitionDecision::Terminate(_reason) =
+                repetition_guard.record_tool_call(&ev_ctx.agent_id, sig)
+            {
+                let err = ToolError::InvocationFailed("repetition guard terminated".to_string());
+                let (error_type, message) = tool_error_class(&err);
+                emitter.emit(tool_error_event(
+                    &ev_ctx,
+                    &decoded.tool_id,
+                    error_type,
+                    message,
+                ));
+                return Ok(vec![encode_tool_error(&err)]);
+            }
+            if is_web_tool_id(&decoded.tool_id) {
+                match check_web_grant(web_grant.as_ref(), &agent_id) {
+                    GrantDecision::Deny(_) => {
+                        let err = ToolError::PermissionDenied("web grant denied".into());
+                        let (error_type, message) = tool_error_class(&err);
+                        emitter.emit(tool_error_event(
+                            &ev_ctx,
+                            &decoded.tool_id,
+                            error_type,
+                            message,
+                        ));
+                        return Ok(vec![encode_tool_error(&err)]);
+                    }
+                    GrantDecision::Allow => {
+                        let Some(disp) = dispatcher else {
+                            let err = ToolError::PermissionDenied("web family withheld".into());
+                            let (error_type, message) = tool_error_class(&err);
+                            emitter.emit(tool_error_event(
+                                &ev_ctx,
+                                &decoded.tool_id,
+                                error_type,
+                                message,
+                            ));
+                            return Ok(vec![encode_tool_error(&err)]);
+                        };
+                        let start = Instant::now();
+                        let result = disp
+                            .invoke(
+                                &agent_id,
+                                &decoded.tool_id,
+                                &decoded.method,
+                                &decoded.params,
+                            )
+                            .await;
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        match &result {
+                            Ok(bytes) => emitter.emit(tool_result_event(
+                                &ev_ctx,
+                                &decoded.tool_id,
+                                &decoded.method,
+                                duration_ms,
+                                bytes.len(),
+                            )),
+                            Err(err) => {
+                                let (error_type, message) = tool_error_class(err);
+                                emitter.emit(tool_error_event(
+                                    &ev_ctx,
+                                    &decoded.tool_id,
+                                    error_type,
+                                    message,
+                                ));
+                            }
+                        }
+                        return Ok(vec![encode_invoke_result(result)]);
+                    }
+                }
+            }
+            let start = Instant::now();
+            let result = tools
+                .invoke(&decoded.tool_id, &decoded.method, &decoded.params)
+                .await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+            match &result {
+                Ok(bytes) => emitter.emit(tool_result_event(
+                    &ev_ctx,
+                    &decoded.tool_id,
+                    &decoded.method,
+                    duration_ms,
+                    bytes.len(),
+                )),
+                Err(err) => {
+                    let (error_type, message) = tool_error_class(err);
+                    emitter.emit(tool_error_event(
+                        &ev_ctx,
+                        &decoded.tool_id,
+                        error_type,
+                        message,
+                    ));
+                }
+            }
+            Ok(vec![encode_invoke_result(result)])
+        })
+    }
+}
+
+impl HostFunctionHandler for WebAwareListHandler {
+    fn call(
+        &self,
+        ctx: HostCallContext,
+        _params: Vec<Val>,
+        _results_len: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
+        let tools = Arc::clone(&self.tools);
+        let emitter = Arc::clone(&self.emitter);
+        let web_grant = Arc::clone(&self.web_grant);
+        let dispatcher = self.dispatcher.clone();
+        let ev_ctx = event_ctx(&ctx);
+        let agent_id = ctx.agent_id.clone();
+        Box::pin(async move {
+            const LIST_METHOD: &str = "list-tools";
+            emitter.emit(tool_invoke_event(&ev_ctx, "", LIST_METHOD));
+            let start = Instant::now();
+            let mut infos = tools.list().await;
+            let show_web =
+                dispatcher.is_some() && web_tool_visible(Some(web_grant.as_ref()), &agent_id);
+            if !show_web {
+                infos.retain(|i| !is_web_tool_id(&i.id));
+            }
             let duration_ms = start.elapsed().as_millis() as u64;
             emitter.emit(tool_result_event(
                 &ev_ctx,

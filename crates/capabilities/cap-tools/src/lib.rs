@@ -28,8 +28,9 @@
 //! skeleton — see MODULE-017 §2.7 Core Logic for the scope note.
 
 pub use host_fn::{
-    register_agent_tools, register_agent_tools_with_guard, AgentToolsInvokeHandler,
-    AgentToolsListHandler, MAX_TOOL_PARAMS_BYTES, MAX_TOOL_STRING_PARAM_BYTES,
+    register_agent_tools, register_agent_tools_for_web, register_agent_tools_with_guard,
+    AgentToolsInvokeHandler, AgentToolsListHandler, MAX_TOOL_PARAMS_BYTES,
+    MAX_TOOL_STRING_PARAM_BYTES,
 };
 pub use lazy_registry::{LazyRegistryConfig, LazyToolRegistry};
 pub use registry::{
@@ -49,6 +50,7 @@ pub mod inventory;
 pub mod lazy_registry;
 mod registry;
 pub mod validator;
+pub mod web;
 
 // Slice F — observability emit + runtime JSON-Schema validation gate.
 mod events;

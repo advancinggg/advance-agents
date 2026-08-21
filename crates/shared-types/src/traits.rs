@@ -40,6 +40,7 @@ pub use crate::security_validator::{
     PromptInjectionHelpers, RedirectCheck, SsrfGuard,
 };
 pub use crate::skills::SkillStateReader;
+pub use crate::web_search::SearchProviderSpi;
 
 /// CONTRACT-073 — per-run token + cost budget enforcement.
 ///

@@ -240,6 +240,7 @@ pub(crate) fn activate_progress_lifecycle(
     event_bus: Arc<dyn EventBusEmit>,
     max_action_message_size: usize,
     failpoint: Option<ProgressLifecycleActivationFailpoint>,
+    evidence_ids: Arc<cap_tools::web::EvidenceIdStore>,
 ) -> Result<ProgressLifecycleActivation, ProgressLifecycleActivationError> {
     activate_progress_lifecycle_with_observer(
         staging,
@@ -251,6 +252,7 @@ pub(crate) fn activate_progress_lifecycle(
         max_action_message_size,
         failpoint,
         || {},
+        evidence_ids,
     )
 }
 
@@ -265,6 +267,7 @@ fn activate_progress_lifecycle_with_observer<F>(
     max_action_message_size: usize,
     failpoint: Option<ProgressLifecycleActivationFailpoint>,
     on_joint_publication: F,
+    evidence_ids: Arc<cap_tools::web::EvidenceIdStore>,
 ) -> Result<ProgressLifecycleActivation, ProgressLifecycleActivationError>
 where
     F: FnOnce(),
@@ -462,6 +465,7 @@ where
         ),
         None => StagedRoutedOutboundSink::registry_only(reply_registry),
     };
+    routed_sink.set_evidence_ids(Arc::clone(&evidence_ids));
 
     checkpoint(
         failpoint,
@@ -587,6 +591,7 @@ mod tests {
             move || {
                 published_observer.fetch_add(1, Ordering::SeqCst);
             },
+            Arc::new(cap_tools::web::EvidenceIdStore::new()),
         )
     }
 

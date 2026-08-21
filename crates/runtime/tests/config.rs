@@ -1388,6 +1388,20 @@ mod config_reload_emission {
         assert!(config_sections_changed(&base, &parsed_minimal()).is_empty());
     }
 
+    #[test]
+    fn cfg_01_absent_web_defaults_standard() {
+        // MODULE-017-CFG-01
+        let base = parsed_minimal();
+        assert_eq!(base.web, WebConfig::default());
+        assert_eq!(
+            base.web.mode,
+            advance_shared_types::web_search::WebRunMode::Standard
+        );
+        let mut edit = parsed_minimal();
+        edit.web.mode = advance_shared_types::web_search::WebRunMode::Offline;
+        assert_eq!(config_sections_changed(&base, &edit), vec!["web"]);
+    }
+
     // HR-R2: multi-section edit → both names, deterministic declaration order.
     #[test]
     fn sections_changed_reports_multi_section_edits_in_order() {

@@ -283,6 +283,9 @@ impl LazyToolRegistry {
     /// `load(id)` per the AC-14 invariant.
     pub async fn register_binary(&self, id: impl Into<String>, bytes: Vec<u8>) {
         let id = id.into();
+        if crate::web::is_web_tool_id(&id) {
+            return;
+        }
         let mut inner = self.inner.lock().await;
         inner.registry.insert(
             id.clone(),

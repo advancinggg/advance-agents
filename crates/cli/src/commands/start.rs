@@ -54,7 +54,7 @@ use advance_scheduler::registry::ComponentRegistry;
 use advance_scheduler::trigger_bus::TriggerBusDispatchImpl;
 use advance_scheduler::trigger_source::TriggerFireEvent;
 use advance_scheduler::types::WebhookConfig;
-use advance_shared_types::traits::EventBusEmit;
+use advance_shared_types::traits::{CallableInventoryReader, EventBusEmit};
 use async_trait::async_trait;
 // SAT-B (slice satB-postproc): the live components-backed PostProcessor is
 // chained onto the driver via `AgentLoopDriverImpl::with_post_processor`.
@@ -436,6 +436,10 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
         wiring_handles.skill_turn_runtime.clone(),
         // W24 seam (f): the shared crash-cascade sink attached to the root loop.
         wiring_handles.crash_cascade_sink.clone(),
+        wiring_handles.evidence_ids.clone(),
+        wiring_handles.tool_registry.clone(),
+        wiring_handles.tools_grant_reader.clone(),
+        wiring_handles.web_grant.clone(),
     )
     .await
     {
@@ -856,6 +860,10 @@ async fn try_spawn_agent_loop(
     // W24 seam (f): the shared crash-cascade sink (Some iff messaging+tree wired),
     // attached to the ROOT loop (uniformity — child loops get it inside the manager).
     crash_cascade_sink: Option<Arc<dyn advance_scheduler::hook::CrashCascadeSink>>,
+    evidence_ids: Arc<cap_tools::web::EvidenceIdStore>,
+    tool_registry: Option<Arc<dyn cap_tools::ToolRegistry>>,
+    tools_grant_reader: Option<Arc<dyn advance_shared_types::traits::ToolsGrantReader>>,
+    web_grant: Option<Arc<dyn advance_shared_types::traits::GrantCheck>>,
 ) -> Result<Option<SpawnedAgentLoop>, String> {
     // MODULE-001-AC-20 (024): resolve the canonical materialized name + (if a core
     // module) encode it to a Component on the fly. `None` → no driver deployed → park.
@@ -937,12 +945,17 @@ async fn try_spawn_agent_loop(
     // the reply registry.
     let outbound: Option<Arc<dyn OutboundActionSink>> =
         progress_loop.is_none().then(|| match &channel_rt {
-            Some(cr) => Arc::new(DaemonOutboundSink::with_channel(
-                reply_registry.clone(),
-                ChannelEgress::new(cr.transport.clone(), cr.manager.clone()),
-            )) as Arc<dyn OutboundActionSink>,
-            None => Arc::new(DaemonOutboundSink::registry_only(reply_registry.clone()))
-                as Arc<dyn OutboundActionSink>,
+            Some(cr) => Arc::new(
+                DaemonOutboundSink::with_channel(
+                    reply_registry.clone(),
+                    ChannelEgress::new(cr.transport.clone(), cr.manager.clone()),
+                )
+                .with_evidence_ids(evidence_ids.clone()),
+            ) as Arc<dyn OutboundActionSink>,
+            None => Arc::new(
+                DaemonOutboundSink::registry_only(reply_registry.clone())
+                    .with_evidence_ids(evidence_ids.clone()),
+            ) as Arc<dyn OutboundActionSink>,
         });
     // Phase-2 Step-2: single-in-flight guard, hoisted here (was created inside
     // `spawn_msg_listener`) and SHARED between the listener (which CASes it on
@@ -1115,9 +1128,24 @@ async fn try_spawn_agent_loop(
             )),
             None => Arc::new(crate::context_wiring::EmptyDecomposition),
         };
+        let callable: Arc<dyn CallableInventoryReader> = if let Some(reg) = tool_registry.as_ref() {
+            let listed = cap_tools::ToolRegistry::list(reg.as_ref()).await;
+            let allow = tools_grant_reader
+                .as_ref()
+                .and_then(|r| r.tool_allowlist(&cap_agent_id));
+            let entries = cap_tools::web::project_callable_tool_entries(
+                listed,
+                allow.as_deref(),
+                web_grant.as_deref(),
+                &cap_agent_id,
+            );
+            Arc::new(cap_tools::CallableInventory::new(entries, vec![]))
+        } else {
+            Arc::new(crate::context_wiring::EmptyCallableInventory)
+        };
         let inner = crate::context_wiring::build_context_assembler_for_agent_with_decomposition(
             assembler_bus,
-            Arc::new(crate::context_wiring::EmptyCallableInventory),
+            callable,
             Arc::new(crate::context_wiring::FixedHostFnInventory::new(
                 crate::context_wiring::host_fns_from_registry(
                     &*host.host_registry(),
@@ -1338,6 +1366,10 @@ pub async fn spawn_test_agent_loop(
         handles.skill_turn_runtime.clone(),
         // W24 seam (f): the shared crash-cascade sink attached to the root loop.
         handles.crash_cascade_sink.clone(),
+        handles.evidence_ids.clone(),
+        handles.tool_registry.clone(),
+        handles.tools_grant_reader.clone(),
+        handles.web_grant.clone(),
     )
     .await
     .map(|spawned| spawned.map(|inner| TestServeLoop { inner }))

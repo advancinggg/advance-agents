@@ -157,6 +157,9 @@ pub struct RuntimeConfig {
     /// `lazy-load-timeout-sec: 30`, `max-result-bytes: 16777216`).
     #[serde(default)]
     pub tools: ToolsConfig,
+    /// CONTRACT-240 run-mode + provider knobs. Optional YAML `web:` block.
+    #[serde(default)]
+    pub web: WebConfig,
     /// /dev Phase-2 Step-3 (2026-06-05) — MODULE-016 channel-system config
     /// (the shared `/hooks/{path}` webhook listener + per-channel adapter /
     /// secret / route / user-mappings). `#[serde(default)]` per the `database` /
@@ -420,6 +423,56 @@ fn default_tool_invoke_timeout_sec() -> u64 {
 
 fn default_bring_up_describe_timeout_sec() -> u64 {
     2
+}
+
+/// CONTRACT-240 `web:` runtime-config block.
+///
+/// Hot-reload of `web.mode` does not un-register tools; a mode change requires
+/// process restart. [`config_sections_changed`] still names `"web"` so operators
+/// see the edit. Enterprise `provider-allowlist: []` is deny-all at the
+/// dispatcher (not a YAML parse error).
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct WebConfig {
+    #[serde(default)]
+    pub mode: advance_shared_types::web_search::WebRunMode,
+    #[serde(default = "default_kb_index_cutoff")]
+    pub kb_index_cutoff: String,
+    #[serde(default = "default_web_provider")]
+    pub provider: String,
+    /// Enterprise-only: empty list denies every provider (deny-all).
+    #[serde(default)]
+    pub provider_allowlist: Vec<String>,
+    #[serde(default)]
+    pub pinned_hosts: Vec<String>,
+    #[serde(default = "default_web_tenant")]
+    pub tenant: String,
+    #[serde(default = "default_web_tenant")]
+    pub principal: String,
+}
+
+fn default_kb_index_cutoff() -> String {
+    "local-kb".into()
+}
+fn default_web_provider() -> String {
+    "fixture".into()
+}
+fn default_web_tenant() -> String {
+    "default".into()
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            mode: advance_shared_types::web_search::WebRunMode::Standard,
+            kb_index_cutoff: default_kb_index_cutoff(),
+            provider: default_web_provider(),
+            provider_allowlist: Vec::new(),
+            pinned_hosts: Vec::new(),
+            tenant: default_web_tenant(),
+            principal: default_web_tenant(),
+        }
+    }
 }
 
 impl Default for ToolsConfig {
@@ -1033,6 +1086,7 @@ pub fn config_sections_changed(old: &RuntimeConfig, new: &RuntimeConfig) -> Vec<
         auto_loop_defaults,
         database,
         tools,
+        web,
         channels,
         run_budget,
         security,
@@ -1071,6 +1125,9 @@ pub fn config_sections_changed(old: &RuntimeConfig, new: &RuntimeConfig) -> Vec<
     }
     if tools != &new.tools {
         changed.push("tools");
+    }
+    if web != &new.web {
+        changed.push("web");
     }
     if channels != &new.channels {
         changed.push("channels");

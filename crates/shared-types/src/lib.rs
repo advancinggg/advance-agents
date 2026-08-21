@@ -157,6 +157,7 @@ pub mod skills;
 pub mod test_support;
 pub mod traits;
 pub mod turn_attribution;
+pub mod web_search;
 
 pub use component::ComponentType;
 

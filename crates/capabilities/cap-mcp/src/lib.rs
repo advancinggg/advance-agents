@@ -27,6 +27,7 @@ pub use inventory::{mcp_tool_entries, mcp_tool_entries_from_infos};
 pub use jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use schema_validator::SchemaValidator;
 pub use stdio_transport::StdioMcpTransport;
+pub use web_provider::refuse_stdio_web_provider;
 pub use whitelist::{
     McpServerEntry, McpServersConfig, McpServersConfigBuilder, McpTransportSpec, ToolPattern,
     ToolSchemas,
@@ -40,4 +41,5 @@ mod inventory;
 mod jsonrpc;
 mod schema_validator;
 mod stdio_transport;
+mod web_provider;
 mod whitelist;

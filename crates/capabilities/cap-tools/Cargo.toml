@@ -30,6 +30,7 @@ jsonschema = { workspace = true }
 # (mirrors cap-llm/Cargo.toml precedent).
 chrono = { workspace = true, features = ["clock"] }
 uuid = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
@@ -55,6 +56,9 @@ cap-mcp = { path = "../cap-mcp" }
 cap-skills = { path = "../cap-skills" }
 # tempfile for the e2e's admin-pool + agent-local roots (already workspace-locked).
 tempfile = { workspace = true }
+cap-http = { path = "../cap-http" }
+cap-secrets = { path = "../cap-secrets" }
+zeroize = { workspace = true }
 
 [lints]
 workspace = true

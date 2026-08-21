@@ -18,7 +18,9 @@
 //! occur. The shim is kept only when no channels are configured (local-dev
 //! ingress); its full removal is an ADR 📌-open follow-up.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use cap_tools::web::{strip_unissued_citations, EvidenceIdStore};
 
 use advance_messaging::{
     AgentAction, OutboundActionSink, ProgressRouteDelivery, RoutedOutboundActionSink,
@@ -111,6 +113,7 @@ impl ChannelEgress {
 pub struct DaemonOutboundSink {
     registry: Arc<ReplyRegistry>,
     channel: Option<ChannelEgress>,
+    evidence_ids: Arc<EvidenceIdStore>,
 }
 
 impl DaemonOutboundSink {
@@ -120,6 +123,7 @@ impl DaemonOutboundSink {
         Self {
             registry,
             channel: None,
+            evidence_ids: Arc::new(EvidenceIdStore::new()),
         }
     }
 
@@ -128,7 +132,13 @@ impl DaemonOutboundSink {
         Self {
             registry,
             channel: Some(channel),
+            evidence_ids: Arc::new(EvidenceIdStore::new()),
         }
+    }
+
+    pub fn with_evidence_ids(mut self, ids: Arc<EvidenceIdStore>) -> Self {
+        self.evidence_ids = ids;
+        self
     }
 }
 
@@ -143,11 +153,21 @@ impl OutboundActionSink for DaemonOutboundSink {
         // Channel-sourced inbound (origin present + channel egress wired) → in-host
         // egress through the security chain.
         if let (Some(origin), Some(ch)) = (&source.origin, &self.channel) {
-            return ch.egress(agent_id, origin, actions).await;
+            let stripped: Vec<AgentAction> = actions
+                .iter()
+                .map(|a| {
+                    let mut copy = a.clone();
+                    copy.payload = strip_unissued_citations(&a.payload, &self.evidence_ids);
+                    copy
+                })
+                .collect();
+            return ch.egress(agent_id, origin, &stripped).await;
         }
         // POST /msg path: fulfil the reply registry with the first action's raw
         // payload (or None for an empty batch → HTTP 202).
-        let reply = actions.first().map(|a| a.payload.clone());
+        let reply = actions
+            .first()
+            .map(|a| strip_unissued_citations(&a.payload, &self.evidence_ids));
         self.registry.fulfill(agent_id, reply);
         Ok(DeliveryReport::empty())
     }
@@ -222,6 +242,7 @@ impl RoutedChannelEgress {
 pub struct StagedRoutedOutboundSink {
     registry: Arc<ReplyRegistry>,
     channel: Option<RoutedChannelEgress>,
+    evidence_ids: Mutex<Arc<EvidenceIdStore>>,
 }
 
 impl StagedRoutedOutboundSink {
@@ -229,6 +250,7 @@ impl StagedRoutedOutboundSink {
         Arc::new(Self {
             registry,
             channel: None,
+            evidence_ids: Mutex::new(Arc::new(EvidenceIdStore::new())),
         })
     }
 
@@ -245,7 +267,34 @@ impl StagedRoutedOutboundSink {
                 typed,
                 routes,
             }),
+            evidence_ids: Mutex::new(Arc::new(EvidenceIdStore::new())),
         })
+    }
+
+    pub fn set_evidence_ids(&self, ids: Arc<EvidenceIdStore>) {
+        *self.evidence_ids.lock().unwrap_or_else(|p| p.into_inner()) = ids;
+    }
+
+    fn strip_message(&self, message: &RoutedOutboundMessage) -> RoutedOutboundMessage {
+        let ids = self
+            .evidence_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let mut copy = message.clone();
+        copy.body = strip_unissued_citations(&message.body, &ids);
+        copy.metadata = message
+            .metadata
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    String::from_utf8_lossy(&strip_unissued_citations(v.as_bytes(), &ids))
+                        .into_owned(),
+                )
+            })
+            .collect();
+        copy
     }
 }
 
@@ -268,9 +317,10 @@ impl RoutedOutboundActionSink for StagedRoutedOutboundSink {
         if !has_progress {
             // Preserve the legacy sink's established first-action semantics.
             let first = &messages[0];
+            let first = self.strip_message(first);
             return match (&first.route, &self.channel) {
                 (OutboundRoute::Channel { .. }, Some(channel)) => {
-                    channel.deliver_legacy(agent_id, first).await
+                    channel.deliver_legacy(agent_id, &first).await
                 }
                 (OutboundRoute::Channel { .. }, None) => Err(DispatchError::TargetNotFound(
                     "channel egress unavailable".into(),
@@ -296,9 +346,12 @@ impl RoutedOutboundActionSink for StagedRoutedOutboundSink {
 
         let mut report = DeliveryReport::empty();
         for message in messages {
+            let message = self.strip_message(message);
             let delivered = match message.encoding {
-                OutboundEncoding::LegacyRaw => channel.deliver_legacy(agent_id, message).await?,
-                OutboundEncoding::ProgressV1 => channel.deliver_progress(agent_id, message).await?,
+                OutboundEncoding::LegacyRaw => channel.deliver_legacy(agent_id, &message).await?,
+                OutboundEncoding::ProgressV1 => {
+                    channel.deliver_progress(agent_id, &message).await?
+                }
             };
             report.outcomes.extend(delivered.outcomes);
         }
@@ -495,6 +548,34 @@ mod tests {
             0,
             "no action → no outbound egress"
         );
+    }
+
+    #[tokio::test]
+    async fn t103_render_strips_unissued_citations_on_registry_fulfill() {
+        // MODULE-017-T103-render
+        let store = Arc::new(EvidenceIdStore::new());
+        let good = store.mint();
+        let registry = Arc::new(ReplyRegistry::new());
+        let rx = registry.register("agent:default");
+        let sink = DaemonOutboundSink::registry_only(registry).with_evidence_ids(store);
+        let msg = Message {
+            id: "m".into(),
+            kind: MessageKind::User,
+            from: "user:http".into(),
+            to: "agent:default".into(),
+            payload: vec![],
+            context: None,
+            timestamp: std::time::SystemTime::now(),
+            origin: None,
+        };
+        let payload = format!("cite {good} and ev_ffffffffffff").into_bytes();
+        sink.deliver("agent:default", &msg, &[AgentAction { payload }])
+            .await
+            .unwrap();
+        let body = rx.await.unwrap().expect("fulfilled");
+        let s = String::from_utf8_lossy(&body);
+        assert!(s.contains(&good));
+        assert!(!s.contains("ev_ffffffffffff"));
     }
 
     #[tokio::test]

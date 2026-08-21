@@ -1313,11 +1313,14 @@ dependencies = [
  "advance-runtime",
  "advance-shared-types",
  "async-trait",
+ "cap-http",
  "cap-mcp",
+ "cap-secrets",
  "cap-skills",
  "chrono",
  "jsonschema",
  "lru",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "tempfile",
@@ -1330,6 +1333,7 @@ dependencies = [
  "wat",
  "wit-component",
  "wit-parser",
+ "zeroize",
 ]
 
 [[package]]

@@ -97,6 +97,10 @@ fn traits_are_object_safe() {
     // Wave-23 (RememberContentPolicy).
     assert_send_sync::<Box<dyn RememberContentPolicy>>();
 
+    // CONTRACT-240 Search Provider SPI.
+    let _search_provider: fn(Box<dyn SearchProviderSpi>) = |_| {};
+    assert_send_sync::<Box<dyn SearchProviderSpi>>();
+
     // CONTRACT-236 / CONTRACT-238 (local-endpoint-s1). Ports are Send+Sync;
     // stream traits are Send-only (HttpBodyStream precedent — do not
     // assert_send_sync on InferenceStream / LocalBodyStream).
