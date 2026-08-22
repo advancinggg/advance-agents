@@ -1,0 +1,20 @@
+# Nested clippy.toml does NOT merge with this file. If a crate grows a nested
+# clippy.toml, copy this `disallowed-methods` table into it.
+# Product (along) does not inherit this file via the git-dep façade; copying
+# it is a separate along pass, not this lane.
+#
+# allow-invalid = true is REQUIRED on rustc 1.91: clippy errors when a path
+# does not resolve in the crate under lint. These methods live in optional
+# deps (futures executor feature, tokio rt). The flag is defense-in-depth
+# for loaded-crate + missing item; it does not mean typos are fine. Public
+# paths below are the documented API names.
+#
+# Runtime::block_on on an *owned* runtime is the blessed CLI sync entry
+# (crates/cli/src/commands/start.rs). Handle::block_on on a worker panics.
+# client-api transport.rs runs handle() under spawn_blocking so adapter-owned
+# runtimes stay legal.
+disallowed-methods = [
+    { path = "futures::executor::block_on", reason = "blocks the caller; use structured async or spawn_blocking. CLI sync entry uses an owned tokio::runtime::Runtime::block_on, never this executor.", allow-invalid = true },
+    { path = "futures_executor::block_on", reason = "same ban as futures::executor::block_on (the futures crate re-exports this).", allow-invalid = true },
+    { path = "tokio::runtime::Handle::block_on", reason = "Handle::block_on on a worker panics (nested runtime). Blessed: spawn_blocking, or an owned Runtime::block_on on a dedicated thread (cli start.rs). client-api transport.rs runs handle() under spawn_blocking so adapter-owned runtimes stay legal.", allow-invalid = true },
+]

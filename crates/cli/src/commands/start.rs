@@ -204,6 +204,17 @@ fn safe_path(p: &Path) -> String {
 
 /// Sync entry point invoked from `main.rs`. Builds a current-thread Tokio
 /// runtime and drives `run_async`.
+///
+/// Incident (grok-housekeeping clippy stage 1): blessed CLI sync entry.
+/// This uses an *owned* `tokio::runtime::Runtime::block_on`, never
+/// `Handle::block_on` (nested-runtime panic) and never
+/// `futures::executor::block_on`. Root `clippy.toml` bans those two
+/// paths. `Runtime::block_on` itself is not banned; the allow documents
+/// the named site from DEV-TASK / Item 5.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "blessed CLI sync entry: owned Runtime::block_on, not Handle::block_on or futures::executor::block_on"
+)]
 pub fn run(workspace: Option<PathBuf>) -> ExitCode {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()

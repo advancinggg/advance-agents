@@ -9,12 +9,9 @@
 //!
 //! Pure, additive, zero new dependencies.
 //!
-//! **Token estimate (documented duplicate)**: the cap is enforced with a local
-//! `chars/4` byte-length estimate — `(len + 3) / 4`, byte-identical to the
-//! workspace rule (`advance_context_engine::assembler::chars_to_tokens`, which
-//! is `pub(crate)` and unreachable from cap-skills). The same local-duplicate
-//! rationale as cap-tools `schema_guard` (MODULE-017 §3.6 (mm)): cross-crate
-//! reuse would need a shared crate or a `pub` promotion, both out of scope.
+//! **Token estimate**: the cap is enforced with the shared
+//! `advance_shared_types::token_estimate` ceil — `(len + 3) / 4`,
+//! byte-identical to `advance_context_engine::assembler::chars_to_tokens`.
 
 /// Maximum tokens for an L0 skill summary (AC-27: "first-paragraph, ≤ 100
 /// tokens each").
@@ -134,10 +131,9 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Local `chars/4` byte-length token estimate, byte-identical to the workspace
-/// `chars_to_tokens` rule (`(len + 3) / 4`).
+/// Shared `chars/4` byte-length token estimate (`(len + 3) / 4`).
 fn approx_tokens(byte_len: usize) -> usize {
-    byte_len.saturating_add(3) / 4
+    advance_shared_types::token_estimate::tokens_from_bytes(byte_len)
 }
 
 /// Truncate `s` so its token estimate is ≤ `max_tokens`. Prefers a trailing

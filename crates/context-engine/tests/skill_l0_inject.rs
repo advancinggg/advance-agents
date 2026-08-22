@@ -17,6 +17,7 @@ use advance_context_engine::{
     SkillSummaryReader, SKILL_BUDGET_TOKENS_DEFAULT,
 };
 use advance_shared_types::context::{AssemblyContext, ContextAssembler, LlmMessage};
+use advance_shared_types::token_estimate::tokens_from_bytes;
 use async_trait::async_trait;
 
 #[path = "common/mod.rs"]
@@ -73,7 +74,7 @@ fn ctx_for_model(model: &str) -> AssemblyContext {
 
 /// Workspace `chars/4` byte-length token estimate (matches the assembler).
 fn approx_tokens(byte_len: usize) -> usize {
-    (byte_len + 3) / 4
+    tokens_from_bytes(byte_len)
 }
 
 fn skills_section(messages: &[LlmMessage]) -> Option<String> {

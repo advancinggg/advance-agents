@@ -3,11 +3,12 @@
 //! L0 progressive-skill injection). White-box helper tests live inline in
 //! `src/summary.rs`.
 
+use advance_shared_types::token_estimate::tokens_from_bytes;
 use cap_skills::{extract_skill_summary, MAX_SKILL_SUMMARY_TOKENS};
 
-/// Mirror of the crate's `chars/4` token estimate for the budget assertion.
+/// Shared `chars/4` token estimate for the budget assertion.
 fn approx_tokens(byte_len: usize) -> usize {
-    byte_len.saturating_add(3) / 4
+    tokens_from_bytes(byte_len)
 }
 
 #[test]

@@ -4,10 +4,11 @@
 use advance_context_engine::{
     build_knowledge_map_section, KnowledgeMap, KnowledgeTopic, TaskSynthesis,
 };
+use advance_shared_types::token_estimate::tokens_from_bytes;
 
 /// `chars/4` rule-of-thumb (same as the crate's `chars_to_tokens`).
 fn est_tokens(s: &str) -> usize {
-    s.len().div_ceil(4)
+    tokens_from_bytes(s.len())
 }
 
 fn topic(name: &str, body: &str) -> KnowledgeTopic {

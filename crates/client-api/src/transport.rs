@@ -230,6 +230,16 @@ async fn http_client_request(
     handle_http(state, peer.ip(), format!("/client/{path}"), request).await
 }
 
+/// Incident (grok-housekeeping clippy stage 1): blessed client-api
+/// transport site. `handle()` is sync; provider adapters may
+/// `Runtime::block_on` internally, so this runs `handle()` on
+/// `spawn_blocking` rather than `Handle::block_on` on the async
+/// worker (nested-runtime panic). Root `clippy.toml` bans
+/// `Handle::block_on` and `futures::executor::block_on`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "blessed transport: spawn_blocking around sync handle(); never Handle::block_on on the async worker"
+)]
 async fn event_stream_transport(
     State(state): State<TransportState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -300,6 +310,14 @@ async fn event_stream_transport(
         })
 }
 
+/// Incident (grok-housekeeping clippy stage 1): blessed client-api
+/// HTTP transport site. Same spawn_blocking rule as
+/// [`event_stream_transport`] — never `Handle::block_on` on this
+/// async worker.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "blessed transport: spawn_blocking around sync handle(); never Handle::block_on on the async worker"
+)]
 async fn handle_http(
     state: TransportState,
     peer_ip: IpAddr,

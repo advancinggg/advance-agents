@@ -148,6 +148,7 @@ pub mod outbound;
 pub mod producer_boundary;
 pub mod progress_card;
 pub mod progress_lifecycle_recovery;
+pub mod release_build_shape;
 pub mod repetition;
 pub mod run;
 pub mod security_validator;
@@ -155,6 +156,7 @@ pub mod sensitive_observation;
 pub mod skills;
 #[cfg(feature = "test-support")]
 pub mod test_support;
+pub mod token_estimate;
 pub mod traits;
 pub mod turn_attribution;
 pub mod web_search;

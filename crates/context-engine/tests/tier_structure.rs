@@ -4,6 +4,7 @@
 mod common;
 
 use advance_shared_types::context::ContextAssembler;
+use advance_shared_types::token_estimate::tokens_from_bytes;
 use common::*;
 
 #[tokio::test]
@@ -82,7 +83,7 @@ async fn tier_counts_include_cache_breakpoint_marker_tokens() {
         .iter()
         .map(|m| m.role.len() + m.content.len())
         .sum();
-    let expected = ((total_bytes + 3) / 4) as u32;
+    let expected = tokens_from_bytes(total_bytes) as u32;
     let actual: u32 = tc.tier1a + tc.tier1b + tc.tier2 + tc.tier3;
     // The per-tier division can lose 1 token per tier due to integer math,
     // so the sum can be slightly less than the global computation. Assert

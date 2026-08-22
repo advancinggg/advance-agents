@@ -687,10 +687,11 @@ fn approx_tokens_str(role: &str, content: &str) -> u32 {
 
 /// `pub(crate)` so `crate::knowledge_map` shares the single token-estimate
 /// rule (avoids a divergent `chars/4` copy that could desync the Tier-1b cap
-/// math from this Tier-token accounting). Body byte-identical to Slice A.
+/// math from this Tier-token accounting). Body is the shared leaf
+/// (`advance_shared_types::token_estimate::tokens_from_bytes_u32`),
+/// byte-identical to Slice A.
 pub(crate) fn chars_to_tokens(chars: usize) -> u32 {
-    let approx = chars.saturating_add(3) / 4;
-    approx.min(u32::MAX as usize) as u32
+    advance_shared_types::token_estimate::tokens_from_bytes_u32(chars)
 }
 
 /// Stage-C SAT-E: the §1.4.3 ⑭ render bound for L5 "Related Task Briefs"
