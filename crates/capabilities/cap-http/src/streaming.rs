@@ -80,15 +80,16 @@
 //!   The executor seam rules are specializations of that precondition. No
 //!   detached cleanup worker, thread, or queue is created.
 //!
-//! Residual (deliberate, MODULE-012 §3.8): the viability feed applies NFKC
-//! per source char, so cross-char composition (base + combining mark) can
-//! diverge from the whole-string canonicalization the detector uses. Since
-//! audit round 5 that divergence is CONTAINED rather than merely accepted: a
-//! completed match on the per-char feed holds (and fail-closes at EOF) even
-//! when the whole-string scan reports Clean, so the divergence can delay or
-//! fail-close a stream but cannot release credential bytes. A first-letter
-//! whose raw encoding splits across a chunk boundary is withheld via the
-//! trailing-incomplete-sequence rule rather than canonicalized early.
+//! Residual: the viability feed still applies NFKC per source char. Mn/Me/Cf
+//! and the historical invisible set are dropped by the same
+//! `is_dropped_from_scan_derivative` predicate the detector uses
+//! (MODULE-012-AC-24), so a spliced combining mark no longer splits the two
+//! paths. Remaining per-char vs whole-string NFKC disagreement is Hangul jamo
+//! / Mc composition, not the leak-anchor splice. A completed match that then
+//! dies on a **non-dropped** killer byte is still held (`Matched`-before-`Dead`).
+//! A first-letter whose raw encoding splits across a chunk boundary is
+//! withheld via the trailing-incomplete-sequence rule rather than
+//! canonicalized early.
 
 use crate::executor::{DefaultRedirectCheck, ExecutorError, WireChunkStream};
 use crate::leak_detector::DefaultLeakDetector;
@@ -341,22 +342,15 @@ fn baseline_head_detector() -> &'static DefaultLeakDetector {
 /// Canonical viability feed with a raw-offset map (audit round 1: viability
 /// walked RAW bytes, so invisible-codepoint interleaving or NFKC-variant
 /// lettering inside a forming credential defeated the hold). Per SOURCE char:
-/// strip `is_invisible` chars, then NFKC-normalize that single char — the
-/// same strip + NFKC pipeline as `canonical_scan_text`, applied char-locally
+/// skip `is_dropped_from_scan_derivative` (Mn/Me/Cf ∪ historical invisibles),
+/// NFKC-normalize that single char, skip dropped NFKC output — the same
+/// drop → NFKC → drop pipeline as `canonical_scan_text`, applied char-locally
 /// so every canonical byte can be traced to the raw offset of its source char.
 ///
-/// **Do NOT restore the old rationale here** (audit round 6). This comment used
-/// to argue that divergence from whole-string NFKC "only produces non-ASCII
-/// output our ASCII-shaped patterns never match — and any divergence errs
-/// toward HOLDING, never toward emitting." A shipped exploit falsified BOTH
-/// clauses from this very function's output: for `a` + U+0301 the per-char feed
-/// keeps the ASCII `a` (which the hold DFA matched, then died on the mark's
-/// lead byte), while it was the WHOLE-STRING side that produced non-ASCII `á`
-/// and hid the credential from the detector — so the divergence erred toward
-/// EMITTING. What makes it safe now is mechanical, not argumentative: the
-/// `Matched`-before-`Dead` ordering in `viable_from` plus the EOF fail-close in
-/// `next_chunk`. Relaxing either re-opens the leak; this note exists so the
-/// disproved argument is not cited to justify doing so.
+/// MODULE-012-AC-24: spliced Mn/Me/Cf no longer reach this feed, so the old
+/// `a` + U+0301 detector-Clean / per-char-`a`-then-dead split is gone. The
+/// `Matched`-before-`Dead` ordering in `viable_from` plus the EOF fail-close
+/// in `next_chunk` remain load-bearing for **non-dropped** killer bytes.
 ///
 /// Returns `(canonical bytes, map canonical-byte-index → raw byte offset of
 /// its source char, raw offset of a trailing INCOMPLETE UTF-8 sequence)`.
@@ -367,11 +361,14 @@ fn baseline_head_detector() -> &'static DefaultLeakDetector {
 /// withholds those raw bytes until the next chunk completes the char.
 pub fn canonical_len_with_limit(buf: &[u8], max_canonical_bytes: usize) -> Result<usize, ()> {
     fn add_char(c: char, total: &mut usize, max_canonical_bytes: usize) -> Result<(), ()> {
-        if crate::invisible::is_invisible(c) {
+        if crate::invisible::is_dropped_from_scan_derivative(c) {
             return Ok(());
         }
         use unicode_normalization::UnicodeNormalization;
         for nc in std::iter::once(c).nfkc() {
+            if crate::invisible::is_dropped_from_scan_derivative(nc) {
+                continue;
+            }
             *total = (*total).checked_add(nc.len_utf8()).ok_or(())?;
             if *total > max_canonical_bytes {
                 return Err(());
@@ -433,11 +430,14 @@ pub fn canonical_map_with_limit(
         canon: &mut Vec<u8>,
         map: &mut Vec<usize>,
     ) -> Result<(), ()> {
-        if crate::invisible::is_invisible(c) {
+        if crate::invisible::is_dropped_from_scan_derivative(c) {
             return Ok(());
         }
         use unicode_normalization::UnicodeNormalization;
         for nc in std::iter::once(c).nfkc() {
+            if crate::invisible::is_dropped_from_scan_derivative(nc) {
+                continue;
+            }
             let mut b = [0u8; 4];
             let encoded = nc.encode_utf8(&mut b).as_bytes();
             let next_len = canon.len().checked_add(encoded.len()).ok_or(())?;
@@ -519,16 +519,11 @@ enum Viability {
 /// **Audit round 5 (Critical)**: the match check MUST precede the dead check.
 /// A DFA that completes a match and is then killed by a non-class byte passes
 /// THROUGH a match state on its way to dead; the previous code observed only
-/// the dead state and reported `Dead`, so the hold released the bytes. That was
-/// exploitable whenever the detector's WHOLE-STRING canonicalization disagreed
-/// with this per-char feed — e.g. `Bearer eyJ` + `a` + U+0301: whole-string NFKC
-/// composes `a`+U+0301 into `á`, so `bearer_token`'s `[A-Za-z0-9_-]+` does not
-/// match and the scan returns Clean, while this feed keeps the ASCII `a` (match)
-/// and then dies on the combining mark's lead byte. The whole chunk — including
-/// the rest of a verbatim JWT — was emitted. Treating "matched" as hold-worthy
-/// makes the hold a SELF-CONTAINED guard that no longer delegates its
-/// correctness to the detector agreeing with us (see also the injected-detector
-/// note on `hold_matchers`).
+/// the dead state and reported `Dead`, so the hold released the bytes.
+/// MODULE-012-AC-24 drops Mn/Me/Cf before this walk, so U+0301 is no longer a
+/// killer. The pin is a **non-dropped** class miss (e.g. `!` after `Bearer eyJabc`).
+/// Treating "matched" as hold-worthy keeps the hold a SELF-CONTAINED guard
+/// (see also the injected-detector note on `hold_matchers`).
 fn viable_from(dfa: &dense::DFA<Vec<u32>>, hay: &[u8], budget: &mut usize) -> Option<Viability> {
     let input = Input::new(hay).anchored(Anchored::Yes);
     let mut state = match dfa.start_state_forward(&input) {
@@ -2785,15 +2780,12 @@ mod tests {
 
     /// AUDIT ROUND 5 (Critical regression pin) — a COMPLETED match that the
     /// DFA then walks out of must report `Matched` (⇒ hold), never `Dead`
-    /// (⇒ emit). The exploit: the per-char canonical feed keeps `a` + U+0301
-    /// separate, so the bearer DFA matches `eyJa` and then dies on the
-    /// combining mark's lead byte — while the DETECTOR's whole-string NFKC
-    /// composes them into `á`, so its `[A-Za-z0-9_-]+` never matches and the
-    /// scan returns Clean. Before the fix `hold_split_point` released the
-    /// whole chunk, JWT and all.
+    /// (⇒ emit). MODULE-012-AC-24 drops Mn, so U+0301 is no longer a DFA killer;
+    /// the pin is a non-dropped class miss (`!`). Keep a non-match prefix so
+    /// the split is not 0.
     #[test]
     fn t29e_completed_match_then_dead_is_held_not_emitted() {
-        let exploit = "data: Bearer eyJa\u{0301}hbGciOiJIUzI1NiJ9.payload.sig";
+        let exploit = "data: Bearer eyJabc!";
         let (split, saw_match) = split_and_match(exploit.as_bytes());
         assert!(
             saw_match,
@@ -2804,17 +2796,7 @@ mod tests {
             "everything from `Bearer` on must be HELD, not emitted (got split {split})"
         );
 
-        // The detector genuinely does NOT flag it — this is what made the old
-        // `Dead` classification a leak rather than a redundancy.
-        let detector = crate::leak_detector::DefaultLeakDetector::new();
-        let verdict = LeakDetector::scan(&detector, exploit, ScanContext::HttpInbound);
-        assert!(
-            matches!(verdict, ScanResult::Clean | ScanResult::Warned { .. }),
-            "fixture premise: whole-string NFKC hides this from the detector, got {verdict:?}"
-        );
-
-        // Same shape against the other Redact row.
-        let basic = "Authorization: Basic QUJD\u{0301}REVGRw==";
+        let basic = "Authorization: Basic QUJDREVGRw==!";
         let (bsplit, bmatch) = split_and_match(basic.as_bytes());
         assert!(bmatch, "auth_header_basic completed match must be Matched");
         assert_eq!(bsplit, 0, "held from the `Authorization:` literal");

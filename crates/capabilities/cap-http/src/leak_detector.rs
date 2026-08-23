@@ -414,4 +414,61 @@ mod tests {
         );
         assert_eq!(sanitize_header_field("中文\r\n中文"), "中文  中文");
     }
+
+    #[test]
+    fn t32_u3_u4_buffered_scan_all_block_redact_rows() {
+        use crate::invisible::{canonical_scan_text, t32_spliced_samples};
+        use crate::patterns::LEAK_PATTERNS;
+        use advance_shared_types::security_validator::{
+            Action, LeakDetector, ScanContext, ScanResult,
+        };
+
+        let det = super::DefaultLeakDetector::new();
+        let rows: Vec<_> = LEAK_PATTERNS
+            .iter()
+            .filter(|p| matches!(p.action, Action::Block | Action::Redact))
+            .collect();
+        assert_eq!(rows.len(), 7);
+        for (name, sample) in t32_spliced_samples() {
+            let input = format!("pre {sample}");
+            let before = input.clone();
+            let spec = rows.iter().find(|p| p.name == name).expect("live row");
+            let verdict = det.scan(&input, ScanContext::HttpOutbound);
+            assert_eq!(input, before, "{name}: scan must not mutate caller input");
+            let findings = match &verdict {
+                ScanResult::Blocked { findings } | ScanResult::Redacted { findings, .. } => {
+                    findings
+                }
+                other => panic!("{name}: expected Block/Redact, got {other:?}"),
+            };
+            assert!(
+                findings.iter().any(|f| f.pattern_name == name),
+                "{name}: missing pattern_name in {findings:?}"
+            );
+            let finding = findings.iter().find(|f| f.pattern_name == name).unwrap();
+            let deriv = canonical_scan_text(&input);
+            let re = regex::Regex::new(spec.regex).unwrap();
+            let m = re.find(&deriv).expect("derivative match");
+            assert_eq!(
+                finding.offset,
+                m.start(),
+                "{name}: offset is derivative-space"
+            );
+            assert_eq!(
+                finding.length,
+                m.end() - m.start(),
+                "{name}: length is derivative-space"
+            );
+            if matches!(spec.action, Action::Redact) {
+                let ScanResult::Redacted { redacted, .. } = &verdict else {
+                    panic!("{name}: Redact row must yield Redacted");
+                };
+                assert!(redacted.contains("[REDACTED]"), "{name}: {redacted:?}");
+                assert!(
+                    !redacted.contains("eyJhbGci") && !redacted.contains("QUJDREVGRw"),
+                    "{name}: secret payload survived in {redacted:?}"
+                );
+            }
+        }
+    }
 }

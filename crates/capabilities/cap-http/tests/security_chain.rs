@@ -1587,12 +1587,9 @@ async fn t27_emit_heavy_invisible_drip_feed_scan_budget_fails_closed() {
     }
 }
 
-/// AUDIT ROUND 5 (Critical, end-to-end): a credential whose completed match the
-/// DETECTOR misses (whole-string NFKC composes `a` + U+0301 into `á`, so
-/// `bearer_token`'s `[A-Za-z0-9_-]+` never matches) must still never reach the
-/// consumer — the per-chunk viability hold now reports `Matched` and holds,
-/// and EOF fail-closes instead of flushing. Before the fix the entire chunk,
-/// JWT and all, was emitted.
+/// MODULE-012-AC-24: after mark-drop the detector Redacts `Bearer eyJa` + U+0301
+/// (the old detector-Clean premise is gone). No credential bytes may emit;
+/// the terminal is leak-block (bearer_token or Redact→Block).
 #[tokio::test]
 async fn t27_detector_blind_completed_match_never_emitted() {
     let payload = "data: Bearer eyJa\u{0301}hbGciOiJIUzI1NiJ9.body.signature";
@@ -1614,16 +1611,14 @@ async fn t27_detector_blind_completed_match_never_emitted() {
         "credential payload must never be emitted, got {seen:?}"
     );
     assert!(
-        !seen.contains("Bearer"),
-        "the held region starts at the `Bearer` literal, got {seen:?}"
+        !seen.contains("eyJa"),
+        "spliced JWT fragment must never be emitted, got {seen:?}"
     );
-    match err.expect("a detector-blind completed match must fail CLOSED at EOF") {
+    match err.expect("spliced bearer must fail CLOSED") {
         HttpError::InboundLeakBlocked(findings) => {
             assert!(
-                findings
-                    .iter()
-                    .any(|f| f.pattern_name == "stream_hold_unresolved_match"),
-                "expected the synthetic stream_hold_unresolved_match Block, got {findings:?}"
+                !findings.is_empty(),
+                "expected a leak-block finding, got {findings:?}"
             );
         }
         other => panic!("expected InboundLeakBlocked, got {other:?}"),
@@ -1722,6 +1717,162 @@ impl advance_shared_types::security_validator::LeakDetector for BlindDetector {
     ) -> advance_shared_types::security_validator::ScanResult {
         advance_shared_types::security_validator::ScanResult::Clean
     }
+}
+
+/// T32 spliced samples (duplicated from crate-local `t32_spliced_samples`;
+/// integration tests cannot see `pub(crate)`). One payload per Block/Redact row.
+fn t32_spliced_payloads() -> Vec<(&'static str, String)> {
+    let openai_body = "A".repeat(20);
+    let anthropic_body = "a".repeat(90);
+    let github_body = "abcdefghijklmnopqrstuvwxyz0123456789AB";
+    vec![
+        (
+            "bearer_token",
+            "B\u{0301}earer eyJhbGciOiJIUzI1NiJ9".to_string(),
+        ),
+        ("openai_api_key", format!("sk\u{20DD}-proj-{openai_body}")),
+        (
+            "anthropic_api_key",
+            format!("sk-ant\u{FFF9}-api{anthropic_body}"),
+        ),
+        ("aws_access_key", "A\u{0600}KIA0123456789ABCDEF".to_string()),
+        ("github_token", format!("g\u{0301}hp_{github_body}")),
+        (
+            "pem_private_key",
+            "-----BE\u{20DD}GIN PRIVATE KEY-----".to_string(),
+        ),
+        (
+            "auth_header_basic",
+            "Author\u{FFF9}ization: Basic QUJDREVGRw==".to_string(),
+        ),
+    ]
+}
+
+fn t32_secret_needles() -> &'static [&'static str] {
+    &[
+        "eyJhbGciOiJIUzI1NiJ9",
+        "sk-proj-",
+        "sk-ant-api",
+        "AKIA0123456789ABCDEF",
+        "ghp_abcdefghijklmnopqrstuvwxyz0123456789AB",
+        "BEGIN PRIVATE KEY",
+        "QUJDREVGRw==",
+    ]
+}
+
+fn t32_assert_no_secret(emitted: &[u8], label: &str) {
+    let seen = String::from_utf8_lossy(emitted);
+    for needle in t32_secret_needles() {
+        assert!(
+            !seen.contains(needle),
+            "{label}: secret {needle:?} leaked in {seen:?}"
+        );
+    }
+}
+
+async fn t32_drain_stream(chain: DefaultHttpSecurityChain) -> (Vec<u8>, Option<HttpError>) {
+    let cap = cap_with_allowlist(&["api.example.com"]);
+    let (_head, mut body) = chain
+        .execute_streaming("agent-1", get_req(), &cap)
+        .await
+        .unwrap();
+    drain(&mut body).await
+}
+
+#[tokio::test]
+async fn t32_i1a_real_detector_each_spliced_row() {
+    for (name, payload) in t32_spliced_payloads() {
+        let exec = Arc::new(MockHttpExecutor::new().with_stream(
+            "https://api.example.com/",
+            stream_head(),
+            vec![payload.as_bytes().to_vec()],
+        ));
+        let chain = build_streaming_chain(exec, Arc::new(TraceCollector::new()));
+        let (emitted, err) = t32_drain_stream(chain).await;
+        t32_assert_no_secret(&emitted, &format!("I1a {name}"));
+        match err.unwrap_or_else(|| panic!("I1a {name} must fail CLOSED")) {
+            HttpError::InboundLeakBlocked(_) => {}
+            other => panic!("I1a {name}: expected InboundLeakBlocked, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn t32_i1b_blind_detector_each_spliced_row() {
+    for (name, payload) in t32_spliced_payloads() {
+        let exec = Arc::new(MockHttpExecutor::new().with_stream(
+            "https://api.example.com/",
+            stream_head(),
+            vec![payload.as_bytes().to_vec()],
+        ));
+        let chain = build_blind_detector_chain(exec);
+        let (emitted, err) = t32_drain_stream(chain).await;
+        t32_assert_no_secret(&emitted, &format!("I1b {name}"));
+        match err.unwrap_or_else(|| panic!("I1b {name} must fail CLOSED")) {
+            HttpError::InboundLeakBlocked(findings) => {
+                assert!(
+                    findings
+                        .iter()
+                        .any(|f| f.pattern_name == "stream_hold_unresolved_match"
+                            || f.pattern_name == name),
+                    "I1b {name}: unexpected findings {findings:?}"
+                );
+            }
+            other => panic!("I1b {name}: expected InboundLeakBlocked, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn t32_i1c_blind_detector_chunk_split_bearer() {
+    let chunk1 = "B\u{0301}ear".as_bytes().to_vec();
+    let chunk2 = b"er eyJhbGciOiJIUzI1NiJ9".to_vec();
+    let exec = Arc::new(MockHttpExecutor::new().with_stream(
+        "https://api.example.com/",
+        stream_head(),
+        vec![chunk1, chunk2],
+    ));
+    let chain = build_blind_detector_chain(exec);
+    let (emitted, err) = t32_drain_stream(chain).await;
+    t32_assert_no_secret(&emitted, "I1c");
+    assert!(
+        !String::from_utf8_lossy(&emitted).contains("Bearer"),
+        "I1c: partial Bearer must not emit, got {:?}",
+        String::from_utf8_lossy(&emitted)
+    );
+    err.expect("I1c must fail CLOSED");
+}
+
+#[tokio::test]
+async fn t32_i1d_blind_detector_ff9e_post_nfkc() {
+    let payload = "B\u{FF9E}earer eyJhbGciOiJIUzI1NiJ9";
+    let exec = Arc::new(MockHttpExecutor::new().with_stream(
+        "https://api.example.com/",
+        stream_head(),
+        vec![payload.as_bytes().to_vec()],
+    ));
+    let chain = build_blind_detector_chain(exec);
+    let (emitted, err) = t32_drain_stream(chain).await;
+    t32_assert_no_secret(&emitted, "I1d");
+    err.expect("I1d must fail CLOSED");
+}
+
+#[tokio::test]
+async fn t32_i2_clean_marks_outside_anchors_pass_through() {
+    let payload = "hello\u{0301} world \u{0600} café";
+    let exec = Arc::new(MockHttpExecutor::new().with_stream(
+        "https://api.example.com/",
+        stream_head(),
+        vec![payload.as_bytes().to_vec()],
+    ));
+    let chain = build_streaming_chain(exec, Arc::new(TraceCollector::new()));
+    let (emitted, err) = t32_drain_stream(chain).await;
+    assert!(err.is_none(), "I2 must not fail-close, got {err:?}");
+    assert_eq!(
+        emitted,
+        payload.as_bytes(),
+        "I2: released bytes must equal wire"
+    );
 }
 
 fn build_blind_detector_chain(exec: Arc<MockHttpExecutor>) -> DefaultHttpSecurityChain {

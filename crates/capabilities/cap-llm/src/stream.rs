@@ -4380,18 +4380,26 @@ mod tests {
         );
     }
 
-    /// NFKC-composition shape (cap-http streaming.rs:519-531): "Bearer eyJa" +
-    /// combining acute — the whole-string verdict may compose the tail, but the
-    /// per-char candidate rule must fail closed at terminal.
+    /// MODULE-012-AC-24: `Bearer eyJa` + U+0301 is a detector Redact after
+    /// mark-drop. Security property is no credential bytes in the guest-visible
+    /// concat of push+finish (loosening only `finish` would miss a leaking push).
     #[test]
     fn decoded_nfkc_composition_eof_fails_closed() {
         let det = real_detector();
         let mut p = DecodedPipeline::new();
-        let (_r, _v) = p.push(&det, "Bearer eyJa\u{0301}".as_bytes());
+        let (r1, v1) = p.push(&det, "Bearer eyJa\u{0301}".as_bytes());
         let (r2, v2) = p.finish(&det);
-        assert!(!r2.contains("eyJ"));
-        assert!(matches!(v2, DecodedVerdict::Fail(_)),
-            "entered-match-in-per-char-view must fail closed at EOF despite whole-string composition");
+        let all = format!("{r1}{r2}");
+        assert!(
+            !all.contains("eyJ"),
+            "credential cleartext must never be released: {all:?}"
+        );
+        assert!(
+            all.contains("[REDACTED]")
+                || matches!(v1, DecodedVerdict::Fail(_))
+                || matches!(v2, DecodedVerdict::Fail(_)),
+            "spliced bearer must redact or fail closed; got {all:?}"
+        );
     }
 
     /// Benign text round-trip: releases with retention, terminal flushes the tail,

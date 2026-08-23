@@ -69,10 +69,11 @@ pub mod canonical_facade {
     // Re-export the invisible strip for per-char feed (M009 decoded pipeline).
     pub use crate::invisible::strip_invisibles as strip_invisible;
     // The EXACT canonicalization `DefaultLeakDetector::scan` applies to its input
-    // (strip-invisibles then whole-string NFKC). Consumers that must align an
-    // offset or a prefix with a `Finding`/`Redacted` derivative MUST use this —
-    // the per-char `canonical_len_with_limit` above is a different (deliberately
-    // divergent) index space.
+    // (drop Mn/Me/Cf ∪ historical invisibles, whole-string NFKC, drop again).
+    // Consumers that must align an offset or a prefix with a `Finding`/`Redacted`
+    // derivative MUST use this. `strip_invisible` is the historical
+    // Default_Ignorable set only and is NOT the detector derivative. The per-char
+    // `canonical_len_with_limit` uses the same drop predicate char-locally.
     pub use crate::invisible::canonical_scan_text;
     // S4 (2026-07-29): the AUDITED viability-hold primitives the wire layer uses
     // (anchored dense-DFA prefix viability over the canonical feed + the

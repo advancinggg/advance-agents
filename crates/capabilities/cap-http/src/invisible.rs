@@ -49,9 +49,59 @@
 //! tokenizer-aware slice — see MODULE-012 §3.6); tag chars
 //! U+E0000..=U+E007F (deprecated in modern Unicode and not a viable
 //! tokenizer-side vector at this time).
+//!
+//! MODULE-012-AC-24 (CONTRACT-112 scanned-content derivative): matching also
+//! drops Unicode General_Category ∈ {Mn, Me, Cf} so a leak pattern's literal
+//! anchor still matches when a combining mark / format character is spliced
+//! inside it (`B` + U+0301 + `earer`). NFC/NFKC alone is not the fix — there
+//! is no precomposed form for that case. The historical `is_invisible` set
+//! (zero-width / Default_Ignorable / bidi) is kept as a union; Hangul fillers
+//! are `Lo` and would otherwise survive a GC-only drop. Mc is not dropped.
+
+use std::sync::OnceLock;
 
 pub fn strip_invisibles(text: &str) -> String {
     text.chars().filter(|c| !is_invisible(*c)).collect()
+}
+
+/// Filter used by the CONTRACT-112 scanned-content derivative: historical
+/// invisibles **or** General_Category ∈ {Mn, Me, Cf}.
+pub(crate) fn is_dropped_from_scan_derivative(c: char) -> bool {
+    is_invisible(c) || is_mark_or_format(c)
+}
+
+fn strip_scan_derivative(text: &str) -> String {
+    text.chars()
+        .filter(|c| !is_dropped_from_scan_derivative(*c))
+        .collect()
+}
+
+/// Unicode General_Category ∈ {Mn, Me, Cf}. Cached from the same
+/// `regex-syntax` tables the leak regexes use (`[\p{Mn}\p{Me}\p{Cf}]`).
+fn is_mark_or_format(c: char) -> bool {
+    // No Mn/Me/Cf in ASCII. `is_invisible` is also non-ASCII (U+00AD is 0xAD).
+    if c <= '\u{007F}' {
+        return false;
+    }
+    let ranges = mark_format_ranges();
+    let i = ranges.partition_point(|&(start, _)| start <= c);
+    i > 0 && c <= ranges[i - 1].1
+}
+
+fn mark_format_ranges() -> &'static [(char, char)] {
+    static RANGES: OnceLock<Vec<(char, char)>> = OnceLock::new();
+    RANGES
+        .get_or_init(|| {
+            let hir =
+                regex_syntax::parse(r"[\p{Mn}\p{Me}\p{Cf}]").expect("static Mn/Me/Cf class parses");
+            match hir.kind() {
+                regex_syntax::hir::HirKind::Class(regex_syntax::hir::Class::Unicode(u)) => {
+                    u.ranges().iter().map(|r| (r.start(), r.end())).collect()
+                }
+                other => panic!("expected Unicode class for Mn/Me/Cf, got {other:?}"),
+            }
+        })
+        .as_slice()
 }
 
 /// Apply Unicode NFKC (Compatibility Composition) normalization to
@@ -81,17 +131,28 @@ pub(crate) fn nfkc_normalize(text: &str) -> String {
     text.nfkc().collect()
 }
 
-/// Compose `strip_invisibles` and `nfkc_normalize` into a single
-/// canonical scan-text derivative. Applied at the upstream entry of
-/// every match-or-emit security primitive (`LeakDetector::scan`,
+/// Compose the CONTRACT-112 scanned-content derivative: drop Mn/Me/Cf
+/// and the historical invisible/zero-width set, NFKC-normalize, then
+/// drop again so a compatibility decomposition cannot re-introduce a
+/// mark before matching.
+///
+/// Applied at the upstream entry of every match-or-emit security
+/// primitive (`LeakDetector::scan`,
 /// `PromptInjectionHelpers::flag_injection_patterns`, and
 /// `PromptInjectionHelpers::wrap_with_boundary`).
 ///
-/// Order matters: strip Cf-category invisibles FIRST so they're
-/// removed before NFKC processing (some invisibles have NFKC
-/// decompositions, but the threat model treats them as zero-width
-/// regardless of NFKC behavior; explicit strip is more conservative).
+/// Order matters: strip first so spliced Mn (`B` + U+0301 + `earer`) is
+/// gone before NFKC (NFC/NFKC alone leaves that splice intact). The
+/// second strip is T32-U6 (`U+FF9E` Lm → U+3099 Mn).
 pub fn canonical_scan_text(text: &str) -> String {
+    strip_scan_derivative(&nfkc_normalize(&strip_scan_derivative(text)))
+}
+
+/// Pre-AC-24 pipeline (strip historical invisibles, then NFKC). T32
+/// mutation: spliced Mn/Me/residual-Cf samples that `canonical_scan_text`
+/// catches must miss on this function.
+#[cfg(test)]
+pub(crate) fn canonical_scan_text_without_mark_drop(text: &str) -> String {
     nfkc_normalize(&strip_invisibles(text))
 }
 
@@ -140,4 +201,145 @@ pub(crate) fn is_invisible(c: char) -> bool {
         || (0x1BCA0..=0x1BCA3).contains(&cp)
         // Musical symbols (R4 — Default_Ignorable).
         || (0x1D173..=0x1D17A).contains(&cp)
+}
+
+/// T32 spliced samples keyed by `pattern_name`. Crate tests only.
+#[cfg(test)]
+pub(crate) fn t32_spliced_samples() -> Vec<(&'static str, String)> {
+    let openai_body = "A".repeat(20);
+    let anthropic_body = "a".repeat(90);
+    let github_body = "abcdefghijklmnopqrstuvwxyz0123456789AB";
+    vec![
+        (
+            "bearer_token",
+            "B\u{0301}earer eyJhbGciOiJIUzI1NiJ9".to_string(),
+        ),
+        ("openai_api_key", format!("sk\u{20DD}-proj-{openai_body}")),
+        (
+            "anthropic_api_key",
+            format!("sk-ant\u{FFF9}-api{anthropic_body}"),
+        ),
+        ("aws_access_key", "A\u{0600}KIA0123456789ABCDEF".to_string()),
+        ("github_token", format!("g\u{0301}hp_{github_body}")),
+        (
+            "pem_private_key",
+            "-----BE\u{20DD}GIN PRIVATE KEY-----".to_string(),
+        ),
+        (
+            "auth_header_basic",
+            "Author\u{FFF9}ization: Basic QUJDREVGRw==".to_string(),
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod t32_derivative {
+    use super::*;
+    use crate::patterns::LEAK_PATTERNS;
+    use advance_shared_types::security_validator::Action;
+    use regex::Regex;
+    use unicode_normalization::UnicodeNormalization;
+
+    fn nfc(s: &str) -> String {
+        s.chars().nfc().collect()
+    }
+    fn nfkc(s: &str) -> String {
+        s.chars().nfkc().collect()
+    }
+
+    fn spliced_samples() -> Vec<(&'static str, String)> {
+        t32_spliced_samples()
+    }
+
+    fn row(name: &str) -> &'static crate::patterns::PatternSpec {
+        LEAK_PATTERNS
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("missing live LEAK_PATTERNS row {name}"))
+    }
+
+    #[test]
+    fn drop_predicate_covers_ac24_classes() {
+        assert!(is_dropped_from_scan_derivative('\u{0301}'), "Mn U+0301");
+        assert!(is_dropped_from_scan_derivative('\u{20DD}'), "Me U+20DD");
+        assert!(is_dropped_from_scan_derivative('\u{0600}'), "Cf U+0600");
+        assert!(is_dropped_from_scan_derivative('\u{FFF9}'), "Cf U+FFF9");
+        assert!(
+            is_dropped_from_scan_derivative('\u{200B}'),
+            "ZWSP via is_invisible"
+        );
+        assert!(
+            is_dropped_from_scan_derivative('\u{00AD}'),
+            "SOFT HYPHEN via is_invisible"
+        );
+        assert!(
+            is_dropped_from_scan_derivative('\u{115F}'),
+            "Hangul filler Lo via is_invisible"
+        );
+        assert!(!is_dropped_from_scan_derivative('A'));
+        assert!(!is_mark_or_format('\u{200B}') || is_invisible('\u{200B}'));
+        assert!(!is_invisible('\u{0301}'));
+        assert!(!is_invisible('\u{20DD}'));
+        assert!(!is_invisible('\u{0600}'));
+        assert!(!is_invisible('\u{FFF9}'));
+        assert!(!is_invisible('\u{FF9E}'));
+        assert_eq!(
+            mark_format_ranges().len(),
+            368,
+            "Unicode 16 Mn∪Me∪Cf range count drifted — re-check the GC source"
+        );
+    }
+
+    #[test]
+    fn t32_u1_nfc_nfkc_alone_leave_b_acute_splice() {
+        let spliced = "B\u{0301}earer";
+        assert_eq!(nfc(spliced), spliced);
+        assert_eq!(nfkc(spliced), spliced);
+        assert_eq!(canonical_scan_text(spliced), "Bearer");
+        assert_ne!(canonical_scan_text_without_mark_drop(spliced), "Bearer");
+    }
+
+    #[test]
+    fn t32_u2_mutation_all_block_redact_rows() {
+        let rows: Vec<_> = LEAK_PATTERNS
+            .iter()
+            .filter(|p| matches!(p.action, Action::Block | Action::Redact))
+            .collect();
+        assert_eq!(rows.len(), 7, "LEAK_PATTERNS Block/Redact count drifted");
+        let samples = spliced_samples();
+        assert_eq!(samples.len(), 7);
+        for (name, sample) in &samples {
+            let spec = row(name);
+            let re = Regex::new(spec.regex).expect("static regex compiles");
+            assert!(
+                re.find(&canonical_scan_text(sample)).is_some(),
+                "{name}: derivative must match spliced sample {sample:?}"
+            );
+            assert!(
+                re.find(&canonical_scan_text_without_mark_drop(sample))
+                    .is_none(),
+                "{name}: mutation (no mark-drop) must miss spliced sample {sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn t32_u6_post_nfkc_drop_ff9e_and_acute_accent() {
+        let spliced = "B\u{FF9E}earer eyJhbGciOiJIUzI1NiJ9";
+        let first_only = nfkc_normalize(&strip_scan_derivative(spliced));
+        assert!(
+            first_only.contains('\u{3099}'),
+            "first-drop-only must leave U+3099 in the haystack, got {first_only:?}"
+        );
+        assert_eq!(
+            canonical_scan_text(spliced),
+            "Bearer eyJhbGciOiJIUzI1NiJ9",
+            "second drop reconstitutes Bearer"
+        );
+        let acute = "x\u{00B4}y";
+        assert!(
+            !canonical_scan_text(acute).contains('\u{0301}'),
+            "U+00B4 NFKC Mn must not survive matching"
+        );
+    }
 }
