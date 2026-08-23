@@ -132,7 +132,9 @@ use advance_shared_types::mailbox::{
 };
 use advance_shared_types::outbound::DeliveryReport;
 use advance_shared_types::repetition::{OutputHash, RepetitionDecision, ToolCallSignature};
-use advance_shared_types::traits::{EventBusEmit, GrantCheck, RepetitionGuardCheck, RunBudget};
+use advance_shared_types::traits::{
+    EventBusEmit, GrantCheck, LlmDeltaSink, NotWiredDeltaSink, RepetitionGuardCheck, RunBudget,
+};
 use cap_http::DefaultPromptInjectionHelpers;
 use cap_tools::web::{
     agent_tool_infos, project_callable_tool_entries, strip_unissued_citations,
@@ -161,7 +163,7 @@ use cap_memory::{
 };
 use tokio_util::sync::CancellationToken;
 // Rollback-memory slice: the production composition-root adapter reused verbatim.
-use advance_cli::wiring::GitMemoryRestore;
+use advance_cli::wiring::{build_llm_gateway, GitMemoryRestore};
 use wit_component::ComponentEncoder;
 
 // --- HF fast-follow imports (2026-06-03) ---
@@ -196,6 +198,7 @@ use std::collections::BTreeMap;
 use wasmtime::component::Val;
 
 pub mod llm_loopback;
+pub mod sidecar_fixture;
 
 /// The harness agent's routing id (`agent:`-prefixed for the messaging layer).
 pub const AGENT_ID: &str = "agent:harness";
@@ -279,6 +282,15 @@ pub enum EventSink {
     RealBus,
 }
 
+/// How [`LlmMode::LocalSidecar`] launches the CONTRACT-238 process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidecarLaunch {
+    /// Spawn in-repo `local-sidecar-fixture` via production `ProcessSupervisor`.
+    Fixture,
+    /// `backend_class: local` with no sidecar spec → `NotWiredInferenceBackend`.
+    Absent,
+}
+
 /// LLM backend mode.
 pub enum LlmMode {
     /// No LLM gateway registered (the default).
@@ -293,6 +305,21 @@ pub enum LlmMode {
     /// Combine with [`SystemUnderTestBuilder::budget`] / [`SystemUnderTestBuilder::repetition`]
     /// and witness `llm.*` events through [`SystemUnderTest::events`].
     LoopbackScripted(Vec<llm_loopback::ScriptedResponse>),
+    /// Production `build_llm_gateway` + optional fixture sidecar. A reachable
+    /// cloud-http mock is also configured (`CLOUD_FALLBACK_SENTINEL`).
+    LocalSidecar { launch: SidecarLaunch },
+    /// Cloud-http only. Live `DefaultSsrfGuard::new()`. `origin` is the YAML
+    /// endpoint verbatim (`http://127.0.0.1` or `https://10.0.0.1`).
+    ProductionSsrf {
+        origin: String,
+        script: Vec<llm_loopback::ScriptedResponse>,
+    },
+    /// Cloud-http only. Chain SSRF fooled for `mapped_host` → 8.8.8.8; executor
+    /// connect-time SSRF still runs.
+    FooledSsrf {
+        mapped_host: String,
+        script: Vec<llm_loopback::ScriptedResponse>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -2415,7 +2442,21 @@ impl SystemUnderTestBuilder {
         if self.with_delta_tee && matches!(self.llm, LlmMode::Off) {
             panic!(".with_delta_tee() requires a loopback LLM");
         }
+        if self.with_delta_tee
+            && matches!(
+                self.llm,
+                LlmMode::LocalSidecar { .. }
+                    | LlmMode::ProductionSsrf { .. }
+                    | LlmMode::FooledSsrf { .. }
+            )
+        {
+            panic!(".with_delta_tee() is unsupported with LocalSidecar/ProductionSsrf/FooledSsrf");
+        }
         let mut llm_stream_reaper: Option<Arc<cap_llm::AgentStreamReaper>> = None;
+        let mut llm_production: Option<Arc<cap_llm::LlmGateway>> = None;
+        let mut llm_cfg: Option<Arc<llm_loopback::InlineConfigProvider>> = None;
+        let mut sidecar_pid: Option<u32> = None;
+        let mut sidecar_addr: Option<std::net::SocketAddr> = None;
         let llm = match self.llm {
             LlmMode::Off => None,
             LlmMode::Loopback(script) => {
@@ -2451,6 +2492,101 @@ impl SystemUnderTestBuilder {
                 )
                 .await;
                 llm_stream_reaper = reaper;
+                Some(lp)
+            }
+            LlmMode::LocalSidecar { launch } => {
+                let before = sidecar_fixture::snapshot_listening_sidecars();
+                let responses = vec![llm_loopback::ScriptedResponse::ok_chat(
+                    llm_loopback::CLOUD_FALLBACK_SENTINEL,
+                    3,
+                    5,
+                )];
+                let lp = llm_loopback::LoopbackLlm::start(
+                    responses,
+                    self.budget.clone(),
+                    self.repetition.clone(),
+                    bus_dyn.clone(),
+                    self.agent_id.clone(),
+                )
+                .await;
+                let cmd = match launch {
+                    SidecarLaunch::Fixture => Some(
+                        sidecar_fixture::local_sidecar_fixture_bin()
+                            .display()
+                            .to_string(),
+                    ),
+                    SidecarLaunch::Absent => None,
+                };
+                let cfg = llm_loopback::local_sidecar_runtime_config(cmd.as_deref(), lp.realport());
+                let prod_cfg = Arc::new(llm_loopback::InlineConfigProvider::new(cfg));
+                let budget: Arc<dyn RunBudget> = self
+                    .budget
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(llm_loopback::AllowAllBudget));
+                let repetition: Arc<dyn RepetitionGuardCheck> = self
+                    .repetition
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(llm_loopback::NoOpRepetitionGuard));
+                let delta: Arc<dyn LlmDeltaSink> = Arc::new(NotWiredDeltaSink);
+                let gw = build_llm_gateway(
+                    prod_cfg.clone(),
+                    lp.security_chain(),
+                    lp.streaming_chain(),
+                    lp.decoded_detector(),
+                    budget,
+                    bus_dyn.clone(),
+                    repetition,
+                    self.agent_id.clone(),
+                    delta,
+                );
+                cap_llm::register_agent_llm(&*registry, gw.clone());
+                llm_production = Some(gw);
+                llm_cfg = Some(prod_cfg);
+                let after = sidecar_fixture::snapshot_listening_sidecars();
+                let spawned = sidecar_fixture::sidecar_diff(&before, &after);
+                match launch {
+                    SidecarLaunch::Fixture => {
+                        assert_eq!(
+                            spawned.len(),
+                            1,
+                            "exactly one new fixture LISTEN after production spawn; got {spawned:?}"
+                        );
+                        sidecar_pid = Some(spawned[0].0);
+                        sidecar_addr = Some(spawned[0].1);
+                    }
+                    SidecarLaunch::Absent => {}
+                }
+                Some(lp)
+            }
+            LlmMode::ProductionSsrf { origin, script } => {
+                let lp = llm_loopback::LoopbackLlm::start_production_ssrf(
+                    origin,
+                    script,
+                    self.budget.clone(),
+                    self.repetition.clone(),
+                    bus_dyn.clone(),
+                    self.agent_id.clone(),
+                )
+                .await;
+                cap_llm::register_agent_llm(&*registry, lp.gateway.clone());
+                llm_production = Some(lp.gateway.clone());
+                Some(lp)
+            }
+            LlmMode::FooledSsrf {
+                mapped_host,
+                script,
+            } => {
+                let lp = llm_loopback::LoopbackLlm::start_fooled_ssrf(
+                    mapped_host,
+                    script,
+                    self.budget.clone(),
+                    self.repetition.clone(),
+                    bus_dyn.clone(),
+                    self.agent_id.clone(),
+                )
+                .await;
+                cap_llm::register_agent_llm(&*registry, lp.gateway.clone());
+                llm_production = Some(lp.gateway.clone());
                 Some(lp)
             }
         };
@@ -3291,9 +3427,10 @@ impl SystemUnderTestBuilder {
             if let Some(guard) = &tool_guard {
                 guard.set_context_assembler(inner.clone());
             }
+            let publish_gw = llm_production.clone().unwrap_or_else(|| lp.gateway.clone());
             let publishing = Arc::new(PublishingContextAssembler::new(
                 inner,
-                lp.gateway.clone(),
+                publish_gw,
                 self.agent_id.clone(),
             ));
             driver = driver.with_context_assembler(publishing);
@@ -3572,6 +3709,10 @@ impl SystemUnderTestBuilder {
             _grant_sweeper: grant_sweeper,
             _grant_sweeper_handle: grant_sweeper_handle,
             llm,
+            llm_production,
+            llm_cfg,
+            sidecar_pid,
+            sidecar_addr,
             l6_llm,
             registry,
             channel,
@@ -4196,6 +4337,10 @@ pub struct SystemUnderTest {
     _grant_sweeper: Option<Arc<cap_grant::TtlSweeper>>,
     _grant_sweeper_handle: Option<tokio::task::JoinHandle<()>>,
     llm: Option<llm_loopback::LoopbackLlm>,
+    llm_production: Option<Arc<cap_llm::LlmGateway>>,
+    llm_cfg: Option<Arc<llm_loopback::InlineConfigProvider>>,
+    sidecar_pid: Option<u32>,
+    sidecar_addr: Option<std::net::SocketAddr>,
     // Wave-7 Lane A (069/216/186/187): the SEPARATE L6-classifier loopback gateway (Some only
     // for `.with_recording_l6()` / `.with_failing_l6_gateway()`). Its own `Drop` aborts the
     // mock task on SUT drop, exactly like `llm`. Read its recorder via `l6_chat_request_count()`.
@@ -5061,9 +5206,34 @@ impl SystemUnderTest {
         self.grant_store.as_ref()
     }
 
-    /// The loopback LLM gateway (when `.llm(Loopback)` was configured).
+    /// Production gateway when LocalSidecar/ProductionSsrf/FooledSsrf; else loopback.
     pub fn llm_gateway(&self) -> Option<Arc<cap_llm::LlmGateway>> {
+        if let Some(gw) = &self.llm_production {
+            return Some(gw.clone());
+        }
         self.llm.as_ref().map(|l| l.gateway.clone())
+    }
+
+    /// OS pid of the fixture sidecar spawned by [`LlmMode::LocalSidecar`].
+    pub fn sidecar_pid(&self) -> Option<u32> {
+        self.sidecar_pid
+    }
+
+    /// Loopback listen addr of the fixture sidecar (not the cloud mock port).
+    pub fn sidecar_addr(&self) -> Option<std::net::SocketAddr> {
+        self.sidecar_addr
+    }
+
+    /// Swap the live runtime config the production/loopback gateway re-reads.
+    pub fn replace_llm_runtime_config(&self, cfg: advance_runtime::config::RuntimeConfig) {
+        if let Some(p) = &self.llm_cfg {
+            p.set(cfg);
+            return;
+        }
+        self.llm
+            .as_ref()
+            .expect("replace_llm_runtime_config requires an LLM")
+            .replace_runtime_config(cfg);
     }
 
     /// The `Authorization` header the loopback LLM mock observed on its last request —

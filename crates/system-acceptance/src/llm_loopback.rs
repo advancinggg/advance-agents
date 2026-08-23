@@ -39,7 +39,7 @@ use axum::response::IntoResponse;
 use advance_runtime::config::{RuntimeConfig, RuntimeConfigProvider};
 use advance_shared_types::capability::BudgetDecision;
 use advance_shared_types::repetition::{OutputHash, RepetitionDecision, ToolCallSignature};
-use advance_shared_types::security_validator::{LeakDetector, SsrfGuard};
+use advance_shared_types::security_validator::{HttpSecurityChain, LeakDetector, SsrfGuard};
 use advance_shared_types::traits::{
     EventBusEmit, HttpStreamingChain, LlmDeltaEvent, LlmDeltaFrame, LlmDeltaSink,
     RepetitionGuardCheck, RunBudget,
@@ -57,7 +57,10 @@ use zeroize::Zeroizing;
 /// override; mapped to a public IP by the chain's SSRF resolver).
 const PROVIDER_HOST: &str = "harness-llm.test";
 /// The secret name the provider's `api-key-secret` references (seeded in the store).
-const API_KEY_SECRET: &str = "harness-llm-api-key";
+pub const API_KEY_SECRET: &str = "harness-llm-api-key";
+
+/// Distinct cloud-mock reply so a silent local→cloud fallback is observable.
+pub const CLOUD_FALLBACK_SENTINEL: &str = "CLOUD-FALLBACK-SENTINEL";
 
 /// Harness-only CONTRACT-234 wrapper: forwards every frame to an inner
 /// [`advance_client_api::LlmDeltaHub`] and records `event.stream_key` on
@@ -473,10 +476,9 @@ pub struct LoopbackLlm {
     /// The loopback server's ephemeral port — reused when `switch_provider` rebuilds
     /// the config so the endpoint host:port (DNS-mapped) stays constant across a switch.
     realport: u16,
-    /// grok-repass Item 2: a retained handle to the SAME chain instance the
-    /// gateway streams through, so fault witnesses can drive
-    /// `execute_streaming` directly (the struct held no chain before).
-    chain: Arc<dyn HttpStreamingChain>,
+    /// Concrete chain (impls HttpSecurityChain + HttpStreamingChain).
+    chain: Arc<DefaultHttpSecurityChain>,
+    decoded_detector: Arc<dyn LeakDetector>,
     /// SYS-J-72 opt-in tee wrapper. `None` on the historical `start()` path.
     tee_sink: Option<Arc<CapturingDeltaSink>>,
 }
@@ -570,7 +572,27 @@ impl LoopbackLlm {
     /// This is the sanctioned consumption point — `WireChunkStream` bytes are
     /// PRE-scan and must only be read through this chain's scanning wrapper.
     pub fn streaming_chain(&self) -> Arc<dyn HttpStreamingChain> {
-        Arc::clone(&self.chain)
+        Arc::clone(&self.chain) as Arc<dyn HttpStreamingChain>
+    }
+
+    pub fn security_chain(&self) -> Arc<dyn HttpSecurityChain> {
+        Arc::clone(&self.chain) as Arc<dyn HttpSecurityChain>
+    }
+
+    pub fn decoded_detector(&self) -> Arc<dyn LeakDetector> {
+        Arc::clone(&self.decoded_detector)
+    }
+
+    pub fn realport(&self) -> u16 {
+        self.realport
+    }
+
+    pub fn replace_runtime_config(&self, cfg: RuntimeConfig) {
+        self.cfg_provider.set(cfg);
+    }
+
+    pub fn config_provider(&self) -> Arc<dyn RuntimeConfigProvider> {
+        self.cfg_provider.clone()
     }
 
     /// SYS-J-72: the capturing tee wrapper, if `start_with_tee` was used.
@@ -611,6 +633,7 @@ impl LoopbackLlm {
             event_bus,
             default_agent_id,
             None,
+            ChainKind::Historical,
         )
         .await
     }
@@ -632,6 +655,51 @@ impl LoopbackLlm {
             event_bus,
             default_agent_id,
             Some(hub),
+            ChainKind::Historical,
+        )
+        .await
+    }
+
+    /// Production `DefaultSsrfGuard::new()` (live forbidden table). YAML
+    /// `endpoint` is `origin` verbatim. Chain bus attached.
+    pub async fn start_production_ssrf(
+        origin: String,
+        responses: Vec<ScriptedResponse>,
+        budget: Option<Arc<dyn RunBudget>>,
+        repetition: Option<Arc<dyn RepetitionGuardCheck>>,
+        event_bus: Arc<dyn EventBusEmit>,
+        default_agent_id: String,
+    ) -> Self {
+        Self::start_inner(
+            responses,
+            budget,
+            repetition,
+            event_bus,
+            default_agent_id,
+            None,
+            ChainKind::Production { origin },
+        )
+        .await
+    }
+
+    /// Chain step 5 fooled (`mapped_host` → 8.8.8.8). No DNS override.
+    /// YAML endpoint `http://{mapped_host}:{realport}`. Chain bus attached.
+    pub async fn start_fooled_ssrf(
+        mapped_host: String,
+        responses: Vec<ScriptedResponse>,
+        budget: Option<Arc<dyn RunBudget>>,
+        repetition: Option<Arc<dyn RepetitionGuardCheck>>,
+        event_bus: Arc<dyn EventBusEmit>,
+        default_agent_id: String,
+    ) -> Self {
+        Self::start_inner(
+            responses,
+            budget,
+            repetition,
+            event_bus,
+            default_agent_id,
+            None,
+            ChainKind::Fooled { mapped_host },
         )
         .await
     }
@@ -643,6 +711,7 @@ impl LoopbackLlm {
         event_bus: Arc<dyn EventBusEmit>,
         default_agent_id: String,
         tee_hub: Option<Arc<advance_client_api::LlmDeltaHub>>,
+        kind: ChainKind,
     ) -> Self {
         // 1. Loopback axum mock on an ephemeral port. The chat handler RECORDS the inbound
         //    request headers (credential-injection witness) and serves the scripted FIFO.
@@ -717,59 +786,84 @@ impl LoopbackLlm {
         });
         let realport = addr.port();
 
-        // 2. Real chain: SSRF sees the public IP for the hostname; the executor's DNS
-        //    override sends the actual TCP to 127.0.0.1:realport.
+        // 2. Real chain. Historical: MockResolver + DNS override (SSRF sees a public
+        //    IP; TCP lands on loopback). Production/Fooled: no DNS override.
         let leak: Arc<dyn LeakDetector> = Arc::new(DefaultLeakDetector::new());
-        let resolver = MockResolver::new().with(PROVIDER_HOST, vec![public_ip()]);
-        let ssrf: Arc<dyn SsrfGuard> =
-            Arc::new(DefaultSsrfGuard::with_resolver(Box::new(resolver)));
         let rl: Arc<dyn RateLimiter> = Arc::new(AlwaysAllow);
+        let (ssrf, dns_overrides, yaml_endpoint, provider_host, attach_bus): (
+            Arc<dyn SsrfGuard>,
+            Vec<(String, SocketAddr)>,
+            String,
+            String,
+            bool,
+        ) = match &kind {
+            ChainKind::Historical => {
+                let resolver = MockResolver::new().with(PROVIDER_HOST, vec![public_ip()]);
+                (
+                    Arc::new(DefaultSsrfGuard::with_resolver(Box::new(resolver))),
+                    vec![(
+                        PROVIDER_HOST.to_string(),
+                        SocketAddr::from(([127, 0, 0, 1], realport)),
+                    )],
+                    format!("http://{PROVIDER_HOST}:{realport}"),
+                    PROVIDER_HOST.to_string(),
+                    false,
+                )
+            }
+            ChainKind::Production { origin } => (
+                Arc::new(DefaultSsrfGuard::new()),
+                Vec::new(),
+                loopback_origin_with_mock_port(origin, realport),
+                origin.clone(),
+                true,
+            ),
+            ChainKind::Fooled { mapped_host } => {
+                let resolver = MockResolver::new().with(mapped_host.as_str(), vec![public_ip()]);
+                (
+                    Arc::new(DefaultSsrfGuard::with_resolver(Box::new(resolver))),
+                    Vec::new(),
+                    format!("http://{mapped_host}:{realport}"),
+                    mapped_host.clone(),
+                    true,
+                )
+            }
+        };
         let reqwest_exec = Arc::new(ReqwestHttpExecutor::from_config(ReqwestExecutorConfig {
             timeout: Duration::from_secs(5),
-            dns_overrides: vec![(
-                PROVIDER_HOST.to_string(),
-                SocketAddr::from(([127, 0, 0, 1], realport)),
-            )],
+            dns_overrides,
             max_redirects: 5,
             ..Default::default()
         }));
         let exec: Arc<dyn HttpExecutor> = reqwest_exec.clone();
         let stream_exec: Arc<dyn cap_http::executor::HttpStreamExecutor> = reqwest_exec.clone();
         let leak_gateway: Arc<dyn LeakDetector> = leak.clone();
-        let chain = Arc::new(
-            DefaultHttpSecurityChain::new(secret_store(), leak, ssrf, rl, exec)
-                .with_stream_executor(stream_exec),
-        );
+        let mut built = DefaultHttpSecurityChain::new(secret_store(), leak, ssrf, rl, exec)
+            .with_stream_executor(stream_exec);
+        if attach_bus {
+            built = built.with_event_bus(event_bus.clone());
+        }
+        let chain = Arc::new(built);
 
-        // 3. Real gateway with an in-memory provider config (bypasses validate_config). The
-        //    budget / repetition guard / event bus are the caller's (HF-2 knobs). Wave-16 Lane 2:
-        //    keep a CONCRETE `Arc<InlineConfigProvider>` (for in-run `switch_provider`) alongside
-        //    the `dyn` coercion the gateway holds — both point at the SAME RwLock-backed config the
-        //    gateway re-reads per call, so a `.set` is observed on the next `generate`.
-        let cfg_provider = Arc::new(InlineConfigProvider::new(loopback_runtime_config_with(
+        let cfg_provider = Arc::new(InlineConfigProvider::new(loopback_runtime_config_endpoint(
             "openai",
             "gpt-4o-mini",
-            realport,
+            &yaml_endpoint,
         )));
         let cfg_provider_dyn: Arc<dyn RuntimeConfigProvider> = cfg_provider.clone();
         let budget: Arc<dyn RunBudget> = budget.unwrap_or_else(|| Arc::new(AllowAllBudget));
         let rep_guard: Arc<dyn RepetitionGuardCheck> =
             repetition.unwrap_or_else(|| Arc::new(NoOpRepetitionGuard));
-        // S4 final (2026-07-29): live streaming re-wired for the harness — same
-        // detector instance as the chain (production-parity composition); journeys
-        // drive the REAL live owner/poll path over the loopback's TCP SSE mode.
         let streaming_chain: Arc<dyn HttpStreamingChain> = chain.clone();
-        let streaming_chain_handle: Arc<dyn HttpStreamingChain> = chain.clone();
         let tee_sink = tee_hub.map(|hub| Arc::new(CapturingDeltaSink::new(hub)));
         let mut gateway = LlmGateway::new(
             cfg_provider_dyn,
-            chain,
+            chain.clone(),
             budget,
             event_bus,
             rep_guard,
             default_agent_id,
         )
-        .with_live_streaming(streaming_chain, leak_gateway);
+        .with_live_streaming(streaming_chain, leak_gateway.clone());
         if let Some(sink) = tee_sink.as_ref() {
             gateway = gateway.with_delta_sink(sink.clone() as Arc<dyn LlmDeltaSink>);
         }
@@ -777,14 +871,33 @@ impl LoopbackLlm {
 
         LoopbackLlm {
             gateway,
-            provider_host: PROVIDER_HOST.to_string(),
+            provider_host,
             recorder,
             mock,
             cfg_provider,
             realport,
-            chain: streaming_chain_handle,
+            chain,
+            decoded_detector: leak_gateway,
             tee_sink,
         }
+    }
+}
+
+enum ChainKind {
+    Historical,
+    Production { origin: String },
+    Fooled { mapped_host: String },
+}
+
+/// `http://127.0.0.1` / `http://localhost` (no port) would dial `:80`, so the
+/// in-process mock recorder could never observe a bypass. Append the bound
+/// mock port. RFC1918 `https://10.0.0.1` is left verbatim.
+fn loopback_origin_with_mock_port(origin: &str, realport: u16) -> String {
+    let trimmed = origin.trim().trim_end_matches('/');
+    if trimmed == "http://127.0.0.1" || trimmed == "http://localhost" {
+        format!("{trimmed}:{realport}")
+    } else {
+        origin.to_string()
     }
 }
 
@@ -998,6 +1111,19 @@ fn loopback_runtime_config_with(
     default_model: &str,
     realport: u16,
 ) -> RuntimeConfig {
+    loopback_runtime_config_endpoint(
+        provider_id,
+        default_model,
+        &format!("http://{PROVIDER_HOST}:{realport}"),
+    )
+}
+
+/// In-memory config whose single provider uses `endpoint` verbatim.
+pub fn loopback_runtime_config_endpoint(
+    provider_id: &str,
+    default_model: &str,
+    endpoint: &str,
+) -> RuntimeConfig {
     let yaml = format!(
         r#"
 wasm:
@@ -1007,7 +1133,7 @@ wasm:
 
 llm-providers:
   - id: {id}
-    endpoint: http://{host}:{port}
+    endpoint: {endpoint}
     api-key-secret: {secret}
     model-aliases:
       default: {model}
@@ -1034,18 +1160,105 @@ post-processor:
 "#,
         id = provider_id,
         model = default_model,
-        host = PROVIDER_HOST,
-        port = realport,
+        endpoint = endpoint,
         secret = API_KEY_SECRET,
     );
     serde_yml::from_str(&yaml).expect("loopback runtime config deserializes")
 }
 
-struct InlineConfigProvider {
+/// Two-provider in-memory config: local first (optional sidecar command),
+/// cloud-http second at `http://harness-llm.test:{cloud_port}`.
+pub fn local_sidecar_runtime_config(
+    sidecar_command: Option<&str>,
+    cloud_port: u16,
+) -> RuntimeConfig {
+    let local_block = match sidecar_command {
+        Some(cmd) => format!(
+            r#"
+  - id: local
+    endpoint: ""
+    api-key-secret: {secret}
+    model-aliases:
+      default: llama
+    cost-per-mtoken-in: 0.001
+    cost-per-mtoken-out: 0.001
+    rate-limit:
+      requests-per-minute: 1000
+      tokens-per-minute: 400000
+    backend-class: local
+    sidecar:
+      command: {cmd}
+"#,
+            secret = API_KEY_SECRET,
+            cmd = cmd,
+        ),
+        None => format!(
+            r#"
+  - id: local
+    endpoint: ""
+    api-key-secret: {secret}
+    model-aliases:
+      default: llama
+    cost-per-mtoken-in: 0.001
+    cost-per-mtoken-out: 0.001
+    rate-limit:
+      requests-per-minute: 1000
+      tokens-per-minute: 400000
+    backend-class: local
+"#,
+            secret = API_KEY_SECRET,
+        ),
+    };
+    let yaml = format!(
+        r#"
+wasm:
+  max_memory_pages: 1024
+  epoch_interruption_ms: 100
+  fuel_enabled: false
+
+llm-providers:
+{local}
+  - id: openai
+    endpoint: http://{host}:{port}
+    api-key-secret: {secret}
+    model-aliases:
+      gpt-4o-mini: gpt-4o-mini
+    cost-per-mtoken-in: 2.50
+    cost-per-mtoken-out: 10.00
+    rate-limit:
+      requests-per-minute: 1000
+      tokens-per-minute: 400000
+    backend-class: cloud-http
+
+cron:
+  max_jitter_ratio: 0.1
+
+git:
+  gc_interval_hours: 24
+  max_tracked_file_mb: 10
+
+secrets:
+  master-key-source: keychain
+  env-var-name: SECRETS_MASTER_KEY
+
+post-processor:
+  llm-model: sonnet-light
+  llm-failure-cooldown-seconds: 600
+"#,
+        local = local_block,
+        host = PROVIDER_HOST,
+        port = cloud_port,
+        secret = API_KEY_SECRET,
+    );
+    serde_yml::from_str(&yaml).expect("local sidecar runtime config deserializes")
+}
+
+/// In-memory [`RuntimeConfigProvider`] (SUT config swaps).
+pub struct InlineConfigProvider {
     cfg: RwLock<Arc<RuntimeConfig>>,
 }
 impl InlineConfigProvider {
-    fn new(cfg: RuntimeConfig) -> Self {
+    pub fn new(cfg: RuntimeConfig) -> Self {
         Self {
             cfg: RwLock::new(Arc::new(cfg)),
         }
@@ -1054,7 +1267,7 @@ impl InlineConfigProvider {
     /// Wave-16 Lane 2 (SYS-AC-005): hot-swap the live config. The gateway reads
     /// `current()` per call, so the next `generate` observes the new config (the
     /// `MODULE-009-T85` per-call-poll contract). Used by `LoopbackLlm::switch_provider`.
-    fn set(&self, cfg: RuntimeConfig) {
+    pub fn set(&self, cfg: RuntimeConfig) {
         *self.cfg.write().unwrap() = Arc::new(cfg);
     }
 }
@@ -1073,7 +1286,7 @@ impl RuntimeConfigProvider for InlineConfigProvider {
 
 /// Default run-budget when `.budget()` is unset — always allows (back-compat).
 #[derive(Default)]
-struct AllowAllBudget;
+pub(crate) struct AllowAllBudget;
 impl RunBudget for AllowAllBudget {
     fn check(&self, _run_id: &str, _t: u64, _c: f64) -> BudgetDecision {
         BudgetDecision::Allow
@@ -1181,7 +1394,7 @@ mod sse_delta_pins {
 }
 
 /// Default repetition guard when `.repetition()` is unset — never trips (back-compat).
-struct NoOpRepetitionGuard;
+pub(crate) struct NoOpRepetitionGuard;
 impl RepetitionGuardCheck for NoOpRepetitionGuard {
     fn record_tool_call(&self, _agent_id: &str, _sig: ToolCallSignature) -> RepetitionDecision {
         RepetitionDecision::Pass
