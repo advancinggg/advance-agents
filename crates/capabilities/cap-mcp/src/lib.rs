@@ -21,7 +21,7 @@
 pub use client::{McpClient, McpToolInfo, McpTransport};
 // Slice J (V1-b) — MCP half of the CONTRACT-165 inventory feed.
 pub use error::{McpError, McpErrorKind};
-pub use host_fn::register_mcp_client;
+pub use host_fn::{register_mcp_client, register_mcp_client_with_web_grant};
 pub use http_transport::HttpMcpTransport;
 pub use inventory::{mcp_tool_entries, mcp_tool_entries_from_infos};
 pub use jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};

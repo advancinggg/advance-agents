@@ -35,6 +35,9 @@ use std::sync::Arc;
 use advance_runtime::host_registry::{
     HostCallContext, HostCallError, HostFunctionHandler, HostFunctionSpec, HostRegistry,
 };
+use advance_shared_types::capability::{CapParams, GrantDecision};
+use advance_shared_types::traits::GrantCheck;
+use advance_shared_types::web_search::{is_web_tool_id, WEB_GRANT_CAPABILITY};
 use wasmtime::component::Val;
 
 use crate::client::{McpClient, McpPromptInfo, McpResourceInfo, McpServerInfo, McpToolInfo};
@@ -287,7 +290,29 @@ fn encode_result_resource_list(r: Result<Vec<McpResourceInfo>, McpError>) -> Val
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Register all 7 mcp-client handlers under the SPLIT capability dimensions.
+///
+/// Family ids `web.search` / `web.extract` fail-closed (omit / permission-denied)
+/// because no [`GrantCheck`] is bound. Use
+/// [`register_mcp_client_with_web_grant`] for the realization-independent
+/// MODULE-013 `"web"` gate.
 pub fn register_mcp_client(registry: &dyn HostRegistry, client: Arc<McpClient>) {
+    register_mcp_client_inner(registry, client, None);
+}
+
+/// Same as [`register_mcp_client`], with a bound `"web"` family grant checker.
+pub fn register_mcp_client_with_web_grant(
+    registry: &dyn HostRegistry,
+    client: Arc<McpClient>,
+    web_grant: Arc<dyn GrantCheck>,
+) {
+    register_mcp_client_inner(registry, client, Some(web_grant));
+}
+
+fn register_mcp_client_inner(
+    registry: &dyn HostRegistry,
+    client: Arc<McpClient>,
+    web_grant: Option<Arc<dyn GrantCheck>>,
+) {
     let entries: Vec<(&'static str, &'static str, Arc<dyn HostFunctionHandler>)> = vec![
         // server-level reads → mcp.servers
         (
@@ -331,6 +356,7 @@ pub fn register_mcp_client(registry: &dyn HostRegistry, client: Arc<McpClient>) 
             CAPABILITY_TOOL_PATTERNS,
             Arc::new(ListMcpToolsHandler {
                 client: client.clone(),
+                web_grant: web_grant.clone(),
             }),
         ),
         (
@@ -338,6 +364,7 @@ pub fn register_mcp_client(registry: &dyn HostRegistry, client: Arc<McpClient>) 
             CAPABILITY_TOOL_PATTERNS,
             Arc::new(InvokeMcpToolHandler {
                 client: client.clone(),
+                web_grant: web_grant.clone(),
             }),
         ),
     ];
@@ -379,15 +406,18 @@ impl HostFunctionHandler for ListMcpServersHandler {
 
 pub struct ListMcpToolsHandler {
     pub client: Arc<McpClient>,
+    pub web_grant: Option<Arc<dyn GrantCheck>>,
 }
 impl HostFunctionHandler for ListMcpToolsHandler {
     fn call(
         &self,
-        _ctx: HostCallContext,
+        ctx: HostCallContext,
         params: Vec<Val>,
         _results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
         let client = Arc::clone(&self.client);
+        let web_grant = self.web_grant.clone();
+        let agent_id = ctx.agent_id.clone();
         Box::pin(async move {
             if params.len() < 1 {
                 return Err(HostCallError::HandlerError(
@@ -395,7 +425,13 @@ impl HostFunctionHandler for ListMcpToolsHandler {
                 ));
             }
             let server_id = decode_string(&params[0])?.to_string();
-            let r = client.list_tools(&server_id).await;
+            let allow_web = web_family_allowed(web_grant.as_deref(), &agent_id, "list-mcp-tools");
+            let r = client.list_tools(&server_id).await.map(|infos| {
+                infos
+                    .into_iter()
+                    .filter(|info| !is_web_tool_id(&info.name) || allow_web)
+                    .collect::<Vec<_>>()
+            });
             Ok(vec![encode_result_tool_list(r)])
         })
     }
@@ -502,15 +538,18 @@ impl HostFunctionHandler for ReadMcpResourceHandler {
 
 pub struct InvokeMcpToolHandler {
     pub client: Arc<McpClient>,
+    pub web_grant: Option<Arc<dyn GrantCheck>>,
 }
 impl HostFunctionHandler for InvokeMcpToolHandler {
     fn call(
         &self,
-        _ctx: HostCallContext,
+        ctx: HostCallContext,
         params: Vec<Val>,
         _results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
         let client = Arc::clone(&self.client);
+        let web_grant = self.web_grant.clone();
+        let agent_id = ctx.agent_id.clone();
         Box::pin(async move {
             if params.len() < 3 {
                 return Err(HostCallError::HandlerError(
@@ -520,12 +559,45 @@ impl HostFunctionHandler for InvokeMcpToolHandler {
             let server_id = decode_string(&params[0])?.to_string();
             let tool_name = decode_string(&params[1])?.to_string();
             let params_bytes = decode_byte_list(&params[2])?;
+            if is_web_tool_id(&tool_name) {
+                match web_family_decision(web_grant.as_deref(), &agent_id, "invoke-mcp-tool") {
+                    GrantDecision::Deny(reason) => {
+                        return Ok(vec![encode_result_bytes(Err(McpError::permission_denied(
+                            reason,
+                        )))]);
+                    }
+                    GrantDecision::Allow => {}
+                }
+            }
             let r = client
                 .invoke_tool(&server_id, &tool_name, &params_bytes)
                 .await;
             Ok(vec![encode_result_bytes(r)])
         })
     }
+}
+
+fn web_family_decision(
+    grant: Option<&dyn GrantCheck>,
+    agent_id: &str,
+    function: &str,
+) -> GrantDecision {
+    match grant {
+        None => GrantDecision::Deny("web grant checker unbound".into()),
+        Some(g) => g.check(
+            agent_id,
+            WEB_GRANT_CAPABILITY,
+            function,
+            &CapParams::empty(),
+        ),
+    }
+}
+
+fn web_family_allowed(grant: Option<&dyn GrantCheck>, agent_id: &str, function: &str) -> bool {
+    matches!(
+        web_family_decision(grant, agent_id, function),
+        GrantDecision::Allow
+    )
 }
 
 #[cfg(test)]

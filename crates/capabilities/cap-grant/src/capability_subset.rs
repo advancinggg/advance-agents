@@ -79,6 +79,7 @@ fn allowed_param_keys(capability: &str) -> Option<&'static [&'static str]> {
         "notify" => Some(&["targets"]),
         "mcp" => Some(&["servers", "tool-patterns"]),
         "skills" => Some(&["allowed-actions", "max-active-skills"]),
+        "web" => Some(&[]),
         _ => None,
     }
 }

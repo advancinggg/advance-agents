@@ -39,6 +39,9 @@ tempfile = { workspace = true }
 # production cap-grant never imports run-manager (it consumes the `RunBudget`
 # trait from advance-shared-types).
 advance-run-manager = { path = "../../run-manager" }
+cap-tools = { path = "../cap-tools" }
+cap-mcp = { path = "../cap-mcp" }
+async-trait = { workspace = true }
 
 [lints]
 workspace = true

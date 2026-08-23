@@ -1,7 +1,7 @@
 //! `SubsetValidator` (CONTRACT-122, MODULE-013 §1.4.3 / PRD §5.7.4).
 //!
-//! Implements the 14 parameter-level subset rules from spec §1.4.3 across 10
-//! capability families. Trait + impl live local to `cap-grant` (NOT promoted
+//! Implements the 14 parameter-level subset rules from spec §1.4.3 across 11
+//! capability families (`web` is whole-capability-only). Trait + impl live local to `cap-grant` (NOT promoted
 //! to shared-types — ARCH §4.2's dependency-inversion list excludes
 //! CONTRACT-122; ARCH §6.1's CONTRACT-122 row direction is M013 → M005 as a
 //! direct compile-time edge).
@@ -86,6 +86,11 @@ impl SubsetValidator for SubsetValidatorImpl {
             "notify" => check_list_subset(&parent.params, &child.params, &["targets"]),
             "mcp" => check_mcp(&parent.params, &child.params),
             "skills" => check_skills(&parent.params, &child.params),
+            "web" => Err(CapGrantError::SubsetViolation(
+                "web is a whole-capability-only grant dimension; param-level subset rules \
+                 are undefined"
+                    .into(),
+            )),
             other => Err(CapGrantError::SubsetViolation(format!(
                 "unknown capability {other:?} — subset rules undefined; fail-closed per \
                  PRD §5.7.4"
