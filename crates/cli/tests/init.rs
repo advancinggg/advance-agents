@@ -24,6 +24,10 @@ fn init_creates_workspace_skeleton() {
     assert!(ws.join(".runtime").is_dir());
     assert!(ws.join(".agent").is_dir());
     assert!(ws.join(".advance/runtime-config.yaml").is_file());
+    assert!(
+        !ws.join(".agent/behavior.wasm").exists(),
+        "advance init does not write a create-only driver"
+    );
 }
 
 #[test]

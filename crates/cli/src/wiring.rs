@@ -34,7 +34,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use advance_event_bus::{EventBus, EventBusConfig, EventBusError, ObservabilityReadApi};
-use advance_messaging::{AgentIdBridge, DynamicRouting, MailboxStore};
+use advance_messaging::{AgentIdBridge, DynamicRouting, MailboxStore, DEFAULT_CAPACITY};
 use advance_run_manager::{RepetitionGuard, RepetitionGuardConfig, RunConfig, RunManager};
 // await-leg B-2 (2026-06-22) — the production messaging-chain registration entry +
 // the suspend-sink port type, consumed by the `declares_messaging` block below.
@@ -619,6 +619,9 @@ pub struct WiringHandles {
     /// Wave-20 notify production closure: the shared process mailbox store for
     /// messaging-declaring workspaces. `None` iff `messaging` is not declared.
     pub messaging_store: Option<Arc<MailboxStore>>,
+    /// Mailbox the Client API messaging provider and the root serve loop share.
+    /// Always set: the C216 store when messaging is declared, otherwise a new store.
+    pub client_ingress_store: Arc<MailboxStore>,
     /// The one process reply registry shared by the dispatcher, serving loop,
     /// and POST listener. Constructed in the composition root even when C216 is
     /// inactive so the legacy no-messaging path remains available.
@@ -1452,6 +1455,9 @@ async fn wire_capabilities_inner(
     let messaging_store = progress_lifecycle
         .as_ref()
         .map(|activation| activation.mailbox_store.clone());
+    let client_ingress_store = messaging_store
+        .clone()
+        .unwrap_or_else(|| Arc::new(MailboxStore::new(DEFAULT_CAPACITY)));
 
     // Build the await manager only after protected MailboxStore activation.
     // `build_await_messaging_chain` installs its concrete dispatcher as the
@@ -2406,6 +2412,11 @@ async fn wire_capabilities_inner(
                 _ => None,
             };
             let grant_approval_for_api = grant_approval_intake.clone();
+            let ingress_for_api = client_ingress_store.clone();
+            let replies_for_api = reply_registry.clone();
+            let ingress_port = progress_lifecycle
+                .as_ref()
+                .map(|activation| activation.execution_ingress.clone());
             match advance_client_api::ClientApiServer::bind_local_factory(0, move |address| {
                 let mut config = advance_client_api::ClientApiConfig::default();
                 config.allowed_origins = vec![format!("http://{address}")];
@@ -2441,6 +2452,12 @@ async fn wire_capabilities_inner(
                 if let Some(hub) = llm_delta_hub_opt.as_ref() {
                     api = api.with_llm_delta_hub(Arc::clone(hub));
                 }
+                api = crate::client_api_adapters::install_serve_loop_messaging(
+                    api,
+                    ingress_for_api.clone(),
+                    ingress_port.clone(),
+                    replies_for_api.clone(),
+                );
                 Arc::new(api)
             })
             .await
@@ -2493,6 +2510,7 @@ async fn wire_capabilities_inner(
             vlm_extractor,
             memory_store,
             messaging_store,
+            client_ingress_store,
             reply_registry,
             channel_runtime,
             progress_lifecycle,

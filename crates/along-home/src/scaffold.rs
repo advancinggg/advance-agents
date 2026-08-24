@@ -161,6 +161,36 @@ pub(crate) fn write_0600_nofollow(path: &Path, bytes: &[u8]) -> Result<(), std::
     Ok(())
 }
 
+/// CONTRACT-243 create-only driver bytes. Copied from
+/// `crates/runtime/tests/fixtures/guest-rust-hello-llm.core.wasm` (wasm32 core).
+const CREATE_DRIVER: &[u8] = include_bytes!("fixtures/behavior.core.wasm");
+
+/// Materialize `<home>/.agent/behavior.wasm` for a new-home `create`.
+/// Not used by `write_recognizable_home` / `advance init`.
+pub(crate) fn write_create_driver(home: &Path) -> Result<(), std::io::Error> {
+    if !crate::recognize::is_real_dir(home) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "home is not a real directory",
+        ));
+    }
+    let agent = home.join(".agent");
+    if !crate::recognize::is_real_dir(&agent) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "agent dir is not a real directory",
+        ));
+    }
+    write_new_0600(&agent.join("behavior.wasm"), CREATE_DRIVER)?;
+    if !crate::recognize::is_real_dir(home) || !crate::recognize::is_real_dir(&agent) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "home or agent dir was replaced during driver write",
+        ));
+    }
+    Ok(())
+}
+
 fn write_new_0600(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);

@@ -1,18 +1,25 @@
 //! Production adapters from host observation/grant surfaces to CONTRACT-190.
 
-use std::sync::{mpsc, Arc};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::SystemTime;
 
 use advance_client_api::{
     BoundGrantApprovalPort, BoundGrantMutation, BoundHistoryPage, BoundHistoryReadPort,
-    BoundMutationOutcome, ClientEventProvider, NormalizedEventFilter, ProviderClientDoneReceipt,
-    ProviderError, ProviderMutationRecovery, ProviderPrepareOutcome, RawEventRow,
+    BoundMutationOutcome, ClientApi, ClientEventProvider, ClientMessageAck, ClientMessageStatus,
+    MessagingProvider, NormalizedEventFilter, ProviderClientDoneReceipt, ProviderError,
+    ProviderMutationRecovery, ProviderPrepareOutcome, RawEventRow,
 };
 use advance_event_bus::{EventFilter, ObservabilityReadApi, ReadApiError, ReadCursor, ReadEvent};
+use advance_messaging::{MailboxStore, Message, MessageKind, MsgError};
 use advance_shared_types::sensitive_observation::{CanonicalCapParam, ObservationNode};
 use cap_grant::{GrantApprovalIntake, GrantTtl};
 
+use crate::execution_turn_ingress::ExecutionTurnIngress;
 use crate::observation_carriers::ObservationCarrierStore;
 use crate::observation_projection::Contract219EventProjector;
+use crate::reply::ReplyRegistry;
 
 const HISTORY_LIMIT: usize = 100;
 const REDACTED: &str = "[REDACTED]";
@@ -509,4 +516,111 @@ fn ttl_node(ttl: GrantTtl) -> ObservationNode {
             .map(|(key, value)| (key.to_owned(), ObservationNode::String(value.to_owned())))
             .collect(),
     )
+}
+
+/// Must match `commands::start::DEFAULT_MSG_AGENT_ID` (avoid a start↔adapters cycle).
+const SERVE_LOOP_AGENT: &str = "agent:default";
+
+/// CLI-served CONTRACT-190 messaging port: deliver a User message onto the
+/// same mailbox the root serve loop recvs (POST `/msg` generate path).
+pub struct ServeLoopMessagingProvider {
+    store: Arc<MailboxStore>,
+    ingress: Option<Arc<ExecutionTurnIngress>>,
+    replies: Arc<ReplyRegistry>,
+    counter: AtomicU64,
+    sent: Mutex<HashMap<String, String>>,
+}
+
+impl ServeLoopMessagingProvider {
+    pub(crate) fn new(
+        store: Arc<MailboxStore>,
+        ingress: Option<Arc<ExecutionTurnIngress>>,
+        replies: Arc<ReplyRegistry>,
+    ) -> Self {
+        Self {
+            store,
+            ingress,
+            replies,
+            counter: AtomicU64::new(0),
+            sent: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn for_test(store: Arc<MailboxStore>, replies: Arc<ReplyRegistry>) -> Self {
+        Self::new(store, None, replies)
+    }
+}
+
+pub(crate) fn install_serve_loop_messaging(
+    api: ClientApi,
+    store: Arc<MailboxStore>,
+    ingress: Option<Arc<ExecutionTurnIngress>>,
+    replies: Arc<ReplyRegistry>,
+) -> ClientApi {
+    api.with_messaging_provider(Arc::new(ServeLoopMessagingProvider::new(
+        store, ingress, replies,
+    )))
+}
+
+impl MessagingProvider for ServeLoopMessagingProvider {
+    fn send(&self, to: &str, payload: &[u8]) -> Result<ClientMessageAck, ProviderError> {
+        if to != SERVE_LOOP_AGENT {
+            return Err(ProviderError::NotFound("target".to_owned()));
+        }
+        let message_id = format!("cmsg-{}", self.counter.fetch_add(1, Ordering::SeqCst));
+        let msg = Message {
+            id: message_id.clone(),
+            kind: MessageKind::User,
+            from: "user:client-api".to_string(),
+            to: to.to_string(),
+            payload: payload.to_vec(),
+            context: None,
+            timestamp: SystemTime::now(),
+            origin: None,
+        };
+        let delivery = match self.ingress.as_deref() {
+            Some(ingress) => ingress.publish(msg),
+            None => self
+                .store
+                .get_or_create(to)
+                .and_then(|mailbox| mailbox.deliver(msg)),
+        };
+        delivery.map_err(|e| match e {
+            MsgError::MailboxFull => ProviderError::Unavailable("mailbox_full".to_owned()),
+            MsgError::InvalidPayload(_) => ProviderError::TooLarge("payload".to_owned()),
+            _ => ProviderError::Unavailable("deliver".to_owned()),
+        })?;
+        self.replies.clear_last_outbound(to);
+        self.sent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(message_id.clone(), to.to_string());
+        Ok(ClientMessageAck {
+            message_id,
+            to: to.to_string(),
+            delivery_state: "delivered".to_string(),
+        })
+    }
+
+    fn message_status(&self, message_id: &str) -> Result<ClientMessageStatus, ProviderError> {
+        let to = self
+            .sent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(message_id)
+            .cloned()
+            .ok_or_else(|| ProviderError::NotFound("message".to_owned()))?;
+        let reply_state = match self.replies.last_outbound(&to) {
+            Some(true) => "replied",
+            _ => "none",
+        };
+        Ok(ClientMessageStatus {
+            message_id: message_id.to_string(),
+            to,
+            from: "user:client-api".to_string(),
+            delivery_state: "delivered".to_string(),
+            reply_state: reply_state.to_string(),
+        })
+    }
 }

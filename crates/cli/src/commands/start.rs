@@ -411,9 +411,9 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
         // memory declared) for the real Tier-1b knowledge reader — same Arc the WIT
         // handlers use (no second open).
         wiring_handles.memory_store.clone(),
-        // Wave-20 notify production closure: reuse the composition root's
-        // messaging store so notify delivery and the serve loop share one mailbox.
-        wiring_handles.messaging_store.clone(),
+        // Client API messaging and the root serve loop share this mailbox
+        // (first-open fs+llm homes have no C216 messaging_store).
+        Some(wiring_handles.client_ingress_store.clone()),
         wiring_handles.reply_registry.clone(),
         wiring_handles.channel_runtime.clone(),
         progress_loop_wiring,
@@ -2179,6 +2179,7 @@ mod tests_024 {
     //! the production loader resolves the canonical materialized name and encodes a
     //! core module to a Component on the fly so a template-materialized child loads.
     use super::{is_core_module, resolve_driver_component_bytes};
+    use advance_along_home::{AlongHomeFirstOpen, HostAlongHome};
     use advance_runtime::config::WasmConfig;
     use advance_runtime::ComponentRuntime;
     use wit_component::ComponentEncoder;
@@ -2242,6 +2243,26 @@ mod tests_024 {
             .expect("runtime")
             .load_component(&bytes)
             .expect("materialized behavior.wasm loads");
+    }
+
+    #[test]
+    fn t109_create_home_resolves_and_loads() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = HostAlongHome::production()
+            .create(tmp.path(), "home-t109")
+            .expect("create");
+        let (path, bytes) = resolve_driver_component_bytes(home.path())
+            .expect("resolve ok")
+            .expect("create wrote a driver");
+        assert!(
+            path.ends_with("behavior.wasm"),
+            "resolved the AC-20 fallback name"
+        );
+        assert_eq!(bytes[4], 0x0d, "resolved bytes are an encoded Component");
+        ComponentRuntime::new(&wasm_cfg())
+            .expect("runtime")
+            .load_component(&bytes)
+            .expect("create-home behavior.wasm loads");
     }
 
     #[test]

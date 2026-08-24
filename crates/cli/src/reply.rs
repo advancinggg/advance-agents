@@ -50,12 +50,15 @@ type ReplySlot = oneshot::Sender<Option<Vec<u8>>>;
 /// correlation) needs a CONTRACT-051 dispatch-trait change and is Step-3.
 pub struct ReplyRegistry {
     inner: Mutex<HashMap<String, ReplySlot>>,
+    /// Per-agent "had a produced reply" bit. Never stores payload bytes.
+    last_outbound: Mutex<HashMap<String, bool>>,
 }
 
 impl ReplyRegistry {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            last_outbound: Mutex::new(HashMap::new()),
         }
     }
 
@@ -74,9 +77,34 @@ impl ReplyRegistry {
     /// slot is registered; never panics if the receiver was already dropped
     /// (timeout / client disconnect).
     pub fn fulfill(&self, agent_id: &str, reply: Option<Vec<u8>>) {
+        {
+            let mut last = self
+                .last_outbound
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            last.insert(agent_id.to_string(), reply.is_some());
+        }
         if let Some(tx) = self.lock().remove(agent_id) {
             let _ = tx.send(reply);
         }
+    }
+
+    /// Last `fulfill` for `agent_id`: `None` never fulfilled; `Some(false)` empty
+    /// action batch; `Some(true)` produced a reply. Payload bytes are not retained.
+    pub fn last_outbound(&self, agent_id: &str) -> Option<bool> {
+        self.last_outbound
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(agent_id)
+            .copied()
+    }
+
+    /// Drop a recorded fulfill so a new Client API send starts at `reply_state: none`.
+    pub fn clear_last_outbound(&self, agent_id: &str) {
+        self.last_outbound
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(agent_id);
     }
 
     /// Drop a pending registration without fulfilling it (the deliver-error
