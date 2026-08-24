@@ -193,6 +193,25 @@ fn kernel_exe(pid: u32) -> Option<PathBuf> {
     }
 }
 
+/// Loopback LISTEN for one owned pid (not a box-wide fixture census).
+pub fn listen_addr_for_pid(pid: u32) -> Option<SocketAddr> {
+    listen_addr_127(pid)
+}
+
+/// `lsof` can lag the PORT= handshake by a few milliseconds.
+pub fn wait_listen_addr_for_pid(pid: u32, budget: std::time::Duration) -> Option<SocketAddr> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if let Some(addr) = listen_addr_127(pid) {
+            return Some(addr);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn listen_addr_127(pid: u32) -> Option<SocketAddr> {
     // macOS lsof ORs selection lists unless `-a` is set. Without it, `-p PID -iTCP`
     // dumps every TCP listener on the box (first n-line is some other daemon).

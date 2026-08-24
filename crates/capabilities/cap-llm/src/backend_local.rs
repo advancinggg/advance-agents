@@ -102,6 +102,11 @@ pub struct SupervisedChild {
 }
 
 impl SupervisedChild {
+    /// OS pid of the spawned sidecar (process-group leader).
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
     fn reap_group(&self) {
         #[cfg(unix)]
         unsafe {

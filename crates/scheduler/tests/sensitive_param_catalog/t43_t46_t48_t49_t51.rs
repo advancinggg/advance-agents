@@ -269,7 +269,8 @@ async fn finalize_published_agent(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    let retain_until_ms = now_ms + 100;
+    // 100ms was too tight on loaded GHA runners (finalize saw retain_until < now).
+    let retain_until_ms = now_ms + 2_000;
     let prepared = harness
         .provider
         .prepare_agent_termination(

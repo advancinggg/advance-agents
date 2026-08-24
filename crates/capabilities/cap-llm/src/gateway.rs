@@ -257,7 +257,6 @@ pub struct LlmGateway {
     inference_backends: Arc<advance_shared_types::inference::InferenceBackendRegistry>,
     catalog: Arc<crate::catalog::ModelProfileCatalog>,
     /// Sidecar OS-process owners. Last `LlmGateway` Arc drop kills them.
-    #[allow(dead_code)]
     sidecar_holds: Vec<Arc<crate::backend_local::SupervisedChild>>,
     /// CONTRACT-234 post-scan token-delta tee (ADR 2026-07-22 D6, tee slice T1).
     ///
@@ -327,6 +326,11 @@ impl LlmGateway {
     ) -> Self {
         self.sidecar_holds = holds;
         self
+    }
+
+    /// Production-owned sidecar children (empty when no local sidecar spawned).
+    pub fn sidecar_holds(&self) -> &[Arc<crate::backend_local::SupervisedChild>] {
+        &self.sidecar_holds
     }
 
     pub(crate) fn map_backend_err(

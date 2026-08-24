@@ -2495,7 +2495,6 @@ impl SystemUnderTestBuilder {
                 Some(lp)
             }
             LlmMode::LocalSidecar { launch } => {
-                let before = sidecar_fixture::snapshot_listening_sidecars();
                 let responses = vec![llm_loopback::ScriptedResponse::ok_chat(
                     llm_loopback::CLOUD_FALLBACK_SENTINEL,
                     3,
@@ -2540,22 +2539,34 @@ impl SystemUnderTestBuilder {
                     delta,
                 );
                 cap_llm::register_agent_llm(&*registry, gw.clone());
-                llm_production = Some(gw);
-                llm_cfg = Some(prod_cfg);
-                let after = sidecar_fixture::snapshot_listening_sidecars();
-                let spawned = sidecar_fixture::sidecar_diff(&before, &after);
                 match launch {
                     SidecarLaunch::Fixture => {
+                        let holds = gw.sidecar_holds();
                         assert_eq!(
-                            spawned.len(),
+                            holds.len(),
                             1,
-                            "exactly one new fixture LISTEN after production spawn; got {spawned:?}"
+                            "production spawn owns exactly one fixture child"
                         );
-                        sidecar_pid = Some(spawned[0].0);
-                        sidecar_addr = Some(spawned[0].1);
+                        let pid = holds[0].pid();
+                        let addr = sidecar_fixture::wait_listen_addr_for_pid(
+                            pid,
+                            std::time::Duration::from_secs(2),
+                        )
+                        .unwrap_or_else(|| {
+                            panic!("owned fixture pid {pid} must LISTEN on 127.0.0.1")
+                        });
+                        sidecar_pid = Some(pid);
+                        sidecar_addr = Some(addr);
                     }
-                    SidecarLaunch::Absent => {}
+                    SidecarLaunch::Absent => {
+                        assert!(
+                            gw.sidecar_holds().is_empty(),
+                            "absent sidecar command must not own a child"
+                        );
+                    }
                 }
+                llm_production = Some(gw);
+                llm_cfg = Some(prod_cfg);
                 Some(lp)
             }
             LlmMode::ProductionSsrf { origin, script } => {
