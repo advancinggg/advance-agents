@@ -343,6 +343,125 @@ impl TeeState {
     }
 }
 
+/// Buffered `generate` / `generate_via_local` producer over the same `TeeState`.
+///
+/// Armed only when the caller asked for a live tee (`tee_live`) AND the sink is
+/// wired. Unwired / non-live: no UUID, no `TeeState`, Drop is a no-op.
+pub(crate) struct GenerateTee {
+    inner: Option<Arc<TeeState>>,
+    seq: u64,
+    closed: bool,
+    fail_usage: Option<advance_shared_types::traits::LlmDeltaUsage>,
+}
+
+impl GenerateTee {
+    pub(crate) fn disarmed() -> Self {
+        Self {
+            inner: None,
+            seq: 0,
+            closed: true,
+            fail_usage: None,
+        }
+    }
+
+    pub(crate) fn open(
+        sink: Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
+        agent_id: &str,
+        run_id: Option<String>,
+        task_id: Option<String>,
+    ) -> Self {
+        if !sink.is_wired() {
+            return Self::disarmed();
+        }
+        let key = format!("st_{}", uuid::Uuid::new_v4().simple());
+        let tee = TeeState::new(sink, agent_id, &key);
+        tee.publish_begin(run_id, task_id);
+        Self {
+            inner: Some(tee),
+            seq: 0,
+            closed: false,
+            fail_usage: None,
+        }
+    }
+
+    pub(crate) fn open_if_live(
+        live: bool,
+        sink: Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
+        agent_id: &str,
+        run_id: Option<String>,
+        task_id: Option<String>,
+    ) -> Self {
+        if live {
+            Self::open(sink, agent_id, run_id, task_id)
+        } else {
+            Self::disarmed()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_armed(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    pub(crate) fn succeed(
+        &mut self,
+        text: &str,
+        usage: Option<advance_shared_types::traits::LlmDeltaUsage>,
+    ) {
+        if let Some(tee) = &self.inner {
+            // Same 256 KiB guest-visible bound as WIT encode / C235 window.
+            // A single uncapped Delta larger than DELTA_WINDOW_BYTES is dropped
+            // whole by the hub (pending-full), so concat would be empty.
+            let text = cap_tee_text(text);
+            tee.publish_delta(self.seq, text);
+            self.seq = self.seq.saturating_add(1);
+            tee.publish_terminal(
+                self.seq,
+                advance_shared_types::traits::LlmTerminalReason::Completed,
+                usage,
+            );
+        }
+        self.closed = true;
+    }
+
+    pub(crate) fn note_committed_usage(
+        &mut self,
+        usage: advance_shared_types::traits::LlmDeltaUsage,
+    ) {
+        self.fail_usage = Some(usage);
+    }
+}
+
+/// Matches `host_fn::MAX_ENCODED_TEXT_BYTES` / C235 `DELTA_WINDOW_BYTES`.
+const TEE_TEXT_MAX: usize = 256 * 1024;
+
+fn cap_tee_text(text: &str) -> &str {
+    if text.len() <= TEE_TEXT_MAX {
+        return text;
+    }
+    let mut end = TEE_TEXT_MAX;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+impl Drop for GenerateTee {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        if let Some(tee) = &self.inner {
+            tee.publish_terminal(
+                self.seq,
+                advance_shared_types::traits::LlmTerminalReason::ProviderError,
+                self.fail_usage,
+            );
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum LivePhase {
     Running,
@@ -834,6 +953,7 @@ impl Settlement {
                         ..Default::default()
                     },
                     output_schema: None,
+                    tee_live: false,
                 };
                 match &terminal {
                     LivePhase::Done {
@@ -1882,6 +2002,7 @@ impl StreamRegistry {
                     ..Default::default()
                 },
                 output_schema: None,
+                tee_live: false,
             },
             response: ChatResponse {
                 text,
@@ -2253,6 +2374,45 @@ mod tee_state_tests {
     /// The headless default is a REAL installed sink (the criterion says "inject"),
     /// and it is free: `is_live` is false, so no caller builds a frame at all.
     #[test]
+    fn generate_tee_notwired_is_disarmed_before_uuid() {
+        let rec = Arc::new(Recorder::default());
+        // A wired recorder would receive frames; NotWired must skip construction.
+        let tee = GenerateTee::open(Arc::new(NotWiredDeltaSink), "a", None, None);
+        assert!(!tee.is_armed());
+        let mut tee = tee;
+        tee.succeed("hello", None);
+        assert!(rec.frames().is_empty());
+    }
+
+    #[test]
+    fn generate_tee_caps_oversize_body_to_window() {
+        let rec = Arc::new(Recorder::default());
+        let mut tee = GenerateTee::open(rec.clone() as Arc<dyn LlmDeltaSink>, "a", None, None);
+        let huge = "x".repeat(TEE_TEXT_MAX + 8);
+        tee.succeed(&huge, None);
+        let concat: String = rec
+            .frames()
+            .iter()
+            .filter_map(|f| match f {
+                LlmDeltaFrame::Delta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(concat.len(), TEE_TEXT_MAX);
+        assert!(!concat.contains('y'));
+    }
+
+    #[test]
+    fn generate_tee_open_if_live_false_skips_wired_sink() {
+        let rec = Arc::new(Recorder::default());
+        let tee =
+            GenerateTee::open_if_live(false, rec.clone() as Arc<dyn LlmDeltaSink>, "a", None, None);
+        assert!(!tee.is_armed());
+        drop(tee);
+        assert!(rec.frames().is_empty());
+    }
+
+    #[test]
     fn t119_notwired_is_installed_and_never_live() {
         let tee = tee_with(Arc::new(NotWiredDeltaSink));
         assert!(!tee.is_live(), "an unwired sink must never be live");
@@ -2520,6 +2680,7 @@ mod tests {
                 messages: vec![],
                 params: Default::default(),
                 output_schema: None,
+                tee_live: false,
             },
             response: ChatResponse {
                 text: text.into(),

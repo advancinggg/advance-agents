@@ -194,6 +194,9 @@ pub(crate) struct LlmRequestContext {
     pub messages: Vec<ChatMessage>,
     pub params: ChatParams,
     pub output_schema: Option<String>,
+    /// When true, `generate` / `generate_via_local` bind `TeeState` (guest WIT
+    /// generate). Host `chat()` / extractors leave this false.
+    pub tee_live: bool,
 }
 
 /// cap-llm-gaps (2026-06-04) — finalized buffered-stream payload produced by
@@ -363,6 +366,7 @@ impl LlmGateway {
             }
         }
         let port = self.local_port(&resolved.id)?;
+        let mut tee = self.generate_tee(&ctx);
         emit_llm_request(self.event_bus.as_ref(), &ctx, &resolved.model);
         let req =
             to_inference_chat_req(&resolved, &ctx, Instant::now() + cap_http::DEFAULT_TIMEOUT);
@@ -394,6 +398,11 @@ impl LlmGateway {
                     if let Some(rid) = &ctx.run_id {
                         self.run_budget
                             .commit(rid, clamped_in.saturating_add(clamped_out), cost);
+                        tee.note_committed_usage(advance_shared_types::traits::LlmDeltaUsage {
+                            input_tokens: clamped_in,
+                            output_tokens: clamped_out,
+                            cost_usd: cost,
+                        });
                     }
                     emit_llm_error(
                         self.event_bus.as_ref(),
@@ -421,6 +430,11 @@ impl LlmGateway {
                     if let Some(rid) = &ctx.run_id {
                         self.run_budget
                             .commit(rid, clamped_in.saturating_add(clamped_out), cost);
+                        tee.note_committed_usage(advance_shared_types::traits::LlmDeltaUsage {
+                            input_tokens: clamped_in,
+                            output_tokens: clamped_out,
+                            cost_usd: cost,
+                        });
                     }
                     emit_llm_error(
                         self.event_bus.as_ref(),
@@ -458,6 +472,14 @@ impl LlmGateway {
             None,
             schema_validation,
         );
+        tee.succeed(
+            &chat_response.text,
+            Some(advance_shared_types::traits::LlmDeltaUsage {
+                input_tokens: clamped_in,
+                output_tokens: clamped_out,
+                cost_usd: cost,
+            }),
+        );
         Ok(chat_response)
     }
 
@@ -481,6 +503,7 @@ impl LlmGateway {
             messages: vec![],
             params: ChatParams::default(),
             output_schema: None,
+            tee_live: false,
         };
         emit_llm_request(self.event_bus.as_ref(), &placeholder_ctx, &model);
         let req = advance_shared_types::inference::InferenceEmbedRequest {
@@ -590,6 +613,16 @@ impl LlmGateway {
     /// The installed sink, for composition-identity verification.
     pub fn delta_sink(&self) -> Arc<dyn advance_shared_types::traits::LlmDeltaSink> {
         Arc::clone(&self.delta_sink)
+    }
+
+    fn generate_tee(&self, ctx: &LlmRequestContext) -> crate::stream::GenerateTee {
+        crate::stream::GenerateTee::open_if_live(
+            ctx.tee_live,
+            self.delta_sink(),
+            &ctx.agent_id,
+            ctx.run_id.clone(),
+            ctx.task_id.clone(),
+        )
     }
 }
 
@@ -1431,6 +1464,7 @@ impl LlmGateway {
             messages,
             params,
             output_schema: None,
+            tee_live: false,
         })
         .await
     }
@@ -1500,6 +1534,8 @@ impl LlmGateway {
         // failure (invalid endpoint url / scheme not allowed) would leave
         // an orphan llm.request with no paired llm.response or llm.error.
         let http_cap = build_http_cap(&resolved, &provider_cfg)?;
+
+        let mut tee = self.generate_tee(&ctx);
 
         // Emit llm.request.
         emit_llm_request(self.event_bus.as_ref(), &ctx, &resolved.model);
@@ -1826,6 +1862,11 @@ impl LlmGateway {
                 if let Some(rid) = &ctx.run_id {
                     self.run_budget
                         .commit(rid, total_committed_tokens, total_committed_cost);
+                    tee.note_committed_usage(advance_shared_types::traits::LlmDeltaUsage {
+                        input_tokens: clamped_in,
+                        output_tokens: clamped_out,
+                        cost_usd: total_committed_cost,
+                    });
                 }
                 if let Some(msg) = exhausted_err {
                     emit_llm_error(
@@ -1862,6 +1903,14 @@ impl LlmGateway {
                     },
                     schema_validation,
                 );
+                tee.succeed(
+                    &chat_response.text,
+                    Some(advance_shared_types::traits::LlmDeltaUsage {
+                        input_tokens: clamped_in,
+                        output_tokens: clamped_out,
+                        cost_usd: attempt_cost,
+                    }),
+                );
                 return Ok(chat_response);
             }
 
@@ -1873,6 +1922,13 @@ impl LlmGateway {
                     if let Some(rid) = &ctx.run_id {
                         self.run_budget
                             .commit(rid, total_committed_tokens, total_committed_cost);
+                        if exhausted_err.is_some() {
+                            tee.note_committed_usage(advance_shared_types::traits::LlmDeltaUsage {
+                                input_tokens: clamped_in,
+                                output_tokens: clamped_out,
+                                cost_usd: total_committed_cost,
+                            });
+                        }
                     }
                     if let Some(msg) = exhausted_err {
                         // Pass/Warn on the schema-exhaustion path — call still
@@ -1914,6 +1970,14 @@ impl LlmGateway {
                         },
                         schema_validation,
                     );
+                    tee.succeed(
+                        &chat_response.text,
+                        Some(advance_shared_types::traits::LlmDeltaUsage {
+                            input_tokens: clamped_in,
+                            output_tokens: clamped_out,
+                            cost_usd: attempt_cost,
+                        }),
+                    );
                     return Ok(chat_response);
                 }
                 RepetitionDecision::Terminate(reason) => {
@@ -1924,6 +1988,11 @@ impl LlmGateway {
                     if let Some(rid) = &ctx.run_id {
                         self.run_budget
                             .commit(rid, total_committed_tokens, total_committed_cost);
+                        tee.note_committed_usage(advance_shared_types::traits::LlmDeltaUsage {
+                            input_tokens: clamped_in,
+                            output_tokens: clamped_out,
+                            cost_usd: total_committed_cost,
+                        });
                     }
                     emit_llm_error(
                         self.event_bus.as_ref(),
@@ -1973,6 +2042,7 @@ impl LlmGatewayInternal for LlmGateway {
             messages,
             params,
             output_schema: None,
+            tee_live: false,
         })
         .await
     }
@@ -2021,6 +2091,7 @@ impl LlmGatewayInternal for LlmGateway {
             messages: vec![],
             params: ChatParams::default(),
             output_schema: None,
+            tee_live: false,
         };
         emit_llm_request(self.event_bus.as_ref(), &placeholder_ctx, &embed_model);
 
@@ -2245,6 +2316,7 @@ impl LlmGateway {
             messages,
             params,
             output_schema: None, // <-- intentional; validate externally below
+            tee_live: false,
         };
         match self.generate(ctx).await {
             Ok(mut response) => {
@@ -2642,6 +2714,7 @@ impl LlmGateway {
             messages,
             params,
             output_schema: Some(output_schema),
+            tee_live: false,
         })
         .await
     }
@@ -2974,6 +3047,74 @@ mod tests {
         }
     }
 
+    fn teed_harness(sink: Arc<dyn advance_shared_types::traits::LlmDeltaSink>) -> Harness {
+        let cfg_provider = Arc::new(MockRuntimeConfigProvider::new(fixture_runtime_config()));
+        let chain = Arc::new(MockHttpSecurityChain::default());
+        let budget = Arc::new(MockRunBudget::default());
+        let bus = Arc::new(MockEventBusEmit::default());
+        let rep_guard = crate::test_support::no_op_repetition_guard();
+        let gateway = Arc::new(
+            LlmGateway::new(
+                Arc::clone(&cfg_provider) as Arc<dyn RuntimeConfigProvider>,
+                Arc::clone(&chain) as Arc<dyn HttpSecurityChain>,
+                Arc::clone(&budget) as Arc<dyn RunBudget>,
+                Arc::clone(&bus) as Arc<dyn EventBusEmit>,
+                rep_guard as Arc<dyn RepetitionGuardCheck>,
+                "test-agent".into(),
+            )
+            .with_delta_sink(sink),
+        );
+        Harness {
+            gateway,
+            chain,
+            budget,
+            bus,
+            cfg_provider,
+        }
+    }
+
+    #[derive(Default)]
+    struct FrameRec {
+        events: std::sync::Mutex<Vec<advance_shared_types::traits::LlmDeltaEvent>>,
+    }
+    impl advance_shared_types::traits::LlmDeltaSink for FrameRec {
+        fn publish(&self, event: advance_shared_types::traits::LlmDeltaEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+    impl FrameRec {
+        fn frames(&self) -> Vec<advance_shared_types::traits::LlmDeltaFrame> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| e.frame.clone())
+                .collect()
+        }
+        fn keys(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| e.stream_key.to_string())
+                .collect()
+        }
+    }
+
+    fn teed_ctx(run_id: Option<&str>) -> LlmRequestContext {
+        LlmRequestContext {
+            agent_id: "test-agent".into(),
+            task_id: None,
+            run_id: run_id.map(str::to_string),
+            iteration: None,
+            trace_id: None,
+            messages: vec![user_msg("hi")],
+            params: ChatParams::default(),
+            output_schema: None,
+            tee_live: true,
+        }
+    }
+
     // Backbone Step 2 — the per-agent assembled-context store: round-trip,
     // per-agent isolation, and per-turn overwrite. Sync (no await).
     #[test]
@@ -3144,6 +3285,7 @@ mod tests {
                 r#"{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]}"#
                     .into(),
             ),
+            tee_live: false,
         };
         let result = h.gateway.generate(ctx).await.expect("retry path success");
         assert!(result.parsed_output.is_some());
@@ -3490,6 +3632,7 @@ mod tests {
                 messages: vec![user_msg("hi")],
                 params: ChatParams::default(),
                 output_schema: None,
+                tee_live: false,
             })
             .await
             .unwrap();
@@ -3591,6 +3734,7 @@ mod tests {
                 messages: vec![user_msg("give me x")],
                 params: ChatParams::default(),
                 output_schema: Some(schema.into()),
+                tee_live: false,
             })
             .await
             .unwrap();
@@ -3635,6 +3779,7 @@ mod tests {
                 messages: vec![user_msg("give me x")],
                 params: ChatParams::default(),
                 output_schema: Some(schema.into()),
+                tee_live: false,
             })
             .await;
         assert!(matches!(result, Err(LlmError::StructuredOutputFailed(_))));
@@ -3784,6 +3929,7 @@ mod tests {
                     messages: vec![user_msg("hi")],
                     params: ChatParams::default(),
                     output_schema: Some(schema),
+                    tee_live: false,
                 })
                 .await
             }
@@ -4246,6 +4392,7 @@ mod tests {
                 r#"{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]}"#
                     .into(),
             ),
+            tee_live: false,
         };
         let result = h.gateway.generate(ctx).await.expect("retry should succeed");
         assert_eq!(result.parsed_output.is_some(), true);
@@ -4445,6 +4592,7 @@ mod tests {
             messages: vec![user_msg("Return JSON")],
             params: ChatParams::default(),
             output_schema: Some(schema.to_string()),
+            tee_live: false,
         };
         // tokio::time::advance to skip backoff sleeps
         let fut = gateway.generate(ctx);
@@ -4499,6 +4647,7 @@ mod tests {
             messages: vec![user_msg("Return JSON")],
             params: ChatParams::default(),
             output_schema: Some(schema.to_string()),
+            tee_live: false,
         };
         let fut = gateway.generate(ctx);
         tokio::pin!(fut);
@@ -4602,6 +4751,7 @@ mod tests {
             messages: vec![user_msg("Return JSON")],
             params: ChatParams::default(),
             output_schema: Some(schema.to_string()),
+            tee_live: false,
         };
         let fut = gateway.generate(ctx);
         tokio::pin!(fut);
@@ -4762,5 +4912,128 @@ mod tests {
             Err(LlmError::RepetitionTerminated(reason)) => assert_eq!(reason, "rep-stream"),
             other => panic!("expected RepetitionTerminated on stream, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn generate_tee_success_begin_delta_terminal() {
+        use advance_shared_types::traits::LlmDeltaFrame;
+        let rec = Arc::new(FrameRec::default());
+        let h = teed_harness(rec.clone());
+        h.chain
+            .push_response("/v1/chat/completions", Ok(ok_chat_response("hello", 1, 2)));
+        let resp = h
+            .gateway
+            .generate(teed_ctx(None))
+            .await
+            .expect("generate ok");
+        assert_eq!(resp.text, "hello");
+        let keys = rec.keys();
+        assert!(!keys.is_empty());
+        assert!(keys.iter().all(|k| k == &keys[0]), "one stream_key");
+        assert!(keys[0].starts_with("st_"));
+        let frames = rec.frames();
+        assert!(matches!(frames.first(), Some(LlmDeltaFrame::Begin { .. })));
+        let concat: String = frames
+            .iter()
+            .filter_map(|f| match f {
+                LlmDeltaFrame::Delta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(concat, "hello");
+        assert!(matches!(
+            frames.last(),
+            Some(LlmDeltaFrame::Terminal { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn generate_tee_notwired_is_disarmed() {
+        #[derive(Default)]
+        struct Silent {
+            pubs: std::sync::atomic::AtomicUsize,
+        }
+        impl advance_shared_types::traits::LlmDeltaSink for Silent {
+            fn is_wired(&self) -> bool {
+                false
+            }
+            fn publish(&self, _: advance_shared_types::traits::LlmDeltaEvent) {
+                self.pubs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let silent = Arc::new(Silent::default());
+        let h = teed_harness(silent.clone());
+        h.chain
+            .push_response("/v1/chat/completions", Ok(ok_chat_response("hello", 1, 2)));
+        let _ = h
+            .gateway
+            .generate(teed_ctx(None))
+            .await
+            .expect("generate ok");
+        assert_eq!(
+            silent.pubs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "is_wired=false must skip publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_without_tee_live_publishes_nothing_on_wired_sink() {
+        let rec = Arc::new(FrameRec::default());
+        let h = teed_harness(rec.clone());
+        h.chain
+            .push_response("/v1/chat/completions", Ok(ok_chat_response("hello", 1, 2)));
+        let mut ctx = teed_ctx(None);
+        ctx.tee_live = false;
+        let resp = h.gateway.generate(ctx).await.expect("ok");
+        assert_eq!(resp.text, "hello");
+        assert!(
+            rec.frames().is_empty(),
+            "host chat/extractor path must not tee, got {:?}",
+            rec.frames()
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_tee_chain_error_closes_terminal() {
+        use advance_shared_types::security_validator::{HttpError, TransportErrorKind};
+        use advance_shared_types::traits::LlmDeltaFrame;
+        let rec = Arc::new(FrameRec::default());
+        let h = teed_harness(rec.clone());
+        h.chain.push_response(
+            "/v1/chat/completions",
+            Err(HttpError::Transport(TransportErrorKind::Other)),
+        );
+        let err = h.gateway.generate(teed_ctx(None)).await;
+        assert!(err.is_err());
+        let frames = rec.frames();
+        let begins = frames
+            .iter()
+            .filter(|f| matches!(f, LlmDeltaFrame::Begin { .. }))
+            .count();
+        assert_eq!(begins, 1, "open once outside retry loop, got {frames:?}");
+        let keys = rec.keys();
+        assert_eq!(
+            keys.iter().collect::<std::collections::HashSet<_>>().len(),
+            1
+        );
+        assert!(
+            matches!(frames.last(), Some(LlmDeltaFrame::Terminal { .. })),
+            "fail after Begin must close Terminal, got {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_tee_budget_deny_before_open_is_silent() {
+        let rec = Arc::new(FrameRec::default());
+        let h = teed_harness(rec.clone());
+        h.budget.deny("rid", "over limit");
+        let err = h.gateway.generate(teed_ctx(Some("rid"))).await;
+        assert!(matches!(err, Err(LlmError::BudgetExceeded(_))));
+        assert!(
+            rec.frames().is_empty(),
+            "budget deny before open must not Begin, got {:?}",
+            rec.frames()
+        );
     }
 }

@@ -177,6 +177,7 @@ impl MessagingProvider for DispatcherMessaging {
             from: ADAPTER_ID.to_string(),
             delivery_state: "delivered".to_string(),
             reply_state: if st.replied { "replied" } else { "none" }.to_string(),
+            stream_key: None,
         })
     }
 }

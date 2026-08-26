@@ -592,6 +592,7 @@ impl MessagingProvider for ServeLoopMessagingProvider {
             _ => ProviderError::Unavailable("deliver".to_owned()),
         })?;
         self.replies.clear_last_outbound(to);
+        self.replies.note_pending_message(to, &message_id);
         self.sent
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -617,6 +618,7 @@ impl MessagingProvider for ServeLoopMessagingProvider {
         };
         Ok(ClientMessageStatus {
             message_id: message_id.to_string(),
+            stream_key: self.replies.stream_key_for_message(message_id),
             to,
             from: "user:client-api".to_string(),
             delivery_state: "delivered".to_string(),

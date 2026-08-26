@@ -2144,8 +2144,12 @@ async fn wire_capabilities_inner(
             // Repetition guard stays NotWired (multi-step agentic run deferred).
             Arc::new(NotWiredRepetitionGuard),
             DEFAULT_AGENT_ID.to_string(),
-            // Tee T2 (step 2 of 2): the hub as the gateway's delta sink.
-            Arc::clone(&llm_delta_hub) as Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
+            // Tee T2 (step 2 of 2): announcer records Begin keys; inner hub is
+            // the ClientApi slot (typed LlmDeltaHub, not the wrapper).
+            Arc::new(crate::reply::StreamKeyAnnouncer::new(
+                Arc::clone(&llm_delta_hub) as Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
+                Arc::clone(&reply_registry),
+            )) as Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
         );
         // Hold an Arc clone for the composition root before registration
         // moves one into the host-fn handlers (all clones share the one gateway,

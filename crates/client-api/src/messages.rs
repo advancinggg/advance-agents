@@ -43,6 +43,9 @@ pub struct ClientMessageStatus {
     pub delivery_state: String,
     /// `none | replied`.
     pub reply_state: String,
+    /// Opaque C235 subscribe pointer (`st_<hex>`). Never assistant body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_key: Option<String>,
 }
 
 /// Register the messaging routes, capturing the shared provider slot in each closure.

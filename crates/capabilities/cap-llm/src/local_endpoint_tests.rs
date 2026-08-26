@@ -93,6 +93,139 @@ async fn t128_local_chat_skips_chain() {
 }
 
 #[tokio::test]
+async fn generate_via_local_tee_live_one_begin() {
+    use crate::gateway::LlmRequestContext;
+    use advance_shared_types::traits::{LlmDeltaEvent, LlmDeltaFrame, LlmDeltaSink};
+
+    #[derive(Default)]
+    struct Rec {
+        frames: std::sync::Mutex<Vec<LlmDeltaFrame>>,
+    }
+    impl LlmDeltaSink for Rec {
+        fn publish(&self, event: LlmDeltaEvent) {
+            self.frames.lock().unwrap().push(event.frame);
+        }
+    }
+
+    let (handoff, _jh) = spawn_inprocess_fixture(false).await.unwrap();
+    let client = SidecarClient {
+        policy: Arc::new(DefaultLocalInferenceTransport),
+        supervisor: Arc::new(StaticHandoffSupervisor { handoff }),
+        provider_id: "local".into(),
+        embedding_model: Some("nomic-embed".into()),
+    };
+    let mut registry = InferenceBackendRegistry::new();
+    registry.insert("local", Arc::new(client));
+    let mut cfg = fixture_runtime_config();
+    cfg.llm_providers = vec![local_cfg()];
+    let rec = Arc::new(Rec::default());
+    let gw = LlmGateway::new(
+        Arc::new(MockRuntimeConfigProvider::new(cfg)),
+        Arc::new(MockHttpSecurityChain::default()),
+        Arc::new(MockRunBudget::default()),
+        Arc::new(MockEventBusEmit::default()),
+        no_op_repetition_guard(),
+        "test-agent".into(),
+    )
+    .with_inference_backends(registry)
+    .with_delta_sink(rec.clone() as Arc<dyn LlmDeltaSink>);
+    let ctx = LlmRequestContext {
+        agent_id: "test-agent".into(),
+        messages: vec![ChatMessage {
+            role: ChatRole::User,
+            content: "hi".into(),
+        }],
+        params: ChatParams {
+            model: Some("llama".into()),
+            ..Default::default()
+        },
+        tee_live: true,
+        ..Default::default()
+    };
+    let resp = gw.generate(ctx).await.expect("local generate");
+    let frames = rec.frames.lock().unwrap().clone();
+    let begins = frames
+        .iter()
+        .filter(|f| matches!(f, LlmDeltaFrame::Begin { .. }))
+        .count();
+    assert_eq!(begins, 1, "exactly one Begin, got {frames:?}");
+    let concat: String = frames
+        .iter()
+        .filter_map(|f| match f {
+            LlmDeltaFrame::Delta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(concat, resp.text);
+    assert!(matches!(
+        frames.last(),
+        Some(LlmDeltaFrame::Terminal { .. })
+    ));
+}
+
+#[tokio::test]
+async fn generate_via_local_budget_deny_before_open_is_silent() {
+    use crate::gateway::LlmRequestContext;
+    use crate::LlmError;
+    use advance_shared_types::traits::{LlmDeltaEvent, LlmDeltaFrame, LlmDeltaSink};
+
+    #[derive(Default)]
+    struct Rec {
+        frames: std::sync::Mutex<Vec<LlmDeltaFrame>>,
+    }
+    impl LlmDeltaSink for Rec {
+        fn publish(&self, event: LlmDeltaEvent) {
+            self.frames.lock().unwrap().push(event.frame);
+        }
+    }
+
+    let (handoff, _jh) = spawn_inprocess_fixture(false).await.unwrap();
+    let client = SidecarClient {
+        policy: Arc::new(DefaultLocalInferenceTransport),
+        supervisor: Arc::new(StaticHandoffSupervisor { handoff }),
+        provider_id: "local".into(),
+        embedding_model: Some("nomic-embed".into()),
+    };
+    let mut registry = InferenceBackendRegistry::new();
+    registry.insert("local", Arc::new(client));
+    let mut cfg = fixture_runtime_config();
+    cfg.llm_providers = vec![local_cfg()];
+    let rec = Arc::new(Rec::default());
+    let budget = Arc::new(MockRunBudget::default());
+    budget.deny("rid-local", "over limit");
+    let gw = LlmGateway::new(
+        Arc::new(MockRuntimeConfigProvider::new(cfg)),
+        Arc::new(MockHttpSecurityChain::default()),
+        budget,
+        Arc::new(MockEventBusEmit::default()),
+        no_op_repetition_guard(),
+        "test-agent".into(),
+    )
+    .with_inference_backends(registry)
+    .with_delta_sink(rec.clone() as Arc<dyn LlmDeltaSink>);
+    let ctx = LlmRequestContext {
+        agent_id: "test-agent".into(),
+        run_id: Some("rid-local".into()),
+        messages: vec![ChatMessage {
+            role: ChatRole::User,
+            content: "hi".into(),
+        }],
+        params: ChatParams {
+            model: Some("llama".into()),
+            ..Default::default()
+        },
+        tee_live: true,
+        ..Default::default()
+    };
+    let err = gw.generate(ctx).await;
+    assert!(matches!(err, Err(LlmError::BudgetExceeded(_))));
+    assert!(
+        rec.frames.lock().unwrap().is_empty(),
+        "local budget deny before open must not Begin"
+    );
+}
+
+#[tokio::test]
 async fn t131_local_embed_uses_configured_model() {
     let (handoff, _jh) = spawn_inprocess_fixture(false).await.unwrap();
     let client = SidecarClient {

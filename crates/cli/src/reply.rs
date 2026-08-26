@@ -17,7 +17,7 @@
 //! at each turn boundary); the real channel-adapter
 //! outbound (notify-channel `send-raw`, SYS-AC-001) is Step-3.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -52,6 +52,12 @@ pub struct ReplyRegistry {
     inner: Mutex<HashMap<String, ReplySlot>>,
     /// Per-agent "had a produced reply" bit. Never stores payload bytes.
     last_outbound: Mutex<HashMap<String, bool>>,
+    /// Last C235 stream_key per agent id (unit-test / no-pending-send path).
+    last_stream_key: Mutex<HashMap<String, String>>,
+    /// FIFO of Client API message_ids per agent alias; Begin consumes the front.
+    pending_message: Mutex<HashMap<String, VecDeque<String>>>,
+    /// stream_key stored on a Client API message_id (pointer only, never body).
+    keys_by_message: Mutex<HashMap<String, String>>,
 }
 
 impl ReplyRegistry {
@@ -59,7 +65,92 @@ impl ReplyRegistry {
         Self {
             inner: Mutex::new(HashMap::new()),
             last_outbound: Mutex::new(HashMap::new()),
+            last_stream_key: Mutex::new(HashMap::new()),
+            pending_message: Mutex::new(HashMap::new()),
+            keys_by_message: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Root pair is `default-agent` ↔ `agent:default`, not `agent:default-agent`.
+    fn alias_keys(id: &str) -> Vec<String> {
+        if id == "agent:default" || id == "default-agent" {
+            return vec!["agent:default".to_string(), "default-agent".to_string()];
+        }
+        if let Some(bare) = id.strip_prefix("agent:") {
+            if bare == "default-agent" {
+                return vec![id.to_string()];
+            }
+            return vec![id.to_string(), bare.to_string()];
+        }
+        if id == "default" {
+            return vec![id.to_string()];
+        }
+        vec![format!("agent:{id}"), id.to_string()]
+    }
+
+    fn pending_slot(id: &str) -> String {
+        Self::alias_keys(id)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    pub fn note_pending_message(&self, agent_id: &str, message_id: &str) {
+        let slot = Self::pending_slot(agent_id);
+        self.pending_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(slot)
+            .or_default()
+            .push_back(message_id.to_string());
+    }
+
+    pub fn record_stream_key(&self, agent_id: &str, key: &str) {
+        {
+            let mut map = self
+                .last_stream_key
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for k in Self::alias_keys(agent_id) {
+                map.insert(k, key.to_string());
+            }
+        }
+        let mid = {
+            let slot = Self::pending_slot(agent_id);
+            self.pending_message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get_mut(&slot)
+                .and_then(|q| q.pop_front())
+        };
+        if let Some(mid) = mid {
+            self.keys_by_message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(mid)
+                .or_insert_with(|| key.to_string());
+        }
+    }
+
+    pub fn last_stream_key(&self, agent_id: &str) -> Option<String> {
+        let map = self
+            .last_stream_key
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for k in Self::alias_keys(agent_id) {
+            if let Some(v) = map.get(&k) {
+                return Some(v.clone());
+            }
+        }
+        None
+    }
+
+    pub fn stream_key_for_message(&self, message_id: &str) -> Option<String> {
+        self.keys_by_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(message_id)
+            .cloned()
     }
 
     /// Register a pending reply slot for `agent_id` and return the receiver to
@@ -101,10 +192,23 @@ impl ReplyRegistry {
 
     /// Drop a recorded fulfill so a new Client API send starts at `reply_state: none`.
     pub fn clear_last_outbound(&self, agent_id: &str) {
-        self.last_outbound
+        let aliases = Self::alias_keys(agent_id);
+        {
+            let mut last = self
+                .last_outbound
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for k in &aliases {
+                last.remove(k);
+            }
+        }
+        let mut keys = self
+            .last_stream_key
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(agent_id);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for k in &aliases {
+            keys.remove(k);
+        }
     }
 
     /// Drop a pending registration without fulfilling it (the deliver-error
@@ -125,6 +229,39 @@ impl ReplyRegistry {
 impl Default for ReplyRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Records `Begin.stream_key` onto [`ReplyRegistry`] then forwards to the hub.
+pub struct StreamKeyAnnouncer {
+    inner: Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
+    replies: Arc<ReplyRegistry>,
+}
+
+impl StreamKeyAnnouncer {
+    pub fn new(
+        inner: Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
+        replies: Arc<ReplyRegistry>,
+    ) -> Self {
+        Self { inner, replies }
+    }
+}
+
+impl advance_shared_types::traits::LlmDeltaSink for StreamKeyAnnouncer {
+    fn is_wired(&self) -> bool {
+        self.inner.is_wired()
+    }
+
+    fn publish(&self, event: advance_shared_types::traits::LlmDeltaEvent) {
+        let begin_key = matches!(
+            event.frame,
+            advance_shared_types::traits::LlmDeltaFrame::Begin { .. }
+        )
+        .then(|| (event.agent_id.to_string(), event.stream_key.to_string()));
+        self.inner.publish(event);
+        if let Some((agent_id, key)) = begin_key {
+            self.replies.record_stream_key(&agent_id, &key);
+        }
     }
 }
 
@@ -417,5 +554,75 @@ mod tests {
         // Ordinary international text + emoji are NOT escaped (readability).
         let s = sanitize_for_stdout("你好 café 🚀".as_bytes());
         assert_eq!(s, "你好 café 🚀");
+    }
+
+    #[test]
+    fn overlapping_sends_fifo_bind_begins_in_order() {
+        let reg = ReplyRegistry::new();
+        reg.note_pending_message("agent:default", "cmsg-1");
+        reg.note_pending_message("agent:default", "cmsg-2");
+        reg.record_stream_key("default-agent", "st_first");
+        reg.record_stream_key("default-agent", "st_second");
+        assert_eq!(
+            reg.stream_key_for_message("cmsg-1").as_deref(),
+            Some("st_first")
+        );
+        assert_eq!(
+            reg.stream_key_for_message("cmsg-2").as_deref(),
+            Some("st_second")
+        );
+    }
+
+    #[test]
+    fn stream_key_binds_to_pending_message_id() {
+        let reg = ReplyRegistry::new();
+        reg.note_pending_message("agent:default", "cmsg-1");
+        reg.record_stream_key("default-agent", "st_one");
+        assert_eq!(
+            reg.stream_key_for_message("cmsg-1").as_deref(),
+            Some("st_one")
+        );
+        reg.note_pending_message("agent:default", "cmsg-2");
+        reg.record_stream_key("default-agent", "st_two");
+        assert_eq!(
+            reg.stream_key_for_message("cmsg-1").as_deref(),
+            Some("st_one")
+        );
+        assert_eq!(
+            reg.stream_key_for_message("cmsg-2").as_deref(),
+            Some("st_two")
+        );
+    }
+
+    #[test]
+    fn stream_key_aliases_root_pair_not_hyphenated_colon() {
+        let reg = ReplyRegistry::new();
+        reg.record_stream_key("default-agent", "st_abc");
+        assert_eq!(
+            reg.last_stream_key("agent:default").as_deref(),
+            Some("st_abc")
+        );
+        assert_eq!(
+            reg.last_stream_key("default-agent").as_deref(),
+            Some("st_abc")
+        );
+        assert!(
+            reg.last_stream_key("agent:default-agent").is_none(),
+            "must not write agent:default-agent"
+        );
+        reg.record_stream_key("agent:default", "st_def");
+        assert_eq!(
+            reg.last_stream_key("default-agent").as_deref(),
+            Some("st_def")
+        );
+    }
+
+    #[test]
+    fn clear_last_outbound_clears_both_stream_key_spellings() {
+        let reg = ReplyRegistry::new();
+        reg.record_stream_key("default-agent", "st_abc");
+        reg.clear_last_outbound("agent:default");
+        assert!(reg.last_stream_key("default-agent").is_none());
+        assert!(reg.last_stream_key("agent:default").is_none());
     }
 }

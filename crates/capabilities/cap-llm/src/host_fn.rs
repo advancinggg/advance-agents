@@ -513,6 +513,7 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
                 messages,
                 params: req.params.unwrap_or_default(),
                 output_schema: req.output_schema,
+                tee_live: true,
             };
             let result = gateway.generate(llm_ctx).await;
             Ok(vec![encode_llm_result(result)])
@@ -548,6 +549,7 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
                 }],
                 params: req.params.unwrap_or_default(),
                 output_schema: req.output_schema,
+                tee_live: false,
             };
             // S4 final: a WIRED gateway takes the live path ONLY — no silent
             // buffered fallback on any live error (plan §1). An UNWIRED gateway
@@ -1666,6 +1668,71 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn generate_handler_tee_live_publishes_begin() {
+        use crate::test_support::{
+            fixture_runtime_config, no_op_repetition_guard, MockEventBusEmit,
+            MockHttpSecurityChain, MockRunBudget, MockRuntimeConfigProvider,
+        };
+        use advance_shared_types::traits::{LlmDeltaEvent, LlmDeltaFrame, LlmDeltaSink};
+
+        #[derive(Default)]
+        struct Rec {
+            frames: std::sync::Mutex<Vec<LlmDeltaFrame>>,
+        }
+        impl LlmDeltaSink for Rec {
+            fn publish(&self, event: LlmDeltaEvent) {
+                self.frames.lock().unwrap().push(event.frame);
+            }
+        }
+
+        let rec = Arc::new(Rec::default());
+        let chain = Arc::new(MockHttpSecurityChain::default());
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": "hello"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "model": "gpt-4o-mini",
+        });
+        chain.push_response(
+            "/v1/chat/completions",
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: serde_json::to_vec(&body).unwrap(),
+            }),
+        );
+        let cfg_provider = Arc::new(MockRuntimeConfigProvider::new(fixture_runtime_config()));
+        let gw = Arc::new(
+            LlmGateway::new(
+                cfg_provider,
+                chain.clone(),
+                Arc::new(MockRunBudget::default()),
+                Arc::new(MockEventBusEmit::default()),
+                no_op_repetition_guard(),
+                "test-agent".into(),
+            )
+            .with_delta_sink(rec.clone() as Arc<dyn LlmDeltaSink>),
+        );
+        let handler = AgentLlmGenerateHandler {
+            gateway: gw,
+            turn_cost: None,
+        };
+        let result = handler
+            .call(dummy_ctx(), vec![Val::String("hi".into())], 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&result[0], Val::Result(Ok(_))),
+            "generate ok: {:?}",
+            result[0]
+        );
+        let frames = rec.frames.lock().unwrap().clone();
+        assert!(
+            matches!(frames.first(), Some(LlmDeltaFrame::Begin { .. })),
+            "handler tee_live must Begin, got {frames:?}"
+        );
+    }
+
     /// Round-AUDIT-ADV-2 W2 — `encode_llm_response` MUST cap parsed_output
     /// at MAX_ENCODED_PARSED_BYTES (64 KiB) to prevent host-side memory
     /// amplification via Val::U8 wrapper overhead.
@@ -2735,6 +2802,7 @@ mod live_gated_tests {
             }],
             params: Default::default(),
             output_schema: None,
+            tee_live: false,
         }
     }
 
