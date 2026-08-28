@@ -14,9 +14,7 @@ use advance_shared_types::inference::{
     InferenceStream, InferenceStreamClass, InferenceStreamHead, InferenceTextDelta, MeshCarrier,
     MeshInferenceDispatch, MeshInferenceDispatchError,
 };
-use advance_shared_types::security_validator::{
-    HttpError, HttpResponse, TransportErrorKind,
-};
+use advance_shared_types::security_validator::{HttpError, HttpResponse, TransportErrorKind};
 use advance_shared_types::traits::{
     HttpStreamingChain, LlmDeltaEvent, LlmDeltaFrame, LlmDeltaSink, LlmTerminalReason,
 };
@@ -193,7 +191,10 @@ impl InferenceBackendPort for ScriptedPort {
     ) -> Result<InferenceChatResponse, InferenceBackendError> {
         self.chats.fetch_add(1, Ordering::SeqCst);
         self.deadlines.lock().unwrap().push(req.deadline);
-        self.seen_messages.lock().unwrap().push(req.messages.clone());
+        self.seen_messages
+            .lock()
+            .unwrap()
+            .push(req.messages.clone());
         let delay = *self.chat_delay.lock().unwrap();
         if let Some(d) = delay {
             tokio::time::sleep(d).await;
@@ -585,11 +586,7 @@ impl MeshInferenceDispatch for CountingMesh {
         invocation_id: &str,
         target: &str,
     ) -> Result<
-        (
-            InferenceStreamHead,
-            Box<dyn InferenceStream>,
-            MeshCarrier,
-        ),
+        (InferenceStreamHead, Box<dyn InferenceStream>, MeshCarrier),
         MeshInferenceDispatchError,
     > {
         self.dispatch_chat(req, invocation_id, target).await?;
@@ -820,7 +817,10 @@ async fn t133_deadline_not_refreshed_per_hop() {
         .expect("ok");
     let d1 = a.deadlines.lock().unwrap()[0];
     let d2 = b.deadlines.lock().unwrap()[0];
-    assert_eq!(d1, d2, "req.deadline must be the same Instant after a delayed first hop");
+    assert_eq!(
+        d1, d2,
+        "req.deadline must be the same Instant after a delayed first hop"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1155,7 +1155,10 @@ fn openai_chat_http_usage(content: &str, in_tok: u64, out_tok: u64) -> HttpRespo
 #[tokio::test]
 async fn t133_cloud_http_schema_then_transport_does_not_failover() {
     let chain = Arc::new(MockHttpSecurityChain::default());
-    chain.push_response("/v1/chat/completions", Ok(openai_chat_http(r#"{"x":"no"}"#)));
+    chain.push_response(
+        "/v1/chat/completions",
+        Ok(openai_chat_http(r#"{"x":"no"}"#)),
+    );
     chain.push_response(
         "/v1/chat/completions",
         Err(HttpError::Transport(TransportErrorKind::ConnectionRefused)),
@@ -1166,18 +1169,8 @@ async fn t133_cloud_http_schema_then_transport_does_not_failover() {
         base_delay_ms: 1,
         max_delay_ms: 2,
     });
-    let mut fast = provider(
-        "fast",
-        InferenceBackendClass::CloudHttp,
-        "llama",
-        None,
-    );
-    let mut slow = provider(
-        "slow",
-        InferenceBackendClass::CloudHttp,
-        "llama",
-        None,
-    );
+    let mut fast = provider("fast", InferenceBackendClass::CloudHttp, "llama", None);
+    let mut slow = provider("slow", InferenceBackendClass::CloudHttp, "llama", None);
     fast.retry_default = one_retry.clone();
     slow.retry_default = one_retry;
     let mut cfg = fixture_runtime_config();
@@ -1278,7 +1271,10 @@ async fn t133_cloud_http_schema_zero_usage_then_transport_does_not_failover() {
 #[tokio::test]
 async fn t133_cloud_http_schema_then_budget_deny_commits() {
     let chain = Arc::new(MockHttpSecurityChain::default());
-    chain.push_response("/v1/chat/completions", Ok(openai_chat_http(r#"{"x":"no"}"#)));
+    chain.push_response(
+        "/v1/chat/completions",
+        Ok(openai_chat_http(r#"{"x":"no"}"#)),
+    );
     chain.push_response("/v1/chat/completions", Ok(openai_chat_http(r#"{"x":2}"#)));
     let mut cfg = fixture_runtime_config();
     cfg.llm_providers = vec![
@@ -1329,7 +1325,10 @@ async fn t133_cloud_http_schema_then_budget_deny_commits() {
 #[tokio::test]
 async fn t133_cloud_http_schema_then_deadline_is_deadline_not_cascade() {
     let chain = Arc::new(MockHttpSecurityChain::default());
-    chain.push_response("/v1/chat/completions", Ok(openai_chat_http(r#"{"x":"no"}"#)));
+    chain.push_response(
+        "/v1/chat/completions",
+        Ok(openai_chat_http(r#"{"x":"no"}"#)),
+    );
     chain.push_response("/v1/chat/completions", Ok(openai_chat_http(r#"{"x":2}"#)));
     *chain.execute_delay.lock().unwrap() = Some(Duration::from_secs(5));
     *chain.execute_delay_from_call.lock().unwrap() = Some(2);

@@ -136,17 +136,19 @@ pub fn is_pre_token_failover(err: &LlmError) -> bool {
     let LlmError::ProviderError(msg) = err else {
         return false;
     };
+    // C238: local transport is loopback-only. A dead/absent sidecar must
+    // not hop onto cloud-http (SYS-AC-314).
     if msg.starts_with(advance_shared_types::inference::LOCAL_TRANSPORT_PREFIX) {
-        return true;
+        return false;
     }
     let rest = msg
         .strip_prefix(advance_shared_types::inference::MESH_REMOTE_PREFIX)
         .map(str::trim_start)
         .unwrap_or(msg);
-    rest == "not wired"
-        || rest == "unavailable"
-        || rest.starts_with(advance_shared_types::inference::LOCAL_TRANSPORT_PREFIX)
-        || crate::retry::is_transport_provider_error(rest)
+    if rest.starts_with(advance_shared_types::inference::LOCAL_TRANSPORT_PREFIX) {
+        return false;
+    }
+    rest == "not wired" || rest == "unavailable" || crate::retry::is_transport_provider_error(rest)
 }
 
 pub fn candidates_for(
@@ -219,8 +221,8 @@ pub fn candidates_for(
         if let Ok(desc) = descriptor_for(p, catalog) {
             if missing_capability(&desc, need).is_some() {
                 saw_capability_skip = true;
-            } else {
-                let model = model_hint.unwrap().to_string();
+            } else if let Some(hint) = model_hint {
+                let model = hint.to_string();
                 let ttft = telemetry
                     .snapshot(&p.id)
                     .map(EndpointTelemetry::predicted_ttft_ms)
@@ -594,6 +596,12 @@ mod t133_helpers {
         )));
         assert!(!is_pre_token_failover(&LlmError::ProviderError(
             "mesh-remote: lease-denied".into()
+        )));
+        assert!(!is_pre_token_failover(&LlmError::ProviderError(
+            "local transport: not wired".into()
+        )));
+        assert!(!is_pre_token_failover(&LlmError::ProviderError(
+            "local transport: sidecar dead".into()
         )));
         assert!(!is_pre_token_failover(&LlmError::RateLimited("x".into())));
     }

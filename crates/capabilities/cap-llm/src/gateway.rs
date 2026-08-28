@@ -27,8 +27,8 @@ use advance_runtime::config::{InferenceBackendClass, LlmProviderConfig, RuntimeC
 use advance_shared_types::capability::BudgetDecision;
 use advance_shared_types::context::LlmMessage;
 use advance_shared_types::inference::{
-    remaining_until, InferenceBackendPort, InferenceChatRequest, InferenceMessage,
-    InferenceStream, InferenceStreamClass, InferenceTextDelta, InferenceTool,
+    remaining_until, InferenceBackendPort, InferenceChatRequest, InferenceMessage, InferenceStream,
+    InferenceStreamClass, InferenceTextDelta, InferenceTool,
 };
 use advance_shared_types::repetition::{OutputHash, RepetitionDecision};
 use advance_shared_types::security_validator::{
@@ -1797,10 +1797,7 @@ impl LlmGateway {
         mut ctx: LlmRequestContext,
     ) -> Result<ChatResponse, LlmError> {
         let start = Instant::now();
-        let deadline = start
-            + self
-                .generate_timeout
-                .unwrap_or(cap_http::DEFAULT_TIMEOUT);
+        let deadline = start + self.generate_timeout.unwrap_or(cap_http::DEFAULT_TIMEOUT);
         let cfg = self.config_provider.current();
         let need = crate::capability::CapabilityNeed {
             tools: ctx.params.tools.as_ref().is_some_and(|t| !t.is_empty()),
@@ -2417,10 +2414,7 @@ impl LlmGateway {
                                 cost_usd: total_committed_cost,
                             });
                         }
-                        return Err(after_req(
-                            LlmError::StructuredOutputFailed(msg),
-                            true,
-                        ));
+                        return Err(after_req(LlmError::StructuredOutputFailed(msg), true));
                     }
                     // Success path: build ChatResponse + emit_llm_response + Ok.
                     let chat_response = ChatResponse {
@@ -2459,10 +2453,7 @@ impl LlmGateway {
                             cost_usd: total_committed_cost,
                         });
                     }
-                    return Err(after_req(
-                        LlmError::RepetitionTerminated(reason),
-                        true,
-                    ));
+                    return Err(after_req(LlmError::RepetitionTerminated(reason), true));
                 }
             }
         }
