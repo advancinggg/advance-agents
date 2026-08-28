@@ -484,6 +484,7 @@ mod tests {
             embedding_model: None,
             sidecar: None,
             profile_id: None,
+            device_id: None,
         }
     }
 

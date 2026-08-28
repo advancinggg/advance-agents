@@ -954,6 +954,9 @@ impl Settlement {
                     },
                     output_schema: None,
                     tee_live: false,
+                    user_constraints: Vec::new(),
+                    hard_task_class: false,
+                    placement: None,
                 };
                 match &terminal {
                     LivePhase::Done {
@@ -2003,6 +2006,9 @@ impl StreamRegistry {
                 },
                 output_schema: None,
                 tee_live: false,
+                user_constraints: Vec::new(),
+                hard_task_class: false,
+                placement: None,
             },
             response: ChatResponse {
                 text,
@@ -2681,6 +2687,9 @@ mod tests {
                 params: Default::default(),
                 output_schema: None,
                 tee_live: false,
+                user_constraints: Vec::new(),
+                hard_task_class: false,
+                placement: None,
             },
             response: ChatResponse {
                 text: text.into(),

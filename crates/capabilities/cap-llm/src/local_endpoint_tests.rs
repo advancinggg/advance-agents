@@ -32,6 +32,7 @@ fn local_cfg() -> LlmProviderConfig {
         embedding_model: Some("nomic-embed".into()),
         sidecar: None,
         profile_id: None,
+        device_id: None,
     }
 }
 
@@ -140,6 +141,9 @@ async fn generate_via_local_tee_live_one_begin() {
             ..Default::default()
         },
         tee_live: true,
+        user_constraints: Vec::new(),
+        hard_task_class: false,
+        placement: None,
         ..Default::default()
     };
     let resp = gw.generate(ctx).await.expect("local generate");
@@ -215,6 +219,9 @@ async fn generate_via_local_budget_deny_before_open_is_silent() {
             ..Default::default()
         },
         tee_live: true,
+        user_constraints: Vec::new(),
+        hard_task_class: false,
+        placement: None,
         ..Default::default()
     };
     let err = gw.generate(ctx).await;

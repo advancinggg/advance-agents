@@ -208,6 +208,20 @@ pub fn build_llm_gateway(
             }
         }
     }
+    for p in config.current().llm_providers.iter() {
+        if p.backend_class != advance_runtime::config::InferenceBackendClass::MeshRemote {
+            continue;
+        }
+        registry.insert(
+            p.id.clone(),
+            Arc::new(cap_llm::MeshRemoteAdapter {
+                dispatch: Arc::new(advance_shared_types::inference::NotWiredMeshInferenceDispatch),
+                provider_id: p.id.clone(),
+                embedding_model: p.embedding_model.clone(),
+                target_device_id: p.device_id.clone().unwrap_or_default(),
+            }),
+        );
+    }
     Arc::new(install_live_streaming(
         LlmGateway::new(
             config,

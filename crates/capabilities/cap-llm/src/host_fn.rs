@@ -514,6 +514,9 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
                 params: req.params.unwrap_or_default(),
                 output_schema: req.output_schema,
                 tee_live: true,
+                user_constraints: Vec::new(),
+                hard_task_class: false,
+                placement: None,
             };
             let result = gateway.generate(llm_ctx).await;
             Ok(vec![encode_llm_result(result)])
@@ -550,6 +553,9 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
                 params: req.params.unwrap_or_default(),
                 output_schema: req.output_schema,
                 tee_live: false,
+                user_constraints: Vec::new(),
+                hard_task_class: false,
+                placement: None,
             };
             // S4 final: a WIRED gateway takes the live path ONLY — no silent
             // buffered fallback on any live error (plan §1). An UNWIRED gateway
@@ -2803,6 +2809,9 @@ mod live_gated_tests {
             params: Default::default(),
             output_schema: None,
             tee_live: false,
+            user_constraints: Vec::new(),
+            hard_task_class: false,
+            placement: None,
         }
     }
 

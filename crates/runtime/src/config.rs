@@ -526,6 +526,18 @@ pub enum InferenceBackendClass {
     CloudHttp,
     #[serde(rename = "local")]
     Local,
+    #[serde(rename = "mesh-remote")]
+    MeshRemote,
+}
+
+impl InferenceBackendClass {
+    pub fn uses_http_egress(self) -> bool {
+        matches!(self, Self::CloudHttp)
+    }
+
+    pub fn uses_inference_port(self) -> bool {
+        matches!(self, Self::Local | Self::MeshRemote)
+    }
 }
 
 /// Supervised sidecar command for a `local` backend-class provider.
@@ -577,6 +589,7 @@ pub struct LlmProviderConfig {
     pub embedding_model: Option<String>,
     pub sidecar: Option<SidecarSpec>,
     pub profile_id: Option<String>,
+    pub device_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -609,6 +622,8 @@ struct LlmProviderConfigRaw {
     sidecar: Option<SidecarSpec>,
     #[serde(rename = "profile-id", default)]
     profile_id: Option<String>,
+    #[serde(rename = "device-id", default)]
+    device_id: Option<String>,
 }
 
 impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
@@ -625,6 +640,11 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
                     if raw.backend_class == Some(InferenceBackendClass::CloudHttp) {
                         return Err(
                             "backend-class: cloud-http is incompatible with backend: local".into(),
+                        );
+                    }
+                    if raw.backend_class == Some(InferenceBackendClass::MeshRemote) {
+                        return Err(
+                            "backend: local is incompatible with backend-class: mesh-remote".into(),
                         );
                     }
                     backend_class = InferenceBackendClass::Local;
@@ -652,6 +672,30 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
                 backend = Some(ProviderBackend::OpenAiChat);
             }
         }
+        if backend_class == InferenceBackendClass::MeshRemote {
+            if matches!(
+                backend,
+                Some(ProviderBackend::AnthropicMessages | ProviderBackend::OpenAiResponses)
+            ) {
+                return Err(
+                    "backend-class: mesh-remote is incompatible with backend: anthropic-messages or openai-responses"
+                        .into(),
+                );
+            }
+            if backend.is_none() {
+                backend = Some(ProviderBackend::OpenAiChat);
+            }
+            if raw.sidecar.is_some() {
+                return Err("sidecar is invalid on backend-class: mesh-remote".into());
+            }
+            let device_id = raw.device_id.as_deref().unwrap_or("");
+            if device_id.trim().is_empty() || device_id.contains('\0') {
+                return Err(
+                    "backend-class: mesh-remote requires a non-empty, non-whitespace device-id with no NUL bytes"
+                        .into(),
+                );
+            }
+        }
         Ok(Self {
             id: raw.id,
             endpoint: raw.endpoint,
@@ -667,6 +711,7 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
             embedding_model: raw.embedding_model,
             sidecar: raw.sidecar,
             profile_id: raw.profile_id,
+            device_id: raw.device_id,
         })
     }
 }
@@ -688,6 +733,7 @@ impl fmt::Debug for LlmProviderConfig {
             .field("embedding_model", &self.embedding_model)
             .field("sidecar", &self.sidecar)
             .field("profile_id", &self.profile_id)
+            .field("device_id", &self.device_id)
             .finish()
     }
 }
@@ -1764,7 +1810,7 @@ fn validate_config(path: &Path, cfg: &RuntimeConfig) -> Result<(), ConfigError> 
     let mut seen_ids = std::collections::HashSet::new();
     for p in &cfg.llm_providers {
         check_nonempty("llm-providers[].id", &p.id)?;
-        if p.backend_class != InferenceBackendClass::Local {
+        if p.backend_class.uses_http_egress() {
             check_nonempty("llm-providers[].endpoint", &p.endpoint)?;
         }
         check_nonempty("llm-providers[].api-key-secret", &p.api_key_secret)?;
@@ -1778,8 +1824,17 @@ fn validate_config(path: &Path, cfg: &RuntimeConfig) -> Result<(), ConfigError> 
         // PII/secrets) to on-path interception. Bare prefix matching is unsafe —
         // `http://localhost.evil.example` starts with `http://localhost` but
         // resolves to an external host (R15 finding). Parse host boundary strictly.
-        if p.backend_class == InferenceBackendClass::Local {
+        if !p.backend_class.uses_http_egress() {
             // endpoint is not the connect target
+            if p.backend_class == InferenceBackendClass::MeshRemote && p.sidecar.is_some() {
+                return invalid("sidecar is invalid on backend-class: mesh-remote");
+            }
+            if p.backend_class == InferenceBackendClass::MeshRemote {
+                check_nonempty(
+                    "llm-providers[].device-id",
+                    p.device_id.as_deref().unwrap_or(""),
+                )?;
+            }
             if let Some(sc) = &p.sidecar {
                 if !std::path::Path::new(&sc.command).is_absolute() {
                     return invalid("llm-providers[].sidecar.command must be an absolute path");

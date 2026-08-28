@@ -1728,3 +1728,83 @@ mod config_reload_emission {
         );
     }
 }
+
+#[test]
+fn validate_accepts_mesh_remote_empty_endpoint() {
+    let yaml = format!(
+        "{}\n{}",
+        minimal_yaml().trim_end_matches('\n').replace(
+            "llm-providers: []",
+            "llm-providers:\n  - id: mesh\n    endpoint: \"\"\n    api-key-secret: k\n    backend-class: mesh-remote\n    device-id: peer-b\n    model-aliases:\n      llama: llama\n    cost-per-mtoken-in: 0.001\n    cost-per-mtoken-out: 0.001\n    rate-limit:\n      requests-per-minute: 1\n      tokens-per-minute: 1"
+        ),
+        ""
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("runtime-config.yaml");
+    write_config(&config_path, &yaml);
+    load_config(&config_path).expect("mesh-remote empty endpoint must load");
+}
+
+#[test]
+fn validate_rejects_mesh_remote_missing_device_id() {
+    let yaml = format!(
+        "{}\n",
+        minimal_yaml().trim_end_matches('\n').replace(
+            "llm-providers: []",
+            "llm-providers:\n  - id: mesh\n    endpoint: \"\"\n    api-key-secret: k\n    backend-class: mesh-remote\n    model-aliases:\n      llama: llama\n    cost-per-mtoken-in: 0.001\n    cost-per-mtoken-out: 0.001\n    rate-limit:\n      requests-per-minute: 1\n      tokens-per-minute: 1"
+        )
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("runtime-config.yaml");
+    write_config(&config_path, &yaml);
+    let err = load_config(&config_path).expect_err("mesh-remote needs device-id");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("device-id") || err.to_string().contains("device-id"),
+        "error: {err:?}"
+    );
+}
+
+#[test]
+fn validate_rejects_mesh_remote_whitespace_or_nul_device_id() {
+    for device_id in [" ", "\t"] {
+        let yaml = format!(
+            "{}\n",
+            minimal_yaml().trim_end_matches('\n').replace(
+                "llm-providers: []",
+                &format!(
+                    "llm-providers:\n  - id: mesh\n    endpoint: \"\"\n    api-key-secret: k\n    backend-class: mesh-remote\n    device-id: \"{device_id}\"\n    model-aliases:\n      llama: llama\n    cost-per-mtoken-in: 0.001\n    cost-per-mtoken-out: 0.001\n    rate-limit:\n      requests-per-minute: 1\n      tokens-per-minute: 1"
+                )
+            )
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("runtime-config.yaml");
+        write_config(&config_path, &yaml);
+        let err = load_config(&config_path).expect_err("mesh-remote device-id must be an identity");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("device-id") || err.to_string().contains("device-id"),
+            "device_id={device_id:?} error: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn validate_rejects_backend_local_with_class_mesh_remote() {
+    let yaml = format!(
+        "{}\n",
+        minimal_yaml().trim_end_matches('\n').replace(
+            "llm-providers: []",
+            "llm-providers:\n  - id: mesh\n    endpoint: \"\"\n    api-key-secret: k\n    backend: local\n    backend-class: mesh-remote\n    model-aliases:\n      llama: llama\n    cost-per-mtoken-in: 0.001\n    cost-per-mtoken-out: 0.001\n    rate-limit:\n      requests-per-minute: 1\n      tokens-per-minute: 1"
+        )
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("runtime-config.yaml");
+    write_config(&config_path, &yaml);
+    let err = load_config(&config_path).expect_err("clash");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("mesh-remote") || err.to_string().contains("parse"),
+        "error: {err:?}"
+    );
+}

@@ -77,7 +77,7 @@ pub fn descriptor_for(
         let p = catalog
             .get(id)
             .ok_or_else(|| LlmError::ModelNotAvailable(format!("unknown profile {id}")))?;
-        if p.capabilities.image && cfg.backend_class == InferenceBackendClass::Local {
+        if p.capabilities.image && cfg.backend_class.uses_inference_port() {
             return Err(LlmError::ModelNotAvailable(
                 "catalog profile claims image on a text-only local sidecar".into(),
             ));
@@ -93,7 +93,7 @@ pub fn descriptor_for(
         return Ok(p.capabilities.clone());
     }
     Ok(match cfg.backend_class {
-        InferenceBackendClass::Local => {
+        InferenceBackendClass::Local | InferenceBackendClass::MeshRemote => {
             CapabilityDescriptor::unbound_local(cfg.embedding_model.is_some())
         }
         InferenceBackendClass::CloudHttp => CapabilityDescriptor::unbound_cloud_http(),
@@ -204,6 +204,7 @@ mod tests {
             embedding_model: None,
             sidecar: None,
             profile_id: None,
+            device_id: None,
         }
     }
 

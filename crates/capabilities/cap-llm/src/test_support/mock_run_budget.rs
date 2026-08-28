@@ -16,11 +16,20 @@ pub(crate) struct MockRunBudget {
     pub commits: Mutex<Vec<(String, u64, f64)>>,
     /// (run_id, additional_tokens, additional_cost) recorded per check().
     pub checks: Mutex<Vec<(String, u64, f64)>>,
+    /// Deny only when `check` sees `additional_tokens > 0` (preflight `check(0,0)` still Allows).
+    pub deny_when_tokens_positive: Mutex<HashMap<String, String>>,
 }
 
 impl MockRunBudget {
     pub fn deny(&self, run_id: &str, reason: &str) {
         self.deny_reasons
+            .lock()
+            .unwrap()
+            .insert(run_id.to_string(), reason.to_string());
+    }
+
+    pub fn deny_when_tokens_positive(&self, run_id: &str, reason: &str) {
+        self.deny_when_tokens_positive
             .lock()
             .unwrap()
             .insert(run_id.to_string(), reason.to_string());
@@ -33,6 +42,17 @@ impl RunBudget for MockRunBudget {
             .lock()
             .unwrap()
             .push((run_id.to_string(), additional_tokens, additional_cost));
+        if additional_tokens > 0 {
+            if let Some(reason) = self
+                .deny_when_tokens_positive
+                .lock()
+                .unwrap()
+                .get(run_id)
+                .cloned()
+            {
+                return BudgetDecision::Deny(reason);
+            }
+        }
         match self.deny_reasons.lock().unwrap().get(run_id) {
             Some(reason) => BudgetDecision::Deny(reason.clone()),
             None => BudgetDecision::Allow,

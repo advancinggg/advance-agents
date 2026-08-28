@@ -108,8 +108,12 @@ fn traits_are_object_safe() {
     let _inference_stream: fn(Box<dyn InferenceStream>) = |_| {};
     let _local_policy: fn(Box<dyn LocalInferenceTransportPolicy>) = |_| {};
     let _local_body: fn(Box<dyn LocalBodyStream>) = |_| {};
+    let _mesh_dispatch: fn(Box<dyn MeshInferenceDispatch>) = |_| {};
+    let _local_resolve: fn(Box<dyn LocalInferenceResolve>) = |_| {};
     assert_send_sync::<Box<dyn InferenceBackendPort>>();
     assert_send_sync::<Box<dyn LocalInferenceTransportPolicy>>();
+    assert_send_sync::<Box<dyn MeshInferenceDispatch>>();
+    assert_send_sync::<Box<dyn LocalInferenceResolve>>();
 
     // L6RunnableSpec is a Send+Sync struct (trait-object field Arc<dyn L6Handler>
     // is Send+Sync; other fields are String which are Send+Sync).

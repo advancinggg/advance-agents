@@ -6,8 +6,11 @@ use std::net::TcpListener;
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
-    println!("PORT={port}");
-    let _ = std::io::stdout().flush();
+    {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(format!("PORT={port}\n").as_bytes());
+        let _ = out.flush();
+    }
     for incoming in listener.incoming() {
         let Ok(mut sock) = incoming else { continue };
         let mut buf = [0u8; 16384];

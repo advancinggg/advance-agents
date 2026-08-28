@@ -32,6 +32,7 @@
 //! See MODULE-009 §3.7 Change History for slice context.
 
 pub mod backend_local;
+pub mod backend_mesh;
 pub mod capability;
 pub mod catalog;
 pub mod cost;
@@ -39,6 +40,7 @@ pub mod error;
 pub mod events;
 pub mod gateway;
 pub mod host_fn;
+pub mod placement;
 pub mod preflight;
 pub mod provider;
 // `providers` is crate-internal: `ProviderAdapter::parse_chat_response`
@@ -61,12 +63,19 @@ pub(crate) mod stream;
 mod local_endpoint_tests;
 
 #[cfg(test)]
+mod mesh_remote_tests;
+
+#[cfg(test)]
+mod placement_tests;
+
+#[cfg(test)]
 mod test_support;
 
 pub use backend_local::{
     FailedSpawnBackend, OwnedHandoffSupervisor, ProcessSupervisor, SidecarClient,
     StaticHandoffSupervisor, SupervisedChild,
 };
+pub use backend_mesh::MeshRemoteAdapter;
 pub use catalog::ModelProfileCatalog;
 pub use cost::compute_cost;
 pub use error::LlmError;
@@ -79,6 +88,7 @@ pub use host_fn::{
     register_agent_llm, register_agent_llm_with_turn_cost, AgentLlmGenerateHandler,
     AgentLlmPollStreamHandler, AgentLlmStreamHandler, AgentStreamReaper, ReapBatch,
 };
+pub use placement::{PlacementRecord, PlacementTelemetry, UserHardConstraint};
 pub use preflight::{
     chat_preflight, DiscardEventBus, NoopRepetition, PreflightAllowBudget, StaticConfig,
 };

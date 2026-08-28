@@ -111,6 +111,9 @@ pub enum InferenceStreamClass {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceStreamHead {
     pub class: InferenceStreamClass,
+    /// C241 snapshot baseline: the stream yields one terminal delta. Gateway
+    /// consumes `DispatchedLive` / DecodedPipeline and must not call `chat()` again.
+    pub snapshot_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -328,6 +331,216 @@ pub trait LocalInferenceTransportPolicy: Send + Sync {
 /// Remaining time until `deadline`, never a second independent clock.
 pub fn remaining_until(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
+}
+
+/// CONTRACT-241/242 inverted ports (mesh-inference-s1). Cap-llm outbound
+/// [`MeshInferenceDispatch`]; target-side [`LocalInferenceResolve`].
+
+pub const MESH_REMOTE_PREFIX: &str = "mesh-remote:";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeshCarrier {
+    Snapshot,
+    DirectPeer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MeshInferenceDispatchError {
+    Unwired,
+    LeaseDenied(String),
+    Unavailable(String),
+    Cancelled,
+    Provider(String),
+}
+
+impl MeshInferenceDispatchError {
+    pub fn as_provider_message(&self) -> String {
+        match self {
+            Self::Unwired => format!("{MESH_REMOTE_PREFIX} not wired"),
+            Self::LeaseDenied(_) => format!("{MESH_REMOTE_PREFIX} lease-denied"),
+            Self::Unavailable(_) => format!("{MESH_REMOTE_PREFIX} unavailable"),
+            Self::Cancelled => format!("{MESH_REMOTE_PREFIX} cancelled"),
+            Self::Provider(s) => format!("{MESH_REMOTE_PREFIX} {s}"),
+        }
+    }
+}
+
+impl std::fmt::Display for MeshInferenceDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_provider_message())
+    }
+}
+
+impl std::error::Error for MeshInferenceDispatchError {}
+
+impl From<MeshInferenceDispatchError> for InferenceBackendError {
+    fn from(e: MeshInferenceDispatchError) -> Self {
+        Self::Provider(e.as_provider_message())
+    }
+}
+
+#[async_trait]
+pub trait MeshInferenceDispatch: Send + Sync {
+    async fn dispatch_chat(
+        &self,
+        req: InferenceChatRequest,
+        invocation_id: &str,
+        target_device_id: &str,
+    ) -> Result<InferenceChatResponse, MeshInferenceDispatchError>;
+    async fn dispatch_embed(
+        &self,
+        req: InferenceEmbedRequest,
+        invocation_id: &str,
+        target_device_id: &str,
+    ) -> Result<InferenceEmbedResponse, MeshInferenceDispatchError>;
+    async fn start_stream(
+        &self,
+        req: InferenceChatRequest,
+        invocation_id: &str,
+        target_device_id: &str,
+    ) -> Result<
+        (InferenceStreamHead, Box<dyn InferenceStream>, MeshCarrier),
+        MeshInferenceDispatchError,
+    >;
+    fn is_wired(&self) -> bool;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NotWiredMeshInferenceDispatch;
+
+#[async_trait]
+impl MeshInferenceDispatch for NotWiredMeshInferenceDispatch {
+    async fn dispatch_chat(
+        &self,
+        _req: InferenceChatRequest,
+        _invocation_id: &str,
+        _target_device_id: &str,
+    ) -> Result<InferenceChatResponse, MeshInferenceDispatchError> {
+        Err(MeshInferenceDispatchError::Unwired)
+    }
+    async fn dispatch_embed(
+        &self,
+        _req: InferenceEmbedRequest,
+        _invocation_id: &str,
+        _target_device_id: &str,
+    ) -> Result<InferenceEmbedResponse, MeshInferenceDispatchError> {
+        Err(MeshInferenceDispatchError::Unwired)
+    }
+    async fn start_stream(
+        &self,
+        _req: InferenceChatRequest,
+        _invocation_id: &str,
+        _target_device_id: &str,
+    ) -> Result<
+        (InferenceStreamHead, Box<dyn InferenceStream>, MeshCarrier),
+        MeshInferenceDispatchError,
+    > {
+        Err(MeshInferenceDispatchError::Unwired)
+    }
+    fn is_wired(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForcedLocalEndpoint {
+    pub endpoint_id: String,
+    pub model_revision: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalInferenceResolveRequest {
+    pub invocation_id: String,
+    pub target_device_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalInferenceResolveError {
+    Unwired,
+    NotForcedLocal(String),
+    Unavailable(String),
+}
+
+impl std::fmt::Display for LocalInferenceResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unwired => f.write_str("local-inference-resolve: not wired"),
+            Self::NotForcedLocal(s) => write!(f, "not forced-local: {s}"),
+            Self::Unavailable(s) => write!(f, "local-inference-resolve unavailable: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for LocalInferenceResolveError {}
+
+pub trait LocalInferenceResolve: Send + Sync {
+    fn resolve_forced_local(
+        &self,
+        request: &LocalInferenceResolveRequest,
+    ) -> Result<ForcedLocalEndpoint, LocalInferenceResolveError>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NotWiredLocalInferenceResolve;
+
+impl LocalInferenceResolve for NotWiredLocalInferenceResolve {
+    fn resolve_forced_local(
+        &self,
+        _request: &LocalInferenceResolveRequest,
+    ) -> Result<ForcedLocalEndpoint, LocalInferenceResolveError> {
+        Err(LocalInferenceResolveError::Unwired)
+    }
+}
+
+/// True when `endpoint_id` looks like a mesh re-route (AC-20 structural hop refuse).
+pub fn is_mesh_remote_endpoint_id(endpoint_id: &str) -> bool {
+    let lower = endpoint_id.trim().to_ascii_lowercase();
+    lower.starts_with("mesh:")
+        || lower.starts_with("mesh-remote:")
+        || lower.starts_with("mesh_")
+        || lower.starts_with("remote:")
+        || lower.starts_with("http://")
+        || lower.starts_with("https://")
+}
+
+/// Allowed forced-local endpoint ids: non-empty `local:<opaque>` where the opaque
+/// suffix is `[a-z0-9][a-z0-9._/-]*` (ASCII only).
+pub fn is_allowed_forced_local_endpoint_id(endpoint_id: &str) -> bool {
+    let trimmed = endpoint_id.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    const PREFIX: &str = "local:";
+    if !lower.starts_with(PREFIX) {
+        return false;
+    }
+    let rest = &lower[PREFIX.len()..];
+    if rest.is_empty() {
+        return false;
+    }
+    if rest.contains(':') || rest.contains('@') || rest.contains("://") {
+        return false;
+    }
+    if is_mesh_remote_endpoint_id(rest)
+        || rest.starts_with("mesh-")
+        || rest.starts_with("mesh_")
+        || rest.starts_with("remote")
+    {
+        return false;
+    }
+    let mut chars = rest.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    rest.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
 }
 
 /// Auth header names C238 must strip (no credential injection on the local path).

@@ -87,6 +87,11 @@ pub(crate) fn emit_llm_request(emit: &dyn EventBusEmit, ctx: &LlmRequestContext,
     if let Some(iter) = ctx.iteration {
         payload["iteration"] = json!(iter);
     }
+    if let Some(p) = &ctx.placement {
+        payload["endpoint_id"] = json!(p.endpoint_id);
+        payload["model_revision"] = json!(p.model_revision);
+        payload["placement_reason"] = json!(p.placement_reason);
+    }
     event.payload = payload;
     emit.emit(event);
 }

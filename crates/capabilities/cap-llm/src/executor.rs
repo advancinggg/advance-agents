@@ -221,6 +221,7 @@ mod tests {
             embedding_model: None,
             sidecar: None,
             profile_id: None,
+            device_id: None,
         };
         resolve_provider_and_model(&[cfg], Some("a")).unwrap()
     }

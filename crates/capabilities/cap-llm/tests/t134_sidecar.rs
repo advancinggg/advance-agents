@@ -10,9 +10,27 @@ use advance_shared_types::inference::{
 use cap_http::DefaultLocalInferenceTransport;
 use cap_llm::backend_local::{ProcessSupervisor, SidecarClient, StaticHandoffSupervisor};
 
-#[tokio::test]
-async fn t134_spawn_handoff_chat_kill() {
+#[test]
+fn t134_spawn_handoff_chat_kill() {
     let bin = env!("CARGO_BIN_EXE_local-sidecar-fixture");
+    // Cold first-exec of the fixture (macOS code-signing) can exceed the
+    // PORT handshake. Drain one PORT= line so ProcessSupervisor is warm.
+    {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        if let Ok(mut child) = Command::new(bin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(out) = child.stdout.take() {
+                let mut line = String::new();
+                let _ = BufReader::new(out).read_line(&mut line);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
     let sup = ProcessSupervisor {
         command: bin.into(),
         args: vec![],
@@ -41,7 +59,10 @@ async fn t134_spawn_handoff_chat_kill() {
         deadline: Instant::now() + Duration::from_secs(5),
         cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
-    let resp = client.chat(req).await.expect("chat against fixture");
+    let resp = tokio::runtime::Runtime::new()
+        .expect("rt")
+        .block_on(client.chat(req))
+        .expect("chat against fixture");
     assert_eq!(resp.text, "pong");
     drop(child);
     assert!(

@@ -27,8 +27,8 @@ use advance_runtime::config::{InferenceBackendClass, LlmProviderConfig, RuntimeC
 use advance_shared_types::capability::BudgetDecision;
 use advance_shared_types::context::LlmMessage;
 use advance_shared_types::inference::{
-    InferenceBackendPort, InferenceChatRequest, InferenceMessage, InferenceStream,
-    InferenceStreamClass, InferenceTextDelta, InferenceTool,
+    remaining_until, InferenceBackendPort, InferenceChatRequest, InferenceMessage,
+    InferenceStream, InferenceStreamClass, InferenceTextDelta, InferenceTool,
 };
 use advance_shared_types::repetition::{OutputHash, RepetitionDecision};
 use advance_shared_types::security_validator::{
@@ -48,7 +48,7 @@ use crate::host_fn::{
     truncate_text_at_char_boundary, DEFAULT_STREAM_OUTPUT_TOKENS, MAX_ENCODED_TEXT_BYTES,
     MAX_TOKENS_PER_ATTEMPT, STREAM_HANDLE_TTL,
 };
-use crate::provider::{make_resolved, resolve_provider_and_model, ResolvedProvider};
+use crate::provider::{make_resolved, ResolvedProvider};
 use crate::providers::select_adapter;
 use crate::retry::{backoff_ms, classify_retryable, resolve_retry_config, PartialRetry};
 use crate::structured_output::try_parse_and_validate;
@@ -197,6 +197,28 @@ pub(crate) struct LlmRequestContext {
     /// When true, `generate` / `generate_via_local` bind `TeeState` (guest WIT
     /// generate). Host `chat()` / extractors leave this false.
     pub tee_live: bool,
+    pub user_constraints: Vec<crate::placement::UserHardConstraint>,
+    pub hard_task_class: bool,
+    pub placement: Option<crate::placement::PlacementRecord>,
+}
+
+/// Winner payload from one hop. Outer generate() is the only success
+/// `llm.response` / `tee.succeed` / success-commit emitter.
+struct DispatchOutcome {
+    response: ChatResponse,
+    event_cost: f64,
+    commit_tokens: u64,
+    commit_cost: f64,
+    structured_retry_attempt: Option<u32>,
+    schema_validation: Option<&'static str>,
+}
+
+struct DispatchError {
+    err: LlmError,
+    request_emitted: bool,
+    /// True when this hop already produced billed tokens (schema-repair
+    /// inner chat succeeded). Pre-token failover must not fire.
+    tokens_released: bool,
 }
 
 /// cap-llm-gaps (2026-06-04) — finalized buffered-stream payload produced by
@@ -267,6 +289,9 @@ pub struct LlmGateway {
     /// row both say headless daemons *inject* a `NotWiredDeltaSink`. Zero cost comes
     /// from `LlmDeltaSink::is_wired`, checked before any frame is built.
     delta_sink: Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
+    placement_telemetry: Arc<dyn crate::placement::PlacementTelemetry>,
+    /// Test-only hop budget. Production `None` uses `cap_http::DEFAULT_TIMEOUT`.
+    generate_timeout: Option<Duration>,
 }
 
 impl LlmGateway {
@@ -295,6 +320,8 @@ impl LlmGateway {
             ),
             catalog: Arc::new(crate::catalog::ModelProfileCatalog::new()),
             sidecar_holds: Vec::new(),
+            placement_telemetry: crate::placement::default_telemetry(),
+            generate_timeout: None,
         }
     }
 
@@ -303,6 +330,20 @@ impl LlmGateway {
         registry: advance_shared_types::inference::InferenceBackendRegistry,
     ) -> Self {
         self.inference_backends = Arc::new(registry);
+        self
+    }
+
+    pub fn with_placement_telemetry(
+        mut self,
+        telemetry: Arc<dyn crate::placement::PlacementTelemetry>,
+    ) -> Self {
+        self.placement_telemetry = telemetry;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_generate_timeout(mut self, timeout: Duration) -> Self {
+        self.generate_timeout = Some(timeout);
         self
     }
 
@@ -352,135 +393,269 @@ impl LlmGateway {
         }
     }
 
-    async fn generate_via_local(
+    fn arm_generate_tee(
         &self,
-        ctx: LlmRequestContext,
-        resolved: ResolvedProvider,
-        _provider_cfg: advance_runtime::config::LlmProviderConfig,
-        start: Instant,
-    ) -> Result<ChatResponse, LlmError> {
-        if let Some(rid) = &ctx.run_id {
-            match self.run_budget.check(rid, 0, 0.0) {
-                BudgetDecision::Deny(reason) => return Err(LlmError::BudgetExceeded(reason)),
-                BudgetDecision::Allow => {}
-            }
+        ctx: &LlmRequestContext,
+        tee: &mut crate::stream::GenerateTee,
+        tee_armed: &mut bool,
+    ) {
+        if !*tee_armed {
+            *tee = self.generate_tee(ctx);
+            *tee_armed = true;
         }
-        let port = self.local_port(&resolved.id)?;
-        let mut tee = self.generate_tee(&ctx);
-        emit_llm_request(self.event_bus.as_ref(), &ctx, &resolved.model);
-        let req =
-            to_inference_chat_req(&resolved, &ctx, Instant::now() + cap_http::DEFAULT_TIMEOUT);
-        let resp = match port.chat(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                let mapped = Self::map_backend_err(e);
-                emit_llm_error(
-                    self.event_bus.as_ref(),
-                    &ctx,
-                    &resolved.model,
-                    mapped.variant_name(),
-                    0,
-                    None,
-                    None,
-                    None,
-                );
-                return Err(mapped);
+    }
+
+    fn placed_endpoint(
+        &self,
+        providers: &[advance_runtime::config::LlmProviderConfig],
+        model_hint: Option<&str>,
+        need: &crate::capability::CapabilityNeed,
+        constraints: &[crate::placement::UserHardConstraint],
+    ) -> Result<
+        (
+            crate::placement::PlacementRecord,
+            advance_runtime::config::LlmProviderConfig,
+            ResolvedProvider,
+        ),
+        LlmError,
+    > {
+        let cands = crate::placement::candidates_for(
+            providers,
+            model_hint,
+            &self.catalog,
+            need,
+            self.placement_telemetry.as_ref(),
+        )?;
+        let rec = crate::placement::place(cands.as_slice(), constraints, &[], None)?
+            .ok_or_else(|| LlmError::ProviderError("no remaining endpoint".into()))?;
+        let pcfg = providers
+            .iter()
+            .find(|p| p.id == rec.endpoint_id)
+            .cloned()
+            .ok_or_else(|| LlmError::ModelNotAvailable(rec.endpoint_id.clone()))?;
+        let resolved = crate::provider::make_resolved(&pcfg, rec.model_revision.clone());
+        Ok((rec, pcfg, resolved))
+    }
+
+    fn port_for(
+        &self,
+        resolved: &ResolvedProvider,
+    ) -> Result<Arc<dyn InferenceBackendPort>, LlmError> {
+        match self.inference_backends.get(&resolved.id) {
+            Some(p) => Ok(p),
+            None if resolved.backend_class
+                == advance_runtime::config::InferenceBackendClass::MeshRemote =>
+            {
+                Err(LlmError::ProviderError("mesh-remote: not wired".into()))
             }
-        };
-        let clamped_in = resp.input_tokens.min(MAX_TOKENS_PER_ATTEMPT);
-        let clamped_out = resp.output_tokens.min(MAX_TOKENS_PER_ATTEMPT);
-        let cost = compute_cost(&resolved, clamped_in, clamped_out);
-        if !resp.text.chars().all(|c| c.is_whitespace()) {
-            let h = compute_output_hash(&resp.text);
-            match self.repetition_guard.record_output(&ctx.agent_id, h) {
-                RepetitionDecision::Pass | RepetitionDecision::Warn(_) => {}
-                RepetitionDecision::Terminate(reason) => {
-                    if let Some(rid) = &ctx.run_id {
-                        self.run_budget
-                            .commit(rid, clamped_in.saturating_add(clamped_out), cost);
-                        tee.note_committed_usage(advance_shared_types::traits::LlmDeltaUsage {
-                            input_tokens: clamped_in,
-                            output_tokens: clamped_out,
-                            cost_usd: cost,
+            None => Err(LlmError::ProviderError("local transport: not wired".into())),
+        }
+    }
+
+    fn note_port_error_terminal(
+        &self,
+        ctx: &LlmRequestContext,
+        tee: &mut crate::stream::GenerateTee,
+        commit_tokens: u64,
+        commit_cost: f64,
+    ) {
+        if let Some(rid) = &ctx.run_id {
+            self.run_budget.commit(rid, commit_tokens, commit_cost);
+            tee.note_committed_usage(advance_shared_types::traits::LlmDeltaUsage {
+                input_tokens: commit_tokens,
+                output_tokens: 0,
+                cost_usd: commit_cost,
+            });
+        }
+    }
+
+    fn cloud_dispatch_err(
+        &self,
+        ctx: &LlmRequestContext,
+        tee: &mut crate::stream::GenerateTee,
+        err: LlmError,
+        tokens: u64,
+        cost: f64,
+        book: bool,
+        completion: bool,
+    ) -> DispatchError {
+        if book && tokens > 0 {
+            self.note_port_error_terminal(ctx, tee, tokens, cost);
+        }
+        DispatchError {
+            err,
+            request_emitted: true,
+            tokens_released: tokens > 0 || completion,
+        }
+    }
+
+    async fn dispatch_port(
+        &self,
+        ctx: &mut LlmRequestContext,
+        resolved: &ResolvedProvider,
+        deadline: Instant,
+        tee: &mut crate::stream::GenerateTee,
+        tee_armed: &mut bool,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let port = self.port_for(resolved).map_err(|err| DispatchError {
+            err,
+            request_emitted: false,
+            tokens_released: false,
+        })?;
+        self.arm_generate_tee(ctx, tee, tee_armed);
+        emit_llm_request(self.event_bus.as_ref(), ctx, &resolved.model);
+        let mut structured_retry_attempt: u32 = 0;
+        let mut commit_tokens: u64 = 0;
+        let mut commit_cost: f64 = 0.0;
+        let mut hop_had_completion = false;
+        loop {
+            if Instant::now() >= deadline {
+                self.note_port_error_terminal(ctx, tee, commit_tokens, commit_cost);
+                return Err(DispatchError {
+                    err: LlmError::ProviderError("deadline-exceeded".into()),
+                    request_emitted: true,
+                    tokens_released: hop_had_completion || commit_tokens > 0,
+                });
+            }
+            let req = to_inference_chat_req(resolved, ctx, deadline);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.note_port_error_terminal(ctx, tee, commit_tokens, commit_cost);
+                return Err(DispatchError {
+                    err: LlmError::ProviderError("deadline-exceeded".into()),
+                    request_emitted: true,
+                    tokens_released: hop_had_completion || commit_tokens > 0,
+                });
+            }
+            let resp = match tokio::time::timeout(remaining, port.chat(req)).await {
+                Err(_) => {
+                    self.note_port_error_terminal(ctx, tee, commit_tokens, commit_cost);
+                    return Err(DispatchError {
+                        err: LlmError::ProviderError("deadline-exceeded".into()),
+                        request_emitted: true,
+                        tokens_released: hop_had_completion || commit_tokens > 0,
+                    });
+                }
+                Ok(Err(e)) => {
+                    let released = hop_had_completion || commit_tokens > 0;
+                    if released {
+                        self.note_port_error_terminal(ctx, tee, commit_tokens, commit_cost);
+                    }
+                    return Err(DispatchError {
+                        err: Self::map_backend_err(e),
+                        request_emitted: true,
+                        tokens_released: released,
+                    });
+                }
+                Ok(Ok(r)) => {
+                    hop_had_completion = true;
+                    r
+                }
+            };
+            let clamped_in = resp.input_tokens.min(MAX_TOKENS_PER_ATTEMPT);
+            let clamped_out = resp.output_tokens.min(MAX_TOKENS_PER_ATTEMPT);
+            let cost = compute_cost(resolved, clamped_in, clamped_out);
+            commit_tokens = commit_tokens
+                .saturating_add(clamped_in)
+                .saturating_add(clamped_out);
+            commit_cost += cost;
+            let observe_once = |tee: &mut crate::stream::GenerateTee| -> Result<(), DispatchError> {
+                if resp.text.chars().all(|c| c.is_whitespace()) {
+                    return Ok(());
+                }
+                let h = compute_output_hash(&resp.text);
+                match self.repetition_guard.record_output(&ctx.agent_id, h) {
+                    RepetitionDecision::Pass | RepetitionDecision::Warn(_) => Ok(()),
+                    RepetitionDecision::Terminate(reason) => {
+                        self.note_port_error_terminal(ctx, tee, commit_tokens, commit_cost);
+                        Err(DispatchError {
+                            err: LlmError::RepetitionTerminated(reason),
+                            request_emitted: true,
+                            tokens_released: true,
+                        })
+                    }
+                }
+            };
+            let mut parsed_output = None;
+            let mut schema_validation = None;
+            if let Some(schema) = ctx.output_schema.clone() {
+                match crate::try_parse_and_validate(&resp.text, schema.as_str()) {
+                    Ok(bytes) => {
+                        parsed_output = Some(bytes);
+                        schema_validation = Some("pass");
+                    }
+                    Err(LlmError::StructuredOutputFailed(msg)) if structured_retry_attempt < 2 => {
+                        structured_retry_attempt = structured_retry_attempt.saturating_add(1);
+                        if let Some(rid) = &ctx.run_id {
+                            if let BudgetDecision::Deny(reason) =
+                                self.run_budget.check(rid, commit_tokens, commit_cost)
+                            {
+                                self.note_port_error_terminal(ctx, tee, commit_tokens, commit_cost);
+                                return Err(DispatchError {
+                                    err: LlmError::BudgetExceeded(format!(
+                                        "structured-retry cost cap exceeded: {reason}"
+                                    )),
+                                    request_emitted: true,
+                                    tokens_released: true,
+                                });
+                            }
+                        }
+                        let truncated_msg = if msg.len() > 200 {
+                            let mut end = 200;
+                            while !msg.is_char_boundary(end) && end > 0 {
+                                end -= 1;
+                            }
+                            format!("{}…", &msg[..end])
+                        } else {
+                            msg
+                        };
+                        ctx.messages.push(ChatMessage {
+                            role: ChatRole::User,
+                            content: format!(
+                                "Your previous response failed schema validation \
+                                 (error truncated): {truncated_msg}. Please return \
+                                 valid JSON matching the original schema."
+                            ),
+                        });
+                        continue;
+                    }
+                    Err(e) => {
+                        if let Err(term) = observe_once(tee) {
+                            return Err(term);
+                        }
+                        self.note_port_error_terminal(ctx, tee, commit_tokens, commit_cost);
+                        return Err(DispatchError {
+                            err: e,
+                            request_emitted: true,
+                            tokens_released: true,
                         });
                     }
-                    emit_llm_error(
-                        self.event_bus.as_ref(),
-                        &ctx,
-                        &resolved.model,
-                        "repetition-terminated",
-                        0,
-                        None,
-                        None,
-                        None,
-                    );
-                    return Err(LlmError::RepetitionTerminated(reason));
                 }
             }
-        }
-        let mut parsed_output = None;
-        let mut schema_validation = None;
-        if let Some(schema) = &ctx.output_schema {
-            match crate::try_parse_and_validate(&resp.text, schema) {
-                Ok(bytes) => {
-                    parsed_output = Some(bytes);
-                    schema_validation = Some("pass");
-                }
-                Err(e) => {
-                    if let Some(rid) = &ctx.run_id {
-                        self.run_budget
-                            .commit(rid, clamped_in.saturating_add(clamped_out), cost);
-                        tee.note_committed_usage(advance_shared_types::traits::LlmDeltaUsage {
-                            input_tokens: clamped_in,
-                            output_tokens: clamped_out,
-                            cost_usd: cost,
-                        });
-                    }
-                    emit_llm_error(
-                        self.event_bus.as_ref(),
-                        &ctx,
-                        &resolved.model,
-                        e.variant_name(),
-                        0,
-                        None,
-                        None,
-                        None,
-                    );
-                    return Err(e);
-                }
+            if let Err(term) = observe_once(tee) {
+                return Err(term);
             }
-        }
-        if let Some(rid) = &ctx.run_id {
-            self.run_budget
-                .commit(rid, clamped_in.saturating_add(clamped_out), cost);
-        }
-        let latency_ms = start.elapsed().as_millis() as u64;
-        let chat_response = ChatResponse {
-            text: resp.text,
-            model: resp.model,
-            input_tokens: clamped_in,
-            output_tokens: clamped_out,
-            finish_reason: resp.finish_reason,
-            parsed_output,
-        };
-        emit_llm_response(
-            self.event_bus.as_ref(),
-            &ctx,
-            &chat_response,
-            cost,
-            latency_ms,
-            None,
-            schema_validation,
-        );
-        tee.succeed(
-            &chat_response.text,
-            Some(advance_shared_types::traits::LlmDeltaUsage {
+            let chat_response = ChatResponse {
+                text: resp.text,
+                model: resp.model,
                 input_tokens: clamped_in,
                 output_tokens: clamped_out,
-                cost_usd: cost,
-            }),
-        );
-        Ok(chat_response)
+                finish_reason: resp.finish_reason,
+                parsed_output,
+            };
+            return Ok(DispatchOutcome {
+                response: chat_response,
+                event_cost: cost,
+                commit_tokens,
+                commit_cost,
+                structured_retry_attempt: if ctx.output_schema.is_some() {
+                    Some(structured_retry_attempt)
+                } else {
+                    None
+                },
+                schema_validation,
+            });
+        }
     }
 
     async fn embed_via_local(
@@ -488,12 +663,13 @@ impl LlmGateway {
         text: &str,
         resolved: ResolvedProvider,
         start: Instant,
+        placement: Option<crate::placement::PlacementRecord>,
     ) -> Result<Vec<f32>, LlmError> {
         let model = resolved
             .embedding_model
             .clone()
             .ok_or_else(|| LlmError::ModelNotAvailable("local embedding_model unset".into()))?;
-        let port = self.local_port(&resolved.id)?;
+        let port = self.port_for(&resolved)?;
         let placeholder_ctx = LlmRequestContext {
             agent_id: self.default_agent_id.clone(),
             task_id: None,
@@ -504,6 +680,9 @@ impl LlmGateway {
             params: ChatParams::default(),
             output_schema: None,
             tee_live: false,
+            user_constraints: Vec::new(),
+            hard_task_class: false,
+            placement,
         };
         emit_llm_request(self.event_bus.as_ref(), &placeholder_ctx, &model);
         let req = advance_shared_types::inference::InferenceEmbedRequest {
@@ -513,9 +692,38 @@ impl LlmGateway {
             deadline: Instant::now() + cap_http::DEFAULT_TIMEOUT,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        let resp = match port.embed(req).await {
-            Ok(r) => r,
-            Err(e) => {
+        let remaining = req.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let mapped = LlmError::ProviderError("deadline-exceeded".into());
+            emit_llm_error(
+                self.event_bus.as_ref(),
+                &placeholder_ctx,
+                &model,
+                mapped.variant_name(),
+                0,
+                None,
+                None,
+                None,
+            );
+            return Err(mapped);
+        }
+        let resp = match tokio::time::timeout(remaining, port.embed(req)).await {
+            Err(_) => {
+                let mapped = LlmError::ProviderError("deadline-exceeded".into());
+                emit_llm_error(
+                    self.event_bus.as_ref(),
+                    &placeholder_ctx,
+                    &model,
+                    mapped.variant_name(),
+                    0,
+                    None,
+                    None,
+                    None,
+                );
+                return Err(mapped);
+            }
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 let mapped = Self::map_backend_err(e);
                 emit_llm_error(
                     self.event_bus.as_ref(),
@@ -550,13 +758,47 @@ impl LlmGateway {
         );
         Ok(resp.vector)
     }
+}
 
-    fn local_port(&self, id: &str) -> Result<Arc<dyn InferenceBackendPort>, LlmError> {
-        self.inference_backends
-            .get(id)
-            .ok_or_else(|| LlmError::ProviderError("local transport: not wired".into()))
+impl advance_shared_types::inference::LocalInferenceResolve for LlmGateway {
+    fn resolve_forced_local(
+        &self,
+        _request: &advance_shared_types::inference::LocalInferenceResolveRequest,
+    ) -> Result<
+        advance_shared_types::inference::ForcedLocalEndpoint,
+        advance_shared_types::inference::LocalInferenceResolveError,
+    > {
+        let cfg = self.config_provider.current();
+        let p = cfg
+            .llm_providers
+            .iter()
+            .find(|p| p.backend_class == InferenceBackendClass::Local)
+            .ok_or_else(|| {
+                advance_shared_types::inference::LocalInferenceResolveError::Unavailable(
+                    "no local provider".into(),
+                )
+            })?;
+        let endpoint_id = format!("local:{}", p.id);
+        if !advance_shared_types::inference::is_allowed_forced_local_endpoint_id(&endpoint_id) {
+            return Err(
+                advance_shared_types::inference::LocalInferenceResolveError::NotForcedLocal(
+                    endpoint_id,
+                ),
+            );
+        }
+        let model_revision = p.profile_id.clone().or_else(|| {
+            let mut keys: Vec<&String> = p.model_aliases.keys().collect();
+            keys.sort();
+            keys.first().map(|k| p.model_aliases[k.as_str()].clone())
+        });
+        Ok(advance_shared_types::inference::ForcedLocalEndpoint {
+            endpoint_id,
+            model_revision,
+        })
     }
+}
 
+impl LlmGateway {
     pub async fn embed_recorded(&self, text: &str) -> Result<(Vec<f32>, String), LlmError> {
         let cfg = self.config_provider.current();
         let resolved = select_embedding_provider(&cfg.llm_providers)?;
@@ -738,14 +980,7 @@ impl LlmGateway {
 
         // --- Preflight/build (pre-reservation; cancellation here strands nothing) ---
         let cfg_now = self.config_provider.current();
-        let mut resolved =
-            resolve_provider_and_model(&cfg_now.llm_providers, ctx.params.model.as_deref())?;
-        let mut provider_cfg = cfg_now
-            .llm_providers
-            .iter()
-            .find(|p| p.id == resolved.id)
-            .cloned()
-            .ok_or_else(|| LlmError::ProviderError("provider cfg missing".into()))?;
+        let mut ctx = ctx;
         let need = crate::capability::CapabilityNeed {
             tools: ctx.params.tools.as_ref().is_some_and(|t| !t.is_empty()),
             output_schema: ctx.output_schema.is_some(),
@@ -753,21 +988,23 @@ impl LlmGateway {
             prompt_tokens_est: estimate_prompt_tokens(&ctx.messages),
             max_tokens: ctx.params.max_tokens,
         };
-        let desc = crate::capability::descriptor_for(&provider_cfg, &self.catalog)?;
-        if crate::capability::missing_capability(&desc, &need).is_some() {
-            resolved = crate::capability::walk_eligible(
-                &cfg_now.llm_providers,
-                ctx.params.model.as_deref(),
-                &self.catalog,
-                &need,
-            )?;
-            provider_cfg = cfg_now
-                .llm_providers
-                .iter()
-                .find(|p| p.id == resolved.id)
-                .cloned()
-                .ok_or_else(|| LlmError::ProviderError("walked provider cfg missing".into()))?;
-        }
+        let cands = crate::placement::candidates_for(
+            &cfg_now.llm_providers,
+            ctx.params.model.as_deref(),
+            &self.catalog,
+            &need,
+            self.placement_telemetry.as_ref(),
+        )?;
+        let rec = crate::placement::place(&cands, &ctx.user_constraints, &[], None)?
+            .ok_or_else(|| LlmError::ProviderError("no remaining endpoint".into()))?;
+        let provider_cfg = cfg_now
+            .llm_providers
+            .iter()
+            .find(|p| p.id == rec.endpoint_id)
+            .cloned()
+            .ok_or_else(|| LlmError::ModelNotAvailable(rec.endpoint_id.clone()))?;
+        let resolved = crate::provider::make_resolved(&provider_cfg, rec.model_revision.clone());
+        ctx.placement = Some(rec);
 
         // Stream path: absent max-tokens resolves to DEFAULT_STREAM_OUTPUT_TOKENS and
         // the RESOLVED value is serialized upstream — the reserved output ceiling is
@@ -790,14 +1027,14 @@ impl LlmGateway {
             },
         }
 
-        let is_local = resolved.backend_class == InferenceBackendClass::Local;
+        let is_local = resolved.backend_class.uses_inference_port();
+        let live_deadline = Instant::now() + STREAM_HANDLE_TTL;
         let (input_est, upstream) = if is_local {
             drop(chain);
-            let port = self.local_port(&resolved.id)?;
+            let port = self.port_for(&resolved)?;
             let mut live_ctx = ctx.clone();
             live_ctx.params = params;
-            let inf_req =
-                to_inference_chat_req(&resolved, &live_ctx, Instant::now() + STREAM_HANDLE_TTL);
+            let inf_req = to_inference_chat_req(&resolved, &live_ctx, live_deadline);
             let input_est = inf_req.reservation_bytes();
             (input_est, LiveUpstream::Local { port, req: inf_req })
         } else {
@@ -866,8 +1103,8 @@ impl LlmGateway {
 
         let owner_task = tokio::spawn(async move {
             // ONE deadline anchor for the entire stream: dispatch, every pull,
-            // every wait (plan §2 — no re-anchoring).
-            let dl = tokio::time::Instant::now() + crate::host_fn::STREAM_HANDLE_TTL;
+            // every wait (plan §2 — remaining_until the request deadline, no re-stamp).
+            let dl = tokio::time::Instant::now() + remaining_until(live_deadline);
 
             // JoinHandle handoff (sync-sent by the spawner before any await).
             let my_task = match jh_rx.await {
@@ -893,7 +1130,7 @@ impl LlmGateway {
             let live = crate::stream::LiveStream {
                 agent_id: agent_owner.clone(),
                 created_at: Instant::now(),
-                deadline: Instant::now() + crate::host_fn::STREAM_HANDLE_TTL,
+                deadline: Instant::now() + remaining_until(live_deadline),
                 state: state_arc.clone(),
                 notify: notify_arc.clone(),
                 poll_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -1346,6 +1583,11 @@ impl LlmGateway {
                 }
             }
 
+            if let Some(err) = failed.take() {
+                let released = state_arc.lock().map(|st| st.visible.len()).unwrap_or(0);
+                failed = Some(wrap_stream_partial(err, released));
+            }
+
             let terminal_phase = match failed {
                 Some(e) => crate::stream::LivePhase::Failed(e),
                 None => {
@@ -1465,8 +1707,86 @@ impl LlmGateway {
             params,
             output_schema: None,
             tee_live: false,
+            user_constraints: Vec::new(),
+            hard_task_class: false,
+            placement: None,
         })
         .await
+    }
+
+    /// Internal entry point used by `chat()`, `chat_for_run()`, and by the
+    /// host_fn `AgentLlmGenerateHandler` (Slice C will pass `run_id` through
+    /// `HostCallContext`). Hosts MODULE-009 §1.4.2's full generate flow.
+    fn finish_winner(
+        &self,
+        ctx: &LlmRequestContext,
+        outcome: DispatchOutcome,
+        start: Instant,
+        tee: &mut crate::stream::GenerateTee,
+    ) -> Result<ChatResponse, LlmError> {
+        if let Some(rid) = &ctx.run_id {
+            self.run_budget
+                .commit(rid, outcome.commit_tokens, outcome.commit_cost);
+        }
+        emit_llm_response(
+            self.event_bus.as_ref(),
+            ctx,
+            &outcome.response,
+            outcome.event_cost,
+            start.elapsed().as_millis() as u64,
+            outcome.structured_retry_attempt,
+            outcome.schema_validation,
+        );
+        tee.succeed(
+            &outcome.response.text,
+            Some(advance_shared_types::traits::LlmDeltaUsage {
+                input_tokens: outcome.response.input_tokens,
+                output_tokens: outcome.response.output_tokens,
+                cost_usd: outcome.event_cost,
+            }),
+        );
+        Ok(outcome.response)
+    }
+
+    fn emit_hop_error(&self, ctx: &LlmRequestContext, model: &str, err: &LlmError) {
+        emit_llm_error(
+            self.event_bus.as_ref(),
+            ctx,
+            model,
+            err.variant_name(),
+            0,
+            None,
+            None,
+            None,
+        );
+    }
+
+    async fn dispatch_one(
+        &self,
+        ctx: &mut LlmRequestContext,
+        resolved: &ResolvedProvider,
+        provider_cfg: &advance_runtime::config::LlmProviderConfig,
+        tee: &mut crate::stream::GenerateTee,
+        tee_armed: &mut bool,
+        deadline: Instant,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let messages_snapshot = ctx.messages.clone();
+        let result = if resolved.backend_class.uses_inference_port() {
+            self.dispatch_port(ctx, resolved, deadline, tee, tee_armed)
+                .await
+        } else {
+            self.dispatch_cloud_http(
+                ctx,
+                resolved.clone(),
+                provider_cfg.clone(),
+                tee,
+                tee_armed,
+                deadline,
+            )
+            .await
+        };
+        ctx.messages = messages_snapshot;
+        result
     }
 
     /// Internal entry point used by `chat()`, `chat_for_run()`, and by the
@@ -1476,19 +1796,12 @@ impl LlmGateway {
         &self,
         mut ctx: LlmRequestContext,
     ) -> Result<ChatResponse, LlmError> {
-        // Round-4 W4 fix: total wall-time across all retries, not per-attempt.
         let start = Instant::now();
+        let deadline = start
+            + self
+                .generate_timeout
+                .unwrap_or(cap_http::DEFAULT_TIMEOUT);
         let cfg = self.config_provider.current();
-
-        // Resolve provider + model.
-        let mut resolved =
-            resolve_provider_and_model(&cfg.llm_providers, ctx.params.model.as_deref())?;
-        let mut provider_cfg = cfg
-            .llm_providers
-            .iter()
-            .find(|p| p.id == resolved.id)
-            .expect("invariant: resolved provider exists in cfg")
-            .clone();
         let need = crate::capability::CapabilityNeed {
             tools: ctx.params.tools.as_ref().is_some_and(|t| !t.is_empty()),
             output_schema: ctx.output_schema.is_some(),
@@ -1496,29 +1809,13 @@ impl LlmGateway {
             prompt_tokens_est: estimate_prompt_tokens(&ctx.messages),
             max_tokens: ctx.params.max_tokens,
         };
-        let desc = crate::capability::descriptor_for(&provider_cfg, &self.catalog)?;
-        if crate::capability::missing_capability(&desc, &need).is_some() {
-            resolved = crate::capability::walk_eligible(
-                &cfg.llm_providers,
-                ctx.params.model.as_deref(),
-                &self.catalog,
-                &need,
-            )?;
-            provider_cfg = cfg
-                .llm_providers
-                .iter()
-                .find(|p| p.id == resolved.id)
-                .expect("invariant: walked provider exists")
-                .clone();
-        }
-        if resolved.backend_class == advance_runtime::config::InferenceBackendClass::Local {
-            return self
-                .generate_via_local(ctx, resolved, provider_cfg, start)
-                .await;
-        }
-        let retry_cfg = resolve_retry_config(&provider_cfg, self.retry_overrides.as_ref(), None);
-
-        // Budget preflight (run_id-gated).
+        let cands = crate::placement::candidates_for(
+            &cfg.llm_providers,
+            ctx.params.model.as_deref(),
+            &self.catalog,
+            &need,
+            self.placement_telemetry.as_ref(),
+        )?;
         if let Some(rid) = &ctx.run_id {
             match self.run_budget.check(rid, 0, 0.0) {
                 BudgetDecision::Deny(reason) => {
@@ -1527,18 +1824,155 @@ impl LlmGateway {
                 BudgetDecision::Allow => {}
             }
         }
+        let mut tee = crate::stream::GenerateTee::disarmed();
+        let mut tee_armed = false;
+        let mut excluded: Vec<String> = Vec::new();
+        let mut last_err: Option<LlmError> = None;
+        let mut last_ok: Option<DispatchOutcome> = None;
+        let mut strength_floor: Option<crate::placement::Strength> = None;
+        loop {
+            if Instant::now() >= deadline {
+                if let Some(outcome) = last_ok.take() {
+                    return self.finish_winner(&ctx, outcome, start, &mut tee);
+                }
+                return Err(
+                    last_err.unwrap_or_else(|| LlmError::ProviderError("deadline-exceeded".into()))
+                );
+            }
+            let rec = match crate::placement::place(
+                &cands,
+                &ctx.user_constraints,
+                &excluded,
+                strength_floor,
+            ) {
+                Ok(Some(r)) => r,
+                Ok(None) | Err(_) if last_ok.is_some() => {
+                    let outcome = last_ok.take().unwrap();
+                    return self.finish_winner(&ctx, outcome, start, &mut tee);
+                }
+                Ok(None) => {
+                    return Err(last_err.unwrap_or_else(|| {
+                        LlmError::ProviderError("no remaining endpoint".into())
+                    }))
+                }
+                Err(e) => return Err(last_err.unwrap_or(e)),
+            };
+            let Some(pcfg) = cfg
+                .llm_providers
+                .iter()
+                .find(|p| p.id == rec.endpoint_id)
+                .cloned()
+            else {
+                return Err(LlmError::ModelNotAvailable(rec.endpoint_id.clone()));
+            };
+            let resolved = crate::provider::make_resolved(&pcfg, rec.model_revision.clone());
+            ctx.placement = Some(rec.clone());
+            if resolved.backend_class.uses_inference_port() {
+                // MeshRemote !is_wired is the OSS NotWired stub (plan §6.2).
+                // Local FailedSpawnBackend is fail-closed in-registry: dispatch
+                // so the spawn reason is not rewritten into "not wired" + hop.
+                let skip_unwired = match self.port_for(&resolved) {
+                    Ok(p)
+                        if resolved.backend_class
+                            == advance_runtime::config::InferenceBackendClass::MeshRemote
+                            && !p.is_wired() =>
+                    {
+                        Some(LlmError::ProviderError("mesh-remote: not wired".into()))
+                    }
+                    Ok(_) => None,
+                    Err(e) => Some(e),
+                };
+                if let Some(err) = skip_unwired {
+                    last_err = Some(err.clone());
+                    excluded.push(rec.endpoint_id);
+                    if crate::placement::is_pre_token_failover(&err) {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+            match self
+                .dispatch_one(
+                    &mut ctx,
+                    &resolved,
+                    &pcfg,
+                    &mut tee,
+                    &mut tee_armed,
+                    deadline,
+                )
+                .await
+            {
+                Ok(outcome) if ctx.hard_task_class => {
+                    last_ok = Some(outcome);
+                    last_err = None;
+                    excluded.push(rec.endpoint_id);
+                    strength_floor = Some(rec.strength);
+                    continue;
+                }
+                Ok(outcome) => {
+                    return self.finish_winner(&ctx, outcome, start, &mut tee);
+                }
+                Err(de) if crate::placement::cascade_trigger(&de.err).is_some() => {
+                    if de.request_emitted {
+                        self.emit_hop_error(&ctx, &resolved.model, &de.err);
+                    }
+                    last_err = Some(de.err);
+                    last_ok = None;
+                    excluded.push(rec.endpoint_id);
+                    strength_floor = Some(rec.strength);
+                    continue;
+                }
+                Err(de)
+                    if crate::placement::is_pre_token_failover(&de.err) && !de.tokens_released =>
+                {
+                    if de.request_emitted {
+                        self.emit_hop_error(&ctx, &resolved.model, &de.err);
+                    }
+                    last_err = Some(de.err);
+                    excluded.push(rec.endpoint_id);
+                    continue;
+                }
+                Err(de) => {
+                    if de.request_emitted {
+                        self.emit_hop_error(&ctx, &resolved.model, &de.err);
+                    }
+                    return Err(de.err);
+                }
+            }
+        }
+    }
+
+    #[allow(unused_assignments)]
+    async fn dispatch_cloud_http(
+        &self,
+        ctx: &mut LlmRequestContext,
+        resolved: ResolvedProvider,
+        provider_cfg: advance_runtime::config::LlmProviderConfig,
+        tee: &mut crate::stream::GenerateTee,
+        tee_armed: &mut bool,
+        deadline: Instant,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let retry_cfg = resolve_retry_config(&provider_cfg, self.retry_overrides.as_ref(), None);
 
         // Build HttpCapability (allowlist + credentials).
         // Round-AUDIT-2 W2 (orphan llm.request) fix: build_http_cap MUST
         // succeed before emit_llm_request fires; otherwise a build-time
         // failure (invalid endpoint url / scheme not allowed) would leave
         // an orphan llm.request with no paired llm.response or llm.error.
-        let http_cap = build_http_cap(&resolved, &provider_cfg)?;
-
-        let mut tee = self.generate_tee(&ctx);
+        let http_cap = build_http_cap(&resolved, &provider_cfg).map_err(|err| DispatchError {
+            err,
+            request_emitted: false,
+            tokens_released: false,
+        })?;
+        self.arm_generate_tee(ctx, tee, tee_armed);
 
         // Emit llm.request.
         emit_llm_request(self.event_bus.as_ref(), &ctx, &resolved.model);
+        let after_req = |err: LlmError, tokens_released: bool| DispatchError {
+            err,
+            request_emitted: true,
+            tokens_released,
+        };
 
         // Total-attempts budget shared across structured + transport retries
         // (cap=6 per §1.4.3).
@@ -1555,6 +1989,7 @@ impl LlmGateway {
         // the preflight degeneracy of `check(rid, 0, 0.0)` documented in §3.6.
         let mut cumulative_tokens: u64 = 0;
         let mut cumulative_cost: f64 = 0.0;
+        let mut hop_had_completion = false;
 
         // Slice D — function-scope terminal-state markers (R7 I2 fix).
         // The structured-validation block inside the loop populates these
@@ -1576,6 +2011,17 @@ impl LlmGateway {
         let adapter = select_adapter(resolved.backend);
 
         while total_attempts < MAX_TOTAL_ATTEMPTS {
+            if Instant::now() >= deadline {
+                return Err(self.cloud_dispatch_err(
+                    ctx,
+                    tee,
+                    LlmError::ProviderError("deadline-exceeded".into()),
+                    cumulative_tokens,
+                    cumulative_cost,
+                    true,
+                    hop_had_completion,
+                ));
+            }
             // Sleep on retry. tokio::time::sleep honors `tokio::time::pause()`
             // virtual time — tests use `#[tokio::test(start_paused = true)]` +
             // `tokio::time::advance()` to skip waits.
@@ -1597,7 +2043,30 @@ impl LlmGateway {
                         .map(|e| e.variant_name())
                         .unwrap_or("unknown"),
                 );
-                tokio::time::sleep(Duration::from_millis(delay)).await;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(self.cloud_dispatch_err(
+                        ctx,
+                        tee,
+                        LlmError::ProviderError("deadline-exceeded".into()),
+                        cumulative_tokens,
+                        cumulative_cost,
+                        true,
+                        hop_had_completion,
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(delay).min(remaining)).await;
+                if Instant::now() >= deadline {
+                    return Err(self.cloud_dispatch_err(
+                        ctx,
+                        tee,
+                        LlmError::ProviderError("deadline-exceeded".into()),
+                        cumulative_tokens,
+                        cumulative_cost,
+                        true,
+                        hop_had_completion,
+                    ));
+                }
             }
             total_attempts += 1;
 
@@ -1609,24 +2078,51 @@ impl LlmGateway {
             let req = match adapter.build_chat_request(&resolved, &ctx.messages, &ctx.params) {
                 Ok(r) => r,
                 Err(e) => {
-                    emit_llm_error(
-                        self.event_bus.as_ref(),
-                        &ctx,
-                        &resolved.model,
-                        e.variant_name(),
-                        total_attempts.saturating_sub(1),
-                        None,
-                        None,
-                        None,
-                    );
-                    return Err(e);
+                    return Err(self.cloud_dispatch_err(
+                        ctx,
+                        tee,
+                        e,
+                        cumulative_tokens,
+                        cumulative_cost,
+                        true,
+                        hop_had_completion,
+                    ));
                 }
             };
 
-            // Call chain.
-            let response = match self.chain.execute(&ctx.agent_id, req, &http_cap).await {
-                Ok(r) => r,
-                Err(http_err) => {
+            // Call chain. Remaining hop budget bounds execute so AC-06 cannot
+            // run a full DEFAULT_TIMEOUT past generate's absolute deadline.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(self.cloud_dispatch_err(
+                    ctx,
+                    tee,
+                    LlmError::ProviderError("deadline-exceeded".into()),
+                    cumulative_tokens,
+                    cumulative_cost,
+                    true,
+                    hop_had_completion,
+                ));
+            }
+            let response = match tokio::time::timeout(
+                remaining,
+                self.chain.execute(&ctx.agent_id, req, &http_cap),
+            )
+            .await
+            {
+                Err(_) => {
+                    return Err(self.cloud_dispatch_err(
+                        ctx,
+                        tee,
+                        LlmError::ProviderError("deadline-exceeded".into()),
+                        cumulative_tokens,
+                        cumulative_cost,
+                        true,
+                        hop_had_completion,
+                    ));
+                }
+                Ok(Ok(r)) => r,
+                Ok(Err(http_err)) => {
                     let mapped = map_http_err_to_llm(http_err);
                     if classify_retryable(&mapped)
                         && total_attempts
@@ -1638,23 +2134,24 @@ impl LlmGateway {
                         last_err = Some(mapped);
                         continue;
                     }
-                    emit_llm_error(
-                        self.event_bus.as_ref(),
-                        &ctx,
-                        &resolved.model,
-                        mapped.variant_name(),
-                        total_attempts.saturating_sub(1),
-                        None,
-                        None,
-                        None,
-                    );
-                    return Err(mapped);
+                    return Err(self.cloud_dispatch_err(
+                        ctx,
+                        tee,
+                        mapped,
+                        cumulative_tokens,
+                        cumulative_cost,
+                        true,
+                        hop_had_completion,
+                    ));
                 }
             };
 
             // Parse response.
             let outcome = match adapter.parse_chat_response(response.status, &response.body) {
-                Ok(o) => o,
+                Ok(o) => {
+                    hop_had_completion = true;
+                    o
+                }
                 Err(e) => {
                     if classify_retryable(&e)
                         && total_attempts
@@ -1666,17 +2163,15 @@ impl LlmGateway {
                         last_err = Some(e);
                         continue;
                     }
-                    emit_llm_error(
-                        self.event_bus.as_ref(),
-                        &ctx,
-                        &resolved.model,
-                        e.variant_name(),
-                        total_attempts.saturating_sub(1),
-                        None,
-                        None,
-                        None,
-                    );
-                    return Err(e);
+                    return Err(self.cloud_dispatch_err(
+                        ctx,
+                        tee,
+                        e,
+                        cumulative_tokens,
+                        cumulative_cost,
+                        true,
+                        hop_had_completion,
+                    ));
                 }
             };
 
@@ -1726,19 +2221,17 @@ impl LlmGateway {
                                     self.run_budget
                                         .check(rid, cumulative_tokens, cumulative_cost)
                                 {
-                                    emit_llm_error(
-                                        self.event_bus.as_ref(),
-                                        &ctx,
-                                        &resolved.model,
-                                        "budget-exceeded",
-                                        total_attempts.saturating_sub(1),
-                                        None,
-                                        None,
-                                        None,
-                                    );
-                                    return Err(LlmError::BudgetExceeded(format!(
-                                        "structured-retry cost cap exceeded: {reason}"
-                                    )));
+                                    return Err(self.cloud_dispatch_err(
+                                        ctx,
+                                        tee,
+                                        LlmError::BudgetExceeded(format!(
+                                            "structured-retry cost cap exceeded: {reason}"
+                                        )),
+                                        cumulative_tokens,
+                                        cumulative_cost,
+                                        true,
+                                        hop_had_completion,
+                                    ));
                                 }
                             }
                             // Round-AUDIT-ADV-1 C1 fix: append the validation
@@ -1792,7 +2285,17 @@ impl LlmGateway {
                         exhausted_err = Some(msg);
                         break;
                     }
-                    Err(other) => return Err(other),
+                    Err(other) => {
+                        return Err(self.cloud_dispatch_err(
+                            ctx,
+                            tee,
+                            other,
+                            cumulative_tokens,
+                            cumulative_cost,
+                            true,
+                            hop_had_completion,
+                        ))
+                    }
                 }
             } else {
                 // No output_schema set — successful upstream parse is the
@@ -1859,29 +2362,18 @@ impl LlmGateway {
             let is_empty_normalized = outcome.text.chars().all(|c| c.is_whitespace());
             if is_empty_normalized {
                 // Skip record_output; treat as implicit Pass on Slice D semantics.
-                if let Some(rid) = &ctx.run_id {
-                    self.run_budget
-                        .commit(rid, total_committed_tokens, total_committed_cost);
-                    tee.note_committed_usage(advance_shared_types::traits::LlmDeltaUsage {
-                        input_tokens: clamped_in,
-                        output_tokens: clamped_out,
-                        cost_usd: total_committed_cost,
-                    });
-                }
                 if let Some(msg) = exhausted_err {
-                    emit_llm_error(
-                        self.event_bus.as_ref(),
-                        &ctx,
-                        &resolved.model,
-                        "structured-output-failed",
-                        total_attempts.saturating_sub(1),
-                        None,
-                        None,
-                        None,
-                    );
-                    return Err(LlmError::StructuredOutputFailed(msg));
+                    if let Some(rid) = &ctx.run_id {
+                        self.run_budget
+                            .commit(rid, total_committed_tokens, total_committed_cost);
+                        tee.note_committed_usage(advance_shared_types::traits::LlmDeltaUsage {
+                            input_tokens: clamped_in,
+                            output_tokens: clamped_out,
+                            cost_usd: total_committed_cost,
+                        });
+                    }
+                    return Err(after_req(LlmError::StructuredOutputFailed(msg), true));
                 }
-                let latency_ms = start.elapsed().as_millis() as u64;
                 let chat_response = ChatResponse {
                     text: outcome.text,
                     model: outcome.model,
@@ -1890,28 +2382,18 @@ impl LlmGateway {
                     finish_reason: outcome.finish_reason,
                     parsed_output,
                 };
-                emit_llm_response(
-                    self.event_bus.as_ref(),
-                    &ctx,
-                    &chat_response,
-                    attempt_cost,
-                    latency_ms,
-                    if ctx.output_schema.is_some() {
+                return Ok(DispatchOutcome {
+                    response: chat_response,
+                    event_cost: attempt_cost,
+                    commit_tokens: total_committed_tokens,
+                    commit_cost: total_committed_cost,
+                    structured_retry_attempt: if ctx.output_schema.is_some() {
                         Some(structured_retry_attempt)
                     } else {
                         None
                     },
                     schema_validation,
-                );
-                tee.succeed(
-                    &chat_response.text,
-                    Some(advance_shared_types::traits::LlmDeltaUsage {
-                        input_tokens: clamped_in,
-                        output_tokens: clamped_out,
-                        cost_usd: attempt_cost,
-                    }),
-                );
-                return Ok(chat_response);
+                });
             }
 
             match self
@@ -1919,35 +2401,28 @@ impl LlmGateway {
                 .record_output(&ctx.agent_id, output_hash)
             {
                 RepetitionDecision::Pass | RepetitionDecision::Warn(_) => {
-                    if let Some(rid) = &ctx.run_id {
-                        self.run_budget
-                            .commit(rid, total_committed_tokens, total_committed_cost);
-                        if exhausted_err.is_some() {
+                    if let Some(msg) = exhausted_err {
+                        // Pass/Warn on the schema-exhaustion path — call still
+                        // fails as StructuredOutputFailed but record_output
+                        // observed the upstream text (closes attacker bypass).
+                        if let Some(rid) = &ctx.run_id {
+                            self.run_budget.commit(
+                                rid,
+                                total_committed_tokens,
+                                total_committed_cost,
+                            );
                             tee.note_committed_usage(advance_shared_types::traits::LlmDeltaUsage {
                                 input_tokens: clamped_in,
                                 output_tokens: clamped_out,
                                 cost_usd: total_committed_cost,
                             });
                         }
-                    }
-                    if let Some(msg) = exhausted_err {
-                        // Pass/Warn on the schema-exhaustion path — call still
-                        // fails as StructuredOutputFailed but record_output
-                        // observed the upstream text (closes attacker bypass).
-                        emit_llm_error(
-                            self.event_bus.as_ref(),
-                            &ctx,
-                            &resolved.model,
-                            "structured-output-failed",
-                            total_attempts.saturating_sub(1),
-                            None,
-                            None,
-                            None,
-                        );
-                        return Err(LlmError::StructuredOutputFailed(msg));
+                        return Err(after_req(
+                            LlmError::StructuredOutputFailed(msg),
+                            true,
+                        ));
                     }
                     // Success path: build ChatResponse + emit_llm_response + Ok.
-                    let latency_ms = start.elapsed().as_millis() as u64;
                     let chat_response = ChatResponse {
                         text: outcome.text,
                         model: outcome.model,
@@ -1957,28 +2432,18 @@ impl LlmGateway {
                         finish_reason: outcome.finish_reason,
                         parsed_output,
                     };
-                    emit_llm_response(
-                        self.event_bus.as_ref(),
-                        &ctx,
-                        &chat_response,
-                        attempt_cost, // single-attempt cost on the event (per §3.5.1)
-                        latency_ms,
-                        if ctx.output_schema.is_some() {
+                    return Ok(DispatchOutcome {
+                        response: chat_response,
+                        event_cost: attempt_cost,
+                        commit_tokens: total_committed_tokens,
+                        commit_cost: total_committed_cost,
+                        structured_retry_attempt: if ctx.output_schema.is_some() {
                             Some(structured_retry_attempt)
                         } else {
                             None
                         },
                         schema_validation,
-                    );
-                    tee.succeed(
-                        &chat_response.text,
-                        Some(advance_shared_types::traits::LlmDeltaUsage {
-                            input_tokens: clamped_in,
-                            output_tokens: clamped_out,
-                            cost_usd: attempt_cost,
-                        }),
-                    );
-                    return Ok(chat_response);
+                    });
                 }
                 RepetitionDecision::Terminate(reason) => {
                     // R1 W7 + R6 C1: Terminate commits cost (preserves
@@ -1994,17 +2459,10 @@ impl LlmGateway {
                             cost_usd: total_committed_cost,
                         });
                     }
-                    emit_llm_error(
-                        self.event_bus.as_ref(),
-                        &ctx,
-                        &resolved.model,
-                        "repetition-terminated",
-                        total_attempts.saturating_sub(1),
-                        None,
-                        None,
-                        None,
-                    );
-                    return Err(LlmError::RepetitionTerminated(reason));
+                    return Err(after_req(
+                        LlmError::RepetitionTerminated(reason),
+                        true,
+                    ));
                 }
             }
         }
@@ -2012,17 +2470,15 @@ impl LlmGateway {
         // Transport-only retry exhaustion (no upstream success ever).
         let final_err =
             last_err.unwrap_or_else(|| LlmError::ProviderError("retry budget exhausted".into()));
-        emit_llm_error(
-            self.event_bus.as_ref(),
-            &ctx,
-            &resolved.model,
-            final_err.variant_name(),
-            total_attempts.saturating_sub(1),
-            None,
-            None,
-            None,
-        );
-        Err(final_err)
+        Err(self.cloud_dispatch_err(
+            ctx,
+            tee,
+            final_err,
+            cumulative_tokens,
+            cumulative_cost,
+            true,
+            hop_had_completion,
+        ))
     }
 }
 
@@ -2043,6 +2499,9 @@ impl LlmGatewayInternal for LlmGateway {
             params,
             output_schema: None,
             tee_live: false,
+            user_constraints: Vec::new(),
+            hard_task_class: false,
+            placement: None,
         })
         .await
     }
@@ -2053,15 +2512,62 @@ impl LlmGatewayInternal for LlmGateway {
         // latency_ms instead of the synthetic 0 used in slice B-2.
         let start = Instant::now();
         let cfg = self.config_provider.current();
-        let resolved = select_embedding_provider(&cfg.llm_providers)?;
-        let provider_cfg = cfg
+        let embed_ps: Vec<_> = cfg
             .llm_providers
             .iter()
-            .find(|p| p.id == resolved.id)
-            .expect("invariant: resolved provider exists in cfg")
-            .clone();
-        if resolved.backend_class == advance_runtime::config::InferenceBackendClass::Local {
-            return self.embed_via_local(text, resolved, start).await;
+            .filter(|p| is_embedding_capable(p))
+            .cloned()
+            .collect();
+        if embed_ps.is_empty() {
+            return Err(select_embedding_provider(&cfg.llm_providers).unwrap_err());
+        }
+        let need = crate::capability::CapabilityNeed {
+            tools: false,
+            output_schema: false,
+            image: false,
+            prompt_tokens_est: None,
+            max_tokens: None,
+        };
+        let (rec, provider_cfg, resolved) = match self.placed_endpoint(&embed_ps, None, &need, &[])
+        {
+            Ok(t) => t,
+            Err(e) if embed_ps.iter().any(|p| !p.model_aliases.is_empty()) => {
+                return Err(e);
+            }
+            Err(e) => {
+                // Empty-alias rows cannot bind in candidates_for (hint is
+                // None). Keep the pre-existing select_embedding_provider
+                // fallback, but only among endpoints place() would keep
+                // (authorized). Otherwise a denied CloudHttp that happens
+                // to be first still receives the embed text.
+                let authorized: Vec<_> = embed_ps
+                    .iter()
+                    .filter(|p| self.placement_telemetry.authorized(&p.id))
+                    .cloned()
+                    .collect();
+                if authorized.is_empty() {
+                    return Err(e);
+                }
+                let resolved = select_embedding_provider(&authorized)?;
+                let pcfg = cfg
+                    .llm_providers
+                    .iter()
+                    .find(|p| p.id == resolved.id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        LlmError::ModelNotAvailable("embedding provider missing".into())
+                    })?;
+                let rec = crate::placement::PlacementRecord {
+                    endpoint_id: resolved.id.clone(),
+                    model_revision: resolved.model.clone(),
+                    placement_reason: "embed:select".into(),
+                    strength: crate::placement::Strength::unbound(),
+                };
+                (rec, pcfg, resolved)
+            }
+        };
+        if resolved.backend_class.uses_inference_port() {
+            return self.embed_via_local(text, resolved, start, Some(rec)).await;
         }
         let retry_cfg = resolve_retry_config(&provider_cfg, self.retry_overrides.as_ref(), None);
         let http_cap = build_http_cap(&resolved, &provider_cfg)?;
@@ -2092,6 +2598,9 @@ impl LlmGatewayInternal for LlmGateway {
             params: ChatParams::default(),
             output_schema: None,
             tee_live: false,
+            user_constraints: Vec::new(),
+            hard_task_class: false,
+            placement: Some(rec),
         };
         emit_llm_request(self.event_bus.as_ref(), &placeholder_ctx, &embed_model);
 
@@ -2317,6 +2826,9 @@ impl LlmGateway {
             params,
             output_schema: None, // <-- intentional; validate externally below
             tee_live: false,
+            user_constraints: Vec::new(),
+            hard_task_class: false,
+            placement: None,
         };
         match self.generate(ctx).await {
             Ok(mut response) => {
@@ -2384,19 +2896,10 @@ impl LlmGateway {
     /// emitted verbatim at the done poll.
     pub(crate) async fn stream_begin(
         &self,
-        ctx: LlmRequestContext,
+        mut ctx: LlmRequestContext,
     ) -> Result<ReadyStream, LlmError> {
         let start = Instant::now();
         let cfg = self.config_provider.current();
-
-        let mut resolved =
-            resolve_provider_and_model(&cfg.llm_providers, ctx.params.model.as_deref())?;
-        let mut provider_cfg = cfg
-            .llm_providers
-            .iter()
-            .find(|p| p.id == resolved.id)
-            .expect("invariant: resolved provider exists in cfg")
-            .clone();
         let need = crate::capability::CapabilityNeed {
             tools: ctx.params.tools.as_ref().is_some_and(|t| !t.is_empty()),
             output_schema: ctx.output_schema.is_some(),
@@ -2404,21 +2907,13 @@ impl LlmGateway {
             prompt_tokens_est: estimate_prompt_tokens(&ctx.messages),
             max_tokens: ctx.params.max_tokens,
         };
-        let desc = crate::capability::descriptor_for(&provider_cfg, &self.catalog)?;
-        if crate::capability::missing_capability(&desc, &need).is_some() {
-            resolved = crate::capability::walk_eligible(
-                &cfg.llm_providers,
-                ctx.params.model.as_deref(),
-                &self.catalog,
-                &need,
-            )?;
-            provider_cfg = cfg
-                .llm_providers
-                .iter()
-                .find(|p| p.id == resolved.id)
-                .expect("invariant: walked provider exists")
-                .clone();
-        }
+        let (rec, provider_cfg, resolved) = self.placed_endpoint(
+            &cfg.llm_providers,
+            ctx.params.model.as_deref(),
+            &need,
+            &ctx.user_constraints,
+        )?;
+        ctx.placement = Some(rec);
         let retry_cfg = resolve_retry_config(&provider_cfg, self.retry_overrides.as_ref(), None);
 
         // Budget preflight (run_id-gated) — "checked once before the stream
@@ -2429,14 +2924,42 @@ impl LlmGateway {
             }
         }
 
-        if resolved.backend_class == InferenceBackendClass::Local {
-            let port = self.local_port(&resolved.id)?;
+        if resolved.backend_class.uses_inference_port() {
+            let port = self.port_for(&resolved)?;
             emit_llm_request(self.event_bus.as_ref(), &ctx, &resolved.model);
             let req =
                 to_inference_chat_req(&resolved, &ctx, Instant::now() + cap_http::DEFAULT_TIMEOUT);
-            let resp = match port.chat(req).await {
-                Ok(r) => r,
-                Err(e) => {
+            let remaining = req.deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let mapped = LlmError::ProviderError("deadline-exceeded".into());
+                emit_llm_error(
+                    self.event_bus.as_ref(),
+                    &ctx,
+                    &resolved.model,
+                    mapped.variant_name(),
+                    0,
+                    None,
+                    None,
+                    None,
+                );
+                return Err(mapped);
+            }
+            let resp = match tokio::time::timeout(remaining, port.chat(req)).await {
+                Err(_) => {
+                    let mapped = LlmError::ProviderError("deadline-exceeded".into());
+                    emit_llm_error(
+                        self.event_bus.as_ref(),
+                        &ctx,
+                        &resolved.model,
+                        mapped.variant_name(),
+                        0,
+                        None,
+                        None,
+                        None,
+                    );
+                    return Err(mapped);
+                }
+                Ok(Err(e)) => {
                     let mapped = Self::map_backend_err(e);
                     emit_llm_error(
                         self.event_bus.as_ref(),
@@ -2450,6 +2973,7 @@ impl LlmGateway {
                     );
                     return Err(mapped);
                 }
+                Ok(Ok(r)) => r,
             };
             return self.finish_buffered_stream(
                 ctx,
@@ -2715,6 +3239,9 @@ impl LlmGateway {
             params,
             output_schema: Some(output_schema),
             tee_live: false,
+            user_constraints: Vec::new(),
+            hard_task_class: false,
+            placement: None,
         })
         .await
     }
@@ -2736,6 +3263,19 @@ impl LlmGateway {
 fn estimate_prompt_tokens(messages: &[ChatMessage]) -> Option<u32> {
     let bytes: u64 = messages.iter().map(|m| m.content.len() as u64).sum();
     Some(((bytes.saturating_add(3)) / 4).min(u32::MAX as u64) as u32)
+}
+
+pub(crate) fn wrap_stream_partial(err: LlmError, released_bytes: usize) -> LlmError {
+    if released_bytes == 0 {
+        return err;
+    }
+    match err {
+        LlmError::ProviderError(msg) if msg.starts_with("stream-partial:") => {
+            LlmError::ProviderError(msg)
+        }
+        LlmError::ProviderError(msg) => LlmError::ProviderError(format!("stream-partial: {msg}")),
+        other => other,
+    }
 }
 
 fn to_inference_chat_req(
@@ -2800,6 +3340,17 @@ pub(crate) fn compute_output_hash(text: &str) -> OutputHash {
 /// per declaration order and resolve to a `ResolvedProvider` mirroring the
 /// canonical resolver at `provider.rs:98-115` (lex-smallest alias key, return
 /// the alias VALUE).
+fn is_embedding_capable(p: &LlmProviderConfig) -> bool {
+    if crate::provider::backend_of(p) == advance_runtime::config::ProviderBackend::AnthropicMessages
+    {
+        return false;
+    }
+    if p.backend_class.uses_inference_port() && p.embedding_model.is_none() {
+        return false;
+    }
+    true
+}
+
 pub(crate) fn select_embedding_provider(
     providers: &[LlmProviderConfig],
 ) -> Result<ResolvedProvider, LlmError> {
@@ -2823,9 +3374,7 @@ pub(crate) fn select_embedding_provider(
         {
             continue;
         }
-        if p.backend_class == advance_runtime::config::InferenceBackendClass::Local
-            && p.embedding_model.is_none()
-        {
+        if p.backend_class.uses_inference_port() && p.embedding_model.is_none() {
             continue;
         }
         let target_model = if p.model_aliases.is_empty() {
@@ -3112,6 +3661,9 @@ mod tests {
             params: ChatParams::default(),
             output_schema: None,
             tee_live: true,
+            user_constraints: Vec::new(),
+            hard_task_class: false,
+            placement: None,
         }
     }
 
@@ -3286,6 +3838,9 @@ mod tests {
                     .into(),
             ),
             tee_live: false,
+            user_constraints: Vec::new(),
+            hard_task_class: false,
+            placement: None,
         };
         let result = h.gateway.generate(ctx).await.expect("retry path success");
         assert!(result.parsed_output.is_some());
@@ -3633,6 +4188,9 @@ mod tests {
                 params: ChatParams::default(),
                 output_schema: None,
                 tee_live: false,
+                user_constraints: Vec::new(),
+                hard_task_class: false,
+                placement: None,
             })
             .await
             .unwrap();
@@ -3735,6 +4293,9 @@ mod tests {
                 params: ChatParams::default(),
                 output_schema: Some(schema.into()),
                 tee_live: false,
+                user_constraints: Vec::new(),
+                hard_task_class: false,
+                placement: None,
             })
             .await
             .unwrap();
@@ -3780,6 +4341,9 @@ mod tests {
                 params: ChatParams::default(),
                 output_schema: Some(schema.into()),
                 tee_live: false,
+                user_constraints: Vec::new(),
+                hard_task_class: false,
+                placement: None,
             })
             .await;
         assert!(matches!(result, Err(LlmError::StructuredOutputFailed(_))));
@@ -3930,6 +4494,9 @@ mod tests {
                     params: ChatParams::default(),
                     output_schema: Some(schema),
                     tee_live: false,
+                    user_constraints: Vec::new(),
+                    hard_task_class: false,
+                    placement: None,
                 })
                 .await
             }
@@ -4247,6 +4814,7 @@ mod tests {
             embedding_model: None,
             sidecar: None,
             profile_id: None,
+            device_id: None,
         };
         let cap1 = build_http_cap(&p1, &cfg1).unwrap();
         assert_eq!(
@@ -4286,6 +4854,7 @@ mod tests {
             embedding_model: None,
             sidecar: None,
             profile_id: None,
+            device_id: None,
         };
         let cap2 = build_http_cap(&p2, &cfg2).unwrap();
         assert_eq!(
@@ -4335,6 +4904,7 @@ mod tests {
                     embedding_model: None,
                     sidecar: None,
                     profile_id: None,
+                    device_id: None,
                 },
             )
         };
@@ -4393,6 +4963,9 @@ mod tests {
                     .into(),
             ),
             tee_live: false,
+            user_constraints: Vec::new(),
+            hard_task_class: false,
+            placement: None,
         };
         let result = h.gateway.generate(ctx).await.expect("retry should succeed");
         assert_eq!(result.parsed_output.is_some(), true);
@@ -4593,6 +5166,9 @@ mod tests {
             params: ChatParams::default(),
             output_schema: Some(schema.to_string()),
             tee_live: false,
+            user_constraints: Vec::new(),
+            hard_task_class: false,
+            placement: None,
         };
         // tokio::time::advance to skip backoff sleeps
         let fut = gateway.generate(ctx);
@@ -4648,6 +5224,9 @@ mod tests {
             params: ChatParams::default(),
             output_schema: Some(schema.to_string()),
             tee_live: false,
+            user_constraints: Vec::new(),
+            hard_task_class: false,
+            placement: None,
         };
         let fut = gateway.generate(ctx);
         tokio::pin!(fut);
@@ -4752,6 +5331,9 @@ mod tests {
             params: ChatParams::default(),
             output_schema: Some(schema.to_string()),
             tee_live: false,
+            user_constraints: Vec::new(),
+            hard_task_class: false,
+            placement: None,
         };
         let fut = gateway.generate(ctx);
         tokio::pin!(fut);

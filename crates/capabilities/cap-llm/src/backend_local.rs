@@ -210,7 +210,7 @@ impl Drop for SupervisedChild {
     }
 }
 
-const PORT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
+const PORT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl ProcessSupervisor {
     pub fn spawn(&self) -> Result<(SidecarHandoff, SupervisedChild), InferenceBackendError> {
@@ -299,6 +299,9 @@ impl ProcessSupervisor {
                 )));
             }
             Err(_) => {
+                // Do not try_wait here: reaping the leader then Drop-killpg
+                // races PID/PGID reuse. SupervisedChild Drop still owns the
+                // child and killpg's the live group.
                 return Err(InferenceBackendError::local_transport(
                     "PORT hand-off timed out",
                 ));
@@ -568,7 +571,13 @@ impl InferenceBackendPort for SidecarClient {
             pending: Vec::new(),
             saw_terminal: false,
         });
-        Ok((InferenceStreamHead { class }, stream))
+        Ok((
+            InferenceStreamHead {
+                class,
+                snapshot_only: false,
+            },
+            stream,
+        ))
     }
 
     fn is_wired(&self) -> bool {

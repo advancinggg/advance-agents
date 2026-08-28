@@ -125,7 +125,7 @@ impl VlmExtractor for LlmGatewayVlm {
             .find(|p| p.id == resolved.id)
             .ok_or_else(|| LlmError::ModelNotAvailable("resolved provider missing in cfg".into()))?
             .clone();
-        if resolved.backend_class == advance_runtime::config::InferenceBackendClass::Local {
+        if resolved.backend_class.uses_inference_port() {
             return Err(LlmError::ProviderError(
                 "unsupported capability: image".into(),
             ));
@@ -587,6 +587,7 @@ mod tests {
             embedding_model: None,
             sidecar: None,
             profile_id: None,
+            device_id: None,
         };
         let mut cfg = fixture_runtime_config();
         cfg.llm_providers.insert(0, local);
@@ -632,6 +633,7 @@ mod tests {
             embedding_model: None,
             sidecar: None,
             profile_id: None,
+            device_id: None,
         };
         let mut cfg = fixture_runtime_config();
         cfg.llm_providers = vec![local];

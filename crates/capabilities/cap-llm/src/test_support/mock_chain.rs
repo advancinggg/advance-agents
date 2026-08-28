@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use advance_shared_types::security_validator::{
     HttpBodyStream, HttpCapability, HttpError, HttpRequest, HttpResponse, HttpResponseHead,
@@ -27,6 +28,12 @@ pub(crate) struct MockHttpSecurityChain {
     /// take precedence over the buffered-response-derived `SimpleStream`
     /// synthesis, so a test can script a mid-stream or terminal `HttpError`.
     pub stream_results: Mutex<HashMap<String, Vec<Result<Vec<u8>, HttpError>>>>,
+    /// When set, `execute` awaits this duration after logging the call so tests
+    /// can bound CloudHttp AC-06 against the generate hop deadline.
+    pub execute_delay: Mutex<Option<Duration>>,
+    /// 1-based call index at which `execute_delay` starts applying. `None`
+    /// means every call (existing behavior).
+    pub execute_delay_from_call: Mutex<Option<usize>>,
 }
 
 impl MockHttpSecurityChain {
@@ -134,6 +141,14 @@ impl HttpSecurityChain for MockHttpSecurityChain {
             t("return");
         }
         self.call_log.lock().unwrap().push(req.clone());
+        let n = self.call_log.lock().unwrap().len();
+        let delay = *self.execute_delay.lock().unwrap();
+        let from = *self.execute_delay_from_call.lock().unwrap();
+        if let Some(d) = delay {
+            if from.map(|f| n >= f).unwrap_or(true) {
+                tokio::time::sleep(d).await;
+            }
+        }
         self.lookup_response(&req.url)
     }
 }
