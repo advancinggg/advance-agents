@@ -3505,17 +3505,16 @@ mod live_gated_tests {
              same-process scheduling baseline p95={base_p95}us | ratio={ratio:.1}x"
         );
 
-        // Deliberately loose: on an idle machine this sits near 1 ms against a baseline of
-        // tens of microseconds. The bound exists to catch a regression in THIS code, not
-        // to re-measure the host — under load both numbers inflate together and the ratio
-        // holds, which is the property the absolute threshold did not have.
+        // §1.6 NFR is p95 < 20 ms. The ratio absorbs loaded runners where the
+        // absolute clock inflates (audit: 78 ms under a concurrent build). An
+        // idle runner can make yield_now+oneshot ~4 µs, which would fail a
+        // ratio-only bound on a healthy ~1.6 ms p95. Pass if either holds.
         assert!(
-            ratio < 400.0,
+            p95 < 20_000 || ratio < 400.0,
             "MODULE-009 §1.6 overhead regression: begin->first-delta p95={p95}us is \
              {ratio:.1}x the same-process scheduling baseline p95={base_p95}us \
-             (p50={p50}us p99={p99}us max={max}us over {ITERATIONS} begins). The ratio is \
-             asserted rather than the absolute 20 ms target because the absolute figure \
-             tracks machine load rather than this slice."
+             (p50={p50}us p99={p99}us max={max}us over {ITERATIONS} begins). Either \
+             the 20 ms NFR or the load-normalized ratio must hold."
         );
     }
 
