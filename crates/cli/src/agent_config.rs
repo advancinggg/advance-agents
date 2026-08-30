@@ -6,6 +6,12 @@
 //! inject into the guest's linker). Factored out of `wiring.rs` so the two
 //! paths cannot drift — a capability the daemon registers at L0 is exactly the
 //! one the loop requests for the guest.
+//!
+//! **`genui` is an intentional two-gate exception (MODULE-001-AC-29 / T110):**
+//! yaml `genui: true` still produces `CapRequest { capability: "genui" }` via
+//! [`KNOWN_CAPABILITIES`], but L0 **registration** is
+//! `RuntimeConfig.genui.enabled` only. yaml on + flag off → `inject` returns
+//! `UnknownCapability` (typed absence).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -40,6 +46,9 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     // `wiring.rs` (which registers the spawn host-fns + opens the agent tree) and
     // the `PerChildLoopManager` observer that serves the spawned child.
     "lifecycle",
+    // MODULE-001-AC-29 / T110: CapRequest gate only. L0 registration is
+    // `RuntimeConfig.genui.enabled` (see module rustdoc two-gate note).
+    "genui",
 ];
 
 /// Defence-in-depth bound on `.agent/config.yaml` size (mirrors the read in
@@ -383,6 +392,20 @@ mod tests {
     }
 
     // ── await-leg B-4a — the messaging capability flip (the keystone) ──
+
+    #[test]
+    fn known_capabilities_includes_genui() {
+        assert!(KNOWN_CAPABILITIES.contains(&"genui"));
+        let yaml = b"capabilities:\n  genui: true\n";
+        assert_eq!(names(&active_capabilities(Some(yaml))), vec!["genui"]);
+        let undeclared = b"capabilities:\n  fs: true\n  llm: true\n";
+        let caps = active_capabilities(Some(undeclared));
+        let got = names(&caps);
+        assert!(
+            !got.contains(&"genui"),
+            "undeclared yaml must not yield a genui CapRequest: {got:?}"
+        );
+    }
 
     #[test]
     fn known_capabilities_includes_messaging() {

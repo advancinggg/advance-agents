@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent_genui;
 pub mod bootstrap;
 pub mod capability_injector;
 pub mod circuit_breaker;
@@ -25,6 +26,7 @@ pub mod wit_bindings;
 // Top-level re-exports of the Slice T public surface.
 // Slice AE: AllowAllGrantCheck is intentionally NOT re-exported (it's a
 // pub(crate) construction-seam stub; see bootstrap.rs rustdoc).
+pub use agent_genui::register_agent_genui;
 pub use bootstrap::{BootstrapError, RuntimeHost, RuntimeHostBuilder};
 pub use capability_injector::{add_wasi_to_linker, CapabilityInjector, ComponentCtx, HostError};
 pub use component_loader::{

@@ -1043,15 +1043,22 @@ pub struct SecurityConfig {
 }
 
 /// MODULE-023 GenUI configuration (CONTRACT-003 additive, default-OFF).
+///
+/// AC-29 claims only `enabled`. The other three keys exist so product YAML
+/// that uses MODULE-023 §2.10 / CONTRACT-003 names parses under
+/// `deny_unknown_fields`. Snake_case is primary; kebab-case remains an alias.
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct GenUiConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(rename = "max-document-bytes", default = "default_max_document_bytes")]
+    #[serde(alias = "max-document-bytes", default = "default_max_document_bytes")]
     pub max_document_bytes: usize,
-    #[serde(rename = "mcp-apps-enabled", default)]
+    #[serde(alias = "mcp-apps-enabled", default)]
     pub mcp_apps_enabled: bool,
+    /// Parse-only. No catalog-admission claim.
+    #[serde(alias = "catalog-extensions", default)]
+    pub catalog_extensions: Vec<serde_json::Value>,
 }
 
 fn default_max_document_bytes() -> usize {
@@ -1064,6 +1071,7 @@ impl Default for GenUiConfig {
             enabled: false,
             max_document_bytes: default_max_document_bytes(),
             mcp_apps_enabled: false,
+            catalog_extensions: Vec::new(),
         }
     }
 }
@@ -2142,9 +2150,9 @@ fn validate_config(path: &Path, cfg: &RuntimeConfig) -> Result<(), ConfigError> 
         );
     }
 
-    // genui
-    if cfg.genui.max_document_bytes < 1024 || cfg.genui.max_document_bytes > 1_048_576 {
-        return invalid("genui.max-document-bytes must be in [1024, 1048576] (1 KiB to 1 MiB)");
+    // genui — CONTRACT-003 / MODULE-001 §2.10 pin (`advance_genui::MAX_DOCUMENT_BYTES`).
+    if !(1..=262_144).contains(&cfg.genui.max_document_bytes) {
+        return invalid("genui.max_document_bytes must be in 1..=262144");
     }
 
     Ok(())

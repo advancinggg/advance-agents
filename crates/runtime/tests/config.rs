@@ -1808,3 +1808,86 @@ fn validate_rejects_backend_local_with_class_mesh_remote() {
         "error: {err:?}"
     );
 }
+
+// -----------------------------------------------------------------------
+// MODULE-001-T110 — CONTRACT-003 `genui:` (AC-29 claims `enabled` only)
+// -----------------------------------------------------------------------
+
+#[test]
+fn genui_absent_block_defaults_off() {
+    for yaml in [minimal_yaml(), CANONICAL_YAML.to_string()] {
+        let config: RuntimeConfig = serde_yml::from_str(&yaml).expect("parses without genui:");
+        assert!(!config.genui.enabled);
+        assert_eq!(config.genui.max_document_bytes, 262_144);
+        assert!(!config.genui.mcp_apps_enabled);
+        assert!(config.genui.catalog_extensions.is_empty());
+    }
+}
+
+#[test]
+fn genui_config_default_enabled_false() {
+    let d = GenUiConfig::default();
+    assert!(!d.enabled);
+    assert_eq!(d.max_document_bytes, 262_144);
+    assert!(!d.mcp_apps_enabled);
+    assert!(d.catalog_extensions.is_empty());
+}
+
+#[test]
+fn genui_snake_case_key_set_parses() {
+    let yaml = format!(
+        "{}\ngenui:\n  enabled: false\n  max_document_bytes: 4096\n  mcp_apps_enabled: true\n  catalog_extensions:\n    - name: demo\n",
+        minimal_yaml().trim_end()
+    );
+    let config: RuntimeConfig = serde_yml::from_str(&yaml).expect("snake_case genui: parses");
+    assert!(!config.genui.enabled);
+    assert_eq!(config.genui.max_document_bytes, 4096);
+    assert!(config.genui.mcp_apps_enabled);
+    assert_eq!(config.genui.catalog_extensions.len(), 1);
+}
+
+#[test]
+fn genui_kebab_case_aliases_still_parse() {
+    let yaml = format!(
+        "{}\ngenui:\n  enabled: false\n  max-document-bytes: 8192\n  mcp-apps-enabled: true\n  catalog-extensions:\n    - kind: extra\n",
+        minimal_yaml().trim_end()
+    );
+    let config: RuntimeConfig = serde_yml::from_str(&yaml).expect("kebab-case genui: aliases bind");
+    assert_eq!(config.genui.max_document_bytes, 8192);
+    assert!(config.genui.mcp_apps_enabled);
+    assert_eq!(config.genui.catalog_extensions.len(), 1);
+}
+
+#[test]
+fn genui_max_document_bytes_range() {
+    let accept = |n: usize| {
+        let yaml = format!(
+            "{}\ngenui:\n  enabled: false\n  max_document_bytes: {n}\n",
+            minimal_yaml().trim_end()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("runtime-config.yaml");
+        write_config(&config_path, &yaml);
+        load_config(&config_path)
+            .unwrap_or_else(|e| panic!("max_document_bytes={n} must accept: {e}"))
+    };
+    let reject = |n: usize| {
+        let yaml = format!(
+            "{}\ngenui:\n  enabled: false\n  max_document_bytes: {n}\n",
+            minimal_yaml().trim_end()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("runtime-config.yaml");
+        write_config(&config_path, &yaml);
+        let err =
+            load_config(&config_path).expect_err(&format!("max_document_bytes={n} must reject"));
+        assert!(
+            err.to_string().contains("262144") || err.to_string().contains("max_document_bytes"),
+            "error should name the range: {err}"
+        );
+    };
+    accept(1);
+    accept(262_144);
+    reject(0);
+    reject(262_145);
+}

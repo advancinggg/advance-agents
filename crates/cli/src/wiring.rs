@@ -48,6 +48,7 @@ use advance_runtime::bootstrap::{BootstrapError, RuntimeHost, RuntimeHostBuilder
 use advance_runtime::config::{
     MasterKeySource, RunBudgetConfig, RuntimeConfigProvider, SecretsConfig,
 };
+use advance_runtime::register_agent_genui;
 use advance_scheduler::{InMemoryComponentSubmitApi, SubmitSubsetGate};
 use advance_scheduler_auto_loop::DefaultAutoLoopDriver;
 use advance_shared_types::agent_tree::{
@@ -1537,10 +1538,17 @@ async fn wire_capabilities_inner(
     let run_config = run_config_from(&builder.config().run_budget);
 
     // Step 5 — register the pre-build providers into the builder's registry.
-    // Each is gated on `.agent/config.yaml` declaring the capability active.
+    // Each is gated on `.agent/config.yaml` declaring the capability active,
+    // except `genui`: L0 registration is `RuntimeConfig.genui.enabled` only
+    // (intentional two-gate — yaml still produces the CapRequest via
+    // KNOWN_CAPABILITIES; flag-off + yaml-on is typed absence at inject).
     // None of these calls are fallible (the fallible fs setup ran in step 2b),
     // so no EventBus-shutdown error path is needed in this block.
     let registry = builder.host_registry();
+    let cfg = builder.config();
+    if cfg.genui.enabled {
+        register_agent_genui(&*registry, cfg.genui.max_document_bytes);
+    }
 
     // 5-spawn — 011 (Wave-11 Lane B, 2026-06-23): register the cap-lifecycle spawn
     // host-fns over the SHARED `agent_tree` so a sub-agent spawn records a `Sub`

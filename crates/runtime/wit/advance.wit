@@ -643,6 +643,25 @@ interface notify {
         -> result<_, notify-error>;
 }
 
+/// MODULE-001-AC-29 / T110: package-level `agent-genui` so guests can
+/// `import advance:runtime/agent-genui`. NOT imported by `world advance-host`
+/// (T42) and NOT added to `advance-host-with-capabilities` (dynamic injector,
+/// same as `agent-llm`). Single function: `emit-document`. The `genui-error`
+/// arms are MODULE-023 §2.8 names with the T110-approved L0 payload projection.
+interface agent-genui {
+    variant genui-error {
+        denied,
+        invalid-component(string),
+        invalid-props(string),
+        document-too-large,
+        invalid-action(string),
+        surface-unavailable(string),
+        bridge-violation,
+    }
+
+    emit-document: func(document-json: string) -> result<string, genui-error>;
+}
+
 world advance-host {
     export message-driven;
     export runnable;
