@@ -1,22 +1,33 @@
 //! Production adapters from host observation/grant surfaces to CONTRACT-190.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::SystemTime;
 
 use advance_client_api::{
     BoundGrantApprovalPort, BoundGrantMutation, BoundHistoryPage, BoundHistoryReadPort,
-    BoundMutationOutcome, ClientApi, ClientEventProvider, ClientMessageAck, ClientMessageStatus,
-    MessagingProvider, NormalizedEventFilter, ProviderClientDoneReceipt, ProviderError,
-    ProviderMutationRecovery, ProviderPrepareOutcome, RawEventRow,
+    BoundMutationOutcome, ClientAgentTreeNode, ClientApi, ClientCursorCodec, ClientEventProvider,
+    ClientMcpEntry, ClientMessageAck, ClientMessageStatus, ClientRunMutation, ClientRunSummary,
+    ClientSkillEntry, ClientToolEntry, ClientToolInventory, LlmDeltaHub, MessagingProvider,
+    NormalizedEventFilter, ProviderClientDoneReceipt, ProviderError, ProviderMutationRecovery,
+    ProviderPrepareOutcome, RawEventRow, RunControlProvider, ToolsProvider,
 };
 use advance_event_bus::{EventFilter, ObservabilityReadApi, ReadApiError, ReadCursor, ReadEvent};
 use advance_messaging::{MailboxStore, Message, MessageKind, MsgError};
-use advance_shared_types::sensitive_observation::{CanonicalCapParam, ObservationNode};
+use advance_run_manager::{RunId, RunManager};
+use advance_shared_types::agent_tree::{AgentKind, AgentStatus};
+use advance_shared_types::run::{RunError, TaskRunStatus};
+use advance_shared_types::security_validator::LeakDetector;
+use advance_shared_types::sensitive_observation::{
+    CanonicalCapParam, ObservationNode, SensitiveObservationRedactor,
+};
+use advance_shared_types::traits::{AgentTreeSnapshot, CallableInventoryReader};
 use cap_grant::{GrantApprovalIntake, GrantTtl};
 
-use crate::execution_turn_ingress::ExecutionTurnIngress;
+pub use crate::execution_turn_ingress::ExecutionTurnIngress;
 use crate::observation_carriers::ObservationCarrierStore;
 use crate::observation_projection::Contract219EventProjector;
 use crate::reply::ReplyRegistry;
@@ -521,6 +532,41 @@ fn ttl_node(ttl: GrantTtl) -> ObservationNode {
 /// Must match `commands::start::DEFAULT_MSG_AGENT_ID` (avoid a start↔adapters cycle).
 const SERVE_LOOP_AGENT: &str = "agent:default";
 
+const MAX_TRACKED_CLIENT_MESSAGES: usize = 4096;
+
+/// Bounded send ledger so `GET /client/messages/{id}` cannot grow without
+/// bound for the daemon lifetime. Oldest ids evict first.
+struct TrackedSends {
+    by_id: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+impl TrackedSends {
+    fn new() -> Self {
+        Self {
+            by_id: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, message_id: String, to: String) {
+        if self.by_id.contains_key(&message_id) {
+            return;
+        }
+        while self.order.len() >= MAX_TRACKED_CLIENT_MESSAGES {
+            if let Some(old) = self.order.pop_front() {
+                self.by_id.remove(&old);
+            }
+        }
+        self.order.push_back(message_id.clone());
+        self.by_id.insert(message_id, to);
+    }
+
+    fn get(&self, message_id: &str) -> Option<&String> {
+        self.by_id.get(message_id)
+    }
+}
+
 /// CLI-served CONTRACT-190 messaging port: deliver a User message onto the
 /// same mailbox the root serve loop recvs (POST `/msg` generate path).
 pub struct ServeLoopMessagingProvider {
@@ -528,11 +574,11 @@ pub struct ServeLoopMessagingProvider {
     ingress: Option<Arc<ExecutionTurnIngress>>,
     replies: Arc<ReplyRegistry>,
     counter: AtomicU64,
-    sent: Mutex<HashMap<String, String>>,
+    sent: Mutex<TrackedSends>,
 }
 
 impl ServeLoopMessagingProvider {
-    pub(crate) fn new(
+    pub fn new(
         store: Arc<MailboxStore>,
         ingress: Option<Arc<ExecutionTurnIngress>>,
         replies: Arc<ReplyRegistry>,
@@ -542,7 +588,7 @@ impl ServeLoopMessagingProvider {
             ingress,
             replies,
             counter: AtomicU64::new(0),
-            sent: Mutex::new(HashMap::new()),
+            sent: Mutex::new(TrackedSends::new()),
         }
     }
 
@@ -552,7 +598,7 @@ impl ServeLoopMessagingProvider {
     }
 }
 
-pub(crate) fn install_serve_loop_messaging(
+pub fn install_serve_loop_messaging(
     api: ClientApi,
     store: Arc<MailboxStore>,
     ingress: Option<Arc<ExecutionTurnIngress>>,
@@ -624,5 +670,486 @@ impl MessagingProvider for ServeLoopMessagingProvider {
             delivery_state: "delivered".to_string(),
             reply_state: reply_state.to_string(),
         })
+    }
+}
+
+/// Optional slots for the shared first-party Client API compose (CLI + SUT).
+#[derive(Default)]
+pub struct FirstPartyClientCompose {
+    pub run: Option<Arc<dyn RunControlProvider>>,
+    pub mailbox: Option<Arc<MailboxStore>>,
+    pub(crate) ingress: Option<Arc<ExecutionTurnIngress>>,
+    pub replies: Option<Arc<ReplyRegistry>>,
+    pub history: Option<Arc<dyn BoundHistoryReadPort>>,
+    pub events: Option<Arc<dyn ClientEventProvider>>,
+    pub cursor: Option<Arc<dyn ClientCursorCodec>>,
+    pub redactor: Option<Arc<SensitiveObservationRedactor>>,
+    pub leak_detector: Option<Arc<dyn LeakDetector>>,
+    pub grants: Option<Arc<dyn BoundGrantApprovalPort>>,
+    pub tools: Option<Arc<dyn ToolsProvider>>,
+    pub llm_delta_hub: Option<Arc<LlmDeltaHub>>,
+}
+
+pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCompose) -> ClientApi {
+    if let Some(run) = parts.run {
+        api = api.with_run_provider(run);
+    }
+    if let (Some(store), Some(replies)) = (parts.mailbox, parts.replies) {
+        api = install_serve_loop_messaging(api, store, parts.ingress, replies);
+    }
+    if let Some(history) = parts.history {
+        api = api.with_bound_history_provider(history);
+    }
+    if let Some(events) = parts.events {
+        api = api.with_event_provider(events);
+    }
+    if let Some(cursor) = parts.cursor {
+        api = api.with_cursor_codec(cursor);
+    }
+    if let Some(redactor) = parts.redactor {
+        api = api.with_observation_redactor(redactor);
+    }
+    if let Some(detector) = parts.leak_detector {
+        api = api.with_leak_detector(detector);
+    }
+    if let Some(grants) = parts.grants {
+        api = api.with_bound_grant_provider(grants);
+    }
+    if let Some(tools) = parts.tools {
+        api = api.with_tools_provider(tools);
+    }
+    if let Some(hub) = parts.llm_delta_hub {
+        api = api.with_llm_delta_hub(hub);
+    }
+    api
+}
+
+/// Install a tools provider only when a real inventory Arc is present.
+/// `skill_root` is the cap-skills provider root (`<workspace>/.agent`); the
+/// bounded walk appends `.agent/skills`, matching `DiskSkillSummaryReader`.
+pub fn install_tools_if_real(
+    api: &ClientApi,
+    inventory: Option<Arc<dyn CallableInventoryReader>>,
+    skill_root: Option<PathBuf>,
+) {
+    let Some(inventory) = inventory else {
+        return;
+    };
+    api.install_tools_provider(Arc::new(InventoryToolsProvider::new(
+        inventory,
+        SERVE_LOOP_AGENT,
+        skill_root,
+    )));
+}
+
+const MAX_VISIBLE_SKILLS: usize = 256;
+const MAX_SKILL_READ_BYTES: u64 = 96 * 1024;
+
+fn read_regular_capped(path: &Path, max_bytes: u64) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > max_bytes {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = String::new();
+    file.take(max_bytes).read_to_string(&mut buf).ok()?;
+    Some(buf)
+}
+
+fn client_provenance(raw: Option<&str>) -> String {
+    match raw.unwrap_or("imported") {
+        "AgentCreated" | "agent_created" => "agent_created".to_owned(),
+        _ => "imported".to_owned(),
+    }
+}
+
+fn client_trust(raw: Option<&str>) -> String {
+    match raw.unwrap_or("untrusted") {
+        "Trusted" | "trusted" => "trusted".to_owned(),
+        _ => "untrusted".to_owned(),
+    }
+}
+
+/// Flat `key: scalar` meta only. Rejects YAML anchors/aliases (`&` / `*`)
+/// and flow/nested documents so a planted `.meta.yaml` cannot expand in-process.
+fn parse_skill_meta(raw: &str) -> Option<(String, u32, String, String)> {
+    if raw.contains('&') || raw.contains('*') {
+        return None;
+    }
+    let mut skill_id = None;
+    let mut version = 0u32;
+    let mut provenance = None;
+    let mut trust_level = None;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            return None;
+        };
+        let key = key.trim();
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        if key.is_empty()
+            || value.starts_with('{')
+            || value.starts_with('[')
+            || value.starts_with('|')
+            || value.starts_with('>')
+        {
+            return None;
+        }
+        match key {
+            "skill_id" => skill_id = Some(value.to_owned()),
+            "version" => version = value.parse().unwrap_or(0),
+            "provenance" => provenance = Some(value.to_owned()),
+            "trust_level" => trust_level = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+    Some((
+        skill_id?,
+        version,
+        client_provenance(provenance.as_deref()),
+        client_trust(trust_level.as_deref()),
+    ))
+}
+
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_dir())
+        .unwrap_or(false)
+}
+
+/// Bounded skill-dir walk. Same layout and caps as `DiskSkillSummaryReader`
+/// — not `SkillStorage::list_active()`. The `.agent` and `.agent/skills`
+/// roots must be real directories (symlink roots are skipped). Leaf files
+/// use stat-before-open; `DirEntry::file_type` skips symlink children.
+fn list_client_skills(skill_root: &Path) -> Vec<ClientSkillEntry> {
+    let agent_dir = skill_root.join(".agent");
+    if !is_real_dir(&agent_dir) {
+        return Vec::new();
+    }
+    let skills_root = agent_dir.join("skills");
+    if !is_real_dir(&skills_root) {
+        return Vec::new();
+    }
+    let entries = match std::fs::read_dir(&skills_root) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for (visited, entry) in entries.enumerate() {
+        if visited >= MAX_VISIBLE_SKILLS {
+            break;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(skill_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let dir = entry.path();
+        let Some(_content) = read_regular_capped(&dir.join("SKILL.md"), MAX_SKILL_READ_BYTES)
+        else {
+            continue;
+        };
+        let Some(meta_raw) = read_regular_capped(&dir.join(".meta.yaml"), MAX_SKILL_READ_BYTES)
+        else {
+            continue;
+        };
+        let Some((meta_id, version, provenance, trust_level)) = parse_skill_meta(&meta_raw) else {
+            continue;
+        };
+        if meta_id != skill_id {
+            continue;
+        }
+        out.push(ClientSkillEntry {
+            skill_id,
+            version,
+            provenance,
+            trust_level,
+        });
+    }
+    out
+}
+
+pub struct InventoryToolsProvider {
+    inventory: Arc<dyn CallableInventoryReader>,
+    mapped_agent: String,
+    skill_root: Option<PathBuf>,
+}
+
+impl InventoryToolsProvider {
+    pub fn new(
+        inventory: Arc<dyn CallableInventoryReader>,
+        mapped_agent: impl Into<String>,
+        skill_root: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            inventory,
+            mapped_agent: mapped_agent.into(),
+            skill_root,
+        }
+    }
+}
+
+impl ToolsProvider for InventoryToolsProvider {
+    fn inventory(&self, _principal_id: &str) -> Result<ClientToolInventory, ProviderError> {
+        let agent = &self.mapped_agent;
+        let wasm = self
+            .inventory
+            .list_wasm_tools(agent)
+            .into_iter()
+            .map(|t| ClientToolEntry {
+                name: t.name,
+                description: t.description,
+            })
+            .collect();
+        let mcp = self
+            .inventory
+            .list_mcp_tools(agent)
+            .into_iter()
+            .map(|t| ClientMcpEntry {
+                name: t.name,
+                description: t.description,
+                server_id: t.server_id,
+            })
+            .collect();
+        let skills = self
+            .skill_root
+            .as_deref()
+            .map(list_client_skills)
+            .unwrap_or_default();
+        Ok(ClientToolInventory { wasm, mcp, skills })
+    }
+}
+
+enum RunControlJob {
+    Pause {
+        id: RunId,
+        reply: mpsc::Sender<Result<(), RunError>>,
+    },
+    Cancel {
+        id: RunId,
+        reply: mpsc::Sender<Result<(), RunError>>,
+    },
+}
+
+pub struct RunManagerRunControl {
+    mgr: Arc<RunManager>,
+    tree: Option<Arc<dyn AgentTreeSnapshot>>,
+    jobs: mpsc::Sender<RunControlJob>,
+}
+
+impl RunManagerRunControl {
+    pub fn new(mgr: Arc<RunManager>, tree: Option<Arc<dyn AgentTreeSnapshot>>) -> Self {
+        let (jobs, receiver) = mpsc::channel();
+        let worker = Arc::clone(&mgr);
+        let _ = std::thread::Builder::new()
+            .name("advance-client-run-control".to_owned())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(_) => return,
+                };
+                while let Ok(job) = receiver.recv() {
+                    match job {
+                        RunControlJob::Pause { id, reply } => {
+                            let _ = reply
+                                .send(runtime.block_on(worker.pause_run(&id, "manual".to_owned())));
+                        }
+                        RunControlJob::Cancel { id, reply } => {
+                            let _ = reply.send(
+                                runtime.block_on(worker.cancel_run(&id, "manual".to_owned())),
+                            );
+                        }
+                    }
+                }
+            });
+        Self { mgr, tree, jobs }
+    }
+
+    fn submit_job(
+        &self,
+        job: impl FnOnce(mpsc::Sender<Result<(), RunError>>) -> RunControlJob,
+    ) -> Result<(), ProviderError> {
+        let (reply, response) = mpsc::channel();
+        self.jobs
+            .send(job(reply))
+            .map_err(|_| ProviderError::Unavailable("run".to_owned()))?;
+        response
+            .recv()
+            .map_err(|_| ProviderError::Unavailable("run".to_owned()))?
+            .map_err(Self::map_err)
+    }
+
+    fn parse_id(run_id: &str) -> Result<RunId, ProviderError> {
+        RunId::from_string(run_id.to_string())
+            .map_err(|_| ProviderError::NotFound("run".to_owned()))
+    }
+
+    fn status_of(&self, run_id: &str) -> Result<String, ProviderError> {
+        self.mgr
+            .list_runs()
+            .into_iter()
+            .find(|r| r.id.as_ref() == run_id)
+            .map(|r| run_status_name(&r.status).to_owned())
+            .ok_or_else(|| ProviderError::NotFound("run".to_owned()))
+    }
+
+    fn map_err(error: RunError) -> ProviderError {
+        match error {
+            RunError::NotFound(_) => ProviderError::NotFound("run".to_owned()),
+            RunError::InvalidState(_) => ProviderError::InvalidState("run".to_owned()),
+            RunError::PermissionDenied(_) => ProviderError::Forbidden("run".to_owned()),
+            RunError::AlreadyExists(_) | RunError::BudgetExceeded(_) => {
+                ProviderError::Unavailable("run".to_owned())
+            }
+        }
+    }
+}
+
+impl RunControlProvider for RunManagerRunControl {
+    fn list_runs(&self) -> Result<Vec<ClientRunSummary>, ProviderError> {
+        Ok(self
+            .mgr
+            .list_runs()
+            .into_iter()
+            .map(|run| ClientRunSummary {
+                run_id: run.id.to_string(),
+                task_id: run.task_id,
+                controller_agent: run.controller_agent,
+                status: run_status_name(&run.status).to_owned(),
+                iteration: run.iteration,
+                token_used: run.budget.token_used,
+                token_limit: run.budget.token_limit,
+                cost_usd: run.budget.cost_usd,
+                cost_usd_limit: run.budget.cost_limit,
+                created_at: run.created_at.to_rfc3339(),
+                updated_at: run.updated_at.to_rfc3339(),
+            })
+            .collect())
+    }
+
+    fn agent_tree(&self) -> Result<Vec<ClientAgentTreeNode>, ProviderError> {
+        let Some(tree) = &self.tree else {
+            return Ok(Vec::new());
+        };
+        Ok(tree
+            .snapshot()
+            .nodes
+            .into_iter()
+            .map(|node| ClientAgentTreeNode {
+                id: node.id.0,
+                kind: agent_kind_name(&node.kind).to_owned(),
+                parent: node.parent.map(|p| p.0),
+                status: agent_status_name(&node.status).to_owned(),
+                template_ref: node.template_ref,
+            })
+            .collect())
+    }
+
+    fn pause(
+        &self,
+        run_id: &str,
+        _reason: Option<&str>,
+    ) -> Result<ClientRunMutation, ProviderError> {
+        let id = Self::parse_id(run_id)?;
+        self.submit_job(|reply| RunControlJob::Pause { id, reply })?;
+        Ok(ClientRunMutation {
+            run_id: run_id.to_owned(),
+            status: self.status_of(run_id)?,
+            emitted_event_ids: Vec::new(),
+        })
+    }
+
+    fn resume(
+        &self,
+        run_id: &str,
+        reason: Option<&str>,
+    ) -> Result<ClientRunMutation, ProviderError> {
+        let id = Self::parse_id(run_id)?;
+        let reason = reason.unwrap_or("manual").to_owned();
+        self.mgr.resume_run(&id, reason).map_err(Self::map_err)?;
+        Ok(ClientRunMutation {
+            run_id: run_id.to_owned(),
+            status: self.status_of(run_id)?,
+            emitted_event_ids: Vec::new(),
+        })
+    }
+
+    fn cancel(
+        &self,
+        run_id: &str,
+        _reason: Option<&str>,
+    ) -> Result<ClientRunMutation, ProviderError> {
+        let id = Self::parse_id(run_id)?;
+        self.submit_job(|reply| RunControlJob::Cancel { id, reply })?;
+        Ok(ClientRunMutation {
+            run_id: run_id.to_owned(),
+            status: self.status_of(run_id)?,
+            emitted_event_ids: Vec::new(),
+        })
+    }
+}
+
+fn run_status_name(status: &TaskRunStatus) -> &'static str {
+    match status {
+        TaskRunStatus::Active => "active",
+        TaskRunStatus::Suspended => "suspended",
+        TaskRunStatus::Paused => "paused",
+        TaskRunStatus::Completed => "completed",
+        TaskRunStatus::Failed(_) => "failed",
+        TaskRunStatus::Cancelled(_) => "cancelled",
+    }
+}
+
+fn agent_kind_name(kind: &AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Root => "root",
+        AgentKind::Child => "child",
+        AgentKind::Sub => "sub",
+    }
+}
+
+fn agent_status_name(status: &AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Active => "active",
+        AgentStatus::Paused => "paused",
+        AgentStatus::Terminated => "terminated",
+        AgentStatus::Failed => "failed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_skill_meta_rejects_yaml_aliases() {
+        assert!(parse_skill_meta("a: &a [*a]\nskill_id: bomb\nversion: 1\n").is_none());
+        assert!(parse_skill_meta(
+            "skill_id: echo-skill\nversion: 3\nprovenance: Imported\ntrust_level: Trusted\n"
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn tracked_sends_evicts_oldest() {
+        let mut sent = TrackedSends::new();
+        for i in 0..=MAX_TRACKED_CLIENT_MESSAGES {
+            sent.insert(format!("cmsg-{i}"), "agent:default".to_owned());
+        }
+        assert!(sent.get("cmsg-0").is_none());
+        assert!(sent
+            .get(&format!("cmsg-{MAX_TRACKED_CLIENT_MESSAGES}"))
+            .is_some());
+        assert_eq!(sent.by_id.len(), MAX_TRACKED_CLIENT_MESSAGES);
     }
 }

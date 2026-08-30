@@ -460,6 +460,15 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if let Some(spawned) = agent_loop.as_ref() {
+        if let Some(server) = wiring_handles.client_api_server.as_ref() {
+            crate::client_api_adapters::install_tools_if_real(
+                server.api().as_ref(),
+                spawned.tools_inventory.clone(),
+                wiring_handles.skills_root.clone(),
+            );
+        }
+    }
 
     // W24 boot leg (SYS-AC-282 / MODULE-001-AC-22): now that the root serve loop is
     // live and the per-child manager's runtime is bound, serve the BOOT-DECLARED
@@ -1091,6 +1100,7 @@ async fn try_spawn_agent_loop(
     // snapshot (SAT-A; the 5-spawn block records `Sub` nodes into it — 011); STILL
     // STUBS `callable_inventory` (empty, lands in a later slice). `None` gateway →
     // keep the default MinimalContextAssembler (no LLM, no seam).
+    let mut client_api_tools = None;
     if let Some(gateway) = llm_gateway {
         // Backbone Step 2 (adversarial r9 W2): probe host fns ONLY under the caps
         // THIS agent declared in `.agent/config.yaml` (the same `caps` set injected
@@ -1154,6 +1164,7 @@ async fn try_spawn_agent_loop(
         } else {
             Arc::new(crate::context_wiring::EmptyCallableInventory)
         };
+        client_api_tools = tool_registry.as_ref().map(|_| Arc::clone(&callable));
         let inner = crate::context_wiring::build_context_assembler_for_agent_with_decomposition(
             assembler_bus,
             callable,
@@ -1192,6 +1203,18 @@ async fn try_spawn_agent_loop(
             cap_agent_id.clone(),
         ));
         driver = driver.with_context_assembler(publishing);
+    } else if let Some(reg) = tool_registry.as_ref() {
+        let listed = cap_tools::ToolRegistry::list(reg.as_ref()).await;
+        let allow = tools_grant_reader
+            .as_ref()
+            .and_then(|r| r.tool_allowlist(&cap_agent_id));
+        let entries = cap_tools::web::project_callable_tool_entries(
+            listed,
+            allow.as_deref(),
+            web_grant.as_deref(),
+            &cap_agent_id,
+        );
+        client_api_tools = Some(Arc::new(cap_tools::CallableInventory::new(entries, vec![])));
     }
     // ComponentConfig.id carries the CAP id (the guest's self-identity for caps).
     let cfg = ComponentConfig {
@@ -1265,6 +1288,7 @@ async fn try_spawn_agent_loop(
         execution_ingress,
         channel_handles,
         channels_active,
+        tools_inventory: client_api_tools,
     }))
 }
 
@@ -1294,6 +1318,8 @@ struct SpawnedAgentLoop {
     /// Phase-2 Step-3: true when channels are configured — the POST /msg shim
     /// listener is then NOT spawned (channels replace it).
     channels_active: bool,
+    /// Real `CallableInventory` gathered at spawn, if tools were registered.
+    tools_inventory: Option<Arc<dyn CallableInventoryReader>>,
 }
 
 #[cfg(feature = "test-support")]

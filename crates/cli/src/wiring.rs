@@ -2435,10 +2435,26 @@ async fn wire_capabilities_inner(
             let ingress_port = progress_lifecycle
                 .as_ref()
                 .map(|activation| activation.execution_ingress.clone());
+            let run_mgr_for_api = run_manager.clone();
+            let tree_for_api = agent_tree_snapshot.clone();
             match advance_client_api::ClientApiServer::bind_local_factory(0, move |address| {
                 let mut config = advance_client_api::ClientApiConfig::default();
                 config.allowed_origins = vec![format!("http://{address}")];
                 let mut api = advance_client_api::ClientApi::new(config);
+                let mut parts = crate::client_api_adapters::FirstPartyClientCompose {
+                    run: Some(Arc::new(
+                        crate::client_api_adapters::RunManagerRunControl::new(
+                            run_mgr_for_api.clone(),
+                            tree_for_api.clone(),
+                        ),
+                    )),
+                    mailbox: Some(ingress_for_api.clone()),
+                    ingress: ingress_port.clone(),
+                    replies: Some(replies_for_api.clone()),
+                    tools: None,
+                    llm_delta_hub: llm_delta_hub_opt.clone(),
+                    ..Default::default()
+                };
                 if let Some((history, events, projector)) = history_events {
                     let history: Arc<dyn advance_client_api::BoundHistoryReadPort> =
                         Arc::new(history);
@@ -2450,32 +2466,20 @@ async fn wire_capabilities_inner(
                             Arc::new(advance_client_api::OsCursorEntropy),
                             client_event_retention_days,
                         ));
-                    let grants = grant_approval_for_api.as_ref().map(|intake| {
+                    parts.history = Some(history);
+                    parts.events = Some(events);
+                    parts.cursor = Some(cursor);
+                    parts.redactor = Some(projector.redactor());
+                    parts.leak_detector = Some(Arc::clone(&public_leak_detector));
+                    parts.grants = grant_approval_for_api.as_ref().map(|intake| {
                         Arc::new(crate::client_api_adapters::Contract219GrantAdapter::new(
                             Arc::clone(intake),
                             Arc::clone(&projector),
                         ))
                             as Arc<dyn advance_client_api::BoundGrantApprovalPort>
                     });
-                    api = api
-                        .with_bound_history_provider(history)
-                        .with_event_provider(events)
-                        .with_cursor_codec(cursor)
-                        .with_observation_redactor(projector.redactor())
-                        .with_leak_detector(Arc::clone(&public_leak_detector));
-                    if let Some(grants) = grants {
-                        api = api.with_bound_grant_provider(grants);
-                    }
                 }
-                if let Some(hub) = llm_delta_hub_opt.as_ref() {
-                    api = api.with_llm_delta_hub(Arc::clone(hub));
-                }
-                api = crate::client_api_adapters::install_serve_loop_messaging(
-                    api,
-                    ingress_for_api.clone(),
-                    ingress_port.clone(),
-                    replies_for_api.clone(),
-                );
+                api = crate::client_api_adapters::compose_first_party_client(api, parts);
                 Arc::new(api)
             })
             .await

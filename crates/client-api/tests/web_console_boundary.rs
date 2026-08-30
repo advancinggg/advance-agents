@@ -14,6 +14,10 @@ fn console_uses_only_public_client_api_and_safe_dom_writes() {
         "/client/grants/pending",
         "/client/grants/",
         "/client/events/stream",
+        "/client/runs",
+        "/client/messages",
+        "/client/tools",
+        "/client/devices",
         "/history",
     ] {
         assert!(
@@ -24,6 +28,7 @@ fn console_uses_only_public_client_api_and_safe_dom_writes() {
     for forbidden in [
         "/internal",
         "/runtime",
+        "/query",
         "EventBus",
         "GrantStore",
         "innerHTML",
@@ -36,6 +41,16 @@ fn console_uses_only_public_client_api_and_safe_dom_writes() {
         );
     }
     assert!(js.contains("textContent"));
+    assert!(js.contains("requestEnvelope"));
+    assert!(
+        js.contains("connectDashboard();") && js.contains("Promise.allSettled"),
+        "login must open the dashboard even when list refreshes fail"
+    );
+    assert!(
+        js.contains("reason: \"manual\"")
+            || js.contains("reason:\"manual\"")
+            || js.contains("{ reason: \"manual\" }")
+    );
     assert!(js.contains("unicode-bidi") || asset("styles.css").contains("unicode-bidi: plaintext"));
     assert!(
         js.contains("\\u202a-\\u202e"),

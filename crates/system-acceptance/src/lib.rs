@@ -197,6 +197,7 @@ use cap_mcp::{
 use std::collections::BTreeMap;
 use wasmtime::component::Val;
 
+mod first_party;
 pub mod llm_loopback;
 pub mod sidecar_fixture;
 
@@ -805,9 +806,13 @@ struct OneAgentTree {
 }
 impl OneAgentTree {
     fn new(workspace: PathBuf) -> Self {
+        Self::new_for(AGENT_ID, workspace)
+    }
+
+    fn new_for(agent_id: impl Into<String>, workspace: PathBuf) -> Self {
         Self {
             nodes: vec![AgentNode {
-                id: AgentId(AGENT_ID.to_string()),
+                id: AgentId(agent_id.into()),
                 kind: AgentKind::Root,
                 parent: None,
                 workspace_path: workspace,
@@ -935,12 +940,14 @@ pub struct DbEventRow {
 enum BusHandle {
     Capturing(Arc<CapturingBus>),
     Real(Arc<EventBus>),
+    Async(Arc<EventBus>),
 }
 impl BusHandle {
     fn as_dyn(&self) -> Arc<dyn EventBusEmit> {
         match self {
             BusHandle::Capturing(b) => b.clone() as Arc<dyn EventBusEmit>,
             BusHandle::Real(b) => b.clone() as Arc<dyn EventBusEmit>,
+            BusHandle::Async(b) => b.clone() as Arc<dyn EventBusEmit>,
         }
     }
 }
@@ -959,6 +966,8 @@ pub struct SystemUnderTestBuilder {
     llm: LlmMode,
     /// SYS-J-72: opt-in CONTRACT-234/235 tee + Client API bind. Default false.
     with_delta_tee: bool,
+    /// SYS-J-66: first-party Client API + C219 + RunManager on the async bus.
+    with_first_party_client: bool,
     /// Optional hub timing override used only when `with_delta_tee` is set.
     delta_tee_timing: Option<advance_client_api::DeltaTiming>,
     agent_id: String,
@@ -1249,6 +1258,7 @@ impl Default for SystemUnderTestBuilder {
             events: EventSink::Capturing,
             llm: LlmMode::Off,
             with_delta_tee: false,
+            with_first_party_client: false,
             delta_tee_timing: None,
             agent_id: AGENT_ID.to_string(),
             budget: None,
@@ -1436,6 +1446,14 @@ impl SystemUnderTestBuilder {
     /// `Cap::Llm` — callers still set `.caps(&[Cap::Llm, ...])`.
     pub fn with_delta_tee(mut self) -> Self {
         self.with_delta_tee = true;
+        self
+    }
+
+    /// SYS-J-66 first-party Client API axis: C219-before-bus, RunManager on
+    /// that bus, shared mailbox messaging, unfiltered tools snapshot.
+    pub fn with_first_party_client(mut self) -> Self {
+        self.with_first_party_client = true;
+        self.reply_capture = true;
         self
     }
     /// Like [`Self::with_delta_tee`], with a hub timing override (`LlmDeltaHub::with_timing`).
@@ -1913,6 +1931,26 @@ impl SystemUnderTestBuilder {
         if self.failing_git_sync && !self.caps.contains(&Cap::Fs) {
             panic!("with_failing_git_sync() requires Cap::Fs (the GitSync port is wired into register_agent_fs)");
         }
+        if self.with_first_party_client {
+            if self.with_delta_tee {
+                panic!(".with_first_party_client() is incompatible with .with_delta_tee()");
+            }
+            if self.with_triggers {
+                panic!(".with_first_party_client() is incompatible with .with_triggers()");
+            }
+            if matches!(self.events, EventSink::RealBus) {
+                panic!(".with_first_party_client() owns the async EventBus (do not set EventSink::RealBus)");
+            }
+            if !self.caps.contains(&Cap::Tools) {
+                panic!(".with_first_party_client() requires Cap::Tools");
+            }
+            if matches!(self.llm, LlmMode::Off) {
+                panic!(".with_first_party_client() requires a loopback LLM");
+            }
+            if self.grant_run_session.is_some() {
+                panic!(".with_first_party_client() constructs its own RunManager (do not grant_run_session)");
+            }
+        }
         if (self.with_live_l6 || self.failing_l6_committer) && !self.with_live_memory {
             panic!("with_live_l6()/with_failing_l6_committer() require with_live_memory() (L6 dispatch attaches to the live post-processor)");
         }
@@ -1973,15 +2011,26 @@ impl SystemUnderTestBuilder {
 
         // Event sink. (Constructed BEFORE the git queue since lifecycle-harvest:
         // the queue's worker captures the sink at spawn for `git.commit` events.)
-        let (bus, event_db_path) = match self.events {
-            EventSink::Capturing => (BusHandle::Capturing(Arc::new(CapturingBus::new())), None),
-            EventSink::RealBus => {
-                let jsonl_dir = workspace_root.join(".runtime/events/jsonl");
-                let db_path = workspace_root.join(".runtime/events.db");
-                std::fs::create_dir_all(&jsonl_dir).expect("create events jsonl dir");
-                let cfg = EventBusConfig::new(jsonl_dir, db_path.clone());
-                let real = EventBus::new_synchronous_for_tests(cfg).expect("real event bus");
-                (BusHandle::Real(Arc::new(real)), Some(db_path))
+        let mut first_party_axis = None;
+        let (bus, event_db_path) = if self.with_first_party_client {
+            let axis = first_party::boot_first_party_axis(&workspace_root, &self.agent_id)
+                .await
+                .expect("first-party C219/EventBus");
+            let db_path = workspace_root.join(".runtime/events.db");
+            let handle = BusHandle::Async(Arc::clone(&axis.bus));
+            first_party_axis = Some(axis);
+            (handle, Some(db_path))
+        } else {
+            match self.events {
+                EventSink::Capturing => (BusHandle::Capturing(Arc::new(CapturingBus::new())), None),
+                EventSink::RealBus => {
+                    let jsonl_dir = workspace_root.join(".runtime/events/jsonl");
+                    let db_path = workspace_root.join(".runtime/events.db");
+                    std::fs::create_dir_all(&jsonl_dir).expect("create events jsonl dir");
+                    let cfg = EventBusConfig::new(jsonl_dir, db_path.clone());
+                    let real = EventBus::new_synchronous_for_tests(cfg).expect("real event bus");
+                    (BusHandle::Real(Arc::new(real)), Some(db_path))
+                }
             }
         };
         let bus_dyn = bus.as_dyn();
@@ -2066,7 +2115,14 @@ impl SystemUnderTestBuilder {
         // single-node OneAgentTree (BS-3, byte-identical); `.agents()` → multi-node.
         let (tree_reader, tree_snap): (Arc<dyn AgentTreeReader>, Arc<dyn AgentTreeSnapshot>) =
             if self.agents.is_empty() {
-                let t = Arc::new(OneAgentTree::new(agent_workspace.clone()));
+                let t = if self.with_first_party_client {
+                    Arc::new(OneAgentTree::new_for(
+                        self.agent_id.clone(),
+                        agent_workspace.clone(),
+                    ))
+                } else {
+                    Arc::new(OneAgentTree::new(agent_workspace.clone()))
+                };
                 (
                     t.clone() as Arc<dyn AgentTreeReader>,
                     t as Arc<dyn AgentTreeSnapshot>,
@@ -2718,6 +2774,14 @@ impl SystemUnderTestBuilder {
                     .expect("register_cap_grant for with_tool_grant_filter");
             grant_store = Some(handles.store.clone());
         }
+        if self.with_first_party_client && grant_store.is_none() {
+            let sqlite =
+                Arc::new(R2d2SqliteIndexHandle::new_in_memory().expect("first-party grant sqlite"));
+            let handles =
+                register_cap_grant(sqlite, bus_dyn.clone(), None, self.agent_id.clone(), None)
+                    .expect("register_cap_grant for first-party grants");
+            grant_store = Some(handles.store.clone());
+        }
 
         // Harvest-triggers slice (SYS-AC 098-114): construct the REAL scheduler trigger
         // subsystems sharing the SUT's event sink. `bus_dyn.clone()` is the SAME
@@ -2990,6 +3054,9 @@ impl SystemUnderTestBuilder {
                     bus_dyn.clone(),
                 );
             }
+            if self.with_first_party_client {
+                first_party::seed_echo_tool(&tools).await;
+            }
             tool_registry_opt = Some(tools);
         }
 
@@ -3017,13 +3084,15 @@ impl SystemUnderTestBuilder {
             injector.clone(),
             cap_requests.clone(),
         );
-        let grant_run_bootstrap =
-            self.grant_run_session
-                .as_ref()
-                .map(|(run_manager, run_config)| {
-                    let cell: SessionRunCell = Arc::new(OnceLock::new());
-                    (run_manager.clone(), run_config.clone(), cell)
-                });
+        let grant_run_session = if let Some(axis) = &first_party_axis {
+            Some((Arc::clone(&axis.run_manager), first_party::run_config()))
+        } else {
+            self.grant_run_session.clone()
+        };
+        let grant_run_bootstrap = grant_run_session.as_ref().map(|(run_manager, run_config)| {
+            let cell: SessionRunCell = Arc::new(OnceLock::new());
+            (run_manager.clone(), run_config.clone(), cell)
+        });
         let wasm_handler = WasmMessageHandler::new(
             runtime,
             loaded,
@@ -3126,7 +3195,15 @@ impl SystemUnderTestBuilder {
         // turn's first-action payload is observable; otherwise pass `None` (the
         // existing gate-only behaviour — every prior `run_turn` test is unaffected).
         let captured_replies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-        let outbound: Option<Arc<dyn OutboundActionSink>> = if self.reply_capture {
+        let outbound: Option<Arc<dyn OutboundActionSink>> = if let Some(axis) = &first_party_axis {
+            Some(Arc::new(first_party::FulfillingCaptureSink {
+                capture: CapturingOutboundSink {
+                    replies: captured_replies.clone(),
+                    evidence: evidence_ids_opt.clone(),
+                },
+                replies: Arc::clone(&axis.reply_registry),
+            }))
+        } else if self.reply_capture {
             Some(Arc::new(CapturingOutboundSink {
                 replies: captured_replies.clone(),
                 evidence: evidence_ids_opt.clone(),
@@ -3152,6 +3229,26 @@ impl SystemUnderTestBuilder {
                 session_agent: self.agent_id.clone(),
                 cell,
             }));
+        }
+        let mut first_party_server = None;
+        if let Some(axis) = &first_party_axis {
+            let tools = tool_registry_opt
+                .as_ref()
+                .expect("first-party requires Cap::Tools");
+            let inventory = first_party::unfiltered_inventory(tools).await;
+            let grants = grant_store.clone().expect("first-party GrantStore");
+            first_party_server = Some(
+                first_party::bind_first_party_client(
+                    axis,
+                    store.clone(),
+                    tree_snap.clone(),
+                    grants,
+                    inventory,
+                    &self.agent_id,
+                )
+                .await
+                .expect("first-party Client API bind"),
+            );
         }
         // Perf-CI lane (perf_slo harness): retain cheap Arc clones of the live
         // inner ContextAssembler (pre-`PublishingContextAssembler`, so timing it is the
@@ -3683,7 +3780,9 @@ impl SystemUnderTestBuilder {
 
         let pump_exits: Arc<Mutex<Vec<advance_client_api::DeltaPumpExit>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let client_api_server = if self.with_delta_tee {
+        let client_api_server = if let Some(server) = first_party_server {
+            Some(server)
+        } else if self.with_delta_tee {
             let hub = llm
                 .as_ref()
                 .and_then(|lp| lp.capturing_sink())
@@ -3753,6 +3852,9 @@ impl SystemUnderTestBuilder {
             _queue: queue,
             _tempdir: tempdir,
             client_api_server,
+            run_manager: first_party_axis
+                .as_ref()
+                .map(|axis| Arc::clone(&axis.run_manager)),
             pump_exits,
             llm_stream_reaper,
             evidence_ids: evidence_ids_opt,
@@ -3847,7 +3949,7 @@ fn build_resolver_chain(
 /// This is the REAL post-dispatch delivery seam `build_agent_loop` wires (the daemon
 /// wires `ReplyRouterSink` here); the harness substitutes only the recording behaviour,
 /// not the dispatch path.
-struct CapturingOutboundSink {
+pub(crate) struct CapturingOutboundSink {
     replies: Arc<Mutex<Vec<Vec<u8>>>>,
     evidence: Option<Arc<EvidenceIdStore>>,
 }
@@ -4445,6 +4547,8 @@ pub struct SystemUnderTest {
     _queue: Arc<advance_git::DefaultGitCommitQueue>,
     _tempdir: tempfile::TempDir,
     client_api_server: Option<advance_client_api::ClientApiServer>,
+    /// SYS-J-66: the axis-owned RunManager (same async bus as `read_api()`).
+    run_manager: Option<Arc<RunManager>>,
     pump_exits: Arc<Mutex<Vec<advance_client_api::DeltaPumpExit>>>,
     llm_stream_reaper: Option<Arc<cap_llm::AgentStreamReaper>>,
     evidence_ids: Option<Arc<EvidenceIdStore>>,
@@ -5000,9 +5104,35 @@ impl SystemUnderTest {
         self.web_principal.as_deref()
     }
 
-    /// SYS-J-72: bound Client API, if `.with_delta_tee()` was set.
+    /// Bound Client API, if `.with_delta_tee()` or `.with_first_party_client()` was set.
     pub fn client_api_server(&self) -> Option<&advance_client_api::ClientApiServer> {
         self.client_api_server.as_ref()
+    }
+
+    /// SYS-J-66: the first-party axis RunManager, if `.with_first_party_client()` was set.
+    pub fn run_manager(&self) -> Option<&Arc<RunManager>> {
+        self.run_manager.as_ref()
+    }
+
+    /// SYS-J-66: best-effort async EventBus shutdown (`Arc::try_unwrap` + `shutdown`).
+    /// Remaining `Arc<dyn EventBusEmit>` clones may keep the concrete bus alive;
+    /// port `0` means a leaked listener does not collide. Does not run on Drop.
+    pub async fn shutdown_event_bus(&mut self) {
+        if !matches!(&self.bus, BusHandle::Async(_)) {
+            return;
+        }
+        let previous = std::mem::replace(
+            &mut self.bus,
+            BusHandle::Capturing(Arc::new(CapturingBus::new())),
+        );
+        let BusHandle::Async(arc) = previous else {
+            self.bus = previous;
+            return;
+        };
+        match Arc::try_unwrap(arc) {
+            Ok(bus) => bus.shutdown().await,
+            Err(arc) => self.bus = BusHandle::Async(arc),
+        }
     }
 
     /// SYS-J-72: capturing tee wrapper (Begin keys + recorded Deltas).
@@ -5051,7 +5181,7 @@ impl SystemUnderTest {
     pub fn events(&self) -> Vec<Event> {
         match &self.bus {
             BusHandle::Capturing(b) => b.events.lock().unwrap().clone(),
-            BusHandle::Real(_) => Vec::new(),
+            BusHandle::Real(_) | BusHandle::Async(_) => Vec::new(),
         }
     }
 

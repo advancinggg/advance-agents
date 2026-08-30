@@ -412,6 +412,20 @@ impl ClientApi {
         self
     }
 
+    /// Late-install tools into an already-bound `Arc<ClientApi>` (CLI spawn
+    /// builds the inventory after `bind_local_factory` returns).
+    pub fn install_tools_provider(&self, provider: Arc<dyn ToolsProvider>) {
+        *self.tools_provider.write().unwrap() = Some(provider);
+    }
+
+    pub fn install_run_provider(&self, provider: Arc<dyn RunControlProvider>) {
+        *self.run_provider.write().unwrap() = Some(provider);
+    }
+
+    pub fn install_messaging_provider(&self, provider: Arc<dyn MessagingProvider>) {
+        *self.messaging_provider.write().unwrap() = Some(provider);
+    }
+
     /// Inject the event provider (m020-s3 / Wave-25 composition root).
     pub fn with_event_provider(self, provider: Arc<dyn ClientEventProvider>) -> Self {
         *self.event_provider.write().unwrap() = Some(provider);

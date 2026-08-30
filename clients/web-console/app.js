@@ -48,6 +48,24 @@ async function request(path, { method = "GET", body, mutation = false } = {}) {
   return envelope.data;
 }
 
+async function requestEnvelope(path, { method = "GET", body, mutation = false } = {}) {
+  if (!path.startsWith("/client/")) throw new Error("public Client API path required");
+  const headers = { "x-advance-api-version": API_VERSION };
+  if (state.token) headers.authorization = `Bearer ${state.token}`;
+  if (body !== undefined) headers["content-type"] = "application/json";
+  if (mutation) {
+    headers["x-csrf-token"] = state.csrf;
+    headers["idempotency-key"] = crypto.randomUUID();
+  }
+  const response = await fetch(path, {
+    method,
+    headers,
+    credentials: "same-origin",
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  return response.json();
+}
+
 document.querySelector("#login-form").addEventListener("submit", async event => {
   event.preventDefault();
   const code = document.querySelector("#bootstrap-code").value;
@@ -58,8 +76,13 @@ document.querySelector("#login-form").addEventListener("submit", async event => 
   state.token = data.token;
   state.csrf = data.csrf_token || "";
   document.querySelector("#connection").textContent = "connected";
-  await refreshGrants();
   connectDashboard();
+  await Promise.allSettled([
+    refreshGrants(),
+    refreshRuns(),
+    refreshTools(),
+    refreshDevices(),
+  ]);
 });
 
 document.querySelector("#history-form").addEventListener("submit", async event => {
@@ -87,15 +110,82 @@ async function decide(grant, action) {
 async function refreshGrants() {
   const target = document.querySelector("#grants");
   target.replaceChildren();
-  const data = await request("/client/grants/pending");
-  for (const grant of data.requests || []) {
-    render(target, grant, [
-      { label: "Approve", run: () => decide(grant, "approve") },
-      { label: "Deny", run: () => decide(grant, "deny") },
-    ]);
+  try {
+    const data = await request("/client/grants/pending");
+    for (const grant of data.requests || []) {
+      render(target, grant, [
+        { label: "Approve", run: () => decide(grant, "approve") },
+        { label: "Deny", run: () => decide(grant, "deny") },
+      ]);
+    }
+  } catch (error) {
+    render(target, { error: String(error.message || error) });
   }
 }
 document.querySelector("#refresh-grants").addEventListener("click", refreshGrants);
+
+async function mutateRun(runId, action) {
+  const body = action === "resume" ? { reason: "manual" } : {};
+  await request(`/client/runs/${encodeURIComponent(runId)}:${action}`, {
+    method: "POST",
+    body,
+    mutation: true,
+  });
+  await refreshRuns();
+}
+
+async function refreshRuns() {
+  const target = document.querySelector("#runs");
+  target.replaceChildren();
+  try {
+    const data = await request("/client/runs");
+    for (const run of data.runs || []) {
+      render(target, run, [
+        { label: "Pause", run: () => mutateRun(run.run_id, "pause") },
+        { label: "Resume", run: () => mutateRun(run.run_id, "resume") },
+        { label: "Cancel", run: () => mutateRun(run.run_id, "cancel") },
+      ]);
+    }
+  } catch (error) {
+    render(target, { error: String(error.message || error) });
+  }
+}
+document.querySelector("#refresh-runs").addEventListener("click", refreshRuns);
+
+document.querySelector("#message-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const to = document.querySelector("#message-to").value;
+  const payload = document.querySelector("#message-payload").value;
+  const data = await request("/client/messages", {
+    method: "POST",
+    body: { to, payload },
+    mutation: true,
+  });
+  const target = document.querySelector("#messages");
+  render(target, data);
+});
+
+async function refreshTools() {
+  const target = document.querySelector("#tools");
+  target.replaceChildren();
+  try {
+    const data = await request("/client/tools");
+    for (const tool of data.wasm || []) render(target, tool);
+    for (const tool of data.mcp || []) render(target, tool);
+    for (const skill of data.skills || []) render(target, skill);
+  } catch (error) {
+    render(target, { error: String(error.message || error) });
+  }
+}
+document.querySelector("#refresh-tools").addEventListener("click", refreshTools);
+
+async function refreshDevices() {
+  const target = document.querySelector("#devices");
+  target.replaceChildren();
+  const envelope = await requestEnvelope("/client/devices");
+  render(target, envelope);
+}
+document.querySelector("#refresh-devices").addEventListener("click", refreshDevices);
 
 function connectDashboard() {
   if (state.socket) state.socket.close();

@@ -11,7 +11,7 @@ use advance_shared_types::await_session::SessionId;
 use advance_shared_types::mailbox::{Message, MsgError};
 use advance_shared_types::turn_attribution::{QueuedTurnSpec, TurnCompletionOwner};
 
-pub(crate) struct ExecutionTurnIngress {
+pub struct ExecutionTurnIngress {
     store: Arc<MailboxStore>,
 }
 

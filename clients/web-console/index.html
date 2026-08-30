@@ -27,6 +27,30 @@
       </form>
       <div id="history" class="records" aria-live="polite"></div>
     </section>
+    <section aria-labelledby="runs-title">
+      <h2 id="runs-title">Runs</h2>
+      <button id="refresh-runs" type="button">Refresh</button>
+      <div id="runs" class="records" aria-live="polite"></div>
+    </section>
+    <section aria-labelledby="messages-title">
+      <h2 id="messages-title">Messages</h2>
+      <form id="message-form">
+        <label>To <input id="message-to" value="agent:default" required></label>
+        <label>Payload <input id="message-payload" required></label>
+        <button type="submit">Send</button>
+      </form>
+      <div id="messages" class="records" aria-live="polite"></div>
+    </section>
+    <section aria-labelledby="tools-title">
+      <h2 id="tools-title">Tools</h2>
+      <button id="refresh-tools" type="button">Refresh</button>
+      <div id="tools" class="records" aria-live="polite"></div>
+    </section>
+    <section aria-labelledby="devices-title">
+      <h2 id="devices-title">Devices</h2>
+      <button id="refresh-devices" type="button">Refresh</button>
+      <div id="devices" class="records" aria-live="polite"></div>
+    </section>
     <section aria-labelledby="grants-title">
       <h2 id="grants-title">Pending approvals</h2>
       <button id="refresh-grants" type="button">Refresh</button>
