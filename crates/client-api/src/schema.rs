@@ -17,6 +17,13 @@ use crate::envelope::{ClientEnvelope, ClientError, ClientErrorCode, ClientWarnin
 use crate::pagination::Cursor;
 use crate::session::{Platform, Principal, Scope, SessionInfo};
 
+pub use crate::compat::{
+    check_response_compat, classify_git_show, enforce_compat_gate, enforce_compat_gate_at,
+    live_snapshot, normalize_parent_sha, parse_compat_parent_sha, parse_yyyy_mm_dd,
+    resolve_parent_spec, response_field_inventory, CompatError, CompatMigration, CompatSnapshot,
+    FieldMeta, GitShowOutput, EXCLUDED_COMPONENTS, RESPONSE_COMPONENTS,
+};
+
 /// The schema-hash manifest checked against by SDK generators and conformance suites.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientSdkManifest {
@@ -400,8 +407,12 @@ pub fn shared_sdk_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("sdk-artifacts")
 }
 
+pub fn schema_dir() -> PathBuf {
+    shared_sdk_dir().join("schema")
+}
+
 pub fn schema_path() -> PathBuf {
-    shared_sdk_dir().join("schema/client-api.schema.json")
+    schema_dir().join("client-api.schema.json")
 }
 
 pub fn manifest_path() -> PathBuf {

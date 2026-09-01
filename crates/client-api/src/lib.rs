@@ -19,6 +19,7 @@ pub mod api;
 pub mod audit;
 pub mod auth;
 pub mod clock;
+pub mod compat;
 pub mod config;
 pub mod cursor;
 pub mod deltas;

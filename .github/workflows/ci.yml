@@ -113,6 +113,19 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compat parent SHA
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "COMPAT_PARENT_SHA=${PR_BASE_SHA}" >> "$GITHUB_ENV"
+          elif [ "$EVENT_NAME" = "push" ]; then
+            echo "COMPAT_PARENT_SHA=${PUSH_BEFORE_SHA}" >> "$GITHUB_ENV"
+          fi
       - name: Install pinned toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:

@@ -19,8 +19,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use advance_client_api::schema::{
-    generate_schema_artifact, manifest_path, platform_surface_json, schema_path, shared_sdk_dir,
-    vectors_path,
+    enforce_compat_gate, generate_schema_artifact, manifest_path, platform_surface_json,
+    schema_path, shared_sdk_dir, vectors_path,
 };
 
 fn check_one(path: &Path, fresh: &str, label: &str, drifted: &mut Vec<String>) {
@@ -105,6 +105,13 @@ fn main() -> ExitCode {
                 &format!("surface[{target}]"),
                 &mut drifted,
             );
+        }
+        match enforce_compat_gate() {
+            Ok(()) => println!("COMPAT  OK"),
+            Err(e) => {
+                eprintln!("COMPAT  FAIL: {e}");
+                drifted.push("compat".to_string());
+            }
         }
         if drifted.is_empty() {
             println!("no drift — checked-in CONTRACT-192 artifacts match a fresh generation");
