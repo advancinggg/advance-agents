@@ -8,12 +8,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::SystemTime;
 
 use advance_client_api::{
-    BoundGrantApprovalPort, BoundGrantMutation, BoundHistoryPage, BoundHistoryReadPort,
-    BoundMutationOutcome, ClientAgentTreeNode, ClientApi, ClientCursorCodec, ClientEventProvider,
-    ClientMcpEntry, ClientMessageAck, ClientMessageStatus, ClientRunMutation, ClientRunSummary,
-    ClientSkillEntry, ClientToolEntry, ClientToolInventory, LlmDeltaHub, MessagingProvider,
-    NormalizedEventFilter, ProviderClientDoneReceipt, ProviderError, ProviderMutationRecovery,
-    ProviderPrepareOutcome, RawEventRow, RunControlProvider, ToolsProvider,
+    BoundGrantApprovalPort, BoundHistoryPage, BoundHistoryReadPort, ClientAgentTreeNode, ClientApi,
+    ClientCursorCodec, ClientEventProvider, ClientMcpEntry, ClientMessageAck, ClientMessageStatus,
+    ClientRunMutation, ClientRunSummary, ClientSkillEntry, ClientToolEntry, ClientToolInventory,
+    LlmDeltaHub, MessagingProvider, NormalizedEventFilter, ProviderError, RawEventRow,
+    RunControlProvider, ToolsProvider,
 };
 use advance_event_bus::{EventFilter, ObservabilityReadApi, ReadApiError, ReadCursor, ReadEvent};
 use advance_messaging::{MailboxStore, Message, MessageKind, MsgError};
@@ -25,7 +24,6 @@ use advance_shared_types::sensitive_observation::{
     CanonicalCapParam, ObservationNode, SensitiveObservationRedactor,
 };
 use advance_shared_types::traits::{AgentTreeSnapshot, CallableInventoryReader};
-use cap_grant::{GrantApprovalIntake, GrantTtl};
 
 pub use crate::execution_turn_ingress::ExecutionTurnIngress;
 use crate::observation_carriers::ObservationCarrierStore;
@@ -371,163 +369,7 @@ fn history_payload(event: &advance_event_bus::Event) -> ObservationNode {
     ])
 }
 
-/// Read adapter for the real CONTRACT-123 intake. Mutation methods remain
-/// unavailable until the separately-scoped durable Order-5 provider is bound;
-/// they fail closed rather than bypassing prepare/recovery semantics.
-pub struct Contract219GrantAdapter {
-    intake: Arc<GrantApprovalIntake>,
-    projector: Arc<Contract219EventProjector>,
-}
-
-impl Contract219GrantAdapter {
-    pub fn new(
-        intake: Arc<GrantApprovalIntake>,
-        projector: Arc<Contract219EventProjector>,
-    ) -> Self {
-        Self { intake, projector }
-    }
-}
-
-impl BoundGrantApprovalPort for Contract219GrantAdapter {
-    fn list_pending_bound(
-        &self,
-    ) -> Result<
-        Vec<advance_shared_types::sensitive_observation::BoundObservationDocument>,
-        ProviderError,
-    > {
-        self.intake
-            .list_pending()
-            .into_iter()
-            .map(|pending| {
-                let params = match pending.params {
-                    Some(params) => ObservationNode::CanonicalCapParams(
-                        params
-                            .into_iter()
-                            .map(|param| CanonicalCapParam {
-                                key: param.key,
-                                value: ObservationNode::String(param.value),
-                            })
-                            .collect(),
-                    ),
-                    None => ObservationNode::Null,
-                };
-                let root = ObservationNode::Object(vec![
-                    (
-                        "kind".to_owned(),
-                        ObservationNode::String("pending_grant".to_owned()),
-                    ),
-                    (
-                        "request_id".to_owned(),
-                        ObservationNode::String(pending.request_id),
-                    ),
-                    (
-                        "decision_revision".to_owned(),
-                        ObservationNode::String("A".repeat(247)),
-                    ),
-                    (
-                        "caller_id".to_owned(),
-                        ObservationNode::String(pending.caller.clone()),
-                    ),
-                    (
-                        "capability".to_owned(),
-                        ObservationNode::String(pending.capability),
-                    ),
-                    ("params".to_owned(), params),
-                    ("ttl".to_owned(), ttl_node(pending.ttl)),
-                    (
-                        "justification".to_owned(),
-                        pending
-                            .justification
-                            .map(ObservationNode::String)
-                            .unwrap_or(ObservationNode::Null),
-                    ),
-                ]);
-                self.projector
-                    .bind_pending_grant(&pending.caller, root)
-                    .map_err(ProviderError::Unavailable)
-            })
-            .collect()
-    }
-
-    fn prepare_mutation_bound(
-        &self,
-        _mutation_id: [u8; 32],
-        _request_fingerprint: [u8; 32],
-        _mutation: BoundGrantMutation,
-    ) -> ProviderPrepareOutcome {
-        ProviderPrepareOutcome::Rejected(ProviderError::Unavailable(
-            "durable grant mutation provider is not composed".to_owned(),
-        ))
-    }
-
-    fn verify_recovery_ticket_bound(
-        &self,
-        _mutation_id: [u8; 32],
-        _request_fingerprint: [u8; 32],
-        _operation_tag: u8,
-        _recovery: &ProviderMutationRecovery,
-    ) -> Result<(), ProviderError> {
-        Err(ProviderError::Unavailable(
-            "durable grant mutation provider is not composed".to_owned(),
-        ))
-    }
-
-    fn execute_prepared_bound(&self, _recovery: &ProviderMutationRecovery) -> BoundMutationOutcome {
-        BoundMutationOutcome::Rejected(ProviderError::Unavailable(
-            "durable grant mutation provider is not composed".to_owned(),
-        ))
-    }
-
-    fn recover_mutation_bound(&self, _recovery: &ProviderMutationRecovery) -> BoundMutationOutcome {
-        BoundMutationOutcome::Rejected(ProviderError::Unavailable(
-            "durable grant mutation provider is not composed".to_owned(),
-        ))
-    }
-
-    fn acknowledge_client_done_bound(
-        &self,
-        _done: &ProviderClientDoneReceipt,
-    ) -> Result<(), ProviderError> {
-        Err(ProviderError::Unavailable(
-            "durable grant mutation provider is not composed".to_owned(),
-        ))
-    }
-}
-
-fn ttl_node(ttl: GrantTtl) -> ObservationNode {
-    let fields = match ttl {
-        GrantTtl::Once => vec![("kind", "once")],
-        GrantTtl::Lifecycle => vec![("kind", "lifecycle")],
-        GrantTtl::Persistent => vec![("kind", "persistent")],
-        GrantTtl::Duration(milliseconds) => {
-            return ObservationNode::Object(vec![
-                (
-                    "kind".to_owned(),
-                    ObservationNode::String("duration".to_owned()),
-                ),
-                (
-                    "milliseconds_u64".to_owned(),
-                    ObservationNode::String(milliseconds.to_string()),
-                ),
-            ])
-        }
-        GrantTtl::Until(at) => {
-            return ObservationNode::Object(vec![
-                (
-                    "kind".to_owned(),
-                    ObservationNode::String("until".to_owned()),
-                ),
-                ("at".to_owned(), ObservationNode::String(at.to_rfc3339())),
-            ])
-        }
-    };
-    ObservationNode::Object(
-        fields
-            .into_iter()
-            .map(|(key, value)| (key.to_owned(), ObservationNode::String(value.to_owned())))
-            .collect(),
-    )
-}
+pub use crate::grant_adapter::Contract219GrantAdapter;
 
 /// Must match `commands::start::DEFAULT_MSG_AGENT_ID` (avoid a start↔adapters cycle).
 const SERVE_LOOP_AGENT: &str = "agent:default";

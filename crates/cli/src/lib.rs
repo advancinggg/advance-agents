@@ -32,6 +32,7 @@ pub mod context_wiring;
 // Wave-25A Order-2 build-and-hold platform anchor.  This module is deliberately
 // not wired into `advance start` until the later atomic composition lane.
 pub mod client_api_adapters;
+pub mod grant_adapter;
 pub mod contract218_anchor;
 pub mod contract218_bootstrap;
 pub mod contract218_keyring;

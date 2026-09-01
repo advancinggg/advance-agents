@@ -299,6 +299,25 @@ fn ai_07_revoke_cascades_root_and_descendant() {
     assert_eq!(store.get("root").unwrap().status, GrantStatus::Revoked);
 }
 
+#[test]
+fn ai_07b_revoke_rejects_static_config() {
+    let (store, _bus, intake, _chain) = setup();
+    let mut static_grant = fs_grant("policy-root-1", "a", "/policy");
+    static_grant.provenance = GrantProvenance::StaticConfig;
+    store.insert(static_grant).expect("seed static");
+
+    let err = intake
+        .revoke("policy-root-1")
+        .expect_err("static-config must not revoke");
+    assert!(
+        matches!(err, CapGrantError::NotFound(_)),
+        "static revoke → NotFound, got {err:?}"
+    );
+    let stored = store.get("policy-root-1").unwrap();
+    assert_eq!(stored.status, GrantStatus::Active);
+    assert!(matches!(stored.provenance, GrantProvenance::StaticConfig));
+}
+
 // ---- AI-08/08b: apply preset -------------------------------------------------
 
 #[test]
@@ -645,4 +664,44 @@ fn ai_17_narrow_rejects_oversized_params() {
         1,
         "a rejected narrow leaves the request pending"
     );
+}
+
+#[test]
+fn m013_first_generation_is_at_least_one() {
+    let (_store, _bus, intake, chain) = setup();
+    drive(&chain, &_store, &_bus, fs_request("/a,/b"));
+    let pending = intake.list_pending();
+    assert_eq!(pending.len(), 1);
+    assert!(
+        pending[0].generation >= 1,
+        "first parked generation must start at 1, got {}",
+        pending[0].generation
+    );
+    match intake.inspect_request(&pending[0].request_id) {
+        Some(cap_grant::RequestInspect::Pending { generation, .. }) => {
+            assert_eq!(generation, pending[0].generation);
+        }
+        other => panic!("expected pending inspect, got {other:?}"),
+    }
+}
+
+#[test]
+fn m013_stale_generation_cas_leaves_pending() {
+    let (_store, bus, intake, chain) = setup();
+    drive(&chain, &_store, &bus, fs_request("/a,/b"));
+    let pending = intake.list_pending();
+    let rid = pending[0].request_id.clone();
+    let generation = pending[0].generation;
+    let err = intake
+        .approve_if_generation(&rid, generation.wrapping_add(1))
+        .expect_err("stale generation must fail");
+    assert!(
+        matches!(err, CapGrantError::InvalidConfig(_)),
+        "stale CAS → InvalidConfig, got {err:?}"
+    );
+    assert_eq!(intake.list_pending().len(), 1, "stale CAS leaves pending");
+    intake
+        .approve_if_generation(&rid, generation)
+        .expect("matching generation approves");
+    assert!(intake.list_pending().is_empty());
 }

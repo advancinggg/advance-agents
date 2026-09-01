@@ -2438,6 +2438,8 @@ async fn wire_capabilities_inner(
                 _ => None,
             };
             let grant_approval_for_api = grant_approval_intake.clone();
+            let projector_for_api = contract219_projector.clone();
+            let leak_for_api = Arc::clone(&public_leak_detector);
             let ingress_for_api = client_ingress_store.clone();
             let replies_for_api = reply_registry.clone();
             let ingress_port = progress_lifecycle
@@ -2477,12 +2479,15 @@ async fn wire_capabilities_inner(
                     parts.history = Some(history);
                     parts.events = Some(events);
                     parts.cursor = Some(cursor);
+                    let _ = projector;
+                }
+                if let Some(projector) = projector_for_api.as_ref() {
                     parts.redactor = Some(projector.redactor());
-                    parts.leak_detector = Some(Arc::clone(&public_leak_detector));
+                    parts.leak_detector = Some(Arc::clone(&leak_for_api));
                     parts.grants = grant_approval_for_api.as_ref().map(|intake| {
                         Arc::new(crate::client_api_adapters::Contract219GrantAdapter::new(
                             Arc::clone(intake),
-                            Arc::clone(&projector),
+                            Arc::clone(projector),
                         ))
                             as Arc<dyn advance_client_api::BoundGrantApprovalPort>
                     });

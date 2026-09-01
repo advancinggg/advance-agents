@@ -39,7 +39,8 @@ pub mod sweeper;
 pub mod wit_impl;
 
 pub use approval_intake::{
-    GrantApprovalIntake, PendingApprovalView, MAX_PENDING_PER_CALLER, MAX_PENDING_REQUESTS,
+    GrantApprovalIntake, PendingApprovalView, RequestInspect, MAX_PENDING_PER_CALLER,
+    MAX_PENDING_REQUESTS,
 };
 pub use capability_subset::validate_capability_subset;
 pub use cascade::CascadeResult;

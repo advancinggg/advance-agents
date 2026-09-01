@@ -125,6 +125,21 @@ pub struct PendingApprovalView {
     pub params: Option<Vec<CapParam>>,
     pub ttl: GrantTtl,
     pub justification: Option<String>,
+    pub generation: u64,
+}
+
+/// Full-registry inspect result for CONTRACT-123 decide / recover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestInspect {
+    Decided,
+    Pending {
+        caller: String,
+        generation: u64,
+        capability: String,
+        params: Option<Vec<CapParam>>,
+        ttl: GrantTtl,
+        justification: Option<String>,
+    },
 }
 
 struct PendingRegistry {
@@ -133,10 +148,19 @@ struct PendingRegistry {
 }
 
 impl PendingRegistry {
-    fn next_seq(&mut self) -> u64 {
+    fn try_next_seq(&mut self) -> std::result::Result<u64, ChannelApprovalError> {
         let s = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
-        s
+        if s == 0 {
+            return Err(ChannelApprovalError::new(
+                "grant-approval-intake: pending generation counter wrapped",
+            ));
+        }
+        self.next_seq = s.checked_add(1).ok_or_else(|| {
+            ChannelApprovalError::new(
+                "grant-approval-intake: pending generation counter wrapped",
+            )
+        })?;
+        Ok(s)
     }
 
     /// Evict the oldest TERMINAL (Approved/Denied) entry. Returns `true` if one
@@ -177,7 +201,7 @@ impl GrantApprovalIntake {
         Self {
             pending: Mutex::new(PendingRegistry {
                 entries: HashMap::new(),
-                next_seq: 0,
+                next_seq: 1,
             }),
             validator,
             store,
@@ -210,6 +234,7 @@ impl GrantApprovalIntake {
                         params: e.request.params.clone(),
                         ttl: e.request.ttl.clone(),
                         justification: e.request.justification.clone(),
+                        generation: e.seq,
                     },
                 )
             })
@@ -338,11 +363,201 @@ impl GrantApprovalIntake {
         Ok(())
     }
 
+    /// Approve only if the parked generation still matches.
+    pub fn approve_if_generation(&self, request_id: &str, expected_gen: u64) -> Result<()> {
+        let (caller, capability) = {
+            let mut reg = self.lock_pending();
+            let entry = reg
+                .entries
+                .get_mut(request_id)
+                .ok_or_else(|| CapGrantError::NotFound(GrantId::new(request_id)))?;
+            if !entry.decision.is_pending() {
+                return Err(already_decided(request_id));
+            }
+            if entry.seq != expected_gen {
+                return Err(CapGrantError::InvalidConfig(format!(
+                    "grant-approval-intake: stale pending generation for {request_id}"
+                )));
+            }
+            entry.decision = IntakeDecision::Approved(None);
+            (
+                entry.request.caller.clone(),
+                entry.request.capability.clone(),
+            )
+        };
+        self.event_bus.emit(resolver_invoked_event(
+            &caller,
+            &capability,
+            INTAKE_RESOLVER_TYPE,
+            "approve",
+        ));
+        Ok(())
+    }
+
+    /// Deny only if the parked generation still matches.
+    pub fn deny_if_generation(
+        &self,
+        request_id: &str,
+        expected_gen: u64,
+        reason: impl Into<String>,
+    ) -> Result<()> {
+        let (caller, capability) = {
+            let mut reg = self.lock_pending();
+            let entry = reg
+                .entries
+                .get_mut(request_id)
+                .ok_or_else(|| CapGrantError::NotFound(GrantId::new(request_id)))?;
+            if !entry.decision.is_pending() {
+                return Err(already_decided(request_id));
+            }
+            if entry.seq != expected_gen {
+                return Err(CapGrantError::InvalidConfig(format!(
+                    "grant-approval-intake: stale pending generation for {request_id}"
+                )));
+            }
+            entry.decision = IntakeDecision::Denied(reason.into());
+            (
+                entry.request.caller.clone(),
+                entry.request.capability.clone(),
+            )
+        };
+        self.event_bus.emit(resolver_invoked_event(
+            &caller,
+            &capability,
+            INTAKE_RESOLVER_TYPE,
+            "deny",
+        ));
+        Ok(())
+    }
+
+    /// Narrow only if the parked generation still matches after the unlocked
+    /// CONTRACT-122 subset check.
+    pub fn narrow_if_generation(
+        &self,
+        request_id: &str,
+        expected_gen: u64,
+        new_params: Vec<CapParam>,
+    ) -> Result<()> {
+        if new_params.len() > MAX_NARROW_PARAMS_ENTRIES {
+            return Err(CapGrantError::InvalidConfig(format!(
+                "narrow: params exceeds {MAX_NARROW_PARAMS_ENTRIES}-entry cap (got {})",
+                new_params.len()
+            )));
+        }
+        let mut total = 0usize;
+        for p in &new_params {
+            if p.key.len() > MAX_NARROW_PARAM_KEY_BYTES {
+                return Err(CapGrantError::InvalidConfig(format!(
+                    "narrow: cap-param key exceeds {MAX_NARROW_PARAM_KEY_BYTES}-byte cap (got {})",
+                    p.key.len()
+                )));
+            }
+            if p.value.len() > MAX_NARROW_PARAM_VALUE_BYTES {
+                return Err(CapGrantError::InvalidConfig(format!(
+                    "narrow: cap-param value exceeds {MAX_NARROW_PARAM_VALUE_BYTES}-byte cap (got {})",
+                    p.value.len()
+                )));
+            }
+            total = total
+                .saturating_add(p.key.len())
+                .saturating_add(p.value.len());
+        }
+        if total > MAX_NARROW_PARAMS_TOTAL_BYTES {
+            return Err(CapGrantError::InvalidConfig(format!(
+                "narrow: aggregate params exceed {MAX_NARROW_PARAMS_TOTAL_BYTES}-byte cap (got {total})"
+            )));
+        }
+
+        let (caller, capability, orig_params, ttl) = {
+            let reg = self.lock_pending();
+            let entry = reg
+                .entries
+                .get(request_id)
+                .ok_or_else(|| CapGrantError::NotFound(GrantId::new(request_id)))?;
+            if !entry.decision.is_pending() {
+                return Err(already_decided(request_id));
+            }
+            if entry.seq != expected_gen {
+                return Err(CapGrantError::InvalidConfig(format!(
+                    "grant-approval-intake: stale pending generation for {request_id}"
+                )));
+            }
+            (
+                entry.request.caller.clone(),
+                entry.request.capability.clone(),
+                entry.request.params.clone().unwrap_or_default(),
+                entry.request.ttl.clone(),
+            )
+        };
+
+        let parent = synthetic_parent_grant(&caller, &capability, orig_params);
+        let child = GrantDraft {
+            capability: capability.clone(),
+            params: new_params.clone(),
+            ttl,
+        };
+        self.validator.validate(&parent, &child)?;
+
+        {
+            let mut reg = self.lock_pending();
+            let entry = reg
+                .entries
+                .get_mut(request_id)
+                .ok_or_else(|| CapGrantError::NotFound(GrantId::new(request_id)))?;
+            if !entry.decision.is_pending() {
+                return Err(already_decided(request_id));
+            }
+            if entry.seq != expected_gen {
+                return Err(CapGrantError::InvalidConfig(format!(
+                    "grant-approval-intake: stale pending generation for {request_id}"
+                )));
+            }
+            entry.decision = IntakeDecision::Approved(Some(new_params));
+        }
+        self.event_bus.emit(resolver_invoked_event(
+            &caller,
+            &capability,
+            INTAKE_RESOLVER_TYPE,
+            "approve",
+        ));
+        Ok(())
+    }
+
+    /// Inspect the full registry (Pending and terminal). Absent → `None`.
+    pub fn inspect_request(&self, request_id: &str) -> Option<RequestInspect> {
+        let reg = self.lock_pending();
+        let entry = reg.entries.get(request_id)?;
+        if entry.decision.is_pending() {
+            Some(RequestInspect::Pending {
+                caller: entry.request.caller.clone(),
+                generation: entry.seq,
+                capability: entry.request.capability.clone(),
+                params: entry.request.params.clone(),
+                ttl: entry.request.ttl.clone(),
+                justification: entry.request.justification.clone(),
+            })
+        } else {
+            Some(RequestInspect::Decided)
+        }
+    }
+
+    /// Snapshot one grant from the store. Missing → `None`.
+    pub fn snapshot_grant(&self, grant_id: &str) -> Option<Grant> {
+        self.store.get(grant_id)
+    }
+
     /// Revoke a dynamic grant (root + provenance descendants). Delegates to
     /// [`GrantStore::cascade_revoke`], which emits `grant.revoked` per grant.
     /// Returns the total number of grants revoked (root + descendants, ≥1 for any
     /// active grant). Holds no pending Mutex across the store call.
     pub fn revoke(&self, grant_id: &str) -> Result<usize> {
+        match self.store.get(grant_id) {
+            Some(grant) if matches!(grant.provenance, GrantProvenance::StaticConfig) => {
+                return Err(CapGrantError::NotFound(GrantId::new(grant_id)));
+            }
+            None => return Err(CapGrantError::NotFound(GrantId::new(grant_id))),
+            Some(_) => {}
+        }
         let result = self.store.cascade_revoke(grant_id)?;
         Ok(result.revoked.len())
     }
@@ -506,7 +721,7 @@ impl ChannelApprovalPort for GrantApprovalIntake {
                 ));
             }
         }
-        let seq = reg.next_seq();
+        let seq = reg.try_next_seq()?;
         reg.entries.insert(
             request.request_id.clone(),
             PendingEntry {

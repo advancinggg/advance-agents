@@ -12,7 +12,7 @@ use advance_shared_types::observation_identity::{
     AgentObservationIdentityRegistrar, HostEmitterId, HostObservationIdentityRegistrar,
     IssuedObservationSourceHandle, ObservationIdentityAuthority,
     ObservationIdentityPersistenceSealer, PersistedObservationBinding,
-    PersistedObservationIdentity, SensitiveParamCatalog,
+    PersistedObservationIdentity, SensitiveParamCatalog, SourceBindingDigest,
 };
 use advance_shared_types::sensitive_observation::{
     BoundObservationDocument, CanonicalCapParam, CanonicalContainerDeclaration,
@@ -20,7 +20,7 @@ use advance_shared_types::sensitive_observation::{
     ObservationDocument, ObservationEventAssociationIssuer, ObservationNode,
     ObservationPathSegment, ObservationProviderDtoAssociationIssuer, ObservationSchemaDocumentKind,
     ObservationSchemaManifest, ObservationSchemaRoot, RedactionDisposition,
-    SensitiveObservationRedactor, STRUCTURAL_EVENT_SCHEMA_ID,
+    SensitiveObservationRedactor, STRUCTURAL_EVENT_SCHEMA_ID, STRUCTURAL_PROVIDER_SCHEMA_ID,
 };
 use cap_http::DefaultSensitiveObservationRedactor;
 use rand::rngs::OsRng;
@@ -33,6 +33,29 @@ use crate::observation_carriers::ObservationCarrierStore;
 const LEGACY3_RESULT_SCHEMA: &str = "advance.run-completed.legacy3-sensitive.v1";
 pub const LEGACY3_HISTORY_SCHEMA: &str = "advance.client.history.legacy3.v1";
 pub const LEGACY3_PENDING_GRANT_SCHEMA: &str = "advance.client.pending-grant.legacy3.v1";
+pub const EMPTY_PARAMS_PENDING_GRANT_SCHEMA: &str = "advance.client.pending-grant.empty-params.v1";
+
+const PENDING_SINGLE_PARAM_KEYS: &[&str] = &[
+    "read-paths",
+    "write-paths",
+    "allowlist",
+    "targets",
+    "max-fanout",
+    "max-depth",
+    "spawn-child",
+    "spawn-sub",
+    "models",
+    "max-tokens-per-call",
+    "names",
+    "ids",
+    "servers",
+    "tool-patterns",
+    "allowed-actions",
+    "max-active-skills",
+];
+
+const PENDING_FS_PARAM_KEYS: &[&str] = &["read-paths", "write-paths"];
+const UNKNOWN_C219_SOURCE: &str = "unknown C219 observation source";
 
 /// Production C219 boundary. The non-clone issuer and sealed redactor stay in
 /// this object; callers can only refresh authenticated sources or request an
@@ -68,11 +91,19 @@ impl Contract219EventProjector {
         let roles = ObservationAssociationRoleFactory::new_at_composition(
             association_key,
             boot_id,
-            vec![
-                legacy3_result_schema()?,
-                legacy3_history_schema()?,
-                legacy3_pending_grant_schema()?,
-            ],
+            {
+                let mut schemas = vec![
+                    legacy3_result_schema()?,
+                    legacy3_history_schema()?,
+                    legacy3_pending_grant_schema()?,
+                    empty_params_pending_grant_schema()?,
+                ];
+                for key in PENDING_SINGLE_PARAM_KEYS {
+                    schemas.push(single_param_pending_grant_schema(key)?);
+                }
+                schemas.push(multi_param_pending_grant_schema(PENDING_FS_PARAM_KEYS)?);
+                schemas
+            },
         )
         .map_err(|error| format!("construct CONTRACT-219 roles: {error}"))?
         .split_once()
@@ -150,14 +181,54 @@ impl Contract219EventProjector {
         exact_caller_id: &str,
         root: ObservationNode,
     ) -> Result<BoundObservationDocument, String> {
+        let schema = pending_grant_schema_for(&root)?;
         let identity = self.mint_live_identity_for(exact_caller_id)?;
         let (subject, document) = self
             .provider_issuer
-            .stamp_live_provider_dto(identity, LEGACY3_PENDING_GRANT_SCHEMA, root)
+            .stamp_live_provider_dto(identity, &schema, root)
             .map_err(|error| format!("stamp C219 pending-grant DTO: {error}"))?;
         self.provider_issuer
             .bind_live_provider_dto(subject, document)
             .map_err(|error| format!("bind C219 pending-grant DTO: {error}"))
+    }
+
+    /// Bind a grant mutation result DTO (structural provider schema).
+    pub fn bind_grant_result(
+        &self,
+        subject_id: Option<&str>,
+        root: ObservationNode,
+    ) -> Result<BoundObservationDocument, String> {
+        let identity = match subject_id {
+            Some(exact) => match self.mint_live_identity_for(exact) {
+                Ok(identity) => identity,
+                Err(error) if error == UNKNOWN_C219_SOURCE => {
+                    self.mint_live_identity_for(HostEmitterId::Runtime.canonical_id())?
+                }
+                Err(error) => return Err(error),
+            },
+            None => self.mint_live_identity_for(HostEmitterId::Runtime.canonical_id())?,
+        };
+        let (subject, document) = self
+            .provider_issuer
+            .stamp_live_provider_dto(identity, STRUCTURAL_PROVIDER_SCHEMA_ID, root)
+            .map_err(|error| format!("stamp C219 grant-result DTO: {error}"))?;
+        self.provider_issuer
+            .bind_live_provider_dto(subject, document)
+            .map_err(|error| format!("bind C219 grant-result DTO: {error}"))
+    }
+
+    /// Fail closed unless `exact_id` is a live hydrated observation source.
+    pub fn require_live_source(&self, exact_id: &str) -> Result<(), String> {
+        self.mint_live_identity_for(exact_id).map(|_| ())
+    }
+
+    /// CONTRACT-218 source-binding digest for a live hydrated identity.
+    pub fn live_source_binding_digest(&self, exact_id: &str) -> Result<[u8; 32], String> {
+        let identity = self.mint_live_identity_for(exact_id)?;
+        let claims = identity.claims_for_persistence();
+        let digest = SourceBindingDigest::for_claims(&claims)
+            .map_err(|error| format!("source binding digest: {error:?}"))?;
+        Ok(*digest.as_bytes())
     }
 
     /// Register and publish a live agent identity before its first event. The
@@ -231,7 +302,7 @@ impl Contract219EventProjector {
             .map_err(|_| "C219 source table lock is poisoned".to_owned())?;
         let source = sources
             .get(exact_id)
-            .ok_or_else(|| "unknown C219 observation source".to_owned())?;
+            .ok_or_else(|| UNKNOWN_C219_SOURCE.to_owned())?;
         self.provider
             .mint_live_identity(source.handle())
             .map_err(|error| format!("mint C218 live identity: {error:?}"))
@@ -350,6 +421,95 @@ fn legacy3_history_schema() -> Result<ObservationSchemaManifest, String> {
         .map_err(|error| format!("construct C219 history schema declaration: {error}"))?],
     )
     .map_err(|error| format!("construct C219 history schema: {error}"))
+}
+
+fn empty_params_pending_grant_schema() -> Result<ObservationSchemaManifest, String> {
+    ObservationSchemaManifest::new(
+        EMPTY_PARAMS_PENDING_GRANT_SCHEMA.to_owned(),
+        ObservationSchemaDocumentKind::ProviderDto,
+        vec![CanonicalContainerDeclaration::new(
+            ObservationSchemaRoot::ProviderRoot,
+            vec![ObservationPathSegment::Member("params".to_owned())],
+            CanonicalContainerKind::CapParams,
+            Vec::new(),
+        )
+        .map_err(|error| format!("construct C219 empty-params schema declaration: {error}"))?],
+    )
+    .map_err(|error| format!("construct C219 empty-params pending-grant schema: {error}"))
+}
+
+fn pending_single_param_schema_id(key: &str) -> String {
+    format!("advance.client.pending-grant.params.{key}.v1")
+}
+
+fn pending_multi_param_schema_id(keys: &[&str]) -> String {
+    format!("advance.client.pending-grant.params.{}.v1", keys.join("."))
+}
+
+fn cap_params_pending_grant_schema(
+    id: String,
+    keys: &[&str],
+) -> Result<ObservationSchemaManifest, String> {
+    ObservationSchemaManifest::new(
+        id,
+        ObservationSchemaDocumentKind::ProviderDto,
+        vec![CanonicalContainerDeclaration::new(
+            ObservationSchemaRoot::ProviderRoot,
+            vec![ObservationPathSegment::Member("params".to_owned())],
+            CanonicalContainerKind::CapParams,
+            keys.iter().map(|key| (*key).to_owned()).collect(),
+        )
+        .map_err(|error| {
+            format!("construct C219 pending-grant declaration {keys:?}: {error}")
+        })?],
+    )
+    .map_err(|error| format!("construct C219 pending-grant schema {keys:?}: {error}"))
+}
+
+fn single_param_pending_grant_schema(key: &str) -> Result<ObservationSchemaManifest, String> {
+    cap_params_pending_grant_schema(pending_single_param_schema_id(key), &[key])
+}
+
+fn multi_param_pending_grant_schema(keys: &[&str]) -> Result<ObservationSchemaManifest, String> {
+    cap_params_pending_grant_schema(pending_multi_param_schema_id(keys), keys)
+}
+
+fn pending_grant_schema_for(root: &ObservationNode) -> Result<String, String> {
+    let ObservationNode::Object(fields) = root else {
+        return Err("pending-grant root must be an object".to_owned());
+    };
+    let params = fields
+        .iter()
+        .find(|(key, _)| key == "params")
+        .map(|(_, value)| value)
+        .ok_or_else(|| "pending-grant root missing params".to_owned())?;
+    match params {
+        ObservationNode::Null => Ok(STRUCTURAL_PROVIDER_SCHEMA_ID.to_owned()),
+        ObservationNode::CanonicalCapParams(values) if values.is_empty() => {
+            Ok(EMPTY_PARAMS_PENDING_GRANT_SCHEMA.to_owned())
+        }
+        ObservationNode::CanonicalCapParams(values)
+            if values.len() == 1 && values[0].key == "api_key" =>
+        {
+            Ok(LEGACY3_PENDING_GRANT_SCHEMA.to_owned())
+        }
+        ObservationNode::CanonicalCapParams(values)
+            if values.len() == 1
+                && PENDING_SINGLE_PARAM_KEYS.contains(&values[0].key.as_str()) =>
+        {
+            Ok(pending_single_param_schema_id(&values[0].key))
+        }
+        ObservationNode::CanonicalCapParams(values)
+            if values.len() == PENDING_FS_PARAM_KEYS.len()
+                && values
+                    .iter()
+                    .map(|value| value.key.as_str())
+                    .eq(PENDING_FS_PARAM_KEYS.iter().copied()) =>
+        {
+            Ok(pending_multi_param_schema_id(PENDING_FS_PARAM_KEYS))
+        }
+        _ => Err("pending-grant params are not a registered C219 shape".to_owned()),
+    }
 }
 
 fn legacy3_pending_grant_schema() -> Result<ObservationSchemaManifest, String> {

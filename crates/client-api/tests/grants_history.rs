@@ -1008,6 +1008,40 @@ fn t17_t18_scope_gates_run_before_provider_access() {
 }
 
 #[test]
+fn t21_justification_block_rejects_pending_page() {
+    let fx = fixture(Some("approvedeny"), "safe");
+    let response = fx
+        .api
+        .handle(ClientRequest::get("/client/grants/pending").with_session("tok"));
+    assert_eq!(
+        response.error_code(),
+        Some(ClientErrorCode::ProjectionRejected)
+    );
+    let encoded = serde_json::to_string(&response).unwrap();
+    assert!(!encoded.contains("approvedeny"));
+    assert!(!encoded.contains("request-a"));
+}
+
+#[test]
+fn t21_c219_redacts_declared_param_before_scan() {
+    let fx = fixture_inner_with_sensitive(
+        Some("param-block-needle"),
+        "safe",
+        false,
+        None,
+        Some("param-block-needle"),
+    );
+    let response = fx
+        .api
+        .handle(ClientRequest::get("/client/grants/pending").with_session("tok"));
+    assert!(response.is_ok(), "{:?}", response.error);
+    let encoded = serde_json::to_string(&response).unwrap();
+    assert!(!encoded.contains("param-block-needle"));
+    assert!(encoded.contains("[REDACTED]"));
+    assert!(encoded.contains("requests"));
+}
+
+#[test]
 fn t18_tampered_second_association_rejects_the_complete_page() {
     let fx = fixture_with_tamper(None, "second-safe", true);
     let response = fx
