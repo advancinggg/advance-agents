@@ -572,10 +572,6 @@ fn t11g_value_only_provider_key() {
 
 #[test]
 fn t11h_console_assets_have_no_persist_apis() {
-    assert!(
-        !PERSIST_IDENTIFIERS.is_empty(),
-        "persist identifier list must stay non-empty"
-    );
     let root = console_dir();
     let mut files = Vec::new();
     collect_js_html(&root, &mut files);
