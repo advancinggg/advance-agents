@@ -68,7 +68,9 @@ async function requestEnvelope(path, { method = "GET", body, mutation = false } 
 
 document.querySelector("#login-form").addEventListener("submit", async event => {
   event.preventDefault();
-  const code = document.querySelector("#bootstrap-code").value;
+  const input = document.querySelector("#bootstrap-code");
+  const code = input.value;
+  input.value = "";
   const data = await request("/client/session/login", {
     method: "POST",
     body: { bootstrap_code: code, platform: "web" },
