@@ -17,7 +17,7 @@ Pinned at **A2UI v0.9.1** (v1.0-RC tracked).
 Product repos consume this crate through the `advance-core` facade:
 
 ```toml
-advance-core = { git = "https://github.com/advancinggg/advance-agents", tag = "v0.1.0" }
+advance-core = { git = "https://github.com/advancinggg/advance-agents", tag = "v0.1.9" }
 ```
 
 ```rust

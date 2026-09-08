@@ -88,10 +88,8 @@ impl Contract219EventProjector {
         if association_key.as_ref() == &[0; 32] {
             return Err("CSPRNG returned a zero CONTRACT-219 association key".to_owned());
         }
-        let roles = ObservationAssociationRoleFactory::new_at_composition(
-            association_key,
-            boot_id,
-            {
+        let roles =
+            ObservationAssociationRoleFactory::new_at_composition(association_key, boot_id, {
                 let mut schemas = vec![
                     legacy3_result_schema()?,
                     legacy3_history_schema()?,
@@ -103,11 +101,10 @@ impl Contract219EventProjector {
                 }
                 schemas.push(multi_param_pending_grant_schema(PENDING_FS_PARAM_KEYS)?);
                 schemas
-            },
-        )
-        .map_err(|error| format!("construct CONTRACT-219 roles: {error}"))?
-        .split_once()
-        .map_err(|error| format!("split CONTRACT-219 roles: {error}"))?;
+            })
+            .map_err(|error| format!("construct CONTRACT-219 roles: {error}"))?
+            .split_once()
+            .map_err(|error| format!("split CONTRACT-219 roles: {error}"))?;
         let ObservationAssociationRoleParts {
             event_issuer,
             provider_issuer,
@@ -459,9 +456,7 @@ fn cap_params_pending_grant_schema(
             CanonicalContainerKind::CapParams,
             keys.iter().map(|key| (*key).to_owned()).collect(),
         )
-        .map_err(|error| {
-            format!("construct C219 pending-grant declaration {keys:?}: {error}")
-        })?],
+        .map_err(|error| format!("construct C219 pending-grant declaration {keys:?}: {error}"))?],
     )
     .map_err(|error| format!("construct C219 pending-grant schema {keys:?}: {error}"))
 }
@@ -494,8 +489,7 @@ fn pending_grant_schema_for(root: &ObservationNode) -> Result<String, String> {
             Ok(LEGACY3_PENDING_GRANT_SCHEMA.to_owned())
         }
         ObservationNode::CanonicalCapParams(values)
-            if values.len() == 1
-                && PENDING_SINGLE_PARAM_KEYS.contains(&values[0].key.as_str()) =>
+            if values.len() == 1 && PENDING_SINGLE_PARAM_KEYS.contains(&values[0].key.as_str()) =>
         {
             Ok(pending_single_param_schema_id(&values[0].key))
         }

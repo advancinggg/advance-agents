@@ -310,7 +310,6 @@ async fn wait_client_events(
     let live = live.cloned();
     wait_json(
         || {
-            let http = http;
             let run_id = run_id.clone();
             let event_type = event_type.clone();
             let live = live.clone();
@@ -352,7 +351,6 @@ async fn wait_history_kind(http: &ClientHttp, run_id: &str, live: &Value) -> Val
     let live = live.clone();
     wait_json(
         || {
-            let http = http;
             let run_id = run_id.clone();
             let live = live.clone();
             async move {

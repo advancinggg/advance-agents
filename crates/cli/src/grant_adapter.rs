@@ -418,20 +418,12 @@ impl Contract219GrantAdapter {
                 request_id,
                 decision_revision,
                 reason,
-            } => self.execute_decide(
-                request_id,
-                decision_revision,
-                DecideOp::Deny { reason },
-            ),
+            } => self.execute_decide(request_id, decision_revision, DecideOp::Deny { reason }),
             BoundGrantMutation::Narrow {
                 request_id,
                 decision_revision,
                 params,
-            } => self.execute_decide(
-                request_id,
-                decision_revision,
-                DecideOp::Narrow { params },
-            ),
+            } => self.execute_decide(request_id, decision_revision, DecideOp::Narrow { params }),
             BoundGrantMutation::Revoke { grant_id } => self.execute_revoke(grant_id),
             BoundGrantMutation::ApplyPreset {
                 target_agent_id,
@@ -557,9 +549,7 @@ impl Contract219GrantAdapter {
                     })
                     .collect();
                 if params_contain_sensitive(Some(&mapped), false) {
-                    return Err(invalid_state(
-                        "sensitive narrow params cannot be applied",
-                    ));
+                    return Err(invalid_state("sensitive narrow params cannot be applied"));
                 }
                 if params_contain_noncanonical(Some(&mapped)) {
                     return Err(invalid_state(
@@ -586,15 +576,14 @@ impl Contract219GrantAdapter {
     }
 
     fn execute_revoke(&self, grant_id: &str) -> Result<(String, TerminalKind), ProviderError> {
-        let grant = self.intake.snapshot_grant(grant_id).ok_or_else(|| {
-            ProviderError::NotFound("grant not found".to_owned())
-        })?;
+        let grant = self
+            .intake
+            .snapshot_grant(grant_id)
+            .ok_or_else(|| ProviderError::NotFound("grant not found".to_owned()))?;
         if grant.status != GrantStatus::Active
             || matches!(grant.provenance, GrantProvenance::StaticConfig)
         {
-            return Err(ProviderError::NotFound(
-                "grant not found".to_owned(),
-            ));
+            return Err(ProviderError::NotFound("grant not found".to_owned()));
         }
         self.projector
             .require_live_source(&grant.grantee)
@@ -698,9 +687,9 @@ impl Contract219GrantAdapter {
                 .snapshot_grant(grant_id)
                 .filter(|grant| grant.status == GrantStatus::Active)
                 .map(|grant| grant.grantee),
-            BoundGrantMutation::ApplyPreset { target_agent_id, .. } => {
-                Some(target_agent_id.clone())
-            }
+            BoundGrantMutation::ApplyPreset {
+                target_agent_id, ..
+            } => Some(target_agent_id.clone()),
         }
     }
 }
@@ -770,7 +759,8 @@ impl BoundGrantApprovalPort for Contract219GrantAdapter {
 
         let mut state = self.lock_state();
         if let Some(existing) = state.rows.get(&mutation_id) {
-            if existing.fingerprint == request_fingerprint && existing.operation_tag == operation_tag
+            if existing.fingerprint == request_fingerprint
+                && existing.operation_tag == operation_tag
             {
                 if !bool::from(existing.digest.ct_eq(&digest)) {
                     return ProviderPrepareOutcome::Rejected(invalid_state(
@@ -923,9 +913,9 @@ fn params_contain_sensitive(params: Option<&[CapParam]>, skip_api_key: bool) -> 
     let Some(params) = params else {
         return false;
     };
-    params.iter().any(|param| {
-        (!skip_api_key || param.key != "api_key") && value_is_sensitive(&param.value)
-    })
+    params
+        .iter()
+        .any(|param| (!skip_api_key || param.key != "api_key") && value_is_sensitive(&param.value))
 }
 
 fn redact_sensitive_param_values(params: Option<&[CapParam]>) -> Option<Vec<CapParam>> {
@@ -1055,10 +1045,7 @@ fn ttl_node(ttl: &GrantTtl) -> ObservationNode {
 
 fn terminal_root(terminal: &TerminalKind) -> ObservationNode {
     match terminal {
-        TerminalKind::Decision {
-            request_id,
-            status,
-        } => ObservationNode::Object(vec![
+        TerminalKind::Decision { request_id, status } => ObservationNode::Object(vec![
             (
                 "kind".to_owned(),
                 ObservationNode::String("grant_decision".to_owned()),
@@ -1067,10 +1054,7 @@ fn terminal_root(terminal: &TerminalKind) -> ObservationNode {
                 "request_id".to_owned(),
                 ObservationNode::String(request_id.clone()),
             ),
-            (
-                "status".to_owned(),
-                ObservationNode::String(status.clone()),
-            ),
+            ("status".to_owned(), ObservationNode::String(status.clone())),
         ]),
         TerminalKind::Revoke {
             grant_id,
@@ -1102,10 +1086,7 @@ fn terminal_root(terminal: &TerminalKind) -> ObservationNode {
                 "kind".to_owned(),
                 ObservationNode::String("preset_apply".to_owned()),
             ),
-            (
-                "preset".to_owned(),
-                ObservationNode::String(preset.clone()),
-            ),
+            ("preset".to_owned(), ObservationNode::String(preset.clone())),
             (
                 "target_agent_id".to_owned(),
                 ObservationNode::String(target.clone()),
@@ -1178,15 +1159,11 @@ fn request_fingerprint(pending: &PendingSnapshot) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-fn document_digest(
-    request_id: &str,
-    pending: &PendingSnapshot,
-) -> Result<[u8; 32], ProviderError> {
+fn document_digest(request_id: &str, pending: &PendingSnapshot) -> Result<[u8; 32], ProviderError> {
     let root = pending_root(request_id, None, pending);
     let document = ObservationDocument::provider_dto(root);
-    let encoded = encode_canonical_document(&document).map_err(|error| {
-        ProviderError::Unavailable(format!("pending document encode: {error}"))
-    })?;
+    let encoded = encode_canonical_document(&document)
+        .map_err(|error| ProviderError::Unavailable(format!("pending document encode: {error}")))?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(DOCUMENT_DOMAIN);
     bytes.extend_from_slice(&encoded);
@@ -1248,7 +1225,10 @@ fn encode_intent(
 }
 
 fn decode_intent(bytes: &[u8]) -> Result<(JournalRow, usize), String> {
-    let mut cursor = DecodeCursor { input: bytes, offset: 0 };
+    let mut cursor = DecodeCursor {
+        input: bytes,
+        offset: 0,
+    };
     if cursor.byte()? != 1 {
         return Err("invalid prepared-intent version".to_owned());
     }
@@ -1333,7 +1313,10 @@ impl<'a> DecodeCursor<'a> {
             .offset
             .checked_add(N)
             .ok_or_else(|| "truncated journal".to_owned())?;
-        let slice = self.input.get(self.offset..end).ok_or("truncated journal")?;
+        let slice = self
+            .input
+            .get(self.offset..end)
+            .ok_or("truncated journal")?;
         self.offset = end;
         Ok(slice.try_into().expect("checked length"))
     }
@@ -1358,25 +1341,19 @@ impl<'a> DecodeCursor<'a> {
             .offset
             .checked_add(len)
             .ok_or_else(|| "truncated journal".to_owned())?;
-        let slice = self.input.get(self.offset..end).ok_or("truncated journal")?;
+        let slice = self
+            .input
+            .get(self.offset..end)
+            .ok_or("truncated journal")?;
         self.offset = end;
         String::from_utf8(slice.to_vec()).map_err(|_| "invalid utf-8".to_owned())
     }
-
 }
 
 fn open_or_init_journal(
     path: &Path,
     ticket_ikm: &[u8; 32],
-) -> Result<
-    (
-        [u8; 16],
-        [u8; 16],
-        [u8; 32],
-        HashMap<[u8; 32], JournalRow>,
-    ),
-    String,
-> {
+) -> Result<([u8; 16], [u8; 16], [u8; 32], HashMap<[u8; 32], JournalRow>), String> {
     match std::fs::metadata(path) {
         Err(error) if error.kind() == ErrorKind::NotFound => init_empty_journal(path, ticket_ikm),
         Err(error) => Err(format!("read grant journal: {error}")),
@@ -1422,15 +1399,7 @@ fn read_journal_capped(path: &Path) -> Result<Vec<u8>, String> {
 fn init_empty_journal(
     path: &Path,
     ticket_ikm: &[u8; 32],
-) -> Result<
-    (
-        [u8; 16],
-        [u8; 16],
-        [u8; 32],
-        HashMap<[u8; 32], JournalRow>,
-    ),
-    String,
-> {
+) -> Result<([u8; 16], [u8; 16], [u8; 32], HashMap<[u8; 32], JournalRow>), String> {
     let boot = random_nonzero_16();
     let instance = random_nonzero_16();
     let revision_mac_key = random_nonzero_32();
@@ -1532,10 +1501,7 @@ fn encode_row(row: &JournalRow) -> Vec<u8> {
     bytes.extend_from_slice(&row.nonce);
     if let Some(terminal) = row.terminal.as_ref() {
         match terminal {
-            TerminalKind::Decision {
-                request_id,
-                status,
-            } => {
+            TerminalKind::Decision { request_id, status } => {
                 bytes.push(1);
                 put_text(&mut bytes, request_id);
                 put_text(&mut bytes, status);
@@ -1569,15 +1535,7 @@ fn encode_row(row: &JournalRow) -> Vec<u8> {
 fn load_journal(
     bytes: &[u8],
     ticket_ikm: &[u8; 32],
-) -> Result<
-    (
-        [u8; 16],
-        [u8; 16],
-        [u8; 32],
-        HashMap<[u8; 32], JournalRow>,
-    ),
-    String,
-> {
+) -> Result<([u8; 16], [u8; 16], [u8; 32], HashMap<[u8; 32], JournalRow>), String> {
     if bytes.len() < HEADER_LEN + 4 {
         return Err("grant journal truncated".to_owned());
     }
@@ -1626,8 +1584,7 @@ fn load_journal(
         if body.len() < consumed + 32 {
             return Err("journal row missing nonce".to_owned());
         }
-        row.nonce
-            .copy_from_slice(&body[consumed..consumed + 32]);
+        row.nonce.copy_from_slice(&body[consumed..consumed + 32]);
         if tag == 2 {
             let mut rest = DecodeCursor {
                 input: body,
@@ -1680,8 +1637,7 @@ fn derive_ticket_key(ikm: &[u8; 32], journal_instance: &[u8; 16]) -> [u8; 32] {
     info.extend_from_slice(&1u32.to_be_bytes());
     let hk = Hkdf::<Sha256>::new(Some(&salt), ikm);
     let mut key = [0u8; 32];
-    hk.expand(&info, &mut key)
-        .expect("HKDF expand ticket key");
+    hk.expand(&info, &mut key).expect("HKDF expand ticket key");
     key
 }
 

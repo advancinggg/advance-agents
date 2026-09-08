@@ -15,16 +15,15 @@ use advance_client_api::durable_idempotency::{
 use advance_client_api::{
     BoundGrantApprovalPort, BoundGrantMutation, BoundMutationOutcome, ClientApi, ClientApiConfig,
     ClientCapParam, ClientErrorCode, ClientRequest, ClientSession, Platform, Principal,
-    ProviderError,
-    ProviderMutationRecovery, ProviderPrepareOutcome, Scope,
+    ProviderError, ProviderMutationRecovery, ProviderPrepareOutcome, Scope,
 };
-use advance_shared_types::sensitive_observation::{ObservationNode, RedactionDisposition};
 use advance_database::{R2d2SqliteIndexHandle, SqliteIndexHandle};
 use advance_scheduler::registry::ComponentRegistry;
 use advance_scheduler::types::ComponentSubmitConfig;
 use advance_scheduler::{ComponentSubmitApi, InMemoryComponentSubmitApi};
 use advance_shared_types::component::ComponentType;
 use advance_shared_types::event::Event;
+use advance_shared_types::sensitive_observation::{ObservationNode, RedactionDisposition};
 use advance_shared_types::traits::{EventBusEmit, LeakDetector};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -51,8 +50,15 @@ struct CountingBus {
 impl EventBusEmit for CountingBus {
     fn emit(&self, event: Event) {
         if event.event_type == "resolver.invoked"
-            && event.payload.get("decision").and_then(|value| value.as_str()) == Some("approve")
-            && event.payload.get("resolver_type").and_then(|value| value.as_str())
+            && event
+                .payload
+                .get("decision")
+                .and_then(|value| value.as_str())
+                == Some("approve")
+            && event
+                .payload
+                .get("resolver_type")
+                .and_then(|value| value.as_str())
                 == Some("GrantApprovalIntake")
         {
             self.intake_approves.fetch_add(1, Ordering::SeqCst);
@@ -358,12 +364,7 @@ fn listed_revision(api: &ClientApi, request_id: &str) -> String {
         .to_owned()
 }
 
-fn grant(
-    id: &str,
-    grantee: &str,
-    paths: &str,
-    provenance: GrantProvenance,
-) -> Grant {
+fn grant(id: &str, grantee: &str, paths: &str, provenance: GrantProvenance) -> Grant {
     Grant {
         id: GrantId::new(id),
         grantee: grantee.to_owned(),
@@ -385,10 +386,34 @@ fn write_nocache(path: &std::path::Path, bytes: &[u8]) {
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
     let mut file = std::fs::File::create(path).expect("create nocache journal");
-    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
-    assert_eq!(rc, 0, "F_NOCACHE");
+    #[cfg(target_os = "macos")]
+    {
+        let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+        assert_eq!(rc, 0, "F_NOCACHE");
+    }
     file.write_all(bytes).expect("write nocache journal");
     file.sync_all().expect("sync nocache journal");
+    #[cfg(target_os = "linux")]
+    {
+        let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(rc, 0, "POSIX_FADV_DONTNEED");
+    }
+}
+
+unsafe fn mincore_page(addr: *mut libc::c_void, len: usize, status: &mut u8) -> libc::c_int {
+    #[cfg(target_os = "macos")]
+    {
+        libc::mincore(addr, len, status as *mut u8 as *mut libc::c_char)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        libc::mincore(addr, len, status as *mut libc::c_uchar)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (addr, len, status);
+        0
+    }
 }
 
 fn vnode_page_resident(path: &std::path::Path, offset: u64) -> bool {
@@ -410,11 +435,11 @@ fn vnode_page_resident(path: &std::path::Path, offset: u64) -> bool {
     };
     assert_ne!(ptr, libc::MAP_FAILED, "mmap journal for mincore");
     let page_off = (offset / page) * page;
-    let mut status: libc::c_char = 0;
-    let rc = unsafe { libc::mincore(ptr.add(page_off as usize), page as usize, &mut status) };
+    let mut status: u8 = 0;
+    let rc = unsafe { mincore_page(ptr.add(page_off as usize), page as usize, &mut status) };
     unsafe { libc::munmap(ptr, map_len as usize) };
     assert_eq!(rc, 0, "mincore");
-    status as u8 & 1 == 1
+    status & 1 == 1
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -784,12 +809,9 @@ async fn t17_live_revoke() {
         ("policy-root-1", "revoke-static-unprefixed"),
     ] {
         let static_revoke = live.api.handle(
-            ClientRequest::post(
-                format!("/client/grants/{grant_id}:revoke"),
-                json!({}),
-            )
-            .with_session("tok")
-            .with_idempotency_key(ik),
+            ClientRequest::post(format!("/client/grants/{grant_id}:revoke"), json!({}))
+                .with_session("tok")
+                .with_idempotency_key(ik),
         );
         assert_eq!(
             static_revoke.error_code(),
@@ -991,10 +1013,7 @@ async fn t17_rev_stale() {
             .with_session("tok")
             .with_idempotency_key("omit"),
     );
-    assert_eq!(
-        omit.error_code(),
-        Some(ClientErrorCode::ProjectionRejected)
-    );
+    assert_eq!(omit.error_code(), Some(ClientErrorCode::ProjectionRejected));
 
     let swapped = live.api.handle(
         ClientRequest::post(
@@ -1905,10 +1924,7 @@ async fn t23_fresh_adapter() {
         .with_idempotency_key("t23-a"),
     );
     assert!(first_done.is_ok(), "{:?}", first_done.error);
-    assert_eq!(
-        first_done.data.as_ref().unwrap()["status"],
-        "approved"
-    );
+    assert_eq!(first_done.data.as_ref().unwrap()["status"], "approved");
     assert_eq!(
         base.intake.decision("t23-a"),
         ChannelApprovalDecision::Approved
@@ -2027,13 +2043,15 @@ async fn t23_fresh_adapter() {
                 RedactionDisposition::Redacted(document) => document,
                 RedactionDisposition::Blocked { .. } => panic!("t23-b projection blocked"),
             };
-            let ObservationNode::Object(fields) = document
-                .provider_root()
-                .expect("t23-b provider root")
+            let ObservationNode::Object(fields) =
+                document.provider_root().expect("t23-b provider root")
             else {
                 panic!("t23-b root is not an object");
             };
-            let status = fields.iter().find(|(key, _)| key == "status").map(|(_, value)| value);
+            let status = fields
+                .iter()
+                .find(|(key, _)| key == "status")
+                .map(|(_, value)| value);
             assert!(
                 matches!(status, Some(ObservationNode::String(value)) if value == "approved"),
                 "t23-b bound status"
@@ -2244,7 +2262,9 @@ async fn t23_new_rejects_do_not_retain_prepared_rows() {
         },
     ) {
         ProviderPrepareOutcome::Rejected(ProviderError::InvalidState(_)) => {}
-        ProviderPrepareOutcome::Rejected(error) => panic!("expected invalid_state remint: {error:?}"),
+        ProviderPrepareOutcome::Rejected(error) => {
+            panic!("expected invalid_state remint: {error:?}")
+        }
         ProviderPrepareOutcome::Prepared(_) => {
             panic!("same mutation_id+fingerprint+tag must not remint a different intent")
         }
@@ -2638,7 +2658,10 @@ async fn t23_concurrent_preset_execute_applies_once() {
             BoundMutationOutcome::OutcomeUnknown(_) => panic!("execute unknown"),
         }
     }
-    assert_eq!(live.intake_approves.preset_applies.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        live.intake_approves.preset_applies.load(Ordering::SeqCst),
+        1
+    );
     assert_eq!(
         live.store
             .list_by_grantee("grantee-comp")
@@ -2765,6 +2788,10 @@ async fn t23_journal_read_error_fails_closed() {
         vnode_page_resident(&oversized, frontier_offset),
         "take(MAX+1) must fault the last byte of the cap (offset 8MiB); reading only 4KiB then store(MAX+1) leaves the frontier cold"
     );
+    // Darwin/APFS readahead after an 8MiB sequential read pulls the remaining 4MiB
+    // tail, so last-page coldness cannot distinguish take(MAX+1) from std::fs::read
+    // there. Linux readahead stays well under 4MiB, so the slurp witness is Linux-only.
+    #[cfg(target_os = "linux")]
     assert!(
         !vnode_page_resident(&oversized, last_offset),
         "capped read must not slurp the 4MiB tail; std::fs::read of the pad faults the last page"
@@ -2973,9 +3000,7 @@ async fn t17_live_arabic_number_sign_param_is_deny_only() {
         .with_idempotency_key("cf-deny"),
     );
     assert!(denied.is_ok(), "{:?}", denied.error);
-    assert!(!listed_pending_ids(&live.api)
-        .iter()
-        .any(|id| id == "cf-fs"));
+    assert!(!listed_pending_ids(&live.api).iter().any(|id| id == "cf-fs"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3346,7 +3371,9 @@ async fn t17_live_parked_second_key_is_gated() {
         .iter()
         .find(|row| row["request_id"] == "pair-bearer")
         .expect("pair-bearer");
-    let pair_bearer_params = pair_bearer["params"].as_array().expect("pair-bearer params");
+    let pair_bearer_params = pair_bearer["params"]
+        .as_array()
+        .expect("pair-bearer params");
     let pair_bearer_write = pair_bearer_params
         .iter()
         .find(|param| param["key"] == "write-paths")
@@ -3669,8 +3696,7 @@ async fn t23_persist_journal_writes_full_filename_tmp() {
     std::fs::write(&persist_tmp_victim, b"keep-persist-tmp").expect("persist tmp victim");
     let persist_tmp = colliding.path().join("grant.journal.tmp");
     let _ = std::fs::remove_file(&persist_tmp);
-    std::os::unix::fs::symlink(&persist_tmp_victim, &persist_tmp)
-        .expect("symlink persist_all tmp");
+    std::os::unix::fs::symlink(&persist_tmp_victim, &persist_tmp).expect("symlink persist_all tmp");
     park(
         &live.intake,
         "persist-tmp-symlink",
@@ -3768,7 +3794,8 @@ async fn t23_persist_journal_writes_full_filename_tmp() {
     if combo_tmp.exists() || combo_tmp.symlink_metadata().is_ok() {
         let _ = std::fs::remove_file(&combo_tmp);
     }
-    std::os::unix::fs::symlink(&combo_victim, &combo_tmp).expect("tmp symlink before 6MiB+3MiB overflow");
+    std::os::unix::fs::symlink(&combo_victim, &combo_tmp)
+        .expect("tmp symlink before 6MiB+3MiB overflow");
     match lone_adapter.prepare_mutation_bound(
         [0x67; 32],
         [0x68; 32],
@@ -3934,12 +3961,16 @@ async fn t23_persist_journal_writes_full_filename_tmp() {
             }
         }
     }
-    assert_eq!(write_adapter.test_journal_row_count(), usize::from(FILL_DENIES));
+    assert_eq!(
+        write_adapter.test_journal_row_count(),
+        usize::from(FILL_DENIES)
+    );
     std::fs::write(&write_victim, b"keep-write-limit").expect("write-limit victim");
     if write_tmp.exists() || write_tmp.symlink_metadata().is_ok() {
         let _ = std::fs::remove_file(&write_tmp);
     }
-    std::os::unix::fs::symlink(&write_victim, &write_tmp).expect("tmp symlink before overflow persist");
+    std::os::unix::fs::symlink(&write_victim, &write_tmp)
+        .expect("tmp symlink before overflow persist");
     let overflow_params = vec![
         ClientCapParam {
             key: String::new(),
@@ -4001,7 +4032,7 @@ async fn t23_persist_journal_writes_full_filename_tmp() {
     )
     .expect("seed small-row journal");
     let mut small_filled = 0u8;
-    let mut small_len = 0;
+    let mut small_len;
     loop {
         let mut mutation_id = [0x65u8; 32];
         mutation_id[31] = small_filled;
@@ -4022,7 +4053,9 @@ async fn t23_persist_journal_writes_full_filename_tmp() {
                     .expect("small-row after fill")
                     .len();
                 let delta = size_after.saturating_sub(size_before);
-                small_filled = small_filled.checked_add(1).expect("too many small fill rows");
+                small_filled = small_filled
+                    .checked_add(1)
+                    .expect("too many small fill rows");
                 small_len = size_after;
                 if size_after.saturating_add(delta) > 8 * 1024 * 1024 {
                     break;
@@ -4047,7 +4080,8 @@ async fn t23_persist_journal_writes_full_filename_tmp() {
     if small_tmp.exists() || small_tmp.symlink_metadata().is_ok() {
         let _ = std::fs::remove_file(&small_tmp);
     }
-    std::os::unix::fs::symlink(&small_victim, &small_tmp).expect("tmp symlink before small-row overflow");
+    std::os::unix::fs::symlink(&small_victim, &small_tmp)
+        .expect("tmp symlink before small-row overflow");
     let mut overflow_id = [0x65u8; 32];
     overflow_id[31] = small_filled;
     match small_adapter.prepare_mutation_bound(
@@ -4293,7 +4327,9 @@ async fn t23_journal_reloads_all_rows_and_executes_by_mutation_id() {
     );
     match reloaded.execute_prepared_bound(&ticket_c) {
         BoundMutationOutcome::Committed(_) => {}
-        BoundMutationOutcome::Rejected(error) => panic!("execute first-sorted live pair: {error:?}"),
+        BoundMutationOutcome::Rejected(error) => {
+            panic!("execute first-sorted live pair: {error:?}")
+        }
         BoundMutationOutcome::OutcomeUnknown(_) => panic!("execute first-sorted live pair unknown"),
     }
     assert_eq!(
@@ -4408,7 +4444,9 @@ async fn t23_journal_reloads_all_rows_and_executes_by_mutation_id() {
     };
     match reloaded.execute_prepared_bound(&ticket_g) {
         BoundMutationOutcome::Committed(_) => {}
-        BoundMutationOutcome::Rejected(error) => panic!("execute first-sorted live pair: {error:?}"),
+        BoundMutationOutcome::Rejected(error) => {
+            panic!("execute first-sorted live pair: {error:?}")
+        }
         BoundMutationOutcome::OutcomeUnknown(_) => panic!("execute first-sorted live pair unknown"),
     }
     assert_eq!(
@@ -4769,7 +4807,10 @@ async fn t23_new_preset_terminal_survives_compact() {
         BoundMutationOutcome::Rejected(error) => panic!("first execute rejected: {error:?}"),
         BoundMutationOutcome::OutcomeUnknown(_) => panic!("first execute unknown"),
     }
-    assert_eq!(live.intake_approves.preset_applies.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        live.intake_approves.preset_applies.load(Ordering::SeqCst),
+        1
+    );
     assert_eq!(live.adapter.test_journal_row_count(), 1);
     let replay = match live.adapter.prepare_mutation_bound(
         [0xA1; 32],
@@ -4787,7 +4828,10 @@ async fn t23_new_preset_terminal_survives_compact() {
         BoundMutationOutcome::Rejected(error) => panic!("replay execute rejected: {error:?}"),
         BoundMutationOutcome::OutcomeUnknown(_) => panic!("replay execute unknown"),
     }
-    assert_eq!(live.intake_approves.preset_applies.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        live.intake_approves.preset_applies.load(Ordering::SeqCst),
+        1
+    );
     assert_eq!(live.adapter.test_journal_row_count(), 1);
 }
 
@@ -4823,4 +4867,3 @@ async fn t17_oversized_justification_does_not_panic_list() {
     assert!(ids.contains(&"visible-sibling".to_owned()), "{ids:?}");
     assert!(!ids.contains(&"huge-just".to_owned()), "{ids:?}");
 }
-

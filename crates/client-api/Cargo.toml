@@ -36,7 +36,7 @@ rand = { workspace = true }
 # m020-s3 CONTRACT-191: LeakDetector trait + Event metadata types (no event-bus production dep).
 advance-shared-types = { path = "../shared-types" }
 # MODULE-023 GenUI types for CONTRACT-192 schema generation.
-advance-genui = { path = "../genui", version = "0.1.0" }
+advance-genui = { path = "../genui", version = "0.1.9" }
 # AEAD cursor tokens (AES-256-GCM) + zeroizing key material.
 aes-gcm = { workspace = true }
 zeroize = { workspace = true }

@@ -6,9 +6,9 @@ resolver = "2"
 [workspace.package]
 # Single source of truth for every member crate version (pre-genesis unification,
 # OPEN-CORE-PUBLISH-RUNBOOK §Pre-genesis #1). Members inherit via
-# `version.workspace = true`. Consumers pin releases by git tag (v0.1.0), so this
-# version and the genesis tag must move together.
-version = "0.1.0"
+# `version.workspace = true`. Consumers pin releases by git tag (v0.1.9), so this
+# version and the release tag must move together.
+version = "0.1.9"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 # The public OSS remote (final name adjudicated 2026-08-07: the ORIGINAL URL is kept

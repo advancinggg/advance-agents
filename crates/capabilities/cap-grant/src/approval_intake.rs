@@ -156,9 +156,7 @@ impl PendingRegistry {
             ));
         }
         self.next_seq = s.checked_add(1).ok_or_else(|| {
-            ChannelApprovalError::new(
-                "grant-approval-intake: pending generation counter wrapped",
-            )
+            ChannelApprovalError::new("grant-approval-intake: pending generation counter wrapped")
         })?;
         Ok(s)
     }
