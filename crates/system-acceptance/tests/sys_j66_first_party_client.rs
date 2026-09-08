@@ -263,10 +263,6 @@ where
     (events, cursor)
 }
 
-async fn drain_events(socket: &mut Sock, overall: Duration) -> (Vec<Value>, Option<Value>) {
-    drain_events_until(socket, overall, |_| false, false).await
-}
-
 fn event_type_is(events: &[Value], event_type: &str) -> bool {
     events.iter().any(|e| e["event_type"] == event_type)
 }
@@ -506,6 +502,12 @@ async fn sys_j66_first_party_client_journey() {
     let seed = read_seed(&mut ws).await;
     assert!(seed.events.is_empty(), "seed must be empty-join");
     send_frame(&mut ws, json!({ "agent_id": AGENT, "limit": 16 })).await;
+    // The subscribe frame replaces the seed cursor with a fresh (None, None) open.
+    // handle_stream high-waters past whatever is already in the log, so if that
+    // first poll runs after the turn has written events the socket never sees
+    // them. Wait out one 250ms transport poll while the log is still empty so
+    // the subscribe lands on empty-join.
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // ── J66-T269a: messaging + fulfill → replied ──
     let ack = http
@@ -564,7 +566,13 @@ async fn sys_j66_first_party_client_journey() {
     let run_id = run_list["run_id"].as_str().expect("run_id").to_string();
     assert_eq!(run_list["status"], "active");
 
-    let (first_events, first_cursor) = drain_events(&mut ws, Duration::from_secs(8)).await;
+    let (first_events, first_cursor) = drain_events_until(
+        &mut ws,
+        Duration::from_secs(15),
+        |evs| !evs.is_empty(),
+        true,
+    )
+    .await;
     assert!(
         !first_events.is_empty(),
         "first turn must project at least one client event"
