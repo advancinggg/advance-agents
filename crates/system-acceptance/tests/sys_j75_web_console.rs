@@ -1,6 +1,6 @@
 //! SYS-J-75 — daemon-altitude web.search / web.extract witnesses.
 //!
-//! AC → test mapping (along bookkeeping handoff; this tree does not flip ledgers):
+//! AC → test mapping (product bookkeeping handoff; this tree does not flip ledgers):
 //!
 //! | AC | Tests | Bytes prove |
 //! | --- | --- | --- |

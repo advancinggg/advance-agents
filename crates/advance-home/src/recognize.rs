@@ -6,20 +6,20 @@ use std::path::{Path, PathBuf};
 
 use advance_runtime::config::load_config;
 
-use crate::contract::{AlongHomeHandle, RecognizeClass};
+use crate::contract::{RecognizeClass, WorkspaceHomeHandle};
 
 pub fn recognize(path: &Path) -> RecognizeClass {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == ErrorKind::PermissionDenied => return RecognizeClass::Unreadable,
-        Err(e) if e.kind() == ErrorKind::NotFound => return RecognizeClass::NotAnAlongHome,
+        Err(e) if e.kind() == ErrorKind::NotFound => return RecognizeClass::NotAWorkspaceHome,
         Err(_) => return RecognizeClass::Unreadable,
     };
     if meta.file_type().is_symlink() {
-        return RecognizeClass::NotAnAlongHome;
+        return RecognizeClass::NotAWorkspaceHome;
     }
     if !meta.is_dir() {
-        return RecognizeClass::NotAnAlongHome;
+        return RecognizeClass::NotAWorkspaceHome;
     }
     #[cfg(unix)]
     {
@@ -41,7 +41,7 @@ pub fn recognize(path: &Path) -> RecognizeClass {
         || path_exists_nofollow(&agent)
         || path_exists_nofollow(&cfg);
     if !any_marker {
-        return RecognizeClass::NotAnAlongHome;
+        return RecognizeClass::NotAWorkspaceHome;
     }
     if !(is_real_dir(&advance)
         && is_real_dir(&runtime)
@@ -58,15 +58,15 @@ pub fn recognize(path: &Path) -> RecognizeClass {
     }
 }
 
-pub fn open(path: &Path) -> Result<AlongHomeHandle, RecognizeClass> {
+pub fn open(path: &Path) -> Result<WorkspaceHomeHandle, RecognizeClass> {
     match recognize(path) {
-        RecognizeClass::Recognized { path } => Ok(AlongHomeHandle { path }),
+        RecognizeClass::Recognized { path } => Ok(WorkspaceHomeHandle { path }),
         other => Err(other),
     }
 }
 
 #[allow(dead_code)]
-pub(crate) fn require_recognized(home: &AlongHomeHandle) -> Result<PathBuf, RecognizeClass> {
+pub(crate) fn require_recognized(home: &WorkspaceHomeHandle) -> Result<PathBuf, RecognizeClass> {
     match recognize(&home.path) {
         RecognizeClass::Recognized { path } => Ok(path),
         other => Err(other),

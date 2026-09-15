@@ -2,11 +2,11 @@
 
 use std::path::Path;
 
-use crate::contract::{AlongHomeHandle, CreateError, RecognizeClass};
+use crate::contract::{CreateError, RecognizeClass, WorkspaceHomeHandle};
 use crate::recognize::{open, recognize};
 use crate::scaffold::{write_create_driver, write_recognizable_home};
 
-pub fn create(parent: &Path, name: &str) -> Result<AlongHomeHandle, CreateError> {
+pub fn create(parent: &Path, name: &str) -> Result<WorkspaceHomeHandle, CreateError> {
     let name = name.trim();
     if !valid_name(name) {
         return Err(CreateError::InvalidName);
@@ -26,7 +26,7 @@ pub fn create(parent: &Path, name: &str) -> Result<AlongHomeHandle, CreateError>
             RecognizeClass::Recognized { .. } => {
                 return open(&target).map_err(|_| CreateError::Io);
             }
-            _ => return Err(CreateError::ExistsNotAlongHome),
+            _ => return Err(CreateError::ExistsNotWorkspaceHome),
         }
     }
     write_recognizable_home(&target).map_err(|_| CreateError::Io)?;

@@ -1,6 +1,6 @@
 //! SYS-J-74 — daemon-altitude local-sidecar witnesses.
 //!
-//! AC → test mapping (along bookkeeping handoff; this tree does not flip ledgers):
+//! AC → test mapping (product bookkeeping handoff; this tree does not flip ledgers):
 //!
 //! | AC | Tests | Bytes prove |
 //! | --- | --- | --- |
@@ -9,7 +9,7 @@
 //! | SYS-AC-315 | `sys_ac_315_literal_loopback_blocked_at_chain` + `sys_ac_315_rfc1918_blocked_at_chain` + `sys_ac_315_connect_time_literal_blocked` + `sys_ac_315_connect_time_localhost_rebinding_blocked` | cloud-http provider `chat()`: chain-step `SsrfBlocked` non-retryable (a/b); connect-time `"transport error"` + mock 0 (c/d) |
 //! | REQ-404 | union of the three SYS-ACs | sidecar e2e leg; in-process half is product SYS-J-81 |
 //!
-//! REQ-404 Verified only if all three SYS-ACs pass (along bookkeeping).
+//! REQ-404 Verified only if all three SYS-ACs pass (product bookkeeping).
 
 use std::net::TcpStream;
 use std::process::Command;

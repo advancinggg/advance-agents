@@ -2,13 +2,13 @@
 
 use std::fs;
 
-use advance_along_home::{AlongHomeFirstOpen, HostAlongHome, RecognizeClass};
+use advance_home::{HostWorkspaceHome, RecognizeClass, WorkspaceHomeFirstOpen};
 
 #[test]
 fn t109_create_writes_wasm_and_second_create_does_not_overwrite() {
     let tmp = tempfile::tempdir().unwrap();
     let parent = tmp.path();
-    let h = HostAlongHome::production();
+    let h = HostWorkspaceHome::production();
 
     let first = h.create(parent, "home-a").unwrap();
     let driver = first.path().join(".agent").join("behavior.wasm");
@@ -34,7 +34,7 @@ fn t109_create_writes_wasm_and_second_create_does_not_overwrite() {
 fn t109_rollback_delete_wasm_second_create_is_ac24_open() {
     let tmp = tempfile::tempdir().unwrap();
     let parent = tmp.path();
-    let h = HostAlongHome::production();
+    let h = HostWorkspaceHome::production();
     let first = h.create(parent, "home-b").unwrap();
     let driver = first.path().join(".agent").join("behavior.wasm");
     fs::remove_file(&driver).unwrap();

@@ -8,7 +8,7 @@ use crate::secret_bytes::SecretBytes;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecognizeClass {
     Recognized { path: PathBuf },
-    NotAnAlongHome,
+    NotAWorkspaceHome,
     Unreadable,
     Unwritable,
     Damaged,
@@ -16,19 +16,19 @@ pub enum RecognizeClass {
 
 /// Opaque handle. No key field.
 #[derive(Clone)]
-pub struct AlongHomeHandle {
+pub struct WorkspaceHomeHandle {
     pub(crate) path: PathBuf,
 }
 
-impl AlongHomeHandle {
+impl WorkspaceHomeHandle {
     pub fn path(&self) -> &Path {
         &self.path
     }
 }
 
-impl std::fmt::Debug for AlongHomeHandle {
+impl std::fmt::Debug for WorkspaceHomeHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AlongHomeHandle")
+        f.debug_struct("WorkspaceHomeHandle")
             .field("path", &self.path)
             .finish()
     }
@@ -40,7 +40,7 @@ pub struct PreflightPass {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConnectedAlong {
+pub struct ConnectedRuntime {
     pub home: PathBuf,
     pub client_api_base: String,
 }
@@ -60,7 +60,7 @@ pub enum RuntimeState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateError {
-    ExistsNotAlongHome,
+    ExistsNotWorkspaceHome,
     ParentUnusable(RecognizeClass),
     InvalidName,
     Io,
@@ -103,34 +103,38 @@ pub enum AdoptError {
     ProviderNotAdopted { reason: String },
 }
 
-pub trait AlongHomeFirstOpen: Send + Sync {
+pub trait WorkspaceHomeFirstOpen: Send + Sync {
     fn recognize(&self, path: &Path) -> RecognizeClass;
-    fn open(&self, path: &Path) -> Result<AlongHomeHandle, RecognizeClass>;
-    fn create(&self, parent: &Path, name: &str) -> Result<AlongHomeHandle, CreateError>;
-    fn provider_status(&self, home: &AlongHomeHandle) -> ProviderStatus;
-    fn runtime_state(&self, home: &AlongHomeHandle) -> RuntimeState;
+    fn open(&self, path: &Path) -> Result<WorkspaceHomeHandle, RecognizeClass>;
+    fn create(&self, parent: &Path, name: &str) -> Result<WorkspaceHomeHandle, CreateError>;
+    fn provider_status(&self, home: &WorkspaceHomeHandle) -> ProviderStatus;
+    fn runtime_state(&self, home: &WorkspaceHomeHandle) -> RuntimeState;
     fn store_and_preflight(
         &self,
-        home: &AlongHomeHandle,
+        home: &WorkspaceHomeHandle,
         provider_id: &str,
         key: SecretBytes,
         cancel: &CancelToken,
     ) -> Result<PreflightPass, PreflightFail>;
     fn confirm_existing_provider(
         &self,
-        home: &AlongHomeHandle,
+        home: &WorkspaceHomeHandle,
         cancel: &CancelToken,
     ) -> Result<PreflightPass, PreflightFail>;
-    fn set_display_name(&self, home: &AlongHomeHandle, name: &str) -> Result<(), DisplayNameError>;
-    fn current_display_name(&self, home: &AlongHomeHandle) -> Option<String>;
+    fn set_display_name(
+        &self,
+        home: &WorkspaceHomeHandle,
+        name: &str,
+    ) -> Result<(), DisplayNameError>;
+    fn current_display_name(&self, home: &WorkspaceHomeHandle) -> Option<String>;
     fn start_or_attach(
         &self,
-        home: &AlongHomeHandle,
+        home: &WorkspaceHomeHandle,
         cancel: &CancelToken,
-    ) -> Result<ConnectedAlong, ConnectError>;
+    ) -> Result<ConnectedRuntime, ConnectError>;
     fn adopt_provider_on_running(
         &self,
-        home: &AlongHomeHandle,
+        home: &WorkspaceHomeHandle,
         cancel: &CancelToken,
     ) -> Result<(), AdoptError>;
 }

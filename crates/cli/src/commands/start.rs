@@ -348,7 +348,7 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
             .first()
             .map(|p| p.id.clone())
             .unwrap_or_default();
-        let _ = advance_along_home::write_selected_provider(&workspace, pid, &first);
+        let _ = advance_home::write_selected_provider(&workspace, pid, &first);
         let mut rx = host.config_watcher().subscribe();
         let ws = workspace.clone();
         tokio::spawn(async move {
@@ -358,7 +358,7 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
                     .first()
                     .map(|p| p.id.clone())
                     .unwrap_or_default();
-                let _ = advance_along_home::write_selected_provider(&ws, pid, &id);
+                let _ = advance_home::write_selected_provider(&ws, pid, &id);
             }
         });
     }
@@ -2205,7 +2205,7 @@ mod tests_024 {
     //! the production loader resolves the canonical materialized name and encodes a
     //! core module to a Component on the fly so a template-materialized child loads.
     use super::{is_core_module, resolve_driver_component_bytes};
-    use advance_along_home::{AlongHomeFirstOpen, HostAlongHome};
+    use advance_home::{HostWorkspaceHome, WorkspaceHomeFirstOpen};
     use advance_runtime::config::WasmConfig;
     use advance_runtime::ComponentRuntime;
     use wit_component::ComponentEncoder;
@@ -2274,7 +2274,7 @@ mod tests_024 {
     #[test]
     fn t109_create_home_resolves_and_loads() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let home = HostAlongHome::production()
+        let home = HostWorkspaceHome::production()
             .create(tmp.path(), "home-t109")
             .expect("create");
         let (path, bytes) = resolve_driver_component_bytes(home.path())

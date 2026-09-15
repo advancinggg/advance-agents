@@ -5,7 +5,7 @@
 //! console JS/HTML and `crates/client-api/src` must not write those stores.
 //!
 //! Does **not** witness T19 live browser DOM.
-//! Does **not** witness Along Keychain / UserDefaults.
+//! Does **not** witness product Keychain / UserDefaults.
 //! Does **not** restamp MODULE-020-AC-14.
 
 use std::collections::BTreeMap;

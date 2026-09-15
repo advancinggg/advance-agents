@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use advance_along_home::{
+use advance_home::{
     write_client_api_discovery, write_recognizable_home, write_selected_provider, AdoptError,
-    AdoptPort, AlongHomeFirstOpen, CancelToken, ConnectError, HostAlongHome, PreflightFail,
-    PreflightPort, RuntimeLauncher, RuntimeState, SecretBytes,
+    AdoptPort, CancelToken, ConnectError, HostWorkspaceHome, PreflightFail, PreflightPort,
+    RuntimeLauncher, RuntimeState, SecretBytes, WorkspaceHomeFirstOpen,
 };
 use advance_runtime::config::LlmProviderConfig;
 use advance_runtime::runtime_lock::{inspect_lock, LockInspection};
@@ -168,8 +168,8 @@ fn materialize_running(home: &Path, base: &str, provider: &str) {
     write_selected_provider(home, pid, provider).unwrap();
 }
 
-fn host(launcher: Arc<dyn RuntimeLauncher>, adopt: Arc<dyn AdoptPort>) -> HostAlongHome {
-    HostAlongHome::with_ports_and_wait(
+fn host(launcher: Arc<dyn RuntimeLauncher>, adopt: Arc<dyn AdoptPort>) -> HostWorkspaceHome {
+    HostWorkspaceHome::with_ports_and_wait(
         Arc::new(PassPreflight),
         launcher,
         adopt,
@@ -323,7 +323,7 @@ fn t105_adopt_ok_on_running_no_second_launch() {
         health: Arc::clone(&health),
         selected: Mutex::new("anthropic".into()),
     });
-    let adopt = Arc::new(advance_along_home::connect::FileAdoptPort {
+    let adopt = Arc::new(advance_home::connect::FileAdoptPort {
         timeout: Duration::from_millis(400),
     });
     let h = host(launcher.clone(), adopt);
@@ -396,7 +396,7 @@ fn t107_pre_daemon_full_trait() {
     let created = h.create(parent, "home").unwrap();
     assert!(matches!(
         h.recognize(created.path()),
-        advance_along_home::RecognizeClass::Recognized { .. }
+        advance_home::RecognizeClass::Recognized { .. }
     ));
     let _ = h.provider_status(&created);
     h.store_and_preflight(

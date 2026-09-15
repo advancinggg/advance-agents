@@ -3,12 +3,12 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use advance_along_home::{
-    write_recognizable_home, AlongHomeFirstOpen, HostAlongHome, RecognizeClass,
+use advance_home::{
+    write_recognizable_home, HostWorkspaceHome, RecognizeClass, WorkspaceHomeFirstOpen,
 };
 
-fn host() -> HostAlongHome {
-    HostAlongHome::production()
+fn host() -> HostWorkspaceHome {
+    HostWorkspaceHome::production()
 }
 
 #[test]
@@ -32,21 +32,21 @@ fn t102_recognize_classes_and_open() {
 
     let empty = tmp.path().join("empty");
     fs::create_dir(&empty).unwrap();
-    assert_eq!(h.recognize(&empty), RecognizeClass::NotAnAlongHome);
+    assert_eq!(h.recognize(&empty), RecognizeClass::NotAWorkspaceHome);
     assert!(matches!(
         h.open(&empty),
-        Err(RecognizeClass::NotAnAlongHome)
+        Err(RecognizeClass::NotAWorkspaceHome)
     ));
 
     let file = tmp.path().join("file");
     fs::write(&file, b"x").unwrap();
-    assert_eq!(h.recognize(&file), RecognizeClass::NotAnAlongHome);
+    assert_eq!(h.recognize(&file), RecognizeClass::NotAWorkspaceHome);
 
     let damaged = tmp.path().join("damaged");
     fs::create_dir_all(damaged.join(".advance")).unwrap();
     fs::create_dir_all(damaged.join(".runtime")).unwrap();
     fs::create_dir_all(damaged.join(".agent")).unwrap();
-    let starter = advance_along_home::MINIMAL_STARTER.as_bytes();
+    let starter = advance_home::MINIMAL_STARTER.as_bytes();
     fs::write(
         damaged.join(".advance").join("runtime-config.yaml"),
         &starter[..40.min(starter.len())],

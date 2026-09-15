@@ -3,9 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use advance_along_home::{
-    write_recognizable_home, AlongHomeFirstOpen, CancelToken, GeneratePathPreflight, HostAlongHome,
-    PreflightFail, SecretBytes,
+use advance_home::{
+    write_recognizable_home, CancelToken, GeneratePathPreflight, HostWorkspaceHome, PreflightFail,
+    SecretBytes, WorkspaceHomeFirstOpen,
 };
 use advance_shared_types::security_validator::HttpResponse;
 use cap_http::{DefaultSsrfGuard, MockHttpExecutor, MockResolver};
@@ -28,15 +28,15 @@ fn openai_resolver() -> Arc<dyn advance_shared_types::security_validator::SsrfGu
     )))
 }
 
-fn host_with_exec(exec: Arc<MockHttpExecutor>) -> HostAlongHome {
+fn host_with_exec(exec: Arc<MockHttpExecutor>) -> HostWorkspaceHome {
     let pre = GeneratePathPreflight {
         executor: exec,
         ssrf: openai_resolver(),
         event_bus: Arc::new(DiscardEventBus),
     };
-    HostAlongHome::with_ports(
+    HostWorkspaceHome::with_ports(
         Arc::new(pre),
-        Arc::new(advance_along_home::ProcessLauncher),
+        Arc::new(advance_home::ProcessLauncher),
         Arc::new(OkAdopt),
     )
 }
@@ -133,13 +133,13 @@ fn t136_openai_while_anthropic_is_first() {
 }
 
 struct OkAdopt;
-impl advance_along_home::AdoptPort for OkAdopt {
+impl advance_home::AdoptPort for OkAdopt {
     fn wait_adopted(
         &self,
         _h: &std::path::Path,
         _e: &str,
         _c: &CancelToken,
-    ) -> Result<(), advance_along_home::AdoptError> {
+    ) -> Result<(), advance_home::AdoptError> {
         Ok(())
     }
 }
@@ -170,9 +170,9 @@ fn t137_cancel_hanging_executor() {
         ssrf: openai_resolver(),
         event_bus: Arc::new(DiscardEventBus),
     };
-    let h = HostAlongHome::with_ports(
+    let h = HostWorkspaceHome::with_ports(
         Arc::new(pre),
-        Arc::new(advance_along_home::ProcessLauncher),
+        Arc::new(advance_home::ProcessLauncher),
         Arc::new(OkAdopt),
     );
     let handle = h.open(&path).unwrap();

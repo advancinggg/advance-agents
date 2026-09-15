@@ -1,6 +1,6 @@
 //! SYS-J-66 — first-party Client API / console witness (SYS-AC-268..271).
 //!
-//! One wired journey at daemon / first-party-client altitude. Along ledger
+//! One wired journey at daemon / first-party-client altitude. Product ledger
 //! flips (MODULE-020-AC-03/06/07/08) are out of this OSS tree.
 //!
 //! J66-T268  — SYS-AC-268: successful lists for runs / tree / grants / tools

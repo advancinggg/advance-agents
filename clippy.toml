@@ -1,7 +1,7 @@
 # Nested clippy.toml does NOT merge with this file. If a crate grows a nested
 # clippy.toml, copy this `disallowed-methods` table into it.
-# Product (along) does not inherit this file via the git-dep façade; copying
-# it is a separate along pass, not this lane.
+# The product repo does not inherit this file via the git-dep façade; copying
+# it is a separate product pass, not this lane.
 #
 # allow-invalid = true is REQUIRED on rustc 1.91: clippy errors when a path
 # does not resolve in the crate under lint. These methods live in optional

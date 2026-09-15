@@ -1,4 +1,4 @@
-//! CONTRACT-243 Along-home first-open host library.
+//! CONTRACT-243 workspace-home first-open host library.
 //!
 //! Callable before any daemon or CONTRACT-210 embed exists. Never returns
 //! provider key material.
@@ -22,12 +22,13 @@ pub mod secret_bytes;
 pub use cancel::CancelToken;
 pub use connect::ProcessLauncher;
 pub use contract::{
-    AdoptError, AlongHomeFirstOpen, AlongHomeHandle, ConnectError, ConnectedAlong, CreateError,
-    DisplayNameError, PreflightFail, PreflightPass, ProviderStatus, RecognizeClass, RuntimeState,
+    AdoptError, ConnectError, ConnectedRuntime, CreateError, DisplayNameError, PreflightFail,
+    PreflightPass, ProviderStatus, RecognizeClass, RuntimeState, WorkspaceHomeFirstOpen,
+    WorkspaceHomeHandle,
 };
 pub use discovery::{write_client_api_discovery, ClientApiDiscovery};
 pub use display_name::TopLevelDisplayName;
-pub use impls::HostAlongHome;
+pub use impls::HostWorkspaceHome;
 pub use ports::{AdoptPort, GeneratePathPreflight, PreflightPort, RuntimeLauncher};
 pub use runtime_state::{write_selected_provider, SelectedProvider};
 pub use scaffold::{write_recognizable_home, AGENT_CONFIG_STARTER, MINIMAL_STARTER};

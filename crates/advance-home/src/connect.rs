@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::cancel::CancelToken;
-use crate::contract::{AdoptError, ConnectError, ConnectedAlong, RuntimeState};
+use crate::contract::{AdoptError, ConnectError, ConnectedRuntime, RuntimeState};
 use crate::discovery::read_client_api_discovery;
 use crate::ports::{AdoptPort, RuntimeLauncher};
 use crate::runtime_state::{committed_provider_id, read_selected_provider, runtime_state};
@@ -166,7 +166,7 @@ pub fn start_or_attach(
     launcher: &dyn RuntimeLauncher,
     adopt: &dyn AdoptPort,
     wait_bound: Duration,
-) -> Result<ConnectedAlong, ConnectError> {
+) -> Result<ConnectedRuntime, ConnectError> {
     if cancel.is_cancelled() {
         return Err(ConnectError::Cancelled);
     }
@@ -252,7 +252,7 @@ fn wait_until_running(
     }
 }
 
-fn attach(home: &Path, cancel: &CancelToken) -> Result<ConnectedAlong, ConnectError> {
+fn attach(home: &Path, cancel: &CancelToken) -> Result<ConnectedRuntime, ConnectError> {
     if cancel.is_cancelled() {
         return Err(ConnectError::Cancelled);
     }
@@ -263,7 +263,7 @@ fn attach(home: &Path, cancel: &CancelToken) -> Result<ConnectedAlong, ConnectEr
             advance_runtime::runtime_lock::LockInspection::Live { pid } if pid == d.pid
         );
         if pid_ok && crate::discovery::client_api_accepts(&d.client_api_base) {
-            return Ok(ConnectedAlong {
+            return Ok(ConnectedRuntime {
                 home: home.to_path_buf(),
                 client_api_base: d.client_api_base,
             });

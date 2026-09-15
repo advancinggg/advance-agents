@@ -2,13 +2,13 @@
 
 use std::fs;
 
-use advance_along_home::{AlongHomeFirstOpen, CreateError, HostAlongHome, RecognizeClass};
+use advance_home::{CreateError, HostWorkspaceHome, RecognizeClass, WorkspaceHomeFirstOpen};
 
 #[test]
 fn t103_create_open_refuse_invalid() {
     let tmp = tempfile::tempdir().unwrap();
     let parent = tmp.path();
-    let h = HostAlongHome::production();
+    let h = HostWorkspaceHome::production();
 
     let first = h.create(parent, "home-a").unwrap();
     assert!(matches!(
@@ -26,7 +26,7 @@ fn t103_create_open_refuse_invalid() {
     fs::create_dir(&sibling).unwrap();
     fs::write(sibling.join("note.txt"), b"keep").unwrap();
     let err = h.create(parent, "not-home").unwrap_err();
-    assert_eq!(err, CreateError::ExistsNotAlongHome);
+    assert_eq!(err, CreateError::ExistsNotWorkspaceHome);
     assert_eq!(fs::read(sibling.join("note.txt")).unwrap(), b"keep");
 
     assert_eq!(

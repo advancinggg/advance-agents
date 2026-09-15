@@ -1,6 +1,6 @@
 //! CLI discovery helper is the same writer used after bind.
 
-use advance_along_home::write_client_api_discovery;
+use advance_home::write_client_api_discovery;
 
 #[test]
 fn client_api_discovery_0600_pid_url() {

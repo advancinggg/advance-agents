@@ -1,15 +1,15 @@
 [package]
-name = "advance-along-home"
+name = "advance-home"
 version.workspace = true
 repository.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CONTRACT-243 Along-home first-open host library."
+description = "CONTRACT-243 workspace-home first-open host library."
 
 publish = false
 
 [lib]
-name = "advance_along_home"
+name = "advance_home"
 path = "src/lib.rs"
 
 [dependencies]

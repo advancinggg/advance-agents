@@ -4,9 +4,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use advance_along_home::{
-    write_recognizable_home, AlongHomeFirstOpen, CancelToken, HostAlongHome, PreflightFail,
-    PreflightPort, ProviderStatus, SecretBytes,
+use advance_home::{
+    write_recognizable_home, CancelToken, HostWorkspaceHome, PreflightFail, PreflightPort,
+    ProviderStatus, SecretBytes, WorkspaceHomeFirstOpen,
 };
 use advance_runtime::config::LlmProviderConfig;
 use cap_secrets::{
@@ -34,14 +34,14 @@ impl PreflightPort for ScriptedPreflight {
     }
 }
 
-fn home_with_ports(preflight: ScriptedPreflight) -> HostAlongHome {
+fn home_with_ports(preflight: ScriptedPreflight) -> HostWorkspaceHome {
     home_with_ports_custom(preflight)
 }
 
-fn home_with_ports_custom(preflight: impl PreflightPort + 'static) -> HostAlongHome {
-    HostAlongHome::with_ports(
+fn home_with_ports_custom(preflight: impl PreflightPort + 'static) -> HostWorkspaceHome {
+    HostWorkspaceHome::with_ports(
         Arc::new(preflight),
-        Arc::new(advance_along_home::ProcessLauncher),
+        Arc::new(advance_home::ProcessLauncher),
         Arc::new(NeverAdopt),
     )
 }
@@ -67,13 +67,13 @@ impl PreflightPort for MidCancel {
 }
 
 struct NeverAdopt;
-impl advance_along_home::AdoptPort for NeverAdopt {
+impl advance_home::AdoptPort for NeverAdopt {
     fn wait_adopted(
         &self,
         _home: &Path,
         _expected_provider: &str,
         _cancel: &CancelToken,
-    ) -> Result<(), advance_along_home::AdoptError> {
+    ) -> Result<(), advance_home::AdoptError> {
         Ok(())
     }
 }
@@ -145,7 +145,7 @@ fn t108_provider_status_and_select() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("h");
     write_recognizable_home(&path).unwrap();
-    let h = HostAlongHome::production();
+    let h = HostWorkspaceHome::production();
     let handle = h.open(&path).unwrap();
     assert_eq!(h.provider_status(&handle), ProviderStatus::Absent);
     let missing = h

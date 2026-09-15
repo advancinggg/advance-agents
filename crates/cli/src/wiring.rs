@@ -2502,7 +2502,7 @@ async fn wire_capabilities_inner(
                         "advance: Client API and Web Console listening at http://{}",
                         server.local_addr()
                     );
-                    let _ = advance_along_home::write_client_api_discovery(
+                    let _ = advance_home::write_client_api_discovery(
                         workspace,
                         std::process::id(),
                         &format!("http://{}", server.local_addr()),

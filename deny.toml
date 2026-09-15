@@ -116,7 +116,7 @@ deny = [
 # sources — where crates are allowed to come from.
 # ---------------------------------------------------------------------------
 # The OSS core is crates.io-ONLY: there are no git dependencies in Cargo.lock.
-# The one git dependency in the wider system is the PRIVATE `along`
+# The one git dependency in the wider system is the private product
 # repo's edge onto THIS repo — that lives in the product repo's own deny config,
 # not here. Keep this gate strict so a stray git/registry source is a hard fail.
 [sources]

@@ -3,9 +3,9 @@
 use std::fs;
 use std::sync::{Arc, Mutex};
 
-use advance_along_home::{
-    write_recognizable_home, AlongHomeFirstOpen, CancelToken, GeneratePathPreflight, HostAlongHome,
-    PreflightFail, PreflightPass, ProviderStatus, SecretBytes,
+use advance_home::{
+    write_recognizable_home, CancelToken, GeneratePathPreflight, HostWorkspaceHome, PreflightFail,
+    PreflightPass, ProviderStatus, SecretBytes, WorkspaceHomeFirstOpen,
 };
 use advance_runtime::config::LlmProviderConfig;
 use advance_shared_types::event::Event;
@@ -17,7 +17,7 @@ use cap_secrets::{
 };
 
 struct Pass;
-impl advance_along_home::PreflightPort for Pass {
+impl advance_home::PreflightPort for Pass {
     fn preflight(
         &self,
         _home: &std::path::Path,
@@ -33,7 +33,7 @@ impl advance_along_home::PreflightPort for Pass {
 }
 
 struct Fail;
-impl advance_along_home::PreflightPort for Fail {
+impl advance_home::PreflightPort for Fail {
     fn preflight(
         &self,
         _home: &std::path::Path,
@@ -48,23 +48,23 @@ impl advance_along_home::PreflightPort for Fail {
 }
 
 struct NoLaunch;
-impl advance_along_home::RuntimeLauncher for NoLaunch {
+impl advance_home::RuntimeLauncher for NoLaunch {
     fn start(
         &self,
         _home: &std::path::Path,
         _cancel: &CancelToken,
-    ) -> Result<(), advance_along_home::ConnectError> {
+    ) -> Result<(), advance_home::ConnectError> {
         Ok(())
     }
 }
 struct NoAdopt;
-impl advance_along_home::AdoptPort for NoAdopt {
+impl advance_home::AdoptPort for NoAdopt {
     fn wait_adopted(
         &self,
         _home: &std::path::Path,
         _e: &str,
         _c: &CancelToken,
-    ) -> Result<(), advance_along_home::AdoptError> {
+    ) -> Result<(), advance_home::AdoptError> {
         Ok(())
     }
 }
@@ -89,7 +89,7 @@ fn t33_store_ciphertext_only() {
     let path = tmp.path().join("h");
     write_recognizable_home(&path).unwrap();
     let key = "sk-test-KEY-T33-plaintext";
-    let h = HostAlongHome::with_ports(Arc::new(Pass), Arc::new(NoLaunch), Arc::new(NoAdopt));
+    let h = HostWorkspaceHome::with_ports(Arc::new(Pass), Arc::new(NoLaunch), Arc::new(NoAdopt));
     let handle = h.open(&path).unwrap();
     let pass = h
         .store_and_preflight(
@@ -115,7 +115,7 @@ fn t34_fail_leaves_previous() {
     write_recognizable_home(&path).unwrap();
     let a = "sk-test-KEY-T34-A";
     let b = "sk-test-KEY-T34-B";
-    let pass = HostAlongHome::with_ports(Arc::new(Pass), Arc::new(NoLaunch), Arc::new(NoAdopt));
+    let pass = HostWorkspaceHome::with_ports(Arc::new(Pass), Arc::new(NoLaunch), Arc::new(NoAdopt));
     let handle = pass.open(&path).unwrap();
     pass.store_and_preflight(
         &handle,
@@ -129,7 +129,7 @@ fn t34_fail_leaves_previous() {
         Some(a)
     );
 
-    let fail = HostAlongHome::with_ports(Arc::new(Fail), Arc::new(NoLaunch), Arc::new(NoAdopt));
+    let fail = HostWorkspaceHome::with_ports(Arc::new(Fail), Arc::new(NoLaunch), Arc::new(NoAdopt));
     let handle = fail.open(&path).unwrap();
     let err = fail
         .store_and_preflight(
@@ -215,7 +215,7 @@ fn t35_t36_no_key_on_error_or_types() {
         ))),
         event_bus: Arc::clone(&rec) as Arc<dyn EventBusEmit>,
     };
-    let h = HostAlongHome::with_ports(Arc::new(pre), Arc::new(NoLaunch), Arc::new(NoAdopt));
+    let h = HostWorkspaceHome::with_ports(Arc::new(pre), Arc::new(NoLaunch), Arc::new(NoAdopt));
     let handle = h.open(&path).unwrap();
     let pass = h
         .store_and_preflight(
@@ -254,7 +254,8 @@ fn t35_t36_no_key_on_error_or_types() {
         ))),
         event_bus: Arc::clone(&rec2) as Arc<dyn EventBusEmit>,
     };
-    let h2 = HostAlongHome::with_ports(Arc::new(pre_fail), Arc::new(NoLaunch), Arc::new(NoAdopt));
+    let h2 =
+        HostWorkspaceHome::with_ports(Arc::new(pre_fail), Arc::new(NoLaunch), Arc::new(NoAdopt));
     let handle = h2.open(&path).unwrap();
     let fail = h2
         .store_and_preflight(
@@ -283,8 +284,8 @@ fn t35_t36_no_key_on_error_or_types() {
     for ty in [
         "pub struct PreflightPass",
         "pub enum ProviderStatus",
-        "pub struct AlongHomeHandle",
-        "pub struct ConnectedAlong",
+        "pub struct WorkspaceHomeHandle",
+        "pub struct ConnectedRuntime",
     ] {
         let idx = src.find(ty).expect(ty);
         let chunk = &src[idx..idx + 180];

@@ -32,7 +32,7 @@ fn t52_single_display_name_writer() {
     assert!(
         path_builders
             .iter()
-            .all(|l| l.contains("along-home") && l.contains("display_name.rs")),
+            .all(|l| l.contains("advance-home") && l.contains("display_name.rs")),
         "{path_builders:?}"
     );
 
@@ -52,12 +52,12 @@ fn t52_single_display_name_writer() {
     assert!(
         first_open
             .iter()
-            .any(|l| l.contains("along-home") && l.contains("impls.rs")),
+            .any(|l| l.contains("advance-home") && l.contains("impls.rs")),
         "{first_open:?}"
     );
     assert!(
         first_open.iter().all(|l| {
-            l.contains("along-home")
+            l.contains("advance-home")
                 && (l.contains("impls.rs")
                     || l.contains("contract.rs")
                     || l.contains("display_name.rs"))
@@ -68,12 +68,9 @@ fn t52_single_display_name_writer() {
 
 #[test]
 fn t53_identity_constants() {
+    assert_eq!(advance_home::TopLevelDisplayName::TREE_ID, "default-agent");
     assert_eq!(
-        advance_along_home::TopLevelDisplayName::TREE_ID,
-        "default-agent"
-    );
-    assert_eq!(
-        advance_along_home::TopLevelDisplayName::MAILBOX_ID,
+        advance_home::TopLevelDisplayName::MAILBOX_ID,
         "agent:default"
     );
     let start = fs::read_to_string(

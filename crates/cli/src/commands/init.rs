@@ -12,9 +12,9 @@ use std::process::ExitCode;
 #[cfg(target_os = "linux")]
 use std::io::Write;
 
-/// Starter YAML lives in `advance-along-home` so create + `advance init` share it.
+/// Starter YAML lives in `advance-home` so create + `advance init` share it.
 #[cfg(target_os = "linux")]
-pub(crate) use advance_along_home::{AGENT_CONFIG_STARTER, MINIMAL_STARTER};
+pub(crate) use advance_home::{AGENT_CONFIG_STARTER, MINIMAL_STARTER};
 
 pub fn run(path: PathBuf) -> ExitCode {
     match run_outer(&path) {
@@ -93,7 +93,7 @@ fn fallback_init(path: &Path) -> Result<PathBuf, String> {
         ));
     }
 
-    advance_along_home::write_recognizable_home(&canonical)
+    advance_home::write_recognizable_home(&canonical)
         .map_err(|e| format!("failed to scaffold recognizable home: {e}"))?;
 
     let mk = cap_secrets::MasterKeyConfig::Keychain {
