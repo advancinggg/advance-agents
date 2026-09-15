@@ -15,6 +15,7 @@
 //! Provider-backed endpoint families (runs/messages/grants) and the CONTRACT-191 event
 //! stream/history sync facade remain transport-independent.
 
+pub mod agents;
 pub mod api;
 pub mod audit;
 pub mod auth;
@@ -41,6 +42,11 @@ pub mod tools;
 pub mod transport;
 pub mod version;
 
+pub use agents::{
+    ClientAgentCapability, ClientAgentConfig, ClientAgentDeclaredChild, ClientAgentDeleteResult,
+    ClientAgentDetail, ClientAgentSummary, ClientAgentTemplate, ClientCreateAgentRequest,
+    ClientDeleteAgentRequest, ClientUpdateAgentRequest,
+};
 pub use api::{ClientApi, ClientMutationContext, HandlerCtx, HandlerResponse, HandlerSpec};
 pub use audit::{AuditEvent, AuditSink, NoopSink};
 pub use clock::{Clock, SystemClock};
@@ -64,7 +70,9 @@ pub use events::{
 };
 pub use messages::{ClientMessageAck, ClientMessageStatus, ClientSendMessageRequest};
 pub use pagination::{Cursor, Page};
-pub use provider::{MessagingProvider, ProviderError, RunControlProvider, ToolsProvider};
+pub use provider::{
+    AgentAdminProvider, MessagingProvider, ProviderError, RunControlProvider, ToolsProvider,
+};
 pub use providers::grants::{
     BoundGrantApprovalPort, BoundGrantMutation, BoundMutationOutcome, ClientCapParam,
     ClientGrantApproveRequest, ClientGrantDecision, ClientGrantDenyRequest,

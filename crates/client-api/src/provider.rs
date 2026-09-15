@@ -18,6 +18,10 @@ use std::sync::{Arc, RwLock};
 use advance_shared_types::security_validator::LeakDetector;
 use advance_shared_types::sensitive_observation::SensitiveObservationRedactor;
 
+use crate::agents::{
+    ClientAgentDeleteResult, ClientAgentDetail, ClientAgentSummary, ClientAgentTemplate,
+    ClientCreateAgentRequest, ClientDeleteAgentRequest, ClientUpdateAgentRequest,
+};
 use crate::cursor::ClientCursorCodec;
 use crate::envelope::{ClientError, ClientErrorCode};
 use crate::events::ClientEventProvider;
@@ -45,6 +49,13 @@ pub enum ProviderError {
     TooLarge(String),
     /// The provider is absent/unhealthy (or a bridged call failed). → `module_unavailable`
     Unavailable(String),
+    /// The resource a create names already exists (agent id / workspace territory taken).
+    /// → `already_exists`
+    AlreadyExists(String),
+    /// The request is well-formed at the envelope level but semantically invalid for the
+    /// provider (unknown template, unparseable config document, a root agent named by a delete,
+    /// a Sub named as a parent, …). → `invalid_request`
+    InvalidRequest(String),
 }
 
 impl ProviderError {
@@ -68,6 +79,12 @@ impl ProviderError {
             ProviderError::TooLarge(_) => (ClientErrorCode::RequestTooLarge, "request too large"),
             ProviderError::Unavailable(_) => {
                 (ClientErrorCode::ModuleUnavailable, "provider unavailable")
+            }
+            ProviderError::AlreadyExists(_) => {
+                (ClientErrorCode::AlreadyExists, "resource already exists")
+            }
+            ProviderError::InvalidRequest(_) => {
+                (ClientErrorCode::InvalidRequest, "invalid request")
             }
         };
         ClientError::new(code, message)
@@ -106,11 +123,42 @@ pub trait ToolsProvider: Send + Sync {
     fn inventory(&self, agent_id: &str) -> Result<ClientToolInventory, ProviderError>;
 }
 
+/// Agent administration provider (MODULE-005 tree + workspace territories, CONTRACT-040/041 host
+/// side) behind the `agents` family. The adapter owns the real `AgentTreeStore`, spawner, terminate
+/// controller, and the `.agent/config.yaml` / display-name files; every argument it receives has
+/// already passed the handler-side validation in [`crate::agents`]. Read results are client-safe
+/// projections (workspace paths are workspace-root-relative, never absolute host paths).
+pub trait AgentAdminProvider: Send + Sync {
+    fn list_agents(&self) -> Result<Vec<ClientAgentSummary>, ProviderError>;
+    fn get_agent(&self, agent_id: &str) -> Result<ClientAgentDetail, ProviderError>;
+    /// Materialize a child agent under `request.parent` (root by default), record it in the
+    /// declared hierarchy so it survives a daemon restart, and return its detail document.
+    fn create_agent(
+        &self,
+        request: &ClientCreateAgentRequest,
+    ) -> Result<ClientAgentDetail, ProviderError>;
+    /// Replace the display name and/or the config document (validated before the write).
+    fn update_agent(
+        &self,
+        agent_id: &str,
+        request: &ClientUpdateAgentRequest,
+    ) -> Result<ClientAgentDetail, ProviderError>;
+    /// Terminate the agent and every descendant (the MODULE-005 cascade), remove it from the
+    /// declared hierarchy, and remove its `.agent/` marker (plus the workspace when requested).
+    fn delete_agent(
+        &self,
+        agent_id: &str,
+        request: &ClientDeleteAgentRequest,
+    ) -> Result<ClientAgentDeleteResult, ProviderError>;
+    fn list_templates(&self) -> Result<Vec<ClientAgentTemplate>, ProviderError>;
+}
+
 /// An interior-mutable provider slot: `None` until the composition root injects a concrete adapter.
 pub type ProviderSlot<T> = Arc<RwLock<Option<Arc<T>>>>;
 pub type RunProviderSlot = ProviderSlot<dyn RunControlProvider>;
 pub type MessagingProviderSlot = ProviderSlot<dyn MessagingProvider>;
 pub type ToolsProviderSlot = ProviderSlot<dyn ToolsProvider>;
+pub type AgentProviderSlot = ProviderSlot<dyn AgentAdminProvider>;
 /// m020-s3: event provider / leak detector / cursor codec slots.
 pub type EventProviderSlot = ProviderSlot<dyn ClientEventProvider>;
 pub type LeakDetectorSlot = ProviderSlot<dyn LeakDetector>;

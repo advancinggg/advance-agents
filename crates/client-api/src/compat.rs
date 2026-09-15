@@ -62,6 +62,13 @@ pub const RESPONSE_COMPONENTS: &[&str] = &[
     "ActionRef",
     "ValidationOutcome",
     "GenUiError",
+    "ClientAgentSummary",
+    "ClientAgentCapability",
+    "ClientAgentDeclaredChild",
+    "ClientAgentConfig",
+    "ClientAgentDetail",
+    "ClientAgentDeleteResult",
+    "ClientAgentTemplate",
 ];
 
 /// Request / filter bodies — not a response-field bag.
@@ -76,6 +83,9 @@ pub const EXCLUDED_COMPONENTS: &[&str] = &[
     "ClientEventStreamRequest",
     "ClientEventFilter",
     "LlmDeltaStreamRequest",
+    "ClientCreateAgentRequest",
+    "ClientUpdateAgentRequest",
+    "ClientDeleteAgentRequest",
 ];
 
 /// Git path of the on-disk honesty baseline, relative to the repo root.

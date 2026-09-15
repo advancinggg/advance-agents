@@ -509,6 +509,20 @@ fn exercise_error_semantics() -> Vec<(&'static str, String)> {
         }),
     ));
 
+    // invalid_request — agents-family request validation rejects a malformed create (bad agent id
+    // charset) before any provider is consulted.
+    observed.push((
+        "validation_invalid_agent_request",
+        fx.api.handle(
+            ClientRequest::post(
+                "/client/agents",
+                json!({ "agent_id": "bad id", "template_ref": "explorer" }),
+            )
+            .with_session("tok")
+            .with_idempotency_key("k-agent-invalid"),
+        ),
+    ));
+
     // module_unavailable — provider slot absent fails closed (separate bare core).
     let bare = ClientApi::new(ClientApiConfig::default());
     mint(
@@ -554,6 +568,7 @@ fn ac12_error_semantics_exercised_against_every_surface() {
         ("auth_underscoped", "forbidden"),
         ("validation_invalid_transition", "invalid_state"),
         ("validation_bad_history_request", "projection_rejected"),
+        ("validation_invalid_agent_request", "invalid_request"),
         ("idempotency_conflict", "idempotency_conflict"),
         ("provider_not_found", "not_found"),
         ("module_unavailable", "module_unavailable"),

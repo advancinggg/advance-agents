@@ -1095,10 +1095,12 @@ fn status_for(code: &ClientErrorCode) -> StatusCode {
         }
         ClientErrorCode::IdempotencyInProgress
         | ClientErrorCode::IdempotencyConflict
-        | ClientErrorCode::InvalidState => StatusCode::CONFLICT,
+        | ClientErrorCode::InvalidState
+        | ClientErrorCode::AlreadyExists => StatusCode::CONFLICT,
         ClientErrorCode::ProjectionRejected => StatusCode::UNPROCESSABLE_ENTITY,
         ClientErrorCode::UnsupportedApiVersion
         | ClientErrorCode::IdempotencyRequired
+        | ClientErrorCode::InvalidRequest
         | ClientErrorCode::Unknown => StatusCode::BAD_REQUEST,
     }
 }

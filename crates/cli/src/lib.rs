@@ -32,6 +32,10 @@ pub mod context_wiring;
 // Wave-25A Order-2 build-and-hold platform anchor.  This module is deliberately
 // not wired into `advance start` until the later atomic composition lane.
 pub mod client_api_adapters;
+// CONTRACT-190 agents family: the production `AgentAdminProvider` over the shared agent tree
+// (list/get/create/update/delete + template listing), its root-config persistence, and the
+// production terminate-controller composition the family drives.
+pub mod client_api_agents;
 pub mod contract218_anchor;
 pub mod contract218_bootstrap;
 pub mod contract218_keyring;

@@ -150,6 +150,17 @@ fn t02e_schema_fidelity() {
         "LlmDeltaPage",
         "LlmDeltaWirePage",
         "LlmDeltaStreamRequest",
+        // agents family (CONTRACT-190 agent CRUD) DTOs.
+        "ClientAgentSummary",
+        "ClientAgentCapability",
+        "ClientAgentDeclaredChild",
+        "ClientAgentConfig",
+        "ClientAgentDetail",
+        "ClientAgentDeleteResult",
+        "ClientAgentTemplate",
+        "ClientCreateAgentRequest",
+        "ClientUpdateAgentRequest",
+        "ClientDeleteAgentRequest",
     ] {
         assert!(comps.get(dto).is_some(), "schema missing DTO {dto}");
     }

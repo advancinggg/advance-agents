@@ -136,6 +136,12 @@ pub enum ClientErrorCode {
     ReplyNotAuthorized,
     InvalidState,
     Forbidden,
+    // agents family codes (additive) — the client-safe projection of MODULE-005 tree/territory
+    // outcomes plus handler-side request validation.
+    /// A create named an agent id / workspace territory that already exists.
+    AlreadyExists,
+    /// The request failed validation (id charset, path containment, bounds, document schema).
+    InvalidRequest,
     /// Forward-compat catch-all (deserialization only; never emitted by this server).
     #[serde(other)]
     Unknown,
@@ -166,6 +172,8 @@ impl ClientErrorCode {
             ClientErrorCode::ReplyNotAuthorized => "reply_not_authorized",
             ClientErrorCode::InvalidState => "invalid_state",
             ClientErrorCode::Forbidden => "forbidden",
+            ClientErrorCode::AlreadyExists => "already_exists",
+            ClientErrorCode::InvalidRequest => "invalid_request",
             ClientErrorCode::Unknown => "unknown",
         }
     }
@@ -195,6 +203,8 @@ impl ClientErrorCode {
             "reply_not_authorized",
             "invalid_state",
             "forbidden",
+            "already_exists",
+            "invalid_request",
         ]
     }
 }

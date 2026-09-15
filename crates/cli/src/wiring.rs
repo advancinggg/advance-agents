@@ -662,6 +662,12 @@ pub struct WiringHandles {
     /// Sub now surfaces by NAME (SYS-AC-011 stays DEFERRED only for the empty-caps
     /// WIT spawn cap-lift gap — the "with capability summaries" clause).
     pub agent_tree_snapshot: Option<Arc<dyn AgentTreeSnapshot>>,
+    /// Agents family (CONTRACT-190 agent CRUD): the shared `AgentTreeStore` itself (`Some` iff
+    /// the tree was built), the retained production spawner, and the composed
+    /// `AgentAdminAdapter` the Client API serves (`Some` iff tree + spawner exist).
+    pub agent_tree: Option<Arc<AgentTreeStore>>,
+    pub agent_spawner: Option<Arc<dyn Spawner>>,
+    pub agent_admin: Option<Arc<crate::client_api_agents::AgentAdminAdapter>>,
     /// Wave-12 Lane C: the `DefaultDecompositionStore` (wrapping the SAME shared
     /// `AgentTreeStore`) the decomposition host-fns record into. `start.rs` wraps it
     /// in a `CapDecompositionReader` (with the agent's bare/colon alias set) and
@@ -867,6 +873,11 @@ pub fn materialize_config_tree(
         std::collections::VecDeque::new();
     queue.push_back((root_id.clone(), decls));
     while let Some((parent_id, children)) = queue.pop_front() {
+        // Re-boot leg: a declared child whose territory was already materialized by an earlier
+        // daemon lifetime (its target dir carries `.agent/`) is ADOPTED into the tree, because
+        // `init_child_workspace` fail-fasts on an existing `.agent/` and would otherwise abort
+        // every second boot of a workspace with declared (or client-created) children.
+        adopt_existing_declared(tree, &parent_id, children)?;
         let entries: Vec<BootstrapEntry> = children
             .iter()
             .map(|d| BootstrapEntry {
@@ -896,6 +907,65 @@ pub fn materialize_config_tree(
                 queue.push_back((AgentId(d.alias.clone()), &d.children));
             }
         }
+    }
+    Ok(())
+}
+
+/// Adopt already-materialized declared territories into `tree` (the re-boot half of
+/// `materialize_config_tree`). For each decl under `parent_id` whose alias is absent from the
+/// tree but whose resolved target dir already carries a real `.agent/` directory, insert the
+/// Child node WITHOUT re-materializing (the skeleton, template files, memory, and driver from
+/// the earlier lifetime stay byte-identical). A fresh target (no `.agent/`) is left to
+/// `apply_auto_bootstrap`, which spawns it; an adopted alias is then seen by the applier as
+/// "alias present, path matches, same template → skip". Path rules are the applier's own
+/// (`resolve_under_parent` + `symlink_check`), so adoption can never widen what a decl may
+/// name. Adopted nodes carry no capabilities — the same template-sourced-caps boundary a
+/// fresh boot materialization has.
+fn adopt_existing_declared(
+    tree: &Arc<AgentTreeStore>,
+    parent_id: &AgentId,
+    decls: &[crate::agent_config::AgentDecl],
+) -> Result<(), CliWiringError> {
+    let Some(parent) = tree.get_node(parent_id) else {
+        return Ok(()); // the applier reports ParentNotFound
+    };
+    for decl in decls {
+        let alias = AgentId(decl.alias.clone());
+        if tree.contains(&alias) {
+            continue;
+        }
+        let Ok(target) = cap_lifecycle::workspace::resolve_under_parent(
+            &parent.workspace_path,
+            &decl.target_path,
+            tree.workspace_root(),
+        ) else {
+            continue; // the applier reports InvalidTargetPath
+        };
+        let marker = target.join(".agent");
+        let is_materialized = std::fs::symlink_metadata(&marker)
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false);
+        if !is_materialized {
+            continue;
+        }
+        cap_lifecycle::workspace::symlink_check(tree.workspace_root(), &target).map_err(|e| {
+            CliWiringError::ConfigTree(format!("adopt declared agent {}: {e}", decl.alias))
+        })?;
+        tree.insert_child(
+            parent_id,
+            AgentNode {
+                id: alias,
+                kind: AgentKind::Child,
+                parent: Some(parent_id.clone()),
+                workspace_path: target,
+                capabilities: Vec::new(),
+                template_ref: Some(decl.template.clone()),
+                status: AgentStatus::Active,
+            },
+        )
+        .map_err(|e| {
+            CliWiringError::ConfigTree(format!("adopt declared agent {}: {e}", decl.alias))
+        })?;
     }
     Ok(())
 }
@@ -1576,6 +1646,10 @@ async fn wire_capabilities_inner(
     // Wave-23 seam (d): retained so `WiringHandles` can expose it (post-build
     // runtime binding + shutdown drain).
     let mut perchild_manager: Option<Arc<PerChildLoopManager>> = None;
+    // Agents family (CONTRACT-190): retain the production spawner so the client-facing agent
+    // CRUD adapter creates children through the SAME spawn path (serve observer included) a
+    // guest `spawn-child` takes.
+    let mut agent_spawner: Option<Arc<dyn Spawner>> = None;
     // W24 seam (f): the shared crash-cascade sink, retained so `WiringHandles` can
     // attach it to the ROOT loop in `start.rs` (each spawned CHILD loop already gets
     // it via `PerChildLoopManager::with_crash_sink`).
@@ -1690,6 +1764,7 @@ async fn wire_capabilities_inner(
             // serve). Per-child liveness is a `lifecycle` + `messaging` config.
             Arc::new(spawner_concrete)
         };
+        agent_spawner = Some(Arc::clone(&spawner));
         register_agent_spawn(&*registry, spawner);
         // Wave-12 Lane C: register the 3 decomposition host-fns over a
         // `DefaultDecompositionStore` sharing THIS tree + the real `event_bus_dyn`,
@@ -2406,11 +2481,54 @@ async fn wire_capabilities_inner(
         advance_messaging::BreakerSubscriber::spawn(host.circuit_breaker_bus(), store.clone())
     });
 
+    // Agents family (CONTRACT-190 agent CRUD): compose the production adapter over the SAME
+    // tree + spawner the guest spawn path uses, and a terminate controller carrying the real
+    // grant/run/mailbox/workspace cascades (+ the per-child serve-loop cascade when messaging
+    // is wired). `None` when no tree exists (no fs/messaging/lifecycle declared) → the family
+    // answers `module_unavailable`.
+    let agent_admin: Option<Arc<crate::client_api_agents::AgentAdminAdapter>> =
+        match (agent_tree.as_ref(), agent_spawner.as_ref()) {
+            (Some(tree), Some(spawner)) => {
+                let resolver: crate::client_api_agents::MailboxKeyResolver =
+                    Arc::new(|bare: &str| {
+                        if bare == DEFAULT_AGENT_ID {
+                            crate::commands::start::DEFAULT_MSG_AGENT_ID.to_string()
+                        } else {
+                            format!("agent:{bare}")
+                        }
+                    });
+                let loop_cascade: Option<Arc<dyn cap_lifecycle::terminate::LoopCascade>> =
+                    perchild_manager.as_ref().map(|mgr| {
+                        Arc::new(crate::perchild_daemon::PerChildLoopCascade::new(
+                            Arc::clone(mgr),
+                        )) as Arc<dyn cap_lifecycle::terminate::LoopCascade>
+                    });
+                let terminator = crate::client_api_agents::build_agent_terminate_controller(
+                    (**tree).clone(),
+                    Arc::clone(&cap_grant.store),
+                    Arc::clone(&client_ingress_store),
+                    Arc::clone(&run_manager),
+                    workspace.to_path_buf(),
+                    resolver,
+                    loop_cascade,
+                );
+                Some(Arc::new(crate::client_api_agents::AgentAdminAdapter::new(
+                    (**tree).clone(),
+                    Arc::clone(spawner),
+                    Arc::new(terminator),
+                    Arc::new(BuiltinTemplateRegistry::new()),
+                    AgentId(DEFAULT_AGENT_ID.to_string()),
+                )))
+            }
+            _ => None,
+        };
+
     // Final production visibility step: bind only after every fallible runtime
     // capability has composed. An unavailable loopback socket degrades the
     // optional public surface without exposing an unbound/raw fallback.
     // CONTRACT-243: bind whenever EventBus is up, even if C218/projector/carriers
     // are None (fs+llm Landing homes and `advance init` without lifecycle).
+    let agent_admin_for_api = agent_admin.clone();
     let client_api_server = match observability_read_api.as_ref() {
         Some(read) => {
             let history_events = match (
@@ -2463,6 +2581,9 @@ async fn wire_capabilities_inner(
                     replies: Some(replies_for_api.clone()),
                     tools: None,
                     llm_delta_hub: llm_delta_hub_opt.clone(),
+                    agents: agent_admin_for_api
+                        .clone()
+                        .map(|a| a as Arc<dyn advance_client_api::AgentAdminProvider>),
                     ..Default::default()
                 };
                 if let Some((history, events, projector)) = history_events {
@@ -2550,6 +2671,9 @@ async fn wire_capabilities_inner(
             channel_runtime,
             progress_lifecycle,
             agent_tree_snapshot,
+            agent_tree: agent_tree.clone(),
+            agent_spawner: agent_spawner.clone(),
+            agent_admin,
             decomposition_store,
             memory_root,
             skills_root,

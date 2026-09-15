@@ -162,6 +162,47 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
             "LlmDeltaStreamRequest".to_string(),
             schema_value::<crate::deltas::LlmDeltaStreamRequest>(),
         );
+        // Agents family (CONTRACT-190 agent CRUD) DTOs (additive).
+        m.insert(
+            "ClientAgentSummary".to_string(),
+            schema_value::<crate::agents::ClientAgentSummary>(),
+        );
+        m.insert(
+            "ClientAgentCapability".to_string(),
+            schema_value::<crate::agents::ClientAgentCapability>(),
+        );
+        m.insert(
+            "ClientAgentDeclaredChild".to_string(),
+            schema_value::<crate::agents::ClientAgentDeclaredChild>(),
+        );
+        m.insert(
+            "ClientAgentConfig".to_string(),
+            schema_value::<crate::agents::ClientAgentConfig>(),
+        );
+        m.insert(
+            "ClientAgentDetail".to_string(),
+            schema_value::<crate::agents::ClientAgentDetail>(),
+        );
+        m.insert(
+            "ClientAgentDeleteResult".to_string(),
+            schema_value::<crate::agents::ClientAgentDeleteResult>(),
+        );
+        m.insert(
+            "ClientAgentTemplate".to_string(),
+            schema_value::<crate::agents::ClientAgentTemplate>(),
+        );
+        m.insert(
+            "ClientCreateAgentRequest".to_string(),
+            schema_value::<crate::agents::ClientCreateAgentRequest>(),
+        );
+        m.insert(
+            "ClientUpdateAgentRequest".to_string(),
+            schema_value::<crate::agents::ClientUpdateAgentRequest>(),
+        );
+        m.insert(
+            "ClientDeleteAgentRequest".to_string(),
+            schema_value::<crate::agents::ClientDeleteAgentRequest>(),
+        );
         // MODULE-023 GenUI DTOs (CONTRACT-220/221).
         m.insert(
             "GenUiDocument".to_string(),
@@ -384,6 +425,21 @@ pub fn conformance_vectors() -> Value {
                     "request_id": "req_example_unavailable",
                     "data": null,
                     "error": { "code": "module_unavailable", "message": "run provider not wired" },
+                    "warnings": []
+                }
+            },
+            {
+                // agents-family request validation (`already_exists` is declared in the error-code
+                // surface but carried by no shared vector: the AC-12 suite requires every vector
+                // code to be produced by the real in-process core, and `already_exists` needs the
+                // tree-backed provider that lives in the cli composition root).
+                "name": "error_invalid_request",
+                "kind": "error",
+                "envelope": {
+                    "api_version": API_VERSION,
+                    "request_id": "req_example_invalid_request",
+                    "data": null,
+                    "error": { "code": "invalid_request", "message": "invalid request" },
                     "warnings": []
                 }
             },

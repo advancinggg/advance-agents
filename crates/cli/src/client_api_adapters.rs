@@ -8,11 +8,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::SystemTime;
 
 use advance_client_api::{
-    BoundGrantApprovalPort, BoundHistoryPage, BoundHistoryReadPort, ClientAgentTreeNode, ClientApi,
-    ClientCursorCodec, ClientEventProvider, ClientMcpEntry, ClientMessageAck, ClientMessageStatus,
-    ClientRunMutation, ClientRunSummary, ClientSkillEntry, ClientToolEntry, ClientToolInventory,
-    LlmDeltaHub, MessagingProvider, NormalizedEventFilter, ProviderError, RawEventRow,
-    RunControlProvider, ToolsProvider,
+    AgentAdminProvider, BoundGrantApprovalPort, BoundHistoryPage, BoundHistoryReadPort,
+    ClientAgentTreeNode, ClientApi, ClientCursorCodec, ClientEventProvider, ClientMcpEntry,
+    ClientMessageAck, ClientMessageStatus, ClientRunMutation, ClientRunSummary, ClientSkillEntry,
+    ClientToolEntry, ClientToolInventory, LlmDeltaHub, MessagingProvider, NormalizedEventFilter,
+    ProviderError, RawEventRow, RunControlProvider, ToolsProvider,
 };
 use advance_event_bus::{EventFilter, ObservabilityReadApi, ReadApiError, ReadCursor, ReadEvent};
 use advance_messaging::{MailboxStore, Message, MessageKind, MsgError};
@@ -530,6 +530,8 @@ pub struct FirstPartyClientCompose {
     pub grants: Option<Arc<dyn BoundGrantApprovalPort>>,
     pub tools: Option<Arc<dyn ToolsProvider>>,
     pub llm_delta_hub: Option<Arc<LlmDeltaHub>>,
+    /// CONTRACT-190 agents family (agent CRUD + template listing) over the shared agent tree.
+    pub agents: Option<Arc<dyn AgentAdminProvider>>,
 }
 
 pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCompose) -> ClientApi {
@@ -562,6 +564,9 @@ pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCom
     }
     if let Some(hub) = parts.llm_delta_hub {
         api = api.with_llm_delta_hub(hub);
+    }
+    if let Some(agents) = parts.agents {
+        api = api.with_agent_provider(agents);
     }
     api
 }

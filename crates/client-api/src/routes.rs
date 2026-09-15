@@ -57,6 +57,11 @@ pub const PATH_EVENTS_STREAM: &str = "/client/events/stream";
 pub const PATH_GRANTS_PENDING: &str = "/client/grants/pending";
 /// Tee T2 (CONTRACT-235) LLM token-delta WebSocket subscription route.
 pub const PATH_LLM_DELTAS_STREAM: &str = "/client/llm/deltas/stream";
+/// Agents family (CONTRACT-190): list (GET) / create (POST).
+pub const PATH_AGENTS: &str = "/client/agents";
+/// Agents family: the templates a create may reference (GET). Its own family so an agent literally
+/// named `templates` can never shadow it.
+pub const PATH_AGENT_TEMPLATES: &str = "/client/agent-templates";
 /// Templated provider-family route patterns (see [`RoutePattern`]).
 pub const TPL_RUN_PAUSE: &str = "/client/runs/{run_id}:pause";
 pub const TPL_RUN_RESUME: &str = "/client/runs/{run_id}:resume";
@@ -69,6 +74,10 @@ pub const TPL_GRANT_REVOKE: &str = "/client/grants/{grant_id}:revoke";
 pub const TPL_PRESET_APPLY: &str = "/client/presets/{preset}:apply";
 pub const TPL_TASK_HISTORY: &str = "/client/tasks/{task_id}/history";
 pub const TPL_RUN_HISTORY: &str = "/client/runs/{run_id}/history";
+/// Agents family templated routes: read one agent, update it, delete it.
+pub const TPL_AGENT_GET: &str = "/client/agents/{agent_id}";
+pub const TPL_AGENT_UPDATE: &str = "/client/agents/{agent_id}:update";
+pub const TPL_AGENT_DELETE: &str = "/client/agents/{agent_id}:delete";
 /// One segment of a templated route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Seg {

@@ -200,9 +200,13 @@ fn t01f_deterministic_error_codes() {
     );
     assert_eq!(ClientErrorCode::InvalidState.as_str(), "invalid_state");
     assert_eq!(ClientErrorCode::Forbidden.as_str(), "forbidden");
+    // agents-family additive codes.
+    assert_eq!(ClientErrorCode::AlreadyExists.as_str(), "already_exists");
+    assert_eq!(ClientErrorCode::InvalidRequest.as_str(), "invalid_request");
     // The known (server-producible) code set is a fixed compatibility surface: 17 foundation codes
-    // (including conflict and durable-capacity rejection) + 4 provider-family codes = 21.
-    assert_eq!(ClientErrorCode::known_codes().len(), 21);
+    // (including conflict and durable-capacity rejection) + 4 provider-family codes + 2 agents-
+    // family codes = 23.
+    assert_eq!(ClientErrorCode::known_codes().len(), 23);
 }
 
 #[test]
