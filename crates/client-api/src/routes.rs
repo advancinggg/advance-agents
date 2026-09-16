@@ -90,6 +90,16 @@ pub const TPL_PACK_UNINSTALL: &str = "/client/packs/{pack_id}:uninstall";
 /// Costs family templated routes: one agent's / one provider's report.
 pub const TPL_COSTS_AGENT_GET: &str = "/client/costs/agents/{agent_id}";
 pub const TPL_COSTS_PROVIDER_GET: &str = "/client/costs/providers/{provider_id}";
+/// Providers family (lane providers-family): list (GET) / create (POST).
+pub const PATH_PROVIDERS: &str = "/client/providers";
+/// Providers family templated routes: one entry, update, delete, key set/clear, preflight, select.
+pub const TPL_PROVIDER_GET: &str = "/client/providers/{provider_id}";
+pub const TPL_PROVIDER_UPDATE: &str = "/client/providers/{provider_id}:update";
+pub const TPL_PROVIDER_DELETE: &str = "/client/providers/{provider_id}:delete";
+pub const TPL_PROVIDER_SET_KEY: &str = "/client/providers/{provider_id}:set-key";
+pub const TPL_PROVIDER_CLEAR_KEY: &str = "/client/providers/{provider_id}:clear-key";
+pub const TPL_PROVIDER_PREFLIGHT: &str = "/client/providers/{provider_id}:preflight";
+pub const TPL_PROVIDER_SELECT: &str = "/client/providers/{provider_id}:select";
 /// One segment of a templated route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Seg {

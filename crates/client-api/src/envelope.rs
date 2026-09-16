@@ -215,6 +215,15 @@ impl ClientErrorCode {
 /// switch on ONE code.
 pub const WARNING_RESTART_REQUIRED: &str = "restart_required";
 
+/// Warning code attached when `runtime-config.yaml` was rewritten but the daemon's config
+/// watcher did not report the applied reload within the handler's wait (the change applies at
+/// the next watcher tick; the write itself succeeded).
+pub const WARNING_RELOAD_PENDING: &str = "reload_pending";
+
+/// Warning code attached when a provider key was stored without a preflight (the entry is not
+/// `cloud-http`, so there is no generate path to verify it against).
+pub const WARNING_PREFLIGHT_SKIPPED: &str = "preflight_skipped";
+
 /// A non-fatal, client-safe advisory attached to any envelope (e.g. an idempotent-replay note).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientWarning {

@@ -84,6 +84,15 @@ pub const RESPONSE_COMPONENTS: &[&str] = &[
     "ClientPackInstallResult",
     "ClientPackUninstallResult",
     "ClientAgentLlm",
+    "ClientProviderCost",
+    "ClientProviderRateLimit",
+    "ClientProviderRetry",
+    "ClientProviderKey",
+    "ClientProviderPreflightResult",
+    "ClientProviderSummary",
+    "ClientProviderList",
+    "ClientProviderKeyResult",
+    "ClientProviderDeleteResult",
 ];
 
 /// Request / filter bodies — not a response-field bag.
@@ -103,6 +112,10 @@ pub const EXCLUDED_COMPONENTS: &[&str] = &[
     "ClientDeleteAgentRequest",
     "ClientCostQuery",
     "ClientPackInstallRequest",
+    "ClientProviderSidecar",
+    "ClientCreateProviderRequest",
+    "ClientUpdateProviderRequest",
+    "ClientSetProviderKeyRequest",
 ];
 
 /// Git path of the on-disk honesty baseline, relative to the repo root.

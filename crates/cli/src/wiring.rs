@@ -690,6 +690,12 @@ pub struct WiringHandles {
     pub agent_tree: Option<Arc<AgentTreeStore>>,
     pub agent_spawner: Option<Arc<dyn Spawner>>,
     pub agent_admin: Option<Arc<crate::client_api_agents::AgentAdminAdapter>>,
+    /// Providers family (lane providers-family): the daemon's LIVE `SecretStore` — the ONE
+    /// instance the LLM egress chain resolves keys from (`Some` iff `llm` / `secrets` is
+    /// declared) — and the composed `WiredProviderAdmin` the Client API serves (always
+    /// composed; it falls back to opening the file when no live store exists).
+    pub secret_store: Option<Arc<SecretStore>>,
+    pub provider_admin: Option<Arc<crate::client_api_providers::WiredProviderAdmin>>,
     /// Wave-12 Lane C: the `DefaultDecompositionStore` (wrapping the SAME shared
     /// `AgentTreeStore`) the decomposition host-fns record into. `start.rs` wraps it
     /// in a `CapDecompositionReader` (with the agent's bare/colon alias set) and
@@ -2741,6 +2747,20 @@ async fn wire_capabilities_inner(
     // CONTRACT-243: bind whenever EventBus is up, even if C218/projector/carriers
     // are None (fs+llm Landing homes and `advance init` without lifecycle).
     let agent_admin_for_api = agent_admin.clone();
+    // Providers family (CONTRACT-190 LLM provider administration): the shared `llm-providers`
+    // writer over THIS workspace, the daemon's live secret store, the config watcher (so a
+    // write waits for its own applied reload) and the Landing first-open preflight port.
+    // Agent references (`llm.provider` pins) are checked through `NoReferences` until the
+    // agent-llm-policy lane's tree walk is wired.
+    let provider_admin: Arc<crate::client_api_providers::WiredProviderAdmin> =
+        Arc::new(crate::client_api_providers::WiredProviderAdmin::new(
+            workspace.to_path_buf(),
+            host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
+            secret_store.clone(),
+            Arc::new(advance_home::GeneratePathPreflight::default()),
+            Arc::new(crate::client_api_providers::NoReferences),
+        ));
+    let provider_admin_for_api = provider_admin.clone();
     let client_api_server = match observability_read_api.as_ref() {
         Some(read) => {
             let history_events = match (
@@ -2809,6 +2829,8 @@ async fn wire_capabilities_inner(
                         Arc::clone(&cost_ledger_for_api),
                     ))),
                     packs: Some(pack_admin_for_api.clone()),
+                    providers: Some(provider_admin_for_api.clone()
+                        as Arc<dyn advance_client_api::ProviderAdminProvider>),
                     ..Default::default()
                 };
                 if let Some((history, events, projector)) = history_events {
@@ -2899,6 +2921,8 @@ async fn wire_capabilities_inner(
             agent_tree: agent_tree.clone(),
             agent_spawner: agent_spawner.clone(),
             agent_admin,
+            secret_store: secret_store.clone(),
+            provider_admin: Some(provider_admin),
             decomposition_store,
             memory_root,
             skills_root,

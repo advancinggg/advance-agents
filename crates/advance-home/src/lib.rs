@@ -30,6 +30,10 @@ pub use discovery::{write_client_api_discovery, ClientApiDiscovery};
 pub use display_name::TopLevelDisplayName;
 pub use impls::HostWorkspaceHome;
 pub use ports::{AdoptPort, GeneratePathPreflight, PreflightPort, RuntimeLauncher};
+pub use provider::{
+    list_provider_entries, open_home_secret_store, remove_provider_entry, select_provider,
+    upsert_provider_entry, ProviderWriteError, UpsertMode,
+};
 pub use runtime_state::{write_selected_provider, SelectedProvider};
 pub use scaffold::{write_recognizable_home, AGENT_CONFIG_STARTER, MINIMAL_STARTER};
 pub use secret_bytes::SecretBytes;

@@ -283,6 +283,63 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
         ] {
             m.insert(name.to_string(), schema);
         }
+        // Providers family (LLM provider administration) DTOs (additive).
+        for (name, schema) in [
+            (
+                "ClientProviderCost",
+                schema_value::<crate::provider_admin::ClientProviderCost>(),
+            ),
+            (
+                "ClientProviderRateLimit",
+                schema_value::<crate::provider_admin::ClientProviderRateLimit>(),
+            ),
+            (
+                "ClientProviderRetry",
+                schema_value::<crate::provider_admin::ClientProviderRetry>(),
+            ),
+            (
+                "ClientProviderSidecar",
+                schema_value::<crate::provider_admin::ClientProviderSidecar>(),
+            ),
+            (
+                "ClientProviderKey",
+                schema_value::<crate::provider_admin::ClientProviderKey>(),
+            ),
+            (
+                "ClientProviderPreflightResult",
+                schema_value::<crate::provider_admin::ClientProviderPreflightResult>(),
+            ),
+            (
+                "ClientProviderSummary",
+                schema_value::<crate::provider_admin::ClientProviderSummary>(),
+            ),
+            (
+                "ClientProviderList",
+                schema_value::<crate::provider_admin::ClientProviderList>(),
+            ),
+            (
+                "ClientCreateProviderRequest",
+                schema_value::<crate::provider_admin::ClientCreateProviderRequest>(),
+            ),
+            (
+                "ClientUpdateProviderRequest",
+                schema_value::<crate::provider_admin::ClientUpdateProviderRequest>(),
+            ),
+            (
+                "ClientSetProviderKeyRequest",
+                schema_value::<crate::provider_admin::ClientSetProviderKeyRequest>(),
+            ),
+            (
+                "ClientProviderKeyResult",
+                schema_value::<crate::provider_admin::ClientProviderKeyResult>(),
+            ),
+            (
+                "ClientProviderDeleteResult",
+                schema_value::<crate::provider_admin::ClientProviderDeleteResult>(),
+            ),
+        ] {
+            m.insert(name.to_string(), schema);
+        }
         // MODULE-023 GenUI DTOs (CONTRACT-220/221).
         m.insert(
             "GenUiDocument".to_string(),
@@ -552,6 +609,20 @@ pub fn conformance_vectors() -> Value {
                     "request_id": "req_example_invalid_request",
                     "data": null,
                     "error": { "code": "invalid_request", "message": "invalid request" },
+                    "warnings": []
+                }
+            },
+            {
+                // providers-family request validation (a malformed provider id / an `:update`
+                // without fields) — rejected before any provider is consulted, so the AC-12
+                // suite produces it from the bare in-process core.
+                "name": "error_invalid_provider_request",
+                "kind": "error",
+                "envelope": {
+                    "api_version": API_VERSION,
+                    "request_id": "req_example_invalid_provider",
+                    "data": null,
+                    "error": { "code": "invalid_request", "message": "invalid provider id" },
                     "warnings": []
                 }
             },

@@ -12,8 +12,8 @@ use advance_client_api::{
     ClientAgentTreeNode, ClientApi, ClientCursorCodec, ClientEventProvider, ClientMcpEntry,
     ClientMessageAck, ClientMessageStatus, ClientRunMutation, ClientRunSummary, ClientSkillEntry,
     ClientToolEntry, ClientToolInventory, CostProvider, LlmDeltaHub, MessagingProvider,
-    NormalizedEventFilter, PackAdminProvider, ProviderError, RawEventRow, RunControlProvider,
-    ToolsProvider,
+    NormalizedEventFilter, PackAdminProvider, ProviderAdminProvider, ProviderError, RawEventRow,
+    RunControlProvider, ToolsProvider,
 };
 use advance_event_bus::{EventFilter, ObservabilityReadApi, ReadApiError, ReadCursor, ReadEvent};
 use advance_messaging::{MailboxStore, Message, MessageKind, MsgError};
@@ -539,6 +539,9 @@ pub struct FirstPartyClientCompose {
     /// CONTRACT-190 packs family (installed packs / install / uninstall) over the production
     /// pack registry.
     pub packs: Option<Arc<dyn PackAdminProvider>>,
+    /// CONTRACT-190 providers family (LLM provider entries + key custody) over the shared
+    /// `llm-providers` writer and the daemon's live secret store.
+    pub providers: Option<Arc<dyn ProviderAdminProvider>>,
 }
 
 pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCompose) -> ClientApi {
@@ -580,6 +583,9 @@ pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCom
     }
     if let Some(packs) = parts.packs {
         api = api.with_pack_provider(packs);
+    }
+    if let Some(providers) = parts.providers {
+        api = api.with_provider_admin(providers);
     }
     api
 }

@@ -42,6 +42,10 @@ pub mod client_api_adapters;
 pub mod client_api_agents;
 pub mod client_api_costs;
 pub mod client_api_packs;
+// CONTRACT-190 providers family (lane providers-family, 2026-09-16): the production
+// `ProviderAdminProvider` over the shared `llm-providers` writer, the daemon's live
+// `SecretStore`, the config watcher and the first-open preflight port.
+pub mod client_api_providers;
 pub mod contract218_anchor;
 pub mod contract218_bootstrap;
 pub mod contract218_keyring;

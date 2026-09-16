@@ -34,6 +34,7 @@ pub mod packs;
 pub mod pagination;
 pub mod projection;
 pub mod provider;
+pub mod provider_admin;
 pub mod providers;
 pub mod request;
 pub mod routes;
@@ -82,8 +83,15 @@ pub use packs::{
 };
 pub use pagination::{Cursor, Page};
 pub use provider::{
-    AgentAdminProvider, CostProvider, MessagingProvider, PackAdminProvider, ProviderError,
-    RunControlProvider, ToolsProvider, UNKNOWN_PROVIDER_DETAIL,
+    AgentAdminProvider, CostProvider, MessagingProvider, PackAdminProvider, ProviderAdminProvider,
+    ProviderError, RunControlProvider, ToolsProvider, UNKNOWN_PROVIDER_DETAIL,
+};
+pub use provider_admin::{
+    ClientCreateProviderRequest, ClientProviderCost, ClientProviderDeleteResult, ClientProviderKey,
+    ClientProviderKeyResult, ClientProviderList, ClientProviderPreflightResult,
+    ClientProviderRateLimit, ClientProviderRetry, ClientProviderSidecar, ClientProviderSummary,
+    ClientSetProviderKeyRequest, ClientUpdateProviderRequest, ProviderAdminOutcome,
+    ProviderAdminWarning,
 };
 pub use providers::grants::{
     BoundGrantApprovalPort, BoundGrantMutation, BoundMutationOutcome, ClientCapParam,

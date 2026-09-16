@@ -34,6 +34,11 @@ use crate::packs::{
     ClientPackDetail, ClientPackInstallRequest, ClientPackInstallResult, ClientPackSummary,
     ClientPackUninstallResult,
 };
+use crate::provider_admin::{
+    ClientCreateProviderRequest, ClientProviderDeleteResult, ClientProviderKeyResult,
+    ClientProviderPreflightResult, ClientProviderSummary, ClientUpdateProviderRequest,
+    ProviderAdminOutcome,
+};
 use crate::providers::grants::BoundGrantApprovalPort;
 use crate::providers::history::BoundHistoryReadPort;
 use crate::runs::{ClientAgentTreeNode, ClientRunMutation, ClientRunSummary};
@@ -233,6 +238,56 @@ pub trait PackAdminProvider: Send + Sync {
     ) -> Result<ClientPackUninstallResult, ProviderError>;
 }
 
+/// LLM provider administration provider (MODULE-001 `llm-providers` config + MODULE-012 key
+/// custody) behind the `providers` family (lane providers-family). The cli adapter owns the
+/// workspace's `runtime-config.yaml` writer (advance-home), the daemon's LIVE `SecretStore`
+/// (the same instance the LLM egress chain resolves keys from — a second `FileSecretStorage`
+/// would not see the write), the config watcher it waits on for the applied reload, and the
+/// first-open preflight port. Every id / request it receives has already passed handler-side
+/// validation in [`crate::provider_admin`]. Summaries never carry key material.
+///
+/// Error projection: unknown id → `NotFound`; duplicate id → `AlreadyExists`; the runtime's
+/// `load_config` rejecting the rewritten document → `InvalidRequest`; deleting the last entry
+/// or an entry an agent's `llm.provider` pins → `InvalidState`; a config / secret-store read or
+/// write failure → `Unavailable`. A FAILED preflight is not an error: `set_key` answers
+/// `stored: false` with the verdict and leaves the old key untouched.
+pub trait ProviderAdminProvider: Send + Sync {
+    /// Every entry in YAML order (index 0 is `selected`).
+    fn list_providers(&self) -> Result<Vec<ClientProviderSummary>, ProviderError>;
+    fn get_provider(&self, provider_id: &str) -> Result<ClientProviderSummary, ProviderError>;
+    /// Append a new entry (never selected unless it is the only one) — no key material.
+    fn create_provider(
+        &self,
+        request: &ClientCreateProviderRequest,
+    ) -> Result<ProviderAdminOutcome<ClientProviderSummary>, ProviderError>;
+    /// Replace the request's fields on an existing entry; untouched keys survive verbatim.
+    fn update_provider(
+        &self,
+        provider_id: &str,
+        request: &ClientUpdateProviderRequest,
+    ) -> Result<ProviderAdminOutcome<ClientProviderSummary>, ProviderError>;
+    /// Remove an entry (refused for the last one / a referenced one). Stored keys are kept.
+    fn delete_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<ProviderAdminOutcome<ClientProviderDeleteResult>, ProviderError>;
+    /// Preflight (cloud-http) then store the key under the entry's `api-key-secret` name.
+    fn set_key(
+        &self,
+        provider_id: &str,
+        key: &str,
+    ) -> Result<ProviderAdminOutcome<ClientProviderKeyResult>, ProviderError>;
+    /// Drop the stored key (no-op when absent).
+    fn clear_key(&self, provider_id: &str) -> Result<ClientProviderSummary, ProviderError>;
+    /// Re-check the stored key against the provider's generate path.
+    fn preflight(&self, provider_id: &str) -> Result<ClientProviderPreflightResult, ProviderError>;
+    /// Move the entry to index 0 (the runtime's default provider).
+    fn select_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<ProviderAdminOutcome<ClientProviderSummary>, ProviderError>;
+}
+
 /// An interior-mutable provider slot: `None` until the composition root injects a concrete adapter.
 pub type ProviderSlot<T> = Arc<RwLock<Option<Arc<T>>>>;
 pub type RunProviderSlot = ProviderSlot<dyn RunControlProvider>;
@@ -241,6 +296,7 @@ pub type ToolsProviderSlot = ProviderSlot<dyn ToolsProvider>;
 pub type AgentProviderSlot = ProviderSlot<dyn AgentAdminProvider>;
 pub type CostProviderSlot = ProviderSlot<dyn CostProvider>;
 pub type PackProviderSlot = ProviderSlot<dyn PackAdminProvider>;
+pub type ProviderAdminSlot = ProviderSlot<dyn ProviderAdminProvider>;
 /// m020-s3: event provider / leak detector / cursor codec slots.
 pub type EventProviderSlot = ProviderSlot<dyn ClientEventProvider>;
 pub type LeakDetectorSlot = ProviderSlot<dyn LeakDetector>;

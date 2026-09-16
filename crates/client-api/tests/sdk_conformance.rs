@@ -523,6 +523,28 @@ fn exercise_error_semantics() -> Vec<(&'static str, String)> {
         ),
     ));
 
+    // invalid_request — providers-family request validation rejects a malformed provider id
+    // before any provider is consulted (the family's shared vector). The family rides
+    // `ApproveGrants` for mutations, so a session carrying that scope is minted here.
+    mint(
+        &fx.api,
+        "tok-admin",
+        vec![Scope::ApproveGrants],
+        None,
+        u64::MAX,
+    );
+    observed.push((
+        "validation_invalid_provider_request",
+        fx.api.handle(
+            ClientRequest::post(
+                "/client/providers/bad%20id:update",
+                json!({ "endpoint": "https://proxy.example" }),
+            )
+            .with_session("tok-admin")
+            .with_idempotency_key("k-provider-invalid"),
+        ),
+    ));
+
     // module_unavailable — provider slot absent fails closed (separate bare core).
     let bare = ClientApi::new(ClientApiConfig::default());
     mint(
@@ -569,6 +591,7 @@ fn ac12_error_semantics_exercised_against_every_surface() {
         ("validation_invalid_transition", "invalid_state"),
         ("validation_bad_history_request", "projection_rejected"),
         ("validation_invalid_agent_request", "invalid_request"),
+        ("validation_invalid_provider_request", "invalid_request"),
         ("idempotency_conflict", "idempotency_conflict"),
         ("provider_not_found", "not_found"),
         ("module_unavailable", "module_unavailable"),
