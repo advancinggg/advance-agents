@@ -209,6 +209,12 @@ impl ClientErrorCode {
     }
 }
 
+/// Warning code attached when a write only takes effect at the next daemon start (a config
+/// document / persisted capability list of the agents family, a sidecar-backed local provider
+/// entry of the providers family, a secrets-mode change). Shared across families so clients
+/// switch on ONE code.
+pub const WARNING_RESTART_REQUIRED: &str = "restart_required";
+
 /// A non-fatal, client-safe advisory attached to any envelope (e.g. an idempotent-replay note).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientWarning {

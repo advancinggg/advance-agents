@@ -137,32 +137,6 @@ impl FileSecretStorage {
         })
     }
 
-    /// Names of all stored secrets, sorted. Backs `advance secrets list`.
-    /// Returns names only — never any (even encrypted) value bytes.
-    pub fn names(&self) -> Vec<String> {
-        let guard = self.cache.read().unwrap_or_else(|e| e.into_inner());
-        let mut names: Vec<String> = guard.keys().cloned().collect();
-        names.sort();
-        names
-    }
-
-    /// Remove a secret by name, rewriting the file. Returns `Ok(true)` if it
-    /// existed, `Ok(false)` if there was nothing to remove (no file write in
-    /// that case). Backs `advance secrets remove`.
-    pub fn remove(&self, name: &str) -> Result<bool, StorageError> {
-        let mut guard = self.cache.write().unwrap_or_else(|e| e.into_inner());
-        let Some(old) = guard.remove(name) else {
-            return Ok(false);
-        };
-        match persist(&self.path, &guard) {
-            Ok(()) => Ok(true),
-            Err(e) => {
-                // Roll back the in-memory state so cache and disk stay consistent.
-                guard.insert(name.to_string(), old);
-                Err(e)
-            }
-        }
-    }
 }
 
 impl SecretStorage for FileSecretStorage {
@@ -195,6 +169,33 @@ impl SecretStorage for FileSecretStorage {
     fn exists(&self, name: &str) -> Result<bool, StorageError> {
         let guard = self.cache.read().unwrap_or_else(|e| e.into_inner());
         Ok(guard.contains_key(name))
+    }
+
+    /// Remove a secret by name, rewriting the file. Returns `Ok(true)` if it
+    /// existed, `Ok(false)` if there was nothing to remove (no file write in
+    /// that case). Backs `advance secrets remove`.
+    fn remove(&self, name: &str) -> Result<bool, StorageError> {
+        let mut guard = self.cache.write().unwrap_or_else(|e| e.into_inner());
+        let Some(old) = guard.remove(name) else {
+            return Ok(false);
+        };
+        match persist(&self.path, &guard) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                // Roll back the in-memory state so cache and disk stay consistent.
+                guard.insert(name.to_string(), old);
+                Err(e)
+            }
+        }
+    }
+
+    /// Names of all stored secrets, sorted. Backs `advance secrets list`.
+    /// Returns names only — never any (even encrypted) value bytes.
+    fn names(&self) -> Vec<String> {
+        let guard = self.cache.read().unwrap_or_else(|e| e.into_inner());
+        let mut names: Vec<String> = guard.keys().cloned().collect();
+        names.sort();
+        names
     }
 }
 

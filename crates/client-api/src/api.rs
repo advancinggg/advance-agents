@@ -50,6 +50,12 @@ pub struct HandlerCtx {
     pub path_params: Vec<(String, String)>,
     /// Present only after the mutation idempotency reservation succeeds.
     pub mutation: Option<ClientMutationContext>,
+    /// Whether the underlying connection peer is loopback (copied from
+    /// [`ClientRequest::is_loopback_peer`](crate::request::ClientRequest::is_loopback_peer)).
+    /// Handlers that accept key material (the providers family `:set-key`) refuse a
+    /// non-loopback cleartext peer with `forbidden`. A product relay transport that
+    /// terminates an authenticated Noise session presents its requests as loopback.
+    pub is_loopback_peer: bool,
 }
 
 /// Stable provider correlation for one admitted mutating request.
@@ -919,6 +925,7 @@ impl ClientApi {
             body: req.body.clone(),
             path_params,
             mutation: None,
+            is_loopback_peer: req.is_loopback_peer,
         };
 
         // 8. Mutation gating (idempotency + CSRF + reserve-before-execute).

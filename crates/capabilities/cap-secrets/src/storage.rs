@@ -56,6 +56,15 @@ pub trait SecretStorage: Send + Sync + 'static {
     fn put(&self, name: &str, stored: StoredSecret) -> Result<(), StorageError>;
     fn get(&self, name: &str) -> Result<Option<StoredSecret>, StorageError>;
     fn exists(&self, name: &str) -> Result<bool, StorageError>;
+    /// Remove a stored secret by name. `Ok(true)` when it existed, `Ok(false)` when there
+    /// was nothing to remove. Backs `advance secrets remove` and the provider `:clear-key`
+    /// route (lane providers-family, 2026-09-16 — lifted from a `FileSecretStorage`
+    /// inherent method so every backend, including the keychain-sync one, serves it
+    /// through the trait object the daemon holds).
+    fn remove(&self, name: &str) -> Result<bool, StorageError>;
+    /// Names of every stored secret, sorted. Names only — never any (even encrypted)
+    /// value bytes.
+    fn names(&self) -> Vec<String>;
 }
 
 #[derive(Default)]
@@ -84,6 +93,18 @@ impl SecretStorage for InMemorySecretStorage {
     fn exists(&self, name: &str) -> Result<bool, StorageError> {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         Ok(guard.contains_key(name))
+    }
+
+    fn remove(&self, name: &str) -> Result<bool, StorageError> {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        Ok(guard.remove(name).is_some())
+    }
+
+    fn names(&self) -> Vec<String> {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        let mut names: Vec<String> = guard.keys().cloned().collect();
+        names.sort();
+        names
     }
 }
 

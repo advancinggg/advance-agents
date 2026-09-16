@@ -52,7 +52,8 @@ pub const MAX_TEMPLATE_REF_BYTES: usize = 128;
 /// Bound on the capability list a create may request (matches the tree's per-node cap).
 pub const MAX_REQUESTED_CAPABILITIES: usize = 64;
 /// Warning code attached when a config document was written (applies at the next daemon start).
-pub const WARNING_RESTART_REQUIRED: &str = "restart_required";
+/// Shared with the other administrative families — the constant lives in [`crate::envelope`].
+pub use crate::envelope::WARNING_RESTART_REQUIRED;
 
 const RESTART_REQUIRED_MESSAGE: &str =
     "capability changes (config document or persisted capability list) apply at the next daemon start";

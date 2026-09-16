@@ -132,6 +132,17 @@ impl SecretStore {
     pub fn exists(&self, name: &str) -> Result<bool, SecretError> {
         Ok(self.storage.exists(name)?)
     }
+
+    /// Remove a stored secret (`Ok(true)` when it existed). No key material is
+    /// touched — the backend drops the ciphertext row.
+    pub fn remove(&self, name: &str) -> Result<bool, SecretError> {
+        Ok(self.storage.remove(name)?)
+    }
+
+    /// Sorted names of every stored secret (never values).
+    pub fn names(&self) -> Vec<String> {
+        self.storage.names()
+    }
 }
 
 fn derive_key(
