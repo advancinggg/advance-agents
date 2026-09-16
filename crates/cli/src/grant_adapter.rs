@@ -4,8 +4,6 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(feature = "test-support")]
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use advance_client_api::{
@@ -53,8 +51,15 @@ const HEADER_LEN: usize = 105;
 const PROVIDER_TAG: u8 = 1;
 const MAX_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
 
+// Test-only byte counter for `read_journal_capped`. Thread-local, NOT a process-global
+// atomic: `with_recovery` reads the journal synchronously on the calling thread, and the
+// cli test binaries run their `#[tokio::test]`s in parallel, so a global counter picks up
+// every other test's seeded-journal reads (CI flake: 8388609 expected, +492 from a
+// sibling test's header read). A thread-local counts exactly the caller's own reads.
 #[cfg(feature = "test-support")]
-static JOURNAL_BYTES_READ: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static JOURNAL_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -330,12 +335,12 @@ impl Contract219GrantAdapter {
 
     #[cfg(feature = "test-support")]
     pub fn test_reset_journal_bytes_read() {
-        JOURNAL_BYTES_READ.store(0, Ordering::SeqCst);
+        JOURNAL_BYTES_READ.with(|c| c.set(0));
     }
 
     #[cfg(feature = "test-support")]
     pub fn test_journal_bytes_read() -> u64 {
-        JOURNAL_BYTES_READ.load(Ordering::SeqCst)
+        JOURNAL_BYTES_READ.with(|c| c.get())
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, JournalState> {
@@ -1378,7 +1383,7 @@ impl<R: Read> Read for CountingRead<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         #[cfg(feature = "test-support")]
-        JOURNAL_BYTES_READ.fetch_add(n as u64, Ordering::SeqCst);
+        JOURNAL_BYTES_READ.with(|c| c.set(c.get().saturating_add(n as u64)));
         Ok(n)
     }
 }
