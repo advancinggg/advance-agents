@@ -568,6 +568,80 @@ fn validate_accepts_http_localhost() {
     assert_eq!(cfg.llm_providers[0].endpoint, "http://localhost:8080");
 }
 
+fn provider_yaml_with(extra: &str) -> String {
+    minimal_yaml().trim_end_matches('\n').replace(
+        "llm-providers: []",
+        &format!(
+            "llm-providers:\n\
+             - id: anthropic\n  \
+               endpoint: https://api.anthropic.com\n  \
+               api-key-secret: anthropic-key\n  \
+               model-aliases:\n    \
+                 m: claude-sonnet-4-5\n  \
+               cost-per-mtoken-in: 3.0\n  \
+               cost-per-mtoken-out: 15.0\n{extra}  \
+               rate-limit:\n    \
+                 requests-per-minute: 100\n    \
+                 tokens-per-minute: 10000"
+        ),
+    )
+}
+
+/// Cache billing — the optional cache-read / cache-write rates parse and are
+/// `None` when omitted (the resolver then applies the conservative defaults).
+#[test]
+fn llm_provider_cache_rates_parse_and_default_to_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("runtime-config.yaml");
+    write_config(&config_path, &provider_yaml_with(""));
+    let cfg = load_config(&config_path).unwrap();
+    assert_eq!(cfg.llm_providers[0].cost_per_mtoken_cache_read, None);
+    assert_eq!(cfg.llm_providers[0].cost_per_mtoken_cache_write, None);
+
+    write_config(
+        &config_path,
+        &provider_yaml_with(
+            "  cost-per-mtoken-cache-read: 0.3\n  cost-per-mtoken-cache-write: 3.75\n",
+        ),
+    );
+    let cfg = load_config(&config_path).unwrap();
+    assert_eq!(cfg.llm_providers[0].cost_per_mtoken_cache_read, Some(0.3));
+    assert_eq!(cfg.llm_providers[0].cost_per_mtoken_cache_write, Some(3.75));
+}
+
+/// Cache billing — a negative cache rate would turn cache hits into a budget
+/// CREDIT; it must be rejected (0 is allowed: a free-cache-hit model).
+#[test]
+fn llm_provider_cache_rates_reject_negative() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("runtime-config.yaml");
+    write_config(
+        &config_path,
+        &provider_yaml_with("  cost-per-mtoken-cache-read: -0.1\n"),
+    );
+    let err = load_config(&config_path).expect_err("negative cache-read rate must reject");
+    assert!(
+        err.to_string().contains("cost-per-mtoken-cache-read"),
+        "error: {err}"
+    );
+
+    write_config(
+        &config_path,
+        &provider_yaml_with("  cost-per-mtoken-cache-write: -1\n"),
+    );
+    let err = load_config(&config_path).expect_err("negative cache-write rate must reject");
+    assert!(
+        err.to_string().contains("cost-per-mtoken-cache-write"),
+        "error: {err}"
+    );
+
+    write_config(
+        &config_path,
+        &provider_yaml_with("  cost-per-mtoken-cache-read: 0\n"),
+    );
+    load_config(&config_path).expect("zero cache-read rate is allowed");
+}
+
 #[test]
 fn validate_rejects_missing_rate_limit() {
     // The canonical YAML has OpenAI provider without rate-limit. Under the new

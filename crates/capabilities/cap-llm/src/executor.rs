@@ -38,8 +38,13 @@ use crate::retry::{backoff_ms, classify_retryable, RetryConfig};
 pub(crate) struct ExecutionOutcome {
     pub text: String,
     pub model: String,
+    /// TOTAL input tokens, cached share INCLUDED (see `cost.rs` module docs).
+    /// Anthropic adapters sum `input_tokens + cache_creation + cache_read`
+    /// because the upstream `input_tokens` is only the uncached remainder.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cached share of `input_tokens`, split by kind for pricing.
+    pub cache: crate::cost::CacheUsage,
     pub finish_reason: String,
 }
 
@@ -199,6 +204,7 @@ mod tests {
             model: "test-model".into(),
             input_tokens: 1,
             output_tokens: 1,
+            cache: Default::default(),
             finish_reason: "stop".into(),
         }
     }
@@ -213,6 +219,8 @@ mod tests {
             model_aliases: aliases,
             cost_per_mtoken_in: 1.0,
             cost_per_mtoken_out: 5.0,
+            cost_per_mtoken_cache_read: None,
+            cost_per_mtoken_cache_write: None,
             rate_limit: None,
             retry_default: None,
             backend: None,

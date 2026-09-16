@@ -50,10 +50,16 @@ pub struct SseFrame {
 /// last-write-wins folding — Anthropic's `message_delta.output_tokens` is a
 /// cumulative snapshot (never an increment), and OpenAI Chat / Responses
 /// report totals exactly once on the terminal frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SseUsage {
+    /// TOTAL input (cached share included) — adapters normalize at parse time
+    /// (Anthropic sums remainder + cache_creation + cache_read).
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Cache-read subset of `input_tokens`, when the frame reports it.
+    pub cache_read_tokens: Option<u64>,
+    /// Cache-write subset of `input_tokens`, when the frame reports it.
+    pub cache_write_tokens: Option<u64>,
 }
 
 /// Normalized per-frame parse result (MODULE-009 §2.3 `SseEvent`).
@@ -95,6 +101,8 @@ impl SseEvent {
 pub struct SseUsageFold {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
 }
 
 impl SseUsageFold {
@@ -106,6 +114,20 @@ impl SseUsageFold {
             if let Some(output) = usage.output_tokens {
                 self.output_tokens = Some(output);
             }
+            if let Some(read) = usage.cache_read_tokens {
+                self.cache_read_tokens = Some(read);
+            }
+            if let Some(write) = usage.cache_write_tokens {
+                self.cache_write_tokens = Some(write);
+            }
+        }
+    }
+
+    /// Folded cached share as a [`CacheUsage`] (absent counters → 0).
+    pub fn cache(&self) -> crate::cost::CacheUsage {
+        crate::cost::CacheUsage {
+            read_tokens: self.cache_read_tokens.unwrap_or(0),
+            write_tokens: self.cache_write_tokens.unwrap_or(0),
         }
     }
 
@@ -334,6 +356,8 @@ mod tests {
                 usage: Some(SseUsage {
                     input_tokens: None,
                     output_tokens: Some(cumulative),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
                 }),
                 ..SseEvent::IGNORE
             });
@@ -345,6 +369,8 @@ mod tests {
             usage: Some(SseUsage {
                 input_tokens: Some(7),
                 output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
             }),
             ..SseEvent::IGNORE
         });
@@ -352,6 +378,8 @@ mod tests {
             usage: Some(SseUsage {
                 input_tokens: None,
                 output_tokens: Some(3),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
             }),
             ..SseEvent::IGNORE
         });
@@ -382,6 +410,8 @@ mod tests {
             usage: Some(SseUsage {
                 input_tokens: None,
                 output_tokens: Some(5),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
             }),
             ..SseEvent::IGNORE
         });

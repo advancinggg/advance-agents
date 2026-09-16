@@ -159,6 +159,7 @@ mod cred_tests {
             model: "m".into(),
             cost_per_mtoken_in: 0.0,
             cost_per_mtoken_out: 0.0,
+            cache_cost: Default::default(),
             backend,
             auth_scheme: auth,
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,

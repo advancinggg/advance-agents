@@ -570,6 +570,9 @@ struct SettlementInner {
     /// Provider usage folded LWW by the owner (None until a usage frame arrives).
     folded_input: Option<u64>,
     folded_output: Option<u64>,
+    /// Cached share of the folded input (LWW with a monotonic floor, like the
+    /// two counters above). Priced at the cache tiers in `finalize`.
+    folded_cache: crate::cost::CacheUsage,
     /// `decoded_output_bytes` as of the last time the provider reported OUTPUT usage.
     /// Bytes decoded after that point are not covered by the reported figure, and
     /// billing adds them back — see `finalize`. Adversarial round 16 found that
@@ -579,6 +582,7 @@ struct SettlementInner {
     model: String,
     cost_per_mtoken_in: f64,
     cost_per_mtoken_out: f64,
+    cache_cost: crate::catalog::CacheCost,
     /// The bill actually submitted (set by the winner; read by tests/snapshot).
     submitted: Option<(u64, u64, f64)>,
     /// Whether `RunBudget::commit` was really called for this stream. `submitted` is
@@ -601,6 +605,7 @@ impl Settlement {
         model: String,
         cost_per_mtoken_in: f64,
         cost_per_mtoken_out: f64,
+        cache_cost: crate::catalog::CacheCost,
         budget: Option<Arc<dyn RunBudget>>,
         emitter: Option<Arc<dyn advance_shared_types::traits::EventBusEmit + Send + Sync>>,
         agent_id: String,
@@ -615,9 +620,11 @@ impl Settlement {
                 decoded_at_last_output_usage: 0,
                 folded_input: None,
                 folded_output: None,
+                folded_cache: crate::cost::CacheUsage::NONE,
                 model,
                 cost_per_mtoken_in,
                 cost_per_mtoken_out,
+                cache_cost,
                 submitted: None,
                 ledger_committed: false,
                 began_at: Instant::now(),
@@ -690,6 +697,33 @@ impl Settlement {
             // Watermark: everything decoded so far is covered by this report.
             g.decoded_at_last_output_usage = g.decoded_output_bytes;
         }
+    }
+
+    /// Record the LWW-folded cached share of the input (owner, pre-finalize).
+    /// Same monotonic floor as `set_folded`: a later, LOWER report can never
+    /// erase a cache counter. Clamping against the billed input happens in
+    /// `finalize` (the cache discount can never exceed the input it applies to).
+    pub fn set_folded_cache(&self, read: Option<u64>, write: Option<u64>) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(r) = read {
+            g.folded_cache.read_tokens = r.max(g.folded_cache.read_tokens);
+        }
+        if let Some(w) = write {
+            g.folded_cache.write_tokens = w.max(g.folded_cache.write_tokens);
+        }
+    }
+
+    /// ONE cost formula for the streaming bill: the cached share is clamped
+    /// to the billed input, then priced at the cache tiers.
+    fn cost_of(g: &SettlementInner, bin: u64, bout: u64) -> f64 {
+        crate::cost::compute_cost_with_rates(
+            g.cost_per_mtoken_in,
+            g.cost_per_mtoken_out,
+            &g.cache_cost,
+            bin,
+            bout,
+            g.folded_cache,
+        )
     }
 
     /// The bill this settlement WOULD submit right now, by the one formula in
@@ -867,8 +901,7 @@ impl Settlement {
                     Self::compute_bill(&g)
                 }
             };
-            let cost = (bin as f64 / 1_000_000.0) * g.cost_per_mtoken_in
-                + (bout as f64 / 1_000_000.0) * g.cost_per_mtoken_out;
+            let cost = Self::cost_of(&g, bin, bout);
             let mut commit_charge: Option<(String, u64, f64)> = None;
             if !matches!(outcome, SettleOutcome::FailedBegin) {
                 if let (Some(_), Some(rid)) = (&self.budget, &g.run_id) {
@@ -2897,6 +2930,7 @@ mod tests {
             "test-model".into(),
             1_000_000.0, // 1.0 usd per token — makes cost assertions exact
             1_000_000.0,
+            Default::default(),
             Some(budget),
             Some(bus as Arc<dyn EventBusEmit + Send + Sync>),
             "agent-A".into(),
@@ -3583,6 +3617,62 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// Cache billing — the streaming bill prices the folded cached share at the
+    /// cache tiers, by the SAME formula as the buffered path
+    /// (`compute_cost_with_rates`), and the cached share is clamped to the
+    /// billed (ceiling-clamped) input.
+    #[test]
+    fn settlement_bills_cached_share_at_cache_tiers() {
+        let b = RecBudget::new();
+        let bus = Arc::new(RecBus::default());
+        let s = Settlement::new(
+            Some("run-1".into()),
+            1_000,
+            100,
+            "m".into(),
+            1.0, // $1 / Mtok input
+            2.0, // $2 / Mtok output
+            crate::catalog::CacheCost {
+                read_per_mtoken: 0.1,
+                write_per_mtoken: 1.25,
+            },
+            Some(b.clone() as Arc<dyn RunBudget>),
+            Some(bus as Arc<dyn EventBusEmit + Send + Sync>),
+            "agent-A".into(),
+        );
+        s.set_folded(Some(1_000), Some(100));
+        s.set_folded_cache(Some(600), Some(300));
+        // A later, LOWER cache report must not erase the earlier one.
+        s.set_folded_cache(Some(1), Some(0));
+        assert!(s.finalize(
+            SettleOutcome::Terminal,
+            LivePhase::Failed(crate::LlmError::ProviderError("x".into()))
+        ));
+        let (tokens, cost) = b.last.lock().unwrap().unwrap();
+        assert_eq!(tokens, 1_100);
+        let expected = crate::cost::compute_cost_with_rates(
+            1.0,
+            2.0,
+            &crate::catalog::CacheCost {
+                read_per_mtoken: 0.1,
+                write_per_mtoken: 1.25,
+            },
+            1_000,
+            100,
+            crate::cost::CacheUsage {
+                read_tokens: 600,
+                write_tokens: 300,
+            },
+        );
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "cost={cost} expected={expected}"
+        );
+        // and strictly below the no-cache bill for the same tokens
+        let no_cache = (1_000.0 / 1e6) * 1.0 + (100.0 / 1e6) * 2.0;
+        assert!(cost < no_cache);
     }
 
     /// Settlement bill rules (plan §4): FailedBegin bills ZERO; folded usage is

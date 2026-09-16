@@ -39,7 +39,7 @@ use advance_shared_types::traits::{EventBusEmit, RepetitionGuardCheck, RunBudget
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use crate::cost::compute_cost;
+use crate::cost::{compute_cost, CacheUsage};
 use crate::providers::sse::SseUsageFold;
 
 use crate::events::{emit_llm_error, emit_llm_request, emit_llm_response, emit_llm_retry};
@@ -554,7 +554,9 @@ impl LlmGateway {
             };
             let clamped_in = resp.input_tokens.min(MAX_TOKENS_PER_ATTEMPT);
             let clamped_out = resp.output_tokens.min(MAX_TOKENS_PER_ATTEMPT);
-            let cost = compute_cost(resolved, clamped_in, clamped_out);
+            // `InferenceChatResponse` (local/mesh backends) carries no cache
+            // counters; no discount is applied (fail-conservative).
+            let cost = compute_cost(resolved, clamped_in, clamped_out, CacheUsage::NONE);
             commit_tokens = commit_tokens
                 .saturating_add(clamped_in)
                 .saturating_add(clamped_out);
@@ -1055,7 +1057,9 @@ impl LlmGateway {
 
         // --- ONE reservation (ADR D2.1) with the conservative cost estimate ---
         if let Some(rid) = &ctx.run_id {
-            let est_cost = compute_cost(&resolved, input_est, out_est);
+            // Reservation is the conservative UPPER bound: no cache discount is
+            // assumed before the provider reports one.
+            let est_cost = compute_cost(&resolved, input_est, out_est, CacheUsage::NONE);
             match self
                 .run_budget
                 .check(rid, input_est.saturating_add(out_est), est_cost)
@@ -1073,6 +1077,7 @@ impl LlmGateway {
             resolved.model.clone(),
             resolved.cost_per_mtoken_in,
             resolved.cost_per_mtoken_out,
+            resolved.cache_cost.clone(),
             Some(self.run_budget.clone()),
             Some(self.event_bus.clone()),
             agent_id.clone(),
@@ -1315,8 +1320,10 @@ impl LlmGateway {
                         if let Some(u) = &delta.usage {
                             fold.input_tokens = Some(u.input_tokens);
                             fold.output_tokens = Some(u.output_tokens);
+                            fold.cache_read_tokens = Some(u.cached_tokens);
                             progressed = true;
                             settlement_owner.set_folded(fold.input_tokens, fold.output_tokens);
+                            settlement_owner.set_folded_cache(fold.cache_read_tokens, None);
                         }
                         if delta.terminal {
                             saw_terminal = true;
@@ -1441,6 +1448,10 @@ impl LlmGateway {
                             if ev.usage.is_some() {
                                 progressed = true;
                                 settlement_owner.set_folded(fold.input_tokens, fold.output_tokens);
+                                settlement_owner.set_folded_cache(
+                                    fold.cache_read_tokens,
+                                    fold.cache_write_tokens,
+                                );
                             }
                             if ev.terminal {
                                 saw_terminal = true;
@@ -2200,8 +2211,12 @@ impl LlmGateway {
                         // S4: use consolidated MAX_TOKENS_PER_ATTEMPT from host_fn (single definition)
                         let clamped_in_inner = outcome.input_tokens.min(MAX_TOKENS_PER_ATTEMPT);
                         let clamped_out_inner = outcome.output_tokens.min(MAX_TOKENS_PER_ATTEMPT);
-                        let attempt_cost =
-                            compute_cost(&resolved, clamped_in_inner, clamped_out_inner);
+                        let attempt_cost = compute_cost(
+                            &resolved,
+                            clamped_in_inner,
+                            clamped_out_inner,
+                            outcome.cache.clamp_each(MAX_TOKENS_PER_ATTEMPT),
+                        );
                         cumulative_tokens = cumulative_tokens
                             .saturating_add(clamped_in_inner)
                             .saturating_add(clamped_out_inner);
@@ -2328,7 +2343,12 @@ impl LlmGateway {
             let clamped_in = outcome.input_tokens.min(MAX_TOKENS_PER_ATTEMPT);
             let clamped_out = outcome.output_tokens.min(MAX_TOKENS_PER_ATTEMPT);
 
-            let attempt_cost = compute_cost(&resolved, clamped_in, clamped_out);
+            let attempt_cost = compute_cost(
+                &resolved,
+                clamped_in,
+                clamped_out,
+                outcome.cache.clamp_each(MAX_TOKENS_PER_ATTEMPT),
+            );
             let (total_committed_tokens, total_committed_cost) = if terminal_already_accumulated {
                 // Schema-exhaustion path: cumulative_* ALREADY includes the
                 // last attempt's tokens/cost (added at the in-loop block
@@ -2974,6 +2994,7 @@ impl LlmGateway {
                     model: resp.model,
                     input_tokens: resp.input_tokens,
                     output_tokens: resp.output_tokens,
+                    cache: CacheUsage::NONE,
                     finish_reason: resp.finish_reason,
                 },
                 1,
@@ -3126,7 +3147,12 @@ impl LlmGateway {
         // record_output → commit. All BEFORE returning the handle (content-gated).
         let clamped_in = outcome.input_tokens.min(MAX_TOKENS_PER_ATTEMPT);
         let clamped_out = outcome.output_tokens.min(MAX_TOKENS_PER_ATTEMPT);
-        let cost = compute_cost(&resolved, clamped_in, clamped_out);
+        let cost = compute_cost(
+            &resolved,
+            clamped_in,
+            clamped_out,
+            outcome.cache.clamp_each(MAX_TOKENS_PER_ATTEMPT),
+        );
 
         let (parsed_output, schema_validation): (Option<Vec<u8>>, Option<&'static str>) =
             match &ctx.output_schema {
@@ -4785,6 +4811,7 @@ mod tests {
             model: "gpt-4o".into(),
             cost_per_mtoken_in: 0.0,
             cost_per_mtoken_out: 0.0,
+            cache_cost: Default::default(),
             backend: advance_runtime::config::ProviderBackend::OpenAiChat,
             auth_scheme: None,
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
@@ -4797,6 +4824,8 @@ mod tests {
             model_aliases: std::collections::HashMap::new(),
             cost_per_mtoken_in: 0.0,
             cost_per_mtoken_out: 0.0,
+            cost_per_mtoken_cache_read: None,
+            cost_per_mtoken_cache_write: None,
             rate_limit: None,
             retry_default: None,
             backend: None,
@@ -4825,6 +4854,7 @@ mod tests {
             model: "local".into(),
             cost_per_mtoken_in: 0.0,
             cost_per_mtoken_out: 0.0,
+            cache_cost: Default::default(),
             backend: advance_runtime::config::ProviderBackend::OpenAiChat,
             auth_scheme: None,
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
@@ -4837,6 +4867,8 @@ mod tests {
             model_aliases: std::collections::HashMap::new(),
             cost_per_mtoken_in: 0.0,
             cost_per_mtoken_out: 0.0,
+            cost_per_mtoken_cache_read: None,
+            cost_per_mtoken_cache_write: None,
             rate_limit: None,
             retry_default: None,
             backend: None,
@@ -4875,6 +4907,7 @@ mod tests {
                     model: "gpt-4o".into(),
                     cost_per_mtoken_in: 0.0,
                     cost_per_mtoken_out: 0.0,
+                    cache_cost: Default::default(),
                     backend: advance_runtime::config::ProviderBackend::OpenAiChat,
                     auth_scheme: None,
                     backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
@@ -4887,6 +4920,8 @@ mod tests {
                     model_aliases: std::collections::HashMap::new(),
                     cost_per_mtoken_in: 0.0,
                     cost_per_mtoken_out: 0.0,
+                    cost_per_mtoken_cache_read: None,
+                    cost_per_mtoken_cache_write: None,
                     rate_limit: None,
                     retry_default: None,
                     backend: None,

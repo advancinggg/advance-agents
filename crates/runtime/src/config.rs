@@ -577,6 +577,14 @@ pub struct LlmProviderConfig {
     pub model_aliases: HashMap<String, String>,
     pub cost_per_mtoken_in: f64,
     pub cost_per_mtoken_out: f64,
+    /// USD per million CACHE-READ input tokens (prompt-cache hits). `None` →
+    /// billed at `cost_per_mtoken_in` (fail-conservative: never an unearned
+    /// discount). Published rates: Anthropic ≈ 0.1× input, OpenAI 0.5× input.
+    pub cost_per_mtoken_cache_read: Option<f64>,
+    /// USD per million CACHE-WRITE input tokens (Anthropic
+    /// `cache_creation_input_tokens`). `None` → 1.25 × `cost_per_mtoken_in`
+    /// (the published 5-minute-TTL premium; set explicitly for 1-hour TTL, 2×).
+    pub cost_per_mtoken_cache_write: Option<f64>,
     pub rate_limit: Option<RateLimit>,
     pub retry_default: Option<RetryDefaults>,
     /// Wire-protocol family (ADR 2026-07-22 D4). `None` → resolver-side
@@ -606,6 +614,10 @@ struct LlmProviderConfigRaw {
     cost_per_mtoken_in: f64,
     #[serde(rename = "cost-per-mtoken-out")]
     cost_per_mtoken_out: f64,
+    #[serde(rename = "cost-per-mtoken-cache-read", default)]
+    cost_per_mtoken_cache_read: Option<f64>,
+    #[serde(rename = "cost-per-mtoken-cache-write", default)]
+    cost_per_mtoken_cache_write: Option<f64>,
     #[serde(rename = "rate-limit", default)]
     rate_limit: Option<RateLimit>,
     #[serde(rename = "retry-default", default)]
@@ -703,6 +715,8 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
             model_aliases: raw.model_aliases,
             cost_per_mtoken_in: raw.cost_per_mtoken_in,
             cost_per_mtoken_out: raw.cost_per_mtoken_out,
+            cost_per_mtoken_cache_read: raw.cost_per_mtoken_cache_read,
+            cost_per_mtoken_cache_write: raw.cost_per_mtoken_cache_write,
             rate_limit: raw.rate_limit,
             retry_default: raw.retry_default,
             backend,
@@ -725,6 +739,14 @@ impl fmt::Debug for LlmProviderConfig {
             .field("model_aliases", &self.model_aliases)
             .field("cost_per_mtoken_in", &self.cost_per_mtoken_in)
             .field("cost_per_mtoken_out", &self.cost_per_mtoken_out)
+            .field(
+                "cost_per_mtoken_cache_read",
+                &self.cost_per_mtoken_cache_read,
+            )
+            .field(
+                "cost_per_mtoken_cache_write",
+                &self.cost_per_mtoken_cache_write,
+            )
             .field("rate_limit", &self.rate_limit)
             .field("retry_default", &self.retry_default)
             .field("backend", &self.backend)
@@ -1892,6 +1914,23 @@ fn validate_config(path: &Path, cfg: &RuntimeConfig) -> Result<(), ConfigError> 
         }
         if !p.cost_per_mtoken_out.is_finite() || p.cost_per_mtoken_out <= 0.0 {
             return invalid("llm-providers[].cost-per-mtoken-out must be finite and > 0");
+        }
+        // Cache rates are optional but, when present, must be finite and
+        // non-negative — a 0 read rate is a legitimate "free cache hit" model,
+        // a negative one would turn cache hits into a budget credit.
+        if let Some(r) = p.cost_per_mtoken_cache_read {
+            if !r.is_finite() || r < 0.0 {
+                return invalid(
+                    "llm-providers[].cost-per-mtoken-cache-read must be finite and >= 0",
+                );
+            }
+        }
+        if let Some(w) = p.cost_per_mtoken_cache_write {
+            if !w.is_finite() || w < 0.0 {
+                return invalid(
+                    "llm-providers[].cost-per-mtoken-cache-write must be finite and >= 0",
+                );
+            }
         }
         // rate-limit is REQUIRED to prevent silent budget bypass via omission.
         match &p.rate_limit {

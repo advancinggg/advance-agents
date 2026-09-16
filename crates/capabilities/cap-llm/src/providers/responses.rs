@@ -20,6 +20,7 @@
 use advance_shared_types::security_validator::{HttpMethod, HttpRequest};
 use serde_json::{json, Value};
 
+use crate::cost::CacheUsage;
 use crate::error::LlmError;
 use crate::executor::ExecutionOutcome;
 use crate::gateway::{ChatMessage, ChatParams, ChatRole};
@@ -247,6 +248,14 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
             let output_tokens = value["usage"]["output_tokens"]
                 .as_u64()
                 .ok_or_else(|| LlmError::ProviderError("invalid response shape".into()))?;
+            // `input_tokens_details.cached_tokens` is a SUBSET of `input_tokens`.
+            let cache = CacheUsage {
+                read_tokens: value["usage"]["input_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
+                write_tokens: 0,
+            }
+            .clamped_to(input_tokens);
             let finish_reason = if value["status"].as_str() == Some("incomplete") {
                 map_incomplete_reason(value["incomplete_details"]["reason"].as_str()).to_string()
             } else {
@@ -257,6 +266,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                 model,
                 input_tokens,
                 output_tokens,
+                cache,
                 finish_reason,
             });
         }
@@ -364,6 +374,8 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                 let usage = SseUsage {
                     input_tokens: usage_val["input_tokens"].as_u64(),
                     output_tokens: usage_val["output_tokens"].as_u64(),
+                    cache_read_tokens: usage_val["input_tokens_details"]["cached_tokens"].as_u64(),
+                    cache_write_tokens: None,
                 };
                 let finish = if name == "response.incomplete" {
                     map_incomplete_reason(
@@ -430,6 +442,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
 mod tests {
     use super::*;
     use crate::gateway::{ChatMessage, ChatParams, ChatRole};
+    use crate::providers::sse::SseUsageFold;
     use advance_runtime::config::ProviderBackend;
 
     // ── grok-repass Item 3: 5xx-disguised context overflow (L3 rows, responses arm).
@@ -609,6 +622,7 @@ mod tests {
             model: "gpt-5.2".into(),
             cost_per_mtoken_in: 1.25,
             cost_per_mtoken_out: 10.0,
+            cache_cost: Default::default(),
             backend: ProviderBackend::OpenAiResponses,
             auth_scheme: None,
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
@@ -673,6 +687,35 @@ mod tests {
             }
             other => panic!("expected static ProviderError, got {other:?}"),
         }
+    }
+
+    /// Cache billing — `input_tokens_details.cached_tokens` is a SUBSET of
+    /// `input_tokens`; buffered and streamed shapes both fold it as a read.
+    #[test]
+    fn t_responses_cached_tokens_is_subset_read_buffered_and_streamed() {
+        let body = br#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1000,"output_tokens":5,"input_tokens_details":{"cached_tokens":250}},"model":"gpt-4.1"}"#;
+        let outcome = OpenAiResponsesAdapter
+            .parse_chat_response(200, body)
+            .unwrap();
+        assert_eq!(outcome.input_tokens, 1000);
+        assert_eq!(
+            outcome.cache,
+            CacheUsage {
+                read_tokens: 250,
+                write_tokens: 0
+            }
+        );
+
+        let mut fold = SseUsageFold::default();
+        let frame = SseFrame {
+            event: Some("response.completed".into()),
+            data: r#"{"type":"response.completed","response":{"usage":{"input_tokens":1000,"output_tokens":5,"input_tokens_details":{"cached_tokens":250}}}}"#.to_string(),
+        };
+        let ev = OpenAiResponsesAdapter.parse_sse_frame(&frame).unwrap();
+        assert!(ev.terminal);
+        fold.apply(&ev);
+        assert_eq!(fold.input_tokens, Some(1000));
+        assert_eq!(fold.cache_read_tokens, Some(250));
     }
 
     /// MODULE-009-T117 — buffered parse: output_text concatenated,

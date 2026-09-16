@@ -21,6 +21,7 @@ use advance_runtime::config::{
     AuthScheme, InferenceBackendClass, LlmProviderConfig, ProviderBackend,
 };
 
+use crate::catalog::CacheCost;
 use crate::error::LlmError;
 
 /// A resolved (provider, model) tuple ready for HTTP execution.
@@ -37,6 +38,10 @@ pub struct ResolvedProvider {
     pub model: String,
     pub cost_per_mtoken_in: f64,
     pub cost_per_mtoken_out: f64,
+    /// Rates for the cached share of the input (prompt-cache reads/writes).
+    /// Always concrete here: `make_resolved` applies the fail-conservative
+    /// defaults when the config omits them (see `CacheCost`).
+    pub cache_cost: CacheCost,
     /// Wire-protocol family (ADR 2026-07-22 D4). Always concrete here:
     /// `make_resolved` applies `backend_of` inference when the config field
     /// is absent, so downstream dispatch never re-derives from the id string.
@@ -57,6 +62,7 @@ impl fmt::Debug for ResolvedProvider {
             .field("model", &self.model)
             .field("cost_per_mtoken_in", &self.cost_per_mtoken_in)
             .field("cost_per_mtoken_out", &self.cost_per_mtoken_out)
+            .field("cache_cost", &self.cache_cost)
             .field("backend", &self.backend)
             .field("auth_scheme", &self.auth_scheme)
             .field("backend_class", &self.backend_class)
@@ -146,6 +152,20 @@ pub fn backend_of(cfg: &LlmProviderConfig) -> ProviderBackend {
     })
 }
 
+/// Cache rates from config, with fail-conservative defaults for the omitted
+/// ones (read → full input rate, write → 1.25 × input rate).
+pub(crate) fn cache_cost_of(p: &LlmProviderConfig) -> CacheCost {
+    let defaults = CacheCost::conservative_from_input_rate(p.cost_per_mtoken_in);
+    CacheCost {
+        read_per_mtoken: p
+            .cost_per_mtoken_cache_read
+            .unwrap_or(defaults.read_per_mtoken),
+        write_per_mtoken: p
+            .cost_per_mtoken_cache_write
+            .unwrap_or(defaults.write_per_mtoken),
+    }
+}
+
 pub(crate) fn make_resolved(p: &LlmProviderConfig, model: String) -> ResolvedProvider {
     ResolvedProvider {
         id: p.id.clone(),
@@ -154,6 +174,7 @@ pub(crate) fn make_resolved(p: &LlmProviderConfig, model: String) -> ResolvedPro
         model,
         cost_per_mtoken_in: p.cost_per_mtoken_in,
         cost_per_mtoken_out: p.cost_per_mtoken_out,
+        cache_cost: cache_cost_of(p),
         backend: backend_of(p),
         auth_scheme: p.auth_scheme,
         backend_class: p.backend_class,
@@ -178,6 +199,8 @@ mod tests {
             model_aliases,
             cost_per_mtoken_in: 1.0,
             cost_per_mtoken_out: 5.0,
+            cost_per_mtoken_cache_read: None,
+            cost_per_mtoken_cache_write: None,
             rate_limit: None,
             retry_default: None,
             backend: None,
@@ -421,5 +444,26 @@ mod tests {
             }
         }
         assert_eq!(count(ProviderBackend::OpenAiChat), 1);
+    }
+
+    /// Cache billing — omitted cache rates resolve to the fail-conservative
+    /// defaults (read = full input rate, write = 1.25 × input rate); explicit
+    /// rates pass through untouched.
+    #[test]
+    fn t_resolved_provider_cache_cost_defaults_and_passthrough() {
+        let mut p = provider("anthropic", &[("m", "claude")]);
+        p.cost_per_mtoken_in = 3.0;
+        let r = make_resolved(&p, "claude".into());
+        assert_eq!(
+            r.cache_cost.read_per_mtoken, 3.0,
+            "no unearned read discount"
+        );
+        assert!((r.cache_cost.write_per_mtoken - 3.75).abs() < 1e-12);
+
+        p.cost_per_mtoken_cache_read = Some(0.3);
+        p.cost_per_mtoken_cache_write = Some(6.0);
+        let r = make_resolved(&p, "claude".into());
+        assert_eq!(r.cache_cost.read_per_mtoken, 0.3);
+        assert_eq!(r.cache_cost.write_per_mtoken, 6.0);
     }
 }

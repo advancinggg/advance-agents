@@ -196,6 +196,8 @@ mod tests {
             model_aliases,
             cost_per_mtoken_in: 0.1,
             cost_per_mtoken_out: 0.1,
+            cost_per_mtoken_cache_read: None,
+            cost_per_mtoken_cache_write: None,
             rate_limit: None,
             retry_default: None,
             backend: None,

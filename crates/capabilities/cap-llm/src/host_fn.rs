@@ -3876,6 +3876,7 @@ mod live_gated_tests {
                 "m".into(),
                 0.0,
                 0.0,
+                Default::default(),
                 None,
                 None,
                 "test-agent".into(),

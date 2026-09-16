@@ -476,6 +476,8 @@ mod tests {
             model_aliases: HashMap::new(),
             cost_per_mtoken_in: 1.0,
             cost_per_mtoken_out: 5.0,
+            cost_per_mtoken_cache_read: None,
+            cost_per_mtoken_cache_write: None,
             rate_limit: None,
             retry_default: rd,
             backend: None,

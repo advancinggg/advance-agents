@@ -5,6 +5,7 @@
 use advance_shared_types::security_validator::{HttpMethod, HttpRequest};
 use serde_json::{json, Value};
 
+use crate::cost::CacheUsage;
 use crate::error::LlmError;
 use crate::executor::ExecutionOutcome;
 use crate::gateway::{ChatMessage, ChatParams, ChatRole};
@@ -125,16 +126,10 @@ impl ProviderAdapter for AnthropicAdapter {
             .or_else(|| value["type"].as_str().map(str::to_string));
         match name.as_deref() {
             Some("error") => Err(LlmError::ProviderError("in-band error frame".into())),
-            Some("message_start") => {
-                let input = value["message"]["usage"]["input_tokens"].as_u64();
-                Ok(SseEvent {
-                    usage: input.map(|i| SseUsage {
-                        input_tokens: Some(i),
-                        output_tokens: None,
-                    }),
-                    ..SseEvent::IGNORE
-                })
-            }
+            Some("message_start") => Ok(SseEvent {
+                usage: anthropic_input_usage(&value["message"]["usage"]),
+                ..SseEvent::IGNORE
+            }),
             Some("content_block_delta") => {
                 if value["delta"]["type"].as_str() == Some("text_delta") {
                     let text = value["delta"]["text"].as_str().unwrap_or("");
@@ -153,12 +148,19 @@ impl ProviderAdapter for AnthropicAdapter {
                 // CUMULATIVE snapshot (MODULE-009-AC-21): output_tokens is
                 // the running total, folded last-write-wins by the caller —
                 // NEVER summed.
+                // Newer API revisions ALSO repeat the cumulative input/cache
+                // counters here; fold them if present (LWW, same as message_start).
                 let output = value["usage"]["output_tokens"].as_u64();
-                Ok(SseEvent {
-                    usage: output.map(|o| SseUsage {
-                        input_tokens: None,
-                        output_tokens: Some(o),
+                let input = anthropic_input_usage(&value["usage"]);
+                let usage = match (input, output) {
+                    (None, None) => None,
+                    (input, output) => Some(SseUsage {
+                        output_tokens: output,
+                        ..input.unwrap_or_default()
                     }),
+                };
+                Ok(SseEvent {
+                    usage,
                     finish_reason: value["delta"]["stop_reason"].as_str().map(str::to_string),
                     ..SseEvent::IGNORE
                 })
@@ -204,8 +206,11 @@ impl ProviderAdapter for AnthropicAdapter {
             // coerce to 0 — would let a malformed proxy or upstream-spec
             // violation bypass run-budget accumulation. Anthropic's API
             // contract always returns usage on 200.
-            let input_tokens = value["usage"]["input_tokens"]
-                .as_u64()
+            // Anthropic's `input_tokens` is only the UNCACHED REMAINDER; the
+            // cached share lives in two sibling fields. Total input is the sum
+            // of all three — reading `input_tokens` alone drops every cached
+            // token (and its cost) from the run budget.
+            let (input_tokens, cache) = anthropic_input_total(&value["usage"])
                 .ok_or_else(|| LlmError::ProviderError("invalid response shape".into()))?;
             let output_tokens = value["usage"]["output_tokens"]
                 .as_u64()
@@ -219,6 +224,7 @@ impl ProviderAdapter for AnthropicAdapter {
                 model,
                 input_tokens,
                 output_tokens,
+                cache,
                 finish_reason,
             });
         }
@@ -257,6 +263,7 @@ mod tests {
             model: "claude-sonnet-4-5".into(),
             cost_per_mtoken_in: 3.0,
             cost_per_mtoken_out: 15.0,
+            cache_cost: Default::default(),
             backend: advance_runtime::config::ProviderBackend::AnthropicMessages,
             auth_scheme: None,
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
@@ -293,6 +300,40 @@ mod tests {
             .headers
             .iter()
             .any(|(n, _)| n.eq_ignore_ascii_case("authorization")));
+    }
+
+    /// Cache billing — Anthropic `usage.input_tokens` is only the UNCACHED
+    /// remainder. The outcome's `input_tokens` must be the TOTAL
+    /// (remainder + cache_creation + cache_read) and the cached share must be
+    /// carried split by kind. Reading `input_tokens` alone (the old code)
+    /// reported 100 here and silently dropped 900 tokens from the run budget.
+    #[test]
+    fn t_anthropic_parse_chat_response_sums_cache_fields_into_input_total() {
+        let body = br#"{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":100,"cache_creation_input_tokens":300,"cache_read_input_tokens":600,"output_tokens":5},"stop_reason":"end_turn","model":"claude"}"#;
+        let outcome = AnthropicAdapter.parse_chat_response(200, body).unwrap();
+        assert_eq!(
+            outcome.input_tokens, 1000,
+            "total = remainder + write + read"
+        );
+        assert_eq!(
+            outcome.cache,
+            CacheUsage {
+                read_tokens: 600,
+                write_tokens: 300
+            }
+        );
+        assert_eq!(outcome.output_tokens, 5);
+    }
+
+    /// Cache billing — absent cache fields (no caching used) → total is the
+    /// remainder alone and the cached share is zero. Pre-cache payloads are
+    /// byte-for-byte unaffected.
+    #[test]
+    fn t_anthropic_parse_chat_response_without_cache_fields_unchanged() {
+        let body = br#"{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":3,"output_tokens":5},"stop_reason":"end_turn","model":"claude"}"#;
+        let outcome = AnthropicAdapter.parse_chat_response(200, body).unwrap();
+        assert_eq!(outcome.input_tokens, 3);
+        assert!(outcome.cache.is_none());
     }
 
     /// Round-AUDIT-5 C1 — Anthropic chat 200 without `usage.input_tokens`
@@ -696,6 +737,38 @@ mod tests {
     }
 }
 
+/// Anthropic Messages usage → (TOTAL input, cached share).
+///
+/// `input_tokens` is the uncached REMAINDER; `cache_creation_input_tokens`
+/// and `cache_read_input_tokens` are parallel counters (absent → 0). The
+/// total is the sum of all three. Returns `None` only when `input_tokens`
+/// itself is absent (fail-closed, never coerce the remainder to 0).
+fn anthropic_input_total(usage: &Value) -> Option<(u64, CacheUsage)> {
+    let remainder = usage["input_tokens"].as_u64()?;
+    let write = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+    let read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+    let total = remainder.saturating_add(write).saturating_add(read);
+    Some((
+        total,
+        CacheUsage {
+            read_tokens: read,
+            write_tokens: write,
+        },
+    ))
+}
+
+/// Stream-frame form of [`anthropic_input_total`]: `None` when the frame
+/// carries no input counter at all.
+fn anthropic_input_usage(usage: &Value) -> Option<SseUsage> {
+    let (total, cache) = anthropic_input_total(usage)?;
+    Some(SseUsage {
+        input_tokens: Some(total),
+        output_tokens: None,
+        cache_read_tokens: Some(cache.read_tokens),
+        cache_write_tokens: Some(cache.write_tokens),
+    })
+}
+
 fn map_anthropic_status(status: u16, body: &[u8]) -> LlmError {
     let body_str = std::str::from_utf8(body).unwrap_or("");
     match status {
@@ -791,8 +864,58 @@ fn is_context_overflow_message(msg: &str) -> bool {
 #[cfg(test)]
 mod stream_tests {
     use super::*;
+    use crate::cost::CacheUsage;
     use crate::providers::sse::{SseFrame, SseUsageFold};
     use advance_runtime::config::ProviderBackend;
+
+    /// Cache billing (stream) — `message_start` carries the cache fields; the
+    /// folded input must be the TOTAL and the cached share must survive the
+    /// later output-only `message_delta` frames (LWW never clears them).
+    #[test]
+    fn t_anthropic_stream_message_start_folds_cache_fields() {
+        let adapter = AnthropicAdapter;
+        let mut fold = SseUsageFold::default();
+        let frames = vec![
+            ev_frame(
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":100,"cache_creation_input_tokens":300,"cache_read_input_tokens":600,"output_tokens":1}}}"#,
+            ),
+            ev_frame(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":12}}"#,
+            ),
+        ];
+        for f in &frames {
+            fold.apply(&adapter.parse_sse_frame(f).unwrap());
+        }
+        assert_eq!(fold.input_tokens, Some(1000));
+        assert_eq!(fold.output_tokens, Some(12));
+        assert_eq!(
+            fold.cache(),
+            CacheUsage {
+                read_tokens: 600,
+                write_tokens: 300
+            }
+        );
+    }
+
+    /// Cache billing (stream) — newer API revisions repeat the cumulative
+    /// input + cache counters on `message_delta`; those fold too.
+    #[test]
+    fn t_anthropic_stream_message_delta_with_input_counters_folds() {
+        let adapter = AnthropicAdapter;
+        let mut fold = SseUsageFold::default();
+        let ev = adapter
+            .parse_sse_frame(&ev_frame(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"cache_read_input_tokens":40,"cache_creation_input_tokens":0,"output_tokens":7}}"#,
+            ))
+            .unwrap();
+        fold.apply(&ev);
+        assert_eq!((fold.input_tokens, fold.output_tokens), (Some(50), Some(7)));
+        assert_eq!(fold.cache_read_tokens, Some(40));
+        assert_eq!(fold.cache_write_tokens, Some(0));
+    }
 
     fn provider() -> ResolvedProvider {
         ResolvedProvider {
@@ -802,6 +925,7 @@ mod stream_tests {
             model: "claude-sonnet-4-5".into(),
             cost_per_mtoken_in: 3.0,
             cost_per_mtoken_out: 15.0,
+            cache_cost: Default::default(),
             backend: ProviderBackend::AnthropicMessages,
             auth_scheme: None,
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,

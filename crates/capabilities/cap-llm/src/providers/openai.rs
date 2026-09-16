@@ -6,6 +6,7 @@
 use advance_shared_types::security_validator::{HttpMethod, HttpRequest};
 use serde_json::{json, Value};
 
+use crate::cost::CacheUsage;
 use crate::error::LlmError;
 use crate::executor::ExecutionOutcome;
 use crate::gateway::{ChatMessage, ChatParams};
@@ -135,8 +136,11 @@ impl ProviderAdapter for OpenAiAdapter {
             .get("usage")
             .filter(|u| u.is_object())
             .map(|u| SseUsage {
+                // `prompt_tokens` is the TOTAL; `cached_tokens` is a subset.
                 input_tokens: u["prompt_tokens"].as_u64(),
                 output_tokens: u["completion_tokens"].as_u64(),
+                cache_read_tokens: u["prompt_tokens_details"]["cached_tokens"].as_u64(),
+                cache_write_tokens: None,
             });
         if delta.is_none() && finish_reason.is_none() && usage.is_none() {
             // Role-only first chunk / keep-alive → Ignore, never Some("").
@@ -171,6 +175,16 @@ impl ProviderAdapter for OpenAiAdapter {
             let output_tokens = value["usage"]["completion_tokens"]
                 .as_u64()
                 .ok_or_else(|| LlmError::ProviderError("invalid response shape".into()))?;
+            // Prompt-cache hits: `prompt_tokens_details.cached_tokens` is a
+            // SUBSET of `prompt_tokens` (already counted in the total) and is
+            // billed at the cache-read rate. Optional — absent → 0.
+            let cache = CacheUsage {
+                read_tokens: value["usage"]["prompt_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
+                write_tokens: 0,
+            }
+            .clamped_to(input_tokens);
             let finish_reason = value["choices"][0]["finish_reason"]
                 .as_str()
                 .unwrap_or("stop")
@@ -180,6 +194,7 @@ impl ProviderAdapter for OpenAiAdapter {
                 model,
                 input_tokens,
                 output_tokens,
+                cache,
                 finish_reason,
             });
         }
@@ -322,6 +337,7 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::gateway::{ChatMessage, ChatParams, ChatRole};
+    use crate::providers::sse::SseUsageFold;
 
     // ── grok-repass Item 3: 5xx-disguised context overflow (L3 rows, openai arm) ──
 
@@ -476,6 +492,53 @@ mod tests {
         }
     }
 
+    /// Cache billing — `prompt_tokens` is already the TOTAL and
+    /// `prompt_tokens_details.cached_tokens` is a SUBSET: the outcome keeps
+    /// the total as-is and carries the cached share as a read (never a write).
+    #[test]
+    fn t_openai_parse_chat_response_cached_tokens_is_subset_read() {
+        let body = br#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":800}},"model":"gpt-4o"}"#;
+        let outcome = OpenAiAdapter.parse_chat_response(200, body).unwrap();
+        assert_eq!(
+            outcome.input_tokens, 1000,
+            "total must NOT be inflated by the subset"
+        );
+        assert_eq!(
+            outcome.cache,
+            CacheUsage {
+                read_tokens: 800,
+                write_tokens: 0
+            }
+        );
+    }
+
+    /// Cache billing — a `cached_tokens` larger than `prompt_tokens` is
+    /// malformed; the cached share is clamped to the total.
+    #[test]
+    fn t_openai_parse_chat_response_cached_tokens_clamped_to_prompt() {
+        let body = br#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":999}},"model":"gpt-4o"}"#;
+        let outcome = OpenAiAdapter.parse_chat_response(200, body).unwrap();
+        assert_eq!(outcome.cache.read_tokens, 10);
+    }
+
+    /// Cache billing (stream) — the terminal usage chunk's
+    /// `prompt_tokens_details.cached_tokens` folds as a cache read.
+    #[test]
+    fn t_openai_chat_stream_usage_chunk_folds_cached_tokens() {
+        let mut fold = SseUsageFold::default();
+        let frame = SseFrame {
+            event: None,
+            data: r#"{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":800}}}"#.to_string(),
+        };
+        fold.apply(&OpenAiAdapter.parse_sse_frame(&frame).unwrap());
+        assert_eq!(
+            (fold.input_tokens, fold.output_tokens),
+            (Some(1000), Some(5))
+        );
+        assert_eq!(fold.cache_read_tokens, Some(800));
+        assert_eq!(fold.cache_write_tokens, None);
+    }
+
     /// Round-AUDIT-5 C1 — chat 200 response without `usage.prompt_tokens`
     /// must reject as ProviderError("invalid response shape"). Prevents
     /// silent zero-token commits to RunBudget on malformed proxies.
@@ -533,6 +596,7 @@ mod tests {
             model: "gpt-4o".into(),
             cost_per_mtoken_in: 2.5,
             cost_per_mtoken_out: 10.0,
+            cache_cost: Default::default(),
             backend: advance_runtime::config::ProviderBackend::OpenAiChat,
             auth_scheme: None,
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
