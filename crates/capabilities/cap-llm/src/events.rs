@@ -83,12 +83,20 @@ fn envelope(ctx: &LlmRequestContext, event_type: &str) -> Event {
 /// response events on a stable token-count slot.
 pub(crate) fn emit_llm_request(emit: &dyn EventBusEmit, ctx: &LlmRequestContext, model: &str) {
     let mut event = envelope(ctx, LLM_REQUEST);
-    let mut payload = json!({ "model": model, "input_tokens": 0 });
+    // Lane agent-llm-policy: `policy_source` is ALWAYS present (`"default"` when no agent
+    // policy field applied, `"agent"` otherwise); `provider_id` mirrors the placed endpoint
+    // (the `llm.response.provider` attribution key) whenever placement resolved.
+    let mut payload = json!({
+        "model": model,
+        "input_tokens": 0,
+        "policy_source": ctx.policy_source.as_str(),
+    });
     if let Some(iter) = ctx.iteration {
         payload["iteration"] = json!(iter);
     }
     if let Some(p) = &ctx.placement {
         payload["endpoint_id"] = json!(p.endpoint_id);
+        payload["provider_id"] = json!(p.endpoint_id);
         payload["model_revision"] = json!(p.model_revision);
         payload["placement_reason"] = json!(p.placement_reason);
     }
@@ -218,6 +226,7 @@ mod tests {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement: None,
+            policy_source: Default::default(),
         }
     }
 

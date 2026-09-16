@@ -41,6 +41,7 @@ pub mod events;
 pub mod gateway;
 pub mod host_fn;
 pub mod placement;
+pub mod policy;
 pub mod preflight;
 pub mod provider;
 // `providers` is crate-internal: `ProviderAdapter::parse_chat_response`
@@ -69,6 +70,9 @@ mod mesh_remote_tests;
 mod placement_tests;
 
 #[cfg(test)]
+mod policy_tests;
+
+#[cfg(test)]
 mod test_support;
 
 pub use backend_local::{
@@ -89,6 +93,10 @@ pub use host_fn::{
     AgentLlmPollStreamHandler, AgentLlmStreamHandler, AgentStreamReaper, ReapBatch,
 };
 pub use placement::{PlacementRecord, PlacementTelemetry, UserHardConstraint};
+pub use policy::{
+    constraint_to_string, is_valid_device_id, parse_constraint, AgentLlmPolicy,
+    AgentLlmPolicySource, ConstraintParseError, LlmPolicySource, NotWiredAgentLlmPolicy,
+};
 pub use preflight::{
     chat_preflight, DiscardEventBus, NoopRepetition, PreflightAllowBudget, StaticConfig,
 };

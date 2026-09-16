@@ -24,6 +24,12 @@
 //! L0 capability wiring reads `.agent/config.yaml` once at boot, so capability declarations edited
 //! through this surface apply at the next daemon start (the tree node of a live child keeps the
 //! capabilities it was created with).
+//!
+//! Lane agent-llm-policy (2026-09-16): the typed `llm` block ([`ClientAgentLlm`]) rides the same
+//! routes — `config.llm` on every detail, `llm` on create/update as a WHOLE-BLOCK replacement
+//! (`{}` clears it). An `llm`-only update carries NO `restart_required`: the gateway re-reads the
+//! block on the agent's next LLM call. The provider validates that `llm.provider` names a live
+//! `llm-providers[].id` and answers `invalid_request` + details `["unknown_provider"]` otherwise.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -51,6 +57,10 @@ pub const MAX_WORKSPACE_PATH_DEPTH: usize = 32;
 pub const MAX_TEMPLATE_REF_BYTES: usize = 128;
 /// Bound on the capability list a create may request (matches the tree's per-node cap).
 pub const MAX_REQUESTED_CAPABILITIES: usize = 64;
+/// Bound on an `llm.model` hint (an alias key or a literal model id).
+pub const MAX_LLM_MODEL_BYTES: usize = 128;
+/// Bound on the `<id>` of an `llm.constraint` `device:<id>`.
+pub const MAX_LLM_DEVICE_ID_BYTES: usize = 128;
 /// Warning code attached when a config document was written (applies at the next daemon start).
 /// Shared with the other administrative families — the constant lives in [`crate::envelope`].
 pub use crate::envelope::WARNING_RESTART_REQUIRED;
@@ -106,6 +116,33 @@ pub struct ClientAgentDeclaredChild {
     pub children: Vec<ClientAgentDeclaredChild>,
 }
 
+/// The typed `llm:` policy block of an agent's config document (lane agent-llm-policy): the
+/// provider the agent is pinned to, its default model hint, and a hard placement constraint.
+/// Every field is optional. On create/update the block is replaced as a whole; `{}` clears it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClientAgentLlm {
+    /// An `llm-providers[].id` of the runtime config (`^[A-Za-z0-9_-]{1,64}$`). Must name a
+    /// configured provider; a request naming another id is `invalid_request` +
+    /// details `["unknown_provider"]`. A pinned provider that later disappears from the config
+    /// makes the agent's LLM calls fail closed (never a silent fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Default model hint (an alias key or a literal model id); an explicit per-call model wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Hard placement constraint: `always-local` | `never-cloud` | `device:<id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint: Option<String>,
+}
+
+impl ClientAgentLlm {
+    /// `true` when no field is set — the "clear the block" form on create/update.
+    pub fn is_empty(&self) -> bool {
+        self.provider.is_none() && self.model.is_none() && self.constraint.is_none()
+    }
+}
+
 /// The agent's config document plus a typed projection of the parts the runtime understands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientAgentConfig {
@@ -115,6 +152,9 @@ pub struct ClientAgentConfig {
     pub config_yaml: Option<String>,
     pub capabilities: Vec<ClientAgentCapability>,
     pub declared_children: Vec<ClientAgentDeclaredChild>,
+    /// The typed `llm:` policy block, when present and well-formed (absent otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm: Option<ClientAgentLlm>,
 }
 
 /// The `GET /client/agents/{agent_id}` / create / update response.
@@ -155,6 +195,10 @@ pub struct ClientCreateAgentRequest {
     /// Optional initial config document written after materialization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_yaml: Option<String>,
+    /// Optional `llm:` policy block written into the new agent's config document (after
+    /// `config_yaml`, so it wins over a block the document may carry). `{}` writes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm: Option<ClientAgentLlm>,
 }
 
 /// The body of `POST /client/agents/{agent_id}:update`. At least one field is required.
@@ -171,6 +215,10 @@ pub struct ClientUpdateAgentRequest {
     /// root agent's capabilities live in its config document, so this field is refused for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<String>>,
+    /// Whole-block replacement of the agent's `llm:` policy (`{}` clears it). Applies at the
+    /// agent's next LLM call — no `restart_required`. Allowed for the root agent too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm: Option<ClientAgentLlm>,
 }
 
 /// The body of `POST /client/agents/{agent_id}:delete` (a `null` body means the defaults).
@@ -301,6 +349,52 @@ pub fn validate_config_document(yaml: &str) -> Result<(), ClientError> {
     Ok(())
 }
 
+/// An `llm.constraint`: exactly `always-local` | `never-cloud` | `device:<id>` with
+/// `<id>` `^[A-Za-z0-9_.:-]{1,128}$` (the cap-llm `parse_constraint` grammar).
+pub fn validate_llm_constraint(constraint: &str) -> Result<(), ClientError> {
+    let err = || invalid("invalid llm constraint");
+    match constraint {
+        "always-local" | "never-cloud" => Ok(()),
+        other => {
+            let id = other.strip_prefix("device:").ok_or_else(err)?;
+            if id.is_empty()
+                || id.len() > MAX_LLM_DEVICE_ID_BYTES
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
+            {
+                return Err(err());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// An `llm` block: provider id charset, bounded single-line model hint, constraint grammar.
+/// Provider EXISTENCE is the provider's check (it owns the live runtime config).
+pub fn validate_agent_llm(llm: &ClientAgentLlm) -> Result<(), ClientError> {
+    if let Some(provider) = &llm.provider {
+        if provider.is_empty()
+            || provider.len() > MAX_AGENT_ID_LEN
+            || !provider.chars().all(is_id_char)
+        {
+            return Err(invalid("invalid llm provider id"));
+        }
+    }
+    if let Some(model) = &llm.model {
+        if model.is_empty()
+            || model.len() > MAX_LLM_MODEL_BYTES
+            || model.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(invalid("invalid llm model"));
+        }
+    }
+    if let Some(constraint) = &llm.constraint {
+        validate_llm_constraint(constraint)?;
+    }
+    Ok(())
+}
+
 /// The requested capability list: bounded, each a valid id, no duplicates.
 pub fn validate_capabilities(capabilities: &[String]) -> Result<(), ClientError> {
     if capabilities.len() > MAX_REQUESTED_CAPABILITIES {
@@ -332,12 +426,19 @@ pub fn validate_create_request(req: &ClientCreateAgentRequest) -> Result<(), Cli
     if let Some(yaml) = &req.config_yaml {
         validate_config_document(yaml)?;
     }
+    if let Some(llm) = &req.llm {
+        validate_agent_llm(llm)?;
+    }
     Ok(())
 }
 
 /// Validate an update request: at least one field, each within bounds.
 pub fn validate_update_request(req: &ClientUpdateAgentRequest) -> Result<(), ClientError> {
-    if req.display_name.is_none() && req.config_yaml.is_none() && req.capabilities.is_none() {
+    if req.display_name.is_none()
+        && req.config_yaml.is_none()
+        && req.capabilities.is_none()
+        && req.llm.is_none()
+    {
         return Err(invalid("empty agent update"));
     }
     if let Some(name) = &req.display_name {
@@ -349,10 +450,14 @@ pub fn validate_update_request(req: &ClientUpdateAgentRequest) -> Result<(), Cli
     if let Some(capabilities) = &req.capabilities {
         validate_capabilities(capabilities)?;
     }
+    if let Some(llm) = &req.llm {
+        validate_agent_llm(llm)?;
+    }
     Ok(())
 }
 
-/// Whether an update changes something that only takes effect at the next daemon start.
+/// Whether an update changes something that only takes effect at the next daemon start. An
+/// `llm`-only update does NOT (the policy is re-read at the next LLM call).
 fn update_needs_restart(req: &ClientUpdateAgentRequest) -> bool {
     req.config_yaml.is_some() || req.capabilities.is_some()
 }
@@ -516,6 +621,80 @@ mod tests {
             assert!(validate_agent_id(bad).is_err(), "{bad:?}");
         }
         assert!(validate_agent_id(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn llm_block_grammar() {
+        let ok = ClientAgentLlm {
+            provider: Some("local".into()),
+            model: Some("tiny".into()),
+            constraint: Some("always-local".into()),
+        };
+        assert!(validate_agent_llm(&ok).is_ok());
+        assert!(validate_agent_llm(&ClientAgentLlm::default()).is_ok());
+        assert!(ClientAgentLlm::default().is_empty() && !ok.is_empty());
+        for c in [
+            "always-local",
+            "never-cloud",
+            "device:phone",
+            "device:mac.local:1",
+        ] {
+            assert!(validate_llm_constraint(c).is_ok(), "{c}");
+        }
+        for c in [
+            "",
+            "Always-Local",
+            " always-local",
+            "device",
+            "device:",
+            "device:a b",
+            "device:a/b",
+            "cloud-only",
+        ] {
+            assert!(validate_llm_constraint(c).is_err(), "{c:?}");
+        }
+        assert!(validate_llm_constraint(&format!("device:{}", "x".repeat(128))).is_ok());
+        assert!(validate_llm_constraint(&format!("device:{}", "x".repeat(129))).is_err());
+        for bad in [
+            ClientAgentLlm {
+                provider: Some("agent:x".into()),
+                ..Default::default()
+            },
+            ClientAgentLlm {
+                provider: Some(String::new()),
+                ..Default::default()
+            },
+            ClientAgentLlm {
+                model: Some("a b".into()),
+                ..Default::default()
+            },
+            ClientAgentLlm {
+                model: Some("x".repeat(129)),
+                ..Default::default()
+            },
+            ClientAgentLlm {
+                constraint: Some("gpu".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(validate_agent_llm(&bad).is_err(), "{bad:?}");
+        }
+        // The request DTO rejects unknown keys.
+        assert!(serde_json::from_value::<ClientAgentLlm>(json!({ "providr": "x" })).is_err());
+        assert!(
+            serde_json::from_value::<ClientUpdateAgentRequest>(json!({ "llm": {} }))
+                .unwrap()
+                .llm
+                .unwrap()
+                .is_empty()
+        );
+        let update: ClientUpdateAgentRequest =
+            serde_json::from_value(json!({ "llm": {} })).unwrap();
+        assert!(
+            validate_update_request(&update).is_ok(),
+            "llm alone is a non-empty update"
+        );
+        assert!(!update_needs_restart(&update));
     }
 
     #[test]

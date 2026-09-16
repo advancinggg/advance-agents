@@ -16,10 +16,10 @@ use serde_json::{json, Value};
 
 use advance_client_api::agents::{
     ClientAgentCapability, ClientAgentConfig, ClientAgentDeclaredChild, ClientAgentDeleteResult,
-    ClientAgentDetail, ClientAgentSummary, ClientAgentTemplate, ClientCreateAgentRequest,
-    ClientDeleteAgentRequest, ClientUpdateAgentRequest, MAX_AGENT_CONFIG_BYTES,
-    MAX_DISPLAY_NAME_BYTES, MAX_REQUESTED_CAPABILITIES, MAX_WORKSPACE_PATH_DEPTH,
-    WARNING_RESTART_REQUIRED,
+    ClientAgentDetail, ClientAgentLlm, ClientAgentSummary, ClientAgentTemplate,
+    ClientCreateAgentRequest, ClientDeleteAgentRequest, ClientUpdateAgentRequest,
+    MAX_AGENT_CONFIG_BYTES, MAX_DISPLAY_NAME_BYTES, MAX_REQUESTED_CAPABILITIES,
+    MAX_WORKSPACE_PATH_DEPTH, WARNING_RESTART_REQUIRED,
 };
 use advance_client_api::audit::RecordingSink;
 use advance_client_api::clock::{Clock, TestClock};
@@ -31,6 +31,7 @@ use advance_client_api::schema::generate_schema_artifact;
 use advance_client_api::{
     AgentAdminProvider, ClientApi, ClientApiConfig, ClientCapParam, ClientEnvelope,
     ClientErrorCode, ClientRequest, ClientSession, Platform, Principal, ProviderError, Scope,
+    UNKNOWN_PROVIDER_DETAIL,
 };
 
 // ── Recording in-memory provider ─────────────────────────────────────────────────────────────
@@ -41,6 +42,7 @@ struct AgentRecord {
     config_yaml: Option<String>,
     capabilities: Vec<String>,
     children: Vec<String>,
+    llm: Option<ClientAgentLlm>,
 }
 
 #[derive(Default)]
@@ -81,6 +83,7 @@ impl MemoryAgentAdmin {
                 config_yaml: Some("capabilities:\n  fs: true\n  llm: true\n".into()),
                 capabilities: vec!["fs".into(), "llm".into()],
                 children: vec!["research".into()],
+                llm: None,
             },
         );
         agents.insert(
@@ -98,6 +101,11 @@ impl MemoryAgentAdmin {
                 config_yaml: None,
                 capabilities: vec!["fs".into()],
                 children: vec![],
+                llm: Some(ClientAgentLlm {
+                    provider: Some("local".into()),
+                    model: Some("tiny".into()),
+                    constraint: None,
+                }),
             },
         );
         Arc::new(Self {
@@ -142,6 +150,7 @@ impl MemoryAgentAdmin {
                     capabilities: vec!["fs".into()],
                     children: vec![],
                 }],
+                llm: rec.llm.clone(),
             },
             capabilities: rec.capabilities.clone(),
             children: rec.children.clone(),
@@ -195,6 +204,11 @@ impl AgentAdminProvider for MemoryAgentAdmin {
         if request.template_ref == "no-such-template" {
             return Err(ProviderError::InvalidRequest("template".into()));
         }
+        if let Some(llm) = &request.llm {
+            if llm.provider.as_deref() == Some("ghost") {
+                return Err(ProviderError::UnknownProvider("ghost".into()));
+            }
+        }
         let rec = AgentRecord {
             summary: ClientAgentSummary {
                 agent_id: request.agent_id.clone(),
@@ -211,6 +225,7 @@ impl AgentAdminProvider for MemoryAgentAdmin {
             config_yaml: request.config_yaml.clone(),
             capabilities: request.capabilities.clone(),
             children: vec![],
+            llm: request.llm.clone().filter(|l| !l.is_empty()),
         };
         let detail = Self::detail(&rec);
         agents.insert(request.agent_id.clone(), rec);
@@ -248,6 +263,16 @@ impl AgentAdminProvider for MemoryAgentAdmin {
                 return Err(ProviderError::InvalidRequest("subset".into()));
             }
             rec.capabilities = caps.clone();
+        }
+        if let Some(llm) = &request.llm {
+            if llm.provider.as_deref() == Some("ghost") {
+                return Err(ProviderError::UnknownProvider("ghost".into()));
+            }
+            rec.llm = if llm.is_empty() {
+                None
+            } else {
+                Some(llm.clone())
+            };
         }
         Ok(Self::detail(rec))
     }
@@ -1088,6 +1113,7 @@ fn ag16_contract_surface_registered() {
         "ClientCreateAgentRequest",
         "ClientUpdateAgentRequest",
         "ClientDeleteAgentRequest",
+        "ClientAgentLlm",
     ] {
         assert!(comps.contains_key(dto), "schema missing {dto}");
     }
@@ -1096,6 +1122,7 @@ fn ag16_contract_surface_registered() {
         "ClientAgentDetail",
         "ClientAgentDeleteResult",
         "ClientAgentTemplate",
+        "ClientAgentLlm",
     ] {
         assert!(RESPONSE_COMPONENTS.contains(&r), "{r} inventoried");
     }
@@ -1165,9 +1192,14 @@ fn ag18_dto_wire_shape() {
         config_yaml: None,
         capabilities: vec![],
         declared_children: vec![],
+        llm: None,
     };
     let v = serde_json::to_value(&cfg).unwrap();
     assert!(v.get("config_yaml").is_none());
+    assert!(
+        v.get("llm").is_none(),
+        "an absent llm block is not serialized as null"
+    );
     assert_eq!(v["capabilities"], json!([]));
 }
 
@@ -1246,4 +1278,140 @@ fn ag19_capabilities_read_and_update() {
         "k-caps-superset",
     ));
     assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest));
+}
+
+// ── AG-20 (lane agent-llm-policy): the typed llm block reads, updates, validates, projects ────
+#[test]
+fn ag20_llm_policy_read_update_and_validation() {
+    let provider = MemoryAgentAdmin::new();
+    let (api, _) = api_with(provider.clone());
+    operator(&api);
+
+    // Read: the block is projected on the detail; an absent block is absent (not null).
+    let d = detail(&api.handle(get("/client/agents/research")));
+    let llm = d.config.llm.clone().expect("research carries an llm block");
+    assert_eq!(llm.provider.as_deref(), Some("local"));
+    assert_eq!(llm.model.as_deref(), Some("tiny"));
+    assert!(llm.constraint.is_none());
+    let env = api.handle(get("/client/agents/default-agent"));
+    assert!(env.data.as_ref().unwrap()["config"].get("llm").is_none());
+
+    // Update: whole-block replacement reaches the provider; NO restart warning for llm alone.
+    let env = api.handle(post(
+        "/client/agents/research:update",
+        json!({ "llm": { "provider": "openai", "constraint": "never-cloud" } }),
+        "k-llm-1",
+    ));
+    let d = detail(&env);
+    let llm = d.config.llm.clone().unwrap();
+    assert_eq!(llm.provider.as_deref(), Some("openai"));
+    assert!(
+        llm.model.is_none(),
+        "whole-block replacement drops the old model"
+    );
+    assert_eq!(llm.constraint.as_deref(), Some("never-cloud"));
+    assert!(
+        !has_warning(&env, WARNING_RESTART_REQUIRED),
+        "an llm-only update applies at the next LLM call"
+    );
+    let (id, req) = provider.last_update.lock().unwrap().clone().unwrap();
+    assert_eq!(id, "research");
+    assert_eq!(
+        req.llm,
+        Some(ClientAgentLlm {
+            provider: Some("openai".into()),
+            model: None,
+            constraint: Some("never-cloud".into()),
+        })
+    );
+
+    // llm + a config document still warns (the document part needs a restart).
+    let env = api.handle(post(
+        "/client/agents/research:update",
+        json!({ "config_yaml": "capabilities:\n  fs: true\n", "llm": { "model": "tiny" } }),
+        "k-llm-2",
+    ));
+    assert!(env.is_ok());
+    assert!(has_warning(&env, WARNING_RESTART_REQUIRED));
+
+    // `{}` clears the block (a non-empty update).
+    let env = api.handle(post(
+        "/client/agents/research:update",
+        json!({ "llm": {} }),
+        "k-llm-3",
+    ));
+    assert!(detail(&env).config.llm.is_none());
+
+    // Root agent accepts an llm update too.
+    let env = api.handle(post(
+        "/client/agents/default-agent:update",
+        json!({ "llm": { "model": "sonnet" } }),
+        "k-llm-root",
+    ));
+    assert_eq!(
+        detail(&env).config.llm.unwrap().model.as_deref(),
+        Some("sonnet")
+    );
+
+    // Handler-side grammar: rejected BEFORE the provider.
+    let before = provider.calls.update.load(Ordering::SeqCst);
+    for (bad, label) in [
+        (json!({ "provider": "agent:x" }), "provider charset"),
+        (json!({ "provider": "" }), "provider empty"),
+        (json!({ "model": "a b" }), "model whitespace"),
+        (json!({ "model": "x".repeat(129) }), "model bound"),
+        (json!({ "constraint": "gpu-only" }), "constraint grammar"),
+        (json!({ "constraint": "device:" }), "device empty"),
+        (json!({ "constraint": "device:a b" }), "device charset"),
+        (json!({ "providr": "x" }), "unknown key"),
+        (json!("local"), "wrong type"),
+    ] {
+        let env = api.handle(post(
+            "/client/agents/research:update",
+            json!({ "llm": bad }),
+            &format!("k-llm-bad-{label}"),
+        ));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{label}");
+    }
+    assert_eq!(provider.calls.update.load(Ordering::SeqCst), before);
+
+    // Provider-side: an unknown provider id is invalid_request + the stable detail token.
+    let env = api.handle(post(
+        "/client/agents/research:update",
+        json!({ "llm": { "provider": "ghost" } }),
+        "k-llm-ghost",
+    ));
+    assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest));
+    assert_eq!(
+        env.error.as_ref().unwrap().details,
+        vec![UNKNOWN_PROVIDER_DETAIL.to_string()]
+    );
+    assert_eq!(UNKNOWN_PROVIDER_DETAIL, "unknown_provider");
+
+    // Create carries the block through to the provider and back on the detail.
+    let mut body = create_body();
+    body["llm"] = json!({ "provider": "local", "model": "tiny" });
+    let env = api.handle(post("/client/agents", body, "k-llm-create"));
+    let d = detail(&env);
+    assert_eq!(d.config.llm.unwrap().provider.as_deref(), Some("local"));
+    let last = provider.last_create.lock().unwrap().clone().unwrap();
+    assert_eq!(last.llm.unwrap().model.as_deref(), Some("tiny"));
+    let mut body = create_body();
+    body["agent_id"] = json!("ghostly");
+    body["llm"] = json!({ "provider": "ghost" });
+    let env = api.handle(post("/client/agents", body, "k-llm-create-ghost"));
+    assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest));
+    assert_eq!(
+        env.error.as_ref().unwrap().details,
+        vec![UNKNOWN_PROVIDER_DETAIL.to_string()]
+    );
+
+    // Compat: the block is an inventoried response component with all-optional fields.
+    let art = generate_schema_artifact();
+    let inventory = response_field_inventory(&art.schema).expect("partition holds");
+    let llm = &inventory["ClientAgentLlm"];
+    assert!(!llm["provider"].required && !llm["model"].required && !llm["constraint"].required);
+    assert!(inventory["ClientAgentConfig"]
+        .keys()
+        .any(|k| k.starts_with("llm")));
 }

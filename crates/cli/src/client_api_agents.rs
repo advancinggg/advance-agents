@@ -23,20 +23,28 @@
 //! consistency: each declared child's `capabilities` must be covered by its parent's (the root's
 //! active capabilities for top-level children), otherwise the request is refused — the API can
 //! never persist a hierarchy the next daemon start would abort on.
+//!
+//! Lane agent-llm-policy (2026-09-16): a create/update `llm` block is written as the top-level
+//! `llm:` key of the TARGET agent's own `.agent/config.yaml` (every other key kept; the root's
+//! document included). `llm.provider` must name an `llm-providers[].id` of the LIVE runtime
+//! config (`RuntimeConfigProvider::current()`), otherwise `UnknownProvider`. The gateway's
+//! `WorkspaceAgentLlmPolicy` re-reads the file by mtime, so the block applies at the agent's
+//! next LLM call — no restart.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use advance_client_api::agents::{
     validate_display_name, ClientAgentCapability, ClientAgentConfig, ClientAgentDeclaredChild,
-    ClientAgentDeleteResult, ClientAgentDetail, ClientAgentSummary, ClientAgentTemplate,
-    ClientCreateAgentRequest, ClientDeleteAgentRequest, ClientUpdateAgentRequest,
-    MAX_AGENT_CONFIG_BYTES,
+    ClientAgentDeleteResult, ClientAgentDetail, ClientAgentLlm, ClientAgentSummary,
+    ClientAgentTemplate, ClientCreateAgentRequest, ClientDeleteAgentRequest,
+    ClientUpdateAgentRequest, MAX_AGENT_CONFIG_BYTES,
 };
 use advance_client_api::{AgentAdminProvider, ClientApi, ClientCapParam, ProviderError};
 use advance_home::TopLevelDisplayName;
 use advance_messaging::MailboxStore;
 use advance_run_manager::RunManager;
+use advance_runtime::config::RuntimeConfigProvider;
 use advance_shared_types::agent_tree::{
     AgentId, AgentKind, AgentNode, AgentStatus, AgentTreeReader, AgentTreeSnapshot, Capability,
 };
@@ -53,7 +61,10 @@ use cap_lifecycle::{
 };
 use serde_yml::{Mapping, Value};
 
-use crate::agent_config::{parse_agents_config, read_agent_yaml, AgentDecl};
+use crate::agent_config::{
+    parse_agent_llm_config, parse_agents_config, read_agent_yaml, upsert_llm_block, AgentDecl,
+    AgentLlmDecl,
+};
 
 const AGENT_DIR: &str = ".agent";
 const CONFIG_FILE: &str = "config.yaml";
@@ -68,6 +79,8 @@ pub struct AgentAdminAdapter {
     templates: Arc<dyn TemplateResolver>,
     root_id: AgentId,
     workspace_root: PathBuf,
+    /// The live runtime config: `llm.provider` ids are validated against its `llm-providers`.
+    config: Arc<dyn RuntimeConfigProvider>,
     /// Serializes every mutation: tree edits + root-config rewrites must not interleave.
     mutation: Mutex<()>,
 }
@@ -79,6 +92,7 @@ impl AgentAdminAdapter {
         terminator: Arc<dyn TerminateController>,
         templates: Arc<dyn TemplateResolver>,
         root_id: AgentId,
+        config: Arc<dyn RuntimeConfigProvider>,
     ) -> Self {
         let workspace_root = tree.workspace_root().to_path_buf();
         Self {
@@ -88,6 +102,7 @@ impl AgentAdminAdapter {
             templates,
             root_id,
             workspace_root,
+            config,
             mutation: Mutex::new(()),
         }
     }
@@ -284,6 +299,29 @@ impl AgentAdminAdapter {
         self.write_document(&root_ws, &doc)
     }
 
+    // ── llm policy block (lane agent-llm-policy) ─────────────────────────────────────────────
+
+    /// `llm.provider` must name a configured `llm-providers[].id` (the live config, so a provider
+    /// added by a hot-reload is accepted without a restart).
+    fn validate_llm_provider(&self, llm: &ClientAgentLlm) -> Result<(), ProviderError> {
+        if let Some(provider) = &llm.provider {
+            let cfg = self.config.current();
+            if !cfg.llm_providers.iter().any(|p| &p.id == provider) {
+                return Err(ProviderError::UnknownProvider(provider.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace (or, for an empty block, remove) the top-level `llm:` key of the agent's own
+    /// config document, keeping every other key.
+    fn write_llm_block(&self, workspace: &Path, llm: &ClientAgentLlm) -> Result<(), ProviderError> {
+        let mut doc = self.load_document(workspace)?;
+        let decl = llm_to_decl(llm);
+        upsert_llm_block(&mut doc, Some(&decl));
+        self.write_document(workspace, &doc)
+    }
+
     // ── validation ───────────────────────────────────────────────────────────────────────────
 
     /// Validate a replacement config document with the runtime's own readers: bounded, YAML that
@@ -383,6 +421,9 @@ impl AgentAdminProvider for AgentAdminAdapter {
         if let Some(yaml) = &request.config_yaml {
             self.validate_config_document(yaml)?;
         }
+        if let Some(llm) = &request.llm {
+            self.validate_llm_provider(llm)?;
+        }
         if let Some(name) = &request.display_name {
             validate_display_name(name)
                 .map_err(|_| ProviderError::InvalidRequest("display name".into()))?;
@@ -439,6 +480,10 @@ impl AgentAdminProvider for AgentAdminAdapter {
         if let Some(yaml) = &request.config_yaml {
             self.write_config_text(&node.workspace_path, yaml)?;
         }
+        // The llm block goes in AFTER the document so it wins over a block the document carries.
+        if let Some(llm) = &request.llm {
+            self.write_llm_block(&node.workspace_path, llm)?;
+        }
         if let Some(name) = &request.display_name {
             TopLevelDisplayName::set(&node.workspace_path, name)
                 .map_err(|_| ProviderError::Unavailable("display name write".into()))?;
@@ -453,6 +498,10 @@ impl AgentAdminProvider for AgentAdminAdapter {
     ) -> Result<ClientAgentDetail, ProviderError> {
         let _guard = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let node = self.node(agent_id)?;
+        // Validate the llm block FIRST so a refused provider id leaves nothing half-applied.
+        if let Some(llm) = &request.llm {
+            self.validate_llm_provider(llm)?;
+        }
         if let Some(yaml) = &request.config_yaml {
             self.validate_config_document(yaml)?;
             let replacement = parse_mapping(yaml.as_bytes())
@@ -510,6 +559,11 @@ impl AgentAdminProvider for AgentAdminAdapter {
             if !self.set_declared_capabilities(agent_id, capabilities)? {
                 return Err(ProviderError::InvalidRequest("agent not declared".into()));
             }
+        }
+        if let Some(llm) = &request.llm {
+            // Whole-block replacement of the agent's OWN document's `llm:` key (root included);
+            // `{}` clears it. Applies at the next LLM call (mtime-tracked), no restart.
+            self.write_llm_block(&node.workspace_path, llm)?;
         }
         Ok(self.detail(&node))
     }
@@ -882,6 +936,31 @@ fn manifest_description(manifest_yaml: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn llm_to_decl(llm: &ClientAgentLlm) -> AgentLlmDecl {
+    AgentLlmDecl {
+        provider: llm.provider.clone(),
+        model: llm.model.clone(),
+        constraint: llm.constraint.clone(),
+    }
+}
+
+fn decl_to_llm(decl: &AgentLlmDecl) -> ClientAgentLlm {
+    ClientAgentLlm {
+        provider: decl.provider.clone(),
+        model: decl.model.clone(),
+        constraint: decl.constraint.clone(),
+    }
+}
+
+/// The typed `llm:` view of a document: present and well-formed → `Some`; absent, empty, or
+/// malformed → `None` (the verbatim text still carries it).
+fn project_llm(yaml: &str) -> Option<ClientAgentLlm> {
+    parse_agent_llm_config(Some(yaml.as_bytes()))
+        .ok()
+        .flatten()
+        .map(|decl| decl_to_llm(&decl))
+}
+
 fn declared_child(decl: &AgentDecl) -> ClientAgentDeclaredChild {
     ClientAgentDeclaredChild {
         alias: decl.alias.clone(),
@@ -907,6 +986,7 @@ pub fn project_config(yaml: Option<&str>) -> ClientAgentConfig {
             config_yaml: None,
             capabilities: Vec::new(),
             declared_children: Vec::new(),
+            llm: None,
         };
     };
     let Ok(decls) = parse_agents_config(Some(yaml.as_bytes())) else {
@@ -914,6 +994,7 @@ pub fn project_config(yaml: Option<&str>) -> ClientAgentConfig {
             config_yaml: Some(yaml.to_string()),
             capabilities: Vec::new(),
             declared_children: Vec::new(),
+            llm: None,
         };
     };
     let mut capabilities = Vec::new();
@@ -960,6 +1041,7 @@ pub fn project_config(yaml: Option<&str>) -> ClientAgentConfig {
         config_yaml: Some(yaml.to_string()),
         capabilities,
         declared_children: decls.iter().map(declared_child).collect(),
+        llm: project_llm(yaml),
     }
 }
 
@@ -987,6 +1069,25 @@ mod tests {
         assert_eq!(secrets.params[0].key, "scope");
         assert_eq!(cfg.declared_children[0].alias, "r");
         assert_eq!(cfg.declared_children[0].target_path, "teams/r");
+    }
+
+    #[test]
+    fn projects_llm_block() {
+        let cfg = project_config(Some(
+            "capabilities:\n  llm: true\nllm:\n  provider: local\n  model: tiny\n  constraint: device:mac\n",
+        ));
+        let llm = cfg.llm.expect("typed llm view");
+        assert_eq!(llm.provider.as_deref(), Some("local"));
+        assert_eq!(llm.model.as_deref(), Some("tiny"));
+        assert_eq!(llm.constraint.as_deref(), Some("device:mac"));
+        assert!(project_config(Some("capabilities:\n  fs: true\n"))
+            .llm
+            .is_none());
+        // Malformed block: no typed view, verbatim text kept.
+        let cfg = project_config(Some("capabilities:\n  fs: true\nllm:\n  providr: x\n"));
+        assert!(cfg.llm.is_none());
+        assert!(cfg.config_yaml.unwrap().contains("providr"));
+        assert_eq!(cfg.capabilities.len(), 1, "the rest still projects");
     }
 
     #[test]

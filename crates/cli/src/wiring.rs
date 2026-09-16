@@ -169,6 +169,9 @@ pub fn build_llm_gateway(
     repetition: Arc<dyn RepetitionGuardCheck>,
     default_agent_id: String,
     delta_sink: Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
+    // Lane agent-llm-policy: the per-agent `llm:` policy source. `None` = not wired (every
+    // request on the default path; `LlmGateway::has_agent_policy()` answers false).
+    agent_policy: Option<Arc<dyn cap_llm::AgentLlmPolicySource>>,
 ) -> Arc<LlmGateway> {
     let catalog = cap_llm::ModelProfileCatalog::new();
     let mut holds: Vec<Arc<cap_llm::SupervisedChild>> = Vec::new();
@@ -229,19 +232,23 @@ pub fn build_llm_gateway(
             }),
         );
     }
+    let mut gateway = LlmGateway::new(
+        config,
+        chain,
+        budget,
+        event_bus,
+        repetition,
+        default_agent_id,
+    )
+    .with_delta_sink(delta_sink)
+    .with_inference_backends(registry)
+    .with_sidecar_holds(holds)
+    .with_catalog(catalog);
+    if let Some(policy) = agent_policy {
+        gateway = gateway.with_agent_policy(policy);
+    }
     Arc::new(install_live_streaming(
-        LlmGateway::new(
-            config,
-            chain,
-            budget,
-            event_bus,
-            repetition,
-            default_agent_id,
-        )
-        .with_delta_sink(delta_sink)
-        .with_inference_backends(registry)
-        .with_sidecar_holds(holds)
-        .with_catalog(catalog),
+        gateway,
         streaming_chain,
         decoded_detector,
     ))
@@ -2409,6 +2416,16 @@ async fn wire_capabilities_inner(
                 Arc::clone(&llm_delta_hub) as Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
                 Arc::clone(&reply_registry),
             )) as Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
+            // Lane agent-llm-policy: the per-agent `llm:` block source over the SAME tree the
+            // spawn / agents-family paths use (Step 2b), root-only when no tree exists.
+            Some(
+                Arc::new(crate::agent_llm_policy::WorkspaceAgentLlmPolicy::new(
+                    agent_tree.clone(),
+                    DEFAULT_AGENT_ID,
+                    workspace.to_path_buf(),
+                    event_bus_dyn.clone(),
+                )) as Arc<dyn cap_llm::AgentLlmPolicySource>,
+            ),
         );
         // Hold an Arc clone for the composition root before registration
         // moves one into the host-fn handlers (all clones share the one gateway,
@@ -2710,6 +2727,9 @@ async fn wire_capabilities_inner(
                     // `/client/agents/templates` lists installed pack templates too.
                     template_resolver.clone(),
                     AgentId(DEFAULT_AGENT_ID.to_string()),
+                    // Lane agent-llm-policy: `llm.provider` ids validate against the LIVE config
+                    // (the builder is consumed by `build()` above; the host owns the watcher).
+                    host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
                 )))
             }
             _ => None,

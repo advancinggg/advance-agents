@@ -83,6 +83,7 @@ pub const RESPONSE_COMPONENTS: &[&str] = &[
     "ClientPackList",
     "ClientPackInstallResult",
     "ClientPackUninstallResult",
+    "ClientAgentLlm",
 ];
 
 /// Request / filter bodies — not a response-field bag.

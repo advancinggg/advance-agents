@@ -46,8 +46,8 @@ pub mod version;
 
 pub use agents::{
     ClientAgentCapability, ClientAgentConfig, ClientAgentDeclaredChild, ClientAgentDeleteResult,
-    ClientAgentDetail, ClientAgentSummary, ClientAgentTemplate, ClientCreateAgentRequest,
-    ClientDeleteAgentRequest, ClientUpdateAgentRequest,
+    ClientAgentDetail, ClientAgentLlm, ClientAgentSummary, ClientAgentTemplate,
+    ClientCreateAgentRequest, ClientDeleteAgentRequest, ClientUpdateAgentRequest,
 };
 pub use api::{ClientApi, ClientMutationContext, HandlerCtx, HandlerResponse, HandlerSpec};
 pub use audit::{AuditEvent, AuditSink, NoopSink};
@@ -83,7 +83,7 @@ pub use packs::{
 pub use pagination::{Cursor, Page};
 pub use provider::{
     AgentAdminProvider, CostProvider, MessagingProvider, PackAdminProvider, ProviderError,
-    RunControlProvider, ToolsProvider,
+    RunControlProvider, ToolsProvider, UNKNOWN_PROVIDER_DETAIL,
 };
 pub use providers::grants::{
     BoundGrantApprovalPort, BoundGrantMutation, BoundMutationOutcome, ClientCapParam,

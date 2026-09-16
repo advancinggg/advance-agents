@@ -752,12 +752,21 @@ fn direct_adapter(ws: &Path) -> (AgentAdminAdapter, AgentTreeStore) {
         Arc::new(NoopRun),
         Arc::new(NoopWorkspace),
     );
+    // Lane agent-llm-policy: a static runtime config (one provider, `openai`) so the direct
+    // adapter can validate `llm.provider` ids without a daemon.
+    let cfg: advance_runtime::config::RuntimeConfig =
+        serde_yml::from_str(&runtime_yaml().replace(
+            "llm-providers: []",
+            "llm-providers:\n  - id: openai\n    endpoint: https://api.openai.com\n    api-key-secret: openai-api-key\n    model-aliases:\n      gpt: gpt-4o\n    cost-per-mtoken-in: 2.50\n    cost-per-mtoken-out: 10.00\n    rate-limit:\n      requests-per-minute: 1000\n      tokens-per-minute: 400000",
+        ))
+        .expect("direct adapter config parses");
     let adapter = AgentAdminAdapter::new(
         tree.clone(),
         Arc::new(spawner),
         Arc::new(terminator),
         Arc::new(BuiltinTemplateRegistry::new()),
         AgentId(ROOT.into()),
+        Arc::new(cap_llm::StaticConfig(Arc::new(cfg))),
     );
     (adapter, tree)
 }
@@ -771,6 +780,7 @@ fn create_req(id: &str, parent: Option<&str>, path: Option<&str>) -> ClientCreat
         capabilities: Vec::new(),
         display_name: None,
         config_yaml: None,
+        llm: None,
     }
 }
 
@@ -879,6 +889,7 @@ fn aa04_adapter_edge_rules_over_real_tree() {
         display_name: None,
         config_yaml: None,
         capabilities: Some(vec![]),
+        llm: None,
     };
     assert!(matches!(
         adapter.update_agent("guest-child", &caps_update),
@@ -900,6 +911,7 @@ fn aa04_adapter_edge_rules_over_real_tree() {
             "agents:\n  - alias: 'bad alias'\n    template: t\n    target-path: p\n".into(),
         ),
         capabilities: None,
+        llm: None,
     };
     assert!(matches!(
         adapter.update_agent(ROOT, &bad),

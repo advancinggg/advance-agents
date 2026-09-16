@@ -12,6 +12,10 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_config;
+// Lane agent-llm-policy (2026-09-16) — the production `AgentLlmPolicySource`: resolves an
+// agent's `.agent/config.yaml` `llm:` block (provider pin / default model / constraint) for the
+// cap-llm gateway, cached by file mtime.
+pub mod agent_llm_policy;
 pub mod agent_loop;
 // await-leg B-2 (2026-06-22) — production composition glue for the await-replies ↔
 // M008 Run suspend/resume lifecycle: the RunManagerSuspendSink adapter +

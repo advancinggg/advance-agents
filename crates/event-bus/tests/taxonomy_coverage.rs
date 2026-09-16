@@ -227,6 +227,8 @@ const KNOWN_EXTENSIONS: &[&str] = &[
     "runtime.warning",
     "runtime.config_reloaded",
     "fs.read.entry",
+    // Lane agent-llm-policy (2026-09-16; `taxonomy::extensions::AGENT_LLM_POLICY_INVALID`).
+    "agent.llm_policy_invalid",
     // MODULE-018 pack lifecycle (Pack lane P1; `taxonomy::pack::*`).
     "pack.installed",
     "pack.uninstalled",

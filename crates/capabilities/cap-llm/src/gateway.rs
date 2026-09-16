@@ -200,6 +200,9 @@ pub(crate) struct LlmRequestContext {
     pub user_constraints: Vec<crate::placement::UserHardConstraint>,
     pub hard_task_class: bool,
     pub placement: Option<crate::placement::PlacementRecord>,
+    /// Lane agent-llm-policy: whether the caller agent's `llm:` policy shaped this request
+    /// (`Agent`) or nothing applied (`Default`). Emitted as `llm.request.policy_source`.
+    pub policy_source: crate::policy::LlmPolicySource,
 }
 
 /// Winner payload from one hop. Outer generate() is the only success
@@ -297,6 +300,9 @@ pub struct LlmGateway {
     placement_telemetry: Arc<dyn crate::placement::PlacementTelemetry>,
     /// Test-only hop budget. Production `None` uses `cap_http::DEFAULT_TIMEOUT`.
     generate_timeout: Option<Duration>,
+    /// Lane agent-llm-policy: the per-agent policy source consulted before placement on every
+    /// generate / stream request. `None` = not wired (byte-identical to the pre-lane gateway).
+    agent_policy: Option<Arc<dyn crate::policy::AgentLlmPolicySource>>,
 }
 
 impl LlmGateway {
@@ -327,6 +333,7 @@ impl LlmGateway {
             sidecar_holds: Vec::new(),
             placement_telemetry: crate::placement::default_telemetry(),
             generate_timeout: None,
+            agent_policy: None,
         }
     }
 
@@ -344,6 +351,74 @@ impl LlmGateway {
     ) -> Self {
         self.placement_telemetry = telemetry;
         self
+    }
+
+    /// Lane agent-llm-policy: install the per-agent policy source (see [`crate::policy`]).
+    /// Consulted on every generate / stream request BEFORE placement. Non-trait inherent
+    /// builder (CONTRACT-081 frozen); every plain `new` caller stays byte-identical.
+    pub fn with_agent_policy(
+        mut self,
+        source: Arc<dyn crate::policy::AgentLlmPolicySource>,
+    ) -> Self {
+        self.agent_policy = Some(source);
+        self
+    }
+
+    /// Composition witness: is a per-agent policy source installed?
+    pub fn has_agent_policy(&self) -> bool {
+        self.agent_policy.is_some()
+    }
+
+    /// Apply the caller agent's `llm:` policy to `ctx` and return the provider list placement
+    /// may consider:
+    /// - `policy.model` fills an ABSENT `ctx.params.model` (an explicit per-call model wins);
+    /// - `policy.constraint` is appended to `ctx.user_constraints`;
+    /// - `policy.provider` narrows the list to that id — an id missing from the live
+    ///   `llm-providers` FAILS CLOSED (`ModelNotAvailable`), never falls back to the head entry.
+    /// Any applied field marks `ctx.policy_source = Agent`. No source / no policy → the
+    /// borrowed list, untouched (byte-identical to the pre-lane path).
+    fn apply_agent_policy<'a>(
+        &self,
+        ctx: &mut LlmRequestContext,
+        providers: &'a [LlmProviderConfig],
+    ) -> Result<std::borrow::Cow<'a, [LlmProviderConfig]>, LlmError> {
+        let Some(policy) = self
+            .agent_policy
+            .as_ref()
+            .and_then(|source| source.policy_for(&ctx.agent_id))
+        else {
+            return Ok(std::borrow::Cow::Borrowed(providers));
+        };
+        let mut applied = false;
+        if ctx.params.model.is_none() {
+            if let Some(model) = policy.model {
+                ctx.params.model = Some(model);
+                applied = true;
+            }
+        }
+        if let Some(constraint) = policy.constraint {
+            ctx.user_constraints.push(constraint);
+            applied = true;
+        }
+        let list = match policy.provider {
+            Some(pin) => {
+                let filtered: Vec<LlmProviderConfig> =
+                    providers.iter().filter(|p| p.id == pin).cloned().collect();
+                if filtered.is_empty() {
+                    return Err(LlmError::ModelNotAvailable(format!(
+                        "provider {pin} not configured for agent {}",
+                        ctx.agent_id
+                    )));
+                }
+                applied = true;
+                std::borrow::Cow::Owned(filtered)
+            }
+            None => std::borrow::Cow::Borrowed(providers),
+        };
+        if applied {
+            ctx.policy_source = crate::policy::LlmPolicySource::Agent;
+        }
+        Ok(list)
     }
 
     #[cfg(test)]
@@ -691,6 +766,7 @@ impl LlmGateway {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement,
+            policy_source: Default::default(),
         };
         emit_llm_request(self.event_bus.as_ref(), &placeholder_ctx, &model);
         let req = advance_shared_types::inference::InferenceEmbedRequest {
@@ -990,6 +1066,8 @@ impl LlmGateway {
         // --- Preflight/build (pre-reservation; cancellation here strands nothing) ---
         let cfg_now = self.config_provider.current();
         let mut ctx = ctx;
+        // Lane agent-llm-policy: same pre-placement policy application as `generate`.
+        let providers = self.apply_agent_policy(&mut ctx, &cfg_now.llm_providers)?;
         let need = crate::capability::CapabilityNeed {
             tools: ctx.params.tools.as_ref().is_some_and(|t| !t.is_empty()),
             output_schema: ctx.output_schema.is_some(),
@@ -998,7 +1076,7 @@ impl LlmGateway {
             max_tokens: ctx.params.max_tokens,
         };
         let cands = crate::placement::candidates_for(
-            &cfg_now.llm_providers,
+            &providers,
             ctx.params.model.as_deref(),
             &self.catalog,
             &need,
@@ -1006,8 +1084,7 @@ impl LlmGateway {
         )?;
         let rec = crate::placement::place(&cands, &ctx.user_constraints, &[], None)?
             .ok_or_else(|| LlmError::ProviderError("no remaining endpoint".into()))?;
-        let provider_cfg = cfg_now
-            .llm_providers
+        let provider_cfg = providers
             .iter()
             .find(|p| p.id == rec.endpoint_id)
             .cloned()
@@ -1730,6 +1807,7 @@ impl LlmGateway {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement: None,
+            policy_source: Default::default(),
         })
         .await
     }
@@ -1820,6 +1898,9 @@ impl LlmGateway {
         let start = Instant::now();
         let deadline = start + self.generate_timeout.unwrap_or(cap_http::DEFAULT_TIMEOUT);
         let cfg = self.config_provider.current();
+        // Lane agent-llm-policy: the agent's pin / default model / constraint shape the
+        // request BEFORE placement; a pinned provider absent from config fails closed here.
+        let providers = self.apply_agent_policy(&mut ctx, &cfg.llm_providers)?;
         let need = crate::capability::CapabilityNeed {
             tools: ctx.params.tools.as_ref().is_some_and(|t| !t.is_empty()),
             output_schema: ctx.output_schema.is_some(),
@@ -1828,7 +1909,7 @@ impl LlmGateway {
             max_tokens: ctx.params.max_tokens,
         };
         let cands = crate::placement::candidates_for(
-            &cfg.llm_providers,
+            &providers,
             ctx.params.model.as_deref(),
             &self.catalog,
             &need,
@@ -1875,12 +1956,7 @@ impl LlmGateway {
                 }
                 Err(e) => return Err(last_err.unwrap_or(e)),
             };
-            let Some(pcfg) = cfg
-                .llm_providers
-                .iter()
-                .find(|p| p.id == rec.endpoint_id)
-                .cloned()
-            else {
+            let Some(pcfg) = providers.iter().find(|p| p.id == rec.endpoint_id).cloned() else {
                 return Err(LlmError::ModelNotAvailable(rec.endpoint_id.clone()));
             };
             let resolved = crate::provider::make_resolved(&pcfg, rec.model_revision.clone());
@@ -2525,6 +2601,7 @@ impl LlmGatewayInternal for LlmGateway {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement: None,
+            policy_source: Default::default(),
         })
         .await
     }
@@ -2624,6 +2701,7 @@ impl LlmGatewayInternal for LlmGateway {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement: Some(rec),
+            policy_source: Default::default(),
         };
         emit_llm_request(self.event_bus.as_ref(), &placeholder_ctx, &embed_model);
 
@@ -2853,6 +2931,7 @@ impl LlmGateway {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement: None,
+            policy_source: Default::default(),
         };
         match self.generate(ctx).await {
             Ok(mut response) => {
@@ -2924,6 +3003,8 @@ impl LlmGateway {
     ) -> Result<ReadyStream, LlmError> {
         let start = Instant::now();
         let cfg = self.config_provider.current();
+        // Lane agent-llm-policy: same pre-placement policy application as `generate`.
+        let providers = self.apply_agent_policy(&mut ctx, &cfg.llm_providers)?;
         let need = crate::capability::CapabilityNeed {
             tools: ctx.params.tools.as_ref().is_some_and(|t| !t.is_empty()),
             output_schema: ctx.output_schema.is_some(),
@@ -2932,7 +3013,7 @@ impl LlmGateway {
             max_tokens: ctx.params.max_tokens,
         };
         let (rec, provider_cfg, resolved) = self.placed_endpoint(
-            &cfg.llm_providers,
+            &providers,
             ctx.params.model.as_deref(),
             &need,
             &ctx.user_constraints,
@@ -3274,6 +3355,7 @@ impl LlmGateway {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement: None,
+            policy_source: Default::default(),
         })
         .await
     }
@@ -3696,6 +3778,7 @@ mod tests {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement: None,
+            policy_source: Default::default(),
         }
     }
 
@@ -3873,6 +3956,7 @@ mod tests {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement: None,
+            policy_source: Default::default(),
         };
         let result = h.gateway.generate(ctx).await.expect("retry path success");
         assert!(result.parsed_output.is_some());
@@ -4223,6 +4307,7 @@ mod tests {
                 user_constraints: Vec::new(),
                 hard_task_class: false,
                 placement: None,
+                policy_source: Default::default(),
             })
             .await
             .unwrap();
@@ -4328,6 +4413,7 @@ mod tests {
                 user_constraints: Vec::new(),
                 hard_task_class: false,
                 placement: None,
+                policy_source: Default::default(),
             })
             .await
             .unwrap();
@@ -4376,6 +4462,7 @@ mod tests {
                 user_constraints: Vec::new(),
                 hard_task_class: false,
                 placement: None,
+                policy_source: Default::default(),
             })
             .await;
         assert!(matches!(result, Err(LlmError::StructuredOutputFailed(_))));
@@ -4529,6 +4616,7 @@ mod tests {
                     user_constraints: Vec::new(),
                     hard_task_class: false,
                     placement: None,
+                    policy_source: Default::default(),
                 })
                 .await
             }
@@ -5010,6 +5098,7 @@ mod tests {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement: None,
+            policy_source: Default::default(),
         };
         let result = h.gateway.generate(ctx).await.expect("retry should succeed");
         assert_eq!(result.parsed_output.is_some(), true);
@@ -5213,6 +5302,7 @@ mod tests {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement: None,
+            policy_source: Default::default(),
         };
         // tokio::time::advance to skip backoff sleeps
         let fut = gateway.generate(ctx);
@@ -5271,6 +5361,7 @@ mod tests {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement: None,
+            policy_source: Default::default(),
         };
         let fut = gateway.generate(ctx);
         tokio::pin!(fut);
@@ -5378,6 +5469,7 @@ mod tests {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement: None,
+            policy_source: Default::default(),
         };
         let fut = gateway.generate(ctx);
         tokio::pin!(fut);

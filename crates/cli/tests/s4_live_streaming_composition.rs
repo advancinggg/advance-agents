@@ -46,6 +46,11 @@ fn s4_production_composition_installs_live_streaming_with_shared_detector() {
         "default-agent".to_string(),
         Arc::new(advance_shared_types::traits::NotWiredDeltaSink)
             as Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
+        None,
+    );
+    assert!(
+        !wired.has_agent_policy(),
+        "no policy source handed in ⇒ the gateway reports none (lane agent-llm-policy)"
     );
     assert!(
         wired.has_live_streaming(),

@@ -204,6 +204,9 @@ pub enum AgentConfigError {
     YamlAnchorAmplification(usize),
     /// A `capabilities:` entry failed the id charset, was duplicated, or the list is over the cap.
     InvalidCapability(String),
+    /// Lane agent-llm-policy: the `llm:` block exists but is malformed (unknown key, wrong
+    /// shape, bad provider id charset, over-long / multi-line model, unknown constraint).
+    InvalidLlm(String),
 }
 
 impl std::fmt::Display for AgentConfigError {
@@ -227,6 +230,7 @@ impl std::fmt::Display for AgentConfigError {
             AgentConfigError::InvalidCapability(c) => {
                 write!(f, "invalid declared capability: {c:?}")
             }
+            AgentConfigError::InvalidLlm(reason) => write!(f, "llm: {reason}"),
         }
     }
 }
@@ -644,5 +648,269 @@ agents:
             parse_agents_config(Some(yaml.as_bytes())),
             Err(AgentConfigError::YamlAnchorAmplification(_))
         ));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lane agent-llm-policy (2026-09-16) — the per-agent `llm:` policy block.
+//
+// `<workspace>/.agent/config.yaml`:
+//
+//   llm:
+//     provider: local            # llm-providers[].id, optional
+//     model: tiny                # alias key or literal model id, optional
+//     constraint: always-local   # always-local | never-cloud | device:<id>, optional
+//
+// Same reading posture as `agents:`: a wholly-unparseable document degrades to
+// "no block"; a PRESENT but malformed block is a loud error. The API path
+// (client_api_agents.rs) refuses such a block; the call path
+// (agent_llm_policy.rs) treats it as absent and emits `agent.llm_policy_invalid`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Bound on an `llm.model` hint (mirrors the client-api `MAX_LLM_MODEL_BYTES`).
+pub const MAX_LLM_MODEL_BYTES: usize = 128;
+
+/// The typed `llm:` block. `deny_unknown_fields` so a typo'd key fails loudly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLlmDecl {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint: Option<String>,
+}
+
+impl AgentLlmDecl {
+    /// `true` when no field is set (an empty block is equivalent to no block).
+    pub fn is_empty(&self) -> bool {
+        self.provider.is_none() && self.model.is_none() && self.constraint.is_none()
+    }
+}
+
+/// Validate a decoded block: provider id charset (`^[A-Za-z0-9_-]{1,64}$`), a bounded
+/// single-token model hint, and the cap-llm constraint grammar.
+pub fn validate_llm_decl(decl: &AgentLlmDecl) -> Result<(), AgentConfigError> {
+    if let Some(provider) = &decl.provider {
+        cap_lifecycle::validate_agent_id(provider).map_err(|_| {
+            AgentConfigError::InvalidLlm(format!("invalid provider id {provider:?}"))
+        })?;
+    }
+    if let Some(model) = &decl.model {
+        if model.is_empty()
+            || model.len() > MAX_LLM_MODEL_BYTES
+            || model.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(AgentConfigError::InvalidLlm(
+                "model must be a single token of at most 128 bytes".into(),
+            ));
+        }
+    }
+    if let Some(constraint) = &decl.constraint {
+        cap_llm::parse_constraint(constraint)
+            .map_err(|e| AgentConfigError::InvalidLlm(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Parse the `llm:` block from an already-read `.agent/config.yaml` snapshot.
+///
+/// - `None` (no config) / a document that does not parse as YAML / no `llm:` key ⇒ `Ok(None)`.
+/// - `llm:` present ⇒ strict: typed shape (`deny_unknown_fields`) + [`validate_llm_decl`];
+///   an empty mapping (`llm: {}`) or `llm:` with no fields ⇒ `Ok(None)`.
+/// - The same anchor/alias amplification guard as [`parse_agents_config`] runs first.
+pub fn parse_agent_llm_config(
+    yaml: Option<&[u8]>,
+) -> Result<Option<AgentLlmDecl>, AgentConfigError> {
+    let Some(bytes) = yaml else {
+        return Ok(None);
+    };
+    precheck_yaml_anchors(bytes)?;
+    let Ok(value) = serde_yml::from_slice::<serde_yml::Value>(bytes) else {
+        return Ok(None);
+    };
+    let Some(llm_val) = value
+        .as_mapping()
+        .and_then(|m| m.get(serde_yml::Value::String("llm".into())))
+    else {
+        return Ok(None);
+    };
+    if llm_val.is_null() {
+        return Ok(None);
+    }
+    if !llm_val.is_mapping() {
+        return Err(AgentConfigError::InvalidLlm(
+            "llm must be a mapping of provider / model / constraint".into(),
+        ));
+    }
+    let decl: AgentLlmDecl = serde_yml::from_value(llm_val.clone())
+        .map_err(|e| AgentConfigError::InvalidLlm(e.to_string()))?;
+    validate_llm_decl(&decl)?;
+    Ok(if decl.is_empty() { None } else { Some(decl) })
+}
+
+/// Replace (or, with `None` / an empty decl, remove) the top-level `llm:` key of a config
+/// document mapping, leaving every other key untouched. The caller writes the document.
+pub fn upsert_llm_block(doc: &mut serde_yml::Mapping, decl: Option<&AgentLlmDecl>) {
+    let key = serde_yml::Value::String("llm".into());
+    match decl {
+        Some(d) if !d.is_empty() => {
+            let value = serde_yml::to_value(d).expect("AgentLlmDecl serializes");
+            doc.insert(key, value);
+        }
+        _ => {
+            doc.remove(&key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod llm_tests {
+    use super::*;
+
+    #[test]
+    fn llm_block_parses_and_validates() {
+        let yaml = b"capabilities:\n  llm: true\nllm:\n  provider: local\n  model: tiny\n  constraint: always-local\n";
+        let decl = parse_agent_llm_config(Some(yaml)).unwrap().unwrap();
+        assert_eq!(decl.provider.as_deref(), Some("local"));
+        assert_eq!(decl.model.as_deref(), Some("tiny"));
+        assert_eq!(decl.constraint.as_deref(), Some("always-local"));
+        // Partial blocks are fine.
+        let decl = parse_agent_llm_config(Some(b"llm:\n  model: sonnet\n"))
+            .unwrap()
+            .unwrap();
+        assert!(decl.provider.is_none() && decl.constraint.is_none());
+        assert_eq!(decl.model.as_deref(), Some("sonnet"));
+        // device pin
+        let decl = parse_agent_llm_config(Some(b"llm:\n  constraint: device:mac-1\n"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decl.constraint.as_deref(), Some("device:mac-1"));
+    }
+
+    #[test]
+    fn absent_empty_or_unparseable_is_none() {
+        assert!(parse_agent_llm_config(None).unwrap().is_none());
+        assert!(parse_agent_llm_config(Some(b"capabilities:\n  fs: true\n"))
+            .unwrap()
+            .is_none());
+        assert!(parse_agent_llm_config(Some(b"llm: {}\n"))
+            .unwrap()
+            .is_none());
+        assert!(parse_agent_llm_config(Some(b"llm:\n")).unwrap().is_none());
+        // Whole-document breakage degrades like the capability gate (no boot regression).
+        assert!(parse_agent_llm_config(Some(b"{ not: valid: yaml ["))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn present_but_malformed_block_is_loud() {
+        for (yaml, label) in [
+            (&b"llm:\n  providr: local\n"[..], "unknown key"),
+            (b"llm: local\n", "scalar block"),
+            (b"llm:\n  - provider: local\n", "sequence block"),
+            (b"llm:\n  provider: \"agent:x\"\n", "provider charset"),
+            (b"llm:\n  provider: \"\"\n", "provider empty"),
+            (b"llm:\n  model: \"a b\"\n", "model whitespace"),
+            (b"llm:\n  constraint: gpu-only\n", "constraint grammar"),
+            (b"llm:\n  constraint: \"device:\"\n", "device empty"),
+            (b"llm:\n  provider: [a]\n", "provider type"),
+        ] {
+            assert!(
+                matches!(
+                    parse_agent_llm_config(Some(yaml)),
+                    Err(AgentConfigError::InvalidLlm(_))
+                ),
+                "{label}"
+            );
+        }
+        let long = format!("llm:\n  model: {}\n", "x".repeat(MAX_LLM_MODEL_BYTES + 1));
+        assert!(matches!(
+            parse_agent_llm_config(Some(long.as_bytes())),
+            Err(AgentConfigError::InvalidLlm(_))
+        ));
+        let ok = format!("llm:\n  model: {}\n", "x".repeat(MAX_LLM_MODEL_BYTES));
+        assert!(parse_agent_llm_config(Some(ok.as_bytes()))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn upsert_preserves_other_keys_and_round_trips() {
+        let mut doc: serde_yml::Mapping = serde_yml::from_str(
+            "capabilities:\n  fs: true\nagents:\n  - alias: r\n    template: explorer\n    target-path: r\n",
+        )
+        .unwrap();
+        upsert_llm_block(
+            &mut doc,
+            Some(&AgentLlmDecl {
+                provider: Some("local".into()),
+                model: None,
+                constraint: Some("never-cloud".into()),
+            }),
+        );
+        let text = serde_yml::to_string(&serde_yml::Value::Mapping(doc.clone())).unwrap();
+        assert!(text.contains("capabilities:") && text.contains("agents:"));
+        let decl = parse_agent_llm_config(Some(text.as_bytes()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decl.provider.as_deref(), Some("local"));
+        assert!(decl.model.is_none(), "None fields are not written");
+        assert_eq!(decl.constraint.as_deref(), Some("never-cloud"));
+        // Replace, then clear.
+        upsert_llm_block(
+            &mut doc,
+            Some(&AgentLlmDecl {
+                model: Some("tiny".into()),
+                ..Default::default()
+            }),
+        );
+        let text = serde_yml::to_string(&serde_yml::Value::Mapping(doc.clone())).unwrap();
+        let decl = parse_agent_llm_config(Some(text.as_bytes()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decl,
+            AgentLlmDecl {
+                model: Some("tiny".into()),
+                ..Default::default()
+            }
+        );
+        upsert_llm_block(&mut doc, Some(&AgentLlmDecl::default()));
+        assert!(!doc.contains_key(serde_yml::Value::String("llm".into())));
+        upsert_llm_block(&mut doc, None);
+        let text = serde_yml::to_string(&serde_yml::Value::Mapping(doc)).unwrap();
+        assert!(parse_agent_llm_config(Some(text.as_bytes()))
+            .unwrap()
+            .is_none());
+        assert!(text.contains("agents:"));
+    }
+
+    /// The client-api handler grammar and the cli/cap-llm grammar must agree on the same table
+    /// (the handler cannot depend on cap-llm, so the grammar is spelled twice).
+    #[test]
+    fn constraint_grammar_agrees_with_client_api() {
+        for c in [
+            "always-local",
+            "never-cloud",
+            "device:phone",
+            "device:mac.local:1",
+            "",
+            "Always-Local",
+            " always-local",
+            "device",
+            "device:",
+            "device:a b",
+            "device:a/b",
+            "cloud-only",
+        ] {
+            assert_eq!(
+                cap_llm::parse_constraint(c).is_ok(),
+                advance_client_api::agents::validate_llm_constraint(c).is_ok(),
+                "{c:?}"
+            );
+        }
     }
 }

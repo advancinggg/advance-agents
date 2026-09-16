@@ -5,7 +5,7 @@
 //! "NOT in PRD §15.3" doc comments. Coverage tests T71/T72 lock the alignment.
 //!
 //! Canonical entries: 130 across 22 PRD-aligned sub-modules (31 distinct top-level
-//! prefixes). Enumerated extensions: 6 — 3 in `extensions::` plus the 3 MODULE-018
+//! prefixes). Enumerated extensions: 7 — 4 in `extensions::` plus the 3 MODULE-018
 //! `pack::` lifecycle events (Pack lane P1). `runtime.degraded.{reason}`
 //! is documented as a dynamic prefix via `extensions::RUNTIME_DEGRADED_PREFIX` but is
 //! NOT a fixed-string entry in `ALL_EVENT_TYPES` — concrete strings are runtime-formed.
@@ -413,6 +413,14 @@ pub mod extensions {
     /// was shipped in Slice A. The paired `fs.read.exit` is NOT introduced —
     /// no live emit, no enumeration source-of-truth.
     pub const FS_READ_ENTRY: &str = "fs.read.entry";
+
+    /// `agent.llm_policy_invalid` — lane agent-llm-policy (2026-09-16): the cli
+    /// `WorkspaceAgentLlmPolicy` found a PRESENT but malformed `llm:` block in an
+    /// agent's `.agent/config.yaml` while resolving that agent's LLM policy. The
+    /// block is treated as absent (the request proceeds on the default path) and
+    /// this event is emitted ONCE per (agent, file mtime). Payload: `agent_id`,
+    /// `reason` (the parser's message; never config content).
+    pub const AGENT_LLM_POLICY_INVALID: &str = "agent.llm_policy_invalid";
 }
 
 /// MODULE-018 pack-system lifecycle events (Pack lane P1). **NOT in
@@ -622,10 +630,11 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     circuit_breaker::CLOSED,
     circuit_breaker::HALF_OPEN,
     // Total canonical: 130
-    // M019/M001 operational extensions (NOT in PRD §15.3) — 3 enumerated entries
+    // M019/M001 operational extensions (NOT in PRD §15.3) — 4 enumerated entries
     extensions::RUNTIME_WARNING,
     extensions::RUNTIME_CONFIG_RELOADED,
     extensions::FS_READ_ENTRY,
+    extensions::AGENT_LLM_POLICY_INVALID,
     // MODULE-018 pack lifecycle extensions (NOT in PRD §15.3) — 3 enumerated entries
     pack::INSTALLED,
     pack::UNINSTALLED,

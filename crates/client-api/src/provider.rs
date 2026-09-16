@@ -39,6 +39,10 @@ use crate::providers::history::BoundHistoryReadPort;
 use crate::runs::{ClientAgentTreeNode, ClientRunMutation, ClientRunSummary};
 use crate::tools::ClientToolInventory;
 
+/// The `ClientError.details` token carried by an `invalid_request` whose cause is an agent
+/// `llm.provider` that names no configured `llm-providers[].id` (lane agent-llm-policy).
+pub const UNKNOWN_PROVIDER_DETAIL: &str = "unknown_provider";
+
 /// A client-safe provider error. Adapters map raw `RunError`/`MsgError`/`SkillError` to a
 /// `ProviderError` VARIANT (operation-scoped; the only inner-string match is
 /// `MsgError::InvalidTarget("reply_not_authorized")`), and the handler maps `ProviderError` to a
@@ -64,6 +68,10 @@ pub enum ProviderError {
     /// provider (unknown template, unparseable config document, a root agent named by a delete,
     /// a Sub named as a parent, …). → `invalid_request`
     InvalidRequest(String),
+    /// Lane agent-llm-policy: an agent's `llm.provider` names an `llm-providers[].id` that is
+    /// not in the live runtime config. → `invalid_request` with details `["unknown_provider"]`
+    /// (the ONE stable detail token clients may switch on; the inner id is log-only).
+    UnknownProvider(String),
 }
 
 impl ProviderError {
@@ -93,6 +101,10 @@ impl ProviderError {
             }
             ProviderError::InvalidRequest(_) => {
                 (ClientErrorCode::InvalidRequest, "invalid request")
+            }
+            ProviderError::UnknownProvider(_) => {
+                return ClientError::new(ClientErrorCode::InvalidRequest, "invalid request")
+                    .with_details(vec![UNKNOWN_PROVIDER_DETAIL.to_string()]);
             }
         };
         ClientError::new(code, message)
