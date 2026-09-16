@@ -20,7 +20,6 @@
 //! provider and cost attribution are witnessed at the cap-llm level (`policy_tests.rs`).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use advance_cli::agent_config::parse_agent_llm_config;
 use advance_cli::agent_llm_policy::WorkspaceAgentLlmPolicy;

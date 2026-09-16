@@ -370,6 +370,38 @@ pub fn conformance_vectors() -> Value {
                 }
             },
             {
+                // Lane agent-llm-policy: an agent detail carrying the typed `llm` block.
+                "name": "agent_detail_with_llm",
+                "kind": "data",
+                "envelope": {
+                    "api_version": API_VERSION,
+                    "request_id": "req_example_agent_llm",
+                    "data": {
+                        "agent": {
+                            "agent_id": "research",
+                            "kind": "child",
+                            "parent": "default-agent",
+                            "status": "active",
+                            "workspace_path": "research",
+                            "template_ref": "explorer"
+                        },
+                        "config": {
+                            "config_yaml": "capabilities:\n  llm: true\nllm:\n  provider: local\n  model: tiny\n",
+                            "capabilities": [
+                                { "name": "llm", "enabled": true, "auto_grant": true, "params": [] }
+                            ],
+                            "declared_children": [],
+                            "llm": { "provider": "local", "model": "tiny", "constraint": "always-local" }
+                        },
+                        "capabilities": ["llm"],
+                        "children": [],
+                        "driver_present": false
+                    },
+                    "error": null,
+                    "warnings": []
+                }
+            },
+            {
                 "name": "error_unsupported_version",
                 "kind": "error",
                 "envelope": {
