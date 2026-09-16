@@ -62,6 +62,9 @@ pub const PATH_AGENTS: &str = "/client/agents";
 /// Agents family: the templates a create may reference (GET). Its own family so an agent literally
 /// named `templates` can never shadow it.
 pub const PATH_AGENT_TEMPLATES: &str = "/client/agent-templates";
+/// Costs family (lane cost-attribution): per-agent / per-provider LLM spend (GET, body/null DTO).
+pub const PATH_COSTS_AGENTS: &str = "/client/costs/agents";
+pub const PATH_COSTS_PROVIDERS: &str = "/client/costs/providers";
 /// Templated provider-family route patterns (see [`RoutePattern`]).
 pub const TPL_RUN_PAUSE: &str = "/client/runs/{run_id}:pause";
 pub const TPL_RUN_RESUME: &str = "/client/runs/{run_id}:resume";
@@ -78,6 +81,9 @@ pub const TPL_RUN_HISTORY: &str = "/client/runs/{run_id}/history";
 pub const TPL_AGENT_GET: &str = "/client/agents/{agent_id}";
 pub const TPL_AGENT_UPDATE: &str = "/client/agents/{agent_id}:update";
 pub const TPL_AGENT_DELETE: &str = "/client/agents/{agent_id}:delete";
+/// Costs family templated routes: one agent's / one provider's report.
+pub const TPL_COSTS_AGENT_GET: &str = "/client/costs/agents/{agent_id}";
+pub const TPL_COSTS_PROVIDER_GET: &str = "/client/costs/providers/{provider_id}";
 /// One segment of a templated route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Seg {

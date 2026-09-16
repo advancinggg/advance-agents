@@ -43,6 +43,7 @@
 //!    separately through CONTRACT-219 in MODULE-020.
 
 mod clock;
+pub mod cost_ledger;
 mod db_indexer;
 pub mod error;
 mod event_io;
@@ -746,6 +747,18 @@ impl EventBus {
     /// handle holds CLONES of this bus's read substrate (SQLite pool + broadcast
     /// Sender + Clock + clamped retention window); it does NOT hold an
     /// `Arc<EventBus>`, so it never affects the bus's own refcount / shutdown.
+    /// Lane cost-attribution (2026-09-16): the DURABLE per-agent / per-provider
+    /// cost ledger over this bus's `events` table. Available in BOTH modes (the
+    /// sync test bus indexes into SQLite too). The handle holds a CLONE of the
+    /// pool, never an `Arc<EventBus>`.
+    pub fn cost_ledger(&self) -> Arc<dyn advance_shared_types::traits::CostLedgerQuery> {
+        let pool = match &self.mode {
+            EventBusMode::Async(state) => Arc::clone(&state.read_pool),
+            EventBusMode::Sync { db_indexer, .. } => db_indexer.pool(),
+        };
+        Arc::new(cost_ledger::SqliteCostLedger::new(pool))
+    }
+
     pub fn read_api(&self) -> Option<Arc<dyn read_api::ObservabilityReadApi>> {
         match &self.mode {
             EventBusMode::Async(state) => Some(Arc::new(read_api::EventBusReadApi::new(

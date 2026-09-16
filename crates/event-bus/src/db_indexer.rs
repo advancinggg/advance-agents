@@ -58,6 +58,12 @@ pub(crate) struct EventDbIndexer {
 }
 
 impl EventDbIndexer {
+    /// A clone of the indexer's pool (lane cost-attribution: the sync-mode bus
+    /// exposes its durable ledger through the same pool it indexes into).
+    pub(crate) fn pool(&self) -> Arc<Pool<SqliteConnectionManager>> {
+        Arc::clone(&self.pool)
+    }
+
     pub(crate) fn new(db_path: &Path) -> Result<Self, EventBusError> {
         // Strip URI flag: caller-supplied path inputs cannot be reinterpreted as
         // SQLite URI strings (matches M004 handle.rs:91-95).

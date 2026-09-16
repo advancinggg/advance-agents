@@ -1443,6 +1443,10 @@ async fn wire_capabilities_inner(
     // to `bus_concrete` and the error-path `Arc::try_unwrap(bus_concrete)` below is
     // unaffected. `Some` for the production async bus.
     let observability_read_api = bus_concrete.read_api();
+    // Lane cost-attribution: the durable per-agent / per-provider cost ledger over the SAME
+    // bus's `events` table. Like `read_api()`, a pool clone — no strong ref to `bus_concrete`.
+    let cost_ledger_for_api: Arc<dyn advance_shared_types::traits::CostLedgerQuery> =
+        bus_concrete.cost_ledger();
 
     // Step 4 — cap-grant production. On failure, shut down the EventBus so we
     // don't leak its background tasks.
@@ -2705,6 +2709,9 @@ async fn wire_capabilities_inner(
                     agents: agent_admin_for_api
                         .clone()
                         .map(|a| a as Arc<dyn advance_client_api::AgentAdminProvider>),
+                    costs: Some(Arc::new(crate::client_api_costs::LedgerCostProvider::new(
+                        Arc::clone(&cost_ledger_for_api),
+                    ))),
                     ..Default::default()
                 };
                 if let Some((history, events, projector)) = history_events {

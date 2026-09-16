@@ -17,7 +17,7 @@
 //! RememberContentPolicy) `Box<dyn>`-constructible.
 
 use crate::capability::{BudgetDecision, CapParams, GrantDecision, McpToolEntry, ToolEntry};
-use crate::cost::RunCost;
+use crate::cost::{AttributedCost, CostLedgerError, CostWindow, RunCost};
 use crate::event::Event;
 use crate::repetition::{OutputHash, RepetitionDecision, ToolCallSignature};
 
@@ -195,6 +195,62 @@ pub trait CostTrackerQuery: Send + Sync {
     fn query_run(&self, run_id: &str) -> Option<RunCost>;
     fn query_iteration(&self, run_id: &str, iteration: u32) -> Option<RunCost>;
 }
+
+/// Durable cost attribution port (lane cost-attribution, 2026-09-16).
+///
+/// Answers "how much has agent X / provider Y spent" from the PERSISTED
+/// `llm.response` rows of the observability store, so the figures survive a
+/// daemon restart (unlike [`CostTrackerQuery`], which is the in-memory budget
+/// aggregate — see cost-tracker invariant 7 for why the two may differ).
+///
+/// Provided by MODULE-019 event-bus (SQLite `events` table); consumed by
+/// MODULE-020 client-api through a client-api-owned adapter. Dependency-inverted
+/// like [`CostTrackerQuery`] so client-api never imports event-bus.
+///
+/// # Implementer invariants
+///
+/// 1. **Read-only**: no method mutates the store.
+/// 2. **Attribution rule**: a row is attributed to its `Event.agent_id` (the agent
+///    whose turn made the call — NOT rolled up to the parent) and to
+///    `payload.provider` (`"unknown"` when absent). Rows with an empty
+///    `agent_id` are dropped from per-agent views but still count for providers.
+/// 3. **Clamping**: negative / non-numeric `cost_usd` count as `0.0`; token counts
+///    likewise. Mirrors `CostTracker::observe`.
+/// 4. **Bounded output**: list methods return at most
+///    [`MAX_ATTRIBUTION_ROWS`] rows, ordered by `cost_usd` DESC then id ASC.
+/// 5. **Unknown key ⇒ zero**: a total for an id with no rows is the zero
+///    aggregate, not an error — the ledger does not know the agent tree.
+/// 6. **Synchronous**: implementations run a bounded SQLite read on the caller's
+///    thread (client-api's `handle()` is sync).
+pub trait CostLedgerQuery: Send + Sync {
+    /// Per-agent totals over the window.
+    fn agent_totals(&self, window: &CostWindow) -> Result<Vec<AttributedCost>, CostLedgerError>;
+    /// One agent's total over the window (zero aggregate when unknown).
+    fn agent_total(&self, agent_id: &str, window: &CostWindow) -> Result<RunCost, CostLedgerError>;
+    /// One agent's spend split by provider id.
+    fn agent_by_provider(
+        &self,
+        agent_id: &str,
+        window: &CostWindow,
+    ) -> Result<Vec<AttributedCost>, CostLedgerError>;
+    /// Per-provider totals over the window.
+    fn provider_totals(&self, window: &CostWindow) -> Result<Vec<AttributedCost>, CostLedgerError>;
+    /// One provider's total over the window (zero aggregate when unknown).
+    fn provider_total(
+        &self,
+        provider_id: &str,
+        window: &CostWindow,
+    ) -> Result<RunCost, CostLedgerError>;
+    /// One provider's spend split by agent id.
+    fn provider_by_agent(
+        &self,
+        provider_id: &str,
+        window: &CostWindow,
+    ) -> Result<Vec<AttributedCost>, CostLedgerError>;
+}
+
+/// Upper bound on rows returned by any `CostLedgerQuery` list method.
+pub const MAX_ATTRIBUTION_ROWS: usize = 10_000;
 
 /// CONTRACT-183 — per-agent WASM tools-grant allowlist projection (Wave-15 Lane E).
 ///

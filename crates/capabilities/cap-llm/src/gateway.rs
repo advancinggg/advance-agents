@@ -206,6 +206,8 @@ pub(crate) struct LlmRequestContext {
 /// `llm.response` / `tee.succeed` / success-commit emitter.
 struct DispatchOutcome {
     response: ChatResponse,
+    /// The resolved provider that served this hop (cost attribution key).
+    provider_id: String,
     event_cost: f64,
     commit_tokens: u64,
     commit_cost: f64,
@@ -237,6 +239,9 @@ pub(crate) struct ReadyStream {
     pub cost_usd: f64,
     pub latency_ms: u64,
     pub schema_validation: Option<&'static str>,
+    /// The resolved provider id (cost attribution key); `None` only when the
+    /// stream never resolved a provider.
+    pub provider_id: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -647,6 +652,7 @@ impl LlmGateway {
             };
             return Ok(DispatchOutcome {
                 response: chat_response,
+                provider_id: resolved.id.clone(),
                 event_cost: cost,
                 commit_tokens,
                 commit_cost,
@@ -757,6 +763,7 @@ impl LlmGateway {
             latency_ms,
             None,
             None,
+            Some(&resolved.id),
         );
         Ok(resp.vector)
     }
@@ -1082,6 +1089,7 @@ impl LlmGateway {
             Some(self.event_bus.clone()),
             agent_id.clone(),
         );
+        settlement.set_provider_id(&resolved.id);
 
         // CONTRACT-234 tee (ADR 2026-07-22 D6, tee slice T1). `stream_key` is an
         // OPAQUE per-stream id, deliberately NOT the guest's `u64` handle: the handle
@@ -1748,6 +1756,7 @@ impl LlmGateway {
             start.elapsed().as_millis() as u64,
             outcome.structured_retry_attempt,
             outcome.schema_validation,
+            Some(&outcome.provider_id),
         );
         tee.succeed(
             &outcome.response.text,
@@ -2402,6 +2411,7 @@ impl LlmGateway {
                 };
                 return Ok(DispatchOutcome {
                     response: chat_response,
+                    provider_id: resolved.id.clone(),
                     event_cost: attempt_cost,
                     commit_tokens: total_committed_tokens,
                     commit_cost: total_committed_cost,
@@ -2449,6 +2459,7 @@ impl LlmGateway {
                     };
                     return Ok(DispatchOutcome {
                         response: chat_response,
+                        provider_id: resolved.id.clone(),
                         event_cost: attempt_cost,
                         commit_tokens: total_committed_tokens,
                         commit_cost: total_committed_cost,
@@ -2694,6 +2705,7 @@ impl LlmGatewayInternal for LlmGateway {
                             latency_ms,
                             None,
                             None,
+                            Some(&resolved.id),
                         );
                         return Ok(v);
                     }
@@ -3214,6 +3226,7 @@ impl LlmGateway {
             cost_usd: cost,
             latency_ms,
             schema_validation,
+            provider_id: Some(resolved.id.clone()),
         })
     }
 
@@ -3231,6 +3244,7 @@ impl LlmGateway {
             ready.latency_ms,
             None, // structured_retry_attempt — the WIT stream path has no structured retry
             ready.schema_validation,
+            ready.provider_id.as_deref(),
         );
         ready.response
     }
