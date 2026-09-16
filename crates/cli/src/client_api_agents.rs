@@ -41,7 +41,7 @@ use advance_client_api::agents::{
     ClientUpdateAgentRequest, MAX_AGENT_CONFIG_BYTES,
 };
 use advance_client_api::{AgentAdminProvider, ClientApi, ClientCapParam, ProviderError};
-use advance_home::TopLevelDisplayName;
+use advance_home::{TopLevelDisplayName, DISPLAY_NAME_KEY};
 use advance_messaging::MailboxStore;
 use advance_run_manager::RunManager;
 use advance_runtime::config::RuntimeConfigProvider;
@@ -507,24 +507,33 @@ impl AgentAdminProvider for AgentAdminAdapter {
             let replacement = parse_mapping(yaml.as_bytes())
                 .map_err(|_| ProviderError::InvalidRequest("agent config document".into()))?;
             let existing = self.load_document(&node.workspace_path)?;
-            match (
-                replacement.contains_key(str_value("agents")),
-                existing.get(str_value("agents")),
-            ) {
-                // Carry the declared hierarchy over: a capabilities edit never drops it.
-                (false, Some(agents)) => {
-                    let mut merged = replacement;
+            let mut merged = replacement;
+            let mut carried = false;
+            // Carry the declared hierarchy over: a capabilities edit never drops it.
+            if !merged.contains_key(str_value("agents")) {
+                if let Some(agents) = existing.get(str_value("agents")) {
                     merged.insert(str_value("agents"), agents.clone());
-                    self.write_document(&node.workspace_path, &merged)?;
+                    carried = true;
                 }
-                _ => {
-                    if node.kind == AgentKind::Root {
-                        // A root document defines the next boot's root capability set AND (when
-                        // it carries `agents`) the hierarchy: keep them consistent, fail closed.
-                        check_hierarchy_capabilities(yaml)?;
-                    }
-                    self.write_config_text(&node.workspace_path, yaml)?
+            }
+            // Carry the display name over: a document written without the key (an older
+            // client, or a client editing a document read before the name was set) never
+            // silently renames the agent. A `display_name` in the same request wins below.
+            if !merged.contains_key(str_value(DISPLAY_NAME_KEY)) {
+                if let Some(name) = existing.get(str_value(DISPLAY_NAME_KEY)) {
+                    merged.insert(str_value(DISPLAY_NAME_KEY), name.clone());
+                    carried = true;
                 }
+            }
+            if carried {
+                self.write_document(&node.workspace_path, &merged)?;
+            } else {
+                if node.kind == AgentKind::Root {
+                    // A root document defines the next boot's root capability set AND (when
+                    // it carries `agents`) the hierarchy: keep them consistent, fail closed.
+                    check_hierarchy_capabilities(yaml)?;
+                }
+                self.write_config_text(&node.workspace_path, yaml)?
             }
         }
         if let Some(name) = &request.display_name {

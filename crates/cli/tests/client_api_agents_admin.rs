@@ -219,9 +219,18 @@ async fn aa01_crud_over_production_wiring() {
     assert!(is_dir(&research_ws.join(".agent")));
     assert!(research_ws.join(".agent/config.yaml").is_file());
     assert!(research_ws.join(".agent/AGENTS.md").is_file());
+    // The name lives in the config document (`display-name` key); no sidecar file is written.
+    let config = std::fs::read_to_string(research_ws.join(".agent/config.yaml")).unwrap();
+    assert!(config.contains("display-name: Research Desk"), "{config}");
+    assert!(config.contains("template: explorer"), "{config}");
+    assert!(
+        !config.contains("\nname:"),
+        "template `name` must not leak: {config}"
+    );
+    assert!(!research_ws.join(".agent/display-name").exists());
     assert_eq!(
-        std::fs::read_to_string(research_ws.join(".agent/display-name")).unwrap(),
-        "Research Desk"
+        advance_home::TopLevelDisplayName::get(&research_ws).as_deref(),
+        Some("Research Desk")
     );
     let snap = snapshot.snapshot();
     let node = snap
@@ -405,8 +414,52 @@ async fn aa01_crud_over_production_wiring() {
     assert_eq!(d.agent.display_name.as_deref(), Some("R&D"));
     assert_eq!(
         std::fs::read_to_string(research_ws.join(".agent/config.yaml")).unwrap(),
-        "capabilities:\n  fs: true\n  memory:\n    auto-grant: false\n"
+        "capabilities:\n  fs: true\n  memory:\n    auto-grant: false\ndisplay-name: R&D\n"
     );
+
+    // update: display name ONLY is not a capability change — no restart warning, and the rest
+    // of the document is untouched.
+    let env = post(
+        &api,
+        "/client/agents/research:update",
+        json!({ "display_name": "Research" }),
+        "k-update-name",
+    );
+    let d = detail(&env);
+    assert!(
+        !env.warnings
+            .iter()
+            .any(|w| w.code == WARNING_RESTART_REQUIRED),
+        "a rename never asks for a restart"
+    );
+    assert_eq!(d.agent.display_name.as_deref(), Some("Research"));
+    assert_eq!(
+        std::fs::read_to_string(research_ws.join(".agent/config.yaml")).unwrap(),
+        "capabilities:\n  fs: true\n  memory:\n    auto-grant: false\ndisplay-name: Research\n"
+    );
+
+    // update: a whole-document replace that omits `display-name` carries the name over.
+    let env = post(
+        &api,
+        "/client/agents/research:update",
+        json!({ "config_yaml": "capabilities:\n  fs: true\n" }),
+        "k-update-doc-only",
+    );
+    let d = detail(&env);
+    assert_eq!(d.agent.display_name.as_deref(), Some("Research"));
+    assert_eq!(
+        std::fs::read_to_string(research_ws.join(".agent/config.yaml")).unwrap(),
+        "capabilities:\n  fs: true\ndisplay-name: Research\n"
+    );
+    // ...and a replace that carries its own key renames explicitly.
+    let env = post(
+        &api,
+        "/client/agents/research:update",
+        json!({ "config_yaml": "capabilities:\n  fs: true\n  memory:\n    auto-grant: false\ndisplay-name: Desk\n" }),
+        "k-update-doc-name",
+    );
+    let d = detail(&env);
+    assert_eq!(d.agent.display_name.as_deref(), Some("Desk"));
     let memory = d
         .config
         .capabilities
@@ -423,7 +476,7 @@ async fn aa01_crud_over_production_wiring() {
     assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
     assert_eq!(
         std::fs::read_to_string(research_ws.join(".agent/config.yaml")).unwrap(),
-        "capabilities:\n  fs: true\n  memory:\n    auto-grant: false\n",
+        "capabilities:\n  fs: true\n  memory:\n    auto-grant: false\ndisplay-name: Desk\n",
         "a rejected document never touches the file"
     );
     let env = post(

@@ -85,6 +85,8 @@ pub struct ClientAgentSummary {
     pub workspace_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_ref: Option<String>,
+    // Persisted as the `display-name` key of `<workspace>/.agent/config.yaml` (older homes: the
+    // `<workspace>/.agent/display-name` sidecar). Doc comment kept verbatim: it is the schema text.
     /// The user-visible name persisted at `<workspace>/.agent/display-name`, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,

@@ -37,19 +37,23 @@ const GENERAL_PURPOSE_AGENTS_MD: &str =
 You inherit the parent agent's full capabilities. Use them only as required\n\
 for the delegated task and surface notable side effects.\n";
 
-const EXPLORER_MANIFEST: &str = "name: \"explorer\"\n\
+const EXPLORER_MANIFEST: &str = "template: \"explorer\"\n\
+display-name: \"Explorer\"\n\
 description: \"Read-only exploration sub-agent (Slice B built-in template).\"\n\
 default-model: \"sonnet\"\n";
 
-const PLANNER_MANIFEST: &str = "name: \"planner\"\n\
+const PLANNER_MANIFEST: &str = "template: \"planner\"\n\
+display-name: \"Planner\"\n\
 description: \"Plan-decomposition sub-agent (Slice B built-in template).\"\n\
 default-model: \"sonnet\"\n";
 
-const REVIEWER_MANIFEST: &str = "name: \"reviewer\"\n\
+const REVIEWER_MANIFEST: &str = "template: \"reviewer\"\n\
+display-name: \"Reviewer\"\n\
 description: \"Critique-and-flag sub-agent (Slice B built-in template).\"\n\
 default-model: \"sonnet\"\n";
 
-const GENERAL_PURPOSE_MANIFEST: &str = "name: \"general-purpose\"\n\
+const GENERAL_PURPOSE_MANIFEST: &str = "template: \"general-purpose\"\n\
+display-name: \"General Purpose\"\n\
 description: \"Inherits parent's full capabilities (Slice B built-in template).\"\n\
 default-model: \"sonnet\"\n";
 

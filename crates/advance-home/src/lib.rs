@@ -29,7 +29,7 @@ pub use contract::{
 };
 pub use create::create_with_secrets_mode;
 pub use discovery::{write_client_api_discovery, ClientApiDiscovery};
-pub use display_name::TopLevelDisplayName;
+pub use display_name::{TopLevelDisplayName, DISPLAY_NAME_KEY};
 pub use impls::HostWorkspaceHome;
 pub use ports::{AdoptPort, GeneratePathPreflight, PreflightPort, RuntimeLauncher};
 pub use provider::{

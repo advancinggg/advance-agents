@@ -130,7 +130,9 @@ fn ti_t08_spawn_child_with_template_overlays_files() {
     let foo = tree.get_node(&AgentId("foo".to_string())).unwrap();
     let agent = foo.workspace_path.join(".agent");
     let config = std::fs::read_to_string(agent.join("config.yaml")).unwrap();
-    assert!(config.contains("name: \"explorer\""));
+    assert!(config.contains("template: \"explorer\""));
+    assert!(config.contains("display-name: \"Explorer\""));
+    assert!(!config.contains("name: \"explorer\""));
     let agents_md = std::fs::read_to_string(agent.join("AGENTS.md")).unwrap();
     assert!(agents_md.contains("Self-Improvement Guidelines"));
     let knowledge = std::fs::read_to_string(agent.join("memory/knowledge.jsonl")).unwrap();
