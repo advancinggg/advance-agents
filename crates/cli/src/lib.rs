@@ -50,6 +50,8 @@ pub mod observation_projection;
 // resolver + the PackEvaluatorResolver + a DefaultMaterializer, consumed by
 // `wiring.rs`. The `advance pack install|list|uninstall` admin surface lives in
 // `commands/pack.rs`.
+pub mod pack_bridges;
+pub mod pack_production;
 pub mod pack_wiring;
 // PACK-GAP-CLOSURE P3 (2026-09-16) — the production HTTPS `RegistryClient`
 // (`registry:name@version` sources; index GET + sha256-verified, bounded tarball
@@ -115,4 +117,5 @@ pub mod vlm_indexer;
 // cap-skills SkillPersistenceCoordinator on the Initiator::AutoLoop (micro) lane. Closes
 // the Wave-17 strict-hold (no production `impl SkillRollback`). cli-only.
 pub mod skill_rollback_bridge;
+pub mod tool_exposure;
 pub mod wiring;

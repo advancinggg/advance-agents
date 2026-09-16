@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p2")]
 //! GAP-05 (P2, exposure leg) — installed resource-capabilities' `tools[]` reconciled against
 //! host-native tools in the ToolRegistry. See docs/plans/PACK-GAP-CLOSURE.md §3.3.
 

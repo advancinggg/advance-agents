@@ -5,7 +5,8 @@
 //! (`AlreadyInstalled`, `DependentsExist`, `UnknownRequiredCapability`, total 24)
 //! for the reinstall / uninstall / capability-catalog surface; lane P3 adds 1
 //! (`SignatureInvalid`, total 25) for the signed-manifest surface and redacts
-//! URL userinfo in `GitCloneFailed`'s Display.
+//! URL userinfo in `GitCloneFailed`'s Display; lane P2 adds 1
+//! (`WorkflowStepFailed`, total 26) for the workflow-compensation surface.
 
 use std::path::PathBuf;
 
@@ -166,4 +167,36 @@ pub enum PackError {
     /// whereas a valid signature from an unknown key merely counts as unsigned.
     #[error("signature verification failed for pack {pack}: {reason}")]
     SignatureInvalid { pack: String, reason: String },
+
+    // ─────────────────────────────────────────────────────────────
+    // PACK-GAP-CLOSURE P2 addition (§3.5) — variant 26.
+    /// `WorkflowApplier::apply`: step `i` failed AFTER at least one earlier step
+    /// had already executed. Every earlier successful `spawn-child` /
+    /// `submit-component` was compensated in reverse order (`terminate_child` /
+    /// `withdraw_component` on the executor) BEFORE this error was returned;
+    /// `register-mcp-server` has no compensation (it only returns an id).
+    ///
+    /// - `step` — `"step[{i}]:{type}"` of the failing step.
+    /// - `source` — the failing step's own error (validation or executor).
+    /// - `compensated` — compensations that succeeded, in execution (reverse)
+    ///   order: `"spawn-child:{target_path}"` / `"submit-component:{ref}"`.
+    /// - `compensation_failures` — compensations that themselves failed, as
+    ///   `"{label}: {error}"`; never swallowed. A non-empty list means the
+    ///   admin must reconcile the named resources by hand.
+    ///
+    /// A failure at the FIRST executed step (nothing to undo) surfaces the raw
+    /// step error unchanged, so pre-P2 callers matching `InvalidWorkflow` /
+    /// `MissingSecret` on single-step templates are unaffected.
+    #[error(
+        "workflow {step} failed: {source} (compensated: [{}]; compensation failures: [{}])",
+        .compensated.join(", "),
+        .compensation_failures.join("; ")
+    )]
+    WorkflowStepFailed {
+        step: String,
+        #[source]
+        source: Box<PackError>,
+        compensated: Vec<String>,
+        compensation_failures: Vec<String>,
+    },
 }

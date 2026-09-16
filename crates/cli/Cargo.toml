@@ -19,10 +19,6 @@ path = "src/lib.rs"
 [features]
 default = []
 test-support = []
-# PACK-GAP-CLOSURE gated witness tests (docs/plans/PACK-GAP-CLOSURE.md §0.2).
-# `gap-p1` / `gap-p3` were retired when lanes P1 / P3 landed (their witnesses run in
-# the default gate).
-gap-p2 = []
 
 [[bin]]
 name = "advance"
@@ -132,6 +128,11 @@ cap-lifecycle = { path = "../capabilities/cap-lifecycle" }
 # cli→cap-channel is cycle-free; cap-channel's AC-08 zero-edge constrains
 # cap-channel's OWN manifest, not cli's.
 cap-channel = { path = "../capabilities/cap-channel" }
+# PACK-GAP-CLOSURE P2 (§3.1, #9): `pack_bridges::mcp` turns a pack's
+# `mcp-servers/{name}.yaml` into a `cap_mcp::McpServerEntry` (trust-gated stdio,
+# host-allowlisted http). cap-mcp depends on cap-http / runtime / shared-types
+# only — no cycle.
+cap-mcp = { path = "../capabilities/cap-mcp" }
 async-trait = { workspace = true }
 # /dev WS-A: `#[derive(Deserialize)]` for the POST /msg request body.
 serde = { workspace = true }
@@ -164,6 +165,9 @@ uuid = { workspace = true }
 # already in the graph via pack-manager).
 reqwest = { workspace = true }
 semver = { workspace = true }
+# PACK-GAP-CLOSURE P2 (§3.4, #10): `pack_production::CapSecretsSecretStore` reads the
+# cap-secrets `Secret<String>` through `secrecy::ExposeSecret` (was a dev-dep only).
+secrecy = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -193,7 +197,6 @@ tempfile = { workspace = true }
 futures-core = { workspace = true }
 # /dev WS-A: `secrets_roundtrip` test resolves a value back through SecretStore
 # and reads it via `ExposeSecret`.
-secrecy = { workspace = true }
 # /dev Phase-3 kickoff (2026-06-06): budget_wiring.rs witnesses the production
 # budget mechanism (RunManager + CostTracker cost gate + rounds gate) on the same
 # component graph wiring.rs builds. (advance-run-manager + advance-event-bus +

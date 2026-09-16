@@ -19,6 +19,15 @@
 //! - [`host_fn::register_agent_tools`] — registers `tool-invoke` +
 //!   `list-tools` HostFunctionSpecs under capability `"tools"`.
 //!
+//! ## PACK-GAP-CLOSURE P2 (§3.3, #5)
+//!
+//! - [`HostTool`] + [`LazyToolRegistry::register_host`] — host-native tools
+//!   in the same id namespace as the WASM tools, listed and invoked through
+//!   the same [`ToolRegistry`] surface with the same fail-closed gates
+//!   (`MethodNotFound`, per-method schemas, invoke timeout, `max_result_bytes`).
+//!   Store-backed pack resource-capability tools are host code by necessity
+//!   (tool WASMs link WASI only).
+//!
 //! ## Slice B scope clarifier
 //!
 //! Slice B verifies AC-09/10/11/12/14 at the **dispatch chain layer**
@@ -32,7 +41,7 @@ pub use host_fn::{
     AgentToolsInvokeHandler, AgentToolsListHandler, MAX_TOOL_PARAMS_BYTES,
     MAX_TOOL_STRING_PARAM_BYTES,
 };
-pub use lazy_registry::{LazyRegistryConfig, LazyToolRegistry};
+pub use lazy_registry::{HostTool, LazyRegistryConfig, LazyToolRegistry};
 pub use registry::{
     InMemoryToolRegistry, MethodInfo, ToolDescription, ToolError, ToolInfo, ToolInstance,
     ToolRegistry,

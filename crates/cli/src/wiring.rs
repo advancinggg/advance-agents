@@ -49,7 +49,7 @@ use advance_runtime::config::{
     MasterKeySource, RunBudgetConfig, RuntimeConfigProvider, SecretsConfig,
 };
 use advance_runtime::register_agent_genui;
-use advance_scheduler::{InMemoryComponentSubmitApi, SubmitSubsetGate};
+use advance_scheduler::{ComponentSubmitApi, InMemoryComponentSubmitApi, SubmitSubsetGate};
 use advance_scheduler_auto_loop::DefaultAutoLoopDriver;
 use advance_shared_types::agent_tree::{
     AgentId, AgentKind, AgentNode, AgentStatus, AgentTreeReader, AgentTreeSnapshot, Capability,
@@ -1229,6 +1229,15 @@ async fn wire_capabilities_inner(
         drop(master_key.take());
         None
     };
+    // PACK-GAP-CLOSURE P2 (§3.4, #10): the pack materializer resolves workflow /
+    // mcp `secret-refs` through the SAME cap-secrets store (P1 left the slot
+    // unwired, so every ref was `MissingSecret`). No store (no secrets/llm
+    // declaration) → the slot stays unbound and keeps failing closed.
+    if let Some(store) = secret_store.as_ref() {
+        let _ = pack_wiring.secret_store.bind(Arc::new(
+            crate::pack_production::CapSecretsSecretStore::new(Arc::clone(store)),
+        ));
+    }
 
     // Step 2b — cap-fs agent-tree + resolver + schema (before EventBus → the
     // fallible `AgentTreeStore::new`/`insert_root` leak nothing on failure).
@@ -1780,6 +1789,12 @@ async fn wire_capabilities_inner(
     // registered. The real scheduler owns admission, quota, subset validation,
     // and durable ComponentRegistry persistence; the bridge owns only the WIT
     // shape conversion plus post-commit declaration publication.
+    // PACK-GAP-CLOSURE P2 (§3.4, #10): the scheduler submit API the production
+    // `SchedulerWorkflowExecutor` submits pack workflow components through.
+    let mut pack_submit_api: Option<Arc<dyn ComponentSubmitApi>> = None;
+    // Concrete handle to the bound executor so the lifecycle terminate cascade
+    // (built later, in the agents-family block) can be installed on it.
+    let mut pack_executor: Option<Arc<crate::pack_production::SchedulerWorkflowExecutor>> = None;
     if let Some(component_registry) = component_registry.as_ref() {
         let subset_gate: Arc<dyn SubmitSubsetGate> =
             Arc::new(CapGrantSubmitSubsetGate::new(Arc::clone(&cap_grant.store)));
@@ -1795,6 +1810,7 @@ async fn wire_capabilities_inner(
             }
             .with_subset_gate(subset_gate),
         );
+        pack_submit_api = Some(Arc::clone(&api) as Arc<dyn ComponentSubmitApi>);
         let mut bridge = SchedulerSubmitBridge::new(api, Arc::clone(&sensitive_params_source));
         if let Some(projector) = contract219_projector.as_ref() {
             bridge = bridge.with_contract219(Arc::clone(projector));
@@ -1888,6 +1904,30 @@ async fn wire_capabilities_inner(
             Arc::new(spawner_concrete)
         };
         agent_spawner = Some(Arc::clone(&spawner));
+        // PACK-GAP-CLOSURE P2 (§3.4, #10): the production `WorkflowExecutor` —
+        // `spawn-child` through THIS spawner (template-resolving, observer-bearing),
+        // `submit-component` through the scheduler submit API, `register-mcp-server`
+        // through the trust-gated MCP bridge into `PackWiring::mcp_entries` — bound
+        // into the pack materializer's slot so `apply_workflow` stops failing closed
+        // with `NotImplemented`. Without a scheduler API (no component registry) the
+        // slot stays unbound.
+        if let Some(submit) = pack_submit_api.as_ref() {
+            let executor = Arc::new(crate::pack_production::SchedulerWorkflowExecutor::new(
+                Arc::clone(&spawner),
+                Arc::clone(tree),
+                AgentId(DEFAULT_AGENT_ID.to_string()),
+                Arc::clone(submit),
+                DEFAULT_AGENT_ID,
+                pack_wiring.registry.clone() as Arc<dyn advance_pack_manager::PackRegistry>,
+                pack_wiring.secret_store.clone() as Arc<dyn advance_pack_manager::SecretStore>,
+                pack_wiring.mcp_entries.clone() as Arc<dyn crate::pack_bridges::McpEntrySink>,
+                tokio::runtime::Handle::current(),
+            ));
+            let _ = pack_wiring
+                .workflow_executor
+                .bind(Arc::clone(&executor) as Arc<dyn advance_pack_manager::WorkflowExecutor>);
+            pack_executor = Some(executor);
+        }
         register_agent_spawn(&*registry, spawner);
         // Wave-12 Lane C: register the 3 decomposition host-fns over a
         // `DefaultDecompositionStore` sharing THIS tree + the real `event_bus_dyn`,
@@ -2511,6 +2551,27 @@ async fn wire_capabilities_inner(
         if let Some(root) = skills_root.as_deref() {
             let _registered = register_skill_tools(&tools_concrete, root).await;
         }
+        // PACK-GAP-CLOSURE P2 (§3.3, #5 exposure leg): every installed pack
+        // resource-capability's `tools[].name` must be a registered HOST tool to
+        // be callable; report the gap at boot (WARN — never blocks: an agent just
+        // does not see a tool nobody provides).
+        let exposure = crate::tool_exposure::reconcile_pack_tool_exposure(
+            &tools_concrete,
+            pack_wiring.registry.as_ref(),
+        )
+        .await;
+        if !exposure.missing.is_empty() || !exposure.errors.is_empty() {
+            eprintln!(
+                "advance: WARN {}; missing host tools: [{}]{}",
+                exposure.summary(),
+                exposure.missing.join(", "),
+                if exposure.errors.is_empty() {
+                    String::new()
+                } else {
+                    format!("; unreadable: [{}]", exposure.errors.join("; "))
+                }
+            );
+        }
         let host_slots = Arc::new(HostToolRegistry::new());
         let web_family_active = declares_web && web_cfg_snapshot.mode != WebRunMode::Offline;
         let dispatcher = if web_family_active {
@@ -2626,19 +2687,26 @@ async fn wire_capabilities_inner(
                             Arc::clone(mgr),
                         )) as Arc<dyn cap_lifecycle::terminate::LoopCascade>
                     });
-                let terminator = crate::client_api_agents::build_agent_terminate_controller(
-                    (**tree).clone(),
-                    Arc::clone(&cap_grant.store),
-                    Arc::clone(&client_ingress_store),
-                    Arc::clone(&run_manager),
-                    workspace.to_path_buf(),
-                    resolver,
-                    loop_cascade,
-                );
+                let terminator: Arc<dyn cap_lifecycle::TerminateController> =
+                    Arc::new(crate::client_api_agents::build_agent_terminate_controller(
+                        (**tree).clone(),
+                        Arc::clone(&cap_grant.store),
+                        Arc::clone(&client_ingress_store),
+                        Arc::clone(&run_manager),
+                        workspace.to_path_buf(),
+                        resolver,
+                        loop_cascade,
+                    ));
+                // PACK-GAP-CLOSURE P2 (§3.5): the pack workflow executor compensates a
+                // spawn through this SAME cascade (loop abort, run cancel, mailbox flush,
+                // grant revoke, tree removal), not a bare tree removal.
+                if let Some(executor) = pack_executor.as_ref() {
+                    let _ = executor.set_terminate_controller(Arc::clone(&terminator));
+                }
                 Some(Arc::new(crate::client_api_agents::AgentAdminAdapter::new(
                     (**tree).clone(),
                     Arc::clone(spawner),
-                    Arc::new(terminator),
+                    terminator,
                     // PACK-GAP-CLOSURE P1 (§2.8): the same chained resolver, so
                     // `/client/agents/templates` lists installed pack templates too.
                     template_resolver.clone(),

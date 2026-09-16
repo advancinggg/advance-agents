@@ -48,6 +48,7 @@ dependencies = [
  "cap-http",
  "cap-lifecycle",
  "cap-llm",
+ "cap-mcp",
  "cap-memory",
  "cap-secrets",
  "cap-skills",

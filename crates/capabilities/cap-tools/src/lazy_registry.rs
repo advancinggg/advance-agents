@@ -33,6 +33,19 @@
 //!
 //! See MODULE-017 §2.7 Core Logic Slice B paragraph for the full
 //! contract.
+//!
+//! ## PACK-GAP-CLOSURE P2 (§3.3, #5) — host-native tools
+//!
+//! Tool WASMs only link WASI p2, so a tool that needs host state (a store,
+//! a database handle, a pack resource-capability) must be HOST code. A
+//! [`HostTool`] is registered under the same id namespace as the WASM
+//! tools ([`LazyToolRegistry::register_host`]; duplicate id → error),
+//! appears in `list()` with its `describe()` output, and is invoked by
+//! `invoke()` with the SAME fail-closed gates as a WASM tool: unknown
+//! method → `MethodNotFound`, per-method JSON schemas (compiled once at
+//! registration), `tool_invoke_timeout`, and `max_result_bytes`
+//! (→ `OutputValidationFailed`, never truncation). No WASM bring-up is
+//! involved; `load()` answers immediately.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -163,6 +176,35 @@ impl From<&ToolsConfig> for LazyRegistryConfig {
     }
 }
 
+/// PACK-GAP-CLOSURE P2 (§3.3, #5) — a host-native tool: same agent-facing
+/// contract as a tool WASM (`describe()` → methods; `execute(method, params)`
+/// → bytes), implemented in host code so it can hold state the WASI-only
+/// linker cannot give a guest (stores, database handles, pack resource
+/// capabilities). Registered through [`LazyToolRegistry::register_host`].
+///
+/// Implementations MUST validate `method` themselves only for the methods
+/// they declared — the registry already refuses undeclared methods with
+/// `MethodNotFound` and bounds the result at `max_result_bytes`.
+#[async_trait]
+pub trait HostTool: Send + Sync {
+    /// The tool's methods (and optional per-method JSON schemas). Read ONCE
+    /// at registration and cached — a tool cannot grow methods afterwards.
+    fn describe(&self) -> ToolDescription;
+
+    /// Run `method` with the raw `params` bytes. The registry applies the
+    /// invoke timeout and the result cap around this call.
+    async fn execute(&self, method: &str, params: &[u8]) -> Result<Vec<u8>, ToolError>;
+}
+
+/// Registered host tool + its cached description and load-time-compiled
+/// per-method schemas (the [`LoadedTool`] equivalent for host code).
+struct HostToolEntry {
+    tool: Arc<dyn HostTool>,
+    description: ToolDescription,
+    input_schemas: HashMap<String, CompiledSchema>,
+    output_schemas: HashMap<String, CompiledSchema>,
+}
+
 /// Per-method JSON-Schema compiled ONCE at tool load (Slice F adversarial
 /// round-11 W1/W2 fix). `Valid` holds the compiled schema, reused across all
 /// invokes of that method (no per-invoke recompile). `Invalid` means a schema
@@ -224,6 +266,9 @@ struct RegistryInner {
     loading: HashMap<String, u64>,
     failed: HashMap<String, String>,
     next_load_epoch: u64,
+    /// PACK-GAP-CLOSURE P2 (§3.3): host-native tools, same id namespace as
+    /// `registry` (a duplicate across the two maps is refused at registration).
+    host: HashMap<String, Arc<HostToolEntry>>,
 }
 
 /// The Slice B production `ToolRegistry` — Slice C adds the optional
@@ -255,6 +300,7 @@ impl LazyToolRegistry {
                 loading: HashMap::new(),
                 failed: HashMap::new(),
                 next_load_epoch: 1,
+                host: HashMap::new(),
             }),
         }
     }
@@ -274,6 +320,7 @@ impl LazyToolRegistry {
                 loading: HashMap::new(),
                 failed: HashMap::new(),
                 next_load_epoch: 1,
+                host: HashMap::new(),
             }),
         }
     }
@@ -298,6 +345,137 @@ impl LazyToolRegistry {
         inner.cache.pop(&id);
     }
 
+    /// PACK-GAP-CLOSURE P2 (§3.3, #5): register a host-native tool under `id`.
+    ///
+    /// Fail-closed at registration (not at first invoke):
+    /// - `id` already registered (as a WASM binary OR a host tool) →
+    ///   `InvocationFailed("duplicate tool id …")` — the namespace is shared;
+    /// - `id` reserved for the web family → `InvocationFailed`;
+    /// - `describe()` larger than [`MAX_TOOL_DESCRIPTION_BYTES`] or declaring
+    ///   the same method twice → `OutputValidationFailed` / `InvocationFailed`.
+    /// Per-method JSON schemas are compiled ONCE here (blocking pool), exactly
+    /// like `bring_up_tool` does for WASM tools; a declared-but-invalid schema
+    /// makes that method fail closed at invoke.
+    pub async fn register_host(
+        &self,
+        id: impl Into<String>,
+        tool: Arc<dyn HostTool>,
+    ) -> Result<(), ToolError> {
+        let id = id.into();
+        if id.is_empty() {
+            return Err(ToolError::InvocationFailed(
+                "host tool id must not be empty".into(),
+            ));
+        }
+        if crate::web::is_web_tool_id(&id) {
+            return Err(ToolError::InvocationFailed(format!(
+                "tool id {id:?} is reserved for the web tool family"
+            )));
+        }
+        let description = tool.describe();
+        let serialized = serde_json::to_vec(&description)
+            .map_err(|e| ToolError::InvocationFailed(format!("describe serialize: {e}")))?;
+        if serialized.len() > MAX_TOOL_DESCRIPTION_BYTES {
+            return Err(ToolError::OutputValidationFailed(format!(
+                "tool description exceeds MAX_TOOL_DESCRIPTION_BYTES ({} > {})",
+                serialized.len(),
+                MAX_TOOL_DESCRIPTION_BYTES
+            )));
+        }
+        {
+            let mut seen = std::collections::HashSet::new();
+            for m in &description.methods {
+                if !seen.insert(m.name.as_str()) {
+                    return Err(ToolError::InvocationFailed(format!(
+                        "host tool {id:?} declares method {:?} twice",
+                        m.name
+                    )));
+                }
+            }
+        }
+        let methods = description.methods.clone();
+        let (input_schemas, output_schemas) =
+            tokio::task::spawn_blocking(move || compile_method_schemas(&methods))
+                .await
+                .map_err(|e| {
+                    ToolError::InvocationFailed(format!("schema compile join error: {e}"))
+                })?;
+        let entry = Arc::new(HostToolEntry {
+            tool,
+            description,
+            input_schemas,
+            output_schemas,
+        });
+        let mut inner = self.inner.lock().await;
+        if inner.registry.contains_key(&id) || inner.host.contains_key(&id) {
+            return Err(ToolError::InvocationFailed(format!(
+                "duplicate tool id {id:?}: already registered"
+            )));
+        }
+        inner.host.insert(id, entry);
+        Ok(())
+    }
+
+    /// PACK-GAP-CLOSURE P2 (§3.3): the ids of every registered host-native
+    /// tool, sorted. The composition root's pack-tool exposure reconciliation
+    /// matches installed resource-capability `tools[].name` against THIS set
+    /// (a store-backed capability tool can only be host code).
+    pub async fn host_tool_ids(&self) -> Vec<String> {
+        let inner = self.inner.lock().await;
+        let mut ids: Vec<String> = inner.host.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    async fn host_entry(&self, tool_id: &str) -> Option<Arc<HostToolEntry>> {
+        let inner = self.inner.lock().await;
+        inner.host.get(tool_id).cloned()
+    }
+
+    /// The host-tool invoke path: declared-method check → input schema gate →
+    /// `execute` under `tool_invoke_timeout` → output schema gate →
+    /// `max_result_bytes` (fail-closed, no truncation). Mirrors the WASM
+    /// path's gate order minus the bring-up.
+    async fn invoke_host(
+        &self,
+        entry: &HostToolEntry,
+        method: &str,
+        params: &[u8],
+    ) -> Result<Vec<u8>, ToolError> {
+        if !entry.description.methods.iter().any(|m| m.name == method) {
+            return Err(ToolError::MethodNotFound(method.to_string()));
+        }
+        let timeout = self.config.tool_invoke_timeout;
+        let max_result = self.config.max_result_bytes;
+        validate_schema_gate(
+            &entry.input_schemas,
+            method,
+            params,
+            timeout,
+            GateSide::Input,
+        )
+        .await?;
+        let bytes = tokio::time::timeout(timeout, entry.tool.execute(method, params))
+            .await
+            .map_err(|_| ToolError::InvocationFailed("invoke timeout".into()))??;
+        validate_schema_gate(
+            &entry.output_schemas,
+            method,
+            &bytes,
+            timeout,
+            GateSide::Output,
+        )
+        .await?;
+        if bytes.len() > max_result {
+            return Err(ToolError::OutputValidationFailed(format!(
+                "tool result exceeds max_result_bytes ({} > {})",
+                bytes.len(),
+                max_result
+            )));
+        }
+        Ok(bytes)
+    }
+
     /// Explicit cache eviction for tests. In production, eviction is
     /// implicit when `LruCache::put` overflows the capacity.
     pub async fn evict_id(&self, id: &str) {
@@ -316,6 +494,12 @@ impl LazyToolRegistry {
 #[async_trait]
 impl ToolRegistry for LazyToolRegistry {
     async fn load(&self, tool_id: &str) -> Result<ToolInstance, ToolError> {
+        // P2: a host tool needs no bring-up — it is loaded by definition.
+        if self.host_entry(tool_id).await.is_some() {
+            return Ok(ToolInstance {
+                tool_id: tool_id.to_string(),
+            });
+        }
         load_inner(self, tool_id).await.map(|loaded| ToolInstance {
             tool_id: loaded.tool_id.clone(),
         })
@@ -327,6 +511,11 @@ impl ToolRegistry for LazyToolRegistry {
         method: &str,
         params: &[u8],
     ) -> Result<Vec<u8>, ToolError> {
+        // P2 (§3.3): host-native tools take the host path — no WASM bring-up,
+        // same fail-closed gates (see `invoke_host`).
+        if let Some(entry) = self.host_entry(tool_id).await {
+            return self.invoke_host(&entry, method, params).await;
+        }
         let loaded = load_inner(self, tool_id).await?;
 
         // Slice B preservation: when no tool_engine was supplied, `invoke`
@@ -450,6 +639,15 @@ impl ToolRegistry for LazyToolRegistry {
                     methods: Vec::new(),
                 });
             }
+        }
+        // P2 (§3.3): host-native tools list with their cached describe()
+        // output (same id namespace; registration refused a duplicate).
+        for (id, entry) in &inner.host {
+            out.push(ToolInfo {
+                id: id.clone(),
+                description: entry.description.description.clone(),
+                methods: entry.description.methods.clone(),
+            });
         }
         // Deterministic order across calls (HashMap iteration is unordered).
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1154,86 +1352,88 @@ pub(crate) fn json_check(schema: &jsonschema::JSONSchema, bytes: &[u8]) -> Resul
     }
 }
 
-/// Input gate against the LOAD-TIME-compiled schema cached on `loaded`. No
-/// per-invoke compile (only the cheap `is_valid`, run on the blocking pool under
-/// `timeout`). Absent method → passthrough; `Invalid` (schema declared but
-/// rejected/uncompilable at load) → fail closed; `Valid` → `json_check`.
+/// Which side of the invoke a schema gate guards (selects the error class).
+#[derive(Clone, Copy)]
+enum GateSide {
+    Input,
+    Output,
+}
+
+impl GateSide {
+    fn err(self, msg: &str) -> ToolError {
+        match self {
+            GateSide::Input => ToolError::InputValidationFailed(format!("input {msg}")),
+            GateSide::Output => ToolError::OutputValidationFailed(format!("output {msg}")),
+        }
+    }
+}
+
+/// Schema gate against LOAD-TIME-compiled schemas. No per-invoke compile (only
+/// the cheap `is_valid`, run on the blocking pool under `timeout`). Absent
+/// method → passthrough; `Invalid` (schema declared but rejected/uncompilable at
+/// load) → fail closed; `Valid` → `json_check`. Shared by the WASM path
+/// (`validate_cached_input` / `validate_cached_output`) and the P2 host-tool
+/// path (`LazyToolRegistry::invoke_host`).
+async fn validate_schema_gate(
+    schemas: &HashMap<String, CompiledSchema>,
+    method: &str,
+    bytes: &[u8],
+    timeout: Duration,
+    side: GateSide,
+) -> Result<(), ToolError> {
+    let schema = match schemas.get(method) {
+        None => return Ok(()),
+        Some(CompiledSchema::Invalid) => return Err(side.err("schema invalid (rejected at load)")),
+        Some(CompiledSchema::Valid(s)) => Arc::clone(s),
+    };
+    let owned = bytes.to_vec();
+    match tokio::time::timeout(
+        timeout,
+        tokio::task::spawn_blocking(move || json_check(&schema, &owned)),
+    )
+    .await
+    {
+        Err(_elapsed) => Err(side.err("schema validation timed out")),
+        Ok(Err(_join)) => Err(side.err("schema validation task failed")),
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(GateFail::NotJson))) => Err(side.err("bytes are not valid JSON")),
+        Ok(Ok(Err(GateFail::SchemaFail))) => Err(side.err("schema validation failed")),
+    }
+}
+
+/// Input gate for the WASM path (see [`validate_schema_gate`]).
 async fn validate_cached_input(
     loaded: &LoadedTool,
     method: &str,
     params: &[u8],
     timeout: Duration,
 ) -> Result<(), ToolError> {
-    let schema = match loaded.input_schemas.get(method) {
-        None => return Ok(()),
-        Some(CompiledSchema::Invalid) => {
-            return Err(ToolError::InputValidationFailed(
-                "input schema invalid (rejected at load)".into(),
-            ))
-        }
-        Some(CompiledSchema::Valid(s)) => Arc::clone(s),
-    };
-    let owned = params.to_vec();
-    match tokio::time::timeout(
+    validate_schema_gate(
+        &loaded.input_schemas,
+        method,
+        params,
         timeout,
-        tokio::task::spawn_blocking(move || json_check(&schema, &owned)),
+        GateSide::Input,
     )
     .await
-    {
-        Err(_elapsed) => Err(ToolError::InputValidationFailed(
-            "input schema validation timed out".into(),
-        )),
-        Ok(Err(_join)) => Err(ToolError::InputValidationFailed(
-            "input schema validation task failed".into(),
-        )),
-        Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(GateFail::NotJson))) => Err(ToolError::InputValidationFailed(
-            "input bytes are not valid JSON".into(),
-        )),
-        Ok(Ok(Err(GateFail::SchemaFail))) => Err(ToolError::InputValidationFailed(
-            "input schema validation failed".into(),
-        )),
-    }
 }
 
-/// Output gate (symmetric to [`validate_cached_input`]; maps to
-/// `OutputValidationFailed`).
+/// Output gate for the WASM path (symmetric to [`validate_cached_input`]; maps
+/// to `OutputValidationFailed`).
 async fn validate_cached_output(
     loaded: &LoadedTool,
     method: &str,
     output: &[u8],
     timeout: Duration,
 ) -> Result<(), ToolError> {
-    let schema = match loaded.output_schemas.get(method) {
-        None => return Ok(()),
-        Some(CompiledSchema::Invalid) => {
-            return Err(ToolError::OutputValidationFailed(
-                "output schema invalid (rejected at load)".into(),
-            ))
-        }
-        Some(CompiledSchema::Valid(s)) => Arc::clone(s),
-    };
-    let owned = output.to_vec();
-    match tokio::time::timeout(
+    validate_schema_gate(
+        &loaded.output_schemas,
+        method,
+        output,
         timeout,
-        tokio::task::spawn_blocking(move || json_check(&schema, &owned)),
+        GateSide::Output,
     )
     .await
-    {
-        Err(_elapsed) => Err(ToolError::OutputValidationFailed(
-            "output schema validation timed out".into(),
-        )),
-        Ok(Err(_join)) => Err(ToolError::OutputValidationFailed(
-            "output schema validation task failed".into(),
-        )),
-        Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(GateFail::NotJson))) => Err(ToolError::OutputValidationFailed(
-            "output bytes are not valid JSON".into(),
-        )),
-        Ok(Ok(Err(GateFail::SchemaFail))) => Err(ToolError::OutputValidationFailed(
-            "output schema validation failed".into(),
-        )),
-    }
 }
 
 #[cfg(test)]

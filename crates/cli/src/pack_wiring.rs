@@ -15,11 +15,15 @@
 //!   (`{pack}@{ver}/components/{name}`), installed on the production auto-loop
 //!   driver by `auto_wiring::install_auto_loop_integration_with_evaluator`.
 //! - a [`DefaultMaterializer`] over the registry (the 11 CONTRACT-171
-//!   materializer methods). Its `WorkflowExecutor` / `SecretStore` seams have no
-//!   production implementation until lane P2 (#10, `pack_production.rs`); until
-//!   then they are the fail-closed [`UnwiredWorkflowExecutor`] /
-//!   [`UnwiredSecretStore`] stubs (`PackError::NotImplemented` / no secrets), so
-//!   the workflow + MCP legs are reachable but never silently succeed.
+//!   materializer methods). PACK-GAP-CLOSURE P2 (§3.4, #10): its
+//!   `WorkflowExecutor` / `SecretStore` seams are the one-shot
+//!   [`LateBoundWorkflowExecutor`] / [`LateBoundSecretStore`] slots — the
+//!   production `SchedulerWorkflowExecutor` (spawner + scheduler submit API)
+//!   and `CapSecretsSecretStore` are built LATER in `wiring.rs` (they depend on
+//!   the template resolver / master key this wiring provides) and bound into
+//!   the slots; until then every leg fails closed (`NotImplemented` / no
+//!   secret), never silently succeeding. [`PackWiring::mcp_entries`] is where a
+//!   workflow's `register-mcp-server` entries are retained for the MCP client.
 //!
 //! Boot semantics (fail-closed): a missing `packs_dir` is created (empty
 //! registry — a fresh `advance init` workspace boots); an existing one is
@@ -33,14 +37,10 @@
 //! daemon sees a new pack after restart (rescan-on-boot); live rescan is a
 //! later lane.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use advance_pack_manager::{
-    DefaultMaterializer, InMemoryPackRegistry, McpServerId, PackError, PackRegistry, SecretStore,
-    SecretValue, WorkflowExecutor, WorkflowTrigger,
-};
+use advance_pack_manager::{DefaultMaterializer, InMemoryPackRegistry, PackError, PackRegistry};
 use advance_shared_types::traits::EventBusEmit;
 use cap_lifecycle::pack_template_resolver::PackTemplateResolver;
 use cap_lifecycle::templates::{
@@ -48,6 +48,8 @@ use cap_lifecycle::templates::{
 };
 
 use crate::auto_wiring::PackEvaluatorResolver;
+use crate::pack_bridges::InMemoryMcpEntrySink;
+use crate::pack_production::{LateBoundSecretStore, LateBoundWorkflowExecutor};
 
 /// Boot-time pack wiring failure. Every variant aborts `advance start`.
 #[derive(Debug)]
@@ -100,12 +102,25 @@ pub struct PackWiring {
     pub template_resolver: Arc<dyn TemplateResolver>,
     /// Auto-loop evaluator FQ-ref resolver over `registry`.
     pub evaluator_resolver: Arc<PackEvaluatorResolver>,
-    /// CONTRACT-171 materializer over `registry` (P2 replaces the executor /
-    /// secret-store stubs with production implementations).
+    /// CONTRACT-171 materializer over `registry`, composed over
+    /// `workflow_executor` + `secret_store`.
     pub materializer: Arc<DefaultMaterializer>,
-    /// Reserved for an in-daemon `Installer` (lanes P2/P3): the bus pack
-    /// lifecycle events (`pack.registry_reloaded` / `pack.uninstalled`) would go
-    /// to. The read-only registry/resolvers built here emit nothing.
+    /// P2 (§3.4): the materializer's `WorkflowExecutor` slot. `wiring.rs` binds
+    /// the production `SchedulerWorkflowExecutor` once the spawner and the
+    /// scheduler submit API exist; unbound → every workflow leg is
+    /// `NotImplemented`.
+    pub workflow_executor: Arc<LateBoundWorkflowExecutor>,
+    /// P2 (§3.4): the materializer's `SecretStore` slot. `wiring.rs` binds the
+    /// cap-secrets-backed store once the master key is loaded; unbound → every
+    /// `secret-refs` lookup is `MissingSecret`.
+    pub secret_store: Arc<LateBoundSecretStore>,
+    /// P2 (§3.1): entries a workflow's `register-mcp-server` produced (trust +
+    /// secrets already applied), retained for the MCP client wiring to drain
+    /// into a `McpServersConfig`.
+    pub mcp_entries: Arc<InMemoryMcpEntrySink>,
+    /// Reserved for an in-daemon `Installer`: the bus pack lifecycle events
+    /// (`pack.registry_reloaded` / `pack.uninstalled`) would go to. The
+    /// read-only registry/resolvers built here emit nothing.
     pub event_bus: Option<Arc<dyn EventBusEmit>>,
 }
 
@@ -142,10 +157,12 @@ pub async fn build_pack_wiring(
         Arc::new(PackTemplateResolver::new(dyn_registry.clone())),
     ));
     let evaluator_resolver = Arc::new(PackEvaluatorResolver::new(dyn_registry.clone()));
+    let workflow_executor = Arc::new(LateBoundWorkflowExecutor::new());
+    let secret_store = Arc::new(LateBoundSecretStore::new());
     let materializer = Arc::new(DefaultMaterializer::new(
         dyn_registry,
-        Arc::new(UnwiredWorkflowExecutor),
-        Arc::new(UnwiredSecretStore),
+        Arc::clone(&workflow_executor) as Arc<dyn advance_pack_manager::WorkflowExecutor>,
+        Arc::clone(&secret_store) as Arc<dyn advance_pack_manager::SecretStore>,
     ));
     Ok(PackWiring {
         packs_dir: packs_dir.to_path_buf(),
@@ -153,6 +170,9 @@ pub async fn build_pack_wiring(
         template_resolver,
         evaluator_resolver,
         materializer,
+        workflow_executor,
+        secret_store,
+        mcp_entries: Arc::new(InMemoryMcpEntrySink::new()),
         event_bus,
     })
 }
@@ -196,58 +216,12 @@ impl TemplateResolver for ChainedTemplateResolver {
     }
 }
 
-/// Fail-closed `WorkflowExecutor` for the boot-time materializer: every leg
-/// surfaces `PackError::NotImplemented` until lane P2 (#10) supplies
-/// `SchedulerWorkflowExecutor`. Never silently succeeds.
-pub struct UnwiredWorkflowExecutor;
-
-impl WorkflowExecutor for UnwiredWorkflowExecutor {
-    fn spawn_child(
-        &self,
-        _template_ref: &str,
-        _target_path: &Path,
-        _config: &BTreeMap<String, serde_yml::Value>,
-    ) -> Result<(), PackError> {
-        Err(PackError::NotImplemented(
-            "workflow spawn-child: no production WorkflowExecutor is wired (PACK-GAP-CLOSURE P2 #10)",
-        ))
-    }
-
-    fn submit_component(
-        &self,
-        _component_ref: &str,
-        _trigger: &WorkflowTrigger,
-    ) -> Result<(), PackError> {
-        Err(PackError::NotImplemented(
-            "workflow submit-component: no production WorkflowExecutor is wired (PACK-GAP-CLOSURE P2 #10)",
-        ))
-    }
-
-    fn register_mcp_server(
-        &self,
-        _config_ref: &str,
-        _resolved_secrets: &BTreeMap<String, SecretValue>,
-    ) -> Result<McpServerId, PackError> {
-        Err(PackError::NotImplemented(
-            "workflow register-mcp-server: no production WorkflowExecutor is wired (PACK-GAP-CLOSURE P2 #10)",
-        ))
-    }
-}
-
-/// Fail-closed `SecretStore` for the boot-time materializer: resolves nothing,
-/// so any `secret-refs` surfaces `PackError::MissingSecret` until lane P2 (#10)
-/// supplies the cap-secrets-backed store.
-pub struct UnwiredSecretStore;
-
-impl SecretStore for UnwiredSecretStore {
-    fn get(&self, _key: &str) -> Option<SecretValue> {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    use advance_pack_manager::{SecretStore, WorkflowExecutor};
 
     struct Pack;
     impl TemplateResolver for Pack {
@@ -280,17 +254,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unwired_executor_fails_closed() {
-        let ex = UnwiredWorkflowExecutor;
+    #[tokio::test]
+    async fn unbound_slots_fail_closed_at_boot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wiring = build_pack_wiring(&tmp.path().join("packs"), None)
+            .await
+            .unwrap();
+        assert!(!wiring.workflow_executor.is_bound());
+        assert!(!wiring.secret_store.is_bound());
         assert!(matches!(
-            ex.spawn_child("t", Path::new("x"), &BTreeMap::new()),
+            wiring
+                .workflow_executor
+                .spawn_child("t", Path::new("x"), &BTreeMap::new()),
             Err(PackError::NotImplemented(_))
         ));
         assert!(matches!(
-            ex.register_mcp_server("c", &BTreeMap::new()),
+            wiring
+                .workflow_executor
+                .register_mcp_server("c", &BTreeMap::new()),
             Err(PackError::NotImplemented(_))
         ));
-        assert!(UnwiredSecretStore.get("anything").is_none());
+        assert!(wiring.secret_store.get("anything").is_none());
+        assert!(wiring.mcp_entries.is_empty());
     }
 }

@@ -55,9 +55,3 @@ wit-parser = { workspace = true }
 
 [lints]
 workspace = true
-
-[features]
-# PACK-GAP-CLOSURE gated witness tests (docs/plans/PACK-GAP-CLOSURE.md §0.2).
-# `gap-p1` / `gap-p3` were retired when lanes P1 / P3 landed (their witnesses run in
-# the default gate).
-gap-p2 = []

@@ -8,9 +8,16 @@
 //! `schedule` / `trigger-event` fields with post-parse XOR validation
 //! (deviates from §19.7 nested-trigger form to avoid serde untagged enum error opacity).
 //!
-//! Slice B: no automatic transactional rollback on partial failure. If
-//! spawn-child succeeds then submit-component fails, the spawned child remains —
-//! admin must manually reconcile (per §3.6 known gaps).
+//! PACK-GAP-CLOSURE P2 (§3.5, #4) — compensation on partial failure. When step
+//! `i` fails (validation OR executor) after at least one earlier step executed,
+//! every earlier successful `spawn-child` / `submit-component` is compensated in
+//! REVERSE order through [`WorkflowExecutor::terminate_child`] /
+//! [`WorkflowExecutor::withdraw_component`] and the applier returns
+//! [`PackError::WorkflowStepFailed`] carrying the failing step, its error, the
+//! compensations that succeeded and the ones that failed (never swallowed).
+//! `register-mcp-server` has no compensation (the executor only returns an id;
+//! nothing is persisted by the applier). A failure at the first executed step
+//! surfaces the raw step error unchanged (nothing to undo).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -80,6 +87,24 @@ pub trait WorkflowExecutor: Send + Sync {
         config_ref: &str,
         resolved_secrets: &BTreeMap<String, SecretValue>,
     ) -> Result<McpServerId, PackError>;
+
+    /// PACK-GAP-CLOSURE P2 (§3.5): undo an earlier successful
+    /// [`spawn_child`](Self::spawn_child) for the same `target_path` when a later
+    /// step fails. Default: `NotImplemented` — an executor that cannot undo a
+    /// spawn reports it (it lands in `WorkflowStepFailed::compensation_failures`)
+    /// rather than pretending the child is gone.
+    fn terminate_child(&self, target_path: &Path) -> Result<(), PackError> {
+        let _ = target_path;
+        Err(PackError::NotImplemented("terminate_child"))
+    }
+
+    /// PACK-GAP-CLOSURE P2 (§3.5): undo an earlier successful
+    /// [`submit_component`](Self::submit_component) for the same `component_ref`.
+    /// Default: `NotImplemented` (same reporting rule as `terminate_child`).
+    fn withdraw_component(&self, component_ref: &str) -> Result<(), PackError> {
+        let _ = component_ref;
+        Err(PackError::NotImplemented("withdraw_component"))
+    }
 }
 
 pub trait SecretStore: Send + Sync {
@@ -177,72 +202,160 @@ impl WorkflowApplier {
             .map_err(|e| PackError::InvalidWorkflow(format!("yaml parse: {e}")))?;
 
         let mut report = WorkflowReport::default();
+        // Side effects that can be undone, in execution order (P2 §3.5).
+        let mut undo: Vec<Compensation> = Vec::new();
         for (idx, step) in template.steps.iter().enumerate() {
-            match step {
-                WorkflowStep::SpawnChild {
-                    template,
-                    target_path,
-                    config,
-                } => {
-                    parse_fq_ref(template).map_err(|e| {
-                        PackError::InvalidWorkflow(format!(
-                            "step {idx} spawn-child template invalid: {e}"
-                        ))
-                    })?;
-                    validate_target_path(target_path, &ctx.target_workspace, idx)?;
-                    executor.spawn_child(template, target_path, config)?;
-                    report.steps_executed.push("spawn-child".into());
-                }
-                WorkflowStep::SubmitComponent {
-                    ref_field,
-                    schedule,
-                    trigger_event,
-                } => {
-                    parse_fq_ref(ref_field).map_err(|e| {
-                        PackError::InvalidWorkflow(format!(
-                            "step {idx} submit-component ref invalid: {e}"
-                        ))
-                    })?;
-                    let trigger = match (schedule, trigger_event) {
-                        (Some(s), None) => WorkflowTrigger::Schedule(s.clone()),
-                        (None, Some(t)) => WorkflowTrigger::TriggerEvent {
-                            event_type: t.event_type.clone(),
-                            filter: t.filter.clone(),
-                        },
-                        _ => {
-                            return Err(PackError::InvalidWorkflow(format!(
-                                "step {idx} submit-component requires exactly one of \
-                                 `schedule` or `trigger-event`"
-                            )));
-                        }
-                    };
-                    executor.submit_component(ref_field, &trigger)?;
-                    report.steps_executed.push("submit-component".into());
-                }
-                WorkflowStep::RegisterMcpServer {
-                    config_ref,
-                    secret_refs,
-                } => {
-                    parse_fq_ref(config_ref).map_err(|e| {
-                        PackError::InvalidWorkflow(format!(
-                            "step {idx} register-mcp-server config-ref invalid: {e}"
-                        ))
-                    })?;
-                    let mut resolved = BTreeMap::new();
-                    for (placeholder, secret_id) in secret_refs {
-                        let value = secret_store.get(secret_id).ok_or_else(|| {
-                            PackError::MissingSecret {
-                                key: secret_id.clone(),
-                            }
-                        })?;
-                        resolved.insert(placeholder.clone(), value);
+            let outcome = Self::apply_step(idx, step, ctx, executor, secret_store);
+            match outcome {
+                Ok((label, compensation)) => {
+                    report.steps_executed.push(label.into());
+                    if let Some(c) = compensation {
+                        undo.push(c);
                     }
-                    let _ = executor.register_mcp_server(config_ref, &resolved)?;
-                    report.steps_executed.push("register-mcp-server".into());
+                }
+                Err(source) => {
+                    // Nothing executed before this step → the raw error is the
+                    // most precise diagnostic and there is nothing to undo.
+                    if report.steps_executed.is_empty() {
+                        return Err(source);
+                    }
+                    let (compensated, compensation_failures) = Self::compensate(executor, &undo);
+                    return Err(PackError::WorkflowStepFailed {
+                        step: format!("step[{idx}]:{}", step_type_name(step)),
+                        source: Box::new(source),
+                        compensated,
+                        compensation_failures,
+                    });
                 }
             }
         }
         Ok(report)
+    }
+
+    /// Validate + execute ONE step. Returns the step label for
+    /// `WorkflowReport::steps_executed` and the compensation to record when the
+    /// step has an undoable side effect.
+    fn apply_step(
+        idx: usize,
+        step: &WorkflowStep,
+        ctx: &WorkflowContext,
+        executor: &dyn WorkflowExecutor,
+        secret_store: &dyn SecretStore,
+    ) -> Result<(&'static str, Option<Compensation>), PackError> {
+        match step {
+            WorkflowStep::SpawnChild {
+                template,
+                target_path,
+                config,
+            } => {
+                parse_fq_ref(template).map_err(|e| {
+                    PackError::InvalidWorkflow(format!(
+                        "step {idx} spawn-child template invalid: {e}"
+                    ))
+                })?;
+                validate_target_path(target_path, &ctx.target_workspace, idx)?;
+                executor.spawn_child(template, target_path, config)?;
+                Ok((
+                    "spawn-child",
+                    Some(Compensation::SpawnChild(target_path.clone())),
+                ))
+            }
+            WorkflowStep::SubmitComponent {
+                ref_field,
+                schedule,
+                trigger_event,
+            } => {
+                parse_fq_ref(ref_field).map_err(|e| {
+                    PackError::InvalidWorkflow(format!(
+                        "step {idx} submit-component ref invalid: {e}"
+                    ))
+                })?;
+                let trigger = match (schedule, trigger_event) {
+                    (Some(s), None) => WorkflowTrigger::Schedule(s.clone()),
+                    (None, Some(t)) => WorkflowTrigger::TriggerEvent {
+                        event_type: t.event_type.clone(),
+                        filter: t.filter.clone(),
+                    },
+                    _ => {
+                        return Err(PackError::InvalidWorkflow(format!(
+                            "step {idx} submit-component requires exactly one of \
+                             `schedule` or `trigger-event`"
+                        )));
+                    }
+                };
+                executor.submit_component(ref_field, &trigger)?;
+                Ok((
+                    "submit-component",
+                    Some(Compensation::SubmitComponent(ref_field.clone())),
+                ))
+            }
+            WorkflowStep::RegisterMcpServer {
+                config_ref,
+                secret_refs,
+            } => {
+                parse_fq_ref(config_ref).map_err(|e| {
+                    PackError::InvalidWorkflow(format!(
+                        "step {idx} register-mcp-server config-ref invalid: {e}"
+                    ))
+                })?;
+                let mut resolved = BTreeMap::new();
+                for (placeholder, secret_id) in secret_refs {
+                    let value =
+                        secret_store
+                            .get(secret_id)
+                            .ok_or_else(|| PackError::MissingSecret {
+                                key: secret_id.clone(),
+                            })?;
+                    resolved.insert(placeholder.clone(), value);
+                }
+                let _ = executor.register_mcp_server(config_ref, &resolved)?;
+                // No compensation: the applier persists nothing for this step.
+                Ok(("register-mcp-server", None))
+            }
+        }
+    }
+
+    /// Run the recorded compensations in REVERSE execution order. Every entry is
+    /// attempted (a failing compensation does not stop the later ones); the
+    /// outcome is split into `(compensated, compensation_failures)`.
+    fn compensate(
+        executor: &dyn WorkflowExecutor,
+        undo: &[Compensation],
+    ) -> (Vec<String>, Vec<String>) {
+        let mut compensated = Vec::new();
+        let mut failures = Vec::new();
+        for c in undo.iter().rev() {
+            let (label, result) = match c {
+                Compensation::SpawnChild(target_path) => (
+                    format!("spawn-child:{}", target_path.display()),
+                    executor.terminate_child(target_path),
+                ),
+                Compensation::SubmitComponent(component_ref) => (
+                    format!("submit-component:{component_ref}"),
+                    executor.withdraw_component(component_ref),
+                ),
+            };
+            match result {
+                Ok(()) => compensated.push(label),
+                Err(e) => failures.push(format!("{label}: {e}")),
+            }
+        }
+        (compensated, failures)
+    }
+}
+
+/// An executed step's undo handle (P2 §3.5). `register-mcp-server` records none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Compensation {
+    SpawnChild(PathBuf),
+    SubmitComponent(String),
+}
+
+fn step_type_name(step: &WorkflowStep) -> &'static str {
+    match step {
+        WorkflowStep::SpawnChild { .. } => "spawn-child",
+        WorkflowStep::SubmitComponent { .. } => "submit-component",
+        WorkflowStep::RegisterMcpServer { .. } => "register-mcp-server",
     }
 }
 
