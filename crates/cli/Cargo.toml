@@ -19,6 +19,10 @@ path = "src/lib.rs"
 [features]
 default = []
 test-support = []
+# PACK-GAP-CLOSURE gated witness tests (docs/plans/PACK-GAP-CLOSURE.md §0.2)
+gap-p1 = []
+gap-p2 = []
+gap-p3 = []
 
 [[bin]]
 name = "advance"
