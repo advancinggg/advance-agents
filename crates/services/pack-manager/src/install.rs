@@ -5,6 +5,14 @@
 //! Local-source deps (DFS with cycle detection + 32-level depth cap + diamond
 //! dedup via registry). Non-Local sources still surface `NotImplemented` at step
 //! ②. AC-05 still partial (full 8-step verbatim awaits non-Local fetchers).
+//!
+//! PACK-GAP-CLOSURE P3 (§4.1): step ③b — after checksum verification and
+//! BEFORE the admin prompt — verifies an optional `pack.sig` against
+//! [`Installer::trust_roots`] (see [`crate::signature`]). A pack whose
+//! `trust-level: trusted` claim is not backed by a trust root is downgraded to
+//! `untrusted` for every downstream consumer (approval prompt, trace payload,
+//! `.meta.yaml`, registry), and the step-④ trace / [`ApprovalContext`] carry
+//! `trust_downgraded` + `signed_by` so the admin sees it at decision time.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,11 +54,12 @@ use crate::{
     deps::DependencyResolver,
     error::PackError,
     fetch::{copy_dir_no_symlinks, FetchContext},
-    manifest::{PackManifest, PackProvides},
+    manifest::{PackManifest, PackProvides, TrustLevel},
     meta::{read_meta_index, write_meta_index_atomic, MetaPackEntry},
     registry::{path_for_kind, ComponentKind, InMemoryPackRegistry, PackRegistry},
     registry_client::RegistryClient,
-    source::{parse_source, SourceRef},
+    signature::verify_pack_signature,
+    source::{parse_source, redact_userinfo, SourceRef},
     verify::verify_checksums,
 };
 
@@ -91,6 +100,11 @@ pub struct Installer {
     /// when `None` (matches §2.10 `pack.fetch_timeout_sec` documented default).
     /// Runtime-config plumbing from `runtime-config.yaml` is Slice D+.
     pub fetch_timeout: Option<std::time::Duration>,
+    /// PACK-GAP-CLOSURE P3 (§4.1): hex-encoded ed25519 public keys
+    /// (`pack.trust-roots`) whose `pack.sig` signature makes a pack's
+    /// `trust-level: trusted` claim effective. Empty ⇒ every pack installs as
+    /// unsigned (a `trusted` claim is downgraded). Compared case-insensitively.
+    pub trust_roots: Vec<String>,
 }
 
 impl Installer {
@@ -114,7 +128,15 @@ impl Installer {
             event_bus: None,
             registry_client: None,
             fetch_timeout: Some(DEFAULT_FETCH_TIMEOUT),
+            trust_roots: Vec::new(),
         }
+    }
+
+    /// PACK-GAP-CLOSURE P3 (§4.1): the ed25519 trust roots (hex public keys)
+    /// a `pack.sig` must be signed by for a `trusted` claim to hold.
+    pub fn with_trust_roots(mut self, roots: Vec<String>) -> Self {
+        self.trust_roots = roots;
+        self
     }
 
     pub fn with_trace_sink(mut self, sink: Arc<dyn InstallTraceSink>) -> Self {
@@ -151,9 +173,35 @@ impl InstallTraceSink for NoopTraceSink {
     fn trace(&self, _: InstallStep, _: serde_json::Value) {}
 }
 
+/// PACK-GAP-CLOSURE P3 (§4.1): facts about the step-③b signature outcome
+/// that are not part of `PackManifest`, handed to the step-④ approval so an
+/// interactive strategy can show them at decision time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApprovalContext {
+    /// Lower-case hex public key of the trust root that signed `pack.yaml`;
+    /// `None` when the pack is unsigned (or signed by an unknown key).
+    pub signed_by: Option<String>,
+    /// The manifest claimed `trust-level: trusted` but no trust root backs it;
+    /// `manifest.trust_level` has ALREADY been downgraded to `Untrusted` when
+    /// this is set.
+    pub trust_downgraded: bool,
+}
+
 #[async_trait]
 pub trait ApprovalStrategy: Send + Sync {
     async fn approve(&self, manifest: &PackManifest) -> Result<bool, PackError>;
+
+    /// Step-④ entry used by the installer. The default ignores the context
+    /// and delegates to [`approve`](Self::approve), so pre-P3 strategies keep
+    /// working; decorators forward it, interactive strategies display it.
+    async fn approve_with_context(
+        &self,
+        manifest: &PackManifest,
+        ctx: &ApprovalContext,
+    ) -> Result<bool, PackError> {
+        let _ = ctx;
+        self.approve(manifest).await
+    }
 }
 
 pub struct AutoApprove;
@@ -299,9 +347,11 @@ impl Installer {
         let src = match parse_source(source) {
             Ok(src) => src,
             Err(e) => {
+                // P3 (§4.2): the raw admin input may carry `user:token@` — the
+                // trace payload (and `e`'s own text) present it redacted.
                 self.trace_sink.trace(
                     InstallStep::Step1ParseSource,
-                    json!({"source": source, "parse_error": format!("{e}")}),
+                    json!({"source": redact_userinfo(source), "parse_error": format!("{e}")}),
                 );
                 return Err(e);
             }
@@ -418,7 +468,8 @@ impl Installer {
             path: pack_yaml_path.clone(),
             source: e,
         })?;
-        let manifest = PackManifest::from_yaml(&yaml)?;
+        // `mut`: step ③b may downgrade `trust_level` (P3 §4.1).
+        let mut manifest = PackManifest::from_yaml(&yaml)?;
         // PACK-GAP-CLOSURE P1 (§2.2): reinstall judgement from DISK (install dir
         // present OR `.meta.yaml` key present) — never the in-memory registry — BEFORE
         // checksum verification and BEFORE the step ④ admin prompt, so a refused
@@ -482,6 +533,30 @@ impl Installer {
             }
         }
 
+        // ③b PACK-GAP-CLOSURE P3 (§4.1): signed manifest. Verifies `pack.sig`
+        //     over the EXACT pack.yaml bytes read above (the same bytes step ③
+        //     parsed). A present-but-invalid signature fails the install
+        //     regardless of roots; a valid signature from a configured trust
+        //     root yields `signed_by`; anything else is unsigned — and an
+        //     unsigned `trusted` claim is DOWNGRADED here, before the admin
+        //     prompt, so every later consumer (trace, approval, `.meta.yaml`,
+        //     registry) sees the effective level. No new InstallStep / trace
+        //     event (the ⑥/⑥a/⑥b/⑥c discipline).
+        let signed_by = verify_pack_signature(
+            tmp.path(),
+            yaml.as_bytes(),
+            &manifest.name,
+            &self.trust_roots,
+        )?;
+        let trust_downgraded = signed_by.is_none() && manifest.trust_level == TrustLevel::Trusted;
+        if trust_downgraded {
+            manifest.trust_level = TrustLevel::Untrusted;
+        }
+        let approval_ctx = ApprovalContext {
+            signed_by: signed_by.clone(),
+            trust_downgraded,
+        };
+
         // ④ admin approval — AC-06 invariant: runs AFTER ③.
         // ADVERSARIAL round-2 Claude Critical fix: include manifest.name +
         // manifest.version in the approval-step trace payload so the admin
@@ -494,17 +569,28 @@ impl Installer {
         // the full `&PackManifest` already, so InteractiveApproval can
         // display name + version; this trace addition surfaces the binding
         // in the audit log too.
-        self.trace_sink.trace(
-            InstallStep::Step4AdminApproval,
-            json!({
-                "pack_name": &manifest.name,
-                "pack_version": &manifest.version,
-                "required_capabilities": &manifest.required_capabilities,
-                "trust_level": &manifest.trust_level,
-            }),
-        );
+        // P3 (§4.1): `trust_level` is the EFFECTIVE level; `signed_by` names
+        // the vouching trust root (null when unsigned); `trust_downgraded` is
+        // present ONLY when an unsigned `trusted` claim was demoted, so the
+        // audit log shows the demotion the admin was asked to accept.
+        let mut step4 = json!({
+            "pack_name": &manifest.name,
+            "pack_version": &manifest.version,
+            "required_capabilities": &manifest.required_capabilities,
+            "trust_level": &manifest.trust_level,
+            "signed_by": &signed_by,
+        });
+        if trust_downgraded {
+            step4["trust_downgraded"] = json!(true);
+        }
+        self.trace_sink
+            .trace(InstallStep::Step4AdminApproval, step4);
         trace.push(InstallStep::Step4AdminApproval);
-        if !self.approval.approve(&manifest).await? {
+        if !self
+            .approval
+            .approve_with_context(&manifest, &approval_ctx)
+            .await?
+        {
             return Err(PackError::AdminRejected);
         }
 
@@ -588,7 +674,10 @@ impl Installer {
                 description: manifest.description.clone(),
                 installed_at: chrono::Utc::now().to_rfc3339(),
                 required_capabilities: manifest.required_capabilities.clone(),
+                // Effective level (P3 §4.1: a downgraded claim is recorded as
+                // untrusted) + the trust root that vouched for it, if any.
                 trust_level: manifest.trust_level,
+                signed_by: signed_by.clone(),
             },
         );
         write_meta_index_atomic(&self.packs_dir, &idx)?;

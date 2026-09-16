@@ -104,6 +104,7 @@ fn make_installer(
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     (installer, registry)
 }

@@ -1,7 +1,8 @@
 //! Pack directory layout validation (AC-03, REQ-342).
 //!
 //! Strict top-level allow-list per PRD §19.3 / MODULE-018 §2.5: `pack.yaml`
-//! MUST exist, optional `.meta.yaml`, top-level entries restricted to the
+//! MUST exist, optional `.meta.yaml` and `pack.sig` (PACK-GAP-CLOSURE P3 §4.1:
+//! the ed25519 signature over `pack.yaml`), top-level entries restricted to the
 //! 11 canonical subdirectory names (the 10 §19.3 kinds + the AC-17
 //! `resource-capabilities` category; sparse subset OK — pack ships only the
 //! subdirs it populates). Unknown top-level entries (`README.md`, `LICENSE`,
@@ -19,10 +20,12 @@ use std::path::Path;
 use crate::error::PackError;
 
 /// Canonical PRD §19.3 / MODULE-018 §2.5 top-level allow-list.
-/// `.meta.yaml` is optional; `pack.yaml` is required (separately checked).
+/// `.meta.yaml` and `pack.sig` are optional; `pack.yaml` is required
+/// (separately checked).
 const CANONICAL_TOP_LEVEL: &[&str] = &[
     "pack.yaml",
     ".meta.yaml",
+    crate::signature::PACK_SIG_FILENAME,
     "behavior-binaries",
     "agent-templates",
     "skills",
@@ -71,8 +74,8 @@ pub(crate) fn validate_pack_layout(install_path: &Path) -> Result<(), PackError>
     // Top-level entry scan — strict allow-list + file-type enforcement.
     // Slice C adversarial round 11 Info 1 fix: don't just allow-list by
     // name — verify each entry has the canonical TYPE for its name.
-    // `pack.yaml` and `.meta.yaml` must be regular files; the 11 subdirs
-    // must be directories. Symlinks are rejected outright at the top
+    // `pack.yaml`, `.meta.yaml` and `pack.sig` must be regular files; the 11
+    // subdirs must be directories. Symlinks are rejected outright at the top
     // level (defense-in-depth on top of `copy_dir_no_symlinks`).
     let read_dir = std::fs::read_dir(install_path).map_err(|e| PackError::Io {
         path: install_path.to_path_buf(),
@@ -127,8 +130,8 @@ pub(crate) fn validate_pack_layout(install_path: &Path) -> Result<(), PackError>
             )));
         }
         if !expected_dir && !md.is_file() {
-            // `name` is `pack.yaml` or `.meta.yaml` (the only non-dir
-            // canonical names).
+            // `name` is `pack.yaml`, `.meta.yaml` or `pack.sig` (the only
+            // non-dir canonical names).
             return Err(PackError::InvalidManifest(format!(
                 "pack layout: top-level {name:?} must be a regular file (got {:?})",
                 md.file_type()
@@ -243,6 +246,19 @@ mod tests {
         let dir = make_pack_dir(&[("resource-capabilities", true), ("extra", true)]);
         match validate_pack_layout(dir.path()) {
             Err(PackError::InvalidManifest(msg)) => assert!(msg.contains("extra")),
+            other => panic!("expected InvalidManifest, got {other:?}"),
+        }
+    }
+
+    // ── PACK-GAP-CLOSURE P3 (§4.1): `pack.sig` is a legitimate top-level file ──
+
+    #[test]
+    fn p3_pack_layout_accepts_pack_sig_file_and_rejects_pack_sig_dir() {
+        let dir = make_pack_dir(&[("pack.sig", false), ("skills", true)]);
+        validate_pack_layout(dir.path()).unwrap();
+        let dir = make_pack_dir(&[("pack.sig", true)]);
+        match validate_pack_layout(dir.path()) {
+            Err(PackError::InvalidManifest(msg)) => assert!(msg.contains("pack.sig")),
             other => panic!("expected InvalidManifest, got {other:?}"),
         }
     }

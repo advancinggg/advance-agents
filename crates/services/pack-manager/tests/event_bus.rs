@@ -75,6 +75,7 @@ async fn t56_pack_registry_reloaded_emitted_after_step8_rescan() {
         event_bus: Some(bus.clone() as Arc<dyn EventBusEmit>),
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     installer
         .install(pack_src.to_string_lossy().as_ref())
@@ -117,6 +118,7 @@ async fn t57_event_field_invariants() {
         event_bus: Some(bus.clone() as Arc<dyn EventBusEmit>),
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     installer
         .install(pack_src.to_string_lossy().as_ref())
@@ -235,6 +237,7 @@ checksums:
         event_bus: Some(bus.clone() as Arc<dyn EventBusEmit>),
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     installer
         .install(root_src.to_string_lossy().as_ref())
@@ -280,6 +283,7 @@ async fn t58_event_bus_none_is_observably_silent() {
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     installer_b
         .install(pack_b_src.to_string_lossy().as_ref())
@@ -301,6 +305,7 @@ async fn t58_event_bus_none_is_observably_silent() {
         event_bus: Some(bus.clone() as Arc<dyn EventBusEmit>),
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     installer_a
         .install(pack_a_src.to_string_lossy().as_ref())

@@ -20,9 +20,9 @@ path = "src/lib.rs"
 default = []
 test-support = []
 # PACK-GAP-CLOSURE gated witness tests (docs/plans/PACK-GAP-CLOSURE.md §0.2).
-# `gap-p1` was retired when lane P1 landed (its witnesses run in the default gate).
+# `gap-p1` / `gap-p3` were retired when lanes P1 / P3 landed (their witnesses run in
+# the default gate).
 gap-p2 = []
-gap-p3 = []
 
 [[bin]]
 name = "advance"
@@ -156,6 +156,14 @@ rusqlite = { workspace = true }
 # `MemoryEntry.id` per extracted knowledge item. Workspace-pinned (v4 feature
 # already enabled; cap-memory uses the same pin) — no root manifest edit.
 uuid = { workspace = true }
+# PACK-GAP-CLOSURE P3 (§4.4, #3): `pack_registry_client::HttpsRegistryClient` — the
+# production `RegistryClient` behind `registry:name@version` sources (index GET +
+# bounded, sha256-verified tarball download). Same workspace pin / rustls posture as
+# cap-http's executor, which is already linked into this binary (no new subtree).
+# `semver` names the `RegistryClient::list_versions` return type (workspace pin,
+# already in the graph via pack-manager).
+reqwest = { workspace = true }
+semver = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -209,6 +217,13 @@ wit-component = { workspace = true }
 git2 = { workspace = true }
 futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
+# PACK-GAP-CLOSURE P3 (§4.4): the HTTPS registry witness builds + hashes its own
+# `.tar.gz` fixture (workspace-pinned; `sha2` / `semver` are prod deps above);
+# the CLI wiring witness (`gap_p3_cli_wiring.rs`) signs a `pack.sig` with a
+# deterministic ed25519 key to drive `pack.trust-roots` end to end.
+ed25519-dalek = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 rustix = { workspace = true }

@@ -36,6 +36,7 @@ fn make_meta(name: &str, version: &str, install_path: std::path::PathBuf) -> Pac
         install_path,
         trust_level: TrustLevel::Untrusted,
         required_capabilities: vec![],
+        signed_by: None,
     }
 }
 
@@ -221,6 +222,7 @@ async fn rescan_rejects_malicious_meta_key_traversal() {
             installed_at: "2026-05-11T00:00:00Z".into(),
             required_capabilities: vec!["fs".into()],
             trust_level: TrustLevel::Untrusted,
+            signed_by: None,
         },
     );
     let yaml = serde_yml::to_string(&idx).unwrap();
@@ -259,6 +261,7 @@ async fn rescan_rejects_malicious_meta_key_separator() {
             installed_at: "2026-05-11T00:00:00Z".into(),
             required_capabilities: vec!["fs".into()],
             trust_level: TrustLevel::Untrusted,
+            signed_by: None,
         },
     );
     let yaml = serde_yml::to_string(&idx).unwrap();
@@ -296,6 +299,7 @@ async fn rescan_rejects_at_symbol_in_key() {
             installed_at: "2026-05-11T00:00:00Z".into(),
             required_capabilities: vec!["fs".into()],
             trust_level: TrustLevel::Untrusted,
+            signed_by: None,
         },
     );
     let yaml = serde_yml::to_string(&idx).unwrap();
@@ -333,6 +337,7 @@ async fn rescan_rejects_unicode_invisible_in_key() {
             installed_at: "2026-05-11T00:00:00Z".into(),
             required_capabilities: vec!["fs".into()],
             trust_level: TrustLevel::Untrusted,
+            signed_by: None,
         },
     );
     let yaml = serde_yml::to_string(&idx).unwrap();
@@ -385,6 +390,7 @@ checksums:
             installed_at: "2026-05-11T00:00:00Z".into(),
             required_capabilities: vec!["fs".into()],
             trust_level: TrustLevel::Trusted, // ← TAMPER
+            signed_by: None,
         },
     );
     let yaml = serde_yml::to_string(&idx).unwrap();
@@ -436,6 +442,7 @@ checksums:
             // Tampered: claim only fewer/different caps than pack.yaml.
             required_capabilities: vec![],
             trust_level: TrustLevel::Untrusted,
+            signed_by: None,
         },
     );
     let yaml = serde_yml::to_string(&idx).unwrap();
@@ -492,6 +499,7 @@ checksums:
             installed_at: "2026-05-12T00:00:00Z".into(),
             required_capabilities: vec!["fs".into()],
             trust_level: TrustLevel::Untrusted,
+            signed_by: None,
         },
     );
     let yaml = serde_yml::to_string(&idx).unwrap();
@@ -559,4 +567,90 @@ async fn rescan_rejects_meta_yaml_symlink() {
             other => panic!("expected InvalidManifest(symlink), got {other:?}"),
         }
     }
+}
+
+// ── PACK-GAP-CLOSURE P3 (§4.1): `.meta.yaml` carries the EFFECTIVE trust level ──
+//    (index ≤ manifest claim; a `trusted` entry must name its signing root).
+
+fn p3_trusted_pack_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let packs_dir = dir.path().join("packs");
+    let install_path = packs_dir.join("foo@1.0.0");
+    std::fs::create_dir_all(&install_path).unwrap();
+    std::fs::write(
+        install_path.join("pack.yaml"),
+        "name: foo\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides: {}\ntrust-level: trusted\nchecksums:\n  algo: sha256\n  files: {}\n",
+    )
+    .unwrap();
+    (dir, packs_dir)
+}
+
+fn p3_write_index(
+    packs_dir: &std::path::Path,
+    trust: advance_pack_manager::TrustLevel,
+    signed_by: Option<&str>,
+) {
+    use advance_pack_manager::{MetaIndex, MetaPackEntry, MetaScope};
+    let mut idx = MetaIndex {
+        scope: MetaScope::default(),
+        packs: Default::default(),
+    };
+    idx.packs.insert(
+        "foo@1.0.0".into(),
+        MetaPackEntry {
+            description: None,
+            installed_at: "2026-09-16T00:00:00Z".into(),
+            required_capabilities: vec![],
+            trust_level: trust,
+            signed_by: signed_by.map(str::to_string),
+        },
+    );
+    std::fs::write(
+        packs_dir.join(".meta.yaml"),
+        serde_yml::to_string(&idx).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn p3_rescan_accepts_downgraded_index_and_reports_effective_trust() {
+    use advance_pack_manager::TrustLevel;
+    let (_dir, packs_dir) = p3_trusted_pack_dir();
+    // Unsigned `trusted` claim was recorded as untrusted at install.
+    p3_write_index(&packs_dir, TrustLevel::Untrusted, None);
+    let reg = InMemoryPackRegistry::new(packs_dir);
+    reg.rescan()
+        .await
+        .expect("index below the claim is legitimate");
+    let meta = &reg.list_installed()[0];
+    assert_eq!(
+        meta.trust_level,
+        TrustLevel::Untrusted,
+        "effective, not claimed"
+    );
+    assert_eq!(meta.signed_by, None);
+}
+
+#[tokio::test]
+async fn p3_rescan_requires_signer_for_a_trusted_index_entry() {
+    use advance_pack_manager::TrustLevel;
+    let (_dir, packs_dir) = p3_trusted_pack_dir();
+    p3_write_index(&packs_dir, TrustLevel::Trusted, None);
+    let reg = InMemoryPackRegistry::new(packs_dir.clone());
+    match reg.rescan().await {
+        Err(PackError::InvalidManifest(msg)) => assert!(
+            msg.contains("signed_by") && msg.contains("tamper"),
+            "expected signer-required rejection, got: {msg}"
+        ),
+        other => panic!("expected InvalidManifest, got {other:?}"),
+    }
+    // With the signing root recorded, the trusted entry is accepted verbatim.
+    let root = "ab".repeat(32);
+    p3_write_index(&packs_dir, TrustLevel::Trusted, Some(&root));
+    reg.rescan()
+        .await
+        .expect("trusted + signed_by is consistent");
+    let meta = &reg.list_installed()[0];
+    assert_eq!(meta.trust_level, TrustLevel::Trusted);
+    assert_eq!(meta.signed_by.as_deref(), Some(root.as_str()));
 }

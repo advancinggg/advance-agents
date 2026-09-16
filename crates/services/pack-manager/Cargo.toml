@@ -21,6 +21,9 @@ chrono = { workspace = true, features = ["clock"] }
 # held across the disk-mutating install/uninstall window. Workspace pin =4.0.4
 # (already vetted by cargo-deny for the cli crate).
 fd-lock = { workspace = true }
+# PACK-GAP-CLOSURE P3 (§4.1, #6): `pack.sig` verification (`VerifyingKey::verify_strict`
+# over the pack.yaml bytes). Workspace pin =2.1.1 (BSD-3-Clause; cargo-deny allow-list).
+ed25519-dalek = { workspace = true }
 # Slice D (2026-05-25): tarball extract codec for non-Local install source AC-05.
 # flate2 wraps the .tar.gz file; tar reads entries inside spawn_blocking.
 flate2 = { workspace = true }
@@ -38,6 +41,10 @@ uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+# PACK-GAP-CLOSURE P3 (§4.3, #15): fd-relative, symlink-proof directory copy
+# (`fetch::copy_dir_no_symlinks_observed`) — openat/mkdirat/statat/Dir on every unix,
+# openat2 RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH on Linux. Workspace pin =0.38.44.
+rustix = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
@@ -51,6 +58,6 @@ workspace = true
 
 [features]
 # PACK-GAP-CLOSURE gated witness tests (docs/plans/PACK-GAP-CLOSURE.md §0.2).
-# `gap-p1` was retired when lane P1 landed (its witnesses run in the default gate).
+# `gap-p1` / `gap-p3` were retired when lanes P1 / P3 landed (their witnesses run in
+# the default gate).
 gap-p2 = []
-gap-p3 = []

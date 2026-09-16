@@ -60,6 +60,7 @@ async fn t38_pack_installed_at_canonical_path() {
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
 
     installer

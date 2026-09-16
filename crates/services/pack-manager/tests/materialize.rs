@@ -214,6 +214,7 @@ async fn install_fixture_pack(
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     installer
         .install(pack_src.to_string_lossy().as_ref())

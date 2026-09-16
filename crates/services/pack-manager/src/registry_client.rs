@@ -41,6 +41,15 @@ pub trait RegistryClient: Send + Sync {
         version: &str,
         dest_dir: &Path,
     ) -> Result<PathBuf, PackError>;
+
+    /// PACK-GAP-CLOSURE P3 (§4.4) / P2 (§3.4): every version of `name` the
+    /// registry offers, in ascending SemVer order. The default surfaces
+    /// `NotImplemented` so pre-existing clients (and the mock) stay source
+    /// compatible; the production `HttpsRegistryClient` (cli) reads its index.
+    async fn list_versions(&self, name: &str) -> Result<Vec<semver::Version>, PackError> {
+        let _ = name;
+        Err(PackError::NotImplemented("list_versions"))
+    }
 }
 
 /// Test/integration helper — NOT production code. Maps `(name, version)` →

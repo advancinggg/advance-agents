@@ -45,6 +45,7 @@ async fn t83_8step_trace_for_git_file_source() {
         event_bus: None,
         registry_client: None,
         fetch_timeout: Some(Duration::from_secs(30)),
+        trust_roots: Vec::new(),
     };
 
     installer.install(&source).await.expect("git install");
@@ -69,6 +70,7 @@ async fn t84_8step_trace_for_tarball_source() {
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
 
     installer.install(tarball.to_str().unwrap()).await.unwrap();
@@ -95,6 +97,7 @@ async fn t85_8step_trace_for_registry_source() {
         event_bus: None,
         registry_client: Some(mock),
         fetch_timeout: Some(Duration::from_secs(10)),
+        trust_roots: Vec::new(),
     };
 
     installer.install("registry:foo@1.0.0").await.unwrap();

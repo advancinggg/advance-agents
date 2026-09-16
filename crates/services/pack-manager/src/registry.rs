@@ -88,8 +88,14 @@ pub struct PackMetadata {
     pub name: String,
     pub version: String,
     pub install_path: PathBuf,
+    /// The EFFECTIVE trust level from `.meta.yaml` (PACK-GAP-CLOSURE P3 §4.1):
+    /// `Trusted` iff the manifest claimed it AND a configured trust root signed
+    /// `pack.yaml` at install. Never above the manifest's own claim.
     pub trust_level: TrustLevel,
     pub required_capabilities: Vec<String>,
+    /// Lower-case hex public key of the trust root that signed `pack.yaml`
+    /// (`.meta.yaml` `signed_by`); `None` for an unsigned pack.
+    pub signed_by: Option<String>,
 }
 
 /// Slice A skeleton shape (full schema lands in Slice C).
@@ -269,15 +275,28 @@ impl InMemoryPackRegistry {
             }
             // Round-9 adversarial C1: cross-validate trust-level and
             // required-capabilities against pack.yaml. .meta.yaml is a
-            // convenience index — pack.yaml is the source of truth. A
-            // hand-edited .meta.yaml that claims `trust_level: Trusted`
-            // for a pack whose pack.yaml declares Untrusted would have
-            // surfaced as a privilege escalation in pre-fix code that
+            // convenience index — pack.yaml is the source of truth for the
+            // CLAIM. A hand-edited .meta.yaml that claims `trust_level:
+            // Trusted` for a pack whose pack.yaml declares Untrusted would
+            // have surfaced as a privilege escalation in pre-fix code that
             // bound metadata fields straight from the entry.
-            if manifest.trust_level != entry.trust_level {
+            //
+            // PACK-GAP-CLOSURE P3 (§4.1): the index holds the EFFECTIVE level
+            // decided at install — an unsigned `trusted` claim is recorded
+            // as `untrusted` — so the rule is "index ≤ manifest": the index
+            // may never claim MORE than pack.yaml, and a `trusted` index entry
+            // must name the trust root that vouched for it.
+            if entry.trust_level == TrustLevel::Trusted
+                && manifest.trust_level != TrustLevel::Trusted
+            {
                 return Err(PackError::InvalidManifest(format!(
-                    ".meta.yaml trust_level for {key} ({:?}) does not match pack.yaml ({:?}) — possible tamper",
+                    ".meta.yaml trust_level for {key} ({:?}) exceeds pack.yaml's claim ({:?}) — possible tamper",
                     entry.trust_level, manifest.trust_level
+                )));
+            }
+            if entry.trust_level == TrustLevel::Trusted && entry.signed_by.is_none() {
+                return Err(PackError::InvalidManifest(format!(
+                    ".meta.yaml trust_level for {key} is trusted but records no signed_by trust root — possible tamper"
                 )));
             }
             // Set-equality (order-insensitive). `required_capabilities` is
@@ -293,9 +312,11 @@ impl InMemoryPackRegistry {
                     ".meta.yaml required_capabilities for {key} does not match pack.yaml — possible tamper"
                 )));
             }
-            // Use manifest values authoritatively (pack.yaml is SSOT for
-            // both fields; .meta.yaml entry only retains them as the
-            // audit-time copy for admin review).
+            // Use manifest values authoritatively for required_capabilities
+            // (pack.yaml is SSOT; the .meta.yaml copy is the audit-time
+            // snapshot for admin review). trust_level comes from the index —
+            // the effective, install-time decision bounded above by the
+            // manifest's claim (checked just above).
             // Re-run step ⑥a artifact existence/type check here too —
             // catches post-install tampering of declared `provides[*]`
             // (deletion, wrong-type swap, intermediate symlink). Codex r3
@@ -317,8 +338,9 @@ impl InMemoryPackRegistry {
                 name: name.into(),
                 version: version.into(),
                 install_path,
-                trust_level: manifest.trust_level,
+                trust_level: entry.trust_level,
                 required_capabilities: manifest.required_capabilities.clone(),
+                signed_by: entry.signed_by.clone(),
             };
             new_map.insert(
                 (name.into(), version.into()),

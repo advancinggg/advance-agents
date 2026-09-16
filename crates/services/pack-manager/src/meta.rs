@@ -55,7 +55,17 @@ pub struct MetaPackEntry {
     // the tool's OWN index — bricking rescan/install.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_capabilities: Vec<String>,
+    /// The EFFECTIVE trust level decided at install (PACK-GAP-CLOSURE P3 §4.1):
+    /// `pack.yaml`'s `trust-level: trusted` claim survives only when a configured
+    /// trust root signed the manifest; otherwise the entry is `untrusted` even
+    /// though the manifest still says `trusted`. `rescan` accepts an index value
+    /// at or BELOW the manifest's claim and rejects anything above it.
     pub trust_level: TrustLevel,
+    /// PACK-GAP-CLOSURE P3 (§4.1): lower-case hex ed25519 public key of the
+    /// trust root that signed `pack.yaml`, when one did. Absent ⇒ unsigned (or
+    /// signed by a key outside the trust roots, which counts the same).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
 }
 
 /// Read `<packs_dir>/.meta.yaml`. Returns `Default` if the file is absent.
@@ -166,7 +176,27 @@ mod meta_index_scale_tests {
             installed_at: "2026-07-06T00:00:00Z".into(),
             required_capabilities: vec![],
             trust_level: TrustLevel::Trusted,
+            signed_by: None,
         }
+    }
+
+    #[test]
+    fn signed_by_round_trips_and_is_omitted_when_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut idx = MetaIndex::default();
+        let mut signed = entry();
+        signed.signed_by = Some("ab".repeat(32));
+        idx.packs.insert("signed@1.0.0".into(), signed);
+        idx.packs.insert("plain@1.0.0".into(), entry());
+        write_meta_index_atomic(dir.path(), &idx).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(".meta.yaml")).unwrap();
+        assert_eq!(text.matches("signed_by").count(), 1, "{text}");
+        let read = read_meta_index(dir.path()).unwrap();
+        assert_eq!(
+            read.packs["signed@1.0.0"].signed_by.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+        assert_eq!(read.packs["plain@1.0.0"].signed_by, None);
     }
 
     #[test]

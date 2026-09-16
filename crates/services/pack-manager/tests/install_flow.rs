@@ -62,6 +62,7 @@ async fn t17_happy_path_emits_8_trace_events_in_order() {
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
 
     let report = installer
@@ -124,6 +125,7 @@ checksums:
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
 
     match installer.install(pack_src.to_string_lossy().as_ref()).await {
@@ -151,6 +153,7 @@ async fn t19_admin_reject_stops_after_step4() {
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
 
     match installer.install(pack_src.to_string_lossy().as_ref()).await {
@@ -179,6 +182,7 @@ async fn t20_runtime_version_mismatch_at_step3() {
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     match installer.install(pack_src.to_string_lossy().as_ref()).await {
         Err(PackError::RuntimeVersionMismatch { .. }) => {}
@@ -225,6 +229,7 @@ checksums:
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     match installer.install(pack_src.to_string_lossy().as_ref()).await {
         Err(PackError::InvalidManifest(msg)) => assert!(
@@ -252,6 +257,7 @@ async fn t22_meta_yaml_contains_scope_and_pack_entry() {
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     installer
         .install(pack_src.to_string_lossy().as_ref())
@@ -282,6 +288,7 @@ async fn t23_step3_precedes_step4_isolated_ordering() {
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     let report = installer
         .install(pack_src.to_string_lossy().as_ref())
@@ -328,6 +335,7 @@ async fn t27_symlink_in_source_rejected() {
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     match installer.install(pack_src.to_string_lossy().as_ref()).await {
         Err(PackError::InvalidManifest(msg)) => assert!(msg.contains("symlink")),
@@ -352,6 +360,7 @@ async fn t28_meta_yaml_tempfile_cleaned_up() {
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     installer
         .install(pack_src.to_string_lossy().as_ref())
@@ -421,6 +430,7 @@ checksums:
                 installed_at: "2026-05-11T00:00:00Z".into(),
                 required_capabilities: vec!["fs".into()],
                 trust_level: TrustLevel::Untrusted,
+                signed_by: None,
             },
         );
     }
@@ -441,6 +451,7 @@ checksums:
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     installer
         .install(pack_src.to_string_lossy().as_ref())
@@ -480,6 +491,7 @@ async fn t38_rescan_partial_failure_atomic_abort() {
             installed_at: "2026-05-11T00:00:00Z".into(),
             required_capabilities: vec!["fs".into()],
             trust_level: TrustLevel::Untrusted,
+            signed_by: None,
         },
     );
     let yaml = serde_yml::to_string(&idx).unwrap();
@@ -535,6 +547,7 @@ async fn t39_install_path_preexists_as_dir_rejected() {
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     match installer.install(pack_src.to_string_lossy().as_ref()).await {
         Err(PackError::AlreadyInstalled { name, version }) => {
@@ -595,6 +608,7 @@ async fn t40_install_path_preexists_as_symlink_rejected() {
             event_bus: None,
             registry_client: None,
             fetch_timeout: None,
+            trust_roots: Vec::new(),
         };
         match installer.install(pack_src.to_string_lossy().as_ref()).await {
             Err(PackError::AlreadyInstalled { name, version }) => {
@@ -646,6 +660,7 @@ checksums:
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     match installer.install(pack_src.to_string_lossy().as_ref()).await {
         Err(PackError::InvalidManifest(msg)) => assert!(
@@ -691,6 +706,7 @@ checksums:
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     match installer.install(pack_src.to_string_lossy().as_ref()).await {
         Err(PackError::InvalidManifest(msg)) => assert!(
@@ -736,6 +752,7 @@ async fn t43_install_path_preexists_as_file_rejected() {
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     match installer.install(pack_src.to_string_lossy().as_ref()).await {
         Err(PackError::AlreadyInstalled { name, version }) => {
@@ -801,6 +818,7 @@ checksums:
             event_bus: None,
             registry_client: None,
             fetch_timeout: None,
+            trust_roots: Vec::new(),
         };
         match installer.install(pack_src.to_string_lossy().as_ref()).await {
             Err(PackError::InvalidManifest(msg)) => assert!(
@@ -850,6 +868,7 @@ checksums:
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     match installer.install(pack_src.to_string_lossy().as_ref()).await {
         Err(PackError::InvalidManifest(msg)) => assert!(
@@ -898,6 +917,7 @@ checksums:
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     match installer.install(pack_src.to_string_lossy().as_ref()).await {
         Err(PackError::InvalidManifest(msg)) => assert!(

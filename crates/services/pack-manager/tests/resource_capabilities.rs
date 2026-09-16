@@ -121,6 +121,7 @@ async fn install_rescap_pack(
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     let report = installer
         .install(pack_src.to_string_lossy().as_ref())

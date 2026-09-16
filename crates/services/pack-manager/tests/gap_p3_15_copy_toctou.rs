@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p3")]
 //! GAP-15 (P3) — fd-relative, symlink-proof directory copy (closes the TOCTOU window
 //! verify.rs:11-20 documents). See docs/plans/PACK-GAP-CLOSURE.md §4.3.
 //!

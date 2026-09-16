@@ -97,6 +97,7 @@ fn make_installer(packs_dir: PathBuf) -> (Installer, Arc<InMemoryPackRegistry>) 
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
     (installer, registry)
 }

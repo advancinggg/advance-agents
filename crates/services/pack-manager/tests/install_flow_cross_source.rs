@@ -85,12 +85,25 @@ async fn t82e_validate_rejects_resolver_injected_invalid_source_ref() {
     };
     assert!(matches!(src.validate(), Err(PackError::InvalidManifest(_))));
 
-    // (f) GitUrl slash in ref (round-7 W2 add)
+    // (f) GitUrl slash in ref (round-7 W2 add) — PACK-GAP-CLOSURE P3 (§4.2)
+    // widened the grammar to `git check-ref-format` rules: a slash ref is now
+    // ACCEPTED; the check-ref-format rejections (`..`, `//`, trailing `/`,
+    // `.lock` segment) still hold.
     let src = SourceRef::GitUrl {
         url: "https://x/r".into(),
         git_ref: Some("feature/foo".into()),
     };
-    assert!(matches!(src.validate(), Err(PackError::InvalidManifest(_))));
+    src.validate().expect("slash refs are accepted since P3");
+    for bad in ["feature/..evil", "a//b", "trailing/", "refs/heads/x.lock"] {
+        let src = SourceRef::GitUrl {
+            url: "https://x/r".into(),
+            git_ref: Some(bad.into()),
+        };
+        assert!(
+            matches!(src.validate(), Err(PackError::InvalidManifest(_))),
+            "must reject {bad}"
+        );
+    }
 
     // (g) GitUrl `.lock` suffix
     let src = SourceRef::GitUrl {
@@ -120,12 +133,15 @@ async fn t82e_validate_rejects_resolver_injected_invalid_source_ref() {
     };
     assert!(matches!(src.validate(), Err(PackError::InvalidManifest(_))));
 
-    // (k) GitUrl SHA-shaped ref
+    // (k) GitUrl SHA-shaped ref — PACK-GAP-CLOSURE P3 (§4.2): a 40-hex ref is
+    // now a commit PIN (fetched by SHA), so validate() accepts it; a 39-hex or
+    // non-hex "almost SHA" is just an ordinary (valid) ref word.
     let src = SourceRef::GitUrl {
         url: "https://x/r".into(),
         git_ref: Some("abcdef0123456789abcdef0123456789abcdef01".into()),
     };
-    assert!(matches!(src.validate(), Err(PackError::InvalidManifest(_))));
+    src.validate()
+        .expect("commit-SHA pins are accepted since P3");
 
     // (l) Tarball wrong extension
     let src = SourceRef::Tarball(PathBuf::from("/tmp/p.bin"));
@@ -238,6 +254,7 @@ trust-level: untrusted
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
 
     installer
@@ -342,6 +359,7 @@ trust-level: untrusted
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
 
     let res = installer.install(root_pack.to_str().unwrap()).await;
@@ -412,6 +430,7 @@ trust-level: untrusted
         event_bus: None,
         registry_client: Some(mock_reg),
         fetch_timeout: Some(Duration::from_secs(10)),
+        trust_roots: Vec::new(),
     };
 
     installer

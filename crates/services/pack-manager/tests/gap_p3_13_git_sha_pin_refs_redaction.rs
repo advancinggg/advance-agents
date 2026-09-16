@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p3")]
 //! GAP-13 (P3) — git source: commit-SHA pin, slash refs, credential redaction.
 //! See docs/plans/PACK-GAP-CLOSURE.md §4.2.
 
