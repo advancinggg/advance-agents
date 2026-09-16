@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p1")]
 //! GAP-14 (P1) — `PackRegistry::provides(name, version)` enumeration.
 //! The cap-lifecycle half
 //! (`PackTemplateResolver::list()`) lives in crates/capabilities/cap-lifecycle/tests/.

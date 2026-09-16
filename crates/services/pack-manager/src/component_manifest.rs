@@ -669,6 +669,15 @@ pub(crate) struct McpExposureDecl {
     pub expose_resources: bool,
 }
 
+/// Pack lane P1: the canonical `id` of the resource-capability at
+/// `cap_dir` (`{install}/resource-capabilities/{name}`), read through the same
+/// bounded / symlink-safe / alias-guarded parse as install-time validation. The
+/// composition root folds these ids into the `required-capabilities` catalog so a
+/// pack may require a capability another installed pack provides.
+pub fn resource_capability_id(cap_dir: &Path) -> Result<String, PackError> {
+    Ok(parse_resource_capability_manifest(cap_dir)?.id)
+}
+
 /// Parse + validate `{cap_dir}/capability.yaml` (AC-17). `cap_dir` is the capability
 /// directory (`{install}/resource-capabilities/{name}`). Register-not-copy: this only
 /// reads + validates; nothing is written. Errors mirror `parse_component_manifest`:

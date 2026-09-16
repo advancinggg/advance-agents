@@ -23,17 +23,16 @@ mod common;
 use common::{build_git_fixture, ENV_LOCK};
 
 fn make_installer(packs_dir: &std::path::Path) -> Installer {
-    Installer {
-        packs_dir: packs_dir.to_path_buf(),
-        registry: Arc::new(InMemoryPackRegistry::new(packs_dir.to_path_buf())),
-        current_runtime_version: "0.1.0".to_string(),
-        approval: Arc::new(AutoApprove),
-        trace_sink: Arc::new(RecordingTraceSink::new()),
-        dep_resolver: None,
-        event_bus: None,
-        registry_client: None,
-        fetch_timeout: Some(Duration::from_secs(30)),
-    }
+    // Pack lane P1: builder form — new fields added by later lanes
+    // no longer break this helper.
+    Installer::new(
+        packs_dir,
+        Arc::new(InMemoryPackRegistry::new(packs_dir.to_path_buf())),
+        "0.1.0",
+        Arc::new(AutoApprove),
+    )
+    .with_trace_sink(Arc::new(RecordingTraceSink::new()))
+    .with_fetch_timeout(Duration::from_secs(30))
 }
 
 #[tokio::test]

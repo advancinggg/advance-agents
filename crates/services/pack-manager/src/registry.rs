@@ -9,6 +9,9 @@
 //! - `parse_fq_ref` rejects unversioned / empty-tail / null-byte / `..` traversal.
 //! - `rescan(&self)` is async no-arg per §1.3.2 line 124; atomic read-build-swap.
 //! - `resolve_pack_component` returns `NotImplemented` (AC-14 waived for Slice A).
+//! - Pack lane P1: `provides(name, version)` enumerates an installed pack's
+//!   `provides:` entries (default `None` on the trait); `dependents_of` (crate)
+//!   backs `Installer::uninstall`'s `DependentsExist` refusal.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,6 +34,17 @@ pub trait PackRegistry: Send + Sync {
     fn has(&self, name: &str, version: &str) -> bool;
     /// PRD §4.7.4 / REQ-073 — Slice A returns `NotImplemented` (AC-14 waived).
     fn resolve_pack_component(&self, fq_ref: &str) -> Result<PackComponentResolution, PackError>;
+
+    /// Pack lane P1: every `provides:` entry (all 11 component
+    /// kinds) of the installed pack `{name}@{version}`, in declaration order per
+    /// kind; `None` when the pack is not installed. Default `None` keeps
+    /// third-party / test registries (e.g. the cli `MockPackRegistry`) source
+    /// compatible; `InMemoryPackRegistry` answers from the manifest it already
+    /// parsed at rescan.
+    fn provides(&self, name: &str, version: &str) -> Option<Vec<PackProvideEntry>> {
+        let _ = (name, version);
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -217,45 +231,7 @@ impl InMemoryPackRegistry {
             })?;
         let mut new_map: BTreeMap<(String, String), PackEntry> = BTreeMap::new();
         for (key, entry) in &idx.packs {
-            // Defense-in-depth: `.meta.yaml` keys are joined into `packs_dir`,
-            // so a hand-edited or stale-tempfile-resurrected entry must not
-            // contain path-separator characters, traversal segments, null
-            // bytes, or leading dots that could escape the pack root.
-            if key.contains('\0')
-                || key.contains('/')
-                || key.contains('\\')
-                || key.starts_with('.')
-                || key.contains("..")
-                // Reject any non-ASCII codepoint OR ASCII control/whitespace.
-                // Unicode invisible / control / format / whitespace codepoints
-                // (zero-width space U+200B, non-breaking space U+00A0,
-                // BiDi formatting marks, etc.) could visually impersonate ASCII
-                // but resolve to a different filesystem path. (Round-9 W5.)
-                // SemVer + pack-name grammar is ASCII-only, so a tight
-                // ASCII-only gate is appropriate.
-                || key.chars().any(|c| !c.is_ascii() || c.is_ascii_control() || c.is_ascii_whitespace())
-            {
-                return Err(PackError::InvalidManifest(format!(
-                    ".meta.yaml key rejected (null/traversal/separator/non-ASCII/control/whitespace): {key:?}"
-                )));
-            }
-            let (name, version) = key.split_once('@').ok_or_else(|| {
-                PackError::InvalidManifest(format!(".meta.yaml key not `name@version`: {key}"))
-            })?;
-            if name.is_empty() || version.is_empty() {
-                return Err(PackError::InvalidManifest(format!(
-                    ".meta.yaml key empty name or version: {key}"
-                )));
-            }
-            // Reject embedded `@` in name OR version. `split_once('@')` splits
-            // on the FIRST `@`, so `foo@bar@1.0.0` would yield name="foo",
-            // version="bar@1.0.0" — opening a spoofing vector against
-            // `path_for_kind`-style consumers that re-split. (Round-9 W5.)
-            if name.contains('@') || version.contains('@') {
-                return Err(PackError::InvalidManifest(format!(
-                    ".meta.yaml key has extra `@` (spoofing): {key:?}"
-                )));
-            }
+            let (name, version) = validate_meta_key(key)?;
             let install_path = self.packs_dir.join(key);
             // Ancestor check: confirm the joined path stays inside packs_dir
             // (canonicalize resolves any symlinks introduced post-hoc).
@@ -423,6 +399,14 @@ impl PackRegistry for InMemoryPackRegistry {
             .contains_key(&(name.into(), version.into()))
     }
 
+    fn provides(&self, name: &str, version: &str) -> Option<Vec<PackProvideEntry>> {
+        self.packs
+            .read()
+            .unwrap()
+            .get(&(name.into(), version.into()))
+            .map(|entry| provides_entries(&entry.manifest.provides))
+    }
+
     fn resolve_pack_component(&self, fq_ref: &str) -> Result<PackComponentResolution, PackError> {
         // (1) Resolve the FQ ref via the existing `resolve()` — validates
         //     grammar, kind discovery, provides-list membership.
@@ -465,6 +449,102 @@ impl PackRegistry for InMemoryPackRegistry {
             output_dir,
             manifest,
         })
+    }
+}
+
+/// Grammar gate for a `.meta.yaml` key (`{name}@{version}`), shared by `rescan`
+/// and [`Installer::uninstall`](crate::Installer::uninstall) (P1): the key is
+/// joined into `packs_dir`, so a hand-edited / stale-tempfile-resurrected /
+/// CLI-supplied key must not contain path separators, traversal segments, null
+/// bytes, or a leading dot that could escape the pack root. Any non-ASCII
+/// codepoint or ASCII control/whitespace is rejected too (zero-width space,
+/// NBSP, BiDi marks … could visually impersonate ASCII but resolve to a
+/// different filesystem path — round-9 W5; SemVer + pack-name grammar is
+/// ASCII-only). An embedded extra `@` in name OR version is a spoofing vector
+/// against `path_for_kind`-style consumers that re-split (round-9 W5).
+pub(crate) fn validate_meta_key(key: &str) -> Result<(&str, &str), PackError> {
+    if key.contains('\0')
+        || key.contains('/')
+        || key.contains('\\')
+        || key.starts_with('.')
+        || key.contains("..")
+        || key
+            .chars()
+            .any(|c| !c.is_ascii() || c.is_ascii_control() || c.is_ascii_whitespace())
+    {
+        return Err(PackError::InvalidManifest(format!(
+            ".meta.yaml key rejected (null/traversal/separator/non-ASCII/control/whitespace): {key:?}"
+        )));
+    }
+    let (name, version) = key.split_once('@').ok_or_else(|| {
+        PackError::InvalidManifest(format!(".meta.yaml key not `name@version`: {key}"))
+    })?;
+    if name.is_empty() || version.is_empty() {
+        return Err(PackError::InvalidManifest(format!(
+            ".meta.yaml key empty name or version: {key}"
+        )));
+    }
+    if name.contains('@') || version.contains('@') {
+        return Err(PackError::InvalidManifest(format!(
+            ".meta.yaml key has extra `@` (spoofing): {key:?}"
+        )));
+    }
+    Ok((name, version))
+}
+
+/// Flatten a manifest's `provides:` into `(kind, name)` entries, in the canonical
+/// 11-kind order (the `find_kind_by_name_strict` order) and declaration order
+/// within a kind.
+fn provides_entries(p: &PackProvides) -> Vec<PackProvideEntry> {
+    const KINDS: [ComponentKind; 11] = [
+        ComponentKind::Binary,
+        ComponentKind::AgentTemplate,
+        ComponentKind::Skill,
+        ComponentKind::RunnableComponent,
+        ComponentKind::ChannelAdapter,
+        ComponentKind::McpServer,
+        ComponentKind::Preset,
+        ComponentKind::Workflow,
+        ComponentKind::MemorySeed,
+        ComponentKind::MetaSchemaExtension,
+        ComponentKind::ResourceCapability,
+    ];
+    let mut out = Vec::new();
+    for kind in KINDS {
+        for name in list_for_kind(p, kind) {
+            out.push(PackProvideEntry {
+                kind,
+                name: name.clone(),
+            });
+        }
+    }
+    out
+}
+
+impl InMemoryPackRegistry {
+    /// Pack lane P1: installed packs (other than `{name}@{version}`
+    /// itself) whose `dependencies:` declare a range that this exact version
+    /// satisfies, as sorted `"{name}@{version}"` strings. A dependency whose
+    /// range or the target version fails to parse as SemVer never matches.
+    pub(crate) fn dependents_of(&self, name: &str, version: &str) -> Vec<String> {
+        let Ok(target) = semver::Version::parse(version) else {
+            return Vec::new();
+        };
+        self.packs
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|((n, v), _)| !(n == name && v == version))
+            .filter(|(_, entry)| {
+                entry.manifest.dependencies.iter().any(|d| {
+                    d.name == name
+                        && semver::VersionReq::parse(&d.version)
+                            .map(|req| req.matches(&target))
+                            .unwrap_or(false)
+                })
+            })
+            .map(|((n, v), _)| format!("{n}@{v}"))
+            .collect()
     }
 }
 

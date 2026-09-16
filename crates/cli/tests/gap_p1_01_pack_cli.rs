@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p1")]
 //! GAP-01 (P1) — `advance pack install | list | uninstall`.
 //! Mirrors the skill_import.rs assert_cmd style.
 

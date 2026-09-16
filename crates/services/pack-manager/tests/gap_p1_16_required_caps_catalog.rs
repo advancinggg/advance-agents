@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p1")]
 //! GAP-16 (P1) — `required-capabilities` validated against a capability catalog.
 //! Implemented as an `ApprovalStrategy`
 //! decorator so `Installer` gains no field.

@@ -63,7 +63,3 @@ wit-parser = { workspace = true }
 
 [lints]
 workspace = true
-
-[features]
-# the pack lanes gated witness tests
-gap-p1 = []

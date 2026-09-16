@@ -26,15 +26,24 @@
 //! - [`WorkflowApplier`] static driver for workflow templates (Slice B AC-10).
 //!   Drives 3 step types through [`WorkflowExecutor`] seam; resolves
 //!   `secret-refs` through [`SecretStore`] seam.
-//! - [`PackError`] taxonomy (21 variants after Slice D — Slice D adds
-//!   `GitCloneFailed`, `TarballExtractFailed`, `RegistryFetchFailed` for the
-//!   non-Local install source surface; Slice C added `ConstraintViolation`).
+//! - [`PackError`] taxonomy (24 variants — Slice D added `GitCloneFailed`,
+//!   `TarballExtractFailed`, `RegistryFetchFailed` for the non-Local install
+//!   source surface; Slice C added `ConstraintViolation`; Pack lane P1
+//!   added `AlreadyInstalled`, `DependentsExist`, `UnknownRequiredCapability`).
+//! - Pack lane P1: [`Installer::new`]
+//!   builder + [`NoopTraceSink`]; disk-truth `AlreadyInstalled` at step ③ (before
+//!   checksum / approval); [`Installer::uninstall`] with `DependentsExist`
+//!   refusal; a cross-process install lock ([`INSTALL_LOCK_FILENAME`]) held
+//!   across steps ③→⑧; [`PackRegistry::provides`] enumeration; and the
+//!   [`CatalogCheckedApproval`] decorator validating `required-capabilities`
+//!   against a [`CapabilityCatalog`].
 //! - [`RegistryClient`] async seam (Slice D AC-05) for `registry:name@version`
 //!   source dispatch; production HTTPS endpoint deferred to Slice D+; ships
 //!   `MockRegistryClient` test helper following the `RecordingTraceSink`
 //!   visibility precedent.
 
 pub mod admin;
+pub mod catalog;
 pub(crate) mod component_manifest;
 pub mod deps;
 pub mod error;
@@ -52,12 +61,16 @@ pub mod verify;
 pub mod workflow;
 
 pub use admin::InteractiveApproval;
+pub use catalog::{CapabilityCatalog, CatalogCheckedApproval, StaticCapabilityCatalog};
+pub use component_manifest::resource_capability_id;
 pub use deps::DependencyResolver;
 pub use error::PackError;
 pub use fetch::FetchContext;
 pub use install::{
     ApprovalStrategy, AutoApprove, AutoReject, InstallStep, InstallTraceSink, Installer,
-    PackInstallReport, RecordingTraceSink,
+    NoopTraceSink, PackInstallReport, PackUninstallReport, RecordingTraceSink, RejectUnlessTrivial,
+    DEFAULT_FETCH_TIMEOUT, INSTALL_LOCK_FILENAME, PACK_REGISTRY_RELOADED_EVENT,
+    PACK_UNINSTALLED_EVENT,
 };
 pub use manifest::{
     ChecksumAlgo, PackChecksums, PackDependency, PackManifest, PackProvides, TrustLevel,

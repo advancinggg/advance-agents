@@ -12,17 +12,15 @@ mod common;
 use common::{build_tarball_fixture, FixtureContent};
 
 fn make_installer(packs_dir: &std::path::Path) -> Installer {
-    Installer {
-        packs_dir: packs_dir.to_path_buf(),
-        registry: Arc::new(InMemoryPackRegistry::new(packs_dir.to_path_buf())),
-        current_runtime_version: "0.1.0".to_string(),
-        approval: Arc::new(AutoApprove),
-        trace_sink: Arc::new(RecordingTraceSink::new()),
-        dep_resolver: None,
-        event_bus: None,
-        registry_client: None,
-        fetch_timeout: None,
-    }
+    // Pack lane P1: builder form — new fields added by later lanes
+    // no longer break this helper.
+    Installer::new(
+        packs_dir,
+        Arc::new(InMemoryPackRegistry::new(packs_dir.to_path_buf())),
+        "0.1.0",
+        Arc::new(AutoApprove),
+    )
+    .with_trace_sink(Arc::new(RecordingTraceSink::new()))
 }
 
 #[tokio::test]

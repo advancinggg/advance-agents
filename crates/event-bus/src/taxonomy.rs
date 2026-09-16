@@ -5,9 +5,10 @@
 //! "NOT in PRD §15.3" doc comments. Coverage tests T71/T72 lock the alignment.
 //!
 //! Canonical entries: 130 across 22 PRD-aligned sub-modules (31 distinct top-level
-//! prefixes). Enumerated extensions: 3. `runtime.degraded.{reason}` is documented as a
-//! dynamic prefix via `extensions::RUNTIME_DEGRADED_PREFIX` but is NOT a fixed-string
-//! entry in `ALL_EVENT_TYPES` — concrete strings are runtime-formed.
+//! prefixes). Enumerated extensions: 6 — 3 in `extensions::` plus the 3 MODULE-018
+//! `pack::` lifecycle events (Pack lane P1). `runtime.degraded.{reason}`
+//! is documented as a dynamic prefix via `extensions::RUNTIME_DEGRADED_PREFIX` but is
+//! NOT a fixed-string entry in `ALL_EVENT_TYPES` — concrete strings are runtime-formed.
 //!
 //! `TRIGGER_BUS_WHITELIST` is preserved at exactly 12 entries per PRD §15.4
 //! (regression-locked by `whitelist_has_12_entries`).
@@ -414,6 +415,27 @@ pub mod extensions {
     pub const FS_READ_ENTRY: &str = "fs.read.entry";
 }
 
+/// MODULE-018 pack-system lifecycle events (Pack lane P1). **NOT in
+/// PRD §15.3** — documented operational extensions, enumerated in
+/// `ALL_EVENT_TYPES` and deliberately ABSENT from `TRIGGER_BUS_WHITELIST`
+/// (PRD §15.4 pins exactly 12 entries; pack lifecycle never triggers
+/// components). The string values are the ones `advance_pack_manager::Installer`
+/// emits (`PACK_REGISTRY_RELOADED_EVENT` / `PACK_UNINSTALLED_EVENT` there); the
+/// CONTRACT-191 client projection table is unchanged (that would be a
+/// client-api contract change).
+pub mod pack {
+    /// Reserved for a per-pack install event. The installer today emits exactly
+    /// one `REGISTRY_RELOADED` per top-level install (MODULE-018 AC-15) and no
+    /// separate `pack.installed`.
+    pub const INSTALLED: &str = "pack.installed";
+    /// One per successful `Installer::uninstall` (payload: `pack_count`,
+    /// `uninstalled_pack`).
+    pub const UNINSTALLED: &str = "pack.uninstalled";
+    /// One per top-level `Installer::install` (payload: `pack_count`,
+    /// `installed_pack`) — recursive dependency installs do not fire their own.
+    pub const REGISTRY_RELOADED: &str = "pack.registry_reloaded";
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // 12-event Trigger Bus whitelist (MODULE-019 §1.3.2a / PRD §15.4).
 // Locked by `whitelist_has_12_entries` regression test.
@@ -438,7 +460,7 @@ pub use advance_scheduler::trigger_bus::WHITELIST as TRIGGER_BUS_WHITELIST;
 /// and AC-20 (canonical PRD §15.3 coverage + no-leftover) coverage tests.
 ///
 /// Stable ordering: by PRD §15.3 sub-section then by declaration order within
-/// section. `extensions::*` appear last.
+/// section. `extensions::*` then `pack::*` appear last.
 ///
 /// **NOTE on `runtime.degraded.{reason}`**: this dynamic-prefix family is documented
 /// at `extensions::RUNTIME_DEGRADED_PREFIX` but NOT included here — concrete strings
@@ -604,6 +626,10 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     extensions::RUNTIME_WARNING,
     extensions::RUNTIME_CONFIG_RELOADED,
     extensions::FS_READ_ENTRY,
+    // MODULE-018 pack lifecycle extensions (NOT in PRD §15.3) — 3 enumerated entries
+    pack::INSTALLED,
+    pack::UNINSTALLED,
+    pack::REGISTRY_RELOADED,
     // NOTE: extensions::RUNTIME_DEGRADED_PREFIX is intentionally NOT enumerated —
     // concrete strings are dynamic (`runtime.degraded.{reason}`); T72 prefix-exempts.
 ];

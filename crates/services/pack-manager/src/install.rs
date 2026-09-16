@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use advance_shared_types::event::Event;
 use advance_shared_types::traits::EventBusEmit;
@@ -20,6 +21,26 @@ use serde_json::json;
 /// and prevents adversarial sources from supplying multi-GiB documents.
 /// (Round-9 adversarial W4.)
 const MAX_PACK_YAML_BYTES: u64 = 1024 * 1024;
+
+/// Pack lane P1: file name of the cross-process install lock,
+/// created inside `packs_dir`. `install` and `uninstall` hold an exclusive
+/// `flock` on it across the disk-mutating window (step ③ `AlreadyInstalled`
+/// judgement → ⑥ copy → ⑦ `.meta.yaml` → ⑧ rescan); the network/temp fetch
+/// (step ②) runs OUTSIDE the lock. Recursive dependency installs run inside
+/// the top-level install's lock session (the lock is taken once, at depth 0).
+pub const INSTALL_LOCK_FILENAME: &str = ".install.lock";
+
+/// Default fetch wall-clock timeout (§2.10 `pack.fetch_timeout_sec`), applied
+/// by [`Installer::new`] and when `fetch_timeout` is `None`.
+pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Event type emitted once per top-level [`Installer::install`] (AC-15).
+/// Registered in the MODULE-019 taxonomy as `taxonomy::pack::REGISTRY_RELOADED`.
+pub const PACK_REGISTRY_RELOADED_EVENT: &str = "pack.registry_reloaded";
+
+/// Event type emitted once per successful [`Installer::uninstall`].
+/// Registered in the MODULE-019 taxonomy as `taxonomy::pack::UNINSTALLED`.
+pub const PACK_UNINSTALLED_EVENT: &str = "pack.uninstalled";
 
 use crate::{
     deps::DependencyResolver,
@@ -72,6 +93,64 @@ pub struct Installer {
     pub fetch_timeout: Option<std::time::Duration>,
 }
 
+impl Installer {
+    /// Pack lane P1: builder entry. Trace sink = [`NoopTraceSink`],
+    /// no dependency resolver / event bus / registry client, fetch timeout =
+    /// [`DEFAULT_FETCH_TIMEOUT`]. Compose the optional seams with the `with_*`
+    /// methods; the fields stay `pub` for the pre-existing literal constructors.
+    pub fn new(
+        packs_dir: impl Into<PathBuf>,
+        registry: Arc<InMemoryPackRegistry>,
+        current_runtime_version: impl Into<String>,
+        approval: Arc<dyn ApprovalStrategy>,
+    ) -> Self {
+        Self {
+            packs_dir: packs_dir.into(),
+            registry,
+            current_runtime_version: current_runtime_version.into(),
+            approval,
+            trace_sink: Arc::new(NoopTraceSink),
+            dep_resolver: None,
+            event_bus: None,
+            registry_client: None,
+            fetch_timeout: Some(DEFAULT_FETCH_TIMEOUT),
+        }
+    }
+
+    pub fn with_trace_sink(mut self, sink: Arc<dyn InstallTraceSink>) -> Self {
+        self.trace_sink = sink;
+        self
+    }
+
+    pub fn with_dep_resolver(mut self, r: Arc<dyn DependencyResolver>) -> Self {
+        self.dep_resolver = Some(r);
+        self
+    }
+
+    pub fn with_event_bus(mut self, bus: Arc<dyn EventBusEmit>) -> Self {
+        self.event_bus = Some(bus);
+        self
+    }
+
+    pub fn with_registry_client(mut self, c: Arc<dyn RegistryClient>) -> Self {
+        self.registry_client = Some(c);
+        self
+    }
+
+    pub fn with_fetch_timeout(mut self, d: Duration) -> Self {
+        self.fetch_timeout = Some(d);
+        self
+    }
+}
+
+/// [`InstallTraceSink`] that discards every trace event — the [`Installer::new`]
+/// default for callers that do not audit the step sequence.
+pub struct NoopTraceSink;
+
+impl InstallTraceSink for NoopTraceSink {
+    fn trace(&self, _: InstallStep, _: serde_json::Value) {}
+}
+
 #[async_trait]
 pub trait ApprovalStrategy: Send + Sync {
     async fn approve(&self, manifest: &PackManifest) -> Result<bool, PackError>;
@@ -92,6 +171,22 @@ pub struct AutoReject;
 impl ApprovalStrategy for AutoReject {
     async fn approve(&self, _: &PackManifest) -> Result<bool, PackError> {
         Ok(false)
+    }
+}
+
+/// Pack lane P1: the unattended (`--no-input` /
+/// `pack.approval: auto-reject`) strategy. Approves a TRIVIAL pack — empty
+/// `required-capabilities`, the AC-07 boundary at which `InteractiveApproval`
+/// also short-circuits without prompting — and rejects every pack that would
+/// need an admin decision. Unlike [`AutoReject`] (which refuses everything and
+/// is kept for the witnesses that pin that), this never blocks a pack that no
+/// human would have been asked about.
+pub struct RejectUnlessTrivial;
+
+#[async_trait]
+impl ApprovalStrategy for RejectUnlessTrivial {
+    async fn approve(&self, manifest: &PackManifest) -> Result<bool, PackError> {
+        Ok(manifest.required_capabilities.is_empty())
     }
 }
 
@@ -162,6 +257,35 @@ pub struct PackInstallReport {
     pub trace_steps: Vec<InstallStep>,
 }
 
+/// Outcome of [`Installer::uninstall`]. `removed_path` is the install directory
+/// that was removed (`packs_dir/{name}@{version}`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackUninstallReport {
+    pub name: String,
+    pub version: String,
+    pub removed_path: PathBuf,
+}
+
+/// Build a CONTRACT-180 `Event` for the pack-manager admin service: UUID v4 for
+/// id / trace_id / span_id, all five correlation `Option`s `None`,
+/// `agent_id = "pack-manager"` (admin-side service, not an agent).
+fn pack_event(event_type: &str, payload: serde_json::Value) -> Event {
+    Event {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now(),
+        agent_id: "pack-manager".to_string(),
+        task_id: None,
+        run_id: None,
+        execution_id: None,
+        trace_id: uuid::Uuid::new_v4().to_string(),
+        span_id: uuid::Uuid::new_v4().to_string(),
+        parent_span_id: None,
+        event_type: event_type.to_string(),
+        payload,
+        duration_ms: None,
+    }
+}
+
 impl Installer {
     /// Public entry — allocates a fresh `in_flight` Vec for cycle detection,
     /// delegates to `install_with_context`, and emits a single AC-15
@@ -194,24 +318,13 @@ impl Installer {
         if let Some(bus) = &self.event_bus {
             let pack_count = self.registry.list_installed().len();
             let installed_pack = format!("{}@{}", report.name, report.version);
-            let event = Event {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: chrono::Utc::now(),
-                agent_id: "pack-manager".to_string(),
-                task_id: None,
-                run_id: None,
-                execution_id: None,
-                trace_id: uuid::Uuid::new_v4().to_string(),
-                span_id: uuid::Uuid::new_v4().to_string(),
-                parent_span_id: None,
-                event_type: "pack.registry_reloaded".to_string(),
-                payload: json!({
+            bus.emit(pack_event(
+                PACK_REGISTRY_RELOADED_EVENT,
+                json!({
                     "pack_count": pack_count,
                     "installed_pack": installed_pack,
                 }),
-                duration_ms: None,
-            };
-            bus.emit(event);
+            ));
         }
 
         Ok(report)
@@ -253,11 +366,27 @@ impl Installer {
         trace.push(InstallStep::Step2DownloadToTemp);
         let ctx = FetchContext {
             registry_client: self.registry_client.as_deref(),
-            fetch_timeout: self
-                .fetch_timeout
-                .unwrap_or(std::time::Duration::from_secs(120)),
+            fetch_timeout: self.fetch_timeout.unwrap_or(DEFAULT_FETCH_TIMEOUT),
         };
         let tmp = ctx.fetch_to_temp(src).await?;
+
+        // Pack lane P1: take the cross-process install lock ONCE, at
+        // the top-level install (depth 0), AFTER the fetch (network/temp work stays
+        // outside the lock) and hold it to the end of step ⑧. Recursive dependency
+        // installs (step ⑤, depth ≥ 1) run inside the parent's lock session. The
+        // guard borrows `lock`, so both live to the end of this function body.
+        let mut lock = if depth == 0 {
+            Some(self.open_install_lock()?)
+        } else {
+            None
+        };
+        let _lock_guard = match lock.as_mut() {
+            Some(l) => Some(l.write().map_err(|e| PackError::Io {
+                path: self.packs_dir.join(INSTALL_LOCK_FILENAME),
+                source: e,
+            })?),
+            None => None,
+        };
 
         // ③ verify pack.yaml + checksums (parse, runtime-version, checksums)
         self.trace_sink
@@ -290,6 +419,18 @@ impl Installer {
             source: e,
         })?;
         let manifest = PackManifest::from_yaml(&yaml)?;
+        // Pack lane P1: reinstall judgement from DISK (install dir
+        // present OR `.meta.yaml` key present) — never the in-memory registry — BEFORE
+        // checksum verification and BEFORE the step ④ admin prompt, so a refused
+        // reinstall never passes through human review. Runs under the install lock
+        // (taken above at depth 0), so two concurrent installs of the same pack yield
+        // exactly one `Ok` and one `AlreadyInstalled`.
+        if self.is_installed_on_disk(&manifest.name, &manifest.version)? {
+            return Err(PackError::AlreadyInstalled {
+                name: manifest.name.clone(),
+                version: manifest.version.clone(),
+            });
+        }
         manifest.check_runtime_compat(&self.current_runtime_version)?;
         verify_checksums(tmp.path(), &manifest.checksums)?;
 
@@ -468,6 +609,174 @@ impl Installer {
             version: manifest.version,
             install_path,
             trace_steps: trace,
+        })
+    }
+}
+
+impl Installer {
+    /// Open the cross-process install lock file (`packs_dir/.install.lock`),
+    /// creating `packs_dir` and the file if absent. The caller takes the
+    /// exclusive guard via `RwLock::write` (a blocking `flock`; the admin surface
+    /// is single-operator, so contention is rare and the held window — steps
+    /// ③→⑧, no network fetch — is short). `O_NOFOLLOW` (unix) + a regular-file
+    /// check refuse a planted symlink at the lock path.
+    fn open_install_lock(&self) -> Result<fd_lock::RwLock<std::fs::File>, PackError> {
+        std::fs::create_dir_all(&self.packs_dir).map_err(|e| PackError::Io {
+            path: self.packs_dir.clone(),
+            source: e,
+        })?;
+        let path = self.packs_dir.join(INSTALL_LOCK_FILENAME);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = opts.open(&path).map_err(|e| PackError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        let md = file.metadata().map_err(|e| PackError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        if !md.is_file() {
+            return Err(PackError::InvalidManifest(format!(
+                "install lock is not a regular file: {}",
+                path.display()
+            )));
+        }
+        Ok(fd_lock::RwLock::new(file))
+    }
+
+    /// §2.2 disk-truth reinstall judgement: `packs_dir/{name}@{version}` exists
+    /// (any file type — a stale partial install counts) OR `.meta.yaml` carries
+    /// the key. The in-memory registry is deliberately NOT consulted.
+    fn is_installed_on_disk(&self, name: &str, version: &str) -> Result<bool, PackError> {
+        let key = format!("{name}@{version}");
+        let dir = self.packs_dir.join(&key);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(_) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(PackError::Io {
+                    path: dir,
+                    source: e,
+                })
+            }
+        }
+        Ok(read_meta_index(&self.packs_dir)?.packs.contains_key(&key))
+    }
+
+    /// Pack lane P1 — remove an installed pack.
+    ///
+    /// Under the same install lock as [`Installer::install`]:
+    /// 1. rescan the registry (disk truth: `.meta.yaml` + each `pack.yaml`);
+    /// 2. `PackNotFound` unless the install dir exists OR `.meta.yaml` has the
+    ///    key (a stale directory without an index entry is still removable —
+    ///    the recovery path for an interrupted install);
+    /// 3. `DependentsExist` if any OTHER installed pack declares a `dependencies:`
+    ///    entry this exact `{name}@{version}` satisfies (conservative: another
+    ///    installed version satisfying the same range does not release it);
+    /// 4. `remove_dir_all(packs_dir/{name}@{version})` — a symlinked install root
+    ///    is refused, never followed;
+    /// 5. atomic `.meta.yaml` rewrite without the key;
+    /// 6. registry rescan; then one `pack.uninstalled` event when an event bus is
+    ///    wired (payload: `pack_count`, `uninstalled_pack`).
+    pub async fn uninstall(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<PackUninstallReport, PackError> {
+        let key = format!("{name}@{version}");
+        // Same grammar gate `rescan` applies to `.meta.yaml` keys: the key is joined
+        // into `packs_dir` and then `remove_dir_all`'d, so a traversal / separator /
+        // non-ASCII / extra-`@` component must never reach the filesystem.
+        crate::registry::validate_meta_key(&key)?;
+        match std::fs::symlink_metadata(&self.packs_dir) {
+            Ok(md) if md.is_dir() => {}
+            Ok(_) => {
+                return Err(PackError::InvalidManifest(format!(
+                    "packs dir is not a directory: {}",
+                    self.packs_dir.display()
+                )));
+            }
+            // No packs dir ⇒ nothing was ever installed here.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PackError::PackNotFound(name.into(), version.into()));
+            }
+            Err(e) => {
+                return Err(PackError::Io {
+                    path: self.packs_dir.clone(),
+                    source: e,
+                });
+            }
+        }
+        let mut lock = self.open_install_lock()?;
+        let _lock_guard = lock.write().map_err(|e| PackError::Io {
+            path: self.packs_dir.join(INSTALL_LOCK_FILENAME),
+            source: e,
+        })?;
+
+        // Disk truth under the lock.
+        self.registry.rescan().await?;
+        let install_path = self.packs_dir.join(&key);
+        let dir_present = match std::fs::symlink_metadata(&install_path) {
+            Ok(md) => {
+                if md.file_type().is_symlink() {
+                    return Err(PackError::InvalidManifest(format!(
+                        "refusing to remove a symlinked install dir: {}",
+                        install_path.display()
+                    )));
+                }
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                return Err(PackError::Io {
+                    path: install_path,
+                    source: e,
+                });
+            }
+        };
+        let indexed = self.registry.has(name, version);
+        if !dir_present && !indexed {
+            return Err(PackError::PackNotFound(name.into(), version.into()));
+        }
+        let dependents = self.registry.dependents_of(name, version);
+        if !dependents.is_empty() {
+            return Err(PackError::DependentsExist {
+                name: name.into(),
+                version: version.into(),
+                dependents,
+            });
+        }
+        if dir_present {
+            std::fs::remove_dir_all(&install_path).map_err(|e| PackError::Io {
+                path: install_path.clone(),
+                source: e,
+            })?;
+        }
+        let mut idx = read_meta_index(&self.packs_dir)?;
+        if idx.packs.remove(&key).is_some() {
+            write_meta_index_atomic(&self.packs_dir, &idx)?;
+        }
+        self.registry.rescan().await?;
+        if let Some(bus) = &self.event_bus {
+            bus.emit(pack_event(
+                PACK_UNINSTALLED_EVENT,
+                json!({
+                    "pack_count": self.registry.list_installed().len(),
+                    "uninstalled_pack": key,
+                }),
+            ));
+        }
+        Ok(PackUninstallReport {
+            name: name.into(),
+            version: version.into(),
+            removed_path: install_path,
         })
     }
 }

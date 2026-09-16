@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p1")]
 //! GAP-07 (P1) — uninstall / reinstall semantics.
 //!
 //! Contract under test:

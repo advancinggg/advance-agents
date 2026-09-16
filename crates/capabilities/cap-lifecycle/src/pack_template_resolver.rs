@@ -20,9 +20,11 @@
 //! - `memory_seed_jsonl` is always `None`: memory-seeds are a SEPARATE pack
 //!   content type (`ComponentKind::MemorySeed`, `memory-seeds/*.jsonl` at pack
 //!   root), NOT an in-template field — inventing a mapping would be wrong.
-//! - `list()` returns empty: the `PackRegistry` trait exposes no per-pack
-//!   `provides` enumeration, so a faithful template-name list is not derivable
-//!   here. `resolve` is the load-bearing path.
+//! - `list()` (Pack lane P1) enumerates every installed pack's
+//!   `agent-templates` provides as FQ refs
+//!   (`{pack}@{version}/agent-templates/{name}`) via `PackRegistry::provides`;
+//!   a registry without a provides enumeration (trait default `None`)
+//!   contributes nothing. `resolve` remains the load-bearing path.
 //!
 //! # Security
 //!
@@ -195,12 +197,23 @@ impl TemplateResolver for PackTemplateResolver {
     }
 
     fn list(&self) -> Vec<String> {
-        // The PackRegistry trait exposes no per-pack `provides` enumeration
-        // (`list_installed()` yields PackMetadata —
-        // name/version/install_path/trust_level/required_capabilities — but NOT
-        // the `provides` lists), so a faithful agent-template-name list is not
-        // derivable here. Sanctioned empty; `resolve` is the load-bearing path.
-        Vec::new()
+        // Pack lane P1: `list_installed()` × `provides()` → every
+        // installed pack's agent-templates as FQ refs (the exact strings `resolve`
+        // accepts). A registry that keeps the trait default (`None`) — e.g. a
+        // test mock without a provides enumeration — contributes nothing.
+        let mut out = Vec::new();
+        for pack in self.registry.list_installed() {
+            let Some(provides) = self.registry.provides(&pack.name, &pack.version) else {
+                continue;
+            };
+            out.extend(
+                provides
+                    .into_iter()
+                    .filter(|p| p.kind == ComponentKind::AgentTemplate)
+                    .map(|p| format!("{}@{}/agent-templates/{}", pack.name, pack.version, p.name)),
+            );
+        }
+        out
     }
 }
 

@@ -172,6 +172,16 @@ fn try_linux_hardened(path: &Path) -> Result<String, TryLinuxErr> {
     .map_err(|e| TryLinuxErr::Failed(format!("reopen .advance: {e}")))?;
     let advance_file = std::fs::File::from(advance_fd);
 
+    // Pack lane P1: scaffold `.advance/packs/` (the default
+    // `pack.packs-dir`) through the same fd-pinned, NO_SYMLINKS path. The macOS /
+    // pre-5.6 fallback gets it from `advance_home::write_recognizable_home`.
+    mkdirat(
+        advance_file.as_fd(),
+        "packs",
+        Mode::from_bits_truncate(0o700),
+    )
+    .map_err(|e| TryLinuxErr::Failed(format!("mkdir .advance/packs: {e}")))?;
+
     let cfg_fd = openat2(
         advance_file.as_fd(),
         "runtime-config.yaml",

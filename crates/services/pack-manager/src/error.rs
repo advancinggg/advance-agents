@@ -1,7 +1,9 @@
 //! MODULE-018 §2.8 error taxonomy — Slice A: 10 variants; Slice B adds 7
 //! (total 17); Slice C adds 1 (`ConstraintViolation`, total 18); Slice D adds
 //! 3 (`GitCloneFailed`, `TarballExtractFailed`, `RegistryFetchFailed`, total 21)
-//! for the non-Local install source surface.
+//! for the non-Local install source surface. Pack lane P1 adds 3
+//! (`AlreadyInstalled`, `DependentsExist`, `UnknownRequiredCapability`, total 24)
+//! for the reinstall / uninstall / capability-catalog surface.
 
 use std::path::PathBuf;
 
@@ -117,4 +119,32 @@ pub enum PackError {
         version: String,
         reason: String,
     },
+
+    // ─────────────────────────────────────────────────────────────
+    // Pack lane P1 additions — variants 22/23/24.
+    /// Step ③ (after manifest parse, BEFORE checksum verification and admin
+    /// approval): `packs_dir/{name}@{version}` already exists on disk OR
+    /// `.meta.yaml` already carries the key. Judged from DISK state (not the
+    /// in-memory registry) so a fresh `Installer` over an existing packs dir
+    /// refuses a reinstall without ever prompting the admin. Recovery path:
+    /// [`Installer::uninstall`](crate::Installer::uninstall) then install.
+    #[error("pack {name}@{version} is already installed")]
+    AlreadyInstalled { name: String, version: String },
+
+    /// `uninstall` refused: other installed packs declare a `dependencies:`
+    /// entry that this exact `{name}@{version}` satisfies. `dependents` is the
+    /// sorted `"{name}@{version}"` list of those packs — uninstall them first.
+    #[error("cannot uninstall {name}@{version}: still required by {}", .dependents.join(", "))]
+    DependentsExist {
+        name: String,
+        version: String,
+        dependents: Vec<String>,
+    },
+
+    /// Step ④ (`CatalogCheckedApproval`): `required-capabilities` names one or
+    /// more capabilities absent from the composition root's capability catalog.
+    /// Surfaced BEFORE the inner approval strategy runs, so an admin is never
+    /// prompted to approve a capability the runtime cannot provide.
+    #[error("pack {pack} declares unknown required-capabilities: {}", .unknown.join(", "))]
+    UnknownRequiredCapability { pack: String, unknown: Vec<String> },
 }

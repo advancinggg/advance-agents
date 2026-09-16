@@ -19,8 +19,8 @@ path = "src/lib.rs"
 [features]
 default = []
 test-support = []
-# the pack lanes gated witness tests
-gap-p1 = []
+# the pack lanes gated witness tests.
+# `gap-p1` was retired when lane P1 landed (its witnesses run in the default gate).
 gap-p2 = []
 gap-p3 = []
 

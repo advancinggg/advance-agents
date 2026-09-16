@@ -89,6 +89,9 @@ use cap_lifecycle::{
 };
 
 use crate::component_submit_bridge::{CapGrantSubmitSubsetGate, SchedulerSubmitBridge};
+// Pack lane P1: the composition-root pack wiring (ONE rescanned pack
+// registry + the chained built-in ∪ pack template resolver + the evaluator resolver).
+use crate::pack_wiring::{build_pack_wiring, PackWiring};
 use crate::perchild_daemon::{KeyResolver, PerChildLoopManager};
 use crate::progress_lifecycle_activation::{
     activate_progress_lifecycle, ProgressLifecycleActivation,
@@ -97,7 +100,9 @@ use crate::progress_lifecycle_bootstrap::{
     bootstrap_progress_lifecycle, ProgressLifecycleBootstrapStaging,
 };
 use crate::reply::ReplyRegistry;
+use advance_scheduler_auto_loop::EvaluatorResolver;
 use advance_shared_types::web_search::WebRunMode;
+use cap_lifecycle::templates::TemplateResolver;
 use cap_llm::{register_agent_llm_with_turn_cost, LlmGateway, LlmGatewayVlm, VlmExtractor};
 use cap_memory::{
     register_agent_memory_with_git_and_policy, L6CursorStore, MemoryGitRestore, MemoryStore,
@@ -459,6 +464,12 @@ pub enum CliWiringError {
     /// fail-closed discipline as AgentTree / MasterKey). Carries the already-formatted
     /// reason (the `AgentConfigError` / `BootstrapError` Display).
     ConfigTree(String),
+    /// Pack lane P1: the boot-time pack wiring failed — the packs dir
+    /// is not a real directory / could not be created, or the registry rescan
+    /// rejected `.meta.yaml` / an installed pack (fail-closed: a tampered pack
+    /// must not be silently ignored). Fires BEFORE the EventBus exists, so a
+    /// failure leaks no background tasks.
+    Pack(crate::pack_wiring::PackWiringError),
 }
 
 impl std::fmt::Display for CliWiringError {
@@ -484,6 +495,7 @@ impl std::fmt::Display for CliWiringError {
             CliWiringError::ConfigTree(m) => {
                 write!(f, "agent-tree config materialization failure: {m}")
             }
+            CliWiringError::Pack(e) => write!(f, "pack wiring failure: {e}"),
         }
     }
 }
@@ -511,6 +523,8 @@ impl std::error::Error for CliWiringError {
             // String-only reason (AgentConfigError / BootstrapError formatted at the
             // call site); no inner source.
             CliWiringError::ConfigTree(_) => None,
+            // PackWiringError implements std::error::Error (pack_wiring.rs).
+            CliWiringError::Pack(e) => Some(e),
         }
     }
 }
@@ -710,6 +724,11 @@ pub struct WiringHandles {
     pub evidence_ids: Arc<EvidenceIdStore>,
     pub tools_grant_reader: Option<Arc<dyn ToolsGrantReader>>,
     pub web_grant: Option<Arc<dyn GrantCheck>>,
+    /// Pack lane P1: the composition-root pack wiring — the ONE
+    /// rescanned pack registry, the chained template resolver every spawner
+    /// shares, the evaluator resolver the auto-loop driver holds, and the
+    /// materializer. Always present (an absent packs dir boots an empty registry).
+    pub pack: PackWiring,
 }
 
 #[cfg(feature = "test-support")]
@@ -863,6 +882,25 @@ pub fn materialize_config_tree(
     root_id: &AgentId,
     decls: &[crate::agent_config::AgentDecl],
 ) -> Result<(), CliWiringError> {
+    materialize_config_tree_with_resolver(
+        tree,
+        root_id,
+        decls,
+        Arc::new(BuiltinTemplateRegistry::new()),
+    )
+}
+
+/// Pack lane P1: [`materialize_config_tree`] over an explicit
+/// [`TemplateResolver`]. `wire_capabilities` passes the composition-root chained
+/// resolver (built-ins ∪ pack FQ refs) so a config-declared `template:` may name an
+/// installed pack template (`{pack}@{ver}/agent-templates/{name}`); the 3-arg entry
+/// keeps the built-in-only behaviour for callers that own no pack registry.
+pub fn materialize_config_tree_with_resolver(
+    tree: &Arc<AgentTreeStore>,
+    root_id: &AgentId,
+    decls: &[crate::agent_config::AgentDecl],
+    template_resolver: Arc<dyn TemplateResolver>,
+) -> Result<(), CliWiringError> {
     if decls.is_empty() {
         return Ok(());
     }
@@ -872,7 +910,7 @@ pub fn materialize_config_tree(
     let spawner = DefaultSpawner::with_template_resolver(
         (**tree).clone(),
         Arc::new(CapGrantSubsetAdapter::new()),
-        Arc::new(BuiltinTemplateRegistry::new()),
+        template_resolver,
     );
     let mut queue: std::collections::VecDeque<(AgentId, &[crate::agent_config::AgentDecl])> =
         std::collections::VecDeque::new();
@@ -1110,6 +1148,17 @@ async fn wire_capabilities_inner(
     let declares_tools = declares("tools");
     let declares_web = declares("web");
     let web_cfg_snapshot = builder.config().web.clone();
+    // Pack lane P1: ONE pack registry rescanned from
+    // `<workspace>/<pack.packs-dir>` (created when absent — a fresh `advance init`
+    // workspace boots with an empty registry), the chained template resolver
+    // (built-ins ∪ pack FQ refs) every spawner below shares, and the evaluator
+    // resolver the auto-loop driver gets. Built BEFORE the EventBus so a rescan
+    // failure (fail-closed) leaks no actor tasks.
+    let pack_wiring: PackWiring =
+        build_pack_wiring(&workspace.join(&builder.config().pack.packs_dir), None)
+            .await
+            .map_err(CliWiringError::Pack)?;
+    let template_resolver: Arc<dyn TemplateResolver> = pack_wiring.template_resolver.clone();
     let evidence_ids = Arc::new(EvidenceIdStore::new());
     // await-leg B-2 (2026-06-22): gate the production messaging chain (await-replies
     // + heartbeat host-fns + the suspend sink). await-leg B-4a (2026-06-22) flipped
@@ -1243,7 +1292,12 @@ async fn wire_capabilities_inner(
     if let Some(tree) = agent_tree.as_ref() {
         let decls = crate::agent_config::parse_agents_config(yaml)
             .map_err(|e| CliWiringError::ConfigTree(format!("{e}")))?;
-        materialize_config_tree(tree, &AgentId(DEFAULT_AGENT_ID.to_string()), &decls)?;
+        materialize_config_tree_with_resolver(
+            tree,
+            &AgentId(DEFAULT_AGENT_ID.to_string()),
+            &decls,
+            template_resolver.clone(),
+        )?;
     }
 
     let mut agent_tree_snapshot: Option<Arc<dyn AgentTreeSnapshot>> = None;
@@ -1484,11 +1538,15 @@ async fn wire_capabilities_inner(
     // server. `bus_concrete.cost_tracker_query()` clones an internal Arc (the same
     // one RunManager consumes below), so calling it here + at the RunManager build
     // is fine.
+    // Pack lane P1: the same augment ALSO installs the composition-root
+    // `PackEvaluatorResolver` (over the boot-time pack registry) — before P1 the
+    // production driver had no evaluator resolver at all.
     let auto_loop_driver = match auto_loop_driver {
-        Some(driver) => match crate::auto_wiring::install_auto_loop_integration(
+        Some(driver) => match crate::auto_wiring::install_auto_loop_integration_with_evaluator(
             driver,
             bus_concrete.cost_tracker_query(),
             workspace,
+            pack_wiring.evaluator_resolver.clone() as Arc<dyn EvaluatorResolver>,
         ) {
             Ok(driver) => Some(driver),
             Err(e) => {
@@ -1742,10 +1800,12 @@ async fn wire_capabilities_inner(
     }
 
     if let Some(tree) = agent_tree.as_ref() {
+        // Pack lane P1: the chained resolver — a guest `spawn-child`
+        // may name an installed pack template by FQ ref.
         let spawner_concrete = DefaultSpawner::with_template_resolver(
             (**tree).clone(),
             Arc::new(CapGrantSubsetAdapter::new()),
-            Arc::new(BuiltinTemplateRegistry::new()),
+            template_resolver.clone(),
         );
         // Wave-23 seam (d): when messaging is wired (so the shared routing/bridge/
         // store exist), build the PerChildLoopManager and attach it as the spawner's
@@ -2575,7 +2635,9 @@ async fn wire_capabilities_inner(
                     (**tree).clone(),
                     Arc::clone(spawner),
                     Arc::new(terminator),
-                    Arc::new(BuiltinTemplateRegistry::new()),
+                    // Pack lane P1: the same chained resolver, so
+                    // `/client/agents/templates` lists installed pack templates too.
+                    template_resolver.clone(),
                     AgentId(DEFAULT_AGENT_ID.to_string()),
                 )))
             }
@@ -2746,6 +2808,7 @@ async fn wire_capabilities_inner(
             evidence_ids: Arc::clone(&evidence_ids),
             tools_grant_reader,
             web_grant: web_grant_handle,
+            pack: pack_wiring,
         },
     ))
 }

@@ -5,8 +5,9 @@
 //! deps, copy, registry update) and its templates/skills become available."
 //!
 //! These drive the REAL admin-side `advance_pack_manager::Installer` end-to-end
-//! (the production library entry — the admin surface; an `advance pack install`
-//! CLI shell does not yet exist and is out of this track's scope). The §2
+//! (the production library entry — the admin surface; the `advance pack install`
+//! CLI shell landed with Pack lane P1 and wraps this same `Installer`,
+//! witnessed separately in `crates/cli/tests/gap_p1_01_pack_cli.rs`). The §2
 //! "Verified By Task" column records this run's /dev task_id (per the §2 legend);
 //! the library-Installer substitution for SYS-AC-090 is documented here, in the
 //! commit message, and in the run SUMMARY — not as free-form text in the ledger
@@ -16,9 +17,10 @@
 //! `AutoReject` are production `ApprovalStrategy` impls; `RecordingTraceSink` and
 //! the recording `EventBusEmit` bus are OBSERVATION sinks (not chain mocks).
 //!
-//! Witnesses (GREEN): SYS-AC-090, SYS-AC-091, SYS-AC-092, SYS-AC-222, SYS-AC-223.
-//! Queued (#[ignore], HF): SYS-AC-093 — needs spawn-agent-from-template (the
-//! multi-agent `.agents()` spawn path owned by Track HF / harness `lib.rs`).
+//! Witnesses (GREEN): SYS-AC-090, SYS-AC-091, SYS-AC-092, SYS-AC-222, SYS-AC-223,
+//! and SYS-AC-093 (GREEN since 2026-06-15 — spawn-agent-from-template through the
+//! `PackTemplateResolver` bridge; it is an ordinary `#[tokio::test]` below. The
+//! earlier "Queued (#[ignore], HF)" note here was stale — Pack lane P1).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
