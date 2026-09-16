@@ -53,6 +53,15 @@ enum Cmd {
         sub: SkillCmd,
     },
 
+    /// Install, list and uninstall packs in the admin packs dir (MODULE-018
+    /// §1.3.2; PACK-GAP-CLOSURE §2.7). Admin/operator surface — not
+    /// agent-callable. Wraps the same 8-step `Installer` the runtime's pack
+    /// registry reads.
+    Pack {
+        #[command(subcommand)]
+        sub: PackCmd,
+    },
+
     /// Provision the on-disk encrypted secret store (admin surface, not
     /// agent-callable). Stored values are AES-256-GCM-encrypted under the
     /// keychain/env master key; `advance start` resolves them at LLM-request
@@ -125,6 +134,40 @@ enum SkillCmd {
 }
 
 #[derive(Subcommand)]
+enum PackCmd {
+    /// Install a pack. `<source>` is a local directory, `git+<url>[@<ref>]`,
+    /// a `.tar.gz` path, or `registry:<name>@<version>`. A pack that declares
+    /// `required-capabilities` prompts for approval on stdin (see --no-input).
+    /// Reinstalling an installed `name@version` is refused — uninstall first.
+    Install {
+        source: String,
+        /// Packs dir. Default: `pack.packs-dir` from
+        /// $ADVANCE_WORKSPACE/.advance/runtime-config.yaml when present, else
+        /// $ADVANCE_WORKSPACE/.advance/packs → ./.advance/packs.
+        #[arg(long)]
+        packs_dir: Option<std::path::PathBuf>,
+        /// Never read stdin: a pack that needs approval is rejected.
+        #[arg(long)]
+        no_input: bool,
+    },
+    /// List installed packs, one per line: `name@version<TAB>trust<TAB>installed-at`.
+    List {
+        /// Packs dir (same default resolution as `install`).
+        #[arg(long)]
+        packs_dir: Option<std::path::PathBuf>,
+    },
+    /// Uninstall `<name>@<version>`. Refused while another installed pack
+    /// depends on it.
+    Uninstall {
+        /// `<name>@<version>` of an installed pack.
+        spec: String,
+        /// Packs dir (same default resolution as `install`).
+        #[arg(long)]
+        packs_dir: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SecretsCmd {
     /// Store a secret. The value is read from STDIN (never argv, which would
     /// leak via `ps`/shell history).
@@ -180,6 +223,17 @@ fn main() -> ExitCode {
             } => commands::skill::run_import(source, mcp_descriptor, name, pool, trust),
             SkillCmd::Materialize { name, to, pool } => {
                 commands::skill::run_materialize(name, to, pool)
+            }
+        },
+        Cmd::Pack { sub } => match sub {
+            PackCmd::Install {
+                source,
+                packs_dir,
+                no_input,
+            } => commands::pack::run_install(source, packs_dir, no_input),
+            PackCmd::List { packs_dir } => commands::pack::run_list(packs_dir),
+            PackCmd::Uninstall { spec, packs_dir } => {
+                commands::pack::run_uninstall(spec, packs_dir)
             }
         },
         Cmd::Secrets { sub } => match sub {

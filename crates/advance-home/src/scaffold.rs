@@ -65,8 +65,9 @@ capabilities:
   llm: true
 ";
 
-/// Write `.advance/` / `.runtime/` / `.agent/` + starter files.
-/// Parent dirs may already exist (Linux `mkdirat` / create path).
+/// Write `.advance/` / `.runtime/` / `.agent/` (+ `.advance/packs/`, the
+/// default MODULE-018 `pack.packs-dir` — PACK-GAP-CLOSURE P1 §2.1) + starter
+/// files. Parent dirs may already exist (Linux `mkdirat` / create path).
 pub fn write_recognizable_home(path: &Path) -> Result<(), std::io::Error> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => {
@@ -92,7 +93,8 @@ pub fn write_recognizable_home(path: &Path) -> Result<(), std::io::Error> {
     {
         dir_opts.mode(0o700);
     }
-    for sub in [".advance", ".runtime", ".agent"] {
+    // Order matters: `.advance` is created before its `packs` child.
+    for sub in [".advance", ".runtime", ".agent", ".advance/packs"] {
         let p = path.join(sub);
         match fs::symlink_metadata(&p) {
             Ok(m) if m.file_type().is_dir() => {}

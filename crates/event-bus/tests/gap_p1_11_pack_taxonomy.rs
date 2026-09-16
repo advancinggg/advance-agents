@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p1")]
 //! GAP-11 (P1) — `pack.*` events registered in the MODULE-019 taxonomy.
 //! See docs/plans/PACK-GAP-CLOSURE.md §2.6. They are documented extensions
 //! (NOT in PRD §15.3) and must NOT enter the 12-entry Trigger Bus whitelist.

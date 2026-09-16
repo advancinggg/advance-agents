@@ -498,6 +498,13 @@ async fn t38_rescan_partial_failure_atomic_abort() {
 // `copy_dir_no_symlinks`. The install_path must not pre-exist (whether as a
 // regular dir, a regular file, or a symlink); a pre-existing symlink would
 // otherwise redirect step ⑥ writes outside the pack root.
+//
+// PACK-GAP-CLOSURE P1 (§2.2): through `Installer::install` a pre-existing
+// `packs_dir/{name}@{version}` is now judged `AlreadyInstalled` at step ③ —
+// BEFORE checksum verification and the step-④ admin prompt — so these three
+// tests assert that (plus "no approval step traced" and "nothing written
+// through the planted path"), and pin the `copy_dir_no_symlinks` dst-side
+// pre-check DIRECTLY (it stays as defense-in-depth behind the step-③ gate).
 
 #[tokio::test]
 async fn t39_install_path_preexists_as_dir_rejected() {
@@ -506,6 +513,16 @@ async fn t39_install_path_preexists_as_dir_rejected() {
     let packs_dir = dir.path().join("packs");
     std::fs::create_dir_all(packs_dir.join("foo@1.0.0")).unwrap();
 
+    // Direct pin of the copy-time dst pre-existence defense.
+    match advance_pack_manager::fetch::copy_dir_no_symlinks(&pack_src, &packs_dir.join("foo@1.0.0"))
+    {
+        Err(PackError::InvalidManifest(msg)) => assert!(
+            msg.contains("must not pre-exist") || msg.contains("pre-existing"),
+            "expected pre-existence rejection, got: {msg}"
+        ),
+        other => panic!("expected InvalidManifest(pre-existing), got {other:?}"),
+    }
+
     let registry = Arc::new(InMemoryPackRegistry::new(packs_dir.clone()));
     let sink = Arc::new(RecordingTraceSink::new());
     let installer = Installer {
@@ -513,19 +530,22 @@ async fn t39_install_path_preexists_as_dir_rejected() {
         registry,
         current_runtime_version: "0.5.0".into(),
         approval: Arc::new(AutoApprove),
-        trace_sink: sink,
+        trace_sink: sink.clone(),
         dep_resolver: None,
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
     };
     match installer.install(pack_src.to_string_lossy().as_ref()).await {
-        Err(PackError::InvalidManifest(msg)) => assert!(
-            msg.contains("must not pre-exist") || msg.contains("pre-existing"),
-            "expected pre-existence rejection, got: {msg}"
-        ),
-        other => panic!("expected InvalidManifest(pre-existing), got {other:?}"),
+        Err(PackError::AlreadyInstalled { name, version }) => {
+            assert_eq!((name.as_str(), version.as_str()), ("foo", "1.0.0"));
+        }
+        other => panic!("expected AlreadyInstalled, got {other:?}"),
     }
+    assert!(
+        !sink.steps().contains(&InstallStep::Step4AdminApproval),
+        "a pre-existing install path is refused before the admin prompt"
+    );
 }
 
 #[tokio::test]
@@ -548,20 +568,11 @@ async fn t40_install_path_preexists_as_symlink_rejected() {
         std::fs::create_dir_all(&attacker_dir).unwrap();
         std::os::unix::fs::symlink(&attacker_dir, packs_dir.join("foo@1.0.0")).unwrap();
 
-        let registry = Arc::new(InMemoryPackRegistry::new(packs_dir.clone()));
-        let sink = Arc::new(RecordingTraceSink::new());
-        let installer = Installer {
-            packs_dir,
-            registry,
-            current_runtime_version: "0.5.0".into(),
-            approval: Arc::new(AutoApprove),
-            trace_sink: sink,
-            dep_resolver: None,
-            event_bus: None,
-            registry_client: None,
-            fetch_timeout: None,
-        };
-        match installer.install(pack_src.to_string_lossy().as_ref()).await {
+        // Direct pin of the copy-time dst symlink defense.
+        match advance_pack_manager::fetch::copy_dir_no_symlinks(
+            &pack_src,
+            &packs_dir.join("foo@1.0.0"),
+        ) {
             Err(PackError::InvalidManifest(msg)) => {
                 assert!(
                     msg.contains("symlink") || msg.contains("pre-exist"),
@@ -570,6 +581,28 @@ async fn t40_install_path_preexists_as_symlink_rejected() {
             }
             other => panic!("expected InvalidManifest(symlink), got {other:?}"),
         }
+        assert!(!attacker_dir.join("pack.yaml").exists());
+
+        let registry = Arc::new(InMemoryPackRegistry::new(packs_dir.clone()));
+        let sink = Arc::new(RecordingTraceSink::new());
+        let installer = Installer {
+            packs_dir,
+            registry,
+            current_runtime_version: "0.5.0".into(),
+            approval: Arc::new(AutoApprove),
+            trace_sink: sink.clone(),
+            dep_resolver: None,
+            event_bus: None,
+            registry_client: None,
+            fetch_timeout: None,
+        };
+        match installer.install(pack_src.to_string_lossy().as_ref()).await {
+            Err(PackError::AlreadyInstalled { name, version }) => {
+                assert_eq!((name.as_str(), version.as_str()), ("foo", "1.0.0"));
+            }
+            other => panic!("expected AlreadyInstalled, got {other:?}"),
+        }
+        assert!(!sink.steps().contains(&InstallStep::Step4AdminApproval));
         // attacker_target must be untouched — no pack.yaml written through it.
         assert!(!attacker_dir.join("pack.yaml").exists());
     }
@@ -681,26 +714,41 @@ async fn t43_install_path_preexists_as_file_rejected() {
     // Pre-create install_path as a regular file (not dir, not symlink).
     std::fs::write(packs_dir.join("foo@1.0.0"), b"stale partial install").unwrap();
 
-    let registry = Arc::new(InMemoryPackRegistry::new(packs_dir.clone()));
-    let sink = Arc::new(RecordingTraceSink::new());
-    let installer = Installer {
-        packs_dir,
-        registry,
-        current_runtime_version: "0.5.0".into(),
-        approval: Arc::new(AutoApprove),
-        trace_sink: sink,
-        dep_resolver: None,
-        event_bus: None,
-        registry_client: None,
-        fetch_timeout: None,
-    };
-    match installer.install(pack_src.to_string_lossy().as_ref()).await {
+    // Direct pin of the copy-time non-directory pre-existence defense.
+    match advance_pack_manager::fetch::copy_dir_no_symlinks(&pack_src, &packs_dir.join("foo@1.0.0"))
+    {
         Err(PackError::InvalidManifest(msg)) => assert!(
             msg.contains("must not pre-exist") && msg.contains("non-directory"),
             "expected non-directory pre-existence rejection, got: {msg}"
         ),
         other => panic!("expected InvalidManifest(pre-existing file), got {other:?}"),
     }
+
+    let registry = Arc::new(InMemoryPackRegistry::new(packs_dir.clone()));
+    let sink = Arc::new(RecordingTraceSink::new());
+    let installer = Installer {
+        packs_dir: packs_dir.clone(),
+        registry,
+        current_runtime_version: "0.5.0".into(),
+        approval: Arc::new(AutoApprove),
+        trace_sink: sink.clone(),
+        dep_resolver: None,
+        event_bus: None,
+        registry_client: None,
+        fetch_timeout: None,
+    };
+    match installer.install(pack_src.to_string_lossy().as_ref()).await {
+        Err(PackError::AlreadyInstalled { name, version }) => {
+            assert_eq!((name.as_str(), version.as_str()), ("foo", "1.0.0"));
+        }
+        other => panic!("expected AlreadyInstalled, got {other:?}"),
+    }
+    assert!(!sink.steps().contains(&InstallStep::Step4AdminApproval));
+    // The stale file is left for the operator (`uninstall` is the recovery path).
+    assert_eq!(
+        std::fs::read(packs_dir.join("foo@1.0.0")).unwrap(),
+        b"stale partial install"
+    );
 }
 
 #[tokio::test]

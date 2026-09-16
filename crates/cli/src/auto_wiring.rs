@@ -363,15 +363,43 @@ pub fn install_auto_loop_integration(
     cost_tracker: Arc<dyn CostTrackerQuery>,
     workspace: &Path,
 ) -> Result<Arc<DefaultAutoLoopDriver>, String> {
+    augment_auto_loop_driver(driver, cost_tracker, workspace, None)
+}
+
+/// PACK-GAP-CLOSURE P1 (§2.8): [`install_auto_loop_integration`] PLUS the
+/// composition-root `EvaluatorResolver` — the [`PackEvaluatorResolver`] over the
+/// production pack registry (`pack_wiring::PackWiring::evaluator_resolver`).
+/// Before P1 the production driver had NO evaluator resolver installed, so an
+/// auto-loop config naming a pack evaluator FQ ref could never resolve at
+/// runtime. Same augment-before-share contract: must run on the still-unique
+/// driver `Arc`.
+pub fn install_auto_loop_integration_with_evaluator(
+    driver: Arc<DefaultAutoLoopDriver>,
+    cost_tracker: Arc<dyn CostTrackerQuery>,
+    workspace: &Path,
+    evaluator: Arc<dyn EvaluatorResolver>,
+) -> Result<Arc<DefaultAutoLoopDriver>, String> {
+    augment_auto_loop_driver(driver, cost_tracker, workspace, Some(evaluator))
+}
+
+fn augment_auto_loop_driver(
+    driver: Arc<DefaultAutoLoopDriver>,
+    cost_tracker: Arc<dyn CostTrackerQuery>,
+    workspace: &Path,
+    evaluator: Option<Arc<dyn EvaluatorResolver>>,
+) -> Result<Arc<DefaultAutoLoopDriver>, String> {
     let driver = Arc::try_unwrap(driver).map_err(|_| {
         "install_auto_loop_integration: auto driver Arc is already shared; install the \
          cost-tracker + results-writer BEFORE cloning the driver into the round-advancer \
          (build_auto_round_advancer)"
             .to_string()
     })?;
-    let driver = driver
+    let mut driver = driver
         .with_cost_tracker(cost_tracker)
         .with_results_writer(Arc::new(ResultsWriter::new(workspace.to_path_buf())));
+    if let Some(resolver) = evaluator {
+        driver = driver.with_evaluator_resolver(resolver);
+    }
     Ok(Arc::new(driver))
 }
 

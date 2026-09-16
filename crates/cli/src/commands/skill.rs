@@ -20,7 +20,7 @@ use cap_skills::{materialize_skill, AdminPoolStorage, McpImportSpec, SkillImport
 /// args / `$ADVANCE_WORKSPACE` may carry ANSI escapes, control bytes, or
 /// newlines; `Path::display()` does NOT escape these, whereas `{:?}` routes
 /// through Debug → `escape_debug` and DOES. Mirrors `start.rs::safe_path`.
-fn safe_path(p: &Path) -> String {
+pub(crate) fn safe_path(p: &Path) -> String {
     format!("{p:?}")
 }
 
@@ -32,7 +32,7 @@ fn safe_path(p: &Path) -> String {
 /// the rejection message). Escapes ASCII/Unicode control chars (incl. ESC
 /// 0x1b and newlines) via `escape_default`; leaves printable chars + tab
 /// readable.
-fn safe_msg(s: &str) -> String {
+pub(crate) fn safe_msg(s: &str) -> String {
     s.chars()
         .flat_map(|c| {
             if c.is_control() && c != '\t' {

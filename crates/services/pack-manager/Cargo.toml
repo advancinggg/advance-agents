@@ -17,6 +17,10 @@ advance-shared-types = { path = "../../shared-types" }
 cap-tools = { path = "../../capabilities/cap-tools" }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
+# PACK-GAP-CLOSURE P1 (§2.5): cross-process install lock (`packs_dir/.install.lock`)
+# held across the disk-mutating install/uninstall window. Workspace pin =4.0.4
+# (already vetted by cargo-deny for the cli crate).
+fd-lock = { workspace = true }
 # Slice D (2026-05-25): tarball extract codec for non-Local install source AC-05.
 # flate2 wraps the .tar.gz file; tar reads entries inside spawn_blocking.
 flate2 = { workspace = true }
@@ -46,7 +50,7 @@ wit-parser = { workspace = true }
 workspace = true
 
 [features]
-# PACK-GAP-CLOSURE gated witness tests (docs/plans/PACK-GAP-CLOSURE.md §0.2)
-gap-p1 = []
+# PACK-GAP-CLOSURE gated witness tests (docs/plans/PACK-GAP-CLOSURE.md §0.2).
+# `gap-p1` was retired when lane P1 landed (its witnesses run in the default gate).
 gap-p2 = []
 gap-p3 = []

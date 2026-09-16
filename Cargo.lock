@@ -337,6 +337,7 @@ dependencies = [
  "async-trait",
  "cap-tools",
  "chrono",
+ "fd-lock",
  "flate2",
  "hex",
  "libc",

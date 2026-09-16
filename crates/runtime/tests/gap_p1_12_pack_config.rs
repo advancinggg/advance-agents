@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p1")]
 //! GAP-12 (P1, unit half) — `PackConfig` defaults + validation.
 //! See docs/plans/PACK-GAP-CLOSURE.md §2.1. The e2e half (through `advance init` +
 //! `load_config`) lives in crates/cli/tests/gap_p1_12_pack_config_e2e.rs.

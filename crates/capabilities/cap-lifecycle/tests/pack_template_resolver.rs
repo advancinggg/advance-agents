@@ -119,17 +119,10 @@ async fn install_pack(opts: PackOpts) -> (TempDir, Arc<InMemoryPackRegistry>) {
     write_source(&src, &opts);
     let packs_dir = tmp.path().join("packs");
     let registry = Arc::new(InMemoryPackRegistry::new(packs_dir.clone()));
-    let installer = Installer {
-        packs_dir,
-        registry: registry.clone(),
-        current_runtime_version: "0.5.0".into(),
-        approval: Arc::new(AutoApprove),
-        trace_sink: Arc::new(RecordingTraceSink::default()),
-        dep_resolver: None,
-        event_bus: None,
-        registry_client: None,
-        fetch_timeout: None,
-    };
+    // PACK-GAP-CLOSURE P1 (§2.0): builder form — later lanes' new fields no longer
+    // break this fixture.
+    let installer = Installer::new(packs_dir, registry.clone(), "0.5.0", Arc::new(AutoApprove))
+        .with_trace_sink(Arc::new(RecordingTraceSink::default()));
     installer
         .install(src.to_string_lossy().as_ref())
         .await
@@ -336,11 +329,18 @@ async fn t_ptr_16_aggregate_over_total_bytes_is_invalid() {
     );
 }
 
+/// PACK-GAP-CLOSURE P1 (#14): `list()` was a sanctioned empty Vec (no `provides`
+/// enumeration on the trait); it now yields every installed agent-template as the
+/// FQ ref `resolve` accepts. (Was `t_ptr_11_list_returns_empty`.)
 #[tokio::test]
-async fn t_ptr_11_list_returns_empty() {
+async fn t_ptr_11_list_returns_installed_template_fq_refs() {
     let (_tmp, reg) = install_pack(PackOpts::default()).await;
     let resolver = PackTemplateResolver::new(reg);
-    assert!(resolver.list().is_empty());
+    let listed = resolver.list();
+    assert_eq!(listed, vec![FQ.to_string()]);
+    resolver
+        .resolve(&listed[0])
+        .expect("every listed ref resolves through the same resolver");
 }
 
 // ── security: post-install symlink tamper ────────────────────────────────────

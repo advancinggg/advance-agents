@@ -192,6 +192,17 @@ pub struct RuntimeConfig {
     pub security: SecurityConfig,
     #[serde(default)]
     pub genui: GenUiConfig,
+    /// PACK-GAP-CLOSURE P1 (§2.1, 2026-09-15) — MODULE-018 pack-system config
+    /// surface (`pack:` block; CONTRACT-003 additive extension). `#[serde(default)]`
+    /// per the `database` / `tools` / … precedent: existing `runtime-config.yaml`
+    /// files without a `pack:` block parse cleanly under `deny_unknown_fields`,
+    /// producing `PackConfig::default()` (`packs-dir: ".advance/packs"`,
+    /// `fetch-timeout-sec: 120`, `approval: interactive`, no trust roots, no
+    /// registry). Read by the cli composition root (`packs-dir` → the boot-time
+    /// pack registry) and by the `advance pack` admin commands (`packs-dir`,
+    /// `fetch-timeout-sec`, `approval`).
+    #[serde(default)]
+    pub pack: PackConfig,
 }
 
 /// /dev Phase-3 kickoff (2026-06-06) — per-run budget caps seeded into the live
@@ -952,6 +963,167 @@ impl Default for DatabaseConfig {
 }
 
 // ---------------------------------------------------------------------------
+// PackConfig (PACK-GAP-CLOSURE P1, 2026-09-15) — MODULE-018 §2.10 pack-system
+// config surface (`pack:` block, CONTRACT-003 additive extension).
+// ---------------------------------------------------------------------------
+
+/// `pack:` block of `runtime-config.yaml`. Every field defaults, so the block
+/// is optional (see `RuntimeConfig.pack`). Shape-validated by
+/// [`PackConfig::validate`]; `load_config` applies the same rules through
+/// `validate_config`, so a bad block never loads.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackConfig {
+    /// Packs dir, RELATIVE to the workspace root (the composition root joins it).
+    /// Same shape rules as `database.db-path`: absolute paths and `..` segments
+    /// are rejected (tampered-config redirection). Default `.advance/packs`.
+    #[serde(rename = "packs-dir", default = "default_packs_dir")]
+    pub packs_dir: String,
+    /// Wall-clock bound on the installer's step-② fetch (git clone / registry
+    /// download), in seconds; `1..=3600`. Default 120 (the `Installer` default).
+    #[serde(
+        rename = "fetch-timeout-sec",
+        default = "default_pack_fetch_timeout_sec"
+    )]
+    pub fetch_timeout_sec: u64,
+    /// Admin approval policy for packs that declare `required-capabilities`.
+    /// There is deliberately NO auto-approve variant: production never approves
+    /// a capability grant unattended.
+    #[serde(default)]
+    pub approval: PackApprovalPolicy,
+    /// Lane P3 (#6 signed manifests): ed25519 public keys, 64 hex chars each.
+    /// P1 validates the shape only.
+    #[serde(rename = "trust-roots", default)]
+    pub trust_roots: Vec<String>,
+    /// Lane P3 (#3 HTTPS registry): `https://…` for any host, or `http://` for a
+    /// loopback host only (`127.0.0.0/8`, `::1`, `localhost`). P1 validates the
+    /// shape only.
+    #[serde(rename = "registry-url", default)]
+    pub registry_url: Option<String>,
+}
+
+/// `pack.approval` policy. Kebab-case in YAML: `interactive` | `auto-reject`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub enum PackApprovalPolicy {
+    /// Prompt the operator on stdin (`InteractiveApproval`).
+    #[default]
+    Interactive,
+    /// Refuse any pack that needs approval (`AutoReject`) — unattended installs.
+    AutoReject,
+}
+
+fn default_packs_dir() -> String {
+    ".advance/packs".to_string()
+}
+fn default_pack_fetch_timeout_sec() -> u64 {
+    120
+}
+
+impl Default for PackConfig {
+    fn default() -> Self {
+        Self {
+            packs_dir: default_packs_dir(),
+            fetch_timeout_sec: default_pack_fetch_timeout_sec(),
+            approval: PackApprovalPolicy::default(),
+            trust_roots: Vec::new(),
+            registry_url: None,
+        }
+    }
+}
+
+impl PackConfig {
+    /// Upper bound on `fetch-timeout-sec` (one hour).
+    pub const MAX_FETCH_TIMEOUT_SEC: u64 = 3600;
+
+    /// Shape validation (standalone form). The error names the offending
+    /// field; the path is the generic `runtime-config.yaml` because this form
+    /// has no file context — `load_config` reports the real path.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_message().map_err(|msg| ConfigError::IoError {
+            path: PathBuf::from("runtime-config.yaml"),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, msg),
+        })
+    }
+
+    /// The single source of the `pack:` shape rules; `validate_config` wraps the
+    /// message under the real config path.
+    pub(crate) fn validate_message(&self) -> Result<(), String> {
+        let dir = &self.packs_dir;
+        if dir.trim().is_empty() || dir.contains('\0') {
+            return Err(
+                "pack.packs-dir must be non-empty, non-whitespace, and contain no NUL bytes".into(),
+            );
+        }
+        if std::path::Path::new(dir).is_absolute() {
+            return Err("pack.packs-dir must be relative to the workspace root (absolute paths are rejected to prevent tampered-config redirection)".into());
+        }
+        if dir.split(['/', '\\']).any(|seg| seg == "..") {
+            return Err("pack.packs-dir must not contain `..` segments (path traversal is rejected to prevent tampered-config redirection)".into());
+        }
+        if self.fetch_timeout_sec == 0 || self.fetch_timeout_sec > Self::MAX_FETCH_TIMEOUT_SEC {
+            return Err("pack.fetch-timeout-sec must be in [1, 3600]".into());
+        }
+        for (i, root) in self.trust_roots.iter().enumerate() {
+            if root.len() != 64 || !root.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "pack.trust-roots[{i}] must be a 64-hex-char ed25519 public key"
+                ));
+            }
+        }
+        if let Some(url) = &self.registry_url {
+            validate_pack_registry_url(url)?;
+        }
+        Ok(())
+    }
+}
+
+/// `https://<host>…` for any host; `http://<host>…` only when `<host>` is a
+/// loopback address (`127.0.0.0/8`, `::1`) or `localhost`. Userinfo
+/// (`user:pass@`) is rejected outright (credentials never belong in config).
+fn validate_pack_registry_url(url: &str) -> Result<(), String> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| "pack.registry-url must be an http(s) URL".to_string())?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err("pack.registry-url has no host".into());
+    }
+    if authority.contains('@') {
+        return Err("pack.registry-url must not carry userinfo (`user:pass@`)".into());
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        authority
+            .rsplit_once(':')
+            .filter(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
+    };
+    if host.is_empty() {
+        return Err("pack.registry-url has no host".into());
+    }
+    match scheme {
+        "https" => Ok(()),
+        "http" if is_loopback_host(host) => Ok(()),
+        "http" => Err(
+            "pack.registry-url: plain http is allowed only for loopback hosts (127.0.0.0/8, ::1, localhost)"
+                .into(),
+        ),
+        _ => Err("pack.registry-url must use https:// (or http:// on a loopback host)".into()),
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
 // SecurityConfig (Wave-16 Lane-4, 2026-06-25) — MODULE-012 AC-17.
 // CONTRACT-003 additive `security:` block. Snake_case keys match the §1.5 AC-17
 // criterion. Each sub-struct's Default mirrors the cap-http compile-time constant
@@ -1178,6 +1350,7 @@ pub fn config_sections_changed(old: &RuntimeConfig, new: &RuntimeConfig) -> Vec<
         run_budget,
         security,
         genui,
+        pack,
     } = old;
     let mut changed = Vec::new();
     if wasm != &new.wasm {
@@ -1227,6 +1400,9 @@ pub fn config_sections_changed(old: &RuntimeConfig, new: &RuntimeConfig) -> Vec<
     }
     if genui != &new.genui {
         changed.push("genui");
+    }
+    if pack != &new.pack {
+        changed.push("pack");
     }
     changed
 }
@@ -2210,6 +2386,12 @@ fn validate_config(path: &Path, cfg: &RuntimeConfig) -> Result<(), ConfigError> 
     // genui — CONTRACT-003 / MODULE-001 §2.10 pin (`advance_genui::MAX_DOCUMENT_BYTES`).
     if !(1..=262_144).contains(&cfg.genui.max_document_bytes) {
         return invalid("genui.max_document_bytes must be in 1..=262144");
+    }
+
+    // pack — PACK-GAP-CLOSURE P1 (§2.1): shape rules live on `PackConfig` so the
+    // standalone `PackConfig::validate` and this file-path-aware gate never drift.
+    if let Err(msg) = cfg.pack.validate_message() {
+        return invalid(&msg);
     }
 
     Ok(())

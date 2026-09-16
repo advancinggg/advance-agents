@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p1")]
 //! GAP-02 (P1) — composition-root pack wiring. See docs/plans/PACK-GAP-CLOSURE.md §2.8.
 //! `build_pack_wiring` must yield a registry rescanned from disk, a chained template
 //! resolver (builtins + pack FQ refs), and a pack evaluator resolver.

@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p1")]
 //! GAP-12 (P1, e2e half) — `pack:` section round-trips through `advance init` +
 //! `load_config`. See docs/plans/PACK-GAP-CLOSURE.md §2.1. The unit half lives in
 //! crates/runtime/tests/gap_p1_12_pack_config.rs.

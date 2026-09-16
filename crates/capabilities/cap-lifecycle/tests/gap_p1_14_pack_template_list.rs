@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p1")]
 //! GAP-14 (P1, cap-lifecycle half) — `PackTemplateResolver::list()` enumerates installed
 //! pack templates as FQ refs (was a sanctioned empty Vec because `PackRegistry` had no
 //! provides enumeration). See docs/plans/PACK-GAP-CLOSURE.md §2.3.

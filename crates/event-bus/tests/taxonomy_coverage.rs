@@ -227,6 +227,10 @@ const KNOWN_EXTENSIONS: &[&str] = &[
     "runtime.warning",
     "runtime.config_reloaded",
     "fs.read.entry",
+    // MODULE-018 pack lifecycle (PACK-GAP-CLOSURE P1 §2.6; `taxonomy::pack::*`).
+    "pack.installed",
+    "pack.uninstalled",
+    "pack.registry_reloaded",
 ];
 
 /// Events whose concrete strings are formed at the call site (not enumerated in

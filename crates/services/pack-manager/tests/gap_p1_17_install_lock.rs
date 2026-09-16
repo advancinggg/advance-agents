@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p1")]
 //! GAP-17 (P1) — cross-process install lock around steps ③(AlreadyInstalled)→⑥→⑦→⑧.
 //! See docs/plans/PACK-GAP-CLOSURE.md §2.5. Concurrent installs of DISTINCT packs must all
 //! land in `.meta.yaml`; concurrent installs of the SAME pack must yield exactly one
@@ -8,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use advance_pack_manager::{
-    AutoApprove, InMemoryPackRegistry, Installer, PackError, INSTALL_LOCK_FILENAME,
+    AutoApprove, InMemoryPackRegistry, Installer, PackError, PackRegistry, INSTALL_LOCK_FILENAME,
 };
 
 fn write_pack(root: &Path, name: &str) -> PathBuf {

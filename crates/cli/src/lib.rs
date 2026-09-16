@@ -44,6 +44,12 @@ pub mod contract218_roles;
 pub mod grant_adapter;
 pub mod observation_carriers;
 pub mod observation_projection;
+// PACK-GAP-CLOSURE P1 (2026-09-15) — composition-root wiring of the MODULE-018 pack
+// system: ONE rescanned InMemoryPackRegistry + the chained (built-in ∪ pack) template
+// resolver + the PackEvaluatorResolver + a DefaultMaterializer, consumed by
+// `wiring.rs`. The `advance pack install|list|uninstall` admin surface lives in
+// `commands/pack.rs`.
+pub mod pack_wiring;
 pub mod reap;
 pub mod webhook_listener;
 // /dev Wave-20 Lane `search` (2026-06-27) — the cross-crate adapter bridging
