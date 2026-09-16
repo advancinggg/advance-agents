@@ -286,11 +286,18 @@ async fn lp01_llm_block_over_production_wiring() {
         "k-llm-clear",
     );
     assert!(detail(&env).config.llm.is_none());
+    let cleared = config_text(&ws);
     assert!(
-        !config_text(&ws).contains("llm:"),
-        "cleared: {}",
-        config_text(&ws)
+        !cleared.lines().any(|l| l.starts_with("llm:")),
+        "no top-level llm key after clearing: {cleared}"
     );
+    assert!(
+        cleared.contains("capabilities:") && cleared.contains("agents:"),
+        "the other keys survive the clear: {cleared}"
+    );
+    assert!(parse_agent_llm_config(Some(cleared.as_bytes()))
+        .unwrap()
+        .is_none());
     // Give coarse-mtime filesystems a distinct stamp before asserting the re-read.
     let f = std::fs::OpenOptions::new()
         .write(true)
