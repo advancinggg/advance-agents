@@ -23,10 +23,11 @@
 //!   that sum; a consumer that read `input_tokens` alone silently dropped every
 //!   cached token (and its cost) from the run budget.
 //!
-//! `CacheUsage` carries the cached share split by kind, because the two are
+//! `CacheUsage` carries the cached share split by kind, because the tiers are
 //! priced an order of magnitude apart (Anthropic: reads ≈ 0.1× input, 5-minute
 //! writes 1.25×, 1-hour writes 2×). Folding them into one counter can never be
-//! priced correctly.
+//! priced correctly. The 1-hour write share comes straight from
+//! `usage.cache_creation.ephemeral_1h_input_tokens` — no client-side inference.
 
 use crate::catalog::CacheCost;
 use crate::provider::ResolvedProvider;
@@ -38,31 +39,38 @@ pub struct CacheUsage {
     /// Tokens served from a prompt cache (Anthropic `cache_read_input_tokens`,
     /// OpenAI `*_details.cached_tokens`).
     pub read_tokens: u64,
-    /// Tokens written into a prompt cache this call (Anthropic
+    /// ALL tokens written into a prompt cache this call, every TTL (Anthropic
     /// `cache_creation_input_tokens`; OpenAI never reports writes).
     pub write_tokens: u64,
+    /// SUBSET of `write_tokens` written with the 1-hour TTL (Anthropic
+    /// `usage.cache_creation.ephemeral_1h_input_tokens`), priced at the 2×
+    /// premium instead of the 5-minute 1.25×. Absent → 0 (all writes 5-minute).
+    pub write_1h_tokens: u64,
 }
 
 impl CacheUsage {
     pub const NONE: CacheUsage = CacheUsage {
         read_tokens: 0,
         write_tokens: 0,
+        write_1h_tokens: 0,
     };
 
     pub fn is_none(&self) -> bool {
         self.read_tokens == 0 && self.write_tokens == 0
     }
 
-    /// Clamp both counters so `read + write <= input_total`. A provider (or a
-    /// proxy in front of it) that reports more cached tokens than input tokens
-    /// is malformed; the clamp keeps the uncached remainder non-negative and
-    /// never lets the cache discount exceed the input it applies to.
+    /// Clamp the counters so `read + write <= input_total` and
+    /// `write_1h <= write`. A provider (or a proxy in front of it) that reports
+    /// more cached tokens than input tokens is malformed; the clamp keeps the
+    /// uncached remainder non-negative and never lets the cache discount (or
+    /// the write premium) exceed the input it applies to.
     pub fn clamped_to(self, input_total: u64) -> CacheUsage {
         let read = self.read_tokens.min(input_total);
         let write = self.write_tokens.min(input_total.saturating_sub(read));
         CacheUsage {
             read_tokens: read,
             write_tokens: write,
+            write_1h_tokens: self.write_1h_tokens.min(write),
         }
     }
 
@@ -72,6 +80,7 @@ impl CacheUsage {
         CacheUsage {
             read_tokens: self.read_tokens.min(ceiling),
             write_tokens: self.write_tokens.min(ceiling),
+            write_1h_tokens: self.write_1h_tokens.min(ceiling),
         }
     }
 }
@@ -82,10 +91,12 @@ impl CacheUsage {
 /// Formula (MODULE-009 §1.4.2, extended with the cache tiers):
 /// ```text
 ///   uncached = input_tokens - cache.read_tokens - cache.write_tokens
-///   cost_usd = (uncached           / 1e6) * cost_per_mtoken_in
-///            + (cache.read_tokens  / 1e6) * cache_cost.read_per_mtoken
-///            + (cache.write_tokens / 1e6) * cache_cost.write_per_mtoken
-///            + (output_tokens      / 1e6) * cost_per_mtoken_out
+///   write_5m = cache.write_tokens - cache.write_1h_tokens
+///   cost_usd = (uncached              / 1e6) * cost_per_mtoken_in
+///            + (cache.read_tokens     / 1e6) * cache_cost.read_per_mtoken
+///            + (write_5m              / 1e6) * cache_cost.write_per_mtoken
+///            + (cache.write_1h_tokens / 1e6) * cache_cost.write_1h_per_mtoken
+///            + (output_tokens         / 1e6) * cost_per_mtoken_out
 /// ```
 ///
 /// `cache` is clamped to `input_tokens` first (see [`CacheUsage::clamped_to`]),
@@ -128,10 +139,13 @@ pub fn compute_cost_with_rates(
         .saturating_sub(cache.read_tokens)
         .saturating_sub(cache.write_tokens);
     let in_cost = (uncached as f64 / 1_000_000.0) * cost_per_mtoken_in;
+    let write_5m = cache.write_tokens.saturating_sub(cache.write_1h_tokens);
     let read_cost = (cache.read_tokens as f64 / 1_000_000.0) * cache_cost.read_per_mtoken;
-    let write_cost = (cache.write_tokens as f64 / 1_000_000.0) * cache_cost.write_per_mtoken;
+    let write_cost = (write_5m as f64 / 1_000_000.0) * cache_cost.write_per_mtoken;
+    let write_1h_cost =
+        (cache.write_1h_tokens as f64 / 1_000_000.0) * cache_cost.write_1h_per_mtoken;
     let out_cost = (output_tokens as f64 / 1_000_000.0) * cost_per_mtoken_out;
-    in_cost + read_cost + write_cost + out_cost
+    in_cost + read_cost + write_cost + write_1h_cost + out_cost
 }
 
 #[cfg(test)]
@@ -149,6 +163,7 @@ mod tests {
             cache_cost: CacheCost {
                 read_per_mtoken: 0.075,
                 write_per_mtoken: 0.1875,
+                write_1h_per_mtoken: 0.300,
             },
             backend: advance_runtime::config::ProviderBackend::OpenAiChat,
             auth_scheme: None,
@@ -200,6 +215,7 @@ mod tests {
             CacheUsage {
                 read_tokens: 600,
                 write_tokens: 0,
+                write_1h_tokens: 0,
             },
         );
         let expected = 0.000_060 + 0.000_045 + 0.000_300;
@@ -223,6 +239,7 @@ mod tests {
             CacheUsage {
                 read_tokens: 0,
                 write_tokens: 1_000,
+                write_1h_tokens: 0,
             },
         );
         let expected = 1_000.0 / 1e6 * 0.1875;
@@ -245,6 +262,7 @@ mod tests {
             CacheUsage {
                 read_tokens: 300,
                 write_tokens: 200,
+                write_1h_tokens: 0,
             },
         );
         let expected = 500.0 / 1e6 * 0.150 + 300.0 / 1e6 * 0.075 + 200.0 / 1e6 * 0.1875;
@@ -263,12 +281,14 @@ mod tests {
         let over = CacheUsage {
             read_tokens: u64::MAX,
             write_tokens: u64::MAX,
+            write_1h_tokens: u64::MAX,
         };
         assert_eq!(
             over.clamped_to(1_000),
             CacheUsage {
                 read_tokens: 1_000,
-                write_tokens: 0
+                write_tokens: 0,
+                write_1h_tokens: 0,
             }
         );
         let cost = compute_cost(&p, 1_000, 0, over);
@@ -278,6 +298,48 @@ mod tests {
             "cost={cost} expected={expected}"
         );
         assert!(cost.is_finite());
+    }
+
+    /// The 1-hour write subset is priced at the 1-hour rate and the rest of the
+    /// writes at the 5-minute rate; `write_1h > write` is clamped to `write`.
+    #[test]
+    fn t_compute_cost_cache_write_1h_tier() {
+        let p = provider();
+        let cost = compute_cost(
+            &p,
+            1_000,
+            0,
+            CacheUsage {
+                read_tokens: 0,
+                write_tokens: 1_000,
+                write_1h_tokens: 400,
+            },
+        );
+        let expected = 600.0 / 1e6 * 0.1875 + 400.0 / 1e6 * 0.300;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "cost={cost} expected={expected}"
+        );
+        // 1h writes cost strictly more than the same writes at 5m.
+        let all_5m = compute_cost(
+            &p,
+            1_000,
+            0,
+            CacheUsage {
+                read_tokens: 0,
+                write_tokens: 1_000,
+                write_1h_tokens: 0,
+            },
+        );
+        assert!(cost > all_5m);
+        // Clamp: write_1h cannot exceed write.
+        let over = CacheUsage {
+            read_tokens: 0,
+            write_tokens: 100,
+            write_1h_tokens: 5_000,
+        }
+        .clamped_to(1_000);
+        assert_eq!(over.write_1h_tokens, 100);
     }
 
     /// `CacheUsage::NONE` reduces exactly to the historical two-rate formula.

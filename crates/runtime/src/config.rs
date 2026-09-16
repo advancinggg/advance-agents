@@ -581,10 +581,14 @@ pub struct LlmProviderConfig {
     /// billed at `cost_per_mtoken_in` (fail-conservative: never an unearned
     /// discount). Published rates: Anthropic ≈ 0.1× input, OpenAI 0.5× input.
     pub cost_per_mtoken_cache_read: Option<f64>,
-    /// USD per million CACHE-WRITE input tokens (Anthropic
-    /// `cache_creation_input_tokens`). `None` → 1.25 × `cost_per_mtoken_in`
-    /// (the published 5-minute-TTL premium; set explicitly for 1-hour TTL, 2×).
+    /// USD per million 5-minute-TTL CACHE-WRITE input tokens (Anthropic
+    /// `cache_creation_input_tokens` minus the 1-hour share). `None` →
+    /// 1.25 × `cost_per_mtoken_in` (the published premium).
     pub cost_per_mtoken_cache_write: Option<f64>,
+    /// USD per million 1-hour-TTL CACHE-WRITE input tokens (Anthropic
+    /// `usage.cache_creation.ephemeral_1h_input_tokens`). `None` →
+    /// 2 × `cost_per_mtoken_in` (the published premium).
+    pub cost_per_mtoken_cache_write_1h: Option<f64>,
     pub rate_limit: Option<RateLimit>,
     pub retry_default: Option<RetryDefaults>,
     /// Wire-protocol family (ADR 2026-07-22 D4). `None` → resolver-side
@@ -618,6 +622,8 @@ struct LlmProviderConfigRaw {
     cost_per_mtoken_cache_read: Option<f64>,
     #[serde(rename = "cost-per-mtoken-cache-write", default)]
     cost_per_mtoken_cache_write: Option<f64>,
+    #[serde(rename = "cost-per-mtoken-cache-write-1h", default)]
+    cost_per_mtoken_cache_write_1h: Option<f64>,
     #[serde(rename = "rate-limit", default)]
     rate_limit: Option<RateLimit>,
     #[serde(rename = "retry-default", default)]
@@ -717,6 +723,7 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
             cost_per_mtoken_out: raw.cost_per_mtoken_out,
             cost_per_mtoken_cache_read: raw.cost_per_mtoken_cache_read,
             cost_per_mtoken_cache_write: raw.cost_per_mtoken_cache_write,
+            cost_per_mtoken_cache_write_1h: raw.cost_per_mtoken_cache_write_1h,
             rate_limit: raw.rate_limit,
             retry_default: raw.retry_default,
             backend,
@@ -746,6 +753,10 @@ impl fmt::Debug for LlmProviderConfig {
             .field(
                 "cost_per_mtoken_cache_write",
                 &self.cost_per_mtoken_cache_write,
+            )
+            .field(
+                "cost_per_mtoken_cache_write_1h",
+                &self.cost_per_mtoken_cache_write_1h,
             )
             .field("rate_limit", &self.rate_limit)
             .field("retry_default", &self.retry_default)
@@ -1929,6 +1940,13 @@ fn validate_config(path: &Path, cfg: &RuntimeConfig) -> Result<(), ConfigError> 
             if !w.is_finite() || w < 0.0 {
                 return invalid(
                     "llm-providers[].cost-per-mtoken-cache-write must be finite and >= 0",
+                );
+            }
+        }
+        if let Some(w) = p.cost_per_mtoken_cache_write_1h {
+            if !w.is_finite() || w < 0.0 {
+                return invalid(
+                    "llm-providers[].cost-per-mtoken-cache-write-1h must be finite and >= 0",
                 );
             }
         }

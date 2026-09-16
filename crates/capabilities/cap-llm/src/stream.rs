@@ -703,13 +703,16 @@ impl Settlement {
     /// Same monotonic floor as `set_folded`: a later, LOWER report can never
     /// erase a cache counter. Clamping against the billed input happens in
     /// `finalize` (the cache discount can never exceed the input it applies to).
-    pub fn set_folded_cache(&self, read: Option<u64>, write: Option<u64>) {
+    pub fn set_folded_cache(&self, read: Option<u64>, write: Option<u64>, write_1h: Option<u64>) {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(r) = read {
             g.folded_cache.read_tokens = r.max(g.folded_cache.read_tokens);
         }
         if let Some(w) = write {
             g.folded_cache.write_tokens = w.max(g.folded_cache.write_tokens);
+        }
+        if let Some(w) = write_1h {
+            g.folded_cache.write_1h_tokens = w.max(g.folded_cache.write_1h_tokens);
         }
     }
 
@@ -3637,15 +3640,16 @@ mod tests {
             crate::catalog::CacheCost {
                 read_per_mtoken: 0.1,
                 write_per_mtoken: 1.25,
+                write_1h_per_mtoken: 2.0,
             },
             Some(b.clone() as Arc<dyn RunBudget>),
             Some(bus as Arc<dyn EventBusEmit + Send + Sync>),
             "agent-A".into(),
         );
         s.set_folded(Some(1_000), Some(100));
-        s.set_folded_cache(Some(600), Some(300));
+        s.set_folded_cache(Some(600), Some(300), Some(100));
         // A later, LOWER cache report must not erase the earlier one.
-        s.set_folded_cache(Some(1), Some(0));
+        s.set_folded_cache(Some(1), Some(0), Some(0));
         assert!(s.finalize(
             SettleOutcome::Terminal,
             LivePhase::Failed(crate::LlmError::ProviderError("x".into()))
@@ -3658,12 +3662,14 @@ mod tests {
             &crate::catalog::CacheCost {
                 read_per_mtoken: 0.1,
                 write_per_mtoken: 1.25,
+                write_1h_per_mtoken: 2.0,
             },
             1_000,
             100,
             crate::cost::CacheUsage {
                 read_tokens: 600,
                 write_tokens: 300,
+                write_1h_tokens: 100,
             },
         );
         assert!(

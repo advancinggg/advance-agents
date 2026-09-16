@@ -163,6 +163,9 @@ pub(crate) fn cache_cost_of(p: &LlmProviderConfig) -> CacheCost {
         write_per_mtoken: p
             .cost_per_mtoken_cache_write
             .unwrap_or(defaults.write_per_mtoken),
+        write_1h_per_mtoken: p
+            .cost_per_mtoken_cache_write_1h
+            .unwrap_or(defaults.write_1h_per_mtoken),
     }
 }
 
@@ -201,6 +204,7 @@ mod tests {
             cost_per_mtoken_out: 5.0,
             cost_per_mtoken_cache_read: None,
             cost_per_mtoken_cache_write: None,
+            cost_per_mtoken_cache_write_1h: None,
             rate_limit: None,
             retry_default: None,
             backend: None,
@@ -459,11 +463,14 @@ mod tests {
             "no unearned read discount"
         );
         assert!((r.cache_cost.write_per_mtoken - 3.75).abs() < 1e-12);
+        assert!((r.cache_cost.write_1h_per_mtoken - 6.0).abs() < 1e-12);
 
         p.cost_per_mtoken_cache_read = Some(0.3);
         p.cost_per_mtoken_cache_write = Some(6.0);
+        p.cost_per_mtoken_cache_write_1h = Some(7.0);
         let r = make_resolved(&p, "claude".into());
         assert_eq!(r.cache_cost.read_per_mtoken, 0.3);
         assert_eq!(r.cache_cost.write_per_mtoken, 6.0);
+        assert_eq!(r.cache_cost.write_1h_per_mtoken, 7.0);
     }
 }

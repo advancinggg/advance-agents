@@ -141,6 +141,7 @@ impl ProviderAdapter for OpenAiAdapter {
                 output_tokens: u["completion_tokens"].as_u64(),
                 cache_read_tokens: u["prompt_tokens_details"]["cached_tokens"].as_u64(),
                 cache_write_tokens: None,
+                cache_write_1h_tokens: None,
             });
         if delta.is_none() && finish_reason.is_none() && usage.is_none() {
             // Role-only first chunk / keep-alive → Ignore, never Some("").
@@ -183,6 +184,7 @@ impl ProviderAdapter for OpenAiAdapter {
                     .as_u64()
                     .unwrap_or(0),
                 write_tokens: 0,
+                write_1h_tokens: 0,
             }
             .clamped_to(input_tokens);
             let finish_reason = value["choices"][0]["finish_reason"]
@@ -507,7 +509,8 @@ mod tests {
             outcome.cache,
             CacheUsage {
                 read_tokens: 800,
-                write_tokens: 0
+                write_tokens: 0,
+                write_1h_tokens: 0,
             }
         );
     }

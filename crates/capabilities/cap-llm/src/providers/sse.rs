@@ -60,6 +60,8 @@ pub struct SseUsage {
     pub cache_read_tokens: Option<u64>,
     /// Cache-write subset of `input_tokens`, when the frame reports it.
     pub cache_write_tokens: Option<u64>,
+    /// 1-hour-TTL subset of `cache_write_tokens`, when the frame reports it.
+    pub cache_write_1h_tokens: Option<u64>,
 }
 
 /// Normalized per-frame parse result (MODULE-009 §2.3 `SseEvent`).
@@ -103,6 +105,7 @@ pub struct SseUsageFold {
     pub output_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
+    pub cache_write_1h_tokens: Option<u64>,
 }
 
 impl SseUsageFold {
@@ -120,6 +123,9 @@ impl SseUsageFold {
             if let Some(write) = usage.cache_write_tokens {
                 self.cache_write_tokens = Some(write);
             }
+            if let Some(write_1h) = usage.cache_write_1h_tokens {
+                self.cache_write_1h_tokens = Some(write_1h);
+            }
         }
     }
 
@@ -128,6 +134,7 @@ impl SseUsageFold {
         crate::cost::CacheUsage {
             read_tokens: self.cache_read_tokens.unwrap_or(0),
             write_tokens: self.cache_write_tokens.unwrap_or(0),
+            write_1h_tokens: self.cache_write_1h_tokens.unwrap_or(0),
         }
     }
 
@@ -358,6 +365,7 @@ mod tests {
                     output_tokens: Some(cumulative),
                     cache_read_tokens: None,
                     cache_write_tokens: None,
+                    cache_write_1h_tokens: None,
                 }),
                 ..SseEvent::IGNORE
             });
@@ -371,6 +379,7 @@ mod tests {
                 output_tokens: None,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                cache_write_1h_tokens: None,
             }),
             ..SseEvent::IGNORE
         });
@@ -380,6 +389,7 @@ mod tests {
                 output_tokens: Some(3),
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                cache_write_1h_tokens: None,
             }),
             ..SseEvent::IGNORE
         });
@@ -412,6 +422,7 @@ mod tests {
                 output_tokens: Some(5),
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                cache_write_1h_tokens: None,
             }),
             ..SseEvent::IGNORE
         });

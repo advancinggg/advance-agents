@@ -309,7 +309,7 @@ mod tests {
     /// reported 100 here and silently dropped 900 tokens from the run budget.
     #[test]
     fn t_anthropic_parse_chat_response_sums_cache_fields_into_input_total() {
-        let body = br#"{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":100,"cache_creation_input_tokens":300,"cache_read_input_tokens":600,"output_tokens":5},"stop_reason":"end_turn","model":"claude"}"#;
+        let body = br#"{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":100,"cache_creation_input_tokens":300,"cache_read_input_tokens":600,"cache_creation":{"ephemeral_5m_input_tokens":200,"ephemeral_1h_input_tokens":100},"output_tokens":5},"stop_reason":"end_turn","model":"claude"}"#;
         let outcome = AnthropicAdapter.parse_chat_response(200, body).unwrap();
         assert_eq!(
             outcome.input_tokens, 1000,
@@ -319,7 +319,8 @@ mod tests {
             outcome.cache,
             CacheUsage {
                 read_tokens: 600,
-                write_tokens: 300
+                write_tokens: 300,
+                write_1h_tokens: 100,
             }
         );
         assert_eq!(outcome.output_tokens, 5);
@@ -747,13 +748,20 @@ fn anthropic_input_total(usage: &Value) -> Option<(u64, CacheUsage)> {
     let remainder = usage["input_tokens"].as_u64()?;
     let write = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
     let read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+    // TTL breakdown of the writes is reported directly by the API; the
+    // 1-hour share is priced at 2× (vs 1.25× for 5-minute writes).
+    let write_1h = usage["cache_creation"]["ephemeral_1h_input_tokens"]
+        .as_u64()
+        .unwrap_or(0);
     let total = remainder.saturating_add(write).saturating_add(read);
     Some((
         total,
         CacheUsage {
             read_tokens: read,
             write_tokens: write,
-        },
+            write_1h_tokens: write_1h,
+        }
+        .clamped_to(total),
     ))
 }
 
@@ -766,6 +774,7 @@ fn anthropic_input_usage(usage: &Value) -> Option<SseUsage> {
         output_tokens: None,
         cache_read_tokens: Some(cache.read_tokens),
         cache_write_tokens: Some(cache.write_tokens),
+        cache_write_1h_tokens: Some(cache.write_1h_tokens),
     })
 }
 
@@ -878,7 +887,7 @@ mod stream_tests {
         let frames = vec![
             ev_frame(
                 "message_start",
-                r#"{"type":"message_start","message":{"usage":{"input_tokens":100,"cache_creation_input_tokens":300,"cache_read_input_tokens":600,"output_tokens":1}}}"#,
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":100,"cache_creation_input_tokens":300,"cache_read_input_tokens":600,"cache_creation":{"ephemeral_5m_input_tokens":250,"ephemeral_1h_input_tokens":50},"output_tokens":1}}}"#,
             ),
             ev_frame(
                 "message_delta",
@@ -894,7 +903,8 @@ mod stream_tests {
             fold.cache(),
             CacheUsage {
                 read_tokens: 600,
-                write_tokens: 300
+                write_tokens: 300,
+                write_1h_tokens: 50,
             }
         );
     }

@@ -43,6 +43,8 @@ pub struct UsageNorm {
     pub cache_read_sources: Vec<String>,
     /// Summed into `cache_write_tokens` (a subset of the total input).
     pub cache_write_sources: Vec<String>,
+    /// Summed into `cache_write_1h_tokens` (a subset of `cache_write_tokens`).
+    pub cache_write_1h_sources: Vec<String>,
 }
 
 impl UsageNorm {
@@ -54,6 +56,7 @@ impl UsageNorm {
             output_token_sources: vec!["/completion_tokens".into()],
             cache_read_sources: vec!["/prompt_tokens_details/cached_tokens".into()],
             cache_write_sources: Vec::new(),
+            cache_write_1h_sources: Vec::new(),
         }
     }
 
@@ -65,6 +68,7 @@ impl UsageNorm {
             output_token_sources: vec!["/output_tokens".into()],
             cache_read_sources: vec!["/input_tokens_details/cached_tokens".into()],
             cache_write_sources: Vec::new(),
+            cache_write_1h_sources: Vec::new(),
         }
     }
 
@@ -81,6 +85,7 @@ impl UsageNorm {
             output_token_sources: vec!["/output_tokens".into()],
             cache_read_sources: vec!["/cache_read_input_tokens".into()],
             cache_write_sources: vec!["/cache_creation_input_tokens".into()],
+            cache_write_1h_sources: vec!["/cache_creation/ephemeral_1h_input_tokens".into()],
         }
     }
 }
@@ -89,24 +94,29 @@ impl UsageNorm {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CacheCost {
     pub read_per_mtoken: f64,
+    /// 5-minute-TTL cache writes.
     pub write_per_mtoken: f64,
+    /// 1-hour-TTL cache writes (Anthropic `ephemeral_1h_input_tokens`).
+    pub write_1h_per_mtoken: f64,
 }
 
 impl CacheCost {
     /// Published Anthropic multipliers relative to the base input rate:
-    /// cache reads 0.1×, 5-minute-TTL cache writes 1.25×.
+    /// cache reads 0.1×, 5-minute-TTL writes 1.25×, 1-hour-TTL writes 2×.
     pub const ANTHROPIC_READ_MULTIPLIER: f64 = 0.1;
     pub const ANTHROPIC_WRITE_5M_MULTIPLIER: f64 = 1.25;
+    pub const ANTHROPIC_WRITE_1H_MULTIPLIER: f64 = 2.0;
 
     /// Fail-CONSERVATIVE default when a provider config omits the cache rates:
     /// reads are billed at the FULL input rate (never an unearned discount) and
-    /// writes at the published 1.25× write premium (the only backend that
+    /// writes at the published 1.25× / 2× premiums (the only backend that
     /// reports writes charges at least that). An operator who wants the real
     /// read discount sets `cost-per-mtoken-cache-read` explicitly.
     pub fn conservative_from_input_rate(cost_per_mtoken_in: f64) -> Self {
         Self {
             read_per_mtoken: cost_per_mtoken_in,
             write_per_mtoken: cost_per_mtoken_in * Self::ANTHROPIC_WRITE_5M_MULTIPLIER,
+            write_1h_per_mtoken: cost_per_mtoken_in * Self::ANTHROPIC_WRITE_1H_MULTIPLIER,
         }
     }
 }
@@ -211,6 +221,8 @@ pub struct NormalizedUsageFold {
     pub cache_read_tokens: u64,
     /// Subset of `input_tokens` written to cache.
     pub cache_write_tokens: u64,
+    /// Subset of `cache_write_tokens` written with the 1-hour TTL.
+    pub cache_write_1h_tokens: u64,
 }
 
 impl NormalizedUsageFold {
@@ -218,6 +230,7 @@ impl NormalizedUsageFold {
         crate::cost::CacheUsage {
             read_tokens: self.cache_read_tokens,
             write_tokens: self.cache_write_tokens,
+            write_1h_tokens: self.cache_write_1h_tokens,
         }
     }
 }
@@ -250,6 +263,7 @@ pub fn normalize_usage(raw: &serde_json::Value, quirks: &ProfileQuirks) -> Norma
     let cache = crate::cost::CacheUsage {
         read_tokens: sum_sources(raw, &norm.cache_read_sources, ""),
         write_tokens: sum_sources(raw, &norm.cache_write_sources, ""),
+        write_1h_tokens: sum_sources(raw, &norm.cache_write_1h_sources, ""),
     }
     .clamped_to(input_tokens);
     NormalizedUsageFold {
@@ -257,6 +271,7 @@ pub fn normalize_usage(raw: &serde_json::Value, quirks: &ProfileQuirks) -> Norma
         output_tokens,
         cache_read_tokens: cache.read_tokens,
         cache_write_tokens: cache.write_tokens,
+        cache_write_1h_tokens: cache.write_1h_tokens,
     }
 }
 
@@ -378,6 +393,7 @@ mod tests {
             cache_cost: CacheCost {
                 read_per_mtoken: 0.1,
                 write_per_mtoken: 0.2,
+                write_1h_per_mtoken: 0.3,
             },
             ..ProfileQuirks::default()
         };
@@ -426,12 +442,14 @@ mod tests {
             "input_tokens": 100,
             "cache_creation_input_tokens": 300,
             "cache_read_input_tokens": 600,
+            "cache_creation": { "ephemeral_5m_input_tokens": 200, "ephemeral_1h_input_tokens": 100 },
             "output_tokens": 7
         });
         let n = normalize_usage(&raw, &quirks);
         assert_eq!(n.input_tokens, 1000, "total = remainder + write + read");
         assert_eq!(n.cache_read_tokens, 600);
         assert_eq!(n.cache_write_tokens, 300);
+        assert_eq!(n.cache_write_1h_tokens, 100);
         assert_eq!(n.output_tokens, 7);
     }
 

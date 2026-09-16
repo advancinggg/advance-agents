@@ -478,6 +478,7 @@ mod tests {
             cost_per_mtoken_out: 5.0,
             cost_per_mtoken_cache_read: None,
             cost_per_mtoken_cache_write: None,
+            cost_per_mtoken_cache_write_1h: None,
             rate_limit: None,
             retry_default: rd,
             backend: None,

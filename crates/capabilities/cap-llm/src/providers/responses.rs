@@ -254,6 +254,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                     .as_u64()
                     .unwrap_or(0),
                 write_tokens: 0,
+                write_1h_tokens: 0,
             }
             .clamped_to(input_tokens);
             let finish_reason = if value["status"].as_str() == Some("incomplete") {
@@ -376,6 +377,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                     output_tokens: usage_val["output_tokens"].as_u64(),
                     cache_read_tokens: usage_val["input_tokens_details"]["cached_tokens"].as_u64(),
                     cache_write_tokens: None,
+                    cache_write_1h_tokens: None,
                 };
                 let finish = if name == "response.incomplete" {
                     map_incomplete_reason(
@@ -702,7 +704,8 @@ mod tests {
             outcome.cache,
             CacheUsage {
                 read_tokens: 250,
-                write_tokens: 0
+                write_tokens: 0,
+                write_1h_tokens: 0,
             }
         );
 

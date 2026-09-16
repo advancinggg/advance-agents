@@ -1323,7 +1323,7 @@ impl LlmGateway {
                             fold.cache_read_tokens = Some(u.cached_tokens);
                             progressed = true;
                             settlement_owner.set_folded(fold.input_tokens, fold.output_tokens);
-                            settlement_owner.set_folded_cache(fold.cache_read_tokens, None);
+                            settlement_owner.set_folded_cache(fold.cache_read_tokens, None, None);
                         }
                         if delta.terminal {
                             saw_terminal = true;
@@ -1451,6 +1451,7 @@ impl LlmGateway {
                                 settlement_owner.set_folded_cache(
                                     fold.cache_read_tokens,
                                     fold.cache_write_tokens,
+                                    fold.cache_write_1h_tokens,
                                 );
                             }
                             if ev.terminal {
@@ -4826,6 +4827,7 @@ mod tests {
             cost_per_mtoken_out: 0.0,
             cost_per_mtoken_cache_read: None,
             cost_per_mtoken_cache_write: None,
+            cost_per_mtoken_cache_write_1h: None,
             rate_limit: None,
             retry_default: None,
             backend: None,
@@ -4869,6 +4871,7 @@ mod tests {
             cost_per_mtoken_out: 0.0,
             cost_per_mtoken_cache_read: None,
             cost_per_mtoken_cache_write: None,
+            cost_per_mtoken_cache_write_1h: None,
             rate_limit: None,
             retry_default: None,
             backend: None,
@@ -4922,6 +4925,7 @@ mod tests {
                     cost_per_mtoken_out: 0.0,
                     cost_per_mtoken_cache_read: None,
                     cost_per_mtoken_cache_write: None,
+                    cost_per_mtoken_cache_write_1h: None,
                     rate_limit: None,
                     retry_default: None,
                     backend: None,

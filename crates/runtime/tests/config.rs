@@ -597,16 +597,21 @@ fn llm_provider_cache_rates_parse_and_default_to_none() {
     let cfg = load_config(&config_path).unwrap();
     assert_eq!(cfg.llm_providers[0].cost_per_mtoken_cache_read, None);
     assert_eq!(cfg.llm_providers[0].cost_per_mtoken_cache_write, None);
+    assert_eq!(cfg.llm_providers[0].cost_per_mtoken_cache_write_1h, None);
 
     write_config(
         &config_path,
         &provider_yaml_with(
-            "  cost-per-mtoken-cache-read: 0.3\n  cost-per-mtoken-cache-write: 3.75\n",
+            "  cost-per-mtoken-cache-read: 0.3\n  cost-per-mtoken-cache-write: 3.75\n  cost-per-mtoken-cache-write-1h: 6.0\n",
         ),
     );
     let cfg = load_config(&config_path).unwrap();
     assert_eq!(cfg.llm_providers[0].cost_per_mtoken_cache_read, Some(0.3));
     assert_eq!(cfg.llm_providers[0].cost_per_mtoken_cache_write, Some(3.75));
+    assert_eq!(
+        cfg.llm_providers[0].cost_per_mtoken_cache_write_1h,
+        Some(6.0)
+    );
 }
 
 /// Cache billing — a negative cache rate would turn cache hits into a budget
@@ -632,6 +637,16 @@ fn llm_provider_cache_rates_reject_negative() {
     let err = load_config(&config_path).expect_err("negative cache-write rate must reject");
     assert!(
         err.to_string().contains("cost-per-mtoken-cache-write"),
+        "error: {err}"
+    );
+
+    write_config(
+        &config_path,
+        &provider_yaml_with("  cost-per-mtoken-cache-write-1h: -1\n"),
+    );
+    let err = load_config(&config_path).expect_err("negative cache-write-1h rate must reject");
+    assert!(
+        err.to_string().contains("cost-per-mtoken-cache-write-1h"),
         "error: {err}"
     );
 
