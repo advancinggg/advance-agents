@@ -2756,6 +2756,15 @@ async fn wire_capabilities_inner(
                 .as_ref()
                 .map(|activation| activation.execution_ingress.clone());
             let run_mgr_for_api = run_manager.clone();
+            // Packs family: the ONE production registry + an installer over `RuntimeConfig.pack`
+            // (same trust roots / registry url / catalog rules as `advance pack install`).
+            let pack_admin_for_api: Arc<dyn advance_client_api::PackAdminProvider> =
+                Arc::new(crate::client_api_packs::WiredPackAdminProvider::new(
+                    pack_wiring.registry.clone(),
+                    pack_wiring.packs_dir.clone(),
+                    runtime_config.pack.clone(),
+                    env!("CARGO_PKG_VERSION"),
+                ));
             let tree_for_api = agent_tree_snapshot.clone();
             match advance_client_api::ClientApiServer::bind_local_factory(0, move |address| {
                 let mut config = advance_client_api::ClientApiConfig::default();
@@ -2779,6 +2788,7 @@ async fn wire_capabilities_inner(
                     costs: Some(Arc::new(crate::client_api_costs::LedgerCostProvider::new(
                         Arc::clone(&cost_ledger_for_api),
                     ))),
+                    packs: Some(pack_admin_for_api.clone()),
                     ..Default::default()
                 };
                 if let Some((history, events, projector)) = history_events {

@@ -30,6 +30,7 @@ pub mod envelope;
 pub mod events;
 pub mod idempotency;
 pub mod messages;
+pub mod packs;
 pub mod pagination;
 pub mod projection;
 pub mod provider;
@@ -75,10 +76,14 @@ pub use events::{
     ClientScalar, EventConcurrency, NormalizedEventFilter, RawEventRow,
 };
 pub use messages::{ClientMessageAck, ClientMessageStatus, ClientSendMessageRequest};
+pub use packs::{
+    ClientPackDetail, ClientPackInstallRequest, ClientPackInstallResult, ClientPackList,
+    ClientPackProvide, ClientPackSummary, ClientPackUninstallResult,
+};
 pub use pagination::{Cursor, Page};
 pub use provider::{
-    AgentAdminProvider, CostProvider, MessagingProvider, ProviderError, RunControlProvider,
-    ToolsProvider,
+    AgentAdminProvider, CostProvider, MessagingProvider, PackAdminProvider, ProviderError,
+    RunControlProvider, ToolsProvider,
 };
 pub use providers::grants::{
     BoundGrantApprovalPort, BoundGrantMutation, BoundMutationOutcome, ClientCapParam,

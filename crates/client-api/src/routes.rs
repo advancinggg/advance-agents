@@ -62,6 +62,9 @@ pub const PATH_AGENTS: &str = "/client/agents";
 /// Agents family: the templates a create may reference (GET). Its own family so an agent literally
 /// named `templates` can never shadow it.
 pub const PATH_AGENT_TEMPLATES: &str = "/client/agent-templates";
+/// Packs family (pack lanes follow-up): installed packs (GET) / install (POST).
+pub const PATH_PACKS: &str = "/client/packs";
+pub const PATH_PACK_INSTALL: &str = "/client/packs:install";
 /// Costs family (lane cost-attribution): per-agent / per-provider LLM spend (GET, body/null DTO).
 pub const PATH_COSTS_AGENTS: &str = "/client/costs/agents";
 pub const PATH_COSTS_PROVIDERS: &str = "/client/costs/providers";
@@ -81,6 +84,9 @@ pub const TPL_RUN_HISTORY: &str = "/client/runs/{run_id}/history";
 pub const TPL_AGENT_GET: &str = "/client/agents/{agent_id}";
 pub const TPL_AGENT_UPDATE: &str = "/client/agents/{agent_id}:update";
 pub const TPL_AGENT_DELETE: &str = "/client/agents/{agent_id}:delete";
+/// Packs family templated routes: one installed pack (`{name}@{version}`), uninstall it.
+pub const TPL_PACK_GET: &str = "/client/packs/{pack_id}";
+pub const TPL_PACK_UNINSTALL: &str = "/client/packs/{pack_id}:uninstall";
 /// Costs family templated routes: one agent's / one provider's report.
 pub const TPL_COSTS_AGENT_GET: &str = "/client/costs/agents/{agent_id}";
 pub const TPL_COSTS_PROVIDER_GET: &str = "/client/costs/providers/{provider_id}";

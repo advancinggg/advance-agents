@@ -257,6 +257,8 @@ pub struct ClientApi {
     agent_provider: AgentProviderSlot,
     /// Costs family (lane cost-attribution) provider slot.
     cost_provider: crate::provider::CostProviderSlot,
+    /// Packs family (MODULE-018 pack administration) provider slot.
+    pack_provider: crate::provider::PackProviderSlot,
     /// m020-s3 CONTRACT-191 slots (event provider / leak detector / cursor codec).
     event_provider: EventProviderSlot,
     leak_detector: LeakDetectorSlot,
@@ -319,6 +321,7 @@ impl ClientApi {
             tools_provider: Arc::new(RwLock::new(None)),
             agent_provider: Arc::new(RwLock::new(None)),
             cost_provider: Arc::new(RwLock::new(None)),
+            pack_provider: Arc::new(RwLock::new(None)),
             event_provider: Arc::new(RwLock::new(None)),
             leak_detector: Arc::new(RwLock::new(None)),
             cursor_codec: Arc::new(RwLock::new(None)),
@@ -365,6 +368,9 @@ impl ClientApi {
         // Costs family (per-agent / per-provider LLM spend) over the CostProvider slot.
         let cost_slot = Arc::clone(&self.cost_provider);
         crate::costs::register(self, cost_slot);
+        // Packs family (installed packs / install / uninstall) over the PackAdminProvider slot.
+        let pack_slot = Arc::clone(&self.pack_provider);
+        crate::packs::register(self, pack_slot);
         let event_slot = Arc::clone(&self.event_provider);
         let detector_slot = Arc::clone(&self.leak_detector);
         let codec_slot = Arc::clone(&self.cursor_codec);
@@ -461,6 +467,18 @@ impl ClientApi {
     /// Late-install the costs-family provider into an already-bound `Arc<ClientApi>`.
     pub fn install_cost_provider(&self, provider: Arc<dyn crate::provider::CostProvider>) {
         *self.cost_provider.write().unwrap() = Some(provider);
+    }
+
+    /// Inject the packs-family provider (composition root / witness). Overwrites the slot the
+    /// packs-family closures read; `None` (default) → `module_unavailable`.
+    pub fn with_pack_provider(self, provider: Arc<dyn crate::provider::PackAdminProvider>) -> Self {
+        *self.pack_provider.write().unwrap() = Some(provider);
+        self
+    }
+
+    /// Late-install the packs-family provider into an already-bound `Arc<ClientApi>`.
+    pub fn install_pack_provider(&self, provider: Arc<dyn crate::provider::PackAdminProvider>) {
+        *self.pack_provider.write().unwrap() = Some(provider);
     }
 
     /// Inject the event provider (m020-s3 / Wave-25 composition root).

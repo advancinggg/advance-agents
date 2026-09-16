@@ -77,6 +77,12 @@ pub const RESPONSE_COMPONENTS: &[&str] = &[
     "ClientAgentDetail",
     "ClientAgentDeleteResult",
     "ClientAgentTemplate",
+    "ClientPackSummary",
+    "ClientPackProvide",
+    "ClientPackDetail",
+    "ClientPackList",
+    "ClientPackInstallResult",
+    "ClientPackUninstallResult",
 ];
 
 /// Request / filter bodies — not a response-field bag.
@@ -95,6 +101,7 @@ pub const EXCLUDED_COMPONENTS: &[&str] = &[
     "ClientUpdateAgentRequest",
     "ClientDeleteAgentRequest",
     "ClientCostQuery",
+    "ClientPackInstallRequest",
 ];
 
 /// Git path of the on-disk honesty baseline, relative to the repo root.

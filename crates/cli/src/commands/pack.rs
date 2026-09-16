@@ -113,7 +113,7 @@ async fn rescanned_registry(
 
 /// `KNOWN_CAPABILITIES` ∪ every installed pack's resource-capability ids (read
 /// through the registry's validated `resolve` + the bounded manifest parser).
-fn build_capability_catalog(
+pub(crate) fn build_capability_catalog(
     registry: &InMemoryPackRegistry,
 ) -> Result<StaticCapabilityCatalog, PackError> {
     let mut names: Vec<String> = KNOWN_CAPABILITIES.iter().map(|s| s.to_string()).collect();
