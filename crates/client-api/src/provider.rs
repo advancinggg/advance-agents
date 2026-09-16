@@ -30,6 +30,10 @@ use crate::cursor::ClientCursorCodec;
 use crate::envelope::{ClientError, ClientErrorCode};
 use crate::events::ClientEventProvider;
 use crate::messages::{ClientMessageAck, ClientMessageStatus};
+use crate::packs::{
+    ClientPackDetail, ClientPackInstallRequest, ClientPackInstallResult, ClientPackSummary,
+    ClientPackUninstallResult,
+};
 use crate::providers::grants::BoundGrantApprovalPort;
 use crate::providers::history::BoundHistoryReadPort;
 use crate::runs::{ClientAgentTreeNode, ClientRunMutation, ClientRunSummary};
@@ -187,6 +191,36 @@ pub trait CostProvider: Send + Sync {
     ) -> Result<ClientProviderCostReport, ProviderError>;
 }
 
+/// Pack administration provider (MODULE-018 pack system) behind the `packs` family. The cli
+/// adapter binds the ONE production `PackRegistry` (rescanned at boot and after every install /
+/// uninstall) plus an `Installer` built from `RuntimeConfig.pack` (trust roots, registry url,
+/// fetch timeout, capability catalog). Every id / request it receives has already passed
+/// handler-side validation in [`crate::packs`].
+///
+/// Error projection: a pack that is already installed → `AlreadyExists`; an unknown
+/// `{name}@{version}` → `NotFound`; an uninstall blocked by dependents → `InvalidState`; a
+/// manifest whose `required-capabilities` exceed the request's `accepted_capabilities` →
+/// `Forbidden`; a malformed / unsigned-but-claiming / checksum-failing pack → `InvalidRequest`;
+/// a fetch / IO failure → `Unavailable`.
+pub trait PackAdminProvider: Send + Sync {
+    /// Installed packs, ordered by name then version.
+    fn list_packs(&self) -> Result<Vec<ClientPackSummary>, ProviderError>;
+    /// One installed pack with its declared provides.
+    fn get_pack(&self, name: &str, version: &str) -> Result<ClientPackDetail, ProviderError>;
+    /// Run the full install flow (source → fetch → checksum → approval → deps → copy → index →
+    /// rescan) with the request's accepted capabilities as the approval decision.
+    fn install_pack(
+        &self,
+        request: &ClientPackInstallRequest,
+    ) -> Result<ClientPackInstallResult, ProviderError>;
+    /// Remove an installed pack (refused while another installed pack depends on it).
+    fn uninstall_pack(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<ClientPackUninstallResult, ProviderError>;
+}
+
 /// An interior-mutable provider slot: `None` until the composition root injects a concrete adapter.
 pub type ProviderSlot<T> = Arc<RwLock<Option<Arc<T>>>>;
 pub type RunProviderSlot = ProviderSlot<dyn RunControlProvider>;
@@ -194,6 +228,7 @@ pub type MessagingProviderSlot = ProviderSlot<dyn MessagingProvider>;
 pub type ToolsProviderSlot = ProviderSlot<dyn ToolsProvider>;
 pub type AgentProviderSlot = ProviderSlot<dyn AgentAdminProvider>;
 pub type CostProviderSlot = ProviderSlot<dyn CostProvider>;
+pub type PackProviderSlot = ProviderSlot<dyn PackAdminProvider>;
 /// m020-s3: event provider / leak detector / cursor codec slots.
 pub type EventProviderSlot = ProviderSlot<dyn ClientEventProvider>;
 pub type LeakDetectorSlot = ProviderSlot<dyn LeakDetector>;

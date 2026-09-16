@@ -244,6 +244,39 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
         ] {
             m.insert(name.to_string(), schema);
         }
+        // Packs family (MODULE-018 pack administration) DTOs (additive).
+        for (name, schema) in [
+            (
+                "ClientPackSummary",
+                schema_value::<crate::packs::ClientPackSummary>(),
+            ),
+            (
+                "ClientPackProvide",
+                schema_value::<crate::packs::ClientPackProvide>(),
+            ),
+            (
+                "ClientPackDetail",
+                schema_value::<crate::packs::ClientPackDetail>(),
+            ),
+            (
+                "ClientPackList",
+                schema_value::<crate::packs::ClientPackList>(),
+            ),
+            (
+                "ClientPackInstallRequest",
+                schema_value::<crate::packs::ClientPackInstallRequest>(),
+            ),
+            (
+                "ClientPackInstallResult",
+                schema_value::<crate::packs::ClientPackInstallResult>(),
+            ),
+            (
+                "ClientPackUninstallResult",
+                schema_value::<crate::packs::ClientPackUninstallResult>(),
+            ),
+        ] {
+            m.insert(name.to_string(), schema);
+        }
         // MODULE-023 GenUI DTOs (CONTRACT-220/221).
         m.insert(
             "GenUiDocument".to_string(),

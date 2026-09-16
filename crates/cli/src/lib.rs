@@ -37,6 +37,7 @@ pub mod client_api_adapters;
 // production terminate-controller composition the family drives.
 pub mod client_api_agents;
 pub mod client_api_costs;
+pub mod client_api_packs;
 pub mod contract218_anchor;
 pub mod contract218_bootstrap;
 pub mod contract218_keyring;
