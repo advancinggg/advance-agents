@@ -19,6 +19,10 @@ path = "src/lib.rs"
 [features]
 default = []
 test-support = []
+# the pack lanes gated witness tests
+gap-p1 = []
+gap-p2 = []
+gap-p3 = []
 
 [[bin]]
 name = "advance"
