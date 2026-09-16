@@ -95,19 +95,17 @@ fn t71_git_url_scheme_whitelist_rejects_invalid_schemes() {
             other => panic!("expected InvalidManifest for {bad}, got {other:?}"),
         }
     }
-    // For URLs with `@` like `git+ssh://user@host/r`, the strict 0/1/2+ @ rule
-    // fires first: 1 @ → split → right side `host/r` contains `/` → ref-grammar
-    // rejection (the scheme rejection would have fired second, but ref check
-    // shadows it). Either error path is correct rejection of the malformed URL.
+    // Pack lane P3: the scheme gate now runs BEFORE the
+    // authority/ref split, so `git+ssh://user@host/r` is a scheme rejection —
+    // and its text must not echo the `user@` userinfo.
     let ssh_case = "git+ssh://user@host/r";
     match parse_source(ssh_case) {
         Err(PackError::InvalidManifest(msg)) => {
             assert!(
-                msg.contains("unsupported git URL scheme")
-                    || msg.contains("forbidden character")
-                    || msg.contains("multiple @"),
-                "expected scheme-or-ref-rejection for {ssh_case}, got: {msg}"
+                msg.contains("unsupported git URL scheme"),
+                "expected scheme-rejection for {ssh_case}, got: {msg}"
             );
+            assert!(!msg.contains("user@"), "userinfo leaked: {msg}");
         }
         other => panic!("expected InvalidManifest for {ssh_case}, got {other:?}"),
     }
@@ -138,6 +136,17 @@ fn t71b_git_ref_grammar_comprehensive_positive_and_negative() {
             ..
         }
     ));
+    // Pack lane P3: slash refs and 40-hex commit pins are now
+    // ACCEPTED (they were Slice D rejections) — the SHA is installed by
+    // `git fetch --depth 1 origin <sha>`, see gap_p3_13.
+    assert!(matches!(
+        parse_source("git+https://x/r@feature/foo").unwrap(),
+        SourceRef::GitUrl { git_ref: Some(ref r), .. } if r == "feature/foo"
+    ));
+    assert!(matches!(
+        parse_source("git+https://x/r@abcdef0123456789abcdef0123456789abcdef01").unwrap(),
+        SourceRef::GitUrl { git_ref: Some(ref r), .. } if r == "abcdef0123456789abcdef0123456789abcdef01"
+    ));
 
     // Negative cases — each MUST return InvalidManifest
     let neg = vec![
@@ -146,8 +155,10 @@ fn t71b_git_ref_grammar_comprehensive_positive_and_negative() {
         ("git+https://x/r@v1\nfoo", "newline / control"),
         ("git+https://x/r@v1 spaces", "whitespace"),
         ("git+https://x/r@", "empty ref"),
-        ("git+https://x/r@feature/foo", "slash in ref"),
+        ("git+https://x/r@feature//foo", "double slash in ref"),
+        ("git+https://x/r@feature/", "trailing slash in ref"),
         ("git+https://x/r@.hidden", "leading dot"),
+        ("git+https://x/r@a/.hidden", "leading dot in a segment"),
         ("git+https://x/r@trailing.", "trailing dot"),
         ("git+https://x/r@v1.lock", ".lock suffix"),
         ("git+https://x/r@v1?query", "? metacharacter"),
@@ -156,14 +167,11 @@ fn t71b_git_ref_grammar_comprehensive_positive_and_negative() {
         ("git+https://x/r@v1:foo", ": metacharacter"),
         ("git+https://x/r@v1*glob", "* metacharacter"),
         ("git+https://x/r@v1[bracket", "[ metacharacter"),
-        (
-            "git+https://x/r@abcdef0123456789abcdef0123456789abcdef01",
-            "40-char SHA",
-        ),
-        ("git+https://user@host/r@v1", "2+ @"),
+        ("git+https://x/r@v1@{1}", "@{ reflog syntax (2+ @)"),
+        ("git+https://user@host/r@v1", "userinfo in authority + ref"),
         (
             "git+https://user@host/r",
-            "userinfo URL without explicit ref → 1@ but slash on right",
+            "userinfo in authority without a ref",
         ),
     ];
     for (input, label) in neg {
@@ -389,6 +397,7 @@ trust-level: untrusted
         event_bus: None,
         registry_client: None,
         fetch_timeout: Some(Duration::from_secs(30)),
+        trust_roots: Vec::new(),
     };
 
     installer

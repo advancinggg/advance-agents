@@ -20,7 +20,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::error::PackError;
-use crate::install::ApprovalStrategy;
+use crate::install::{ApprovalContext, ApprovalStrategy};
 use crate::manifest::PackManifest;
 
 /// Answers "is this capability name something the runtime can provide?".
@@ -63,11 +63,10 @@ impl CatalogCheckedApproval {
     pub fn new(inner: Arc<dyn ApprovalStrategy>, catalog: Arc<dyn CapabilityCatalog>) -> Self {
         Self { inner, catalog }
     }
-}
 
-#[async_trait]
-impl ApprovalStrategy for CatalogCheckedApproval {
-    async fn approve(&self, manifest: &PackManifest) -> Result<bool, PackError> {
+    /// The catalog gate: `Err(UnknownRequiredCapability)` naming every unknown
+    /// requirement (manifest order, de-duplicated), `Ok(())` otherwise.
+    fn check(&self, manifest: &PackManifest) -> Result<(), PackError> {
         // Order-preserving, de-duplicated list of the unknown names so the error
         // text reads in manifest order and never repeats an entry.
         let mut seen = BTreeSet::new();
@@ -84,7 +83,26 @@ impl ApprovalStrategy for CatalogCheckedApproval {
                 unknown,
             });
         }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ApprovalStrategy for CatalogCheckedApproval {
+    async fn approve(&self, manifest: &PackManifest) -> Result<bool, PackError> {
+        self.check(manifest)?;
         self.inner.approve(manifest).await
+    }
+
+    /// Pack lane P3: the signature context is forwarded verbatim so an
+    /// interactive inner strategy can show the downgrade / signer.
+    async fn approve_with_context(
+        &self,
+        manifest: &PackManifest,
+        ctx: &ApprovalContext,
+    ) -> Result<bool, PackError> {
+        self.check(manifest)?;
+        self.inner.approve_with_context(manifest, ctx).await
     }
 }
 
@@ -132,6 +150,46 @@ mod tests {
         assert!(yes.approve(&manifest(&["fs", "llm"])).await.unwrap());
         let no = CatalogCheckedApproval::new(Arc::new(AutoReject), catalog);
         assert!(!no.approve(&manifest(&["fs"])).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn context_is_forwarded_to_the_inner_strategy() {
+        struct Capture(std::sync::Mutex<Option<ApprovalContext>>);
+        #[async_trait]
+        impl ApprovalStrategy for Capture {
+            async fn approve(&self, _: &PackManifest) -> Result<bool, PackError> {
+                Ok(false)
+            }
+            async fn approve_with_context(
+                &self,
+                _: &PackManifest,
+                ctx: &ApprovalContext,
+            ) -> Result<bool, PackError> {
+                *self.0.lock().unwrap() = Some(ctx.clone());
+                Ok(true)
+            }
+        }
+        let inner = Arc::new(Capture(std::sync::Mutex::new(None)));
+        let approval = CatalogCheckedApproval::new(
+            inner.clone(),
+            Arc::new(StaticCapabilityCatalog::new(["fs"])),
+        );
+        let ctx = ApprovalContext {
+            signed_by: Some("ab".repeat(32)),
+            trust_downgraded: false,
+        };
+        assert!(approval
+            .approve_with_context(&manifest(&["fs"]), &ctx)
+            .await
+            .unwrap());
+        assert_eq!(inner.0.lock().unwrap().as_ref(), Some(&ctx));
+        // The catalog gate still runs first.
+        assert!(matches!(
+            approval
+                .approve_with_context(&manifest(&["warp"]), &ctx)
+                .await,
+            Err(PackError::UnknownRequiredCapability { .. })
+        ));
     }
 
     #[tokio::test]

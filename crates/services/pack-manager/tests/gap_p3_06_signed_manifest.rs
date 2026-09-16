@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p3")]
 //! GAP-06 (P3) — signed manifests (`pack.sig` over `pack.yaml` bytes, ed25519).
 //!
 //! Requires `ed25519-dalek` (pinned workspace-wide) — deterministic keys, no RNG.

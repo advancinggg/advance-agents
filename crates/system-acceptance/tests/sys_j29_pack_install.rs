@@ -133,6 +133,7 @@ fn installer(
         event_bus,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     }
 }
 

@@ -51,6 +51,10 @@ pub mod observation_projection;
 // `wiring.rs`. The `advance pack install|list|uninstall` admin surface lives in
 // `commands/pack.rs`.
 pub mod pack_wiring;
+// Pack lane P3 — the production HTTPS `RegistryClient`
+// (`registry:name@version` sources; index GET + sha256-verified, bounded tarball
+// download), wired by `commands/pack.rs` from `pack.registry-url`.
+pub mod pack_registry_client;
 pub mod reap;
 pub mod webhook_listener;
 // /dev Wave-20 Lane `search` (2026-06-27) — the cross-crate adapter bridging

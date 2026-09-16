@@ -5,6 +5,10 @@
 //! is empty.
 //!
 //! Bounded 16-byte ASCII-only line read; default reject.
+//!
+//! Pack lane P3: the prompt also shows the signature outcome —
+//! the signing trust root, or the fact that an unsigned `trusted` claim was
+//! downgraded to `untrusted` — through [`ApprovalContext`].
 
 use std::io::{BufRead, Write};
 use std::sync::Mutex;
@@ -12,7 +16,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::error::PackError;
-use crate::install::ApprovalStrategy;
+use crate::install::{ApprovalContext, ApprovalStrategy};
 use crate::manifest::PackManifest;
 
 const MAX_LINE_BYTES: usize = 16;
@@ -41,6 +45,13 @@ impl InteractiveApproval<std::io::Stdout, std::io::BufReader<std::io::Stdin>> {
     }
 }
 
+fn stdout_io(e: std::io::Error) -> PackError {
+    PackError::Io {
+        path: std::path::PathBuf::from("<stdout>"),
+        source: e,
+    }
+}
+
 #[async_trait]
 impl<W, R> ApprovalStrategy for InteractiveApproval<W, R>
 where
@@ -48,6 +59,15 @@ where
     R: BufRead + Send + 'static,
 {
     async fn approve(&self, manifest: &PackManifest) -> Result<bool, PackError> {
+        self.approve_with_context(manifest, &ApprovalContext::default())
+            .await
+    }
+
+    async fn approve_with_context(
+        &self,
+        manifest: &PackManifest,
+        ctx: &ApprovalContext,
+    ) -> Result<bool, PackError> {
         // AC-07 short-circuit: trivial install (empty required-capabilities) does
         // not require admin approval. Approve without prompting.
         if manifest.required_capabilities.is_empty() {
@@ -57,28 +77,24 @@ where
         let trust_str = format!("{:?}", manifest.trust_level).to_lowercase();
         {
             let mut w = self.writer.lock().expect("writer mutex poisoned");
-            writeln!(w, "Pack: {}@{}", manifest.name, manifest.version).map_err(|e| {
-                PackError::Io {
-                    path: std::path::PathBuf::from("<stdout>"),
-                    source: e,
-                }
-            })?;
-            writeln!(w, "Required capabilities: [{caps_str}]").map_err(|e| PackError::Io {
-                path: std::path::PathBuf::from("<stdout>"),
-                source: e,
-            })?;
-            writeln!(w, "Trust level: {trust_str}").map_err(|e| PackError::Io {
-                path: std::path::PathBuf::from("<stdout>"),
-                source: e,
-            })?;
-            write!(w, "Approve? [y/N] ").map_err(|e| PackError::Io {
-                path: std::path::PathBuf::from("<stdout>"),
-                source: e,
-            })?;
-            w.flush().map_err(|e| PackError::Io {
-                path: std::path::PathBuf::from("<stdout>"),
-                source: e,
-            })?;
+            writeln!(w, "Pack: {}@{}", manifest.name, manifest.version).map_err(stdout_io)?;
+            writeln!(w, "Required capabilities: [{caps_str}]").map_err(stdout_io)?;
+            if ctx.trust_downgraded {
+                writeln!(
+                    w,
+                    "Trust level: {trust_str} (DOWNGRADED: pack.yaml claims trusted, but \
+                     pack.sig is missing or not signed by a configured trust root)"
+                )
+                .map_err(stdout_io)?;
+            } else {
+                writeln!(w, "Trust level: {trust_str}").map_err(stdout_io)?;
+            }
+            match &ctx.signed_by {
+                Some(pk) => writeln!(w, "Signed by trust root: {pk}").map_err(stdout_io)?,
+                None => writeln!(w, "Signed by trust root: (unsigned)").map_err(stdout_io)?,
+            }
+            write!(w, "Approve? [y/N] ").map_err(stdout_io)?;
+            w.flush().map_err(stdout_io)?;
         }
         let line = {
             let mut r = self.reader.lock().expect("reader mutex poisoned");
@@ -131,6 +147,7 @@ fn read_bounded_line<R: BufRead>(reader: &mut R) -> std::io::Result<String> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::Arc;
 
     #[test]
     fn read_bounded_line_handles_newline() {
@@ -173,5 +190,59 @@ mod tests {
         let mut r = Cursor::new(b"y\tes\n".to_vec());
         let s = read_bounded_line(&mut r).unwrap();
         assert_eq!(s, "y\tes");
+    }
+
+    /// Shared, inspectable writer for the prompt-text tests.
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn manifest_needing_approval() -> PackManifest {
+        PackManifest::from_yaml(
+            "name: foo\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\nprovides: {}\nrequired-capabilities:\n  - fs\nchecksums:\n  algo: sha256\n  files: {}\n",
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn prompt_shows_downgrade_and_signer() {
+        let sink = Sink::default();
+        let approval = InteractiveApproval::new(sink.clone(), Cursor::new(b"y\n".to_vec()));
+        let ctx = ApprovalContext {
+            signed_by: None,
+            trust_downgraded: true,
+        };
+        assert!(approval
+            .approve_with_context(&manifest_needing_approval(), &ctx)
+            .await
+            .unwrap());
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("DOWNGRADED"), "{out}");
+        assert!(out.contains("(unsigned)"), "{out}");
+
+        let sink = Sink::default();
+        let approval = InteractiveApproval::new(sink.clone(), Cursor::new(b"n\n".to_vec()));
+        let ctx = ApprovalContext {
+            signed_by: Some("ab".repeat(32)),
+            trust_downgraded: false,
+        };
+        assert!(!approval
+            .approve_with_context(&manifest_needing_approval(), &ctx)
+            .await
+            .unwrap());
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains(&format!("Signed by trust root: {}", "ab".repeat(32))),
+            "{out}"
+        );
+        assert!(!out.contains("DOWNGRADED"), "{out}");
     }
 }

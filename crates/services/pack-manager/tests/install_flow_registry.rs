@@ -33,6 +33,7 @@ async fn t80_registry_source_end_to_end_via_mock_registry_client() {
         event_bus: None,
         registry_client: Some(mock.clone()),
         fetch_timeout: Some(Duration::from_secs(10)),
+        trust_roots: Vec::new(),
     };
 
     let report = installer.install("registry:foo@1.0.0").await.unwrap();
@@ -76,6 +77,7 @@ async fn t80b_registry_fetch_failed_timeout() {
         event_bus: None,
         registry_client: Some(mock.clone()),
         fetch_timeout: Some(Duration::from_secs(1)),
+        trust_roots: Vec::new(),
     };
 
     let res = installer.install("registry:foo@1.0.0").await;
@@ -111,6 +113,7 @@ async fn t80b_registry_fetch_failed_client_error_propagates() {
         event_bus: None,
         registry_client: Some(mock.clone()),
         fetch_timeout: Some(Duration::from_secs(10)),
+        trust_roots: Vec::new(),
     };
 
     let res = installer.install("registry:bar@1.0.0").await;
@@ -151,6 +154,7 @@ async fn t80c_registry_identity_mismatch_rejected() {
         event_bus: None,
         registry_client: Some(mock.clone()),
         fetch_timeout: Some(Duration::from_secs(10)),
+        trust_roots: Vec::new(),
     };
 
     let res = installer.install("registry:bar@9.9.9").await;
@@ -208,6 +212,7 @@ async fn t80d_registry_path_confinement_rejected() {
         event_bus: None,
         registry_client: Some(client),
         fetch_timeout: Some(Duration::from_secs(10)),
+        trust_roots: Vec::new(),
     };
 
     let res = installer.install("registry:foo@1.0.0").await;
@@ -269,6 +274,7 @@ async fn t80e_registry_returned_symlink_rejected() {
         event_bus: None,
         registry_client: Some(client),
         fetch_timeout: Some(Duration::from_secs(10)),
+        trust_roots: Vec::new(),
     };
 
     let res = installer.install("registry:foo@1.0.0").await;
@@ -309,6 +315,7 @@ async fn t81_registry_source_without_client_configured_rejected() {
         event_bus: None,
         registry_client: None,
         fetch_timeout: None,
+        trust_roots: Vec::new(),
     };
 
     let res = installer.install("registry:foo@1.0.0").await;

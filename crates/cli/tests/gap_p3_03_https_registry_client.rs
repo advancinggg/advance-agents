@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p3")]
 //! GAP-03 (P3) — `HttpsRegistryClient` against a local axum registry.
 //! Needs cli dev-deps `tar`, `flate2`, `sha2`
 //! (workspace-pinned) to build and hash the tarball fixture.

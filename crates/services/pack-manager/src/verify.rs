@@ -8,16 +8,19 @@
 //! - Final canonicalize+ancestor check catches symlink escape introduced after
 //!   manifest write.
 //!
-//! Caller pre-condition (TOCTOU note — best effort, NOT absolute): the `root`
-//! directory passed in SHOULD have been populated via
-//! [`crate::fetch::copy_dir_no_symlinks`] (or an equivalent symlink-rejecting
-//! copy). `install.rs` step ② calls `copy_dir_no_symlinks` before this, but
-//! that copier itself has a TOCTOU window between `symlink_metadata` and
-//! `std::fs::copy` — an attacker with write access to the *source* directory
-//! during install can still smuggle a symlink in. Slice A's threat model
-//! bounds this by trusting the admin source (admin's local checkout);
-//! Slice B closes the window via `rustix::fs::openat2(RESOLVE_NO_SYMLINKS)`
-//! on Linux 5.6+. See MODULE-018 §2.9 + §3.6 for the full documented gap.
+//! Caller pre-condition: the `root` directory passed in SHOULD have been
+//! populated via [`crate::fetch::copy_dir_no_symlinks`] (or an equivalent
+//! symlink-rejecting copy). `install.rs` step ② calls `copy_dir_no_symlinks`
+//! before this. That copier used to leave a TOCTOU window between its
+//! `symlink_metadata` probe and the path-based `std::fs::copy` / descent, so
+//! an attacker with write access to the *source* directory during install
+//! could smuggle a symlink in; Pack lane P3 closed it — the walk
+//! is fd-relative (`openat2` `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH` on Linux
+//! 5.6+, `openat` + `O_NOFOLLOW` on other unix), so a swap during the copy
+//! fails the install instead of being followed. The documented residual is
+//! the path-based open of the two ROOTS (see
+//! [`crate::fetch::copy_dir_no_symlinks_observed`]), bounded by the caller's
+//! own temp / packs directory.
 
 use std::io::Read;
 use std::path::Path;

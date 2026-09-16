@@ -3,7 +3,9 @@
 //! 3 (`GitCloneFailed`, `TarballExtractFailed`, `RegistryFetchFailed`, total 21)
 //! for the non-Local install source surface. Pack lane P1 adds 3
 //! (`AlreadyInstalled`, `DependentsExist`, `UnknownRequiredCapability`, total 24)
-//! for the reinstall / uninstall / capability-catalog surface.
+//! for the reinstall / uninstall / capability-catalog surface; lane P3 adds 1
+//! (`SignatureInvalid`, total 25) for the signed-manifest surface and redacts
+//! URL userinfo in `GitCloneFailed`'s Display.
 
 use std::path::PathBuf;
 
@@ -97,11 +99,17 @@ pub enum PackError {
     // Slice D additions (§2.8 19/20/21 variants) — non-Local install
     // source fetch failures (git+/tarball/registry).
     /// git+ subprocess `git clone --depth 1 [--branch <ref>] -- <url> <dest>`
-    /// returned non-zero status, or `tokio::time::timeout` fired, or git
-    /// binary not found in PATH. `reason` carries a short diagnostic
-    /// (git's stderr first line, "wall-clock timeout", "git binary not
-    /// found in PATH", etc.).
-    #[error("git clone failed for {url}: {reason}")]
+    /// (or, for a commit-SHA pin, the `init` / `remote add` / `fetch --depth 1
+    /// origin <sha>` / `checkout FETCH_HEAD` sequence) returned non-zero status,
+    /// or `tokio::time::timeout` fired, or git binary not found in PATH.
+    /// `reason` carries a short diagnostic (git's stderr first line,
+    /// "wall-clock timeout", "git binary not found in PATH", etc.).
+    ///
+    /// Pack lane P3: the Display form passes `url` through
+    /// [`crate::source::redact_userinfo`], so a credential-bearing URL
+    /// (`https://user:token@host/…`) never reaches a log or a terminal in
+    /// clear text. The raw field is kept for programmatic callers.
+    #[error("git clone failed for {}: {reason}", crate::source::redact_userinfo(.url))]
     GitCloneFailed { url: String, reason: String },
 
     /// Tarball untar rejected an entry (`..` traversal, absolute path, null
@@ -147,4 +155,15 @@ pub enum PackError {
     /// prompted to approve a capability the runtime cannot provide.
     #[error("pack {pack} declares unknown required-capabilities: {}", .unknown.join(", "))]
     UnknownRequiredCapability { pack: String, unknown: Vec<String> },
+
+    // ─────────────────────────────────────────────────────────────
+    // Pack lane P3 addition — variant 25.
+    /// Step ③b: the pack ships a `pack.sig` that is malformed (not the
+    /// `alg: ed25519` / `public-key` / `signature` YAML shape, bad hex, a
+    /// non-canonical key or signature) OR whose signature does not verify over
+    /// the exact `pack.yaml` bytes. Raised REGARDLESS of the configured trust
+    /// roots: a pack that claims a signature it cannot back is refused outright,
+    /// whereas a valid signature from an unknown key merely counts as unsigned.
+    #[error("signature verification failed for pack {pack}: {reason}")]
+    SignatureInvalid { pack: String, reason: String },
 }

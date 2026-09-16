@@ -8,14 +8,17 @@
 //! `skill.rs`.
 //!
 //! - `<source>`: local directory / `git+<url>[@<ref>]` / `<path>.tar.gz` /
-//!   `registry:<name>@<version>` (the `parse_source` grammar). A registry
-//!   source needs a `RegistryClient`, which is lane P3 (#3) — until then it is
-//!   surfaced as an install error, never silently skipped.
+//!   `registry:<name>@<version>` (the `parse_source` grammar; P3 §4.2 accepts
+//!   `@<40-hex>` commit pins and slash refs). A registry source is served by
+//!   the `HttpsRegistryClient` built from `pack.registry-url` (P3 §4.4); with no
+//!   URL configured it is surfaced as an install error, never silently skipped.
 //! - packs dir: `--packs-dir` → `pack.packs-dir` of the workspace
 //!   `runtime-config.yaml` (when present) joined onto the workspace root →
 //!   `<ws>/.advance/packs`, where `<ws>` = `$ADVANCE_WORKSPACE` → `.`. A
 //!   present-but-invalid runtime config is a hard error (fail-closed, matching
-//!   `advance start`); an absent one means defaults.
+//!   `advance start`); an absent one means defaults. `pack.trust-roots` become
+//!   the installer's signing roots (P3 §4.1): an unsigned `trusted` claim is
+//!   downgraded and shown as such in the approval prompt.
 //! - approval: `InteractiveApproval` on stdin/stdout by default; `--no-input`
 //!   (or `pack.approval: auto-reject`) → `RejectUnlessTrivial`. Both approve a
 //!   pack with an empty `required-capabilities` without any decision (AC-07);
@@ -43,6 +46,7 @@ use advance_runtime::config::{load_config, PackApprovalPolicy, PackConfig};
 
 use super::skill::{safe_msg, safe_path};
 use crate::agent_config::KNOWN_CAPABILITIES;
+use crate::pack_registry_client::HttpsRegistryClient;
 
 /// Runtime version the installer checks `runtime-version:` ranges against.
 const CURRENT_RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -52,6 +56,10 @@ struct PackCliSettings {
     packs_dir: PathBuf,
     fetch_timeout: Duration,
     auto_reject: bool,
+    /// P3 §4.1 — `pack.trust-roots` (hex ed25519 public keys).
+    trust_roots: Vec<String>,
+    /// P3 §4.4 — `pack.registry-url`; `None` ⇒ no `RegistryClient` is wired.
+    registry_url: Option<String>,
 }
 
 /// `$ADVANCE_WORKSPACE` (non-empty) → `.` — mirrors `start.rs::resolve_workspace`
@@ -79,6 +87,8 @@ fn resolve_settings(packs_dir: Option<PathBuf>) -> Result<PackCliSettings, Strin
         packs_dir: packs_dir.unwrap_or_else(|| ws.join(&pack_cfg.packs_dir)),
         fetch_timeout: Duration::from_secs(pack_cfg.fetch_timeout_sec),
         auto_reject: pack_cfg.approval == PackApprovalPolicy::AutoReject,
+        trust_roots: pack_cfg.trust_roots,
+        registry_url: pack_cfg.registry_url,
     })
 }
 
@@ -187,13 +197,29 @@ async fn run_install_async(source: String, packs_dir: Option<PathBuf>, no_input:
         Arc::new(InteractiveApproval::new_stdin())
     };
     let approval = Arc::new(CatalogCheckedApproval::new(inner, Arc::new(catalog)));
-    let installer = Installer::new(
+    let mut installer = Installer::new(
         settings.packs_dir.clone(),
         registry,
         CURRENT_RUNTIME_VERSION,
         approval,
     )
-    .with_fetch_timeout(settings.fetch_timeout);
+    .with_fetch_timeout(settings.fetch_timeout)
+    .with_trust_roots(settings.trust_roots);
+    // P3 §4.4: the production registry client, only when the operator
+    // configured `pack.registry-url` (the config loader already shape-checked
+    // it; the client re-applies the https / loopback-http policy).
+    if let Some(url) = &settings.registry_url {
+        match HttpsRegistryClient::new(url, settings.fetch_timeout) {
+            Ok(client) => installer = installer.with_registry_client(Arc::new(client)),
+            Err(e) => {
+                eprintln!(
+                    "advance pack install: cannot build the registry client: {}",
+                    safe_msg(&e.to_string())
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
 
     match installer.install(&source).await {
         Ok(report) => {

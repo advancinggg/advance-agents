@@ -38,9 +38,17 @@
 //!   [`CatalogCheckedApproval`] decorator validating `required-capabilities`
 //!   against a [`CapabilityCatalog`].
 //! - [`RegistryClient`] async seam (Slice D AC-05) for `registry:name@version`
-//!   source dispatch; production HTTPS endpoint deferred to Slice D+; ships
-//!   `MockRegistryClient` test helper following the `RecordingTraceSink`
-//!   visibility precedent.
+//!   source dispatch; ships `MockRegistryClient` test helper following the
+//!   `RecordingTraceSink` visibility precedent. The production HTTPS client
+//!   (`HttpsRegistryClient`) lives in the cli composition root
+//!   (Pack lane P3); `list_versions` is a default method here.
+//! - Pack lane P3: signed manifests
+//!   ([`signature`] — `pack.sig` ed25519 over `pack.yaml`, `Installer::with_trust_roots`,
+//!   `PackError::SignatureInvalid`, unsigned `trusted` claims downgraded and
+//!   surfaced through [`ApprovalContext`]); git commit-SHA pins + slash refs +
+//!   userinfo redaction ([`redact_userinfo`]); and the fd-relative
+//!   [`fetch::copy_dir_no_symlinks_observed`] copy that closes the source-side
+//!   symlink-swap TOCTOU window.
 
 pub mod admin;
 pub mod catalog;
@@ -56,6 +64,7 @@ pub mod materialize_impl;
 pub mod meta;
 pub mod registry;
 pub mod registry_client;
+pub mod signature;
 pub mod source;
 pub mod verify;
 pub mod workflow;
@@ -67,10 +76,10 @@ pub use deps::DependencyResolver;
 pub use error::PackError;
 pub use fetch::FetchContext;
 pub use install::{
-    ApprovalStrategy, AutoApprove, AutoReject, InstallStep, InstallTraceSink, Installer,
-    NoopTraceSink, PackInstallReport, PackUninstallReport, RecordingTraceSink, RejectUnlessTrivial,
-    DEFAULT_FETCH_TIMEOUT, INSTALL_LOCK_FILENAME, PACK_REGISTRY_RELOADED_EVENT,
-    PACK_UNINSTALLED_EVENT,
+    ApprovalContext, ApprovalStrategy, AutoApprove, AutoReject, InstallStep, InstallTraceSink,
+    Installer, NoopTraceSink, PackInstallReport, PackUninstallReport, RecordingTraceSink,
+    RejectUnlessTrivial, DEFAULT_FETCH_TIMEOUT, INSTALL_LOCK_FILENAME,
+    PACK_REGISTRY_RELOADED_EVENT, PACK_UNINSTALLED_EVENT,
 };
 pub use manifest::{
     ChecksumAlgo, PackChecksums, PackDependency, PackManifest, PackProvides, TrustLevel,
@@ -85,7 +94,8 @@ pub use registry::{
     PackComponentResolution, PackMetadata, PackProvideEntry, PackRegistry, PackResolution,
 };
 pub use registry_client::{MockRegistryClient, RegistryClient};
-pub use source::{parse_source, SourceRef};
+pub use signature::{verify_pack_signature, PACK_SIG_FILENAME};
+pub use source::{is_commit_sha, parse_source, redact_userinfo, SourceRef};
 pub use workflow::{
     SecretStore, SecretValue, TriggerEventBody, WorkflowApplier, WorkflowExecutor, WorkflowStep,
     WorkflowTemplate, WorkflowTrigger,

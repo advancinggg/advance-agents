@@ -174,7 +174,22 @@ notify = "=6.1.1"
 # rustix for openat2 + RESOLVE_NO_SYMLINKS on Linux 5.6+ — closes the parent-dir
 # TOCTOU gap between symlink_metadata check and open() that O_NOFOLLOW (leaf-only)
 # cannot cover. On macOS falls back to open() with O_NOFOLLOW|O_NONBLOCK.
+# Pack lane P3: pack-manager's fd-relative `copy_dir_no_symlinks`
+# (openat2 NO_SYMLINKS|BENEATH on Linux; openat + O_NOFOLLOW elsewhere) is a
+# second consumer of this same pin.
 rustix = { version = "=0.38.44", default-features = false, features = ["std", "fs"] }
+# Pack lane P3: signed pack manifests — `pack.sig` carries an
+# ed25519 signature over the `pack.yaml` bytes, verified with `verify_strict` against
+# the operator's `pack.trust-roots`. Pure-Rust dalek crypto (BSD-3-Clause, already on
+# the deny.toml allow-list). Default features only (`fast` precomputed tables, `std`,
+# `zeroize`); no `rand_core` — production never generates keys, and the witness tests
+# derive deterministic keys from fixed seeds.
+ed25519-dalek = "=2.1.1"
+# Pack lane P3: the cli `HttpsRegistryClient` (registry index + tarball
+# download) shares cap-http's exact reqwest posture, so the pin moves from cap-http's
+# manifest to here (single source of truth). rustls-tls avoids native-tls/openssl;
+# no json/gzip/http2; `stream` for the bounded, hashed-while-downloading body read.
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
 # Slice m018-A (2026-05-11): MODULE-018 pack-manager workspace dep.
 # semver — SemVer 2.0 Version + VersionReq parser for pack.yaml `version` field
 # and `runtime-version` range validation (§19.4 / AC-04). Pinned =1.0.28 per Slice A'
