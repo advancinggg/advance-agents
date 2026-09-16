@@ -9,6 +9,23 @@
 //!
 //! Remaining 5 methods return `PackError::NotImplemented(...)` per §3.5 Slice C
 //! Feature Implementation Record row.
+//!
+//! Pack lane P2 — the integration-boundary no-ops stop being
+//! no-ops:
+//! - `register_mcp_server` parses the `mcp-servers/{name}.yaml` document through
+//!   [`crate::mcp_server_manifest`] (the file finally has a schema) BEFORE the
+//!   `secret-refs` pre-check;
+//! - `merge_meta_schema_extension` is a STRUCTURED single-document merge
+//!   ([`crate::meta_schema_merge`]) — identical redeclaration idempotent, a
+//!   differing type/default → `ConstraintViolation`, target untouched on error;
+//!   [`DefaultMaterializer::merge_meta_schema_extension_report`] exposes the
+//!   `added` / `unchanged` field lists the cli bridge reports;
+//! - `materialize_channel_adapter` is an explicit `NotImplemented` (cap-channel
+//!   has no path-loaded adapter surface — decision recorded in the plan) instead
+//!   of a silent directory copy nothing ever loads; `install` still accepts the
+//!   `channel-adapters:` declaration.
+//! The skills / presets / memory-seeds legs are bridged in the cli composition
+//! root (`pack_bridges`) over the unchanged copy/resolve methods here.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -20,6 +37,7 @@ use crate::fetch::copy_dir_no_symlinks;
 use crate::materialize::{
     GrantId, MaterializeAction, McpServerId, ResourceCapabilityId, WorkflowContext, WorkflowReport,
 };
+use crate::meta_schema_merge::{merge_meta_schema_extension_file, MetaSchemaMergeReport};
 use crate::registry::{ComponentKind, PackRegistry};
 use crate::workflow::{SecretStore, WorkflowApplier, WorkflowExecutor};
 
@@ -45,7 +63,7 @@ const MAX_SMALL_YAML_BYTES: u64 = 1024 * 1024;
 /// `max_bytes`. Used by `merge_meta_schema_extension` for both the pack
 /// source and the on-disk target. Mirrors `copy_file_nofollow_bounded`
 /// minus the copy-to-destination side.
-fn read_bytes_nofollow_bounded(
+pub(crate) fn read_bytes_nofollow_bounded(
     path: &Path,
     max_bytes: u64,
     label: &str,
@@ -330,6 +348,23 @@ impl DefaultMaterializer {
         }
         Ok(resolution.local_path)
     }
+
+    /// Pack lane P2: the reporting form of
+    /// [`MaterializeAction::merge_meta_schema_extension`] — same merge, plus
+    /// which `optional` fields were added and which were already present with an
+    /// identical spec. The cli `PackMetaSchemaBridge` reloads the live
+    /// `MetaSchemaLoader` after this and forwards the report.
+    pub fn merge_meta_schema_extension_report(
+        &self,
+        pack_ref: &str,
+        target_schema: &Path,
+    ) -> Result<MetaSchemaMergeReport, PackError> {
+        let local_path = self.resolve_kind(pack_ref, ComponentKind::MetaSchemaExtension)?;
+        Ok(merge_meta_schema_extension_file(
+            &local_path,
+            target_schema,
+        )?)
+    }
 }
 
 impl MaterializeAction for DefaultMaterializer {
@@ -368,17 +403,23 @@ impl MaterializeAction for DefaultMaterializer {
         Ok(local_path)
     }
 
-    /// Slice C — `target` is the destination DIRECTORY. Copies the channel
-    /// adapter tree to `target/` using `copy_dir_no_symlinks` (same security
-    /// posture as `materialize_template` / `materialize_skill`).
+    /// Pack lane P2 — explicitly UNSUPPORTED. Slice C
+    /// copied the adapter tree to `target/`, but cap-channel has no surface that
+    /// loads an adapter from a path, so the copy was dead weight that looked like
+    /// a successful materialization. The ref is still resolved first (a wrong
+    /// kind surfaces as `MaterializeMissingProvide`, an uninstalled pack as
+    /// `PackNotFound`); a resolvable adapter then fails closed with
+    /// `NotImplemented` and NOTHING is written to `target`. `install` keeps
+    /// accepting `provides.channel-adapters` so existing packs stay installable.
     fn materialize_channel_adapter(
         &self,
         pack_ref: &str,
-        target: &Path,
+        _target: &Path,
     ) -> Result<PathBuf, PackError> {
-        let local_path = self.resolve_kind(pack_ref, ComponentKind::ChannelAdapter)?;
-        copy_dir_no_symlinks(&local_path, target)?;
-        Ok(target.to_path_buf())
+        let _local_path = self.resolve_kind(pack_ref, ComponentKind::ChannelAdapter)?;
+        Err(PackError::NotImplemented(
+            "channel-adapters: cap-channel has no path-loaded adapter surface",
+        ))
     }
 
     fn register_mcp_server(
@@ -410,6 +451,12 @@ impl MaterializeAction for DefaultMaterializer {
                 resolution.local_path.display()
             )));
         }
+        // Pack lane P2: the document now HAS a schema — parse
+        // + validate it (bounded / symlink-safe / alias-guarded) so a pack that
+        // ships an unparsable or policy-violating server config is refused here,
+        // not at first use by the cli bridge.
+        let _manifest =
+            crate::mcp_server_manifest::parse_mcp_server_manifest(&resolution.local_path)?;
         // Resolve each `(placeholder, secret_id)` through SecretStore.
         // Adversarial round 2 W4 fix: previous Slice B behavior silently
         // discarded `secret_refs` and returned a deterministic ID, opening a
@@ -507,106 +554,20 @@ impl MaterializeAction for DefaultMaterializer {
         copy_file_nofollow_bounded(&local_path, target, MAX_BINARY_MATERIALIZE_BYTES)
     }
 
-    /// Slice C — byte-level multi-document YAML concatenation. Real
-    /// semantic union (parse → merge → re-emit) belongs to MODULE-002's
-    /// `MetaSchemaManager` (§3.6 Known Gap). When `target_schema` exists
-    /// without a trailing `\n`, prepend `\n` to the `---\n` separator so
-    /// downstream multi-doc parsers see a clean document boundary.
-    /// Atomic-write via tempfile + rename. Slice C adversarial round 12
-    /// W2: source AND target reads go through `read_bytes_nofollow_bounded`
-    /// (Unix O_NOFOLLOW + fstat-on-FD + bounded Read::take) so a swap
-    /// between probe and read cannot bypass the 1 MiB cap or symlink
-    /// rejection.
+    /// Pack lane P2 — STRUCTURED single-document merge (was
+    /// Slice C's `---`-separated byte concatenation, which cap-fs never parsed).
+    /// See [`crate::meta_schema_merge`] for the grammar and conflict rules;
+    /// [`DefaultMaterializer::merge_meta_schema_extension_report`] returns the
+    /// `added` / `unchanged` field lists. Source AND target are read through
+    /// `O_NOFOLLOW` + fstat + a 1 MiB cap; the target is rewritten atomically
+    /// only on success (byte-identical on any error).
     fn merge_meta_schema_extension(
         &self,
         pack_ref: &str,
         target_schema: &Path,
     ) -> Result<(), PackError> {
-        let local_path = self.resolve_kind(pack_ref, ComponentKind::MetaSchemaExtension)?;
-        let source_bytes = read_bytes_nofollow_bounded(
-            &local_path,
-            MAX_SMALL_YAML_BYTES,
-            "meta-schema-extension source",
-        )?;
-
-        // Target may not exist (copy verbatim) OR may exist (append with
-        // separator). Both branches use O_NOFOLLOW + bounded read.
-        let merged: Vec<u8> = match std::fs::symlink_metadata(target_schema) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let mut v = source_bytes.clone();
-                if v.last().is_none_or(|b| *b != b'\n') {
-                    v.push(b'\n');
-                }
-                v
-            }
-            Ok(leaf_md) => {
-                if leaf_md.file_type().is_symlink() {
-                    return Err(PackError::InvalidManifest(format!(
-                        "meta-schema-extension target is a symlink (rejected): {}",
-                        target_schema.display()
-                    )));
-                }
-                let target_bytes = read_bytes_nofollow_bounded(
-                    target_schema,
-                    MAX_SMALL_YAML_BYTES,
-                    "meta-schema-extension target",
-                )?;
-                let mut v = target_bytes;
-                let needs_leading_nl = v.last().is_none_or(|b| *b != b'\n');
-                if needs_leading_nl {
-                    v.push(b'\n');
-                }
-                v.extend_from_slice(b"---\n");
-                v.extend_from_slice(&source_bytes);
-                if v.last().is_none_or(|b| *b != b'\n') {
-                    v.push(b'\n');
-                }
-                v
-            }
-            Err(e) => {
-                return Err(PackError::Io {
-                    path: target_schema.to_path_buf(),
-                    source: e,
-                });
-            }
-        };
-
-        // Atomic-write: tempfile in same dir → fsync → rename.
-        let parent = target_schema.parent().unwrap_or_else(|| Path::new("."));
-        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let tmp = parent.join(format!(
-            ".meta-schema-merge.tmp.{}.{}",
-            std::process::id(),
-            nanos
-        ));
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-                .map_err(|e| PackError::Io {
-                    path: tmp.clone(),
-                    source: e,
-                })?;
-            f.write_all(&merged).map_err(|e| PackError::Io {
-                path: tmp.clone(),
-                source: e,
-            })?;
-            f.sync_all().map_err(|e| PackError::Io {
-                path: tmp.clone(),
-                source: e,
-            })?;
-        }
-        std::fs::rename(&tmp, target_schema).map_err(|e| {
-            // Best-effort cleanup of the tempfile if rename fails.
-            let _ = std::fs::remove_file(&tmp);
-            PackError::Io {
-                path: target_schema.to_path_buf(),
-                source: e,
-            }
-        })?;
-        Ok(())
+        self.merge_meta_schema_extension_report(pack_ref, target_schema)
+            .map(|_| ())
     }
 
     /// AC-17 (m018-rescap) — register-not-copy REGISTRATION surface for the

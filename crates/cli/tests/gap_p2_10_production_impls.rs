@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p2")]
 //! GAP-10 (P2) — production implementations of the pack-manager seams.
 //! `SchedulerWorkflowExecutor` is covered by the
 //! compensation contract (pack-manager gap_p2_04) + system journeys, not here.

@@ -678,6 +678,19 @@ pub fn resource_capability_id(cap_dir: &Path) -> Result<String, PackError> {
     Ok(parse_resource_capability_manifest(cap_dir)?.id)
 }
 
+/// Pack lane P2: the `tools[].name` list of the
+/// resource-capability at `cap_dir`, in declaration order, through the same
+/// bounded / symlink-safe / alias-guarded parse. The composition root reconciles
+/// these names against the host-native tools registered in the `ToolRegistry`
+/// (`advance_cli::tool_exposure::reconcile_pack_tool_exposure`).
+pub fn resource_capability_tool_names(cap_dir: &Path) -> Result<Vec<String>, PackError> {
+    Ok(parse_resource_capability_manifest(cap_dir)?
+        .tools
+        .into_iter()
+        .map(|t| t.name)
+        .collect())
+}
+
 /// Parse + validate `{cap_dir}/capability.yaml` (AC-17). `cap_dir` is the capability
 /// directory (`{install}/resource-capabilities/{name}`). Register-not-copy: this only
 /// reads + validates; nothing is written. Errors mirror `parse_component_manifest`:

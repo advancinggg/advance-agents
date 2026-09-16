@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p2")]
 //! GAP-05 (P2, registry half) — host-native tools in `LazyToolRegistry`.
 //! Tool WASMs only link WASI; a store-backed
 //! tool must be host code, registered under the same id namespace and subject to the same

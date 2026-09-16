@@ -66,6 +66,24 @@ impl SkillImporter {
         target_name: &str,
         admin: &AdminPoolStorage,
     ) -> Result<(), SkillError> {
+        self.import_from_local_path_with_trust(source, target_name, admin, TrustLevel::Untrusted)
+            .await
+    }
+
+    /// Pack lane P2: [`Self::import_from_local_path`] with
+    /// a CALLER-decided trust level. The walk, caps and `provenance: Imported`
+    /// are identical; only the bundle's `trust_level` differs. The one
+    /// production caller is the cli `PackSkillBridge`, which passes `Trusted`
+    /// iff the pack's admin-approved `.meta.yaml` entry is `trusted` (never
+    /// the pack.yaml self-claim). Everything else keeps using the
+    /// `Untrusted`-defaulting entry point.
+    pub async fn import_from_local_path_with_trust(
+        &self,
+        source: &Path,
+        target_name: &str,
+        admin: &AdminPoolStorage,
+        trust_level: TrustLevel,
+    ) -> Result<(), SkillError> {
         validate_skill_name(target_name)?;
 
         // Reject if source itself is a symlink (root-level defense).
@@ -198,7 +216,7 @@ impl SkillImporter {
             templates,
             source_scripts,
             Provenance::Imported,
-            TrustLevel::Untrusted,
+            trust_level,
         )?;
         admin.write_bundle(&bundle).await
     }

@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p2")]
 //! GAP-08 + GAP-09 (P2, cli half) — pack → subsystem bridges with trust propagation.
 //!
 //!
@@ -21,10 +20,23 @@ use cap_fs::meta_schema::{FieldType, MetaSchemaLoader};
 use cap_grant::preset::PresetRegistry;
 use cap_mcp::McpTransportSpec;
 use cap_skills::{AdminPoolStorage, Provenance, TrustLevel};
+use ed25519_dalek::{Signer, SigningKey};
+
+/// FIXTURE (P3 §4.1): since lane P3 an unsigned `trust-level: trusted` claim is
+/// DOWNGRADED to `untrusted` at install, so a fixture pack is only effectively
+/// trusted when its `pack.yaml` is signed by a configured trust root. The
+/// "trusted" packs below carry a `pack.sig` from this fixed key and the
+/// installer is given its public key as the sole root.
+fn trust_root_key() -> SigningKey {
+    SigningKey::from_bytes(&[42u8; 32])
+}
 
 const MCP_STDIO: &str = "server-id: local-tools\ndescription: stdio server\ntransport:\n  kind: stdio\n  command: /usr/bin/true\n  args: []\nsecret-refs:\n  API_TOKEN: mcp-token\n";
 const MCP_HTTP: &str = "server-id: remote-tools\ndescription: http server\ntransport:\n  kind: http\n  endpoint-url: https://mcp.example.com/sse\n";
-const PRESET: &str = "name: data-readonly\ngrants:\n  - capability: tools\n    params: []\n";
+// FIXTURE-GRAMMAR: `cap_grant::preset::parse_preset` requires `default-ttl` and a
+// per-grant `ttl` (once | lifecycle | persistent | {duration|until}); the plan's
+// draft omitted both.
+const PRESET: &str = "name: data-readonly\ndefault-ttl: once\ngrants:\n  - capability: tools\n    params: []\n    ttl: once\n";
 const SEEDS: &str = "{\"id\":\"seed-1\",\"type\":\"fact\",\"content\":\"pack seed one\",\"created_at\":\"2026-09-15T00:00:00Z\",\"tags\":[\"pack\"]}\n{\"id\":\"seed-2\",\"type\":\"fact\",\"content\":\"pack seed two\",\"created_at\":\"2026-09-15T00:00:00Z\"}\n";
 
 fn write_pack(root: &Path, name: &str, trust: &str) -> PathBuf {
@@ -52,17 +64,30 @@ fn write_pack(root: &Path, name: &str, trust: &str) -> PathBuf {
     )
     .unwrap();
     std::fs::write(dir.join("memory-seeds/base.jsonl"), SEEDS).unwrap();
-    std::fs::write(
-        dir.join("pack.yaml"),
-        format!("name: {name}\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\ntrust-level: {trust}\nprovides:\n  skills:\n    - web-search\n  mcp-servers:\n    - local\n    - remote\n  presets:\n    - data-readonly\n  meta-schema-extensions:\n    - todo\n  memory-seeds:\n    - base\nchecksums:\n  algo: sha256\n  files: {{}}\n"),
-    )
-    .unwrap();
+    let pack_yaml = format!("name: {name}\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\ntrust-level: {trust}\nprovides:\n  skills:\n    - web-search\n  mcp-servers:\n    - local\n    - remote\n  presets:\n    - data-readonly\n  meta-schema-extensions:\n    - todo\n  memory-seeds:\n    - base\nchecksums:\n  algo: sha256\n  files: {{}}\n");
+    std::fs::write(dir.join("pack.yaml"), &pack_yaml).unwrap();
+    if trust == "trusted" {
+        let key = trust_root_key();
+        let sig = key.sign(pack_yaml.as_bytes());
+        std::fs::write(
+            dir.join("pack.sig"),
+            format!(
+                "alg: ed25519\npublic-key: {}\nsignature: {}\n",
+                hex::encode(key.verifying_key().to_bytes()),
+                hex::encode(sig.to_bytes())
+            ),
+        )
+        .unwrap();
+    }
     dir
 }
 
 async fn registry_with(packs: &Path, srcs: &[PathBuf]) -> Arc<dyn PackRegistry> {
     let registry = Arc::new(InMemoryPackRegistry::new(packs.to_path_buf()));
-    let inst = Installer::new(packs, registry.clone(), "0.1.0", Arc::new(AutoApprove));
+    let inst = Installer::new(packs, registry.clone(), "0.1.0", Arc::new(AutoApprove))
+        .with_trust_roots(vec![hex::encode(
+            trust_root_key().verifying_key().to_bytes(),
+        )]);
     for s in srcs {
         inst.install(s.to_str().unwrap()).await.expect("install");
     }

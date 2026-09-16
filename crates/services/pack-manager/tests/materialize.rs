@@ -33,9 +33,12 @@ fn build_pack_with_all_10_provides(root: &Path, name: &str, version: &str) -> Pa
     )
     .unwrap();
     std::fs::create_dir_all(pack_dir.join("mcp-servers")).unwrap();
+    // Pack lane P2: `mcp-servers/{name}.yaml` now has a schema
+    // (`advance_pack_manager::mcp_server_manifest`) that `register_mcp_server`
+    // parses; the Slice B `name: brave` placeholder is no longer a valid document.
     std::fs::write(
         pack_dir.join("mcp-servers").join("brave.yaml"),
-        b"name: brave",
+        b"server-id: brave\ndescription: brave search\ntransport:\n  kind: http\n  endpoint-url: https://api.search.brave.com/mcp\n",
     )
     .unwrap();
     std::fs::create_dir_all(pack_dir.join("presets")).unwrap();
@@ -57,11 +60,13 @@ fn build_pack_with_all_10_provides(root: &Path, name: &str, version: &str) -> Pa
     )
     .unwrap();
     std::fs::create_dir_all(pack_dir.join("meta-schema-extensions")).unwrap();
+    // Pack lane P2: extensions are parsed structurally — a real
+    // `optional:` field (the Slice C `ext: {}` placeholder has no meaning).
     std::fs::write(
         pack_dir
             .join("meta-schema-extensions")
             .join("research-meta.yaml"),
-        b"ext: {}",
+        b"optional:\n  ext:\n    type: string\n    default: \"\"\n",
     )
     .unwrap();
 
@@ -584,7 +589,12 @@ async fn t59_materialize_binary_copies_to_target_dir_with_wasm_extension() {
 }
 
 #[tokio::test]
-async fn t60_materialize_channel_adapter_copies_directory_tree() {
+async fn t60_materialize_channel_adapter_is_explicitly_unsupported() {
+    // Pack lane P2: cap-channel has no path-loaded
+    // adapter surface, so the Slice C directory copy (which nothing ever loaded)
+    // is now an explicit `NotImplemented`; the ref is still resolved first (a
+    // wrong kind → MaterializeMissingProvide, see the kind-mismatch test) and
+    // NOTHING is written to the target.
     let (_dir, registry) = install_fixture_pack("bigpackT60", "1.0.0").await;
     let registry_dyn: Arc<dyn PackRegistry> = registry.clone();
     let executor: Arc<dyn WorkflowExecutor> = Arc::new(MockExecutor::default());
@@ -593,14 +603,22 @@ async fn t60_materialize_channel_adapter_copies_directory_tree() {
 
     let target_root = tempfile::TempDir::new().unwrap();
     let target = target_root.path().join("dest-adapter");
-    let returned = mat
+    let err = mat
         .materialize_channel_adapter(
             "bigpackT60@1.0.0/channel-adapters/telegram-adapter",
             &target,
         )
-        .unwrap();
-    assert_eq!(returned, target);
-    assert!(target.join("adapter.yaml").is_file());
+        .expect_err("channel adapters are not materializable");
+    assert!(matches!(err, PackError::NotImplemented(_)), "got {err:?}");
+    assert!(
+        !target.exists(),
+        "nothing is written for an unsupported kind"
+    );
+    // An uninstalled pack still surfaces as PackNotFound (resolution first).
+    assert!(matches!(
+        mat.materialize_channel_adapter("ghost@1.0.0/channel-adapters/x", &target),
+        Err(PackError::PackNotFound(..))
+    ));
 }
 
 #[tokio::test]
@@ -662,7 +680,10 @@ async fn t62_copy_memory_seed_writes_to_target_file() {
 }
 
 #[tokio::test]
-async fn t63_merge_meta_schema_extension_appends_with_newline_normalization() {
+async fn t63_merge_meta_schema_extension_is_a_structured_single_document_merge() {
+    // Pack lane P2: the Slice C `---`-separated append (which
+    // cap-fs's single-document loader never parsed) is replaced by a structured
+    // merge into ONE document.
     let (_dir, registry) = install_fixture_pack("bigpackT63", "1.0.0").await;
     let registry_dyn: Arc<dyn PackRegistry> = registry.clone();
     let executor: Arc<dyn WorkflowExecutor> = Arc::new(MockExecutor::default());
@@ -671,41 +692,50 @@ async fn t63_merge_meta_schema_extension_appends_with_newline_normalization() {
 
     let target_root = tempfile::TempDir::new().unwrap();
 
-    // (a) Target absent → copy source verbatim (ensure trailing newline).
+    // (a) Target absent → a fresh single document carrying the extension.
     let target_a = target_root.path().join("schema-a.yaml");
     mat.merge_meta_schema_extension(
         "bigpackT63@1.0.0/meta-schema-extensions/research-meta",
         &target_a,
     )
     .unwrap();
-    let body_a = std::fs::read(&target_a).unwrap();
-    assert!(!body_a.is_empty());
-    assert_eq!(*body_a.last().unwrap(), b'\n', "trailing newline ensured");
+    let body_a = std::fs::read_to_string(&target_a).unwrap();
+    assert!(body_a.ends_with('\n'), "trailing newline ensured");
+    assert!(!body_a.contains("---"), "ONE document: {body_a}");
+    let doc_a: serde_yml::Value = serde_yml::from_str(&body_a).unwrap();
+    assert_eq!(doc_a["optional"]["ext"]["type"].as_str(), Some("string"));
 
-    // (b) Target exists WITH trailing newline → append `---\n` + source.
+    // (b) Target exists → its `required` section (and unrelated keys) survive
+    //     and the extension lands in `optional`; the report names the field.
     let target_b = target_root.path().join("schema-b.yaml");
-    std::fs::write(&target_b, b"existing: value\n").unwrap();
-    mat.merge_meta_schema_extension(
-        "bigpackT63@1.0.0/meta-schema-extensions/research-meta",
+    std::fs::write(
         &target_b,
+        "required:\n  name:\n    type: string\n    auto: filename\nexisting: value",
     )
     .unwrap();
+    let report = mat
+        .merge_meta_schema_extension_report(
+            "bigpackT63@1.0.0/meta-schema-extensions/research-meta",
+            &target_b,
+        )
+        .unwrap();
+    assert_eq!(report.added, vec!["ext".to_string()]);
+    assert!(report.unchanged.is_empty());
     let body_b = std::fs::read_to_string(&target_b).unwrap();
-    assert!(body_b.starts_with("existing: value\n---\n"));
-    assert!(body_b.contains("ext: {}"));
+    assert!(!body_b.contains("---"), "ONE document: {body_b}");
+    let doc_b: serde_yml::Value = serde_yml::from_str(&body_b).unwrap();
+    assert_eq!(doc_b["required"]["name"]["auto"].as_str(), Some("filename"));
+    assert_eq!(doc_b["existing"].as_str(), Some("value"));
+    assert_eq!(doc_b["optional"]["ext"]["default"].as_str(), Some(""));
 
-    // (c) Target exists WITHOUT trailing newline → newline normalised
-    // before separator.
-    let target_c = target_root.path().join("schema-c.yaml");
-    std::fs::write(&target_c, b"existing: value").unwrap();
-    mat.merge_meta_schema_extension(
-        "bigpackT63@1.0.0/meta-schema-extensions/research-meta",
-        &target_c,
-    )
-    .unwrap();
-    let body_c = std::fs::read_to_string(&target_c).unwrap();
-    assert!(
-        body_c.starts_with("existing: value\n---\n"),
-        "missing trailing newline must be normalised before separator: {body_c:?}"
-    );
+    // (c) Re-merging the same extension is idempotent (byte-identical target).
+    let report = mat
+        .merge_meta_schema_extension_report(
+            "bigpackT63@1.0.0/meta-schema-extensions/research-meta",
+            &target_b,
+        )
+        .unwrap();
+    assert!(report.added.is_empty());
+    assert_eq!(report.unchanged, vec!["ext".to_string()]);
+    assert_eq!(std::fs::read_to_string(&target_b).unwrap(), body_b);
 }

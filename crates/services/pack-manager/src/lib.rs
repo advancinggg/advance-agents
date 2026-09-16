@@ -26,10 +26,11 @@
 //! - [`WorkflowApplier`] static driver for workflow templates (Slice B AC-10).
 //!   Drives 3 step types through [`WorkflowExecutor`] seam; resolves
 //!   `secret-refs` through [`SecretStore`] seam.
-//! - [`PackError`] taxonomy (24 variants — Slice D added `GitCloneFailed`,
+//! - [`PackError`] taxonomy (26 variants — Slice D added `GitCloneFailed`,
 //!   `TarballExtractFailed`, `RegistryFetchFailed` for the non-Local install
 //!   source surface; Slice C added `ConstraintViolation`; Pack lane P1
-//!   added `AlreadyInstalled`, `DependentsExist`, `UnknownRequiredCapability`).
+//!   added `AlreadyInstalled`, `DependentsExist`, `UnknownRequiredCapability`;
+//!   P3 added `SignatureInvalid`; P2 added `WorkflowStepFailed`).
 //! - Pack lane P1: [`Installer::new`]
 //!   builder + [`NoopTraceSink`]; disk-truth `AlreadyInstalled` at step ③ (before
 //!   checksum / approval); [`Installer::uninstall`] with `DependentsExist`
@@ -49,6 +50,16 @@
 //!   userinfo redaction ([`redact_userinfo`]); and the fd-relative
 //!   [`fetch::copy_dir_no_symlinks_observed`] copy that closes the source-side
 //!   symlink-swap TOCTOU window.
+//! - Pack lane P2: workflow
+//!   compensation (`WorkflowExecutor::{terminate_child, withdraw_component}` +
+//!   `PackError::WorkflowStepFailed`); the `mcp-servers/{name}.yaml` schema
+//!   ([`mcp_server_manifest`]); the STRUCTURED meta-schema extension merge
+//!   ([`meta_schema_merge`]); `materialize_channel_adapter` explicitly
+//!   unsupported; and [`resource_capability_tool_names`] for the cli's
+//!   pack-tool exposure reconciliation. The pack → subsystem bridges themselves
+//!   (skills / presets / mcp / meta-schema / memory-seeds) and the production
+//!   `WorkflowExecutor` / `SecretStore` / `DependencyResolver` implementations
+//!   live in the cli composition root (`pack_bridges`, `pack_production`).
 
 pub mod admin;
 pub mod catalog;
@@ -61,7 +72,9 @@ pub(crate) mod layout;
 pub mod manifest;
 pub mod materialize;
 pub mod materialize_impl;
+pub mod mcp_server_manifest;
 pub mod meta;
+pub mod meta_schema_merge;
 pub mod registry;
 pub mod registry_client;
 pub mod signature;
@@ -71,7 +84,7 @@ pub mod workflow;
 
 pub use admin::InteractiveApproval;
 pub use catalog::{CapabilityCatalog, CatalogCheckedApproval, StaticCapabilityCatalog};
-pub use component_manifest::resource_capability_id;
+pub use component_manifest::{resource_capability_id, resource_capability_tool_names};
 pub use deps::DependencyResolver;
 pub use error::PackError;
 pub use fetch::FetchContext;
@@ -88,7 +101,15 @@ pub use materialize::{
     GrantId, MaterializeAction, McpServerId, ResourceCapabilityId, WorkflowContext, WorkflowReport,
 };
 pub use materialize_impl::DefaultMaterializer;
+pub use mcp_server_manifest::{
+    parse_mcp_server_manifest, parse_mcp_server_manifest_str, McpServerManifest, McpTransportDecl,
+    MAX_MCP_SERVER_YAML_BYTES,
+};
 pub use meta::{MetaIndex, MetaPackEntry, MetaScope};
+pub use meta_schema_merge::{
+    merge_meta_schema_extension_file, merge_meta_schema_extension_file_with, MetaSchemaMergeError,
+    MetaSchemaMergeReport, MAX_META_SCHEMA_YAML_BYTES,
+};
 pub use registry::{
     path_for_kind, ComponentKind, ComponentManifest, InMemoryPackRegistry, NamespaceResolver,
     PackComponentResolution, PackMetadata, PackProvideEntry, PackRegistry, PackResolution,

@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p2")]
 //! GAP-04 (P2) — workflow compensation on partial failure.
 //! When step i fails, every earlier
 //! successful spawn-child / submit-component is compensated in reverse order and the
@@ -6,7 +5,7 @@
 //! compensation_failures }`.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use advance_pack_manager::{
@@ -76,6 +75,18 @@ impl WorkflowExecutor for FailingSubmit {
     }
 }
 
+/// FIXTURE-GRAMMAR: the applier's existing `validate_target_path` gate rejects an
+/// absolute `target-path` unless `target_workspace` is set (an empty workspace
+/// means "no containment configured"); the fixture keeps the absolute
+/// `/research-assistant` the assertions name and opts into `/` containment,
+/// exactly like `tests/triggers.rs` t45 does.
+fn ctx() -> WorkflowContext {
+    WorkflowContext {
+        admin_id: "admin".into(),
+        target_workspace: PathBuf::from("/"),
+    }
+}
+
 const TEMPLATE: &str = r#"name: wf
 steps:
   - type: spawn-child
@@ -92,7 +103,7 @@ fn g04_failed_step_compensates_earlier_spawn_in_reverse_order() {
         calls: Mutex::new(Vec::new()),
         fail_terminate: false,
     };
-    let ctx = WorkflowContext::default();
+    let ctx = ctx();
     let err = WorkflowApplier::apply(TEMPLATE, &ctx, &exec, &NoSecrets)
         .expect_err("submit-component fails → apply fails");
     match err {
@@ -138,8 +149,8 @@ fn g04_compensation_failure_is_reported_not_swallowed() {
         calls: Mutex::new(Vec::new()),
         fail_terminate: true,
     };
-    let err = WorkflowApplier::apply(TEMPLATE, &WorkflowContext::default(), &exec, &NoSecrets)
-        .expect_err("still an error");
+    let err =
+        WorkflowApplier::apply(TEMPLATE, &ctx(), &exec, &NoSecrets).expect_err("still an error");
     match err {
         PackError::WorkflowStepFailed {
             compensated,
@@ -183,7 +194,7 @@ fn g04_success_path_report_is_unchanged() {
             Ok(McpServerId(r.to_string()))
         }
     }
-    let report = WorkflowApplier::apply(TEMPLATE, &WorkflowContext::default(), &AllOk, &NoSecrets)
-        .expect("all steps succeed");
+    let report =
+        WorkflowApplier::apply(TEMPLATE, &ctx(), &AllOk, &NoSecrets).expect("all steps succeed");
     assert_eq!(report.steps_executed.len(), 2);
 }

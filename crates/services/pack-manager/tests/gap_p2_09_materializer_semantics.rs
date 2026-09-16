@@ -1,4 +1,3 @@
-#![cfg(feature = "gap-p2")]
 //! GAP-09 (P2, pack-manager half) — materializer semantics that stop being no-ops.
 //!1:
 //! - `materialize_channel_adapter` → explicit `NotImplemented` (cap-channel has no
