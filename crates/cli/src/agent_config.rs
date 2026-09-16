@@ -137,8 +137,9 @@ pub fn active_capabilities(yaml: Option<&[u8]>) -> Vec<CapRequest> {
 // daemon materializes into the agent-tree at boot (BEFORE the EventBus / any
 // message), so a workspace's hierarchy exists up-front rather than only after a
 // runtime `spawn-child`. This module owns the schema + parse + validation; the
-// boot-time materialization (BFS over the tree calling
-// `cap_lifecycle::apply_auto_bootstrap`) lives in `wiring::materialize_config_tree`.
+// boot-time materialization (BFS over the tree applying the MODULE-005 §1.4.5
+// ensure-present matrix per decl, carrying `capabilities:`) lives in
+// `wiring::materialize_config_tree`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Defensive caps on the declared agent hierarchy. `MAX_AGENT_TREE_NODES` bounds
@@ -155,9 +156,9 @@ const MAX_YAML_ANCHORS: usize = 64;
 const MAX_YAML_ALIASES: usize = 64;
 
 /// One declared child agent. The `agents:` block is a sequence of these; `children`
-/// nests recursively. `target-path` is workspace-relative (validated lexically by
-/// `apply_auto_bootstrap`'s `resolve_under_parent` at materialization time — `..` /
-/// absolute / hidden / over-depth are rejected there). `deny_unknown_fields`
+/// nests recursively. `target-path` is parent-workspace-relative (validated lexically by
+/// `resolve_under_parent` at materialization time — `..` / absolute / hidden / over-depth
+/// are rejected there). `deny_unknown_fields`
 /// rejects typo'd keys so a malformed declared hierarchy fails loudly rather than
 /// silently dropping a node.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -167,9 +168,17 @@ pub struct AgentDecl {
     pub template: String,
     #[serde(rename = "target-path")]
     pub target_path: PathBuf,
+    /// Whole-capability ids the child is spawned with (the persisted form of a client create's
+    /// `capabilities`; `CapParams::empty()` each). Subset-gated against the parent at
+    /// materialization; absent ⇒ no capabilities (byte-identical to the pre-2026-09-15 schema).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     #[serde(default)]
     pub children: Vec<AgentDecl>,
 }
+
+/// Bound on `capabilities:` entries per declaration (mirrors the tree's per-node cap).
+pub const MAX_DECLARED_CAPABILITIES: usize = 64;
 
 /// Errors from parsing / validating the `agents:` hierarchy. Distinct from the
 /// lenient capability gate: a well-formed config whose `agents:` block is itself
@@ -193,6 +202,8 @@ pub enum AgentConfigError {
     TooDeep(usize),
     /// Anchor / alias amplification exceeded the defensive cap.
     YamlAnchorAmplification(usize),
+    /// A `capabilities:` entry failed the id charset, was duplicated, or the list is over the cap.
+    InvalidCapability(String),
 }
 
 impl std::fmt::Display for AgentConfigError {
@@ -213,6 +224,9 @@ impl std::fmt::Display for AgentConfigError {
                 f,
                 "agents: yaml anchor/alias count exceeds defensive cap ({n})"
             ),
+            AgentConfigError::InvalidCapability(c) => {
+                write!(f, "invalid declared capability: {c:?}")
+            }
         }
     }
 }
@@ -327,11 +341,33 @@ fn validate_decls(
         if !seen.insert(d.alias.clone()) {
             return Err(AgentConfigError::DuplicateAlias(d.alias.clone()));
         }
+        validate_declared_capabilities(&d.capabilities)?;
         *count += 1;
         if *count > MAX_AGENT_TREE_NODES {
             return Err(AgentConfigError::TooManyNodes(*count));
         }
         validate_decls(&d.children, depth + 1, seen, count)?;
+    }
+    Ok(())
+}
+
+/// Validate a declaration's `capabilities:` list: bounded, each id `^[A-Za-z0-9_-]{1,64}$`
+/// (the cap-lifecycle id charset — never a `:`-scoped form), no duplicates.
+pub fn validate_declared_capabilities(capabilities: &[String]) -> Result<(), AgentConfigError> {
+    if capabilities.len() > MAX_DECLARED_CAPABILITIES {
+        return Err(AgentConfigError::InvalidCapability(format!(
+            "{} entries > {MAX_DECLARED_CAPABILITIES}",
+            capabilities.len()
+        )));
+    }
+    for (i, cap) in capabilities.iter().enumerate() {
+        cap_lifecycle::validate_agent_id(cap)
+            .map_err(|_| AgentConfigError::InvalidCapability(cap.clone()))?;
+        if capabilities[..i].iter().any(|c| c == cap) {
+            return Err(AgentConfigError::InvalidCapability(format!(
+                "duplicate {cap}"
+            )));
+        }
     }
     Ok(())
 }
@@ -481,6 +517,51 @@ agents:
         assert_eq!(decls[0].children[0].target_path, PathBuf::from("g"));
         assert_eq!(decls[1].alias, "child-b");
         assert!(decls[1].children.is_empty());
+    }
+
+    #[test]
+    fn declared_capabilities_parse_and_validate() {
+        let yaml = b"\
+agents:
+  - alias: r
+    template: explorer
+    target-path: r
+    capabilities: [fs, llm]
+";
+        let decls = parse_agents_config(Some(yaml)).unwrap();
+        assert_eq!(
+            decls[0].capabilities,
+            vec!["fs".to_string(), "llm".to_string()]
+        );
+        // Absent ⇒ empty (backward compatible).
+        let yaml = b"agents:\n  - alias: r\n    template: explorer\n    target-path: r\n";
+        assert!(parse_agents_config(Some(yaml)).unwrap()[0]
+            .capabilities
+            .is_empty());
+        for bad in [
+            "capabilities: [\"a b\"]",
+            "capabilities: [\"cap:x\"]",
+            "capabilities: [fs, fs]",
+            "capabilities: [\"\"]",
+        ] {
+            let yaml = format!(
+                "agents:\n  - alias: r\n    template: explorer\n    target-path: r\n    {bad}\n"
+            );
+            assert!(
+                matches!(
+                    parse_agents_config(Some(yaml.as_bytes())),
+                    Err(AgentConfigError::InvalidCapability(_))
+                ),
+                "{bad}"
+            );
+        }
+        let many: Vec<String> = (0..=MAX_DECLARED_CAPABILITIES)
+            .map(|i| format!("c{i}"))
+            .collect();
+        assert!(matches!(
+            validate_declared_capabilities(&many),
+            Err(AgentConfigError::InvalidCapability(_))
+        ));
     }
 
     #[test]

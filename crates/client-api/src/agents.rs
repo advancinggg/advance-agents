@@ -4,7 +4,7 @@
 //! - `GET  /client/agents`                       list agents (`Scope::ReadRuns`)
 //! - `POST /client/agents`                       create a child agent (`Scope::ControlRuns`, mutation)
 //! - `GET  /client/agents/{agent_id}`            read one agent + its config document (`ReadRuns`)
-//! - `POST /client/agents/{agent_id}:update`     update display name / config document (`ControlRuns`)
+//! - `POST /client/agents/{agent_id}:update`     update display name / config document / persisted capabilities (`ControlRuns`)
 //! - `POST /client/agents/{agent_id}:delete`     terminate + de-register an agent (`ControlRuns`)
 //! - `GET  /client/agent-templates`              list the templates a create may reference (`ReadRuns`)
 //!
@@ -55,7 +55,7 @@ pub const MAX_REQUESTED_CAPABILITIES: usize = 64;
 pub const WARNING_RESTART_REQUIRED: &str = "restart_required";
 
 const RESTART_REQUIRED_MESSAGE: &str =
-    "capability declarations in the agent config document apply at the next daemon start";
+    "capability changes (config document or persisted capability list) apply at the next daemon start";
 
 // ── DTOs (CONTRACT-192 schema components) ────────────────────────────────────────────────────
 
@@ -98,6 +98,10 @@ pub struct ClientAgentDeclaredChild {
     pub template: String,
     /// Relative to the declaring parent's workspace.
     pub target_path: String,
+    /// Whole-capability ids the child is (re-)materialized with at daemon start — the persisted
+    /// form of a create's `capabilities` / an update's `capabilities`.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     pub children: Vec<ClientAgentDeclaredChild>,
 }
 
@@ -117,6 +121,9 @@ pub struct ClientAgentConfig {
 pub struct ClientAgentDetail {
     pub agent: ClientAgentSummary,
     pub config: ClientAgentConfig,
+    /// The capability ids the LIVE tree node carries (the operative set a served child is
+    /// linked with; for the root, its declared active capabilities). Ids only — never params.
+    pub capabilities: Vec<String>,
     /// Direct children (tree ids).
     pub children: Vec<String>,
     /// Whether a loadable driver (`.agent/behavior.component.wasm` or `.agent/behavior.wasm`) is
@@ -158,6 +165,11 @@ pub struct ClientUpdateAgentRequest {
     /// Full replacement of `.agent/config.yaml` (validated by the provider before the write).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_yaml: Option<String>,
+    /// Full replacement of a CHILD agent's persisted capability list (subset-gated against the
+    /// parent; applies at the next daemon start — the live node keeps its current set). The
+    /// root agent's capabilities live in its config document, so this field is refused for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
 }
 
 /// The body of `POST /client/agents/{agent_id}:delete` (a `null` body means the defaults).
@@ -324,7 +336,7 @@ pub fn validate_create_request(req: &ClientCreateAgentRequest) -> Result<(), Cli
 
 /// Validate an update request: at least one field, each within bounds.
 pub fn validate_update_request(req: &ClientUpdateAgentRequest) -> Result<(), ClientError> {
-    if req.display_name.is_none() && req.config_yaml.is_none() {
+    if req.display_name.is_none() && req.config_yaml.is_none() && req.capabilities.is_none() {
         return Err(invalid("empty agent update"));
     }
     if let Some(name) = &req.display_name {
@@ -333,7 +345,15 @@ pub fn validate_update_request(req: &ClientUpdateAgentRequest) -> Result<(), Cli
     if let Some(yaml) = &req.config_yaml {
         validate_config_document(yaml)?;
     }
+    if let Some(capabilities) = &req.capabilities {
+        validate_capabilities(capabilities)?;
+    }
     Ok(())
+}
+
+/// Whether an update changes something that only takes effect at the next daemon start.
+fn update_needs_restart(req: &ClientUpdateAgentRequest) -> bool {
+    req.config_yaml.is_some() || req.capabilities.is_some()
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────────────────────
@@ -453,7 +473,7 @@ pub(crate) fn register(api: &mut ClientApi, slot: AgentProviderSlot) {
             let detail = provider
                 .update_agent(&agent_id, &req)
                 .map_err(ProviderError::into_client_error)?;
-            Ok(detail_response(detail, req.config_yaml.is_some()))
+            Ok(detail_response(detail, update_needs_restart(&req)))
         })
         .with_scopes(vec![Scope::ControlRuns]),
     );

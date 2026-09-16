@@ -232,3 +232,78 @@ agents:
         "no out-of-territory child workspace may be created"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn t40e_declared_capabilities_materialize_at_boot() {
+    // A decl's `capabilities:` list reaches the spawned node (whole-capability, subset-gated
+    // against the root's declared active set).
+    let (_g, ws, cfg) = fresh_workspace(
+        "\
+capabilities:
+  fs: true
+agents:
+  - alias: scout
+    template: explorer
+    target-path: scout
+    capabilities: [fs]
+  - alias: plain
+    template: planner
+    target-path: plain
+",
+    );
+    let data = boot_and_snapshot(&ws, &cfg).await;
+    let scout = data
+        .nodes
+        .iter()
+        .find(|n| n.id.0 == "scout")
+        .expect("scout");
+    assert_eq!(
+        scout
+            .capabilities
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fs"]
+    );
+    let plain = data
+        .nodes
+        .iter()
+        .find(|n| n.id.0 == "plain")
+        .expect("plain");
+    assert!(
+        plain.capabilities.is_empty(),
+        "absent list ⇒ cap-less (unchanged)"
+    );
+
+    // A capability the root does not hold fails the spawner's subset gate → boot fails closed.
+    let (_g, ws, cfg) = fresh_workspace(
+        "\
+capabilities:
+  fs: true
+agents:
+  - alias: greedy
+    template: explorer
+    target-path: greedy
+    capabilities: [llm]
+",
+    );
+    boot_expect_config_tree_err(&ws, &cfg).await;
+
+    // An off-charset capability id is rejected at parse time (before any materialization).
+    let (_g, ws, cfg) = fresh_workspace(
+        "\
+capabilities:
+  fs: true
+agents:
+  - alias: odd
+    template: explorer
+    target-path: odd
+    capabilities: [\"cap:x\"]
+",
+    );
+    boot_expect_config_tree_err(&ws, &cfg).await;
+    assert!(
+        !ws.join("odd").exists(),
+        "rejected declaration leaves no territory"
+    );
+}

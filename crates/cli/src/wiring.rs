@@ -80,11 +80,12 @@ use cap_http::{
     DefaultHttpSecurityChain, DefaultLeakDetector, DefaultPromptInjectionHelpers, ExecutorError,
     HttpExecutor,
 };
+use cap_lifecycle::spawn::{SpawnChildConfig, SpawnerSubsetGate};
 use cap_lifecycle::{
-    apply_auto_bootstrap, register_agent_component_submit, register_agent_decomposition,
-    register_agent_spawn, AgentTreeStore, BootstrapEnsure, BootstrapEntry, BootstrapKind,
-    BuiltinTemplateRegistry, CapGrantSubsetAdapter, ComponentSubmitGate, DefaultDecompositionStore,
-    DefaultSpawner, SpawnError, SpawnObserver, Spawner, WorkspaceFileResidentPolicy,
+    register_agent_component_submit, register_agent_decomposition, register_agent_spawn,
+    AgentTreeStore, BuiltinTemplateRegistry, CapGrantSubsetAdapter, ComponentSubmitGate,
+    DefaultDecompositionStore, DefaultSpawner, SpawnError, SpawnObserver, Spawner,
+    WorkspaceFileResidentPolicy,
 };
 
 use crate::component_submit_bridge::{CapGrantSubmitSubsetGate, SchedulerSubmitBridge};
@@ -837,22 +838,26 @@ impl MemoryGitRestore for GitMemoryRestore {
 /// + every declared child already present (each with a workspace territory + identity)
 /// rather than only after a runtime `spawn-child`.
 ///
-/// BFS over the declared tree: each node's DIRECT children become one
-/// [`apply_auto_bootstrap`] batch under that node's alias as `parent_id` (the root's
-/// children use `root_id`). Each decl's `alias` becomes the spawned child's `AgentId`,
-/// so a grandchild names its parent by that alias. The spawner is a template-resolving
-/// [`DefaultSpawner`] sharing `tree` (Clone shares the interior `Arc<RwLock<_>>`), so
-/// spawned children land in the same store every downstream consumer reads (the cap-fs
-/// resolver, the assembler's `# Available Delegates` snapshot, the messaging
-/// dispatcher).
+/// BFS over the declared tree, one batch per parent (the root's children use `root_id`).
+/// Each decl's `alias` becomes the spawned child's `AgentId`, so a grandchild names its
+/// parent by that alias. The spawner is a template-resolving [`DefaultSpawner`] sharing
+/// `tree` (Clone shares the interior `Arc<RwLock<_>>`), so spawned children land in the
+/// same store every downstream consumer reads (the cap-fs resolver, the assembler's
+/// `# Available Delegates` snapshot, the messaging dispatcher).
 ///
-/// Idempotent: re-running over an already-materialized tree is a no-op (apply's
-/// alias/path reuse path skips an existing same-template child). Fail-closed: any
-/// spawn / template / path error aborts boot with [`CliWiringError::ConfigTree`].
+/// Per decl the MODULE-005 §1.4.5 ensure-present matrix is applied by
+/// [`materialize_declared_child`] (2026-09-15: cli-owned so a decl's `capabilities:` reach
+/// the spawn — the cap-lifecycle `apply_auto_bootstrap` applier always spawns cap-less):
+/// alias present + same territory + same template → skip (idempotent); alias present
+/// elsewhere / other template → fail closed; territory occupied by another alias → fail
+/// closed; otherwise `spawn_child` with the declared whole-capability ids (subset-gated
+/// against the parent by the spawner). Already-materialized territories (a re-boot) are
+/// adopted first by [`adopt_existing_declared`]. Fail-closed: any spawn / template / path
+/// error aborts boot with [`CliWiringError::ConfigTree`].
 ///
-/// Requires the agent-tree, which is built only when `fs` or `messaging` is declared
-/// (the existing tree-construction gate); a config declaring `agents:` without
-/// `fs`/`messaging` has no tree and materializes nothing.
+/// Requires the agent-tree, which is built only when `fs`, `messaging`, or `lifecycle` is
+/// declared (the existing tree-construction gate); a config declaring `agents:` without one
+/// of them has no tree and materializes nothing.
 pub fn materialize_config_tree(
     tree: &Arc<AgentTreeStore>,
     root_id: &AgentId,
@@ -878,29 +883,11 @@ pub fn materialize_config_tree(
         // `init_child_workspace` fail-fasts on an existing `.agent/` and would otherwise abort
         // every second boot of a workspace with declared (or client-created) children.
         adopt_existing_declared(tree, &parent_id, children)?;
-        let entries: Vec<BootstrapEntry> = children
-            .iter()
-            .map(|d| BootstrapEntry {
-                template: d.template.clone(),
-                kind: BootstrapKind::Child,
-                target_path: d.target_path.clone(),
-                alias: d.alias.clone(),
-                ensure: BootstrapEnsure::Present,
-            })
-            .collect();
-        let report = apply_auto_bootstrap(&entries, &parent_id, &spawner, tree)
-            .map_err(|e| CliWiringError::ConfigTree(format!("{e}")))?;
-        // apply_auto_bootstrap returns Ok (NOT Err) when an existing alias at the same
-        // target-path declares a DIFFERENT template — it records that as a `conflicts`
-        // entry. At a fresh boot the tree holds only the root so no decl can collide;
-        // but to keep this materializer fail-closed for any future idempotent re-run
-        // against an already-populated tree, surface a conflict as ConfigTree rather
-        // than silently keeping the existing (template-mismatched) node.
-        if !report.conflicts.is_empty() {
-            return Err(CliWiringError::ConfigTree(format!(
-                "config-declared agent conflicts with an existing tree node (template mismatch): {:?}",
-                report.conflicts
-            )));
+        let parent = tree.get_node(&parent_id).ok_or_else(|| {
+            CliWiringError::ConfigTree(format!("declared parent {:?} not in tree", parent_id))
+        })?;
+        for decl in children {
+            materialize_declared_child(tree, &spawner, &parent, decl)?;
         }
         for d in children {
             if !d.children.is_empty() {
@@ -911,6 +898,71 @@ pub fn materialize_config_tree(
     Ok(())
 }
 
+/// The whole-capability set a declaration carries (`CapParams::empty()` each — the same shape
+/// the root node is seeded with and a client create requests).
+fn declared_capabilities(decl: &crate::agent_config::AgentDecl) -> Vec<Capability> {
+    decl.capabilities
+        .iter()
+        .map(|c| Capability {
+            id: advance_shared_types::capability::CapabilityId::new(c.as_str()),
+            params: CapParams::empty(),
+        })
+        .collect()
+}
+
+/// One decl through the MODULE-005 §1.4.5 ensure-present matrix, spawning with the declared
+/// capabilities (see [`materialize_config_tree`]).
+fn materialize_declared_child(
+    tree: &Arc<AgentTreeStore>,
+    spawner: &dyn Spawner,
+    parent: &AgentNode,
+    decl: &crate::agent_config::AgentDecl,
+) -> Result<(), CliWiringError> {
+    let err = |m: String| CliWiringError::ConfigTree(format!("declared agent {}: {m}", decl.alias));
+    let expected = cap_lifecycle::workspace::resolve_under_parent(
+        &parent.workspace_path,
+        &decl.target_path,
+        tree.workspace_root(),
+    )
+    .map_err(|e| err(format!("invalid target-path: {e}")))?;
+    let alias = AgentId(decl.alias.clone());
+    if let Some(existing) = tree.get_node(&alias) {
+        if existing.workspace_path == expected
+            && existing.template_ref.as_deref() == Some(decl.template.as_str())
+        {
+            return Ok(()); // adopted / already materialized — idempotent
+        }
+        return Err(err(format!(
+            "conflicts with an existing tree node (territory {}, template {:?})",
+            existing.workspace_path.display(),
+            existing.template_ref
+        )));
+    }
+    if let Some(occupant) = tree
+        .snapshot()
+        .nodes
+        .iter()
+        .find(|n| n.workspace_path == expected)
+    {
+        return Err(err(format!(
+            "target-path {} is occupied by agent {:?}",
+            expected.display(),
+            occupant.id
+        )));
+    }
+    spawner
+        .spawn_child(SpawnChildConfig {
+            parent_id: parent.id.clone(),
+            child_id: alias,
+            child_workspace_path: decl.target_path.clone(),
+            capabilities: declared_capabilities(decl),
+            template_ref: Some(decl.template.clone()),
+            binary: None,
+        })
+        .map(|_| ())
+        .map_err(|e| err(format!("spawn failed: {e}")))
+}
+
 /// Adopt already-materialized declared territories into `tree` (the re-boot half of
 /// `materialize_config_tree`). For each decl under `parent_id` whose alias is absent from the
 /// tree but whose resolved target dir already carries a real `.agent/` directory, insert the
@@ -919,8 +971,9 @@ pub fn materialize_config_tree(
 /// `apply_auto_bootstrap`, which spawns it; an adopted alias is then seen by the applier as
 /// "alias present, path matches, same template → skip". Path rules are the applier's own
 /// (`resolve_under_parent` + `symlink_check`), so adoption can never widen what a decl may
-/// name. Adopted nodes carry no capabilities — the same template-sourced-caps boundary a
-/// fresh boot materialization has.
+/// name. Adopted nodes carry the decl's `capabilities:` (subset-gated against the parent node
+/// with the same `CapGrantSubsetAdapter` the spawner uses), so a client-created child keeps the
+/// capability set it was created/updated with across daemon restarts.
 fn adopt_existing_declared(
     tree: &Arc<AgentTreeStore>,
     parent_id: &AgentId,
@@ -951,6 +1004,12 @@ fn adopt_existing_declared(
         cap_lifecycle::workspace::symlink_check(tree.workspace_root(), &target).map_err(|e| {
             CliWiringError::ConfigTree(format!("adopt declared agent {}: {e}", decl.alias))
         })?;
+        let capabilities = declared_capabilities(decl);
+        CapGrantSubsetAdapter::new()
+            .check(&parent.capabilities, &capabilities)
+            .map_err(|e| {
+                CliWiringError::ConfigTree(format!("adopt declared agent {}: {e}", decl.alias))
+            })?;
         tree.insert_child(
             parent_id,
             AgentNode {
@@ -958,7 +1017,7 @@ fn adopt_existing_declared(
                 kind: AgentKind::Child,
                 parent: Some(parent_id.clone()),
                 workspace_path: target,
-                capabilities: Vec::new(),
+                capabilities,
                 template_ref: Some(decl.template.clone()),
                 status: AgentStatus::Active,
             },

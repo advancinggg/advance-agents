@@ -25,7 +25,8 @@ use advance_client_api::{
     Scope,
 };
 use advance_runtime::bootstrap::RuntimeHostBuilder;
-use advance_shared_types::agent_tree::{AgentId, AgentKind, AgentNode, AgentStatus};
+use advance_shared_types::agent_tree::{AgentId, AgentKind, AgentNode, AgentStatus, Capability};
+use advance_shared_types::capability::{CapParams, CapabilityId};
 use cap_lifecycle::terminate::{GrantCascadeRevoke, MailboxCascade, RunCascade, WorkspaceCleanup};
 use cap_lifecycle::{
     AgentTreeStore, BuiltinTemplateRegistry, CapGrantSubsetAdapter, DefaultSpawner,
@@ -233,11 +234,73 @@ async fn aa01_crud_over_production_wiring() {
     assert_eq!(node.capabilities.len(), 1);
     assert_eq!(node.capabilities[0].id.as_str(), "fs");
     assert_eq!(root_declared_aliases(&ws), vec!["research".to_string()]);
+    assert_eq!(d.capabilities, vec!["fs".to_string()], "live node caps");
     let root = detail(&get(&api, &format!("/client/agents/{ROOT}")));
+    assert_eq!(
+        root.capabilities,
+        vec!["fs".to_string()],
+        "root's declared active caps"
+    );
     assert_eq!(root.children, vec!["research".to_string()]);
     assert_eq!(root.config.declared_children[0].alias, "research");
     assert_eq!(root.config.declared_children[0].template, "explorer");
     assert_eq!(root.config.declared_children[0].target_path, "research");
+    assert_eq!(
+        root.config.declared_children[0].capabilities,
+        vec!["fs".to_string()],
+        "requested capabilities are persisted in the declaration"
+    );
+
+    // Persisted capability update: subset-gated, restart-applied, root refused.
+    let env = post(
+        &api,
+        "/client/agents/research:update",
+        json!({ "capabilities": [] }),
+        "k-caps-clear",
+    );
+    let d = detail(&env);
+    assert!(env
+        .warnings
+        .iter()
+        .any(|w| w.code == WARNING_RESTART_REQUIRED));
+    assert_eq!(
+        d.capabilities,
+        vec!["fs".to_string()],
+        "live node unchanged until restart"
+    );
+    let root = detail(&get(&api, &format!("/client/agents/{ROOT}")));
+    assert!(root.config.declared_children[0].capabilities.is_empty());
+    let env = post(
+        &api,
+        "/client/agents/research:update",
+        json!({ "capabilities": ["fs"] }),
+        "k-caps-restore",
+    );
+    assert!(env.is_ok(), "{:?}", env.error);
+    let env = post(
+        &api,
+        "/client/agents/research:update",
+        json!({ "capabilities": ["llm"] }),
+        "k-caps-superset",
+    );
+    assert_eq!(
+        env.error_code(),
+        Some(ClientErrorCode::InvalidRequest),
+        "a capability the parent does not hold is refused"
+    );
+    let env = post(
+        &api,
+        &format!("/client/agents/{ROOT}:update"),
+        json!({ "capabilities": ["fs"] }),
+        "k-caps-root",
+    );
+    assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
+    let root = detail(&get(&api, &format!("/client/agents/{ROOT}")));
+    assert_eq!(
+        root.config.declared_children[0].capabilities,
+        vec!["fs".to_string()],
+        "refused updates leave the declaration untouched"
+    );
 
     // conflicts + validation through the real spawner / tree.
     let env = post(
@@ -371,6 +434,23 @@ async fn aa01_crud_over_production_wiring() {
     );
     assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
 
+    // A root config edit that drops a capability a declared child carries is refused (it would
+    // abort the next boot), whether the document carries `agents` or relies on the carry-over.
+    let env = post(
+        &api,
+        &format!("/client/agents/{ROOT}:update"),
+        json!({ "config_yaml": "capabilities:\n  llm: true\n" }),
+        "k-update-root-drop",
+    );
+    assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
+    let root_doc = std::fs::read_to_string(ws.join(".agent/config.yaml")).unwrap();
+    assert!(
+        root_doc.contains("fs: true") && !root_doc.contains("llm: true"),
+        "a refused root edit leaves the document untouched: {root_doc}"
+    );
+    let root = detail(&get(&api, &format!("/client/agents/{ROOT}")));
+    assert!(root.config.capabilities.iter().any(|c| c.name == "fs"));
+
     // root config edit WITHOUT an `agents` key keeps the declared hierarchy.
     let env = post(
         &api,
@@ -475,18 +555,28 @@ async fn aa02_restart_rematerializes_created_agents() {
         detail(&post(
             &api,
             "/client/agents",
-            json!({ "agent_id": "research", "template_ref": "explorer", "display_name": "R" }),
+            json!({
+                "agent_id": "research",
+                "template_ref": "explorer",
+                "display_name": "R",
+                "capabilities": ["fs"]
+            }),
             "k1",
         ));
         detail(&post(
             &api,
             "/client/agents",
-            json!({ "agent_id": "notes", "parent": "research", "template_ref": "planner" }),
+            json!({
+                "agent_id": "notes",
+                "parent": "research",
+                "template_ref": "planner",
+                "capabilities": ["fs"]
+            }),
             "k2",
         ));
         std::fs::write(ws.join("research/.agent/skills/.keep"), "").unwrap();
     }
-    // Second lifetime: the declared hierarchy is adopted, not re-initialized.
+    // Second lifetime: the declared hierarchy is adopted, not re-initialized — capabilities kept.
     let (_host, handles) = boot(&ws, &cfg).await;
     let snap = handles.agent_tree_snapshot.clone().unwrap().snapshot();
     let research = snap
@@ -497,6 +587,15 @@ async fn aa02_restart_rematerializes_created_agents() {
     assert_eq!(research.parent.as_ref().map(|p| p.0.as_str()), Some(ROOT));
     assert_eq!(research.workspace_path, ws.join("research"));
     assert_eq!(research.template_ref.as_deref(), Some("explorer"));
+    assert_eq!(
+        research
+            .capabilities
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fs"],
+        "created capabilities survive a restart"
+    );
     let notes = snap
         .nodes
         .iter()
@@ -507,6 +606,7 @@ async fn aa02_restart_rematerializes_created_agents() {
         Some("research")
     );
     assert_eq!(notes.workspace_path, ws.join("research/notes"));
+    assert_eq!(notes.capabilities.len(), 1);
     assert!(
         ws.join("research/.agent/skills/.keep").is_file(),
         "adoption keeps the earlier lifetime's territory byte-identical"
@@ -516,7 +616,44 @@ async fn aa02_restart_rematerializes_created_agents() {
     let d = detail(&get(&api, "/client/agents/research"));
     assert_eq!(d.agent.display_name.as_deref(), Some("R"));
     assert_eq!(d.children, vec!["notes".to_string()]);
-    // The adopted agent is fully manageable: delete it and boot a third time root-only.
+    assert_eq!(d.capabilities, vec!["fs".to_string()]);
+    // Narrowing a parent below what its declared child carries is refused (it would abort the
+    // next boot); narrow the child first, then the parent. Both apply at the NEXT boot.
+    let env = post(
+        &api,
+        "/client/agents/research:update",
+        json!({ "capabilities": [] }),
+        "k-caps-too-early",
+    );
+    assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
+    let env = post(
+        &api,
+        "/client/agents/notes:update",
+        json!({ "capabilities": [] }),
+        "k-caps-notes",
+    );
+    assert!(env.is_ok(), "{:?}", env.error);
+    let env = post(
+        &api,
+        "/client/agents/research:update",
+        json!({ "capabilities": [] }),
+        "k-caps",
+    );
+    assert!(env.is_ok(), "{:?}", env.error);
+    drop(api);
+    drop(handles);
+    let (_host, handles) = boot(&ws, &cfg).await;
+    let snap = handles.agent_tree_snapshot.clone().unwrap().snapshot();
+    let research = snap.nodes.iter().find(|n| n.id.0 == "research").unwrap();
+    assert!(
+        research.capabilities.is_empty(),
+        "the updated capability list is what the third boot materializes"
+    );
+    let notes = snap.nodes.iter().find(|n| n.id.0 == "notes").unwrap();
+    assert!(notes.capabilities.is_empty());
+    // The adopted agent is fully manageable: delete it and boot again root-only.
+    let api = handles.client_api_server.as_ref().unwrap().api();
+    mint(&api, "tok", Scope::operator_default());
     let env = post(&api, "/client/agents/research:delete", Value::Null, "k3");
     assert!(env.is_ok(), "{:?}", env.error);
     drop(api);
@@ -590,7 +727,15 @@ fn direct_adapter(ws: &Path) -> (AgentAdminAdapter, AgentTreeStore) {
         kind: AgentKind::Root,
         parent: None,
         workspace_path: ws.to_path_buf(),
-        capabilities: Vec::new(),
+        // Live root holds fs + llm while its config document declares only fs (see aa04):
+        // the persisted-consistency check must gate on the document, not the live node.
+        capabilities: ["fs", "llm"]
+            .into_iter()
+            .map(|c| Capability {
+                id: CapabilityId::new(c),
+                params: CapParams::empty(),
+            })
+            .collect(),
         template_ref: None,
         status: AgentStatus::Active,
     })
@@ -641,15 +786,34 @@ fn aa04_adapter_edge_rules_over_real_tree() {
     .unwrap();
     let (adapter, tree) = direct_adapter(&ws);
 
-    // A create carrying its own config document writes it after materialization.
+    // A capability the live root holds but its config document does not declare is refused:
+    // it would be persisted under a root that cannot cover it at the next boot.
+    let mut greedy = create_req("greedy", None, None);
+    greedy.capabilities = vec!["llm".into()];
+    assert!(matches!(
+        adapter.create_agent(&greedy),
+        Err(ProviderError::InvalidRequest(_))
+    ));
+    assert!(root_declared_aliases(&ws).is_empty());
+    assert!(!ws.join("greedy").exists());
+
+    // A create carrying its own config document writes it after materialization; requested
+    // capabilities are persisted in the declaration.
     let mut req = create_req("a", None, None);
     req.config_yaml = Some("capabilities:\n  fs: true\n".into());
+    req.capabilities = vec!["fs".into()];
     let d = adapter.create_agent(&req).unwrap();
     assert_eq!(
         d.config.config_yaml.as_deref(),
         Some("capabilities:\n  fs: true\n")
     );
+    assert_eq!(d.capabilities, vec!["fs".to_string()]);
     assert_eq!(root_declared_aliases(&ws), vec!["a".to_string()]);
+    let root = adapter.get_agent(ROOT).unwrap();
+    assert_eq!(
+        root.config.declared_children[0].capabilities,
+        vec!["fs".to_string()]
+    );
 
     // Sub agents are not valid parents; a hidden-name path is rejected by the tree rules.
     tree.insert_child(
@@ -709,12 +873,33 @@ fn aa04_adapter_edge_rules_over_real_tree() {
     assert!(tree.contains(&AgentId("guest-child".into())));
     assert_eq!(root_declared_aliases(&ws), vec!["a".to_string()]);
 
+    // Capabilities: a guest-spawned (undeclared) child cannot persist a capability list; a Sub
+    // never can; the root's capabilities are its config document.
+    let caps_update = ClientUpdateAgentRequest {
+        display_name: None,
+        config_yaml: None,
+        capabilities: Some(vec![]),
+    };
+    assert!(matches!(
+        adapter.update_agent("guest-child", &caps_update),
+        Err(ProviderError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        adapter.update_agent("ephemeral", &caps_update),
+        Err(ProviderError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        adapter.update_agent(ROOT, &caps_update),
+        Err(ProviderError::InvalidRequest(_))
+    ));
+
     // Update: an `agents`-carrying document replaces the hierarchy; an invalid one is rejected.
     let bad = ClientUpdateAgentRequest {
         display_name: None,
         config_yaml: Some(
             "agents:\n  - alias: 'bad alias'\n    template: t\n    target-path: p\n".into(),
         ),
+        capabilities: None,
     };
     assert!(matches!(
         adapter.update_agent(ROOT, &bad),

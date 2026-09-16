@@ -39,6 +39,7 @@ use advance_client_api::{
 struct AgentRecord {
     summary: ClientAgentSummary,
     config_yaml: Option<String>,
+    capabilities: Vec<String>,
     children: Vec<String>,
 }
 
@@ -78,6 +79,7 @@ impl MemoryAgentAdmin {
                     display_name: Some("Home".into()),
                 },
                 config_yaml: Some("capabilities:\n  fs: true\n  llm: true\n".into()),
+                capabilities: vec!["fs".into(), "llm".into()],
                 children: vec!["research".into()],
             },
         );
@@ -94,6 +96,7 @@ impl MemoryAgentAdmin {
                     display_name: None,
                 },
                 config_yaml: None,
+                capabilities: vec!["fs".into()],
                 children: vec![],
             },
         );
@@ -136,9 +139,11 @@ impl MemoryAgentAdmin {
                     alias: "research".into(),
                     template: "explorer".into(),
                     target_path: "research".into(),
+                    capabilities: vec!["fs".into()],
                     children: vec![],
                 }],
             },
+            capabilities: rec.capabilities.clone(),
             children: rec.children.clone(),
             driver_present: rec.summary.kind == "root",
         }
@@ -204,6 +209,7 @@ impl AgentAdminProvider for MemoryAgentAdmin {
                 display_name: request.display_name.clone(),
             },
             config_yaml: request.config_yaml.clone(),
+            capabilities: request.capabilities.clone(),
             children: vec![],
         };
         let detail = Self::detail(&rec);
@@ -233,6 +239,15 @@ impl AgentAdminProvider for MemoryAgentAdmin {
         }
         if let Some(yaml) = &request.config_yaml {
             rec.config_yaml = Some(yaml.clone());
+        }
+        if let Some(caps) = &request.capabilities {
+            if rec.summary.kind == "root" {
+                return Err(ProviderError::InvalidRequest("root".into()));
+            }
+            if caps.iter().any(|c| c != "fs" && c != "llm") {
+                return Err(ProviderError::InvalidRequest("subset".into()));
+            }
+            rec.capabilities = caps.clone();
         }
         Ok(Self::detail(rec))
     }
@@ -1097,6 +1112,9 @@ fn ag16_contract_surface_registered() {
     assert!(!summary["display_name"].required);
     let deleted = &inventory["ClientAgentDeleteResult"];
     assert_eq!(deleted["removed_agent_ids"].type_token, "array<string>");
+    let detail = &inventory["ClientAgentDetail"];
+    assert!(detail["capabilities"].required);
+    assert_eq!(detail["capabilities"].type_token, "array<string>");
     // The recursive declared-children DTO inventories without looping.
     assert!(inventory["ClientAgentConfig"]
         .keys()
@@ -1131,7 +1149,7 @@ fn ag18_dto_wire_shape() {
     let d = ClientDeleteAgentRequest::default();
     assert!(!d.remove_workspace);
     let u = ClientUpdateAgentRequest::default();
-    assert!(u.display_name.is_none() && u.config_yaml.is_none());
+    assert!(u.display_name.is_none() && u.config_yaml.is_none() && u.capabilities.is_none());
     let summary = ClientAgentSummary {
         agent_id: "a".into(),
         kind: "child".into(),
@@ -1151,4 +1169,81 @@ fn ag18_dto_wire_shape() {
     let v = serde_json::to_value(&cfg).unwrap();
     assert!(v.get("config_yaml").is_none());
     assert_eq!(v["capabilities"], json!([]));
+}
+
+// ── AG-19: persisted capabilities are readable and updatable (restart-applied) ────────────────
+#[test]
+fn ag19_capabilities_read_and_update() {
+    let provider = MemoryAgentAdmin::new();
+    let (api, _) = api_with(provider.clone());
+    operator(&api);
+    let d = detail(&api.handle(get("/client/agents/research")));
+    assert_eq!(d.capabilities, vec!["fs".to_string()]);
+    let root = detail(&api.handle(get("/client/agents/default-agent")));
+    assert_eq!(root.capabilities, vec!["fs".to_string(), "llm".to_string()]);
+    assert_eq!(
+        root.config.declared_children[0].capabilities,
+        vec!["fs".to_string()]
+    );
+
+    let env = api.handle(post(
+        "/client/agents/research:update",
+        json!({ "capabilities": ["fs", "llm"] }),
+        "k-caps-1",
+    ));
+    let d = detail(&env);
+    assert_eq!(d.capabilities, vec!["fs".to_string(), "llm".to_string()]);
+    assert!(
+        has_warning(&env, WARNING_RESTART_REQUIRED),
+        "a persisted capability change applies at the next daemon start"
+    );
+    let (_, req) = provider.last_update.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        req.capabilities,
+        Some(vec!["fs".to_string(), "llm".to_string()])
+    );
+
+    // An empty list is a valid "no capabilities" update.
+    let env = api.handle(post(
+        "/client/agents/research:update",
+        json!({ "capabilities": [] }),
+        "k-caps-2",
+    ));
+    assert!(detail(&env).capabilities.is_empty());
+
+    // Handler-side validation: charset / duplicates / bound, before the provider.
+    let before = provider.calls.update.load(Ordering::SeqCst);
+    for (bad, label) in [
+        (json!(["cap:x"]), "charset"),
+        (json!(["fs", "fs"]), "duplicate"),
+        (json!("fs"), "wrong type"),
+        (
+            json!((0..=MAX_REQUESTED_CAPABILITIES)
+                .map(|i| format!("c{i}"))
+                .collect::<Vec<_>>()),
+            "too many",
+        ),
+    ] {
+        let env = api.handle(post(
+            "/client/agents/research:update",
+            json!({ "capabilities": bad }),
+            &format!("k-caps-bad-{label}"),
+        ));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{label}");
+    }
+    assert_eq!(provider.calls.update.load(Ordering::SeqCst), before);
+
+    // Provider-side outcomes: root refuses, a superset of the parent is refused.
+    let env = api.handle(post(
+        "/client/agents/default-agent:update",
+        json!({ "capabilities": ["fs"] }),
+        "k-caps-root",
+    ));
+    assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest));
+    let env = api.handle(post(
+        "/client/agents/research:update",
+        json!({ "capabilities": ["secrets"] }),
+        "k-caps-superset",
+    ));
+    assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest));
 }

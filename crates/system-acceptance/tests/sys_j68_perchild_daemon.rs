@@ -1731,6 +1731,7 @@ async fn build_rig_282(serve: bool) -> Rig282 {
             alias: a.clone(),
             template: "explorer".to_string(),
             target_path: PathBuf::from("children").join(a),
+            capabilities: vec![],
             children: vec![],
         })
         .collect();

@@ -8,7 +8,9 @@
 //!
 //! Persistence: the daemon's tree is in-memory. A client-created child is recorded in the root
 //! `.agent/config.yaml` `agents:` hierarchy block (the MODULE-005-AC-25 boot materializer's
-//! input) so it is re-materialized at the next daemon start; a delete removes the declaration.
+//! input) — alias / template / target-path / `capabilities` — so it is re-materialized at the
+//! next daemon start with the capability set it was created (or last updated) with; a delete
+//! removes the declaration.
 //! The root document is rewritten through `serde_yml` (comments are not preserved). A child whose
 //! parent is itself undeclared (a guest-spawned, non-persisted parent) is created live but not
 //! persisted, because the parent will not exist after a restart either.
@@ -16,7 +18,11 @@
 //! Config-document rule (`:update`): a replacement document that carries no top-level `agents`
 //! key keeps the agent's existing `agents:` block (the hierarchy is managed through create/delete,
 //! never silently dropped by a capabilities edit); a document that carries `agents` replaces it and
-//! is validated with the same schema the boot materializer uses.
+//! is validated with the same schema the boot materializer uses. Every write of the ROOT document
+//! (create / delete / capability update / root config edit) is additionally checked for boot
+//! consistency: each declared child's `capabilities` must be covered by its parent's (the root's
+//! active capabilities for top-level children), otherwise the request is refused — the API can
+//! never persist a hierarchy the next daemon start would abort on.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -37,12 +43,13 @@ use advance_shared_types::agent_tree::{
 use advance_shared_types::capability::{CapParams, CapabilityId};
 use advance_shared_types::mailbox::{Message, MessageKind};
 use cap_grant::GrantStore;
-use cap_lifecycle::spawn::{SpawnChildConfig, Spawner};
+use cap_lifecycle::spawn::{SpawnChildConfig, Spawner, SpawnerSubsetGate};
 use cap_lifecycle::templates::TemplateResolver;
 use cap_lifecycle::terminate::{LoopCascade, MailboxCascade, TerminateController};
 use cap_lifecycle::{
-    atomic_write, AgentTreeStore, DefaultTerminateController, FsMemoryArchiver, FsWorkspaceCleanup,
-    GrantRevokeCascade, LifecycleError, RunManagerCascade, SpawnError,
+    atomic_write, AgentTreeStore, CapGrantSubsetAdapter, DefaultTerminateController,
+    FsMemoryArchiver, FsWorkspaceCleanup, GrantRevokeCascade, LifecycleError, RunManagerCascade,
+    SpawnError,
 };
 use serde_yml::{Mapping, Value};
 
@@ -134,6 +141,11 @@ impl AgentAdminAdapter {
         ClientAgentDetail {
             agent: self.summary(node),
             config: project_config(read_config_document(&node.workspace_path).as_deref()),
+            capabilities: node
+                .capabilities
+                .iter()
+                .map(|c| c.id.as_str().to_string())
+                .collect(),
             children,
             driver_present: is_regular_file(&agent_dir.join("behavior.component.wasm"))
                 || is_regular_file(&agent_dir.join("behavior.wasm")),
@@ -163,6 +175,9 @@ impl AgentAdminAdapter {
         // The rewritten hierarchy must still pass the boot materializer's schema + caps.
         parse_agents_config(Some(text.as_bytes()))
             .map_err(|_| ProviderError::InvalidRequest("declared hierarchy".into()))?;
+        if workspace == self.root_workspace()? {
+            check_hierarchy_capabilities(&text)?;
+        }
         self.write_config_text(workspace, &text)
     }
 
@@ -188,6 +203,7 @@ impl AgentAdminAdapter {
         alias: &str,
         template: &str,
         target_path: &str,
+        capabilities: &[String],
     ) -> Result<bool, ProviderError> {
         let root_ws = self.root_workspace()?;
         let mut doc = self.load_document(&root_ws)?;
@@ -195,6 +211,9 @@ impl AgentAdminAdapter {
         entry.insert(str_value("alias"), str_value(alias));
         entry.insert(str_value("template"), str_value(template));
         entry.insert(str_value("target-path"), str_value(target_path));
+        if !capabilities.is_empty() {
+            entry.insert(str_value("capabilities"), capabilities_value(capabilities));
+        }
         let agents = decl_sequence_mut(&mut doc);
         // A stale declaration with the same alias (left behind by an older daemon) is replaced.
         remove_decl(agents, alias);
@@ -225,6 +244,30 @@ impl AgentAdminAdapter {
             self.write_document(&root_ws, &doc)?;
         }
         Ok(removed)
+    }
+
+    /// Replace the persisted `capabilities:` of `alias`'s declaration. `Ok(false)` when the agent
+    /// is not declared (a guest-spawned, non-persisted child).
+    fn set_declared_capabilities(
+        &self,
+        alias: &str,
+        capabilities: &[String],
+    ) -> Result<bool, ProviderError> {
+        let root_ws = self.root_workspace()?;
+        let mut doc = self.load_document(&root_ws)?;
+        let Some(Value::Sequence(agents)) = doc.get_mut(str_value("agents")) else {
+            return Ok(false);
+        };
+        let Some(decl) = find_decl_mut(agents, alias) else {
+            return Ok(false);
+        };
+        if capabilities.is_empty() {
+            decl.remove(str_value("capabilities"));
+        } else {
+            decl.insert(str_value("capabilities"), capabilities_value(capabilities));
+        }
+        self.write_document(&root_ws, &doc)?;
+        Ok(true)
     }
 
     fn restore_declared_child(&self, parent_id: &str, decl: Value) -> Result<(), ProviderError> {
@@ -376,6 +419,7 @@ impl AgentAdminProvider for AgentAdminAdapter {
             &request.agent_id,
             &request.template_ref,
             &relative,
+            &request.capabilities,
         )?;
         let cfg = SpawnChildConfig {
             parent_id: AgentId(parent_id.clone()),
@@ -424,7 +468,14 @@ impl AgentAdminProvider for AgentAdminAdapter {
                     merged.insert(str_value("agents"), agents.clone());
                     self.write_document(&node.workspace_path, &merged)?;
                 }
-                _ => self.write_config_text(&node.workspace_path, yaml)?,
+                _ => {
+                    if node.kind == AgentKind::Root {
+                        // A root document defines the next boot's root capability set AND (when
+                        // it carries `agents`) the hierarchy: keep them consistent, fail closed.
+                        check_hierarchy_capabilities(yaml)?;
+                    }
+                    self.write_config_text(&node.workspace_path, yaml)?
+                }
             }
         }
         if let Some(name) = &request.display_name {
@@ -432,6 +483,33 @@ impl AgentAdminProvider for AgentAdminAdapter {
                 .map_err(|_| ProviderError::InvalidRequest("display name".into()))?;
             TopLevelDisplayName::set(&node.workspace_path, name)
                 .map_err(|_| ProviderError::Unavailable("display name write".into()))?;
+        }
+        if let Some(capabilities) = &request.capabilities {
+            // The persisted capability list is a CHILD-declaration concept: the root's operative
+            // set is its own config document, and a Sub is never declared.
+            if node.kind != AgentKind::Child {
+                return Err(ProviderError::InvalidRequest(
+                    "capabilities on non-child".into(),
+                ));
+            }
+            let parent_id = node
+                .parent
+                .clone()
+                .ok_or_else(|| ProviderError::InvalidRequest("orphan agent".into()))?;
+            let parent = self.node(&parent_id.0)?;
+            let requested: Vec<Capability> = capabilities
+                .iter()
+                .map(|c| Capability {
+                    id: CapabilityId::new(c.as_str()),
+                    params: CapParams::empty(),
+                })
+                .collect();
+            CapGrantSubsetAdapter::new()
+                .check(&parent.capabilities, &requested)
+                .map_err(|_| ProviderError::InvalidRequest("capability subset".into()))?;
+            if !self.set_declared_capabilities(agent_id, capabilities)? {
+                return Err(ProviderError::InvalidRequest("agent not declared".into()));
+            }
         }
         Ok(self.detail(&node))
     }
@@ -670,6 +748,38 @@ fn str_value(s: &str) -> Value {
     Value::String(s.to_string())
 }
 
+fn capabilities_value(capabilities: &[String]) -> Value {
+    Value::Sequence(capabilities.iter().map(|c| str_value(c)).collect())
+}
+
+/// The next boot materializes every declared child with its `capabilities:` and subset-gates
+/// them against the parent node (the root's node set is the root document's active
+/// capabilities). A root document whose hierarchy violates that would abort the next daemon
+/// start, so every write of the root document is checked here first (fail-closed →
+/// `invalid_request`). Whole-capability ids only, so containment is the exact gate.
+fn check_hierarchy_capabilities(root_document: &str) -> Result<(), ProviderError> {
+    let bytes = root_document.as_bytes();
+    let decls = parse_agents_config(Some(bytes))
+        .map_err(|_| ProviderError::InvalidRequest("declared hierarchy".into()))?;
+    let root_caps: Vec<String> = crate::agent_config::active_capabilities(Some(bytes))
+        .into_iter()
+        .map(|c| c.capability.as_str().to_string())
+        .collect();
+    fn covered(parent: &[String], decls: &[AgentDecl]) -> bool {
+        decls.iter().all(|d| {
+            d.capabilities.iter().all(|c| parent.contains(c))
+                && covered(&d.capabilities, &d.children)
+        })
+    }
+    if covered(&root_caps, &decls) {
+        Ok(())
+    } else {
+        Err(ProviderError::InvalidRequest(
+            "declared capabilities exceed the parent's".into(),
+        ))
+    }
+}
+
 fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_dir())
@@ -782,6 +892,7 @@ fn declared_child(decl: &AgentDecl) -> ClientAgentDeclaredChild {
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/"),
+        capabilities: decl.capabilities.clone(),
         children: decl.children.iter().map(declared_child).collect(),
     }
 }
@@ -884,6 +995,31 @@ mod tests {
         assert!(cfg.capabilities.is_empty());
         assert!(cfg.declared_children.is_empty());
         assert!(cfg.config_yaml.is_some());
+    }
+
+    #[test]
+    fn hierarchy_capabilities_must_be_covered() {
+        assert!(check_hierarchy_capabilities(
+            "capabilities:\n  fs: true\nagents:\n  - alias: a\n    template: t\n    target-path: a\n    capabilities: [fs]\n    children:\n      - alias: b\n        template: t\n        target-path: b\n        capabilities: [fs]\n"
+        )
+        .is_ok());
+        // root lacks llm
+        assert!(check_hierarchy_capabilities(
+            "capabilities:\n  fs: true\nagents:\n  - alias: a\n    template: t\n    target-path: a\n    capabilities: [llm]\n"
+        )
+        .is_err());
+        // grandchild exceeds its parent
+        assert!(check_hierarchy_capabilities(
+            "capabilities:\n  fs: true\n  llm: true\nagents:\n  - alias: a\n    template: t\n    target-path: a\n    capabilities: [fs]\n    children:\n      - alias: b\n        template: t\n        target-path: b\n        capabilities: [llm]\n"
+        )
+        .is_err());
+        // opted-out (`fs: false`) does not cover a child
+        assert!(check_hierarchy_capabilities(
+            "capabilities:\n  fs: false\nagents:\n  - alias: a\n    template: t\n    target-path: a\n    capabilities: [fs]\n"
+        )
+        .is_err());
+        // no hierarchy ⇒ trivially consistent
+        assert!(check_hierarchy_capabilities("capabilities:\n  fs: true\n").is_ok());
     }
 
     #[test]
