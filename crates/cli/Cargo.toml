@@ -19,6 +19,8 @@ path = "src/lib.rs"
 [features]
 default = []
 test-support = []
+# Entity-data gated witness tests (feature-gated until the lane closes)
+lane-e2 = []
 
 [[bin]]
 name = "advance"

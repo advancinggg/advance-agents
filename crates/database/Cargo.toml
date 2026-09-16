@@ -28,3 +28,7 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+# Entity-data gated witness tests (feature-gated until the lane closes)
+lane-e1 = []

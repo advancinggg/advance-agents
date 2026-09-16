@@ -1,0 +1,15 @@
+# Aspect `completion` — an entity has it iff `status` is present.
+# Field grammar = the workspace meta-schema (`.agent/meta-schema.yaml`); merged structurally
+# at install (same field name must have the same type across packs).
+optional:
+  status:
+    type: string
+  due:
+    type: string
+  priority:
+    type: integer
+    default: 0
+  assignee:
+    type: string
+  completed_at:
+    type: string

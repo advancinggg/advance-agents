@@ -1,0 +1,17 @@
+name: todo
+version: 0.1.0
+author: advance.studio
+description: "To-Do aspect (`completion`) for the entity model: status / due / priority / assignee / completed_at on any entity, plus the skill that teaches agents to manage items through the data.* host functions. changelog: 0.1.0 initial declaration."
+license: MIT OR Apache-2.0
+runtime-version: ">=0.1.14"
+required-capabilities:
+  - data
+trust-level: untrusted
+provides:
+  skills:
+    - todo
+  meta-schema-extensions:
+    - completion
+checksums:
+  algo: sha256
+  files: {}

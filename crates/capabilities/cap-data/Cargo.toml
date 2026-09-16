@@ -1,0 +1,28 @@
+[package]
+name = "cap-data"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Structured-data capability (`data`): the entity model over frontmatter (file / inline items / index.md), host-owned canonical writes, tiers and promotion, and the agent-data host functions. Skeleton (lane E1)."
+
+publish = false
+
+[lib]
+name = "cap_data"
+path = "src/lib.rs"
+
+[dependencies]
+advance-shared-types = { path = "../../shared-types" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[features]
+# Entity-data gated witness tests (feature-gated until the lane closes)
+lane-e1 = []
+
+[lints]
+workspace = true

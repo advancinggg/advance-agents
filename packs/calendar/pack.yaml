@@ -1,0 +1,17 @@
+name: calendar
+version: 0.1.0
+author: advance.studio
+description: "Calendar aspect (`schedule`) for the entity model: starts / ends / all_day / repeat (RRULE) / tz on any entity, plus the skill that teaches agents to schedule through the data.* host functions. changelog: 0.1.0 initial declaration."
+license: MIT OR Apache-2.0
+runtime-version: ">=0.1.14"
+required-capabilities:
+  - data
+trust-level: untrusted
+provides:
+  skills:
+    - calendar
+  meta-schema-extensions:
+    - schedule
+checksums:
+  algo: sha256
+  files: {}

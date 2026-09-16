@@ -1037,6 +1037,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cap-data"
+version = "0.1.14"
+dependencies = [
+ "advance-shared-types",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "cap-fs"
 version = "0.1.14"
 dependencies = [
