@@ -136,7 +136,6 @@ impl FileSecretStorage {
             cache: RwLock::new(cache),
         })
     }
-
 }
 
 impl SecretStorage for FileSecretStorage {
