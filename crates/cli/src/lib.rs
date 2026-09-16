@@ -36,6 +36,7 @@ pub mod client_api_adapters;
 // (list/get/create/update/delete + template listing), its root-config persistence, and the
 // production terminate-controller composition the family drives.
 pub mod client_api_agents;
+pub mod client_api_costs;
 pub mod contract218_anchor;
 pub mod contract218_bootstrap;
 pub mod contract218_keyring;

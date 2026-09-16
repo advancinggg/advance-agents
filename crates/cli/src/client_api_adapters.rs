@@ -11,8 +11,8 @@ use advance_client_api::{
     AgentAdminProvider, BoundGrantApprovalPort, BoundHistoryPage, BoundHistoryReadPort,
     ClientAgentTreeNode, ClientApi, ClientCursorCodec, ClientEventProvider, ClientMcpEntry,
     ClientMessageAck, ClientMessageStatus, ClientRunMutation, ClientRunSummary, ClientSkillEntry,
-    ClientToolEntry, ClientToolInventory, LlmDeltaHub, MessagingProvider, NormalizedEventFilter,
-    ProviderError, RawEventRow, RunControlProvider, ToolsProvider,
+    ClientToolEntry, ClientToolInventory, CostProvider, LlmDeltaHub, MessagingProvider,
+    NormalizedEventFilter, ProviderError, RawEventRow, RunControlProvider, ToolsProvider,
 };
 use advance_event_bus::{EventFilter, ObservabilityReadApi, ReadApiError, ReadCursor, ReadEvent};
 use advance_messaging::{MailboxStore, Message, MessageKind, MsgError};
@@ -532,6 +532,9 @@ pub struct FirstPartyClientCompose {
     pub llm_delta_hub: Option<Arc<LlmDeltaHub>>,
     /// CONTRACT-190 agents family (agent CRUD + template listing) over the shared agent tree.
     pub agents: Option<Arc<dyn AgentAdminProvider>>,
+    /// CONTRACT-190 costs family (per-agent / per-provider LLM spend) over the bus's durable
+    /// cost ledger.
+    pub costs: Option<Arc<dyn CostProvider>>,
 }
 
 pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCompose) -> ClientApi {
@@ -567,6 +570,9 @@ pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCom
     }
     if let Some(agents) = parts.agents {
         api = api.with_agent_provider(agents);
+    }
+    if let Some(costs) = parts.costs {
+        api = api.with_cost_provider(costs);
     }
     api
 }

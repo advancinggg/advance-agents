@@ -22,6 +22,7 @@ pub mod auth;
 pub mod clock;
 pub mod compat;
 pub mod config;
+pub mod costs;
 pub mod cursor;
 pub mod deltas;
 pub mod durable_idempotency;
@@ -51,6 +52,11 @@ pub use api::{ClientApi, ClientMutationContext, HandlerCtx, HandlerResponse, Han
 pub use audit::{AuditEvent, AuditSink, NoopSink};
 pub use clock::{Clock, SystemClock};
 pub use config::ClientApiConfig;
+pub use costs::{
+    ClientAgentCostEntry, ClientAgentCostList, ClientAgentCostReport, ClientCostQuery,
+    ClientCostTotals, ClientCostWindow, ClientProviderCostEntry, ClientProviderCostList,
+    ClientProviderCostReport, ValidatedCostWindow,
+};
 pub use cursor::{
     AeadClientCursorCodec, ClientCursorCodec, CursorClock, CursorEntropy, CursorKeyCustody,
     MemoryCursorKeyCustody, OpenedSeal, OsCursorEntropy, SealPurpose, SystemCursorClock,
@@ -71,7 +77,8 @@ pub use events::{
 pub use messages::{ClientMessageAck, ClientMessageStatus, ClientSendMessageRequest};
 pub use pagination::{Cursor, Page};
 pub use provider::{
-    AgentAdminProvider, MessagingProvider, ProviderError, RunControlProvider, ToolsProvider,
+    AgentAdminProvider, CostProvider, MessagingProvider, ProviderError, RunControlProvider,
+    ToolsProvider,
 };
 pub use providers::grants::{
     BoundGrantApprovalPort, BoundGrantMutation, BoundMutationOutcome, ClientCapParam,

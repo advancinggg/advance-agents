@@ -98,7 +98,7 @@ pub(crate) fn emit_llm_request(emit: &dyn EventBusEmit, ctx: &LlmRequestContext,
 
 /// Emit an `llm.response` event. Fired after a successful upstream call.
 /// Payload carries: model + tokens + cost_usd + structured_retry_attempt +
-/// schema_validation + iteration (if Some). `duration_ms = Some(latency_ms)`.
+/// schema_validation + iteration (if Some) + provider (if Some). `duration_ms = Some(latency_ms)`.
 pub(crate) fn emit_llm_response(
     emit: &dyn EventBusEmit,
     ctx: &LlmRequestContext,
@@ -107,6 +107,7 @@ pub(crate) fn emit_llm_response(
     latency_ms: u64,
     structured_retry_attempt: Option<u32>,
     schema_validation: Option<&str>,
+    provider_id: Option<&str>,
 ) {
     let mut event = envelope(ctx, LLM_RESPONSE);
     event.duration_ms = Some(latency_ms);
@@ -127,6 +128,11 @@ pub(crate) fn emit_llm_response(
     });
     if let Some(iter) = ctx.iteration {
         payload["iteration"] = json!(iter);
+    }
+    // Lane cost-attribution (2026-09-16): the resolved provider id, so the
+    // durable ledger can bill per provider API. Absent only on legacy rows.
+    if let Some(provider) = provider_id {
+        payload["provider"] = json!(provider);
     }
     event.payload = payload;
     emit.emit(event);
@@ -183,4 +189,82 @@ pub(crate) fn emit_llm_error(
         event.payload["submitted_cost_usd"] = json!(v);
     }
     emit.emit(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecBus(Mutex<Vec<Event>>);
+    impl EventBusEmit for RecBus {
+        fn emit(&self, event: Event) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    fn ctx() -> LlmRequestContext {
+        LlmRequestContext {
+            agent_id: "agent-a".into(),
+            task_id: None,
+            run_id: Some("run-1".into()),
+            iteration: Some(2),
+            trace_id: None,
+            messages: vec![],
+            params: crate::gateway::ChatParams::default(),
+            output_schema: None,
+            tee_live: false,
+            user_constraints: Vec::new(),
+            hard_task_class: false,
+            placement: None,
+        }
+    }
+
+    fn resp() -> ChatResponse {
+        ChatResponse {
+            text: "hi".into(),
+            model: "m-1".into(),
+            input_tokens: 10,
+            output_tokens: 5,
+            finish_reason: "stop".into(),
+            parsed_output: None,
+        }
+    }
+
+    /// Lane cost-attribution: `llm.response` carries the resolved provider id at the
+    /// TOP-LEVEL `provider` key (the durable ledger's attribution key) alongside the
+    /// canonical token/cost fields, and stays byte-compatible when no provider is given.
+    #[test]
+    fn llm_response_carries_provider_when_resolved() {
+        let bus = RecBus::default();
+        emit_llm_response(
+            &bus,
+            &ctx(),
+            &resp(),
+            0.25,
+            42,
+            None,
+            None,
+            Some("anthropic"),
+        );
+        emit_llm_response(&bus, &ctx(), &resp(), 0.25, 42, None, None, None);
+        let events = bus.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        let with = &events[0];
+        assert_eq!(with.event_type, LLM_RESPONSE);
+        assert_eq!(with.agent_id, "agent-a");
+        assert_eq!(with.run_id.as_deref(), Some("run-1"));
+        assert_eq!(with.payload["provider"], json!("anthropic"));
+        assert_eq!(with.payload["input_tokens"], json!(10));
+        assert_eq!(with.payload["output_tokens"], json!(5));
+        assert_eq!(with.payload["cost_usd"], json!(0.25));
+        assert_eq!(with.payload["iteration"], json!(2));
+        assert_eq!(with.duration_ms, Some(42));
+        let without = &events[1];
+        assert!(without.payload.get("provider").is_none());
+        let mut expect = with.payload.clone();
+        expect.as_object_mut().unwrap().remove("provider");
+        assert_eq!(without.payload, expect);
+    }
 }

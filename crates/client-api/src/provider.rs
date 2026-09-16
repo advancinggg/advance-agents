@@ -22,6 +22,10 @@ use crate::agents::{
     ClientAgentDeleteResult, ClientAgentDetail, ClientAgentSummary, ClientAgentTemplate,
     ClientCreateAgentRequest, ClientDeleteAgentRequest, ClientUpdateAgentRequest,
 };
+use crate::costs::{
+    ClientAgentCostEntry, ClientAgentCostReport, ClientProviderCostEntry, ClientProviderCostReport,
+    ValidatedCostWindow,
+};
 use crate::cursor::ClientCursorCodec;
 use crate::envelope::{ClientError, ClientErrorCode};
 use crate::events::ClientEventProvider;
@@ -153,12 +157,43 @@ pub trait AgentAdminProvider: Send + Sync {
     fn list_templates(&self) -> Result<Vec<ClientAgentTemplate>, ProviderError>;
 }
 
+/// LLM spend attribution provider (MODULE-019 durable cost ledger, lane cost-attribution) behind
+/// the `costs` family. The adapter binds the runtime's `CostLedgerQuery` (persisted
+/// `llm.response` rows, survives restart) and projects to client DTOs. Every id/window it receives
+/// has already passed handler-side validation in [`crate::costs`]. Unknown ids answer the zero
+/// aggregate (the ledger does not know the agent tree); a failed store read is `Unavailable`.
+pub trait CostProvider: Send + Sync {
+    /// Per-agent totals, `cost_usd` descending then agent id.
+    fn agent_totals(
+        &self,
+        window: &ValidatedCostWindow,
+    ) -> Result<Vec<ClientAgentCostEntry>, ProviderError>;
+    /// One agent's total + split by provider id.
+    fn agent_report(
+        &self,
+        agent_id: &str,
+        window: &ValidatedCostWindow,
+    ) -> Result<ClientAgentCostReport, ProviderError>;
+    /// Per-provider totals, `cost_usd` descending then provider id.
+    fn provider_totals(
+        &self,
+        window: &ValidatedCostWindow,
+    ) -> Result<Vec<ClientProviderCostEntry>, ProviderError>;
+    /// One provider's total + split by agent id.
+    fn provider_report(
+        &self,
+        provider_id: &str,
+        window: &ValidatedCostWindow,
+    ) -> Result<ClientProviderCostReport, ProviderError>;
+}
+
 /// An interior-mutable provider slot: `None` until the composition root injects a concrete adapter.
 pub type ProviderSlot<T> = Arc<RwLock<Option<Arc<T>>>>;
 pub type RunProviderSlot = ProviderSlot<dyn RunControlProvider>;
 pub type MessagingProviderSlot = ProviderSlot<dyn MessagingProvider>;
 pub type ToolsProviderSlot = ProviderSlot<dyn ToolsProvider>;
 pub type AgentProviderSlot = ProviderSlot<dyn AgentAdminProvider>;
+pub type CostProviderSlot = ProviderSlot<dyn CostProvider>;
 /// m020-s3: event provider / leak detector / cursor codec slots.
 pub type EventProviderSlot = ProviderSlot<dyn ClientEventProvider>;
 pub type LeakDetectorSlot = ProviderSlot<dyn LeakDetector>;

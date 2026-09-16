@@ -56,6 +56,14 @@ pub const RESPONSE_COMPONENTS: &[&str] = &[
     "Scope",
     "Cursor",
     "ClientErrorCode",
+    "ClientCostWindow",
+    "ClientCostTotals",
+    "ClientAgentCostEntry",
+    "ClientProviderCostEntry",
+    "ClientAgentCostReport",
+    "ClientProviderCostReport",
+    "ClientAgentCostList",
+    "ClientProviderCostList",
     "GenUiDocument",
     "ComponentNode",
     "CatalogEntry",
@@ -86,6 +94,7 @@ pub const EXCLUDED_COMPONENTS: &[&str] = &[
     "ClientCreateAgentRequest",
     "ClientUpdateAgentRequest",
     "ClientDeleteAgentRequest",
+    "ClientCostQuery",
 ];
 
 /// Git path of the on-disk honesty baseline, relative to the repo root.

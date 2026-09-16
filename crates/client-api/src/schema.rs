@@ -203,6 +203,47 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
             "ClientDeleteAgentRequest".to_string(),
             schema_value::<crate::agents::ClientDeleteAgentRequest>(),
         );
+        // Costs family (lane cost-attribution: per-agent / per-provider LLM spend) DTOs (additive).
+        for (name, schema) in [
+            (
+                "ClientCostQuery",
+                schema_value::<crate::costs::ClientCostQuery>(),
+            ),
+            (
+                "ClientCostWindow",
+                schema_value::<crate::costs::ClientCostWindow>(),
+            ),
+            (
+                "ClientCostTotals",
+                schema_value::<crate::costs::ClientCostTotals>(),
+            ),
+            (
+                "ClientAgentCostEntry",
+                schema_value::<crate::costs::ClientAgentCostEntry>(),
+            ),
+            (
+                "ClientProviderCostEntry",
+                schema_value::<crate::costs::ClientProviderCostEntry>(),
+            ),
+            (
+                "ClientAgentCostReport",
+                schema_value::<crate::costs::ClientAgentCostReport>(),
+            ),
+            (
+                "ClientProviderCostReport",
+                schema_value::<crate::costs::ClientProviderCostReport>(),
+            ),
+            (
+                "ClientAgentCostList",
+                schema_value::<crate::costs::ClientAgentCostList>(),
+            ),
+            (
+                "ClientProviderCostList",
+                schema_value::<crate::costs::ClientProviderCostList>(),
+            ),
+        ] {
+            m.insert(name.to_string(), schema);
+        }
         // MODULE-023 GenUI DTOs (CONTRACT-220/221).
         m.insert(
             "GenUiDocument".to_string(),

@@ -580,6 +580,9 @@ struct SettlementInner {
     /// decoded-byte fallback and a guest could receive real generated text for free.
     decoded_at_last_output_usage: u64,
     model: String,
+    /// Resolved provider id (cost attribution key), set by the gateway right
+    /// after construction; `None` in fixtures that never resolve a provider.
+    provider_id: Option<String>,
     cost_per_mtoken_in: f64,
     cost_per_mtoken_out: f64,
     cache_cost: crate::catalog::CacheCost,
@@ -597,6 +600,19 @@ struct SettlementInner {
 }
 
 impl Settlement {
+    /// Record the resolved provider id carried on the terminal `llm.response`
+    /// (lane cost-attribution). Idempotent; last write wins.
+    pub fn set_provider_id(&self, provider_id: &str) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.provider_id = Some(provider_id.to_string());
+    }
+
+    /// The resolved provider id, if recorded.
+    pub fn provider_id(&self) -> Option<String> {
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.provider_id.clone()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         run_id: Option<String>,
@@ -622,6 +638,7 @@ impl Settlement {
                 folded_output: None,
                 folded_cache: crate::cost::CacheUsage::NONE,
                 model,
+                provider_id: None,
                 cost_per_mtoken_in,
                 cost_per_mtoken_out,
                 cache_cost,
@@ -893,7 +910,16 @@ impl Settlement {
         // gated on the phase published at the end of this function), the flag means
         // exactly "the call ran AND RETURNED" (round 27 aligned this comment with
         // the accessor's precise predicate — a panicking call was also 'made').
-        let (commit_charge, run_id, model, billed_in, billed_out, billed_cost, elapsed_ms) = {
+        let (
+            commit_charge,
+            run_id,
+            model,
+            provider_id,
+            billed_in,
+            billed_out,
+            billed_cost,
+            elapsed_ms,
+        ) = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if g.committed {
                 return false;
@@ -927,6 +953,7 @@ impl Settlement {
                 commit_charge,
                 g.run_id.clone(),
                 g.model.clone(),
+                g.provider_id.clone(),
                 bin,
                 bout,
                 cost,
@@ -1017,6 +1044,7 @@ impl Settlement {
                             elapsed_ms,
                             None,
                             *schema_validation,
+                            provider_id.as_deref(),
                         );
                     }
                     LivePhase::Failed(e) => {
@@ -2057,6 +2085,7 @@ impl StreamRegistry {
             cost_usd: cost,
             latency_ms,
             schema_validation: schema_tag,
+            provider_id: live.settlement.provider_id(),
         })
     }
 
@@ -2738,6 +2767,7 @@ mod tests {
             cost_usd: 0.0,
             latency_ms: 0,
             schema_validation: None,
+            provider_id: None,
         }
     }
 
