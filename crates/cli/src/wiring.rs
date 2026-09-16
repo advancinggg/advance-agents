@@ -1921,7 +1921,6 @@ async fn wire_capabilities_inner(
                 pack_wiring.registry.clone() as Arc<dyn advance_pack_manager::PackRegistry>,
                 pack_wiring.secret_store.clone() as Arc<dyn advance_pack_manager::SecretStore>,
                 pack_wiring.mcp_entries.clone() as Arc<dyn crate::pack_bridges::McpEntrySink>,
-                tokio::runtime::Handle::current(),
             ));
             let _ = pack_wiring
                 .workflow_executor

@@ -112,7 +112,6 @@ async fn rig(tmp: &Path) -> Rig {
         registry_dyn.clone(),
         Arc::clone(&secrets),
         Arc::clone(&sink) as Arc<dyn advance_cli::pack_bridges::McpEntrySink>,
-        tokio::runtime::Handle::current(),
     ));
     let materializer = DefaultMaterializer::new(
         registry_dyn,

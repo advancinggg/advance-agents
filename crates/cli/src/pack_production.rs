@@ -314,8 +314,11 @@ impl DependencyResolver for RegistryDependencyResolver {
 /// representation and is refused.
 ///
 /// Scheduler calls are async; the executor bridges from the applier's sync
-/// context by driving them on a scoped helper thread over the captured runtime
-/// handle (safe from within a worker of a multi-thread runtime).
+/// context by driving each call on a dedicated scoped thread with an OWNED
+/// current-thread runtime (the workspace's blessed sync entry — never
+/// `Handle::block_on`, which panics on a worker). A fresh OS thread carries no
+/// runtime context, so this is safe whatever context `apply_workflow` runs in;
+/// the scheduler's own `spawn_blocking` calls run on that owned runtime.
 pub struct SchedulerWorkflowExecutor {
     spawner: Arc<dyn Spawner>,
     tree: Arc<AgentTreeStore>,
@@ -331,7 +334,6 @@ pub struct SchedulerWorkflowExecutor {
     secrets: Arc<dyn SecretStore>,
     mcp: PackMcpBridge,
     mcp_sink: Arc<dyn McpEntrySink>,
-    handle: tokio::runtime::Handle,
 }
 
 impl SchedulerWorkflowExecutor {
@@ -345,7 +347,6 @@ impl SchedulerWorkflowExecutor {
         registry: Arc<dyn PackRegistry>,
         secrets: Arc<dyn SecretStore>,
         mcp_sink: Arc<dyn McpEntrySink>,
-        handle: tokio::runtime::Handle,
     ) -> Self {
         Self {
             spawner,
@@ -358,7 +359,6 @@ impl SchedulerWorkflowExecutor {
             registry,
             secrets,
             mcp_sink,
-            handle,
         }
     }
 
@@ -412,17 +412,29 @@ impl SchedulerWorkflowExecutor {
         Ok((AgentId(id), rel))
     }
 
-    /// Drive `fut` to completion from the applier's sync context.
-    fn block_on<F>(&self, fut: F) -> Result<F::Output, PackError>
+    /// Drive `fut` to completion from the applier's sync context: a dedicated
+    /// scoped thread builds an owned current-thread runtime and `block_on`s the
+    /// future there (see the type docs). Runtime build failure and a panicking
+    /// future both surface as `InvalidWorkflow`, never as a hang.
+    fn block_on<F>(fut: F) -> Result<F::Output, PackError>
     where
         F: std::future::Future + Send,
         F::Output: Send,
     {
-        let handle = self.handle.clone();
         std::thread::scope(|s| {
-            s.spawn(move || handle.block_on(fut))
-                .join()
-                .map_err(|_| PackError::InvalidWorkflow("scheduler call panicked".into()))
+            s.spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        PackError::InvalidWorkflow(format!(
+                            "scheduler call: failed to build the owned runtime: {e}"
+                        ))
+                    })?;
+                Ok(runtime.block_on(fut))
+            })
+            .join()
+            .map_err(|_| PackError::InvalidWorkflow("scheduler call panicked".into()))?
         })
     }
 
@@ -535,7 +547,7 @@ impl WorkflowExecutor for SchedulerWorkflowExecutor {
             retry: None,
             sensitive_params: Vec::new(),
         };
-        self.block_on(self.submit.submit_component(&self.submitter, cfg))?
+        Self::block_on(self.submit.submit_component(&self.submitter, cfg))?
             .map(|_| ())
             .map_err(|e| {
                 PackError::InvalidWorkflow(format!("submit-component {component_ref}: {e:?}"))
@@ -616,10 +628,9 @@ impl WorkflowExecutor for SchedulerWorkflowExecutor {
 
     /// Compensation: `kill_component` under the same FQ-ref id.
     fn withdraw_component(&self, component_ref: &str) -> Result<(), PackError> {
-        self.block_on(self.submit.kill_component(component_ref))?
-            .map_err(|e| {
-                PackError::InvalidWorkflow(format!("withdraw-component {component_ref}: {e:?}"))
-            })
+        Self::block_on(self.submit.kill_component(component_ref))?.map_err(|e| {
+            PackError::InvalidWorkflow(format!("withdraw-component {component_ref}: {e:?}"))
+        })
     }
 }
 
