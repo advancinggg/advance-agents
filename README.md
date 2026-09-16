@@ -44,7 +44,7 @@ Depend on the single façade crate [`crates/advance-core`](crates/advance-core) 
 the supported public surface under stable module names:
 
 ```toml
-advance-core = { git = "https://github.com/advancinggg/advance-agents", tag = "v0.1.13" }
+advance-core = { git = "https://github.com/advancinggg/advance-agents", tag = "v0.1.14" }
 ```
 
 ## Architecture at a glance
