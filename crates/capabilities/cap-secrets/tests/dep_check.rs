@@ -50,6 +50,12 @@ impl SecretStorage for SpyingSecretStorage {
         self.exists_log.lock().unwrap().push(name.to_string());
         self.inner.exists(name)
     }
+    fn remove(&self, name: &str) -> Result<bool, StorageError> {
+        self.inner.remove(name)
+    }
+    fn names(&self) -> Vec<String> {
+        self.inner.names()
+    }
 }
 
 fn ctx_for(agent_id: &str) -> HostCallContext {
