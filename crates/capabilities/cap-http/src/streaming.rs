@@ -1868,6 +1868,14 @@ mod tests {
         fn exists(&self, name: &str) -> Result<bool, cap_secrets::StorageError> {
             cap_secrets::SecretStorage::exists(&self.inner, name)
         }
+
+        fn remove(&self, name: &str) -> Result<bool, cap_secrets::StorageError> {
+            cap_secrets::SecretStorage::remove(&self.inner, name)
+        }
+
+        fn names(&self) -> Vec<String> {
+            cap_secrets::SecretStorage::names(&self.inner)
+        }
     }
 
     struct BlockingDetector {
