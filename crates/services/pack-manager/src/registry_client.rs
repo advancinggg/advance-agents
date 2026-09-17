@@ -42,7 +42,7 @@ pub trait RegistryClient: Send + Sync {
         dest_dir: &Path,
     ) -> Result<PathBuf, PackError>;
 
-    /// Pack lane P3 / P2 (§3.4): every version of `name` the
+    /// Pack lanes P3 / P2: every version of `name` the
     /// registry offers, in ascending SemVer order. The default surfaces
     /// `NotImplemented` so pre-existing clients (and the mock) stay source
     /// compatible; the production `HttpsRegistryClient` (cli) reads its index.
