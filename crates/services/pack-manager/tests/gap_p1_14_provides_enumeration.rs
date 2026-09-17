@@ -1,5 +1,5 @@
 //! GAP-14 (P1) — `PackRegistry::provides(name, version)` enumeration.
-//! The cap-lifecycle half
+//! See the internal pack gap-closure plan §2.3. The cap-lifecycle half
 //! (`PackTemplateResolver::list()`) lives in crates/capabilities/cap-lifecycle/tests/.
 
 use std::path::{Path, PathBuf};

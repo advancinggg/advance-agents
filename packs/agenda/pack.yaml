@@ -1,0 +1,17 @@
+name: agenda
+version: 0.1.0
+author: advance.studio
+description: "Agenda aspect for the entity model: status / due / priority / assignee / completed_at / starts / ends / all_day / repeat / exdates / tz on any entity (an entity is an agenda item iff it has `status` or `starts`), with named queries (open / overdue / day / upcoming), views (list / board / calendar / form) and the series operations detach_occurrence / shift_series bound to the `agenda` skill tool. Reads and writes go through the runtime's `data` host tool. changelog: 0.1.0 initial declaration (merges the former todo + calendar packs)."
+license: MIT OR Apache-2.0
+runtime-version: ">=0.1.14"
+required-capabilities:
+  - tools
+trust-level: untrusted
+provides:
+  skills:
+    - agenda
+  meta-schema-extensions:
+    - agenda
+checksums:
+  algo: sha256
+  files: {}

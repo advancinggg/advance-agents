@@ -1,5 +1,5 @@
 //! GAP-05 (P2, registry half) — host-native tools in `LazyToolRegistry`.
-//! Tool WASMs only link WASI; a store-backed
+//! See the internal pack gap-closure plan §3.3. Tool WASMs only link WASI; a store-backed
 //! tool must be host code, registered under the same id namespace and subject to the same
 //! fail-closed result cap.
 

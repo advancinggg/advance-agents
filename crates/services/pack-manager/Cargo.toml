@@ -53,5 +53,9 @@ tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"
 wit-component = { workspace = true }
 wit-parser = { workspace = true }
 
+[features]
+# entity-data lane gated witness tests (the internal entity-data lane plan §0.2)
+lane-e1 = []
+
 [lints]
 workspace = true

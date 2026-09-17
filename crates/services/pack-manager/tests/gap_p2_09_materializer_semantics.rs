@@ -1,5 +1,5 @@
 //! GAP-09 (P2, pack-manager half) — materializer semantics that stop being no-ops.
-//!1:
+//! See the internal pack gap-closure plan §3.1:
 //! - `materialize_channel_adapter` → explicit `NotImplemented` (cap-channel has no
 //!   path-loaded adapter surface) instead of a silent directory copy.
 //! - `merge_meta_schema_extension` → STRUCTURED merge into a single YAML document

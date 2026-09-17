@@ -1,5 +1,5 @@
 //! GAP-06 (P3) — signed manifests (`pack.sig` over `pack.yaml` bytes, ed25519).
-//!
+//! See the internal pack gap-closure plan §4.1.
 //! Requires `ed25519-dalek` (pinned workspace-wide) — deterministic keys, no RNG.
 
 use std::path::{Path, PathBuf};

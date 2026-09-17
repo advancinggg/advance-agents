@@ -1,4 +1,4 @@
-//! GAP-07 (P1) — uninstall / reinstall semantics.
+//! GAP-07 (P1) — uninstall / reinstall semantics. See the internal pack gap-closure plan §2.2.
 //!
 //! Contract under test:
 //! - `Installer::uninstall(name, version)` removes `packs_dir/{name}@{version}`, drops the

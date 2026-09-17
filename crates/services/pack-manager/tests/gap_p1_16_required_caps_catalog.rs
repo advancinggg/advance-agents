@@ -1,5 +1,5 @@
 //! GAP-16 (P1) — `required-capabilities` validated against a capability catalog.
-//! Implemented as an `ApprovalStrategy`
+//! See the internal pack gap-closure plan §2.4. Implemented as an `ApprovalStrategy`
 //! decorator so `Installer` gains no field.
 
 use std::path::{Path, PathBuf};

@@ -1,5 +1,5 @@
 //! GAP-12 (P1, e2e half) — `pack:` section round-trips through `advance init` +
-//! `load_config`. The unit half lives in
+//! `load_config`. See the internal pack gap-closure plan §2.1. The unit half lives in
 //! crates/runtime/tests/gap_p1_12_pack_config.rs.
 
 use advance_runtime::config::{load_config, PackApprovalPolicy, PackConfig};

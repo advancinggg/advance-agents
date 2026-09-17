@@ -4,7 +4,7 @@ version.workspace = true
 repository.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Structured-data capability (`data`): the entity model over frontmatter (file / inline items / index.md), host-owned canonical writes, tiers and promotion, and the agent-data host functions. Skeleton (lane E1)."
+description = "Structured-data capability (`data`): the entity model over frontmatter (file / inline items / index.md), host-owned canonical writes, tiers and promotion, the `apply` reducer transaction and the `data` host tool. Skeleton — see the internal entity-data lane plan (lane E1)."
 
 publish = false
 
@@ -21,7 +21,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [features]
-# Entity-data gated witness tests (feature-gated until the lane closes)
+# entity-data lane gated witness tests (the internal entity-data lane plan §0.2)
 lane-e1 = []
 
 [lints]

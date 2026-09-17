@@ -1,5 +1,5 @@
 //! GAP-15 (P3) — fd-relative, symlink-proof directory copy (closes the TOCTOU window
-//! verify.rs:11-20 documents).
+//! verify.rs:11-20 documents). See the internal pack gap-closure plan §4.3.
 //!
 //! `copy_dir_no_symlinks_observed(src, dst, on_descend)` fires the callback for a
 //! directory entry AFTER it was classified as a directory and IMMEDIATELY BEFORE it is

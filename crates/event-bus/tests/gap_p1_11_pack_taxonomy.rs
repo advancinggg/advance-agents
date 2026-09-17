@@ -1,5 +1,5 @@
 //! GAP-11 (P1) — `pack.*` events registered in the MODULE-019 taxonomy.
-//! They are documented extensions
+//! See the internal pack gap-closure plan §2.6. They are documented extensions
 //! (NOT in PRD §15.3) and must NOT enter the 12-entry Trigger Bus whitelist.
 
 use advance_event_bus::taxonomy::{self, ALL_EVENT_TYPES, TRIGGER_BUS_WHITELIST};

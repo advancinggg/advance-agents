@@ -1,10 +1,12 @@
 #![cfg(feature = "lane-e1")]
-//! Lane E1 — `SqliteEntityIndex` over the workspace index DB.
+//! Lane E1 — `SqliteEntityIndex` over the workspace index DB (the internal entity-data lane plan §2.2).
 
 use std::sync::Arc;
 
 use advance_database::{R2d2SqliteIndexHandle, SqliteEntityIndex, SqliteIndexHandle};
-use advance_shared_types::entity::{EntityId, EntityIndex, EntityKind, EntityQuery, EntityRow};
+use advance_shared_types::entity::{
+    EntityId, EntityIndex, EntityKind, EntityQuery, EntityRow, OrderKey,
+};
 use chrono::{DateTime, Utc};
 
 fn ts(s: &str) -> DateTime<Utc> {
@@ -21,6 +23,7 @@ fn row(id: &str, path: &str, anchor: Option<&str>, kind: EntityKind) -> EntityRo
         kind,
         r#type: "work-item".into(),
         title: Some(id.into()),
+        aspects: vec!["agenda".into()],
         status: Some("todo".into()),
         due_at: None,
         starts_at: None,
@@ -93,29 +96,64 @@ async fn e1_replace_path_is_whole_path_replacement() {
 }
 
 #[tokio::test]
-async fn e1_query_filters_and_bounds() {
+async fn e1_query_filters_windows_order_and_bounds() {
     let (_t, idx) = index().await;
     let mut soon = row("e-soon", "a.md", None, EntityKind::File);
     soon.due_at = Some(ts("2026-09-20T00:00:00Z"));
+    soon.priority = Some(1);
     let mut later = row("e-later", "b.md", None, EntityKind::File);
     later.due_at = Some(ts("2026-12-01T00:00:00Z"));
     later.status = Some("done".into());
-    idx.replace_path("alice", "a.md", vec![soon]).await.unwrap();
-    idx.replace_path("alice", "b.md", vec![later])
-        .await
-        .unwrap();
+    let mut meeting = row("e-meet", "c.md", None, EntityKind::File);
+    meeting.r#type = "meeting".into();
+    meeting.status = None;
+    meeting.starts_at = Some(ts("2026-09-20T09:00:00Z"));
+    meeting.ends_at = Some(ts("2026-09-20T10:00:00Z"));
+    let mut plain = row("e-plain", "d.md", None, EntityKind::File);
+    plain.aspects = vec![];
+    plain.status = None;
+    for (p, r) in [
+        ("a.md", soon),
+        ("b.md", later),
+        ("c.md", meeting),
+        ("d.md", plain),
+    ] {
+        idx.replace_path("alice", p, vec![r]).await.unwrap();
+    }
+
+    let mut q = EntityQuery::for_agent("alice");
+    q.aspect = Some("agenda".into());
+    assert_eq!(idx.query(&q).await.unwrap().len(), 3, "the plain file has no aspect");
+
+    let mut q = EntityQuery::for_agent("alice");
+    q.status = Some(vec!["todo".into(), "doing".into()]);
+    assert_eq!(idx.query(&q).await.unwrap().len(), 1, "status is an IN filter");
 
     let mut q = EntityQuery::for_agent("alice");
     q.due_between = Some((ts("2026-09-01T00:00:00Z"), ts("2026-10-01T00:00:00Z")));
-    let rows = idx.query(&q).await.unwrap();
     assert_eq!(
-        rows.iter().map(|r| r.id.0.as_str()).collect::<Vec<_>>(),
+        idx.query(&q).await.unwrap().iter().map(|r| r.id.0.as_str()).collect::<Vec<_>>(),
         vec!["e-soon"]
     );
 
     let mut q = EntityQuery::for_agent("alice");
-    q.status = Some("done".into());
-    assert_eq!(idx.query(&q).await.unwrap().len(), 1);
+    q.any_between = Some((ts("2026-09-20T00:00:00Z"), ts("2026-09-21T00:00:00Z")));
+    q.order = vec![OrderKey {
+        field: "starts_at".into(),
+        ascending: true,
+    }];
+    let day: Vec<_> = idx
+        .query(&q)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id.0)
+        .collect();
+    assert_eq!(
+        day,
+        vec!["e-meet".to_string(), "e-soon".to_string()],
+        "due-only and starts-only rows both fall in the day window; null sort key last"
+    );
 
     let mut q = EntityQuery::for_agent("alice");
     q.limit = 5000;
@@ -126,13 +164,17 @@ async fn e1_query_filters_and_bounds() {
 }
 
 #[tokio::test]
-async fn e1_repeat_expands_into_occurrences_with_horizon_and_cap() {
+async fn e1_repeat_expands_into_occurrences_with_exdates_horizon_and_cap() {
     let (_t, idx) = index().await;
     let mut weekly = row("e-w", "cal.md", None, EntityKind::File);
-    weekly.r#type = "event".into();
+    weekly.r#type = "meeting".into();
+    weekly.status = None;
     weekly.starts_at = Some(ts("2026-09-21T02:00:00Z"));
     weekly.ends_at = Some(ts("2026-09-21T03:00:00Z"));
-    weekly.fields = serde_json::json!({ "repeat": "FREQ=WEEKLY;BYDAY=MO" });
+    weekly.fields = serde_json::json!({
+        "repeat": "FREQ=WEEKLY;BYDAY=MO",
+        "exdates": ["2026-10-05T02:00:00Z"]
+    });
     idx.replace_path("alice", "cal.md", vec![weekly])
         .await
         .unwrap();
@@ -143,7 +185,14 @@ async fn e1_repeat_expands_into_occurrences_with_horizon_and_cap() {
     assert_eq!(
         rows.len(),
         1,
-        "one entity even though it occurs 4 times in the window"
+        "one entity even though it occurs several times in the window"
+    );
+
+    let mut q = EntityQuery::for_agent("alice");
+    q.occurs_between = Some((ts("2026-10-05T00:00:00Z"), ts("2026-10-06T00:00:00Z")));
+    assert!(
+        idx.query(&q).await.unwrap().is_empty(),
+        "an exdate removes that occurrence"
     );
 
     let mut q = EntityQuery::for_agent("alice");

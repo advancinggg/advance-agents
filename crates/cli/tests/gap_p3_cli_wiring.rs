@@ -1,5 +1,5 @@
 //! Pack lane P3 — composition-root wiring witnesses for `advance pack
-//! install`: the `pack:` block of
+//! install` (the internal pack gap-closure plan §4.1 + §4.4): the `pack:` block of
 //! the workspace `runtime-config.yaml` drives the real binary.
 //!
 //! - `pack.trust-roots` → `Installer::with_trust_roots`: a `pack.sig` signed by

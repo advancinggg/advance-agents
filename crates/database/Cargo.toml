@@ -30,5 +30,5 @@ tempfile = { workspace = true }
 workspace = true
 
 [features]
-# Entity-data gated witness tests (feature-gated until the lane closes)
+# entity-data lane gated witness tests (the internal entity-data lane plan §0.2)
 lane-e1 = []

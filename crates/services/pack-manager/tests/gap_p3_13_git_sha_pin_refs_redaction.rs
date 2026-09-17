@@ -1,5 +1,5 @@
 //! GAP-13 (P3) — git source: commit-SHA pin, slash refs, credential redaction.
-//!
+//! See the internal pack gap-closure plan §4.2.
 
 use std::path::Path;
 use std::sync::Arc;

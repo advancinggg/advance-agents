@@ -1,4 +1,4 @@
-//! GAP-02 (P1) — composition-root pack wiring.
+//! GAP-02 (P1) — composition-root pack wiring. See the internal pack gap-closure plan §2.8.
 //! `build_pack_wiring` must yield a registry rescanned from disk, a chained template
 //! resolver (builtins + pack FQ refs), and a pack evaluator resolver.
 

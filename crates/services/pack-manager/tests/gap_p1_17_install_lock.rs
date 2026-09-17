@@ -1,5 +1,5 @@
 //! GAP-17 (P1) — cross-process install lock around steps ③(AlreadyInstalled)→⑥→⑦→⑧.
-//! Concurrent installs of DISTINCT packs must all
+//! See the internal pack gap-closure plan §2.5. Concurrent installs of DISTINCT packs must all
 //! land in `.meta.yaml`; concurrent installs of the SAME pack must yield exactly one
 //! `Ok` and one `AlreadyInstalled` (never an `Io` error from the dst-fresh check).
 

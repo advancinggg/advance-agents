@@ -8,10 +8,15 @@ Each subdirectory is one installable pack: its layout IS the install layout —
 else is allowed at a pack's top level (no README / LICENSE — describe the pack in
 `pack.yaml` `description` and in its skills' `SKILL.md`).
 
-Install one locally:
+Source directories are **text only**. A pack that ships a skill `tool.wasm` keeps the Rust
+source in `crates/packs/<name>-tools` (a workspace `exclude`, target `wasm32-unknown-unknown`)
+and a build manifest `packs/<name>.build.yaml` next to the pack directory:
 
 ```bash
-advance pack install packs/todo --packs-dir .advance/packs
+rustup target add wasm32-unknown-unknown
+advance pack build packs/agenda --out target/packs     # copies the pack, builds tool.wasm, fills checksums
+advance pack install target/packs/agenda --packs-dir .advance/packs
+advance pack install packs/agenda --packs-dir .advance/packs   # text-only install (no series operations)
 ```
 
 ## Contribution rules
@@ -22,10 +27,15 @@ advance pack install packs/todo --packs-dir .advance/packs
 2. `required-capabilities` may only name runtime capabilities (`agent_config::KNOWN_CAPABILITIES`)
    or resource-capability ids provided by another pack in this directory.
 3. Every pack here is installed by CI on every change (`crates/cli/tests/packs_dir_ci.rs`
-   drives the real installer). A pack that fails to install fails the build.
+   drives the real installer over the source directories, and over `target/packs/*` when a
+   build ran first). A pack that fails to install fails the build.
 4. Versions are semver. Bumping a pack's version records the change in the `description`
    `changelog:` line (the layout allow-list has no room for a CHANGELOG file).
-5. Skills are knowledge-only unless they ship a `tool.wasm` that exports `tool-exports`.
+5. A skill's `tool.wasm` is pure computation: no clock, no randomness, no I/O. `data.apply`
+   invokes it with a fixed clock and seed, so equal inputs must give equal outputs.
+6. Structured data lives in frontmatter and is read and written through the runtime's `data`
+   host tool. A pack declares vocabulary (fields, invariants, queries, views, operation
+   bindings) in `meta-schema-extensions/`; it never ships code that touches storage.
 
-See the structured-data lane notes for the entity model the `todo` and `calendar` packs
-declare aspects for.
+See `the internal entity-data lane plan` for the entity model and the `agenda` pack that declares
+the first aspect.

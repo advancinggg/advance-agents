@@ -1,5 +1,5 @@
 //! GAP-04 (P2) — workflow compensation on partial failure.
-//! When step i fails, every earlier
+//! See the internal pack gap-closure plan §3.5. When step i fails, every earlier
 //! successful spawn-child / submit-component is compensated in reverse order and the
 //! applier returns `PackError::WorkflowStepFailed { step, source, compensated,
 //! compensation_failures }`.

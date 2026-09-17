@@ -1,5 +1,5 @@
 //! GAP-01 (P1) — `advance pack install | list | uninstall`.
-//! Mirrors the skill_import.rs assert_cmd style.
+//! See the internal pack gap-closure plan §2.7. Mirrors the skill_import.rs assert_cmd style.
 
 use std::path::{Path, PathBuf};
 

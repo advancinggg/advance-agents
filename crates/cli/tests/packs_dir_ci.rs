@@ -1,4 +1,4 @@
-//! `packs/` directory CI guard.
+//! `packs/` directory CI guard (the internal entity-data lane plan §3.1 rule 4).
 //!
 //! Every subdirectory of the repository's `packs/` is a first-party or community pack. This
 //! test drives the REAL `advance_pack_manager::Installer` over each one into a fresh temporary
@@ -12,7 +12,27 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use advance_pack_manager::{AutoApprove, InMemoryPackRegistry, Installer, PackRegistry};
+use advance_pack_manager::{
+    AutoApprove, ComponentKind, InMemoryPackRegistry, Installer, PackRegistry,
+};
+
+/// The MODULE-018 install-layout directory of each provide kind (the `{kind-dir}` segment of a
+/// prefixed FQ ref). Exhaustive on purpose: a 12th kind must be added here too.
+fn kind_dir(kind: ComponentKind) -> &'static str {
+    match kind {
+        ComponentKind::Binary => "behavior-binaries",
+        ComponentKind::AgentTemplate => "agent-templates",
+        ComponentKind::Skill => "skills",
+        ComponentKind::RunnableComponent => "components",
+        ComponentKind::ChannelAdapter => "channel-adapters",
+        ComponentKind::McpServer => "mcp-servers",
+        ComponentKind::Preset => "presets",
+        ComponentKind::Workflow => "workflows",
+        ComponentKind::MemorySeed => "memory-seeds",
+        ComponentKind::MetaSchemaExtension => "meta-schema-extensions",
+        ComponentKind::ResourceCapability => "resource-capabilities",
+    }
+}
 
 fn packs_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -66,8 +86,10 @@ async fn every_pack_in_packs_dir_installs_with_the_real_installer() {
             "{}: not in registry after install",
             dir.display()
         );
-        // Every declared provide resolves through the registry (the exact FQ-ref grammar the
-        // runtime uses), so a typo between pack.yaml and the directory tree cannot ship.
+        // Every declared provide resolves through the registry in the prefixed FQ-ref form
+        // (`{pack}@{version}/{kind-dir}/{name}`, the one the runtime uses when a pack reuses a
+        // name across kinds — `agenda` is both a skill and a meta-schema extension), so a typo
+        // between pack.yaml and the directory tree cannot ship.
         let provides = registry
             .provides(&report.name, &report.version)
             .expect("installed pack enumerates provides");
@@ -77,7 +99,13 @@ async fn every_pack_in_packs_dir_installs_with_the_real_installer() {
             dir.display()
         );
         for p in provides {
-            let fq = format!("{}@{}/{}", report.name, report.version, p.name);
+            let fq = format!(
+                "{}@{}/{}/{}",
+                report.name,
+                report.version,
+                kind_dir(p.kind),
+                p.name
+            );
             registry.resolve(&fq).unwrap_or_else(|e| {
                 panic!("{}: provide {fq} does not resolve: {e}", dir.display())
             });

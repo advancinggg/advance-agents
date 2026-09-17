@@ -1,0 +1,65 @@
+# Aspect `agenda` — the one aspect this pack owns (the internal entity-data lane plan §1.2 / §1.4).
+# An entity has it iff `status` or `starts` is present. Grammar = meta-schema v2 (lane E1):
+# installing this pack only checks the file exists; the boot-time structured merge needs E1.
+aspect: agenda
+key: [status, starts]
+
+optional:
+  status:
+    type: [todo, doing, done, cancelled]
+    transitions:
+      todo: [doing, done, cancelled]
+      doing: [todo, done, cancelled]
+      done: [todo]
+      cancelled: [todo]
+  due:
+    type: datetime
+  priority:
+    type: integer
+  assignee:
+    type: string
+    inherit: true
+  completed_at:
+    type: datetime
+    derive:
+      when: { status: done }
+      value: $now
+      else: unset
+  starts:
+    type: datetime
+  ends:
+    type: datetime
+    ensure: { gt: starts }
+  all_day:
+    type: boolean
+  repeat:
+    type: string            # RFC 5545 RRULE, e.g. FREQ=WEEKLY;BYDAY=MO
+  exdates:
+    type: list<datetime>    # occurrences removed from the series
+  tz:
+    type: string            # IANA zone, e.g. Asia/Shanghai
+
+queries:
+  open:
+    where: { status: [todo, doing] }
+    order: [due asc, priority desc]
+  overdue:
+    where: { status: [todo, doing], due: { lt: $now } }
+    order: [due asc]
+  day:
+    args: { day: datetime }
+    any_between: [$args.day, $args.day + 1d]
+    order: [starts asc, due asc]
+  upcoming:
+    any_between: [$now, $now + 7d]
+    order: [starts asc, due asc]
+
+views:
+  list:     { kind: list,     query: open }
+  board:    { kind: board,    query: open, group_by: status }
+  calendar: { kind: calendar, query: upcoming }
+  form:     { kind: form }
+
+operations:
+  detach_occurrence: { tool: agenda, method: detach-occurrence }
+  shift_series:      { tool: agenda, method: shift-series }

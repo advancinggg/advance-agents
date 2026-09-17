@@ -31,7 +31,7 @@
 //!   source surface; Slice C added `ConstraintViolation`; Pack lane P1
 //!   added `AlreadyInstalled`, `DependentsExist`, `UnknownRequiredCapability`;
 //!   P3 added `SignatureInvalid`; P2 added `WorkflowStepFailed`).
-//! - Pack lane P1: [`Installer::new`]
+//! - Pack lane P1 (the internal pack gap-closure plan §2): [`Installer::new`]
 //!   builder + [`NoopTraceSink`]; disk-truth `AlreadyInstalled` at step ③ (before
 //!   checksum / approval); [`Installer::uninstall`] with `DependentsExist`
 //!   refusal; a cross-process install lock ([`INSTALL_LOCK_FILENAME`]) held
@@ -43,14 +43,14 @@
 //!   `RecordingTraceSink` visibility precedent. The production HTTPS client
 //!   (`HttpsRegistryClient`) lives in the cli composition root
 //!   (Pack lane P3); `list_versions` is a default method here.
-//! - Pack lane P3: signed manifests
+//! - Pack lane P3 (the internal pack gap-closure plan §4): signed manifests
 //!   ([`signature`] — `pack.sig` ed25519 over `pack.yaml`, `Installer::with_trust_roots`,
 //!   `PackError::SignatureInvalid`, unsigned `trusted` claims downgraded and
 //!   surfaced through [`ApprovalContext`]); git commit-SHA pins + slash refs +
 //!   userinfo redaction ([`redact_userinfo`]); and the fd-relative
 //!   [`fetch::copy_dir_no_symlinks_observed`] copy that closes the source-side
 //!   symlink-swap TOCTOU window.
-//! - Pack lane P2: workflow
+//! - Pack lane P2 (the internal pack gap-closure plan §3): workflow
 //!   compensation (`WorkflowExecutor::{terminate_child, withdraw_component}` +
 //!   `PackError::WorkflowStepFailed`); the `mcp-servers/{name}.yaml` schema
 //!   ([`mcp_server_manifest`]); the STRUCTURED meta-schema extension merge

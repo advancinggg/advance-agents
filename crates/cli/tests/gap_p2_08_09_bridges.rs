@@ -1,5 +1,5 @@
 //! GAP-08 + GAP-09 (P2, cli half) — pack → subsystem bridges with trust propagation.
-//!
+//! See the internal pack gap-closure plan §3.1 / §3.2.
 //!
 //! FIXTURE-GRAMMAR notes: the `mcp-servers/*.yaml` and `presets/*.yaml` fixtures below
 //! must follow the grammars ALREADY enforced by `materialize_impl.rs::register_mcp_server`
