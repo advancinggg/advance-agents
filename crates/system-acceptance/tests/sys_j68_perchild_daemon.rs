@@ -1737,7 +1737,12 @@ async fn build_rig_282(serve: bool) -> Rig282 {
     let injector = Arc::new(CapabilityInjector::new(registry, grant, breaker));
     let runtime = Arc::new(ComponentRuntime::new(&wasm_cfg()).expect("runtime"));
 
-    let key_resolver: KeyResolver = Arc::new(|bare: &str| format!("agent:{bare}"));
+    // Bare tree id → served key through the tree's handle registry (the production
+    // resolver): a boot-declared child is served under `agent:<alias>`, not its UUID.
+    let key_resolver: KeyResolver = {
+        let keys_tree = bare_store.clone();
+        Arc::new(move |bare: &str| advance_cli::agent_config::mailbox_key_for(&keys_tree, bare))
+    };
     let mgr = Arc::new(PerChildLoopManager::new(
         store.clone(),
         bus_dyn.clone(),

@@ -372,8 +372,9 @@ fn history_payload(event: &advance_event_bus::Event) -> ObservationNode {
 
 pub use crate::grant_adapter::Contract219GrantAdapter;
 
-/// The root serve key when no identity is composed (tests): the default handle `root`.
-#[cfg(feature = "test-support")]
+/// The root serve key when no identity is composed (harness / unit fixtures): the mailbox of
+/// the default root handle `root`. Production composes the resolved `agent:<handle>` instead
+/// (`WiringHandles::root_mailbox_id`).
 const SERVE_LOOP_AGENT: &str = "agent:root";
 
 const MAX_TRACKED_CLIENT_MESSAGES: usize = 4096;
@@ -530,8 +531,9 @@ impl MessagingProvider for ServeLoopMessagingProvider {
 pub struct FirstPartyClientCompose {
     pub run: Option<Arc<dyn RunControlProvider>>,
     pub mailbox: Option<Arc<MailboxStore>>,
-    /// The root serve key (`agent:<handle>`) the messaging provider accepts as `to`.
-    pub serve_agent: String,
+    /// The root serve key (`agent:<handle>`) the messaging provider accepts as `to`; `None`
+    /// (a harness composition) ⇒ the default handle's key `agent:root`.
+    pub serve_agent: Option<String>,
     pub(crate) ingress: Option<Arc<ExecutionTurnIngress>>,
     pub replies: Option<Arc<ReplyRegistry>>,
     pub history: Option<Arc<dyn BoundHistoryReadPort>>,
@@ -563,7 +565,13 @@ pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCom
         api = api.with_run_provider(run);
     }
     if let (Some(store), Some(replies)) = (parts.mailbox, parts.replies) {
-        api = install_serve_loop_messaging(api, store, parts.ingress, replies, &parts.serve_agent);
+        api = install_serve_loop_messaging(
+            api,
+            store,
+            parts.ingress,
+            replies,
+            parts.serve_agent.as_deref().unwrap_or(SERVE_LOOP_AGENT),
+        );
     }
     if let Some(history) = parts.history {
         api = api.with_bound_history_provider(history);

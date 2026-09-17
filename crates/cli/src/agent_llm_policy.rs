@@ -90,10 +90,10 @@ impl WorkspaceAgentLlmPolicy {
         tree.get_node(&AgentId(agent_id.to_string()))
             .map(|n| n.workspace_path)
             .or_else(|| {
-                // A colon-scoped served id (`agent:<bare>`) resolves to its bare tree id.
+                // A served id (`agent:<handle>`) resolves through the tree's handle registry.
                 agent_id
                     .strip_prefix("agent:")
-                    .and_then(|bare| tree.get_node(&AgentId(bare.to_string())))
+                    .and_then(|handle| tree.node_by_handle(handle))
                     .map(|n| n.workspace_path)
             })
     }

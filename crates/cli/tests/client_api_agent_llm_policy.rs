@@ -35,7 +35,9 @@ use cap_llm::{
 };
 use serde_json::{json, Value};
 
-const ROOT: &str = "default-agent";
+/// The root's HANDLE (the `/client/agents/{agent_id}` path parameter); its cap-layer id is the
+/// per-boot UUID in `handles.root_agent_id`.
+const ROOT: &str = "root";
 const MASTER_KEY_ENV: &str = "ADV_AGENT_LLM_POLICY_MK";
 const MASTER_KEY_HEX: &str = "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c";
 
@@ -215,11 +217,13 @@ async fn lp01_llm_block_over_production_wiring() {
     // The production policy source over the shared tree resolves the root from disk.
     let source = WorkspaceAgentLlmPolicy::new(
         handles.agent_tree.clone(),
-        ROOT,
+        handles.root_agent_id.clone(),
         ws.clone(),
         handles.event_bus_dyn.clone(),
     );
-    let policy = source.policy_for(ROOT).expect("root policy");
+    let policy = source
+        .policy_for(&handles.root_agent_id)
+        .expect("root policy");
     assert_eq!(policy.provider.as_deref(), Some("eu-mirror"));
     assert_eq!(policy.model.as_deref(), Some("gpt4o"));
     assert_eq!(
@@ -243,7 +247,8 @@ async fn lp01_llm_block_over_production_wiring() {
     assert_eq!(config_text(&ws), before, "a refused update writes nothing");
 
     // A child created WITH a block gets it in its own territory; the tree-backed source
-    // resolves it by the bare tree id.
+    // resolves it by the bare tree id (the minted UUID the response carries as `id`, not the
+    // handle `research`).
     let env = post(
         &api,
         "/client/agents",
@@ -256,6 +261,8 @@ async fn lp01_llm_block_over_production_wiring() {
         "k-create-research",
     );
     let d = detail(&env);
+    let child_id = d.agent.id.clone();
+    assert_eq!(d.agent.agent_id, "research");
     assert_eq!(d.config.llm.unwrap().provider.as_deref(), Some("openai"));
     let child_text = config_text(&ws.join("research"));
     assert!(child_text.contains("llm:"), "{child_text}");
@@ -264,7 +271,7 @@ async fn lp01_llm_block_over_production_wiring() {
         "the child's block never lands in the root document"
     );
     let policy = source
-        .policy_for("research")
+        .policy_for(&child_id)
         .expect("child policy via the tree");
     assert_eq!(policy.provider.as_deref(), Some("openai"));
     assert_eq!(policy.model.as_deref(), Some("gpt4o"));
@@ -305,7 +312,7 @@ async fn lp01_llm_block_over_production_wiring() {
         .unwrap();
     f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
         .unwrap();
-    assert!(source.policy_for(ROOT).is_none());
+    assert!(source.policy_for(&handles.root_agent_id).is_none());
 }
 
 // ── LP-02: a pinned provider missing from the runtime config fails closed, in-process ─────────
@@ -334,7 +341,10 @@ async fn lp02_pin_to_vanished_provider_fails_closed_without_leaving_the_process(
         LlmError::ModelNotAvailable(msg) => {
             assert_eq!(
                 msg,
-                "provider vanished not configured for agent default-agent"
+                format!(
+                    "provider vanished not configured for agent {}",
+                    handles.root_agent_id
+                )
             )
         }
         other => panic!("expected ModelNotAvailable, got {other:?}"),

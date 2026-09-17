@@ -2870,7 +2870,7 @@ async fn wire_capabilities_inner(
                     mailbox: Some(ingress_for_api.clone()),
                     ingress: ingress_port.clone(),
                     replies: Some(replies_for_api.clone()),
-                    serve_agent: root_colon_for_api.clone(),
+                    serve_agent: Some(root_colon_for_api.clone()),
                     tools: None,
                     llm_delta_hub: llm_delta_hub_opt.clone(),
                     agents: agent_admin_for_api

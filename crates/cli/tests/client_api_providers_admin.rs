@@ -687,7 +687,7 @@ async fn pv04_agent_pin_blocks_delete_through_production_reference_check() {
     // Pin the root agent to `openai` through the agents family (Lane 2's surface).
     let env = post(
         &api,
-        "/client/agents/default-agent:update",
+        "/client/agents/root:update",
         json!({ "llm": { "provider": "openai" } }),
         "k-pv04-pin",
     );
@@ -725,7 +725,7 @@ async fn pv04_agent_pin_blocks_delete_through_production_reference_check() {
     // Clear the pin (`{}`), re-create the second provider, and the former pin target deletes.
     let env = post(
         &api,
-        "/client/agents/default-agent:update",
+        "/client/agents/root:update",
         json!({ "llm": {} }),
         "k-pv04-unpin",
     );

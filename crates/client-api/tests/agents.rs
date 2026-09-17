@@ -1295,7 +1295,7 @@ fn ag20_llm_policy_read_update_and_validation() {
     assert_eq!(llm.provider.as_deref(), Some("local"));
     assert_eq!(llm.model.as_deref(), Some("tiny"));
     assert!(llm.constraint.is_none());
-    let env = api.handle(get("/client/agents/default-agent"));
+    let env = api.handle(get("/client/agents/root"));
     assert!(env.data.as_ref().unwrap()["config"].get("llm").is_none());
 
     // Update: whole-block replacement reaches the provider; NO restart warning for llm alone.
@@ -1346,7 +1346,7 @@ fn ag20_llm_policy_read_update_and_validation() {
 
     // Root agent accepts an llm update too.
     let env = api.handle(post(
-        "/client/agents/default-agent:update",
+        "/client/agents/root:update",
         json!({ "llm": { "model": "sonnet" } }),
         "k-llm-root",
     ));

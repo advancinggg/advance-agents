@@ -51,7 +51,6 @@ use cap_memory::MemoryStore;
 use wasmtime::component::Val;
 
 const NS: &str = "advance:runtime/agent-lifecycle@0.2.0";
-const CAP_AGENT: &str = "root"; // the bare cap id = the tree Root + spawn caller
 const MSG_AGENT: &str = "agent:root"; // the colon msg id the production assembler keys on
 const TEST_MASTER_KEY_HEX: &str =
     "2031425364758697a8b9cadbecfd0e1f2031425364758697a8b9cadbecfd0e1f";

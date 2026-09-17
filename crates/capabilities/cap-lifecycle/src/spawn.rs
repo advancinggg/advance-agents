@@ -410,11 +410,7 @@ impl Spawner for DefaultSpawner {
         };
         // Persist the immutable id into the child's own document so the next boot adopts
         // the SAME id (every store keyed by it stays attached across restarts).
-        if let Err(e) = crate::identity::upsert_config_key(
-            &target_dir,
-            crate::identity::ID_KEY,
-            &cfg.child_id.0,
-        ) {
+        if let Err(e) = crate::identity::persist_agent_id(&target_dir, &cfg.child_id.0) {
             rollback_target_dir(&target_dir, target_pre_existed, self.tree.workspace_root());
             return Err(SpawnError::WorkspaceIoFailure(format!(
                 "persist agent id: {e}"

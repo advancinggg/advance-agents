@@ -452,9 +452,10 @@ async fn t_ptr_10_e2e_spawn_child_materializes_pack_template() {
 
     let node = tree.get_node(&AgentId("scout".to_string())).unwrap();
     let agent = node.workspace_path.join(".agent");
+    // The manifest lands verbatim; the spawner appends only the immutable `id:` line.
     assert_eq!(
         std::fs::read_to_string(agent.join("config.yaml")).unwrap(),
-        EMBEDDED_TEMPLATE_YAML
+        format!("{EMBEDDED_TEMPLATE_YAML}id: scout\n")
     );
     assert!(std::fs::read_to_string(agent.join("AGENTS.md"))
         .unwrap()

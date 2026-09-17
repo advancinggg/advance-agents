@@ -575,11 +575,12 @@ async fn sys_ac_093_template_materializable_via_spawn_from_template() {
         SKILL_CONTENT,
         "materialized skill content == the installed pack's template skill"
     );
-    // config.yaml == the pack's verbatim template.yaml (apply_template's manifest dest).
+    // config.yaml == the pack's verbatim template.yaml (apply_template's manifest dest) plus
+    // the immutable `id:` line the spawner appends.
     assert_eq!(
         std::fs::read_to_string(agent.join("config.yaml")).expect("config.yaml materialized"),
-        TEMPLATE_YAML,
-        "materialized config.yaml == the installed pack's verbatim template.yaml"
+        format!("{TEMPLATE_YAML}id: child093\n"),
+        "materialized config.yaml == the installed pack's verbatim template.yaml + id"
     );
 
     // ── 5. Non-vacuity CONTROL — a template_ref that does NOT resolve in the ──
