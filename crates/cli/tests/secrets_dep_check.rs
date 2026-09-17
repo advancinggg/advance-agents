@@ -101,6 +101,7 @@ fn t15h_build_policy_maps_config_to_declared_policy() {
     let empty = SecretsConfig {
         master_key_source: MasterKeySource::EnvVar,
         env_var_name: "X".into(),
+        keychain: None,
         dependencies: HashMap::new(),
     };
     assert!(
@@ -114,6 +115,7 @@ fn t15h_build_policy_maps_config_to_declared_policy() {
     let configured = SecretsConfig {
         master_key_source: MasterKeySource::EnvVar,
         env_var_name: "X".into(),
+        keychain: None,
         dependencies: deps,
     };
     let policy = build_secrets_dependency_policy(&configured)

@@ -30,12 +30,21 @@ impl Drop for StoredSecret {
 
 pub enum StorageError {
     Backend(String),
+    /// keychain-sync: the stored value carries a key id (`kid`) that is not the id of the
+    /// master key this handle was opened with — the ciphertext was written under a
+    /// DIFFERENT master key (another namespace's key, a re-minted key, or a device that
+    /// never synced the master item). Distinct from a generic decrypt failure so the
+    /// operator gets an actionable reason.
+    KeyMismatch,
 }
 
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StorageError::Backend(_) => write!(f, "storage backend error"),
+            StorageError::KeyMismatch => {
+                write!(f, "ciphertext was written under a different master key")
+            }
         }
     }
 }

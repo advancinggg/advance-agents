@@ -34,6 +34,15 @@ serde_json = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+# keychain-sync (this lane): the iCloud-Keychain backend calls
+# `SecItemAdd / SecItemCopyMatching / SecItemUpdate / SecItemDelete` directly (the `keyring`
+# crate's macOS backend is the legacy file keychain and cannot set `kSecAttrSynchronizable` /
+# `kSecUseDataProtectionKeychain`). Both crates are already in Cargo.lock through
+# `keyring → security-framework`; the pins mirror the locked versions.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+security-framework-sys = "=2.17.0"
+core-foundation = "=0.9.4"
+
 [dev-dependencies]
 tokio = { workspace = true }
 # /dev WS-A: FileSecretStorage tests write to throwaway temp dirs.

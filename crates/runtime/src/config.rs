@@ -843,8 +843,54 @@ pub struct CircuitBreakerSpec {
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub enum MasterKeySource {
+    /// The `keyring` OS credential store (legacy file keychain on macOS) with the env var
+    /// as fallback; ciphertext in `<home>/.advance/secrets.json`.
     Keychain,
+    /// The env var only; ciphertext in `<home>/.advance/secrets.json`.
     EnvVar,
+    /// keychain-sync (this lane): master key AND every
+    /// ciphertext row are synchronizable data-protection keychain items (iCloud Keychain
+    /// carries them between devices); the home keeps only secret names. Env var first
+    /// (unchanged contract), then the keychain master item; `master.key` / `secrets.json`
+    /// are never used. Apple platforms only — elsewhere the secrets store fails closed.
+    KeychainSync,
+}
+
+/// The optional `secrets.keychain` block (only valid with `master-key-source: keychain-sync`).
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct KeychainSyncConfig {
+    /// `kSecAttrAccessGroup` of every item (`<TEAMID>.agents.advance.shared`); absent → the
+    /// process's default access group.
+    #[serde(rename = "access-group", default)]
+    pub access_group: Option<String>,
+    /// Item namespace (`agents.advance.<namespace>.{master,secrets}`); homes sharing a
+    /// namespace share secret names. `^[A-Za-z0-9_-]{1,64}$`, default `default`.
+    #[serde(default = "default_keychain_namespace")]
+    pub namespace: String,
+    /// `true` (default) → `kSecAttrSynchronizable` items (iCloud Keychain); `false` →
+    /// ThisDeviceOnly items on this device (synced items are read through and never
+    /// deleted).
+    #[serde(default = "default_true")]
+    pub synchronizable: bool,
+}
+
+fn default_keychain_namespace() -> String {
+    "default".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for KeychainSyncConfig {
+    fn default() -> Self {
+        Self {
+            access_group: None,
+            namespace: default_keychain_namespace(),
+            synchronizable: true,
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -854,6 +900,10 @@ pub struct SecretsConfig {
     pub master_key_source: MasterKeySource,
     #[serde(rename = "env-var-name")]
     pub env_var_name: String,
+    /// keychain-sync item settings; `None` = defaults (namespace `default`, synchronizable).
+    /// Rejected by validation unless `master-key-source: keychain-sync`.
+    #[serde(default)]
+    pub keychain: Option<KeychainSyncConfig>,
     /// AC-15 caller-dependency allowlist (Wave-18 Lane-3, additive — CONTRACT-003).
     /// Maps a BARE cap agent-id (`HostCallContext.agent_id`, e.g. the
     /// production-stamped `default-agent`) to the secret names that agent has
@@ -2239,6 +2289,33 @@ fn validate_config(path: &Path, cfg: &RuntimeConfig) -> Result<(), ConfigError> 
     ];
     if RESERVED.contains(&name) {
         return invalid("secrets.env-var-name must not be an OS-reserved name");
+    }
+    // keychain-sync block: only meaningful with that source; bounded identifiers.
+    if let Some(kc) = &cfg.secrets.keychain {
+        if cfg.secrets.master_key_source != MasterKeySource::KeychainSync {
+            return invalid("secrets.keychain requires master-key-source: keychain-sync");
+        }
+        if kc.namespace.is_empty()
+            || kc.namespace.len() > 64
+            || !kc
+                .namespace
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return invalid("secrets.keychain.namespace must match ^[A-Za-z0-9_-]{1,64}$");
+        }
+        if let Some(group) = &kc.access_group {
+            if group.is_empty()
+                || group.len() > 256
+                || !group
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            {
+                return invalid(
+                    "secrets.keychain.access-group must be a non-empty [A-Za-z0-9_.-] identifier (<= 256 chars)",
+                );
+            }
+        }
     }
 
     // --- PostProcessor: non-empty model + cooldown bounded ---

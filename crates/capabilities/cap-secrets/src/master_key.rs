@@ -344,7 +344,9 @@ fn persist_master_key_file_exclusive(
     Ok(())
 }
 
-fn decode_to_key(hex_str: &Zeroizing<String>) -> Result<Zeroizing<[u8; 32]>, SecretError> {
+pub(crate) fn decode_to_key(
+    hex_str: &Zeroizing<String>,
+) -> Result<Zeroizing<[u8; 32]>, SecretError> {
     // hex 0.4: `hex::decode(&str) -> Result<Vec<u8>, FromHexError>`.
     // Expected input: 64 hex chars (32 bytes) — matches the established
     // project convention (MODULE-001 runtime-config.yaml + PRD §secrets:

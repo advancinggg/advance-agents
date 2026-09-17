@@ -17,6 +17,10 @@ pub enum SecretError {
     Storage(StorageError),
     /// Decrypted plaintext was not valid UTF-8.
     InvalidUtf8,
+    /// keychain-sync: the ciphertext's key id does not match the master key in use (see
+    /// [`StorageError::KeyMismatch`]). Surfaced as its own variant so the message names the
+    /// cause ("a different master key") instead of a generic decrypt failure.
+    KeyMismatch,
 }
 
 impl std::fmt::Display for SecretError {
@@ -38,6 +42,10 @@ impl std::fmt::Display for SecretError {
             // Elide the backend string on Display and Debug alike.
             SecretError::Storage(_) => write!(f, "secret storage backend error"),
             SecretError::InvalidUtf8 => write!(f, "decrypted secret not valid UTF-8"),
+            SecretError::KeyMismatch => write!(
+                f,
+                "ciphertext was written under a different master key (kid mismatch): resolve it with the master key that wrote it, or re-store the secret under the current key"
+            ),
         }
     }
 }
@@ -78,7 +86,10 @@ impl std::error::Error for SecretError {
 
 impl From<StorageError> for SecretError {
     fn from(e: StorageError) -> Self {
-        SecretError::Storage(e)
+        match e {
+            StorageError::KeyMismatch => SecretError::KeyMismatch,
+            other => SecretError::Storage(other),
+        }
     }
 }
 
@@ -158,6 +169,22 @@ mod tests {
         );
 
         // InvalidUtf8: trivial.
+        // KeyMismatch: fixed text, no bytes (and the storage-level twin maps onto it).
+        let km = SecretError::KeyMismatch;
+        let s = format!("{km}");
+        assert!(
+            s.contains("different master key"),
+            "KeyMismatch Display: {s}"
+        );
+        assert!(
+            !contains_long_hex(&s),
+            "KeyMismatch Display leaked hex: {s}"
+        );
+        assert!(matches!(
+            SecretError::from(StorageError::KeyMismatch),
+            SecretError::KeyMismatch
+        ));
+
         let u = SecretError::InvalidUtf8;
         let s = format!("{u}");
         assert_eq!(s, "decrypted secret not valid UTF-8");
