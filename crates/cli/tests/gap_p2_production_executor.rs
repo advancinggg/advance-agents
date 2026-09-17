@@ -183,10 +183,12 @@ async fn pe_01_success_path_spawns_submits_and_registers() {
 
     // spawn-child: a real child node under the root, materialized from the
     // pack template into `<ws>/research-assistant/.agent/`.
+    // The target-path leaf is the child's HANDLE; its tree id is a minted UUID.
     let child = r
         .tree
-        .get_node(&AgentId("research-assistant".into()))
+        .node_by_handle("research-assistant")
         .expect("child node inserted");
+    assert!(uuid::Uuid::parse_str(&child.id.0).is_ok(), "{}", child.id.0);
     assert_eq!(child.parent, Some(AgentId("root".into())));
     assert_eq!(
         child.template_ref.as_deref(),
@@ -304,15 +306,15 @@ async fn pe_04_compensation_goes_through_the_lifecycle_cascade_when_installed() 
         "{err:?}"
     );
     // The cascade was invoked with the executor's parent as caller …
-    assert_eq!(
-        terminator.calls.lock().unwrap().clone(),
-        vec![("root".to_string(), "doomed-assistant".to_string())]
+    let calls = terminator.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].0, "root");
+    assert!(
+        uuid::Uuid::parse_str(&calls[0].1).is_ok(),
+        "the cascade is called with the child's tree id, not its handle: {calls:?}"
     );
     // … and the workspace the spawn created is gone too (the cascade keeps
     // Child territories; the undo must not).
-    assert!(r
-        .tree
-        .get_node(&AgentId("doomed-assistant".into()))
-        .is_none());
+    assert!(r.tree.node_by_handle("doomed-assistant").is_none());
     assert!(!r.workspace.join("doomed-assistant").exists());
 }

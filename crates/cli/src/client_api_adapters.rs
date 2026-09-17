@@ -372,8 +372,9 @@ fn history_payload(event: &advance_event_bus::Event) -> ObservationNode {
 
 pub use crate::grant_adapter::Contract219GrantAdapter;
 
-/// Must match `commands::start::DEFAULT_MSG_AGENT_ID` (avoid a start↔adapters cycle).
-const SERVE_LOOP_AGENT: &str = "agent:default";
+/// The root serve key when no identity is composed (tests): the default handle `root`.
+#[cfg(feature = "test-support")]
+const SERVE_LOOP_AGENT: &str = "agent:root";
 
 const MAX_TRACKED_CLIENT_MESSAGES: usize = 4096;
 
@@ -418,6 +419,8 @@ pub struct ServeLoopMessagingProvider {
     replies: Arc<ReplyRegistry>,
     counter: AtomicU64,
     sent: Mutex<TrackedSends>,
+    /// The served root mailbox key (`agent:<handle>`), the only accepted `to`.
+    serve_agent: String,
 }
 
 impl ServeLoopMessagingProvider {
@@ -425,6 +428,7 @@ impl ServeLoopMessagingProvider {
         store: Arc<MailboxStore>,
         ingress: Option<Arc<ExecutionTurnIngress>>,
         replies: Arc<ReplyRegistry>,
+        serve_agent: impl Into<String>,
     ) -> Self {
         Self {
             store,
@@ -432,12 +436,13 @@ impl ServeLoopMessagingProvider {
             replies,
             counter: AtomicU64::new(0),
             sent: Mutex::new(TrackedSends::new()),
+            serve_agent: serve_agent.into(),
         }
     }
 
     #[cfg(feature = "test-support")]
     pub fn for_test(store: Arc<MailboxStore>, replies: Arc<ReplyRegistry>) -> Self {
-        Self::new(store, None, replies)
+        Self::new(store, None, replies, SERVE_LOOP_AGENT)
     }
 }
 
@@ -446,15 +451,19 @@ pub fn install_serve_loop_messaging(
     store: Arc<MailboxStore>,
     ingress: Option<Arc<ExecutionTurnIngress>>,
     replies: Arc<ReplyRegistry>,
+    serve_agent: &str,
 ) -> ClientApi {
     api.with_messaging_provider(Arc::new(ServeLoopMessagingProvider::new(
-        store, ingress, replies,
+        store,
+        ingress,
+        replies,
+        serve_agent,
     )))
 }
 
 impl MessagingProvider for ServeLoopMessagingProvider {
     fn send(&self, to: &str, payload: &[u8]) -> Result<ClientMessageAck, ProviderError> {
-        if to != SERVE_LOOP_AGENT {
+        if to != self.serve_agent {
             return Err(ProviderError::NotFound("target".to_owned()));
         }
         let message_id = format!("cmsg-{}", self.counter.fetch_add(1, Ordering::SeqCst));
@@ -521,6 +530,8 @@ impl MessagingProvider for ServeLoopMessagingProvider {
 pub struct FirstPartyClientCompose {
     pub run: Option<Arc<dyn RunControlProvider>>,
     pub mailbox: Option<Arc<MailboxStore>>,
+    /// The root serve key (`agent:<handle>`) the messaging provider accepts as `to`.
+    pub serve_agent: String,
     pub(crate) ingress: Option<Arc<ExecutionTurnIngress>>,
     pub replies: Option<Arc<ReplyRegistry>>,
     pub history: Option<Arc<dyn BoundHistoryReadPort>>,
@@ -552,7 +563,7 @@ pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCom
         api = api.with_run_provider(run);
     }
     if let (Some(store), Some(replies)) = (parts.mailbox, parts.replies) {
-        api = install_serve_loop_messaging(api, store, parts.ingress, replies);
+        api = install_serve_loop_messaging(api, store, parts.ingress, replies, &parts.serve_agent);
     }
     if let Some(history) = parts.history {
         api = api.with_bound_history_provider(history);
@@ -602,6 +613,7 @@ pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCom
 pub fn install_tools_if_real(
     api: &ClientApi,
     inventory: Option<Arc<dyn CallableInventoryReader>>,
+    mapped_agent: &str,
     skill_root: Option<PathBuf>,
 ) {
     let Some(inventory) = inventory else {
@@ -609,7 +621,7 @@ pub fn install_tools_if_real(
     };
     api.install_tools_provider(Arc::new(InventoryToolsProvider::new(
         inventory,
-        SERVE_LOOP_AGENT,
+        mapped_agent,
         skill_root,
     )));
 }
@@ -1016,7 +1028,7 @@ mod tests {
     fn tracked_sends_evicts_oldest() {
         let mut sent = TrackedSends::new();
         for i in 0..=MAX_TRACKED_CLIENT_MESSAGES {
-            sent.insert(format!("cmsg-{i}"), "agent:default".to_owned());
+            sent.insert(format!("cmsg-{i}"), "agent:root".to_owned());
         }
         assert!(sent.get("cmsg-0").is_none());
         assert!(sent

@@ -18,7 +18,6 @@ use crate::profile::uses_runtime_lock;
 use crate::registry;
 use crate::workspace::prepare_workspace;
 
-const DEFAULT_AGENT: &str = "default-agent";
 const LOCK_HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// Embed start (must run on GLOBAL_RT).
@@ -75,11 +74,18 @@ async fn start_embed_inner(
     } else {
         None
     };
+    // The root agent's immutable id (persisted in `.agent/config.yaml`; minted on first use).
+    let root_agent_id = if static_path.is_some() {
+        cap_lifecycle::identity::ensure_agent_id(&workspace)
+            .map_err(|e| BridgeError::Bootstrap(format!("root agent id: {e}")))?
+    } else {
+        cap_lifecycle::identity::new_agent_id()
+    };
     let grant_handles = register_cap_grant(
         builder.sqlite_index_handle(),
         bus,
         static_path,
-        DEFAULT_AGENT.to_string(),
+        root_agent_id,
         None,
     )
     .map_err(|e| BridgeError::Bootstrap(e.to_string()))?;

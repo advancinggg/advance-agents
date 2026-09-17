@@ -8,14 +8,14 @@
 //!
 //! `deliver` → [`crate::hierarchy::validate_routing`] gates on
 //! [`crate::id_validation::is_safe_id`], whose grammar is
-//! `"system" | "agent:"body | "user:"body` — a BARE id (`default-agent`,
+//! `"system" | "agent:"body | "user:"body` — a BARE id (`root`,
 //! `child`) is REJECTED. So the send/await path is inherently COLON-space, and
 //! its tree must answer `agent_exists` + `parent_of` over COLON keys. The
 //! production `AgentTreeStore`, however, is BARE-keyed. `DynamicRouting` bridges
 //! the two GRAMMARS in ONE reader:
 //! - a **colon** key (`agent:child`) is answered from an interior-mutable colon
 //!   adjacency map written at spawn (`seed_root` / `register_child`);
-//! - a **bare** key (`default-agent`, `child`) DELEGATES to the wrapped bare
+//! - a **bare** key (`root`, `child`) DELEGATES to the wrapped bare
 //!   `AgentTreeStore` — so `deliver_notify`'s bridge-resolved BARE membership
 //!   check and the assembler's `# Available Delegates` bare queries keep working
 //!   byte-identically.
@@ -237,48 +237,48 @@ mod tests {
     // space; bare keys delegate to the wrapped store (notify path preserved).
     #[test]
     fn t_e1_dual_grammar_routing() {
-        // Bare tree: root default-agent + a spawned child (bare) under it.
+        // Bare tree: root root + a spawned child (bare) under it.
         let bare = Arc::new(BareFixture::with(&[
-            ("default-agent", None),
-            ("child-1", Some("default-agent")),
+            ("root", None),
+            ("child-1", Some("root")),
         ]));
         let dr = DynamicRouting::new(bare);
-        dr.seed_root("agent:default");
-        assert!(dr.register_child("agent:child-1", "agent:default"));
+        dr.seed_root("agent:root");
+        assert!(dr.register_child("agent:child-1", "agent:root"));
 
         // Colon send-path facts (what validate_routing consumes):
         assert!(dr.agent_exists("agent:child-1"));
         assert_eq!(
             dr.parent_of("agent:child-1"),
-            Some("agent:default".to_string())
+            Some("agent:root".to_string())
         );
-        assert_eq!(dr.parent_of("agent:default"), None); // root
+        assert_eq!(dr.parent_of("agent:root"), None); // root
 
         // Bare delegation (notify membership path): the wrapped store answers.
-        assert!(dr.agent_exists("default-agent"));
+        assert!(dr.agent_exists("root"));
         assert!(dr.agent_exists("child-1"));
-        assert_eq!(dr.parent_of("child-1"), Some("default-agent".to_string()));
+        assert_eq!(dr.parent_of("child-1"), Some("root".to_string()));
 
         // Unregistered colon child → false (routing-entry-absent discriminator).
         assert!(!dr.agent_exists("agent:child-2"));
 
         // children_of / agent_kind in colon space.
-        assert_eq!(dr.children_of("agent:default"), vec!["agent:child-1"]);
-        assert_eq!(dr.agent_kind("agent:default"), Some(AgentKind::Root));
+        assert_eq!(dr.children_of("agent:root"), vec!["agent:child-1"]);
+        assert_eq!(dr.agent_kind("agent:root"), Some(AgentKind::Root));
         assert_eq!(dr.agent_kind("agent:child-1"), Some(AgentKind::Child));
 
         // register_child is first-wins.
-        assert!(!dr.register_child("agent:child-1", "agent:default"));
+        assert!(!dr.register_child("agent:child-1", "agent:root"));
     }
 
     // T-E1 (Wave-23 seam e teardown): unregister_child drops a child's colon
     // adjacency (so a subsequent send dead-ends unknown_target) but never the root.
     #[test]
     fn t_e1_unregister_child_drops_child_never_root() {
-        let bare = Arc::new(BareFixture::with(&[("default-agent", None)]));
+        let bare = Arc::new(BareFixture::with(&[("root", None)]));
         let dr = DynamicRouting::new(bare);
-        dr.seed_root("agent:default");
-        assert!(dr.register_child("agent:child-1", "agent:default"));
+        dr.seed_root("agent:root");
+        assert!(dr.register_child("agent:child-1", "agent:root"));
         assert!(dr.agent_exists("agent:child-1"));
 
         // Teardown removes the child → agent_exists false (send now unknown_target).
@@ -289,22 +289,22 @@ mod tests {
         assert!(!dr.unregister_child("agent:child-1"));
 
         // The root (parent None) is NOT a child — teardown refuses it.
-        assert!(!dr.unregister_child("agent:default"));
-        assert!(dr.agent_exists("agent:default"));
+        assert!(!dr.unregister_child("agent:root"));
+        assert!(dr.agent_exists("agent:root"));
 
         // After teardown the id can be RE-registered (a fresh spawn).
-        assert!(dr.register_child("agent:child-1", "agent:default"));
+        assert!(dr.register_child("agent:child-1", "agent:root"));
         assert!(dr.agent_exists("agent:child-1"));
     }
 
     // T-E1: sibling adjacency in colon space (two children of the same parent).
     #[test]
     fn t_e1_colon_siblings() {
-        let bare = Arc::new(BareFixture::with(&[("default-agent", None)]));
+        let bare = Arc::new(BareFixture::with(&[("root", None)]));
         let dr = DynamicRouting::new(bare);
-        dr.seed_root("agent:default");
-        dr.register_child("agent:a", "agent:default");
-        dr.register_child("agent:b", "agent:default");
+        dr.seed_root("agent:root");
+        dr.register_child("agent:a", "agent:root");
+        dr.register_child("agent:b", "agent:root");
         let sibs = dr.siblings_of("agent:a");
         assert_eq!(sibs, vec!["agent:b"]);
     }

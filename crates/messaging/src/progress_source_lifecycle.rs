@@ -458,7 +458,7 @@ mod tests {
         .expect("turn authority");
         let (_, turn_binding) = turn
             .registry_issuer
-            .reserve_turn("msg-1", "agent:default")
+            .reserve_turn("msg-1", "agent:root")
             .expect("active source")
             .into_parts();
         let parts = ProgressCardAuthorityFactory::new_with_os_rng_at_composition(
@@ -484,13 +484,13 @@ mod tests {
             source_message_id: "msg-1".into(),
         };
         let lease = delivery
-            .prepare(&key, "agent:default", OutboundRouteRefKind::Action)
+            .prepare(&key, "agent:root", OutboundRouteRefKind::Action)
             .expect("route lease");
         drop(lease);
 
         let store_facts = StoreQuiescenceFacts {
             turn_id: "msg-1".into(),
-            expected_agent: "agent:default".into(),
+            expected_agent: "agent:root".into(),
             store_incarnation: [1; 16],
         };
         let store_proof = turn
@@ -508,7 +508,7 @@ mod tests {
 
         let _second_source = turn
             .registry_issuer
-            .reserve_turn("msg-2", "agent:default")
+            .reserve_turn("msg-2", "agent:root")
             .expect("second active source");
         let second_key = ProgressCardKey {
             adapter_id: "telegram".into(),
@@ -517,7 +517,7 @@ mod tests {
             source_message_id: "msg-2".into(),
         };
         let failed_lease = delivery
-            .prepare(&second_key, "agent:default", OutboundRouteRefKind::Action)
+            .prepare(&second_key, "agent:root", OutboundRouteRefKind::Action)
             .expect("second route lease");
         authority
             .state
@@ -528,7 +528,7 @@ mod tests {
         drop(failed_lease);
         assert_eq!(authority.state.lock().pending_settlements.len(), 1);
         assert!(delivery
-            .prepare(&second_key, "agent:default", OutboundRouteRefKind::Action,)
+            .prepare(&second_key, "agent:root", OutboundRouteRefKind::Action,)
             .is_err());
         assert_eq!(
             authority.state.lock().pending_settlements.len(),
@@ -557,7 +557,7 @@ mod tests {
         .expect("turn authority");
         let (_, turn_binding) = turn
             .registry_issuer
-            .reserve_turn("msg-close", "agent:default")
+            .reserve_turn("msg-close", "agent:root")
             .expect("active source")
             .into_parts();
         let parts = ProgressCardAuthorityFactory::new_with_os_rng_at_composition(
@@ -590,12 +590,12 @@ mod tests {
         drop(
             provider
                 .delivery
-                .prepare(&key, "agent:default", OutboundRouteRefKind::Action)
+                .prepare(&key, "agent:root", OutboundRouteRefKind::Action)
                 .expect("arm route lifecycle"),
         );
         let facts = StoreQuiescenceFacts {
             turn_id: "msg-close".into(),
-            expected_agent: "agent:default".into(),
+            expected_agent: "agent:root".into(),
             store_incarnation: [2; 16],
         };
         let proof = turn
@@ -644,7 +644,7 @@ mod tests {
             .expect("turn authority");
             let (_, turn_binding) = turn
                 .registry_issuer
-                .reserve_turn("msg-cancel-fail", "agent:default")
+                .reserve_turn("msg-cancel-fail", "agent:root")
                 .expect("active source")
                 .into_parts();
             let progress = ProgressCardAuthorityFactory::new_with_os_rng_at_composition(
@@ -677,12 +677,12 @@ mod tests {
             drop(
                 provider
                     .delivery
-                    .prepare(&key, "agent:default", OutboundRouteRefKind::Action)
+                    .prepare(&key, "agent:root", OutboundRouteRefKind::Action)
                     .expect("route lifecycle armed"),
             );
             let facts = StoreQuiescenceFacts {
                 turn_id: "msg-cancel-fail".into(),
-                expected_agent: "agent:default".into(),
+                expected_agent: "agent:root".into(),
                 store_incarnation: [4; 16],
             };
             let proof = turn
@@ -789,7 +789,7 @@ mod tests {
             .expect("turn authority");
             let (_, turn_binding) = turn
                 .registry_issuer
-                .reserve_turn("msg-restart", "agent:default")
+                .reserve_turn("msg-restart", "agent:root")
                 .expect("active source")
                 .into_parts();
             let mut progress = ProgressCardAuthorityFactory::new_with_os_rng_at_composition(
@@ -806,7 +806,7 @@ mod tests {
             };
             let binding = progress
                 .outbound_route_seal_issuer
-                .arm_before_progress(&key, "agent:default")
+                .arm_before_progress(&key, "agent:root")
                 .expect("route lifecycle armed");
             let route_ref = progress
                 .outbound_route_seal_issuer
@@ -818,7 +818,7 @@ mod tests {
                 .expect("route settled");
             let facts = StoreQuiescenceFacts {
                 turn_id: "msg-restart".into(),
-                expected_agent: "agent:default".into(),
+                expected_agent: "agent:root".into(),
                 store_incarnation: [3; 16],
             };
             let proof = turn

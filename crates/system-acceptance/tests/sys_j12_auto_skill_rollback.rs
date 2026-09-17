@@ -15,7 +15,7 @@
 //!
 //! Disclosed boundaries (MODULE-017 §3.6): the production auto-loop runtime is
 //! still DORMANT (no `advance auto start` CLI ingress); the witness drives the
-//! production `DefaultAutoLoopDriver` + `default-agent` binding end-to-end — the
+//! production `DefaultAutoLoopDriver` + `root` binding end-to-end — the
 //! accepted floor under which the sibling auto SYS-AC (031/032/035) already pass.
 //!
 //! Flips: SYS-AC-034 / 035 / 036; supports MODULE-017-AC-06 / AC-07.
@@ -30,7 +30,7 @@ use stepd_auto_support::{close_ctx, commit_file, primary_criteria, AutoWired, Wi
 
 /// The production cli skills coordinator binds to `DEFAULT_AGENT_ID`; the bridged
 /// witness chain mirrors it (the observer session gate + M003 root resolve align).
-const AGENT: &str = "default-agent";
+const AGENT: &str = "root";
 
 /// Does a `[micro] [runtime:auto-loop]`-tagged commit exist in the repo history?
 /// The cap-skills coordinator tags AutoLoop-initiated commits this way; its

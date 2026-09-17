@@ -912,5 +912,148 @@ mod llm_tests {
                 "{c:?}"
             );
         }
+// Root identity — three names, three jobs (MODULE-005; `cap_lifecycle::identity`):
+// the immutable `id` (UUID, every store's key), the addressable `handle`
+// (mailbox `agent:<handle>`), and the free-text `display-name`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The root agent's resolved identity for this boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootIdentity {
+    /// Immutable tree / cap-layer / persistence id.
+    pub id: String,
+    /// Addressable handle (`root` unless the config carries or derives another).
+    pub handle: String,
+}
+
+impl RootIdentity {
+    /// The root's mailbox / serve key.
+    pub fn mailbox_id(&self) -> String {
+        format!("agent:{}", self.handle)
+    }
+}
+
+/// Top-level `handle` key of `.agent/config.yaml`.
+pub const HANDLE_KEY: &str = "handle";
+
+fn top_level_string(yaml: &[u8], key: &str) -> Option<String> {
+    let v: serde_yml::Value = serde_yml::from_slice(yaml).ok()?;
+    let s = v
+        .as_mapping()?
+        .get(serde_yml::Value::String(key.into()))?
+        .as_str()?
+        .trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Resolve — and persist on first sight — the root identity of `workspace`.
+///
+/// - `id`: the config's `id` key, else a fresh UUID written back (the persistence key
+///   must survive restarts). A workspace without a `.agent/` directory (no config at
+///   all) gets an ephemeral id: it declares no capabilities, so nothing is keyed by it.
+/// - `handle`: the config's `handle` key when valid; else derived ONCE from
+///   `display-name` (and written back, so a later rename never re-derives it); else
+///   `root`.
+pub fn resolve_root_identity(workspace: &Path) -> Result<RootIdentity, String> {
+    use advance_shared_types::agent_tree::derive_agent_id;
+    let agent_dir = workspace.join(".agent");
+    let persisted = std::fs::symlink_metadata(&agent_dir)
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false);
+    if !persisted {
+        return Ok(RootIdentity {
+            id: cap_lifecycle::identity::new_agent_id(),
+            handle: cap_lifecycle::identity::ROOT_HANDLE.to_string(),
+        });
+    }
+    let id = cap_lifecycle::identity::ensure_agent_id(workspace)
+        .map_err(|e| format!("root agent id: {e}"))?;
+    let yaml = read_agent_yaml(workspace).unwrap_or_default();
+    let handle = match top_level_string(&yaml, HANDLE_KEY) {
+        Some(h) if cap_lifecycle::identifier::validate_agent_id(&h).is_ok() => h,
+        Some(h) => return Err(format!("root handle {h:?} is not a valid agent id")),
+        None => {
+            let derived = top_level_string(&yaml, advance_home::DISPLAY_NAME_KEY)
+                .and_then(|name| derive_agent_id(&name))
+                .unwrap_or_else(|| cap_lifecycle::identity::ROOT_HANDLE.to_string());
+            cap_lifecycle::identity::upsert_config_key(workspace, HANDLE_KEY, &derived)
+                .map_err(|e| format!("persist root handle: {e}"))?;
+            derived
+        }
+    };
+    Ok(RootIdentity { id, handle })
+}
+
+/// Served mailbox key (`agent:<handle>`) or bare id → the tree id, via the tree's handle
+/// registry. A colon key whose handle the tree does not know falls back to the handle itself
+/// (the pre-identity mechanical form, so fixtures keyed id-as-handle keep working).
+pub fn tree_id_for(
+    tree: &dyn advance_shared_types::agent_tree::AgentTreeReader,
+    reference: &str,
+) -> String {
+    match reference.strip_prefix("agent:") {
+        Some(handle) => tree
+            .id_by_handle(handle)
+            .unwrap_or_else(|| handle.to_string()),
+        None => reference.to_string(),
+    }
+}
+
+/// Bare tree id → served mailbox key (`agent:<handle>`), via the tree's handle registry; an
+/// id the tree does not know keeps the mechanical form.
+pub fn mailbox_key_for(
+    tree: &dyn advance_shared_types::agent_tree::AgentTreeReader,
+    bare: &str,
+) -> String {
+    format!(
+        "agent:{}",
+        tree.handle_of(bare).unwrap_or_else(|| bare.to_string())
+    )
+}
+
+#[cfg(test)]
+mod root_identity_tests {
+    use super::*;
+
+    #[test]
+    fn derives_handle_from_display_name_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join(".agent")).unwrap();
+        std::fs::write(
+            ws.join(".agent/config.yaml"),
+            "capabilities:\n  fs: true\ndisplay-name: Soul Mate\n",
+        )
+        .unwrap();
+        let first = resolve_root_identity(ws).unwrap();
+        assert_eq!(first.handle, "soul-mate");
+        assert_eq!(first.mailbox_id(), "agent:soul-mate");
+        // A later rename does not move the handle or the id.
+        std::fs::write(
+            ws.join(".agent/config.yaml"),
+            format!(
+                "capabilities:\n  fs: true\ndisplay-name: Someone Else\nid: {}\nhandle: soul-mate\n",
+                first.id
+            ),
+        )
+        .unwrap();
+        let again = resolve_root_identity(ws).unwrap();
+        assert_eq!(again, first);
+    }
+
+    #[test]
+    fn falls_back_to_root_and_ephemeral_without_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join(".agent")).unwrap();
+        std::fs::write(ws.join(".agent/config.yaml"), "display-name: 灵魂伴侣\n").unwrap();
+        let r = resolve_root_identity(ws).unwrap();
+        assert_eq!(r.handle, "root");
+        let text = std::fs::read_to_string(ws.join(".agent/config.yaml")).unwrap();
+        assert!(text.contains("handle: root"), "{text}");
+        let bare = tempfile::tempdir().unwrap();
+        let e = resolve_root_identity(bare.path()).unwrap();
+        assert_eq!(e.handle, "root");
+        assert!(!bare.path().join(".agent").exists());
     }
 }

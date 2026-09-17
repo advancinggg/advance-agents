@@ -172,7 +172,7 @@ fn advance_start_post_msg_wakes_a_turn() {
     );
 
     // 6. Bounded poll (≤10s) for the turn's observable side effect: the skeleton
-    //    guest's fs.write lands `j01.txt` (under the default-agent territory =
+    //    guest's fs.write lands `j01.txt` (under the root territory =
     //    the workspace) whose content == the posted payload.
     let written = ws.join("j01.txt");
     let poll_deadline = Instant::now() + Duration::from_secs(10);

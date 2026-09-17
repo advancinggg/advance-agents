@@ -453,7 +453,7 @@ mod tests {
             id: "m".into(),
             kind: MessageKind::User,
             from: "user:alice".into(),
-            to: "agent:default".into(),
+            to: "agent:root".into(),
             payload: b"hi".to_vec(),
             context: None,
             timestamp: std::time::SystemTime::now(),
@@ -476,7 +476,7 @@ mod tests {
         let mgr = Arc::new(SubscriptionManager::new());
         let sub_id = mgr
             .subscribe_host_pump(
-                "agent:default",
+                "agent:root",
                 ChannelConfig {
                     adapter_type: AdapterType::Telegram,
                     params: vec![],
@@ -497,7 +497,7 @@ mod tests {
         );
         let msg = channel_message(channel_origin(sub_id.as_str(), "98765"));
         sink.deliver(
-            "agent:default",
+            "agent:root",
             &msg,
             &[AgentAction {
                 payload: b"the reply".to_vec(),
@@ -507,7 +507,7 @@ mod tests {
         .unwrap();
         let calls = transport.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "agent:default");
+        assert_eq!(calls[0].0, "agent:root");
         assert_eq!(
             calls[0].1, "98765",
             "conversation target from channel_metadata"
@@ -522,7 +522,7 @@ mod tests {
         let mgr = Arc::new(SubscriptionManager::new());
         let sub_id = mgr
             .subscribe_host_pump(
-                "agent:default",
+                "agent:root",
                 ChannelConfig {
                     adapter_type: AdapterType::Telegram,
                     params: vec![],
@@ -542,7 +542,7 @@ mod tests {
             ChannelEgress::new(transport.clone(), mgr.clone()),
         );
         let msg = channel_message(channel_origin(sub_id.as_str(), "98765"));
-        sink.deliver("agent:default", &msg, &[]).await.unwrap();
+        sink.deliver("agent:root", &msg, &[]).await.unwrap();
         assert_eq!(
             transport.calls.lock().unwrap().len(),
             0,
@@ -556,20 +556,20 @@ mod tests {
         let store = Arc::new(EvidenceIdStore::new());
         let good = store.mint();
         let registry = Arc::new(ReplyRegistry::new());
-        let rx = registry.register("agent:default");
+        let rx = registry.register("agent:root");
         let sink = DaemonOutboundSink::registry_only(registry).with_evidence_ids(store);
         let msg = Message {
             id: "m".into(),
             kind: MessageKind::User,
             from: "user:http".into(),
-            to: "agent:default".into(),
+            to: "agent:root".into(),
             payload: vec![],
             context: None,
             timestamp: std::time::SystemTime::now(),
             origin: None,
         };
         let payload = format!("cite {good} and ev_ffffffffffff").into_bytes();
-        sink.deliver("agent:default", &msg, &[AgentAction { payload }])
+        sink.deliver("agent:root", &msg, &[AgentAction { payload }])
             .await
             .unwrap();
         let body = rx.await.unwrap().expect("fulfilled");
@@ -585,7 +585,7 @@ mod tests {
             calls: Mutex::new(vec![]),
         });
         let registry = Arc::new(ReplyRegistry::new());
-        let rx = registry.register("agent:default");
+        let rx = registry.register("agent:root");
         let sink = DaemonOutboundSink::with_channel(
             registry.clone(),
             ChannelEgress::new(transport.clone(), mgr),
@@ -595,14 +595,14 @@ mod tests {
             id: "m".into(),
             kind: MessageKind::User,
             from: "user:http".into(),
-            to: "agent:default".into(),
+            to: "agent:root".into(),
             payload: vec![],
             context: None,
             timestamp: std::time::SystemTime::now(),
             origin: None,
         };
         sink.deliver(
-            "agent:default",
+            "agent:root",
             &msg,
             &[AgentAction {
                 payload: b"registry reply".to_vec(),
@@ -621,13 +621,13 @@ mod tests {
     #[tokio::test]
     async fn staged_routed_legacy_reply_is_byte_identical_and_first_only() {
         let registry = Arc::new(ReplyRegistry::new());
-        let rx = registry.register("agent:default");
+        let rx = registry.register("agent:root");
         let sink = StagedRoutedOutboundSink::registry_only(registry);
         let source = Message {
             id: "m".into(),
             kind: MessageKind::User,
             from: "user:http".into(),
-            to: "agent:default".into(),
+            to: "agent:root".into(),
             payload: vec![],
             context: None,
             timestamp: std::time::SystemTime::now(),
@@ -635,7 +635,7 @@ mod tests {
         };
         let exact = vec![0, 0xff, b'\r', b'\n', 0x80, b'x'];
         sink.deliver_routed(
-            "agent:default",
+            "agent:root",
             &source,
             &[
                 direct_routed(exact.clone()),
@@ -650,19 +650,19 @@ mod tests {
     #[tokio::test]
     async fn staged_routed_empty_batch_fulfils_no_reply() {
         let registry = Arc::new(ReplyRegistry::new());
-        let rx = registry.register("agent:default");
+        let rx = registry.register("agent:root");
         let sink = StagedRoutedOutboundSink::registry_only(registry);
         let source = Message {
             id: "m".into(),
             kind: MessageKind::User,
             from: "user:http".into(),
-            to: "agent:default".into(),
+            to: "agent:root".into(),
             payload: vec![],
             context: None,
             timestamp: std::time::SystemTime::now(),
             origin: None,
         };
-        sink.deliver_routed("agent:default", &source, &[])
+        sink.deliver_routed("agent:root", &source, &[])
             .await
             .unwrap();
         assert_eq!(rx.await.unwrap(), None);

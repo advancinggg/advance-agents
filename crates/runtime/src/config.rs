@@ -906,7 +906,7 @@ pub struct SecretsConfig {
     pub keychain: Option<KeychainSyncConfig>,
     /// AC-15 caller-dependency allowlist (Wave-18 Lane-3, additive — CONTRACT-003).
     /// Maps a BARE cap agent-id (`HostCallContext.agent_id`, e.g. the
-    /// production-stamped `default-agent`) to the secret names that agent has
+    /// production-stamped `root`) to the secret names that agent has
     /// declared a dependency on. When non-empty, the cli composition root
     /// (`register_secrets_capability`) registers the GATED `secret-exists`
     /// handler over a `DeclaredDependencyPolicy`, so a caller whose `agent_id`

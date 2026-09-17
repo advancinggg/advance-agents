@@ -8,14 +8,14 @@
 //! - **T-011-01**: with `fs` declared, `lookup("lifecycle")` has spawn-child /
 //!   spawn-sub / spawn-agent-from-template registered (idempotent=false, canonical ns).
 //! - **T-011-02** (the witness): drive the PROD-REGISTERED `spawn-sub` handler with a
-//!   bare `default-agent` caller → the SHARED `agent_tree_snapshot` now has a `Sub`
-//!   under `default-agent` → `format_available_delegates_section` lists it → the REAL
+//!   bare `root` caller → the SHARED `agent_tree_snapshot` now has a `Sub`
+//!   under `root` → `format_available_delegates_section` lists it → the REAL
 //!   assembler (built over the SAME snapshot) assembles a `# Available Delegates`
 //!   message listing the sub. Same store the assembler reads, not a harness tree.
 //! - **T-011-03**: no fs/messaging cap ⇒ NO lifecycle host-fns + `agent_tree_snapshot`
 //!   is None (the gate holds — no tree, no spawn registration).
-//! - **T-011-04** (keying-residual lock): after a real spawn under bare `default-agent`,
-//!   querying the section with the PRODUCTION colon msg-id `agent:default` lists NOTHING
+//! - **T-011-04** (keying-residual lock): after a real spawn under bare `root`,
+//!   querying the section with the PRODUCTION colon msg-id `agent:root` lists NOTHING
 //!   — a genuine parent-key MISS (documents waived_scope #2; the SYS-J-04 harvest that
 //!   fixes the assembler keying flips this).
 //! - **T-011-05**: a messaging-ONLY agent registers the spawn host-fns over the
@@ -51,8 +51,8 @@ use cap_memory::MemoryStore;
 use wasmtime::component::Val;
 
 const NS: &str = "advance:runtime/agent-lifecycle@0.2.0";
-const CAP_AGENT: &str = "default-agent"; // the bare cap id = the tree Root + spawn caller
-const MSG_AGENT: &str = "agent:default"; // the colon msg id the production assembler keys on
+const CAP_AGENT: &str = "root"; // the bare cap id = the tree Root + spawn caller
+const MSG_AGENT: &str = "agent:root"; // the colon msg id the production assembler keys on
 const TEST_MASTER_KEY_HEX: &str =
     "2031425364758697a8b9cadbecfd0e1f2031425364758697a8b9cadbecfd0e1f";
 
@@ -113,10 +113,10 @@ fn fresh_workspace(caps_yaml: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
     (dir, workspace, config_path)
 }
 
-/// A `HostCallContext` for a registered lifecycle op, caller = bare `default-agent`.
-fn spawn_ctx(op: &str) -> HostCallContext {
+/// A `HostCallContext` for a registered lifecycle op, caller = the root's tree id.
+fn spawn_ctx(caller: &str, op: &str) -> HostCallContext {
     HostCallContext {
-        agent_id: CAP_AGENT.to_string(),
+        agent_id: caller.to_string(),
         trace_id: "tr-011".to_string(),
         turn_id: None,
         capability: "lifecycle".to_string(),
@@ -172,6 +172,7 @@ fn ctx_for(agent_id: &str) -> AssemblyContext {
 /// Drive the prod-registered `op` handler and return its single `Val`.
 async fn call_lifecycle(
     host: &advance_runtime::bootstrap::RuntimeHost,
+    caller: &str,
     op: &str,
     params: Vec<Val>,
 ) -> Val {
@@ -183,7 +184,7 @@ async fn call_lifecycle(
         .unwrap_or_else(|| panic!("{op} registered"));
     let out = spec
         .handler
-        .call(spawn_ctx(op), params, 1)
+        .call(spawn_ctx(caller, op), params, 1)
         .await
         .unwrap_or_else(|e| panic!("{op} call: {e:?}"));
     assert_eq!(out.len(), 1, "{op} returns exactly one Val");
@@ -221,12 +222,14 @@ async fn t_011_02_spawn_sub_records_into_shared_tree_and_assembler_lists_it() {
     let (_g, ws, cfg) = fresh_workspace("capabilities:\n  fs: true\n");
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
     let (host, handles) = wire_capabilities(builder, &ws).await.expect("wire");
+    // The root's cap-layer id is its immutable UUID (per boot), not the literal `root`.
+    let cap_agent: &str = handles.root_agent_id.as_str();
 
-    // Drive the PROD-REGISTERED spawn-sub handler (caller = bare default-agent = Root).
+    // Drive the PROD-REGISTERED spawn-sub handler (caller = bare root = Root).
     // Empty params ⇒ template_ref = None (no resolver needed).
-    let sub_id = ok_spawn_id(&call_lifecycle(&host, "spawn-sub", vec![]).await);
+    let sub_id = ok_spawn_id(&call_lifecycle(&host, cap_agent, "spawn-sub", vec![]).await);
 
-    // The SAME store the assembler snapshots now contains the Sub under default-agent.
+    // The SAME store the assembler snapshots now contains the Sub under root.
     let snap = handles
         .agent_tree_snapshot
         .clone()
@@ -235,22 +238,22 @@ async fn t_011_02_spawn_sub_records_into_shared_tree_and_assembler_lists_it() {
     let recorded = data.nodes.iter().any(|n| {
         n.id.0 == sub_id
             && n.kind == AgentKind::Sub
-            && n.parent.as_ref() == Some(&AgentId(CAP_AGENT.to_string()))
+            && n.parent.as_ref() == Some(&AgentId(cap_agent.to_string()))
     });
     assert!(
         recorded,
-        "spawn-sub must record a Sub node parented at `{CAP_AGENT}` into the shared tree; nodes={:?}",
+        "spawn-sub must record a Sub node parented at `{cap_agent}` into the shared tree; nodes={:?}",
         data.nodes.iter().map(|n| (&n.id.0, &n.kind, &n.parent)).collect::<Vec<_>>()
     );
 
     // The delegates section (reading the SAME snapshot) lists the sub.
-    let section = format_available_delegates_section(snap.as_ref(), CAP_AGENT);
+    let section = format_available_delegates_section(snap.as_ref(), cap_agent);
     assert!(
         section.contains(&format!("- {sub_id}")),
         "the # Available Delegates section must list the spawned sub `{sub_id}`: {section}"
     );
     assert_eq!(
-        delegate_lines(snap.as_ref(), CAP_AGENT),
+        delegate_lines(snap.as_ref(), cap_agent),
         1,
         "exactly one delegate (the spawned sub)"
     );
@@ -263,13 +266,13 @@ async fn t_011_02_spawn_sub_records_into_shared_tree_and_assembler_lists_it() {
         Arc::new(FixedHostFnInventory::new(vec![])),
         snap.clone(),
         None::<Arc<MemoryStore>>,
-        CAP_AGENT,
-        &[CAP_AGENT.to_string()],
+        cap_agent,
+        &[cap_agent.to_string()],
         None, // memory_root
         None, // skills_agent_root
     );
     let result = assembler
-        .assemble(ctx_for(CAP_AGENT))
+        .assemble(ctx_for(cap_agent))
         .await
         .expect("assemble");
     let delegates_msg = result
@@ -302,15 +305,17 @@ async fn t_011_03_no_tree_no_spawn_registration() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn t_011_04_colon_msg_id_misses_keying_residual_lock() {
-    // Documents waived_scope #2: spawns record under the BARE cap-id `default-agent`,
-    // but production assembles with the COLON msg-id `agent:default` → the delegates
-    // lookup MISSES. `agent:default` passes is_valid_agent_id (colons allowed), so the
+    // Documents waived_scope #2: spawns record under the BARE cap-id `root`,
+    // but production assembles with the COLON msg-id `agent:root` → the delegates
+    // lookup MISSES. `agent:root` passes is_valid_agent_id (colons allowed), so the
     // empty result is a genuine parent-key miss, NOT a guard rejection.
     let (_g, ws, cfg) = fresh_workspace("capabilities:\n  fs: true\n");
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
     let (host, handles) = wire_capabilities(builder, &ws).await.expect("wire");
+    // The root's cap-layer id is its immutable UUID (per boot), not the literal `root`.
+    let cap_agent: &str = handles.root_agent_id.as_str();
 
-    let sub_id = ok_spawn_id(&call_lifecycle(&host, "spawn-sub", vec![]).await);
+    let sub_id = ok_spawn_id(&call_lifecycle(&host, cap_agent, "spawn-sub", vec![]).await);
     let snap = handles
         .agent_tree_snapshot
         .clone()
@@ -318,9 +323,9 @@ async fn t_011_04_colon_msg_id_misses_keying_residual_lock() {
 
     // Bare cap-id lists the sub (sanity — the mechanism works when keyed consistently).
     assert_eq!(
-        delegate_lines(snap.as_ref(), CAP_AGENT),
+        delegate_lines(snap.as_ref(), cap_agent),
         1,
-        "bare `{CAP_AGENT}` lists the sub `{sub_id}`"
+        "bare `{cap_agent}` lists the sub `{sub_id}`"
     );
     // Colon msg-id misses — the documented production keying residual.
     assert_eq!(
@@ -358,10 +363,13 @@ async fn t_011_06_spawn_from_template_is_operational() {
     let (_g, ws, cfg) = fresh_workspace("capabilities:\n  fs: true\n");
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
     let (host, handles) = wire_capabilities(builder, &ws).await.expect("wire");
+    // The root's cap-layer id is its immutable UUID (per boot), not the literal `root`.
+    let cap_agent: &str = handles.root_agent_id.as_str();
 
     // params: [agent-kind=sub, template-ref=explorer] (a BuiltinTemplateRegistry builtin).
     let v = call_lifecycle(
         &host,
+        cap_agent,
         "spawn-agent-from-template",
         vec![Val::String("sub".into()), Val::String("explorer".into())],
     )
@@ -376,11 +384,11 @@ async fn t_011_06_spawn_from_template_is_operational() {
     let recorded = data.nodes.iter().any(|n| {
         n.id.0 == sub_id
             && n.kind == AgentKind::Sub
-            && n.parent.as_ref() == Some(&AgentId(CAP_AGENT.to_string()))
+            && n.parent.as_ref() == Some(&AgentId(cap_agent.to_string()))
     });
     assert!(
         recorded,
-        "spawn-agent-from-template kind=sub must record a Sub under `{CAP_AGENT}`; nodes={:?}",
+        "spawn-agent-from-template kind=sub must record a Sub under `{cap_agent}`; nodes={:?}",
         data.nodes
             .iter()
             .map(|n| (&n.id.0, &n.kind))

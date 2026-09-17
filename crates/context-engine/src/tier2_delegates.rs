@@ -70,8 +70,8 @@ pub fn format_available_delegates_section(snap: &dyn AgentTreeSnapshot, agent_id
 /// `node.parent` against the agent's full id-**alias set** (`{agent_id} ∪
 /// aliases`), not the single `agent_id`. This bridges the colon/bare keying
 /// split: production cap-lifecycle spawns record `Sub` nodes under the BARE
-/// cap-id (`default-agent`) while `assemble()` runs under the COLON msg-id
-/// (`agent:default`). The cli composition root passes the production
+/// cap-id (`root`) while `assemble()` runs under the COLON msg-id
+/// (`agent:root`). The cli composition root passes the production
 /// `query_aliases = [cap_agent_id, msg_agent_id]` (the SAME set already wired
 /// to the Tier-1b memory readers). An empty `aliases` slice ⇒ the original
 /// single-id behaviour. Each candidate key (the `agent_id` AND each alias) is

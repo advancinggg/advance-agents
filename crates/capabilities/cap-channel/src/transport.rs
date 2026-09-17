@@ -236,7 +236,7 @@ mod tests {
 
     fn host_pump_sub(mgr: &SubscriptionManager) -> SubscriptionId {
         mgr.subscribe_host_pump(
-            "agent:default",
+            "agent:root",
             ChannelConfig {
                 adapter_type: AdapterType::Telegram,
                 params: vec![],

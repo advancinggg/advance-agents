@@ -33,7 +33,7 @@ const DB_TOOL_COMPONENT: &[u8] =
     include_bytes!("../../capabilities/cap-tools/tests/fixtures/db_tool.component.wasm");
 
 const TOOLS_NS: &str = "advance:runtime/agent-tools@0.1.0";
-const CAP_AGENT: &str = "default-agent";
+const CAP_AGENT: &str = "root";
 
 // ── helpers ──────────────────────────────────────────────────────────
 

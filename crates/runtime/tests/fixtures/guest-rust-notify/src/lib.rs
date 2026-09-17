@@ -43,7 +43,7 @@ const STATE_NOTIFY_CHANNEL_BLOCKED: [u8; 4] = [0x07, 0x1F, 0xB0, 0x02];
 // The notify-agent target — a registered agent. The cli test owns a target
 // under the canonical colon id "agent:target".
 const NOTIFY_AGENT_TARGET: &str = "agent:target";
-const NOTIFY_AGENT_DEFAULT: &str = "agent:default";
+const NOTIFY_AGENT_DEFAULT: &str = "agent:root";
 const NOTIFY_AGENT_HARNESS: &str = "agent:harness";
 const NOTIFY_AGENT_UNKNOWN: &str = "agent:does-not-exist";
 const NOTIFY_CHANNEL_ID: &str = "channel:test";

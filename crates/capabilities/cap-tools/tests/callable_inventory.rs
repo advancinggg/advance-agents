@@ -341,6 +341,7 @@ impl AgentTreeReader for NullAgentTree {
 impl AgentTreeSnapshot for NullAgentTree {
     fn snapshot(&self) -> AgentTreeSnapshotData {
         AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes: Vec::new(),
             parent_of: HashMap::new(),
             children_of: HashMap::new(),

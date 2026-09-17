@@ -206,7 +206,7 @@ async fn production_guest_is_raw_only_at_execution_and_redacted_on_every_surface
         .handler
         .call(
             HostCallContext {
-                agent_id: "default-agent".to_owned(),
+                agent_id: "root".to_owned(),
                 trace_id: "legacy3-submit".to_owned(),
                 turn_id: None,
                 capability: "lifecycle".to_owned(),

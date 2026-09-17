@@ -582,12 +582,12 @@ mod tests {
     fn hostpump_sub_is_host_pumpable_not_wit_pollable() {
         let mgr = SubscriptionManager::new();
         let id = mgr
-            .subscribe_host_pump("agent:default", config_for(AdapterType::Telegram))
+            .subscribe_host_pump("agent:root", config_for(AdapterType::Telegram))
             .unwrap();
         assert_eq!(mgr.lookup(&id).unwrap().consumer, Consumer::HostPump);
         // poll_host_pump allowed; WIT poll_raw rejected (single-owner).
         assert!(mgr.poll_host_pump(&id).unwrap().is_none());
-        let err = mgr.poll_raw("agent:default", &id).unwrap_err();
+        let err = mgr.poll_raw("agent:root", &id).unwrap_err();
         assert!(matches!(err, ChannelError::PermissionDenied(_)));
     }
 
@@ -595,7 +595,7 @@ mod tests {
     fn host_pump_drains_enqueued_event_without_ownership_gate() {
         let mgr = SubscriptionManager::new();
         let id = mgr
-            .subscribe_host_pump("agent:default", config_for(AdapterType::Telegram))
+            .subscribe_host_pump("agent:root", config_for(AdapterType::Telegram))
             .unwrap();
         let ev = RawEvent {
             data: b"in".to_vec(),

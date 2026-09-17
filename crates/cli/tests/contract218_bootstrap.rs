@@ -77,7 +77,7 @@ async fn anchored_component_source_drives_sealed_structural_projection() {
         Arc::clone(&runtime.ready_issuer),
     );
     api.submit_component(
-        "default-agent",
+        "root",
         ComponentSubmitConfig {
             id: "legacy3-sensitive".to_owned(),
             component_type: ComponentType::Task,

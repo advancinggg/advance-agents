@@ -106,7 +106,7 @@ impl CostProvider for MemoryCosts {
                 totals: Self::totals(4),
             },
             ClientAgentCostEntry {
-                agent_id: "default-agent".into(),
+                agent_id: "root".into(),
                 totals: Self::totals(1),
             },
         ])

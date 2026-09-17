@@ -51,7 +51,7 @@ impl TurnObserver for CompositeTurnObserver {
 ///
 /// Observers receive the COLON-keyed serve id (e.g. `agent:child-7`), while cap-llm's
 /// stream registry is keyed by the BARE cap-id — including the root special pair
-/// `agent:default` → `default-agent`. Both production composition sites already HOLD
+/// `agent:root` → `root`. Both production composition sites already HOLD
 /// that pair when they build the observer (`start.rs`: `DEFAULT_MSG_AGENT_ID` +
 /// `cap_agent_id`; `perchild_daemon.rs::on_child_spawned`: `child_colon` +
 /// `child_bare`), so the pair is injected verbatim and never re-derived: there is no
@@ -249,7 +249,7 @@ mod tests {
             Arc::new(Tagging("first", log.clone())) as Arc<dyn TurnObserver>,
             Arc::new(Tagging("second", log.clone())),
         ]);
-        composite.on_turn_complete("agent:default");
+        composite.on_turn_complete("agent:root");
         assert_eq!(*log.lock().unwrap(), vec!["first", "second"]);
     }
 
@@ -261,7 +261,7 @@ mod tests {
             Arc::new(Counting(a.clone())),
             Arc::new(Counting(b.clone())),
         ]);
-        composite.on_turn_complete("agent:default");
+        composite.on_turn_complete("agent:root");
         assert_eq!(a.load(Ordering::SeqCst), 1);
         assert_eq!(b.load(Ordering::SeqCst), 1);
     }

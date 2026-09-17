@@ -13,7 +13,7 @@
 //! as a daemon boot invokes them.
 //!
 //! - **T40-a** (the AC-25 witness): a 2-level `agents:` block → the snapshot shows
-//!   root `default-agent` (Root, parent None) + each declared child (Child, correct
+//!   root `root` (Root, parent None) + each declared child (Child, correct
 //!   parent edge, `workspace_path == canon(ws)/<target-path>`, identity = alias,
 //!   `template_ref` recorded), with the grandchild nested under its parent (the tree
 //!   matches the configured hierarchy).
@@ -32,7 +32,7 @@ use advance_cli::wiring::{wire_capabilities, CliWiringError};
 use advance_runtime::bootstrap::RuntimeHostBuilder;
 use advance_shared_types::agent_tree::AgentKind;
 
-const ROOT: &str = "default-agent";
+const ROOT: &str = "root";
 
 /// Minimal `runtime-config.yaml`. Declaring only fs in `.agent/config.yaml` leaves
 /// `needs_key = false`, so `load_real_master_key` is never called — no env var /
@@ -128,13 +128,23 @@ agents:
     );
 
     let data = boot_and_snapshot(&ws, &cfg).await;
-    let node = |id: &str| {
-        data.nodes.iter().find(|n| n.id.0 == id).unwrap_or_else(|| {
-            panic!(
-                "{id} must be materialized at boot; nodes={:?}",
-                data.nodes.iter().map(|n| &n.id.0).collect::<Vec<_>>()
-            )
-        })
+    // Nodes are addressed by HANDLE (the declared alias); the tree id is a per-run UUID.
+    let node = |handle: &str| {
+        data.nodes
+            .iter()
+            .find(|n| data.handle_of(&n.id) == handle)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{handle} must be materialized at boot; nodes={:?}",
+                    data.nodes
+                        .iter()
+                        .map(|n| data.handle_of(&n.id))
+                        .collect::<Vec<_>>()
+                )
+            })
+    };
+    let parent_handle = |n: &advance_shared_types::agent_tree::AgentNode| {
+        n.parent.as_ref().map(|p| data.handle_of(p))
     };
 
     // Root: present, kind Root, no parent.
@@ -146,14 +156,24 @@ agents:
     // template recorded.
     let child_a = node("child-a");
     assert_eq!(child_a.kind, AgentKind::Child);
-    assert_eq!(child_a.parent.as_ref().map(|p| p.0.as_str()), Some(ROOT));
+    assert_eq!(parent_handle(child_a).as_deref(), Some(ROOT));
+    assert!(
+        uuid::Uuid::parse_str(&child_a.id.0).is_ok(),
+        "tree id is a UUID: {}",
+        child_a.id.0
+    );
+    assert_eq!(
+        cap_lifecycle::identity::read_agent_id(&child_a.workspace_path).as_deref(),
+        Some(child_a.id.0.as_str()),
+        "the id is persisted in the child's own config document"
+    );
     assert_eq!(child_a.workspace_path, ws.join("children/a"));
     assert_eq!(child_a.template_ref.as_deref(), Some("explorer"));
 
     // child-b: sibling, distinct territory + template.
     let child_b = node("child-b");
     assert_eq!(child_b.kind, AgentKind::Child);
-    assert_eq!(child_b.parent.as_ref().map(|p| p.0.as_str()), Some(ROOT));
+    assert_eq!(parent_handle(child_b).as_deref(), Some(ROOT));
     assert_eq!(child_b.workspace_path, ws.join("children/b"));
     assert_eq!(child_b.template_ref.as_deref(), Some("reviewer"));
 
@@ -161,7 +181,7 @@ agents:
     // proving the FULL configured hierarchy is materialized — not just one level.
     let gc = node("grandchild");
     assert_eq!(gc.kind, AgentKind::Child);
-    assert_eq!(gc.parent.as_ref().map(|p| p.0.as_str()), Some("child-a"));
+    assert_eq!(parent_handle(gc).as_deref(), Some("child-a"));
     assert_eq!(gc.workspace_path, ws.join("children/a/g"));
     assert_eq!(gc.template_ref.as_deref(), Some("planner"));
 
@@ -189,7 +209,8 @@ async fn t40b_no_agents_block_boots_root_only() {
         "no agents: ⇒ root-only boot; got {:?}",
         data.nodes.iter().map(|n| &n.id.0).collect::<Vec<_>>()
     );
-    assert_eq!(data.nodes[0].id.0, ROOT);
+    assert_eq!(data.handle_of(&data.nodes[0].id), ROOT);
+    assert!(uuid::Uuid::parse_str(&data.nodes[0].id.0).is_ok());
     assert_eq!(data.nodes[0].kind, AgentKind::Root);
 }
 
@@ -255,7 +276,7 @@ agents:
     let scout = data
         .nodes
         .iter()
-        .find(|n| n.id.0 == "scout")
+        .find(|n| data.handle_of(&n.id) == "scout")
         .expect("scout");
     assert_eq!(
         scout
@@ -268,7 +289,7 @@ agents:
     let plain = data
         .nodes
         .iter()
-        .find(|n| n.id.0 == "plain")
+        .find(|n| data.handle_of(&n.id) == "plain")
         .expect("plain");
     assert!(
         plain.capabilities.is_empty(),

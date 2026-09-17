@@ -17,8 +17,8 @@
 //!   `set_status(bare, Failed)` + `parent_of` over the bare tree), then
 //! - `notify_parent_crash` re-derives the parent's served mailbox key from the bare
 //!   parent id via an injected **key-resolver** `Fn(&str) -> String` (NOT a hardcoded
-//!   `agent:{bare}` prefix — the production root is bare `default-agent` served at
-//!   colon `agent:default`, a SPECIAL mapping; the resolver makes the served-key
+//!   `agent:{bare}` prefix — the production root is bare `root` served at
+//!   colon `agent:root`, a SPECIAL mapping; the resolver makes the served-key
 //!   policy the caller's responsibility).
 //!
 //! **W24 perchild-daemon-2 (seam f): NOW WIRED into `advance start`** — built in
@@ -60,6 +60,7 @@ pub fn build_crash_cascade_sink(
         store: mailbox_store,
         resolver: Arc::new(key_resolver),
     });
+    let keys_tree = tree.clone();
     let controller = DefaultTerminateController::new(
         tree,
         Arc::new(NoopGrantCascade),
@@ -67,7 +68,10 @@ pub fn build_crash_cascade_sink(
         Arc::new(NoopRunCascade),
         Arc::new(NoopWorkspaceCleanup),
     );
-    Arc::new(CrashCascadeSinkImpl { controller })
+    Arc::new(CrashCascadeSinkImpl {
+        controller,
+        tree: keys_tree,
+    })
 }
 
 /// The `CrashCascadeSink` impl: strip colon→bare and drive the real cap-lifecycle
@@ -76,11 +80,14 @@ pub fn build_crash_cascade_sink(
 /// loop (and on a root/None parent `handle_crash` returns `Ok` with no notification).
 struct CrashCascadeSinkImpl {
     controller: DefaultTerminateController,
+    /// The same tree, for the served-key (`agent:<handle>`) → tree-id resolution.
+    tree: AgentTreeStore,
 }
 
 impl CrashCascadeSink for CrashCascadeSinkImpl {
     fn handle_crash(&self, agent_id: &str, reason: &str) {
-        let bare = agent_id.strip_prefix("agent:").unwrap_or(agent_id);
+        let bare = crate::agent_config::tree_id_for(&self.tree, agent_id);
+        let bare = bare.as_str();
         if let Err(e) = self.controller.handle_crash(bare, reason) {
             eprintln!(
                 "build_crash_cascade_sink: handle_crash({bare}) → {e:?} (swallowed — \

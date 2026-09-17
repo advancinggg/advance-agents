@@ -1517,7 +1517,7 @@ mod tests {
     fn sub() -> Subscription {
         Subscription::new_with_consumer(
             SubscriptionId("sub-1".into()),
-            "agent:default",
+            "agent:root",
             ChannelConfig {
                 adapter_type: AdapterType::Telegram,
                 params: vec![],
@@ -1580,7 +1580,7 @@ mod tests {
         .unwrap();
         let (_, turn_binding) = turn
             .registry_issuer
-            .reserve_turn("msg-1", "agent:default")
+            .reserve_turn("msg-1", "agent:root")
             .unwrap()
             .into_parts();
         let authority = ProgressCardAuthorityFactory::new_with_os_rng_at_composition(
@@ -1591,7 +1591,7 @@ mod tests {
         .unwrap();
         let mut route = authority.outbound_route_seal_issuer;
         let key = key_from_message(&message("msg-1", "ack", "x")).unwrap();
-        let binding = route.arm_before_progress(&key, "agent:default").unwrap();
+        let binding = route.arm_before_progress(&key, "agent:root").unwrap();
         let coordinator = ProgressCardCoordinator::new(
             transport.clone(),
             authority.protected_state_issuer,
@@ -1622,7 +1622,7 @@ mod tests {
     ) -> Result<DeliveryReport, ChannelError> {
         let key = key_from_message(message)?;
         let binding = route
-            .arm_before_progress(&key, "agent:default")
+            .arm_before_progress(&key, "agent:root")
             .map_err(|_| fixed_invalid("progress-route-binding-mismatch"))?;
         let route_ref = route
             .acquire_route_ref(
@@ -1631,7 +1631,7 @@ mod tests {
             )
             .unwrap();
         let rendered = coordinator
-            .render("agent:default", &sub(), message, &route_ref)
+            .render("agent:root", &sub(), message, &route_ref)
             .await;
         route.settle_route_ref(&route_ref).unwrap();
         rendered
@@ -1708,7 +1708,7 @@ mod tests {
             let key = key_from_message(&terminal).unwrap();
             let facts = StoreQuiescenceFacts {
                 turn_id: "msg-1".into(),
-                expected_agent: "agent:default".into(),
+                expected_agent: "agent:root".into(),
                 store_incarnation: [1; 16],
             };
             let proof = store_issuer.issue_drained(&facts, 1).unwrap();
@@ -2164,7 +2164,7 @@ mod tests {
         let refreshed = route
             .arm_before_progress(
                 &key_from_message(&message("msg-1", "ack", "again")).unwrap(),
-                "agent:default",
+                "agent:root",
             )
             .unwrap();
         let old_ref = route
@@ -2175,7 +2175,7 @@ mod tests {
             .unwrap();
         assert!(restarted
             .render(
-                "agent:default",
+                "agent:root",
                 &sub(),
                 &message("msg-1", "ack", "again"),
                 &old_ref,
@@ -2190,7 +2190,7 @@ mod tests {
             ..message("msg-1", "ack", "x")
         };
         let refreshed = route
-            .arm_before_progress(&key_from_message(&invalid).unwrap(), "agent:default")
+            .arm_before_progress(&key_from_message(&invalid).unwrap(), "agent:root")
             .unwrap();
         let invalid_ref = route
             .acquire_route_ref(
@@ -2199,7 +2199,7 @@ mod tests {
             )
             .unwrap();
         assert!(active_coordinator
-            .render("agent:default", &sub(), &invalid, &invalid_ref)
+            .render("agent:root", &sub(), &invalid, &invalid_ref)
             .await
             .is_err());
         route.settle_route_ref(&invalid_ref).unwrap();

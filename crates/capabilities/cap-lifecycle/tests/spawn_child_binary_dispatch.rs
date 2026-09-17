@@ -42,7 +42,7 @@ fn spawn_child_val_record_decodes_binary_and_materializes() {
     let tmp = TempDir::new().unwrap();
     let tree = AgentTreeStore::new(tmp.path().to_path_buf()).unwrap();
     tree.insert_root(AgentNode {
-        id: AgentId("default-agent".into()),
+        id: AgentId("root".into()),
         kind: AgentKind::Root,
         parent: None,
         workspace_path: tmp.path().to_path_buf(),
@@ -63,7 +63,7 @@ fn spawn_child_val_record_decodes_binary_and_materializes() {
         .handler;
 
     let ctx = HostCallContext {
-        agent_id: "default-agent".into(),
+        agent_id: "root".into(),
         trace_id: "t".into(),
         turn_id: None,
         capability: "lifecycle".into(),
@@ -125,7 +125,7 @@ fn spawn_child_positional_fallback_unchanged() {
     let tmp = TempDir::new().unwrap();
     let tree = AgentTreeStore::new(tmp.path().to_path_buf()).unwrap();
     tree.insert_root(AgentNode {
-        id: AgentId("default-agent".into()),
+        id: AgentId("root".into()),
         kind: AgentKind::Root,
         parent: None,
         workspace_path: tmp.path().to_path_buf(),
@@ -145,7 +145,7 @@ fn spawn_child_positional_fallback_unchanged() {
         .unwrap()
         .handler;
     let ctx = HostCallContext {
-        agent_id: "default-agent".into(),
+        agent_id: "root".into(),
         trace_id: "t".into(),
         turn_id: None,
         capability: "lifecycle".into(),

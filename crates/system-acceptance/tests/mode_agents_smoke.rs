@@ -67,6 +67,7 @@ async fn spawn_child_mutates_the_real_tree() {
 
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".into()),
             child_id: AgentId("gc1".into()),
             child_workspace_path: PathBuf::from("children/gc1"),

@@ -310,7 +310,7 @@ mod tests {
             id: "m1".into(),
             kind: MessageKind::User,
             from: "user:t".into(),
-            to: "agent:default".into(),
+            to: "agent:root".into(),
             payload: b"please refactor the tokenizer".to_vec(),
             context: None,
             timestamp: SystemTime::UNIX_EPOCH,
@@ -336,7 +336,7 @@ mod tests {
         let m = msg();
         let r = res();
         let ctx = ExtractionContext {
-            agent_id: "agent:default",
+            agent_id: "agent:root",
             msg: &m,
             result: &r,
         };
@@ -356,7 +356,7 @@ mod tests {
         assert_eq!(ex.digest.as_deref(), Some("Refactored the tokenizer"));
         assert_eq!(ex.knowledge.len(), 1);
         assert_eq!(ex.knowledge[0].content, "the tokenizer is now table-driven");
-        assert_eq!(ex.knowledge[0].agent_id, "agent:default");
+        assert_eq!(ex.knowledge[0].agent_id, "agent:root");
         assert_eq!(ex.knowledge[0].entry_type, MemoryType::Fact);
         assert_eq!(ex.descriptions.len(), 1);
         assert_eq!(ex.descriptions[0].path, "src/tok.rs");

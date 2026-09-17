@@ -341,8 +341,8 @@ pub struct ManagerOptions {
     /// sender's CANONICAL colon id (see `AwaitSessionManagerImpl::canonical_sender`).
     /// `None` (the default) → the `from` stamp is the mechanical `agent:{source}`
     /// prefix (exact prior behavior). It is REQUIRED for a correct root→child send:
-    /// the root is the sole special pair (`default-agent` ↔ `agent:default`), so the
-    /// mechanical prefix would mis-stamp its `from` as `agent:default-agent` and fail
+    /// the root is the sole special pair (`root` ↔ `agent:root`), so the
+    /// mechanical prefix would mis-stamp its `from` as `agent:root-agent` and fail
     /// the parent→child adjacency check in `validate_routing`. Every other agent's
     /// bare→colon mapping IS mechanical, so this is a no-op for them.
     pub id_bridge: Option<Arc<AgentIdBridge>>,
@@ -599,10 +599,10 @@ impl AwaitSessionManagerImpl {
     /// Wave-23 `perchild-daemon-1` (C1 fix): stamp a genuine-send's `from` as the
     /// sender's CANONICAL colon id. For every agent whose bare→colon mapping is
     /// mechanical this is exactly `agent:{source}` (byte-identical to the pre-fix
-    /// prefix). The ROOT is the sole special pair — bare `default-agent` ↔ colon
-    /// `agent:default` (NOT `agent:default-agent`) — so a naive prefix would
+    /// prefix). The ROOT is the sole special pair — bare `root` ↔ colon
+    /// `agent:root` (NOT `agent:root-agent`) — so a naive prefix would
     /// mis-stamp the root's `from` and break the parent→child adjacency check in
-    /// `validate_routing` (the child's registered colon parent is `agent:default`).
+    /// `validate_routing` (the child's registered colon parent is `agent:root`).
     /// When an [`AgentIdBridge`] is injected AND `source` is a member (the root seed
     /// pair + every runtime-registered child), resolve to its canonical
     /// `mailbox_key`; otherwise fall back to the mechanical prefix (no bridge / a

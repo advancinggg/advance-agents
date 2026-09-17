@@ -13,8 +13,6 @@ fn t50_t106_set_and_read() {
     let h = HostWorkspaceHome::production();
     let handle = h.open(&home).unwrap();
     h.set_display_name(&handle, "Atlas").unwrap();
-    assert_eq!(TopLevelDisplayName::TREE_ID, "default-agent");
-    assert_eq!(TopLevelDisplayName::MAILBOX_ID, "agent:default");
     assert_eq!(h.current_display_name(&handle).as_deref(), Some("Atlas"));
     assert_eq!(TopLevelDisplayName::get(&home).as_deref(), Some("Atlas"));
 }
@@ -64,21 +62,14 @@ fn name_lives_in_config_document_and_keeps_other_keys() {
 }
 
 #[test]
-fn legacy_sidecar_is_read_until_the_first_write_replaces_it() {
+fn a_sidecar_file_is_never_consulted() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("h");
     write_recognizable_home(&home).unwrap();
-    std::fs::write(home.join(".agent/display-name"), "Old Name\n").unwrap();
-    assert_eq!(TopLevelDisplayName::get(&home).as_deref(), Some("Old Name"));
-    TopLevelDisplayName::set(&home, "New Name").unwrap();
-    assert!(
-        !home.join(".agent/display-name").exists(),
-        "stale sidecar cleared"
-    );
-    assert_eq!(TopLevelDisplayName::get(&home).as_deref(), Some("New Name"));
-    // The config key wins over a sidecar that reappears.
     std::fs::write(home.join(".agent/display-name"), "Ghost").unwrap();
-    assert_eq!(TopLevelDisplayName::get(&home).as_deref(), Some("New Name"));
+    assert_eq!(TopLevelDisplayName::get(&home), None);
+    TopLevelDisplayName::set(&home, "Real").unwrap();
+    assert_eq!(TopLevelDisplayName::get(&home).as_deref(), Some("Real"));
 }
 
 #[test]

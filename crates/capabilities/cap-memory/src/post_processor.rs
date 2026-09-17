@@ -168,8 +168,8 @@ pub struct Components {
     pub fs_root: Option<PathBuf>,
     // ── Slice satB-postproc (SAT-B): the BARE cap id the post-processor writes
     // under (store/index/file ops). `run()` receives the COLON messaging id
-    // (`agent:default`) but the shared `MemoryStore`/WIT handlers key the write
-    // bucket by the bare cap id (`default-agent`); the two id grammars are
+    // (`agent:root`) but the shared `MemoryStore`/WIT handlers key the write
+    // bucket by the bare cap id (`root`); the two id grammars are
     // incompatible, so the composition root supplies the bare id here. `None`
     // ⇒ writes use the `run()` agent_id verbatim (preserves every existing test). ──
     pub write_agent_id: Option<String>,
@@ -1536,8 +1536,8 @@ impl PostProcessorHook for PostProcessor {
         // Step 9 uses the BARE `write_id`, NOT the run() messaging agent_id
         // (SAT-C / audit r1 fix): now that Step-9 DISPATCHES into the L6
         // runnable, the runnable lists/commits the agent's MEMORY bucket — which
-        // Steps 5/7/8 wrote under `write_id` (`default-agent`), not the colon
-        // messaging id (`agent:default`). Dispatching under the colon id would
+        // Steps 5/7/8 wrote under `write_id` (`root`), not the colon
+        // messaging id (`agent:root`). Dispatching under the colon id would
         // consolidate an empty/wrong bucket while emitting l6_completed +
         // marking-ran. The lease/emit are also keyed by `write_id` so the
         // runnable's lease-loss gate (which sees `write_id`) stays consistent.

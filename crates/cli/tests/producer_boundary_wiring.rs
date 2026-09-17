@@ -118,7 +118,7 @@ async fn ac_29_production_wiring_rejects_file_bytes_accepts_insight() {
 
     // A guest that copies the whole workspace file's bytes into remember() is REJECTED
     // by the production-wired producer-boundary guard.
-    let rejected = remember_raw(&host, "default-agent", &file_content).await;
+    let rejected = remember_raw(&host, "root", &file_content).await;
     match &rejected[0] {
         Val::Result(Err(Some(payload))) => match payload.as_ref() {
             Val::Variant(name, inner) => {
@@ -139,7 +139,7 @@ async fn ac_29_production_wiring_rejects_file_bytes_accepts_insight() {
     // A genuine insight is accepted and persisted.
     let accepted = remember_raw(
         &host,
-        "default-agent",
+        "root",
         "Cross-file insight: the retry loop double-counts tokens under contention.",
     )
     .await;

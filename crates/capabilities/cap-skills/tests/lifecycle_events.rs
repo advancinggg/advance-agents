@@ -36,7 +36,7 @@ use wasmtime::component::Val;
 
 const NS: &str = "advance:runtime/agent-skills@0.1.0";
 const CAP: &str = "skills";
-const AGENT: &str = "default-agent";
+const AGENT: &str = "root";
 
 /// Captures every emitted event for assertions.
 #[derive(Default)]
@@ -257,7 +257,7 @@ async fn lc_01_activate_emits_skill_activated_and_turn_commit() {
     );
     let msg = fx.head_message();
     assert!(
-        msg.starts_with("[turn] [agent:default-agent]"),
+        msg.starts_with("[turn] [agent:root]"),
         "commit is a turn commit: {msg}"
     );
     assert!(
@@ -324,7 +324,7 @@ async fn lc_02_rollback_emits_event_restores_version_and_turn_commit() {
     );
     let msg = fx.head_message();
     assert!(
-        msg.starts_with("[turn] [agent:default-agent]"),
+        msg.starts_with("[turn] [agent:root]"),
         "rollback is a turn commit: {msg}"
     );
     assert!(

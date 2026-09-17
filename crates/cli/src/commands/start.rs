@@ -101,15 +101,16 @@ struct ProgressLoopWiring {
     execution_boundary: Arc<dyn ProtectedTurnExecutionBoundary>,
 }
 
-/// Canonical messaging id for the daemon's single agent. Distinct from the
-/// cap-layer id (`"default-agent"`, used for cap-fs/grant/skills/llm via
-/// `ComponentCtx`): messaging `is_safe_id` REQUIRES an `agent:`/`user:` prefix at
-/// dispatch, while cap-grant + cap-lifecycle REJECT a colon (`[A-Za-z0-9_-]`).
-/// The two grammars are incompatible (a documented cross-module product gap), so
-/// the composition root maps between them — this id is used for the `MailboxStore`
-/// key, `run_agent`/dispatch, the reply registry, and the `POST /msg` target.
-/// `pub` so the integration tests witness the production id (false-green guard).
-pub const DEFAULT_MSG_AGENT_ID: &str = "agent:default";
+/// The root's mailbox key when its handle is the default `root` (see
+/// `docs/AGENT-IDENTITY.md`). The PRODUCTION value is resolved per boot by
+/// `wire_capabilities` (`WiringHandles::root_mailbox_id` = `agent:<handle>`) and
+/// threaded into `try_spawn_agent_loop`; this constant remains as the fixture
+/// default for tests that build the serve loop without the wiring. The cap-layer
+/// id is the root's immutable UUID (`WiringHandles::root_agent_id`): messaging
+/// `is_safe_id` REQUIRES an `agent:`/`user:` prefix at dispatch, while cap-grant +
+/// cap-lifecycle REJECT a colon (`[A-Za-z0-9_-]`), so the served key and the
+/// store key are two spellings mapped by the tree's handle registry.
+pub const DEFAULT_MSG_AGENT_ID: &str = "agent:root";
 
 /// How long `POST /msg` waits for the turn's reply before returning 504. Bounds
 /// the request hold time for an errored/hung turn (the happy + no-reply paths
@@ -400,6 +401,8 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
     let agent_loop = match try_spawn_agent_loop(
         &host,
         &workspace,
+        wiring_handles.root_agent_id.clone(),
+        wiring_handles.root_mailbox_id.clone(),
         wiring_handles.event_bus_dyn.clone(),
         wiring_handles.run_manager.clone(),
         wiring_handles.run_config.clone(),
@@ -465,6 +468,7 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
             crate::client_api_adapters::install_tools_if_real(
                 server.api().as_ref(),
                 spawned.tools_inventory.clone(),
+                &wiring_handles.root_mailbox_id,
                 wiring_handles.skills_root.clone(),
             );
         }
@@ -816,6 +820,10 @@ fn select_agent_loop_store(provided: Option<Arc<MailboxStore>>) -> Arc<MailboxSt
 async fn try_spawn_agent_loop(
     host: &RuntimeHost,
     workspace: &Path,
+    // The root identity resolved by `wire_capabilities` (`cap_agent_id` = immutable
+    // id, `msg_agent_id` = `agent:<handle>` mailbox key).
+    root_agent_id: String,
+    root_mailbox_id: String,
     event_bus: Arc<dyn EventBusEmit>,
     run_manager: Arc<RunManager>,
     run_config: RunConfig,
@@ -902,15 +910,15 @@ async fn try_spawn_agent_loop(
     // TWO agent ids — the two id grammars are incompatible (see DEFAULT_MSG_AGENT_ID):
     // - cap_agent_id (bare): cap-fs resolver-tree root + cap-grant grantee,
     //   resolved via ComponentCtx at host-fn time. MUST match wiring.rs
-    //   DEFAULT_AGENT_ID ("default-agent") or the deployed agent's fs + grant
+    //   DEFAULT_AGENT_ID ("root") or the deployed agent's fs + grant
     //   resolution fails (lookup by exact id string). cap-grant/cap-lifecycle
     //   reject a colon, so this stays bare.
-    let cap_agent_id = "default-agent".to_string();
+    let cap_agent_id = root_agent_id;
     // - msg_agent_id (canonical, colon-prefixed): the MailboxStore key + the
     //   run_agent/dispatch id + the reply-registry key + the POST /msg target.
     //   messaging is_safe_id requires the prefix; the mailbox store does not
     //   validate key grammar, so deliver/recv stay consistent on it.
-    let msg_agent_id = DEFAULT_MSG_AGENT_ID.to_string();
+    let msg_agent_id = root_mailbox_id;
     // WS-A: source the guest's capability set from `.agent/config.yaml` (was a
     // hardcoded `vec![fs]`). The SAME `.agent/config.yaml` gates which host fns
     // `wiring::wire_capabilities` registered, so the requested caps and the
@@ -1382,6 +1390,8 @@ pub async fn spawn_test_agent_loop(
     try_spawn_agent_loop(
         host,
         workspace,
+        handles.root_agent_id.clone(),
+        handles.root_mailbox_id.clone(),
         handles.event_bus_dyn.clone(),
         handles.run_manager.clone(),
         handles.run_config.clone(),
@@ -1727,18 +1737,12 @@ mod tests {
     #[tokio::test]
     async fn deliver_to_store_then_poll_returns_message() {
         let store = Arc::new(MailboxStore::new(NonZeroUsize::new(8).unwrap()));
-        deliver_to_store(
-            &store,
-            None,
-            "default-agent",
-            "m1".to_string(),
-            b"hello".to_vec(),
-        )
-        .unwrap_or_else(|_| panic!("deliver should succeed"));
-        let mb = store.get_or_create("default-agent").unwrap();
+        deliver_to_store(&store, None, "root", "m1".to_string(), b"hello".to_vec())
+            .unwrap_or_else(|_| panic!("deliver should succeed"));
+        let mb = store.get_or_create("root").unwrap();
         let got = mb.poll().expect("a message was delivered");
         assert_eq!(got.payload, b"hello");
-        assert_eq!(got.to, "default-agent");
+        assert_eq!(got.to, "root");
         assert_eq!(got.from, "user:http");
         assert_eq!(got.kind, MessageKind::User);
     }
@@ -1748,15 +1752,8 @@ mod tests {
     #[tokio::test]
     async fn deliver_to_store_wakes_a_recv() {
         let store = Arc::new(MailboxStore::new(NonZeroUsize::new(8).unwrap()));
-        deliver_to_store(
-            &store,
-            None,
-            "default-agent",
-            "m1".to_string(),
-            b"wake".to_vec(),
-        )
-        .unwrap();
-        let mb = store.get_or_create("default-agent").unwrap();
+        deliver_to_store(&store, None, "root", "m1".to_string(), b"wake".to_vec()).unwrap();
+        let mb = store.get_or_create("root").unwrap();
         // The message is already queued, so recv resolves immediately.
         let got = mb.recv().await;
         assert_eq!(got.payload, b"wake");
@@ -2017,7 +2014,7 @@ mod satb_gate_tests {
             id: "m".into(),
             kind: MessageKind::User,
             from: "user:t".into(),
-            to: "agent:default".into(),
+            to: "agent:root".into(),
             payload: vec![],
             context: None,
             timestamp: SystemTime::UNIX_EPOCH,
@@ -2047,31 +2044,22 @@ mod satb_gate_tests {
         let ws = std::env::temp_dir(); // unused on the trace-only path
 
         // (memory present, llm absent) → trace-only, no writes.
-        let pp = build_live_post_processor(
-            Some(&store),
-            None,
-            &ws,
-            bus(),
-            "default-agent",
-            None,
-            None,
-            None,
-        );
-        pp.run("default-agent", &fixture_msg(), &fixture_result())
+        let pp =
+            build_live_post_processor(Some(&store), None, &ws, bus(), "root", None, None, None);
+        pp.run("root", &fixture_msg(), &fixture_result())
             .await
             .expect("run Ok");
         assert!(
-            store.list("default-agent").is_empty(),
+            store.list("root").is_empty(),
             "an LLM-absent config must write NO synthetic memory entries"
         );
 
         // (both absent) → trace-only, no writes.
-        let pp2 =
-            build_live_post_processor(None, None, &ws, bus(), "default-agent", None, None, None);
-        pp2.run("default-agent", &fixture_msg(), &fixture_result())
+        let pp2 = build_live_post_processor(None, None, &ws, bus(), "root", None, None, None);
+        pp2.run("root", &fixture_msg(), &fixture_result())
             .await
             .expect("run Ok");
-        assert!(store.list("default-agent").is_empty());
+        assert!(store.list("root").is_empty());
     }
 }
 
@@ -2112,7 +2100,7 @@ mod skill_turn_boundary_pin {
             id: "m".into(),
             kind: MessageKind::User,
             from: "user:t".into(),
-            to: "agent:default".into(),
+            to: "agent:root".into(),
             payload: vec![],
             context: None,
             timestamp: SystemTime::UNIX_EPOCH,
@@ -2149,7 +2137,7 @@ mod skill_turn_boundary_pin {
             cap_skills::SkillStore::with_storage(storage),
         ));
         let coordinator = Arc::new(cap_skills::SkillPersistenceCoordinator::with_shared_store(
-            "default-agent".to_string(),
+            "root".to_string(),
             dir.path().to_path_buf(),
             Arc::clone(&shared),
             Arc::new(OkCommitQueue) as Arc<dyn GitCommitQueue>,
@@ -2160,7 +2148,7 @@ mod skill_turn_boundary_pin {
         let driver =
             cap_skills::SkillTurnPersistenceDriver::new(Arc::clone(&shared), coordinator, flusher);
         let runtime = Arc::new(cap_skills::SkillTurnRuntime::new(
-            "default-agent",
+            "root",
             dir.path().to_path_buf(),
             shared,
             driver,
@@ -2174,27 +2162,27 @@ mod skill_turn_boundary_pin {
 
         // begin drives the runtime: on-disk lease exists + runtime is active.
         let lease = boundary
-            .begin_turn("default-agent", &msg())
+            .begin_turn("root", &msg())
             .await
             .expect("begin_turn through the production boundary");
-        assert!(runtime.is_active_for("default-agent").await);
+        assert!(runtime.is_active_for("root").await);
         assert_eq!(lease_json_count(dir.path()), 1);
 
         // finish settles it (empty turn → journal removed, runtime idle).
         boundary
-            .finish_turn("default-agent", &lease)
+            .finish_turn("root", &lease)
             .await
             .expect("finish_turn through the production boundary");
-        assert!(!runtime.is_active_for("default-agent").await);
+        assert!(!runtime.is_active_for("root").await);
         assert_eq!(lease_json_count(dir.path()), 0);
 
         // abort drops a fresh lease.
         let lease = boundary
-            .begin_turn("default-agent", &msg())
+            .begin_turn("root", &msg())
             .await
             .expect("second begin_turn");
-        boundary.abort_turn("default-agent", &lease, "test").await;
-        assert!(!runtime.is_active_for("default-agent").await);
+        boundary.abort_turn("root", &lease, "test").await;
+        assert!(!runtime.is_active_for("root").await);
         assert_eq!(lease_json_count(dir.path()), 0);
     }
 }

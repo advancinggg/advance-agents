@@ -282,7 +282,7 @@ mod tests {
             id: "msg-99".into(),
             kind: MessageKind::User,
             from: "user:alice".into(),
-            to: "agent:default".into(),
+            to: "agent:root".into(),
             payload: vec![],
             context: None,
             timestamp: SystemTime::now(),

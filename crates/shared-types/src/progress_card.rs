@@ -3007,7 +3007,7 @@ mod tests {
         let key_digest = key.digest().unwrap();
         let (_, turn_binding) = turn
             .registry_issuer
-            .reserve_turn("msg-99", "agent:default")
+            .reserve_turn("msg-99", "agent:root")
             .unwrap()
             .into_parts();
         let mut rng = rand::rngs::OsRng;
@@ -3020,11 +3020,11 @@ mod tests {
         .unwrap();
         authority
             .outbound_route_seal_issuer
-            .arm_before_progress(&key, "agent:default")
+            .arm_before_progress(&key, "agent:root")
             .unwrap();
         let store_facts = StoreQuiescenceFacts {
             turn_id: "msg-99".into(),
-            expected_agent: "agent:default".into(),
+            expected_agent: "agent:root".into(),
             store_incarnation: [1; 16],
         };
         let store_proof = turn
@@ -3130,7 +3130,7 @@ mod tests {
         .unwrap();
         let _source = turn
             .registry_issuer
-            .reserve_turn("msg-99", "agent:default")
+            .reserve_turn("msg-99", "agent:root")
             .unwrap();
         let mut authority = ProgressCardAuthorityFactory::new_with_os_rng_at_composition(
             turn.activation_staging,
@@ -3147,7 +3147,7 @@ mod tests {
         let key_digest = key.digest().unwrap();
         authority
             .outbound_route_seal_issuer
-            .arm_before_progress(&key, "agent:default")
+            .arm_before_progress(&key, "agent:root")
             .unwrap();
         let attempt_id = [4; 16];
         let attempt_kind = IndeterminateAttemptKind::FallbackSend {

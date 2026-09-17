@@ -47,7 +47,7 @@ async fn real_c218_c219_carriers_drive_public_history_and_pending_projection() {
     .await
     .expect("C219 projector");
     projector
-        .register_agent("default-agent")
+        .register_agent("root")
         .await
         .expect("register caller identity");
 
@@ -57,7 +57,7 @@ async fn real_c218_c219_carriers_drive_public_history_and_pending_projection() {
     );
     submit
         .submit_component(
-            "default-agent",
+            "root",
             ComponentSubmitConfig {
                 id: "legacy3-sensitive".to_owned(),
                 component_type: ComponentType::Task,

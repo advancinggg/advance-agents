@@ -157,6 +157,7 @@ fn t_se_01_spawn_child_allow() {
     let parent_caps = vec![cap("fs", json!({"read-paths": "/tmp"}))];
     let (_tmp, _tree, spawner) = setup_with_parent_caps(parent_caps);
     let result = spawner.spawn_child(SpawnChildConfig {
+        handle: None,
         parent_id: AgentId("root".to_string()),
         child_id: AgentId("foo".to_string()),
         child_workspace_path: PathBuf::from("agents/foo"),
@@ -173,6 +174,7 @@ fn t_se_02_spawn_child_reject() {
     let (_tmp, _tree, spawner) = setup_with_parent_caps(parent_caps);
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("agents/foo"),
@@ -353,6 +355,7 @@ fn t_se_09_fail_closed_unrecognized_parent_key() {
     let (_tmp, _tree, spawner) = setup_with_parent_caps(parent_caps);
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("agents/foo"),

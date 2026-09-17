@@ -131,6 +131,7 @@ fn agent_state_deny_unknown_fields() {
 #[test]
 fn agent_tree_snapshot_data_round_trip() {
     let data = AgentTreeSnapshotData {
+        handles: Default::default(),
         nodes: vec![],
         parent_of: HashMap::new(),
         children_of: HashMap::new(),

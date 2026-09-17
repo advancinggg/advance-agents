@@ -9,8 +9,6 @@ use advance_shared_types::web_search::{WebRunMode, WEB_EXTRACT_TOOL_ID, WEB_SEAR
 use wasmtime::component::Val;
 
 const TOOLS_NS: &str = "advance:runtime/agent-tools@0.1.0";
-const CAP_AGENT: &str = "default-agent";
-
 fn runtime_yaml(web_block: &str) -> String {
     format!(
         r#"wasm:
@@ -55,9 +53,10 @@ fn fresh_workspace(caps_yaml: &str, web_block: &str) -> (tempfile::TempDir, Path
     (dir, workspace, config_path)
 }
 
-fn tool_invoke_ctx() -> HostCallContext {
+/// `caller` is the root's tree id (its per-boot UUID, from `WiringHandles::root_agent_id`).
+fn tool_invoke_ctx(caller: &str) -> HostCallContext {
     HostCallContext {
-        agent_id: CAP_AGENT.to_string(),
+        agent_id: caller.to_string(),
         trace_id: "tr-web".to_string(),
         turn_id: None,
         capability: "tools".to_string(),
@@ -109,6 +108,8 @@ async fn t105_e_standard_wires_family_and_search_hits() {
     let (_g, ws, cfg) = fresh_workspace("capabilities:\n  tools: true\n  web: true\n", "");
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
     let (host, handles) = wire_capabilities(builder, &ws).await.expect("wire");
+    // The root's cap-layer id is its immutable UUID (per boot), not the literal `root`.
+    let cap_agent: &str = handles.root_agent_id.as_str();
 
     let status = handles.web_status.as_ref().expect("web_status");
     assert_eq!(status.mode, WebRunMode::Standard);
@@ -134,7 +135,7 @@ async fn t105_e_standard_wires_family_and_search_hits() {
     let out = spec
         .handler
         .call(
-            tool_invoke_ctx(),
+            tool_invoke_ctx(cap_agent),
             invoke_params(WEB_SEARCH_TOOL_ID, "search", br#"{"query":"rust"}"#),
             1,
         )
@@ -163,6 +164,8 @@ async fn t105_a_offline_withholds_family_and_leftover_is_permission_denied() {
     );
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
     let (host, handles) = wire_capabilities(builder, &ws).await.expect("wire");
+    // The root's cap-layer id is its immutable UUID (per boot), not the literal `root`.
+    let cap_agent: &str = handles.root_agent_id.as_str();
 
     let status = handles.web_status.as_ref().expect("web_status");
     assert_eq!(status.mode, WebRunMode::Offline);
@@ -188,7 +191,7 @@ async fn t105_a_offline_withholds_family_and_leftover_is_permission_denied() {
     let out = spec
         .handler
         .call(
-            tool_invoke_ctx(),
+            tool_invoke_ctx(cap_agent),
             invoke_params(WEB_SEARCH_TOOL_ID, "search", br#"{"query":"rust"}"#),
             1,
         )

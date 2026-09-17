@@ -169,8 +169,21 @@ pub struct AgentTreeSnapshotData {
     pub children_of: std::collections::HashMap<AgentId, Vec<AgentId>>,
     pub peer_slug_map:
         std::collections::HashMap<AgentId, std::collections::HashMap<String, AgentId>>,
+    /// Tree id → handle (the addressable name; see [`AgentTreeReader::handle_of`]). A node
+    /// absent from this map uses its id as the handle.
+    pub handles: std::collections::HashMap<AgentId, String>,
     /// Monotonic revision number; increments on every tree mutation.
     pub revision: u64,
+}
+
+impl AgentTreeSnapshotData {
+    /// The handle of `id` (its id when no handle was registered).
+    pub fn handle_of(&self, id: &AgentId) -> String {
+        self.handles
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.0.clone())
+    }
 }
 
 /// CONTRACT-040 — read-only agent tree navigation. Canonical source:
@@ -196,6 +209,25 @@ pub trait AgentTreeReader: Send + Sync {
     fn agent_exists(&self, agent_id: &str) -> bool;
     fn agent_kind(&self, agent_id: &str) -> Option<AgentKind>;
     fn capabilities(&self, agent_id: &str) -> Vec<Capability>;
+    /// The agent's HANDLE — the human-typed, addressable name (`research`; mailbox
+    /// `agent:research`). Distinct from the tree id (`AgentId`), which is the immutable
+    /// persistence key (a UUID for production agents). Readers without a handle registry
+    /// (test fixtures) treat the id as its own handle.
+    fn handle_of(&self, agent_id: &str) -> Option<String> {
+        if self.agent_exists(agent_id) {
+            Some(agent_id.to_string())
+        } else {
+            None
+        }
+    }
+    /// Reverse of [`AgentTreeReader::handle_of`]: the tree id owning `handle`.
+    fn id_by_handle(&self, handle: &str) -> Option<String> {
+        if self.agent_exists(handle) {
+            Some(handle.to_string())
+        } else {
+            None
+        }
+    }
 }
 
 /// CONTRACT-040 — full tree snapshot extension. Canonical source: MODULE-005
@@ -212,4 +244,67 @@ pub trait AgentTreeReader: Send + Sync {
 ///    (recommended ≤ 1024 agents per workspace).
 pub trait AgentTreeSnapshot: AgentTreeReader {
     fn snapshot(&self) -> AgentTreeSnapshotData;
+}
+
+/// Maximum agent id length (mirrors the MODULE-005 `AgentId` implementer invariant).
+pub const MAX_AGENT_ID_LEN: usize = 64;
+
+/// Derive a tree id from a user-visible display name: lower-cased, whitespace runs
+/// collapsed to `-`, everything outside `[a-z0-9_-]` dropped, leading/trailing `-`
+/// trimmed, capped at [`MAX_AGENT_ID_LEN`]. `None` when nothing survives (e.g. a
+/// name written entirely in a non-Latin script) — the caller then picks a fallback.
+/// The id is derived ONCE at creation and frozen; a later rename never re-derives it.
+pub fn derive_agent_id(display_name: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut pending_dash = false;
+    for ch in display_name.trim().chars() {
+        if ch.is_whitespace() {
+            pending_dash = !out.is_empty();
+            continue;
+        }
+        for lower in ch.to_lowercase() {
+            if lower.is_ascii_alphanumeric() || lower == '_' || lower == '-' {
+                if pending_dash {
+                    out.push('-');
+                    pending_dash = false;
+                }
+                out.push(lower);
+            }
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut id: String = trimmed.chars().take(MAX_AGENT_ID_LEN).collect();
+    while id.ends_with('-') {
+        id.pop();
+    }
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+#[cfg(test)]
+mod derive_agent_id_tests {
+    use super::derive_agent_id;
+
+    #[test]
+    fn derives_slugs() {
+        assert_eq!(derive_agent_id("Research").as_deref(), Some("research"));
+        assert_eq!(derive_agent_id("Soul Mate").as_deref(), Some("soul-mate"));
+        assert_eq!(
+            derive_agent_id("  R&D   Desk! ").as_deref(),
+            Some("rd-desk")
+        );
+        assert_eq!(derive_agent_id("a_b-C").as_deref(), Some("a_b-c"));
+        assert_eq!(derive_agent_id("--x--").as_deref(), Some("x"));
+        assert_eq!(derive_agent_id("灵魂伴侣"), None);
+        assert_eq!(derive_agent_id("   "), None);
+        assert_eq!(derive_agent_id("!!!"), None);
+        let long = "a".repeat(100);
+        assert_eq!(derive_agent_id(&long).unwrap().len(), 64);
+    }
 }

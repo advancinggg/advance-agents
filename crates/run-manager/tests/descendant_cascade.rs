@@ -214,6 +214,7 @@ fn mock_tree(edges: &[(&str, &str)]) -> Arc<MockTree> {
 
     Arc::new(MockTree {
         data: AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes,
             parent_of,
             children_of,

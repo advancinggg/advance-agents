@@ -144,7 +144,7 @@ async fn ac_39_production_memory_persists_under_agent_memory_across_restart() {
         let (host, handles) = wire_capabilities(builder, &ws).await.expect("wire");
 
         // Two agents write DISTINCT entries through the production-registered handler.
-        remember(&host, "default-agent", "durable-prod-binding").await;
+        remember(&host, "root", "durable-prod-binding").await;
         remember(&host, "other-agent", "other-secret-xyz").await;
 
         // The literal on-disk file landed under <ws>/.agent/memory.
@@ -167,17 +167,17 @@ async fn ac_39_production_memory_persists_under_agent_memory_across_restart() {
     let reopened = MemoryStore::open(&mem_root, DEFAULT_MAX_ACTIVE_PER_AGENT)
         .expect("re-open production memory dir");
 
-    // (a) across-restart binding: default-agent's entry survived.
+    // (a) across-restart binding: root's entry survived.
     assert!(
-        !reopened.recall("default-agent", "durable", 10).is_empty(),
-        "AC-39(a): default-agent's memory persisted under .agent/memory across restart"
+        !reopened.recall("root", "durable", 10).is_empty(),
+        "AC-39(a): root's memory persisted under .agent/memory across restart"
     );
 
     // (b) per-agent scoping / no cross-agent leakage (non-degenerate — BOTH agents wrote):
-    //   - default-agent's query hits ONLY its own bucket;
+    //   - root's query hits ONLY its own bucket;
     //   - other-agent never wrote "durable" → empty for that query;
     //   - other-agent's own entry is recall-able under other-agent;
-    //   - default-agent never wrote "other-secret" → empty for that query.
+    //   - root never wrote "other-secret" → empty for that query.
     assert!(
         reopened.recall("other-agent", "durable", 10).is_empty(),
         "AC-39(b): other-agent has no 'durable' entry (no cross-agent leakage)"
@@ -189,10 +189,8 @@ async fn ac_39_production_memory_persists_under_agent_memory_across_restart() {
         "AC-39(b): other-agent recalls its OWN entry"
     );
     assert!(
-        reopened
-            .recall("default-agent", "other-secret", 10)
-            .is_empty(),
-        "AC-39(b): default-agent has no 'other-secret' entry (no cross-agent leakage)"
+        reopened.recall("root", "other-secret", 10).is_empty(),
+        "AC-39(b): root has no 'other-secret' entry (no cross-agent leakage)"
     );
 
     // (c) fresh agent starts empty: a brand-new .agent/memory dir hydrates to empty.
@@ -203,9 +201,7 @@ async fn ac_39_production_memory_persists_under_agent_memory_across_restart() {
     )
     .expect("open fresh memory dir");
     assert!(
-        fresh_store
-            .recall("default-agent", "durable", 10)
-            .is_empty(),
+        fresh_store.recall("root", "durable", 10).is_empty(),
         "AC-39(c): a freshly-opened .agent/memory dir starts empty"
     );
 }

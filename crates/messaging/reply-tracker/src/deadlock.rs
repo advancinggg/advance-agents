@@ -180,6 +180,7 @@ mod tests {
             );
         }
         AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes: node_ids.iter().map(|i| node(i)).collect(),
             parent_of,
             children_of: HashMap::new(),

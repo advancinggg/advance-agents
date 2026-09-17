@@ -43,7 +43,7 @@ fn s4_production_composition_installs_live_streaming_with_shared_detector() {
         Arc::new(StubBudget),
         Arc::new(StubBus) as Arc<dyn EventBusEmit>,
         Arc::new(StubRep),
-        "default-agent".to_string(),
+        "root".to_string(),
         Arc::new(advance_shared_types::traits::NotWiredDeltaSink)
             as Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
         None,
@@ -77,7 +77,7 @@ fn s4_production_composition_installs_live_streaming_with_shared_detector() {
         Arc::new(StubBudget),
         Arc::new(StubBus) as Arc<dyn EventBusEmit>,
         Arc::new(StubRep),
-        "default-agent".to_string(),
+        "root".to_string(),
     );
     assert!(!bare.has_live_streaming());
 }
@@ -238,8 +238,8 @@ mod t120 {
     const CHILD_CORE: &[u8] =
         include_bytes!("../../runtime/tests/fixtures/guest-rust-minimal.core.wasm");
 
-    const ROOT_BARE: &str = "default-agent";
-    const ROOT_COLON: &str = "agent:default";
+    const ROOT_BARE: &str = "root";
+    const ROOT_COLON: &str = "agent:root";
     const CHILD_BARE: &str = "tchild";
     const CHILD_COLON: &str = "agent:tchild";
 
@@ -645,16 +645,19 @@ database:
             .expect("spawn production serve loop")
             .expect("deployed skeleton component starts a serve loop");
         assert_eq!(serve.agent_id(), ROOT_COLON);
+        // The root's BARE cap-id is its immutable per-boot UUID (never the literal `root`).
+        let root_bare = handles.root_agent_id.clone();
+        assert_ne!(root_bare, ROOT_BARE);
 
         // A live abandoned stream owned by the root's BARE cap-id, plus a
         // bystander stream the root's turn must NOT settle.
-        let _handle = plant_live_stream(&rig, ROOT_BARE).await;
+        let _handle = plant_live_stream(&rig, &root_bare).await;
         let _bystander = plant_live_stream(&rig, "bystander-agent").await;
 
         deliver(&store, ROOT_COLON, "t120-turn-1");
         let term = rig
             .sink
-            .wait_terminal(ROOT_BARE, Duration::from_secs(30))
+            .wait_terminal(&root_bare, Duration::from_secs(30))
             .await
             .expect(
                 "the root serve loop's turn end must reap the abandoned live stream \
@@ -690,17 +693,17 @@ database:
         // the new stream gets its own Terminal; the FIRST stream's count stays 1.
         // (Eviction-vs-latch is NOT distinguishable here: the exactly-once CAS and
         // settle-once finalize produce identical observations either way.)
-        let _handle2 = plant_live_stream(&rig, ROOT_BARE).await;
+        let _handle2 = plant_live_stream(&rig, &root_bare).await;
         deliver(&store, ROOT_COLON, "t120-turn-2");
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while rig.sink.terminals_for(ROOT_BARE).len() < 2 {
+        while rig.sink.terminals_for(&root_bare).len() < 2 {
             assert!(
                 std::time::Instant::now() < deadline,
                 "turn 2 must run and reap the second planted stream (liveness oracle)"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let terms = rig.sink.terminals_for(ROOT_BARE);
+        let terms = rig.sink.terminals_for(&root_bare);
         assert_eq!(terms.len(), 2, "one Terminal per stream across two turns");
         assert!(
             terms.iter().any(|t| t.stream_key == term.stream_key)
@@ -817,6 +820,7 @@ database:
             .with_spawn_observer(mgr.clone() as Arc<dyn SpawnObserver>);
         spawner
             .spawn_child(SpawnChildConfig {
+                handle: None,
                 parent_id: AgentId(ROOT_BARE.to_string()),
                 child_id: AgentId(CHILD_BARE.to_string()),
                 child_workspace_path: PathBuf::from("children").join(CHILD_BARE),
@@ -888,7 +892,7 @@ database:
     /// identity, NOT composition identity — the composition gates are cases 1
     /// and 2). REDESIGNED with the §5.2-item-5 fix: the observer holds an exact
     /// authoritative `(serve-key, cap-id)` pair injected at construction
-    /// (`for_agent`), so `agent:default` reaps the BARE `default-agent` stream
+    /// (`for_agent`), so `agent:root` reaps the BARE `root` stream
     /// via the injected root pair, a second observer reaps its own agent via its
     /// own pair, and any NON-matching id — another agent's key, a malformed id,
     /// the empty string — reaps NOTHING by exact compare: there is no derivation
@@ -913,7 +917,7 @@ database:
         assert_eq!(
             obs.reap_now(ROOT_COLON),
             1,
-            "the injected root pair reaps the BARE default-agent stream"
+            "the injected root pair reaps the BARE root stream"
         );
         let term = rig
             .sink
@@ -923,7 +927,7 @@ database:
         assert_reaped(&term);
         assert!(
             rig.sink.terminals_for("other-agent").is_empty(),
-            "reaping agent:default must not settle other-agent's stream"
+            "reaping agent:root must not settle other-agent's stream"
         );
         let obs_other =
             ReapTurnObserver::for_agent(rig.reaper.clone(), "agent:other-agent", "other-agent");

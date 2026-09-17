@@ -309,7 +309,7 @@ fn body_chat_id(req: &HttpRequest) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn external_message_yields_reply_back_out_same_adapter_correlated() {
-    let mut h = wire("agent:default");
+    let mut h = wire("agent:root");
     h.deliver_update_and_await_turn(98765, 4242).await;
 
     let sent = h.sent.lock().unwrap().clone();
@@ -332,7 +332,7 @@ async fn external_message_yields_reply_back_out_same_adapter_correlated() {
 #[tokio::test(flavor = "multi_thread")]
 async fn one_subscription_two_conversations_fan_out_to_correct_chats() {
     // The ADR-mandated test: one subscription fans replies to many conversations.
-    let mut h = wire("agent:default");
+    let mut h = wire("agent:root");
     h.deliver_update_and_await_turn(98765, 4242).await;
     h.deliver_update_and_await_turn(11111, 5555).await;
 

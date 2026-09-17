@@ -73,7 +73,12 @@ const RESTART_REQUIRED_MESSAGE: &str =
 /// One agent as listed by `GET /client/agents` (a client-safe projection of the tree node).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientAgentSummary {
+    /// The agent's HANDLE — the addressable name (`research`; mailbox `agent:research`) and the
+    /// `{agent_id}` path parameter of this family. Renameable via `:update`.
     pub agent_id: String,
+    /// The immutable id (a UUID): the key every store uses (grants, memory, the cost ledger's
+    /// `agent_id`). Never changes, even across a handle rename.
+    pub id: String,
     /// `root | child | sub`.
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,9 +183,12 @@ pub struct ClientAgentDetail {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClientCreateAgentRequest {
-    /// `^[A-Za-z0-9_-]{1,64}$`; becomes the tree id.
-    pub agent_id: String,
-    /// Parent tree id; defaults to the root agent.
+    /// The handle (`^[A-Za-z0-9_-]{1,64}$`). Optional: when absent it is derived from
+    /// `display_name` (lower-cased, spaces → `-`, other characters dropped; `-2`, `-3`… on a
+    /// collision; `agent-<n>` when nothing survives). The immutable id is minted server-side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Parent handle; defaults to the root agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     /// Directory RELATIVE TO THE PARENT's workspace; defaults to `agent_id`.
@@ -209,6 +217,10 @@ pub struct ClientCreateAgentRequest {
 pub struct ClientUpdateAgentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// A new handle (`^[A-Za-z0-9_-]{1,64}$`, unique). The id and every store keyed by it are
+    /// untouched; the live mailbox keeps the old key until the next daemon start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     /// Full replacement of `.agent/config.yaml` (validated by the provider before the write).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_yaml: Option<String>,
@@ -413,7 +425,13 @@ pub fn validate_capabilities(capabilities: &[String]) -> Result<(), ClientError>
 
 /// Validate a full create request (every field, in a fixed order).
 pub fn validate_create_request(req: &ClientCreateAgentRequest) -> Result<(), ClientError> {
-    validate_agent_id(&req.agent_id)?;
+    match &req.agent_id {
+        Some(id) => validate_agent_id(id)?,
+        None if req.display_name.is_none() => {
+            return Err(invalid("agent_id or display_name is required"));
+        }
+        None => {}
+    }
     if let Some(parent) = &req.parent {
         validate_agent_id(parent)?;
     }
@@ -437,11 +455,15 @@ pub fn validate_create_request(req: &ClientCreateAgentRequest) -> Result<(), Cli
 /// Validate an update request: at least one field, each within bounds.
 pub fn validate_update_request(req: &ClientUpdateAgentRequest) -> Result<(), ClientError> {
     if req.display_name.is_none()
+        && req.handle.is_none()
         && req.config_yaml.is_none()
         && req.capabilities.is_none()
         && req.llm.is_none()
     {
         return Err(invalid("empty agent update"));
+    }
+    if let Some(handle) = &req.handle {
+        validate_agent_id(handle)?;
     }
     if let Some(name) = &req.display_name {
         validate_display_name(name)?;
@@ -461,7 +483,7 @@ pub fn validate_update_request(req: &ClientUpdateAgentRequest) -> Result<(), Cli
 /// Whether an update changes something that only takes effect at the next daemon start. An
 /// `llm`-only update does NOT (the policy is re-read at the next LLM call).
 fn update_needs_restart(req: &ClientUpdateAgentRequest) -> bool {
-    req.config_yaml.is_some() || req.capabilities.is_some()
+    req.config_yaml.is_some() || req.capabilities.is_some() || req.handle.is_some()
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────────────────────
@@ -616,7 +638,7 @@ mod tests {
 
     #[test]
     fn agent_id_charset() {
-        assert!(validate_agent_id("default-agent").is_ok());
+        assert!(validate_agent_id("root").is_ok());
         assert!(validate_agent_id("A_b-9").is_ok());
         assert!(validate_agent_id(&"x".repeat(64)).is_ok());
         for bad in ["", " ", "a b", "agent:x", "../x", "ünï", "x/y"] {

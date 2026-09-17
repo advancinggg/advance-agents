@@ -28,8 +28,8 @@ use advance_shared_types::SessionId;
 use async_trait::async_trait;
 use cap_http::{DefaultSsrfGuard, ExecutorError, HttpExecutor, MockResolver};
 
-const AGENT_COLON: &str = "agent:default";
-const AGENT_BARE: &str = "default-agent";
+const AGENT_COLON: &str = "agent:root";
+const AGENT_BARE: &str = "root";
 const TEST_MASTER_KEY: &str = "4f0be08e7d1746246fe409f30f67df1826848f071d4608f41de29c5c082f9b31";
 const CORE: &[u8] = include_bytes!("../../runtime/tests/fixtures/guest-rust-send.core.wasm");
 

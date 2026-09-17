@@ -49,6 +49,9 @@ type ReplySlot = oneshot::Sender<Option<Vec<u8>>>;
 /// is serial), so the key is unambiguous. Message-id keying (concurrent
 /// correlation) needs a CONTRACT-051 dispatch-trait change and is Step-3.
 pub struct ReplyRegistry {
+    /// Colon ⇄ bare alias resolution over the agent tree (`agent:<handle>` ⇄ tree id). `None`
+    /// (unit fixtures) ⇒ the mechanical pairing `agent:<x>` ⇄ `x`.
+    tree: Option<Arc<dyn advance_shared_types::agent_tree::AgentTreeReader>>,
     inner: Mutex<HashMap<String, ReplySlot>>,
     /// Per-agent "had a produced reply" bit. Never stores payload bytes.
     last_outbound: Mutex<HashMap<String, bool>>,
@@ -63,6 +66,7 @@ pub struct ReplyRegistry {
 impl ReplyRegistry {
     pub fn new() -> Self {
         Self {
+            tree: None,
             inner: Mutex::new(HashMap::new()),
             last_outbound: Mutex::new(HashMap::new()),
             last_stream_key: Mutex::new(HashMap::new()),
@@ -71,32 +75,44 @@ impl ReplyRegistry {
         }
     }
 
-    /// Root pair is `default-agent` ↔ `agent:default`, not `agent:default-agent`.
-    fn alias_keys(id: &str) -> Vec<String> {
-        if id == "agent:default" || id == "default-agent" {
-            return vec!["agent:default".to_string(), "default-agent".to_string()];
-        }
-        if let Some(bare) = id.strip_prefix("agent:") {
-            if bare == "default-agent" {
-                return vec![id.to_string()];
-            }
-            return vec![id.to_string(), bare.to_string()];
-        }
-        if id == "default" {
-            return vec![id.to_string()];
-        }
-        vec![format!("agent:{id}"), id.to_string()]
+    /// Resolve aliases through the agent tree: a served key `agent:<handle>` and its tree id
+    /// (a UUID in production) name the same agent.
+    pub fn with_tree(
+        mut self,
+        tree: Arc<dyn advance_shared_types::agent_tree::AgentTreeReader>,
+    ) -> Self {
+        self.tree = Some(tree);
+        self
     }
 
-    fn pending_slot(id: &str) -> String {
-        Self::alias_keys(id)
+    /// Both spellings of one agent: `[served colon key, bare tree id]`. With a tree, the pair
+    /// is `agent:<handle>` ⇄ tree id; without one, the mechanical `agent:<x>` ⇄ `x`.
+    fn alias_keys(&self, id: &str) -> Vec<String> {
+        if let Some(bare) = id.strip_prefix("agent:") {
+            let tree_id = self
+                .tree
+                .as_ref()
+                .and_then(|t| t.id_by_handle(bare))
+                .unwrap_or_else(|| bare.to_string());
+            return vec![id.to_string(), tree_id];
+        }
+        let handle = self
+            .tree
+            .as_ref()
+            .and_then(|t| t.handle_of(id))
+            .unwrap_or_else(|| id.to_string());
+        vec![format!("agent:{handle}"), id.to_string()]
+    }
+
+    fn pending_slot(&self, id: &str) -> String {
+        self.alias_keys(id)
             .into_iter()
             .next()
             .unwrap_or_else(|| id.to_string())
     }
 
     pub fn note_pending_message(&self, agent_id: &str, message_id: &str) {
-        let slot = Self::pending_slot(agent_id);
+        let slot = self.pending_slot(agent_id);
         self.pending_message
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -111,12 +127,12 @@ impl ReplyRegistry {
                 .last_stream_key
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for k in Self::alias_keys(agent_id) {
+            for k in self.alias_keys(agent_id) {
                 map.insert(k, key.to_string());
             }
         }
         let mid = {
-            let slot = Self::pending_slot(agent_id);
+            let slot = self.pending_slot(agent_id);
             self.pending_message
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -137,7 +153,7 @@ impl ReplyRegistry {
             .last_stream_key
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for k in Self::alias_keys(agent_id) {
+        for k in self.alias_keys(agent_id) {
             if let Some(v) = map.get(&k) {
                 return Some(v.clone());
             }
@@ -192,7 +208,7 @@ impl ReplyRegistry {
 
     /// Drop a recorded fulfill so a new Client API send starts at `reply_state: none`.
     pub fn clear_last_outbound(&self, agent_id: &str) {
-        let aliases = Self::alias_keys(agent_id);
+        let aliases = self.alias_keys(agent_id);
         {
             let mut last = self
                 .last_outbound
@@ -386,7 +402,7 @@ mod tests {
             id: "m".into(),
             kind: MessageKind::User,
             from: "user:http".into(),
-            to: "agent:default".into(),
+            to: "agent:root".into(),
             payload: Vec::new(),
             context: None,
             timestamp: std::time::SystemTime::now(),
@@ -397,16 +413,16 @@ mod tests {
     #[tokio::test]
     async fn register_then_fulfill_some_delivers_payload() {
         let reg = ReplyRegistry::new();
-        let rx = reg.register("agent:default");
-        reg.fulfill("agent:default", Some(b"hi".to_vec()));
+        let rx = reg.register("agent:root");
+        reg.fulfill("agent:root", Some(b"hi".to_vec()));
         assert_eq!(rx.await.unwrap(), Some(b"hi".to_vec()));
     }
 
     #[tokio::test]
     async fn register_then_fulfill_none_delivers_none() {
         let reg = ReplyRegistry::new();
-        let rx = reg.register("agent:default");
-        reg.fulfill("agent:default", None);
+        let rx = reg.register("agent:root");
+        reg.fulfill("agent:root", None);
         assert_eq!(rx.await.unwrap(), None);
     }
 
@@ -420,38 +436,38 @@ mod tests {
     #[tokio::test]
     async fn cancel_removes_pending_slot() {
         let reg = ReplyRegistry::new();
-        let rx = reg.register("agent:default");
-        reg.cancel("agent:default");
+        let rx = reg.register("agent:root");
+        reg.cancel("agent:root");
         // A subsequent fulfill is a no-op (slot already removed) → the receiver
         // resolves to Err (sender dropped by cancel).
-        reg.fulfill("agent:default", Some(b"late".to_vec()));
+        reg.fulfill("agent:root", Some(b"late".to_vec()));
         assert!(rx.await.is_err());
     }
 
     #[test]
     fn double_fulfill_second_is_noop() {
         let reg = ReplyRegistry::new();
-        let _rx = reg.register("agent:default");
-        reg.fulfill("agent:default", Some(b"first".to_vec()));
+        let _rx = reg.register("agent:root");
+        reg.fulfill("agent:root", Some(b"first".to_vec()));
         // Slot already consumed; second fulfill is a no-op and must not panic.
-        reg.fulfill("agent:default", Some(b"second".to_vec()));
+        reg.fulfill("agent:root", Some(b"second".to_vec()));
     }
 
     #[test]
     fn fulfill_after_receiver_dropped_does_not_panic() {
         let reg = ReplyRegistry::new();
-        let rx = reg.register("agent:default");
+        let rx = reg.register("agent:root");
         drop(rx);
-        reg.fulfill("agent:default", Some(b"orphan".to_vec()));
+        reg.fulfill("agent:root", Some(b"orphan".to_vec()));
     }
 
     #[tokio::test]
     async fn router_sink_fulfills_with_first_action_payload() {
         let reg = Arc::new(ReplyRegistry::new());
-        let rx = reg.register("agent:default");
+        let rx = reg.register("agent:root");
         let sink = ReplyRouterSink::new(reg.clone());
         sink.deliver(
-            "agent:default",
+            "agent:root",
             &dummy_msg(),
             &[
                 AgentAction {
@@ -473,11 +489,11 @@ mod tests {
         // carry the FULL first-action bytes (the preview truncation is stdout-only)
         // and must not panic on a large / multi-action batch.
         let reg = Arc::new(ReplyRegistry::new());
-        let rx = reg.register("agent:default");
+        let rx = reg.register("agent:root");
         let sink = ReplyRouterSink::new(reg.clone());
         let big = vec![b'x'; STDOUT_PREVIEW_BYTES * 3]; // larger than the preview cap
         sink.deliver(
-            "agent:default",
+            "agent:root",
             &dummy_msg(),
             &[
                 AgentAction {
@@ -500,11 +516,9 @@ mod tests {
     #[tokio::test]
     async fn router_sink_empty_batch_fulfills_none() {
         let reg = Arc::new(ReplyRegistry::new());
-        let rx = reg.register("agent:default");
+        let rx = reg.register("agent:root");
         let sink = ReplyRouterSink::new(reg.clone());
-        sink.deliver("agent:default", &dummy_msg(), &[])
-            .await
-            .unwrap();
+        sink.deliver("agent:root", &dummy_msg(), &[]).await.unwrap();
         assert_eq!(rx.await.unwrap(), None);
     }
 
@@ -559,10 +573,10 @@ mod tests {
     #[test]
     fn overlapping_sends_fifo_bind_begins_in_order() {
         let reg = ReplyRegistry::new();
-        reg.note_pending_message("agent:default", "cmsg-1");
-        reg.note_pending_message("agent:default", "cmsg-2");
-        reg.record_stream_key("default-agent", "st_first");
-        reg.record_stream_key("default-agent", "st_second");
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.note_pending_message("agent:root", "cmsg-2");
+        reg.record_stream_key("root", "st_first");
+        reg.record_stream_key("root", "st_second");
         assert_eq!(
             reg.stream_key_for_message("cmsg-1").as_deref(),
             Some("st_first")
@@ -576,14 +590,14 @@ mod tests {
     #[test]
     fn stream_key_binds_to_pending_message_id() {
         let reg = ReplyRegistry::new();
-        reg.note_pending_message("agent:default", "cmsg-1");
-        reg.record_stream_key("default-agent", "st_one");
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.record_stream_key("root", "st_one");
         assert_eq!(
             reg.stream_key_for_message("cmsg-1").as_deref(),
             Some("st_one")
         );
-        reg.note_pending_message("agent:default", "cmsg-2");
-        reg.record_stream_key("default-agent", "st_two");
+        reg.note_pending_message("agent:root", "cmsg-2");
+        reg.record_stream_key("root", "st_two");
         assert_eq!(
             reg.stream_key_for_message("cmsg-1").as_deref(),
             Some("st_one")
@@ -595,34 +609,78 @@ mod tests {
     }
 
     #[test]
-    fn stream_key_aliases_root_pair_not_hyphenated_colon() {
-        let reg = ReplyRegistry::new();
-        reg.record_stream_key("default-agent", "st_abc");
+    fn stream_key_aliases_resolve_through_the_tree() {
+        // A tree whose root id is a UUID with handle `root`: recording under either spelling
+        // is visible under the other, and the mechanical `agent:<uuid>` is never written.
+        struct OneRoot;
+        impl advance_shared_types::agent_tree::AgentTreeReader for OneRoot {
+            fn parent_of(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn children_of(&self, _: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn siblings_of(&self, _: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn agent_exists(&self, id: &str) -> bool {
+                id == "11111111-1111-4111-8111-111111111111"
+            }
+            fn agent_kind(&self, _: &str) -> Option<advance_shared_types::agent_tree::AgentKind> {
+                None
+            }
+            fn capabilities(&self, _: &str) -> Vec<advance_shared_types::agent_tree::Capability> {
+                Vec::new()
+            }
+            fn handle_of(&self, id: &str) -> Option<String> {
+                self.agent_exists(id).then(|| "root".to_string())
+            }
+            fn id_by_handle(&self, handle: &str) -> Option<String> {
+                (handle == "root").then(|| "11111111-1111-4111-8111-111111111111".to_string())
+            }
+        }
+        let reg = ReplyRegistry::new().with_tree(Arc::new(OneRoot));
+        reg.record_stream_key("11111111-1111-4111-8111-111111111111", "st_uuid");
         assert_eq!(
-            reg.last_stream_key("agent:default").as_deref(),
-            Some("st_abc")
-        );
-        assert_eq!(
-            reg.last_stream_key("default-agent").as_deref(),
-            Some("st_abc")
+            reg.last_stream_key("agent:root").as_deref(),
+            Some("st_uuid")
         );
         assert!(
-            reg.last_stream_key("agent:default-agent").is_none(),
-            "must not write agent:default-agent"
+            reg.last_stream_key("agent:someone-else").is_none(),
+            "an unrelated served key never aliases onto the root"
         );
-        reg.record_stream_key("agent:default", "st_def");
+        reg.record_stream_key("agent:root", "st_colon");
         assert_eq!(
-            reg.last_stream_key("default-agent").as_deref(),
-            Some("st_def")
+            reg.last_stream_key("11111111-1111-4111-8111-111111111111")
+                .as_deref(),
+            Some("st_colon")
         );
+        reg.clear_last_outbound("agent:root");
+        assert!(reg
+            .last_stream_key("11111111-1111-4111-8111-111111111111")
+            .is_none());
+    }
+
+    #[test]
+    fn stream_key_aliases_root_pair_not_hyphenated_colon() {
+        let reg = ReplyRegistry::new();
+        reg.record_stream_key("root", "st_abc");
+        assert_eq!(reg.last_stream_key("agent:root").as_deref(), Some("st_abc"));
+        assert_eq!(reg.last_stream_key("root").as_deref(), Some("st_abc"));
+        assert!(
+            reg.last_stream_key("agent:root-agent").is_none(),
+            "must not write agent:root-agent"
+        );
+        reg.record_stream_key("agent:root", "st_def");
+        assert_eq!(reg.last_stream_key("root").as_deref(), Some("st_def"));
     }
 
     #[test]
     fn clear_last_outbound_clears_both_stream_key_spellings() {
         let reg = ReplyRegistry::new();
-        reg.record_stream_key("default-agent", "st_abc");
-        reg.clear_last_outbound("agent:default");
-        assert!(reg.last_stream_key("default-agent").is_none());
-        assert!(reg.last_stream_key("agent:default").is_none());
+        reg.record_stream_key("root", "st_abc");
+        reg.clear_last_outbound("agent:root");
+        assert!(reg.last_stream_key("root").is_none());
+        assert!(reg.last_stream_key("agent:root").is_none());
     }
 }

@@ -55,6 +55,7 @@ async fn sys_ac_046_spawn_child_super_parent_rejected() {
     // Child requests write access OUTSIDE the parent's prefix → super-parent.
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".into()),
             child_id: AgentId("gc-evil".into()),
             child_workspace_path: PathBuf::from("children/gc-evil"),
@@ -99,6 +100,7 @@ async fn sys_ac_048_true_subset_spawn_succeeds() {
     // Same gate, same parent — a prefix-subpath request passes (discrimination).
     let child = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".into()),
             child_id: AgentId("gc-sub".into()),
             child_workspace_path: PathBuf::from("children/gc-sub"),

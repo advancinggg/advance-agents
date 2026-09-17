@@ -75,6 +75,7 @@ pub mod error;
 /// `task.subtask_updated`); consumed by `wit_impl` dispatch.
 pub mod events;
 pub mod identifier;
+pub mod identity;
 /// Pack-sourced `TemplateResolver` (sat/pack-template-bridge, 2026-06-15):
 /// resolves a pack-installed agent-template via `PackRegistry` into a
 /// `TemplateContent` for `apply_template`.

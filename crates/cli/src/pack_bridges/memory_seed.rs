@@ -289,10 +289,9 @@ mod tests {
 
     #[test]
     fn cap_memory_bucket_shape_is_refused_flat_layout_is_not() {
-        assert!(refuse_cap_memory_bucket(Path::new(
-            "/ws/.agent/memory/default-agent/knowledge.jsonl"
-        ))
-        .is_err());
+        assert!(
+            refuse_cap_memory_bucket(Path::new("/ws/.agent/memory/root/knowledge.jsonl")).is_err()
+        );
         assert!(refuse_cap_memory_bucket(Path::new("/ws/.agent/memory/knowledge.jsonl")).is_ok());
         assert!(
             refuse_cap_memory_bucket(Path::new("/ws/child/.agent/memory/knowledge.jsonl")).is_ok()

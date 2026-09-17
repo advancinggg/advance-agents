@@ -86,6 +86,7 @@ impl AgentTreeSnapshot for TestTree {
         // `resolve_read` only consults `nodes` (matches `n.id.0 == agent_id` →
         // `workspace_path`); the HashMap projections are unused by the staleness path.
         AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes: vec![AgentNode {
                 id: AgentId(self.agent_id.clone()),
                 kind: AgentKind::Root,

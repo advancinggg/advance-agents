@@ -1,7 +1,7 @@
 //! Wave-19 Lane-2 — `AgentIdBridge` dispatcher-integration witnesses (TB-IDB-02).
 //!
 //! These drive the REAL `MailboxDispatcherImpl::deliver_notify` over a BARE-keyed
-//! `TestTree` whose node is `default-agent` (so the colon target `agent:default`
+//! `TestTree` whose node is `root` (so the colon target `agent:root`
 //! MISSES `agent_exists` — the production residual). With the bridge wired, a
 //! `notify_agent`/`notify_channel` to the colon form resolves to the bare
 //! membership key + the canonical mailbox key and DELIVERS; without it, the
@@ -64,23 +64,23 @@ async fn recv(store: &MailboxStore, agent: &str) -> Message {
 // would miss. Pins both halves: membership (bare key) + mailbox keying (canonical).
 #[tokio::test]
 async fn tb_idb_02a_bridge_delivers_via_alias() {
-    // PRODUCTION-shaped: the tree node is BARE `default-agent`.
-    let tree = TestTree::new().add_root("default-agent");
-    let (store, d) = dispatcher(tree, &[], &[("agent:default", "default-agent")]);
+    // PRODUCTION-shaped: the tree node is BARE `root`.
+    let tree = TestTree::new().add_root("root");
+    let (store, d) = dispatcher(tree, &[], &[("agent:root", "root")]);
 
-    d.notify_agent("system", "agent:default", vec![7], None)
+    d.notify_agent("system", "agent:root", vec![7], None)
         .await
-        .expect("bridge resolves agent:default -> default-agent membership; delivers");
+        .expect("bridge resolves agent:root -> root membership; delivers");
 
     // The message lands under the CANONICAL mailbox key (the serve-loop poll key),
     // NOT the bare tree key.
-    let msg = recv(&store, "agent:default").await;
+    let msg = recv(&store, "agent:root").await;
     assert_eq!(msg.from, "system");
-    assert_eq!(msg.to, "agent:default", "msg.to == canonical mailbox key");
+    assert_eq!(msg.to, "agent:root", "msg.to == canonical mailbox key");
     assert_eq!(msg.payload, vec![7]);
     // And NOT under the bare key (no orphan / double mailbox).
     assert!(
-        store.get("default-agent").is_none(),
+        store.get("root").is_none(),
         "delivery must NOT create a bare-keyed mailbox"
     );
 }
@@ -90,26 +90,26 @@ async fn tb_idb_02a_bridge_delivers_via_alias() {
 // bridge is LOAD-BEARING (not a no-op).
 #[tokio::test]
 async fn tb_idb_02b_no_bridge_target_unknown() {
-    let tree = TestTree::new().add_root("default-agent");
+    let tree = TestTree::new().add_root("root");
     let (store, d) = dispatcher(tree, &[], &[]); // no bridge
 
     let err = d
-        .notify_agent("system", "agent:default", vec![7], None)
+        .notify_agent("system", "agent:root", vec![7], None)
         .await
         .unwrap_err();
     assert_eq!(err, NotifyError::InvalidTarget("target_unknown".into()));
-    assert!(store.get("agent:default").is_none());
-    assert!(store.get("default-agent").is_none());
+    assert!(store.get("agent:root").is_none());
+    assert!(store.get("root").is_none());
 }
 
 // TB-IDB-02c — safety preserved: a multi-colon (is_safe_id-malformed) target is
 // rejected at the is_safe_id gate BEFORE the bridge; a syntactically-valid but
-// NON-member colon target (the `agent:default-agent` orphan-key trap) resolves to
+// NON-member colon target (the `agent:root-agent` orphan-key trap) resolves to
 // None → bare `agent_exists` miss → target_unknown. Neither delivers anything.
 #[tokio::test]
 async fn tb_idb_02c_malformed_and_nonmember_reject() {
-    let tree = TestTree::new().add_root("default-agent");
-    let (store, d) = dispatcher(tree, &[], &[("agent:default", "default-agent")]);
+    let tree = TestTree::new().add_root("root");
+    let (store, d) = dispatcher(tree, &[], &[("agent:root", "root")]);
 
     // multi-colon → is_safe_id rejects first → invalid_id.
     let e1 = d
@@ -118,19 +118,19 @@ async fn tb_idb_02c_malformed_and_nonmember_reject() {
         .unwrap_err();
     assert_eq!(e1, NotifyError::InvalidTarget("invalid_id".into()));
 
-    // is_safe_id-valid but NOT a bridge member; its bare strip (`default-agent`)
+    // is_safe_id-valid but NOT a bridge member; its bare strip (`root`)
     // WOULD match the tree, but the no-strip-fallback design means it is NOT
-    // bridged → bare tree miss on `agent:default-agent` → target_unknown (no
-    // orphan delivery to `default-agent`).
+    // bridged → bare tree miss on `agent:root-agent` → target_unknown (no
+    // orphan delivery to `root`).
     let e2 = d
-        .notify_agent("system", "agent:default-agent", vec![2], None)
+        .notify_agent("system", "agent:root-agent", vec![2], None)
         .await
         .unwrap_err();
     assert_eq!(e2, NotifyError::InvalidTarget("target_unknown".into()));
 
-    assert!(store.get("agent:default-agent").is_none());
-    assert!(store.get("default-agent").is_none());
-    assert!(store.get("agent:default").is_none());
+    assert!(store.get("agent:root-agent").is_none());
+    assert!(store.get("root").is_none());
+    assert!(store.get("agent:root").is_none());
 }
 
 // TB-IDB-02d — notify_channel through the bridge: a registered channel resolves

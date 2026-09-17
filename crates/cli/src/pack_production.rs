@@ -376,8 +376,8 @@ impl SchedulerWorkflowExecutor {
         self.terminator.get().is_some()
     }
 
-    /// `(child agent id, child workspace path relative to the parent)` from a
-    /// workflow `target-path`.
+    /// `(child HANDLE, child workspace path relative to the parent)` from a workflow
+    /// `target-path` (the leaf names the child; its immutable id is minted at spawn).
     fn child_identity(target_path: &Path) -> Result<(AgentId, PathBuf), PackError> {
         let mut rel = PathBuf::new();
         for comp in target_path.components() {
@@ -482,11 +482,13 @@ impl WorkflowExecutor for SchedulerWorkflowExecutor {
                 config.len()
             )));
         }
-        let (child_id, rel) = Self::child_identity(target_path)?;
+        let (handle, rel) = Self::child_identity(target_path)?;
         self.spawner
             .spawn_child(SpawnChildConfig {
+                // The target-path leaf is the child's HANDLE; the immutable id is minted here.
+                handle: Some(handle.0),
                 parent_id: self.parent.clone(),
-                child_id,
+                child_id: AgentId(cap_lifecycle::identity::new_agent_id()),
                 child_workspace_path: rel,
                 capabilities: Vec::new(),
                 template_ref: Some(template_ref.to_string()),
@@ -576,8 +578,14 @@ impl WorkflowExecutor for SchedulerWorkflowExecutor {
     /// afterwards (the cascade keeps `Child` territories on terminate; an undo
     /// must not), guarded to a real directory under the tree's workspace root.
     fn terminate_child(&self, target_path: &Path) -> Result<(), PackError> {
-        let (child_id, _) = Self::child_identity(target_path)?;
-        let ws = self.tree.get_node(&child_id).map(|n| n.workspace_path);
+        // The target-path leaf is the child's HANDLE; the cascade and the tree speak ids.
+        let (handle, _) = Self::child_identity(target_path)?;
+        let node = self.tree.node_by_handle(&handle.0);
+        let child_id = node
+            .as_ref()
+            .map(|n| n.id.clone())
+            .unwrap_or_else(|| handle.clone());
+        let ws = node.map(|n| n.workspace_path);
         match self.terminator.get() {
             Some(controller) => controller
                 .terminate_child(&self.parent.0, &child_id.0)

@@ -63,6 +63,7 @@ impl AgentTreeReader for TestAgentTree {
 impl AgentTreeSnapshot for TestAgentTree {
     fn snapshot(&self) -> AgentTreeSnapshotData {
         AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes: self.nodes.clone(),
             parent_of: HashMap::new(),
             children_of: HashMap::new(),
@@ -156,6 +157,7 @@ impl AgentTreeReader for MultiAgentTree {
 impl AgentTreeSnapshot for MultiAgentTree {
     fn snapshot(&self) -> AgentTreeSnapshotData {
         AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes: self.nodes.clone(),
             parent_of: self.parent_of_map.clone(),
             children_of: self.children_of_map.clone(),

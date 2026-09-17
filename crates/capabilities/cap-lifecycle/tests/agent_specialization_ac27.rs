@@ -84,6 +84,7 @@ fn ac27_spawned_node_binds_identity_parent_caps_and_state_slot() {
 
     let returned = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: parent_id.clone(),
             child_id: child_id.clone(),
             child_workspace_path: PathBuf::from("agents/specialized-child"),
@@ -171,6 +172,7 @@ fn ac27_two_spawned_nodes_have_distinct_identities_and_caps() {
 
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("child-a".to_string()),
             child_workspace_path: PathBuf::from("agents/child-a"),
@@ -181,6 +183,7 @@ fn ac27_two_spawned_nodes_have_distinct_identities_and_caps() {
         .unwrap();
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("child-b".to_string()),
             child_workspace_path: PathBuf::from("agents/child-b"),

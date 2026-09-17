@@ -93,6 +93,7 @@ fn ti02_insert_root_then_child_indices() {
     let (_tmp, tree, spawner) = setup();
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: std::path::PathBuf::from("agents/foo"),
@@ -118,6 +119,7 @@ fn ti15_mixed_child_and_sub_consistent() {
     let (_tmp, tree, spawner) = setup();
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: std::path::PathBuf::from("agents/foo"),
@@ -236,6 +238,7 @@ fn ti18_snapshot_atomicity_under_threads() {
         std::fs::create_dir_all(&ws_dir).unwrap();
         spawner
             .spawn_child(SpawnChildConfig {
+                handle: None,
                 parent_id: AgentId("root".to_string()),
                 child_id: AgentId(format!("c{i}")),
                 child_workspace_path: std::path::PathBuf::from(format!("c{i}")),
@@ -445,6 +448,7 @@ fn tu39_snapshot_reader_per_turn_consistency() {
     std::fs::create_dir_all(&new_ws).unwrap();
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("late".to_string()),
             child_workspace_path: std::path::PathBuf::from("late"),

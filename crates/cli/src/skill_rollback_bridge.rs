@@ -32,7 +32,7 @@
 //!   (no re-create) → surfaced as an error, never a fake `Ok`.
 //!
 //! Disclosed boundaries (dormant `advance auto start` ingress, the
-//! `default-agent` / `agent:default` grammar split, the version-read TOCTOU, and
+//! `root` / `agent:root` grammar split, the version-read TOCTOU, and
 //! the `Weak`-broken record-side reference cycle): MODULE-017 §3.6 (bbb).
 
 use std::sync::{Arc, Weak};

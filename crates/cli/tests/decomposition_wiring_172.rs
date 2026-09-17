@@ -16,7 +16,7 @@
 //! - **T-172-03**: no fs/messaging cap ⇒ NO decomposition host-fns + `decomposition_store`
 //!   is None ⇒ `EmptyDecomposition` ⇒ no section (the `agent_tree.is_some()` gate holds).
 //! - **T-172-04** (keying — does BETTER than 011): after a real submit under the bare
-//!   `default-agent`, assembling with the PRODUCTION colon msg-id `agent:default` STILL
+//!   `root`, assembling with the PRODUCTION colon msg-id `agent:root` STILL
 //!   renders the section — the `CapDecompositionReader`'s bare-first alias set resolves
 //!   the colon/bare residual the 011 delegates section left open.
 //! - **T-172-05** (171 — emit is product-wired): driving the prod-registered
@@ -56,8 +56,8 @@ use cap_memory::MemoryStore;
 use wasmtime::component::Val;
 
 const NS: &str = "advance:runtime/agent-lifecycle@0.2.0";
-const CAP_AGENT: &str = "default-agent"; // bare cap id = the tree Root + decomposition owner
-const MSG_AGENT: &str = "agent:default"; // colon msg id the production assembler keys on
+const CAP_AGENT: &str = "root"; // bare cap id = the tree Root + decomposition owner
+const MSG_AGENT: &str = "agent:root"; // colon msg id the production assembler keys on
 const TASK: &str = "task-decomp-172";
 
 struct NoBus;
@@ -225,6 +225,8 @@ async fn t_172_02_assembler_lists_subtasks_from_shared_store() {
     let (_g, ws, cfg) = fresh_workspace("capabilities:\n  fs: true\n");
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
     let (_host, handles) = wire_capabilities(builder, &ws).await.expect("wire");
+    // The root's cap-layer id is its immutable UUID (per boot), not the literal `root`.
+    let cap_agent: &str = handles.root_agent_id.as_str();
 
     // The SHARED store the wiring exposes (Some under fs/messaging).
     let store = handles
@@ -233,7 +235,7 @@ async fn t_172_02_assembler_lists_subtasks_from_shared_store() {
         .expect("fs ⇒ decomposition_store is Some");
     store
         .submit(
-            CAP_AGENT,
+            cap_agent,
             TASK,
             plan(
                 "ship feature",
@@ -246,11 +248,11 @@ async fn t_172_02_assembler_lists_subtasks_from_shared_store() {
     // renders the active task's subtasks (the live store, not a harness-seeded one).
     let reader = Arc::new(CapDecompositionReader::new(
         store.clone(),
-        vec![CAP_AGENT.to_string(), MSG_AGENT.to_string()],
+        vec![cap_agent.to_string(), MSG_AGENT.to_string()],
     ));
     let assembler = assembler_over(reader);
     let result = assembler
-        .assemble(ctx_for(CAP_AGENT, Some(TASK)))
+        .assemble(ctx_for(cap_agent, Some(TASK)))
         .await
         .expect("assemble");
     let section = result
@@ -313,17 +315,19 @@ async fn t_172_04_colon_msg_id_still_renders_via_alias() {
     let (_g, ws, cfg) = fresh_workspace("capabilities:\n  fs: true\n");
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
     let (_host, handles) = wire_capabilities(builder, &ws).await.expect("wire");
+    // The root's cap-layer id is its immutable UUID (per boot), not the literal `root`.
+    let cap_agent: &str = handles.root_agent_id.as_str();
     let store = handles.decomposition_store.clone().expect("Some");
     store
-        .submit(CAP_AGENT, TASK, plan("g", &[("only subtask", "_self")]))
+        .submit(cap_agent, TASK, plan("g", &[("only subtask", "_self")]))
         .expect("submit ok");
 
     // Assemble with the PRODUCTION colon msg-id. The reader's bare-first alias set
-    // resolves the owner (bare `default-agent`) even though the assembler passes the
+    // resolves the owner (bare `root`) even though the assembler passes the
     // colon id — fixing the colon/bare residual 011's delegates section left open.
     let reader = Arc::new(CapDecompositionReader::new(
         store.clone(),
-        vec![CAP_AGENT.to_string(), MSG_AGENT.to_string()],
+        vec![cap_agent.to_string(), MSG_AGENT.to_string()],
     ));
     let assembler = assembler_over(reader);
     let result = assembler
@@ -441,13 +445,15 @@ async fn t_172_06_orphaned_subtasks_excluded_from_section() {
     let (_g, ws, cfg) = fresh_workspace("capabilities:\n  fs: true\n");
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
     let (_host, handles) = wire_capabilities(builder, &ws).await.expect("wire");
+    // The root's cap-layer id is its immutable UUID (per boot), not the literal `root`.
+    let cap_agent: &str = handles.root_agent_id.as_str();
     let store = handles.decomposition_store.clone().expect("Some");
 
     // Submit [alpha, beta]; complete alpha; re-submit [beta] (omitting alpha) so the
     // Completed-then-dropped alpha is retained orphaned (decomposition.rs orphan rule).
     let r1 = store
         .submit(
-            CAP_AGENT,
+            cap_agent,
             TASK,
             plan("g", &[("alpha-task", "_self"), ("beta-task", "_self")]),
         )
@@ -459,14 +465,14 @@ async fn t_172_06_orphaned_subtasks_excluded_from_section() {
         .map(|m| m.subtask_id.clone())
         .expect("alpha id");
     store
-        .update_subtask_status(CAP_AGENT, TASK, &alpha_id, SubtaskStatus::Completed, None)
+        .update_subtask_status(cap_agent, TASK, &alpha_id, SubtaskStatus::Completed, None)
         .expect("complete alpha");
     store
-        .submit(CAP_AGENT, TASK, plan("g", &[("beta-task", "_self")]))
+        .submit(cap_agent, TASK, plan("g", &[("beta-task", "_self")]))
         .expect("submit 2 (drops alpha)");
 
     // Precondition: the persisted state holds BOTH an orphaned + a non-orphaned subtask.
-    let state = store.get(CAP_AGENT, TASK).expect("get").expect("present");
+    let state = store.get(cap_agent, TASK).expect("get").expect("present");
     assert!(
         state.subtasks.iter().any(|s| s.orphaned),
         "alpha (Completed-then-dropped) must be retained orphaned: {:?}",
@@ -481,11 +487,11 @@ async fn t_172_06_orphaned_subtasks_excluded_from_section() {
     // The section lists ONLY the non-orphaned subtask.
     let reader = Arc::new(CapDecompositionReader::new(
         store.clone(),
-        vec![CAP_AGENT.to_string(), MSG_AGENT.to_string()],
+        vec![cap_agent.to_string(), MSG_AGENT.to_string()],
     ));
     let assembler = assembler_over(reader);
     let result = assembler
-        .assemble(ctx_for(CAP_AGENT, Some(TASK)))
+        .assemble(ctx_for(cap_agent, Some(TASK)))
         .await
         .expect("assemble");
     let section = result

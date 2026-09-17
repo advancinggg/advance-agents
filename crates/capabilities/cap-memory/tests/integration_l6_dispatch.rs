@@ -368,7 +368,7 @@ async fn dsp_08_dispatch_uses_bare_write_id_not_messaging_id() {
         Arc::clone(&emitter),
         Extraction::default(),
     )
-    .with_write_agent_id("default-agent")
+    .with_write_agent_id("root")
     .with_l6_handler(Arc::new(RecordingDispatch {
         calls: Arc::clone(&calls),
         return_ok: true,
@@ -376,19 +376,19 @@ async fn dsp_08_dispatch_uses_bare_write_id_not_messaging_id() {
     }));
     let pp = PostProcessor::with_components(components);
     // run() receives the COLON messaging id; the dispatch must use the bare id.
-    pp.run("agent:default", &fixture_msg(), &fixture_result())
+    pp.run("agent:root", &fixture_msg(), &fixture_result())
         .await
         .expect("run ok");
     let c = calls.lock().unwrap();
     assert_eq!(c.len(), 1, "Step-9 dispatches once");
     assert_eq!(
-        c[0].0, "default-agent",
+        c[0].0, "root",
         "dispatch must use the BARE write id (the memory bucket), not the run() messaging id"
     );
     // The consolidation_due event is keyed by the same bare write id.
     assert_eq!(
         emitter.consolidation_due(),
-        vec!["default-agent".to_string()],
+        vec!["root".to_string()],
         "consolidation_due is emitted under the bare write id"
     );
 }

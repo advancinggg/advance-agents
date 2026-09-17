@@ -1,14 +1,11 @@
 //! MODULE-005 persist for an agent's display name (first-open write path).
 //!
-//! The display name lives in the agent's own config document,
-//! `<home>/.agent/config.yaml`, under the top-level `display-name` key. The
-//! runtime never reads that key at boot (it consumes `capabilities:` and
-//! `agents:` only), so a rename is not a capability change and needs no
-//! restart. Homes written before this key existed persisted the name in a
-//! sidecar file `<home>/.agent/display-name`; [`TopLevelDisplayName::get`]
-//! still falls back to it, so an old home keeps its name without migration.
-//! A write always goes to the config document, and clears a stale sidecar
-//! so the two can never disagree afterwards.
+//! An agent has three names (see `cap-lifecycle::identity`): the immutable `id`
+//! (UUID, every store's key), the addressable `handle` (mailbox `agent:<handle>`,
+//! derived once from the display name and frozen), and the free-text
+//! `display-name` this module persists. All three live in the agent's own
+//! `<home>/.agent/config.yaml`. The runtime never reads `display-name` at boot,
+//! so a rename is not a capability change and needs no restart.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,23 +19,13 @@ pub const DISPLAY_NAME_KEY: &str = "display-name";
 
 /// Bound on the config document read here (mirrors the lifecycle atomic-write cap).
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
-/// Bound on the legacy sidecar file.
-const MAX_SIDECAR_BYTES: u64 = 256;
 
 pub struct TopLevelDisplayName;
 
 impl TopLevelDisplayName {
-    pub const TREE_ID: &'static str = "default-agent";
-    pub const MAILBOX_ID: &'static str = "agent:default";
-
     /// The config document the name is persisted in.
     pub fn config_path(home: &Path) -> PathBuf {
         home.join(".agent").join("config.yaml")
-    }
-
-    /// The pre-`display-name`-key sidecar file (read-only fallback).
-    pub fn path(home: &Path) -> PathBuf {
-        home.join(".agent").join("display-name")
     }
 
     /// Persist `name` as the `display-name` key of `<home>/.agent/config.yaml`,
@@ -72,30 +59,16 @@ impl TopLevelDisplayName {
         crate::scaffold::write_0600_nofollow(&tmp, text.as_bytes())
             .map_err(|_| DisplayNameError::Empty)?;
         fs::rename(&tmp, &dest).map_err(|_| DisplayNameError::Empty)?;
-        // The document is now authoritative: drop a stale sidecar so a later
-        // read can never resurrect the old name.
-        let legacy = Self::path(home);
-        if matches!(fs::symlink_metadata(&legacy), Ok(m) if m.file_type().is_file()) {
-            let _ = fs::remove_file(&legacy);
-        }
         Ok(())
     }
 
-    /// The persisted display name: the `display-name` key of the config
-    /// document, else the legacy sidecar file, else `None`.
+    /// The persisted display name (the `display-name` key), if any.
     pub fn get(home: &Path) -> Option<String> {
-        if let Some(name) = Self::from_config(home) {
-            return Some(name);
-        }
-        let raw = crate::scaffold::read_small_regular(&Self::path(home), MAX_SIDECAR_BYTES)?;
-        non_empty(&raw)
-    }
-
-    fn from_config(home: &Path) -> Option<String> {
         let raw = crate::scaffold::read_small_regular(&Self::config_path(home), MAX_CONFIG_BYTES)?;
         let doc = parse_mapping(&raw)?;
         let value = doc.get(Value::String(DISPLAY_NAME_KEY.to_string()))?;
-        non_empty(value.as_str()?)
+        let trimmed = value.as_str()?.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
 }
 
@@ -104,14 +77,5 @@ fn parse_mapping(raw: &str) -> Option<Mapping> {
         Value::Mapping(m) => Some(m),
         Value::Null => Some(Mapping::new()),
         _ => None,
-    }
-}
-
-fn non_empty(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
     }
 }

@@ -115,6 +115,7 @@ fn setup() -> (TempDir, AgentTreeStore, Arc<RecorderGate>) {
     let spawner = DefaultSpawner::new(tree.clone(), Arc::new(AlwaysOkGate));
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("agents/foo"),
@@ -191,6 +192,7 @@ fn ti_t28_rollback_child_rejects_non_parent() {
     let spawner = DefaultSpawner::new(tree.clone(), Arc::new(AlwaysOkGate));
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("sibling".to_string()),
             child_workspace_path: PathBuf::from("agents/sibling"),

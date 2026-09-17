@@ -34,7 +34,7 @@ use cap_lifecycle::{
 };
 use serde_json::{json, Value};
 
-const ROOT: &str = "default-agent";
+const ROOT: &str = "root";
 
 fn runtime_yaml() -> String {
     r#"wasm:
@@ -129,6 +129,25 @@ fn root_declared_aliases(ws: &Path) -> Vec<String> {
     out
 }
 
+/// A config document with its identity lines (`id:` — a UUID minted per run — and the root's
+/// `handle:`) removed, so the rest can be compared verbatim.
+fn sans_identity(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.starts_with("id: ") && !l.starts_with("handle: "))
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+/// The on-disk config document of `ws` minus its identity lines; asserts the id is present.
+fn config_sans_id(ws: &Path) -> String {
+    let text = std::fs::read_to_string(ws.join(".agent/config.yaml")).unwrap();
+    assert!(
+        text.lines().any(|l| l.starts_with("id: ")),
+        "config carries the immutable id: {text}"
+    );
+    sans_identity(&text)
+}
+
 fn is_dir(p: &Path) -> bool {
     std::fs::symlink_metadata(p)
         .map(|m| m.file_type().is_dir())
@@ -163,8 +182,17 @@ async fn aa01_crud_over_production_wiring() {
     assert!(agents[0].parent.is_none());
 
     let root = detail(&get(&api, &format!("/client/agents/{ROOT}")));
+    assert!(
+        uuid::Uuid::parse_str(&root.agent.id).is_ok(),
+        "the root's id is a UUID: {}",
+        root.agent.id
+    );
     assert_eq!(
-        root.config.config_yaml.as_deref(),
+        root.config
+            .config_yaml
+            .as_deref()
+            .map(sans_identity)
+            .as_deref(),
         Some("capabilities:\n  fs: true\n")
     );
     assert_eq!(root.config.capabilities.len(), 1);
@@ -236,7 +264,7 @@ async fn aa01_crud_over_production_wiring() {
     let node = snap
         .nodes
         .iter()
-        .find(|n| n.id.0 == "research")
+        .find(|n| snap.handle_of(&n.id) == "research")
         .expect("tree node recorded");
     assert_eq!(node.kind, AgentKind::Child);
     assert_eq!(node.workspace_path, research_ws);
@@ -413,7 +441,7 @@ async fn aa01_crud_over_production_wiring() {
         .any(|w| w.code == WARNING_RESTART_REQUIRED));
     assert_eq!(d.agent.display_name.as_deref(), Some("R&D"));
     assert_eq!(
-        std::fs::read_to_string(research_ws.join(".agent/config.yaml")).unwrap(),
+        config_sans_id(&research_ws),
         "capabilities:\n  fs: true\n  memory:\n    auto-grant: false\ndisplay-name: R&D\n"
     );
 
@@ -434,7 +462,7 @@ async fn aa01_crud_over_production_wiring() {
     );
     assert_eq!(d.agent.display_name.as_deref(), Some("Research"));
     assert_eq!(
-        std::fs::read_to_string(research_ws.join(".agent/config.yaml")).unwrap(),
+        config_sans_id(&research_ws),
         "capabilities:\n  fs: true\n  memory:\n    auto-grant: false\ndisplay-name: Research\n"
     );
 
@@ -448,7 +476,7 @@ async fn aa01_crud_over_production_wiring() {
     let d = detail(&env);
     assert_eq!(d.agent.display_name.as_deref(), Some("Research"));
     assert_eq!(
-        std::fs::read_to_string(research_ws.join(".agent/config.yaml")).unwrap(),
+        config_sans_id(&research_ws),
         "capabilities:\n  fs: true\ndisplay-name: Research\n"
     );
     // ...and a replace that carries its own key renames explicitly.
@@ -475,7 +503,7 @@ async fn aa01_crud_over_production_wiring() {
     );
     assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
     assert_eq!(
-        std::fs::read_to_string(research_ws.join(".agent/config.yaml")).unwrap(),
+        config_sans_id(&research_ws),
         "capabilities:\n  fs: true\n  memory:\n    auto-grant: false\ndisplay-name: Desk\n",
         "a rejected document never touches the file"
     );
@@ -635,9 +663,16 @@ async fn aa02_restart_rematerializes_created_agents() {
     let research = snap
         .nodes
         .iter()
-        .find(|n| n.id.0 == "research")
+        .find(|n| snap.handle_of(&n.id) == "research")
         .expect("research re-materialized");
-    assert_eq!(research.parent.as_ref().map(|p| p.0.as_str()), Some(ROOT));
+    assert_eq!(
+        research
+            .parent
+            .as_ref()
+            .map(|p| snap.handle_of(p))
+            .as_deref(),
+        Some(ROOT)
+    );
     assert_eq!(research.workspace_path, ws.join("research"));
     assert_eq!(research.template_ref.as_deref(), Some("explorer"));
     assert_eq!(
@@ -652,10 +687,10 @@ async fn aa02_restart_rematerializes_created_agents() {
     let notes = snap
         .nodes
         .iter()
-        .find(|n| n.id.0 == "notes")
+        .find(|n| snap.handle_of(&n.id) == "notes")
         .expect("nested child re-materialized");
     assert_eq!(
-        notes.parent.as_ref().map(|p| p.0.as_str()),
+        notes.parent.as_ref().map(|p| snap.handle_of(p)).as_deref(),
         Some("research")
     );
     assert_eq!(notes.workspace_path, ws.join("research/notes"));
@@ -697,12 +732,20 @@ async fn aa02_restart_rematerializes_created_agents() {
     drop(handles);
     let (_host, handles) = boot(&ws, &cfg).await;
     let snap = handles.agent_tree_snapshot.clone().unwrap().snapshot();
-    let research = snap.nodes.iter().find(|n| n.id.0 == "research").unwrap();
+    let research = snap
+        .nodes
+        .iter()
+        .find(|n| snap.handle_of(&n.id) == "research")
+        .unwrap();
     assert!(
         research.capabilities.is_empty(),
         "the updated capability list is what the third boot materializes"
     );
-    let notes = snap.nodes.iter().find(|n| n.id.0 == "notes").unwrap();
+    let notes = snap
+        .nodes
+        .iter()
+        .find(|n| snap.handle_of(&n.id) == "notes")
+        .unwrap();
     assert!(notes.capabilities.is_empty());
     // The adopted agent is fully manageable: delete it and boot again root-only.
     let api = handles.client_api_server.as_ref().unwrap().api();
@@ -826,7 +869,7 @@ fn direct_adapter(ws: &Path) -> (AgentAdminAdapter, AgentTreeStore) {
 
 fn create_req(id: &str, parent: Option<&str>, path: Option<&str>) -> ClientCreateAgentRequest {
     ClientCreateAgentRequest {
-        agent_id: id.into(),
+        agent_id: Some(id.into()),
         parent: parent.map(str::to_string),
         workspace_path: path.map(str::to_string),
         template_ref: "explorer".into(),
@@ -867,7 +910,11 @@ fn aa04_adapter_edge_rules_over_real_tree() {
     req.capabilities = vec!["fs".into()];
     let d = adapter.create_agent(&req).unwrap();
     assert_eq!(
-        d.config.config_yaml.as_deref(),
+        d.config
+            .config_yaml
+            .as_deref()
+            .map(sans_identity)
+            .as_deref(),
         Some("capabilities:\n  fs: true\n")
     );
     assert_eq!(d.capabilities, vec!["fs".to_string()]);
@@ -879,12 +926,14 @@ fn aa04_adapter_edge_rules_over_real_tree() {
     );
 
     // Sub agents are not valid parents; a hidden-name path is rejected by the tree rules.
+    // (`a` is a HANDLE; the tree is keyed by the minted id.)
+    let a_id = tree.node_by_handle("a").expect("a exists").id;
     tree.insert_child(
-        &AgentId("a".into()),
+        &a_id,
         AgentNode {
             id: AgentId("ephemeral".into()),
             kind: AgentKind::Sub,
-            parent: Some(AgentId("a".into())),
+            parent: Some(a_id.clone()),
             workspace_path: {
                 let p = ws.join("a/.sub/x");
                 std::fs::create_dir_all(&p).unwrap();
@@ -933,13 +982,14 @@ fn aa04_adapter_edge_rules_over_real_tree() {
         .create_agent(&create_req("guest-child", Some("guest"), None))
         .unwrap();
     assert_eq!(d.agent.workspace_path, "guest/guest-child");
-    assert!(tree.contains(&AgentId("guest-child".into())));
+    assert!(tree.node_by_handle("guest-child").is_some());
     assert_eq!(root_declared_aliases(&ws), vec!["a".to_string()]);
 
     // Capabilities: a guest-spawned (undeclared) child cannot persist a capability list; a Sub
     // never can; the root's capabilities are its config document.
     let caps_update = ClientUpdateAgentRequest {
         display_name: None,
+        handle: None,
         config_yaml: None,
         capabilities: Some(vec![]),
         llm: None,
@@ -960,6 +1010,7 @@ fn aa04_adapter_edge_rules_over_real_tree() {
     // Update: an `agents`-carrying document replaces the hierarchy; an invalid one is rejected.
     let bad = ClientUpdateAgentRequest {
         display_name: None,
+        handle: None,
         config_yaml: Some(
             "agents:\n  - alias: 'bad alias'\n    template: t\n    target-path: p\n".into(),
         ),

@@ -87,8 +87,8 @@ use wasmtime::component::Val;
 const CHILD_CORE: &[u8] =
     include_bytes!("../../runtime/tests/fixtures/guest-rust-minimal.core.wasm");
 
-const ROOT_BARE: &str = "default-agent";
-const ROOT_COLON: &str = "agent:default";
+const ROOT_BARE: &str = "root";
+const ROOT_COLON: &str = "agent:root";
 const CHILD_BARE: &str = "childfoo";
 const CHILD_COLON: &str = "agent:childfoo";
 
@@ -130,8 +130,8 @@ struct Rig {
     mailbox_store: Arc<MailboxStore>,
     /// The REAL production send entrypoint (`handle_send`) over the SAME
     /// dispatcher + bridge — so the root→child send exercises the genuine
-    /// `from` canonicalization (`agent:default`, not the mechanical
-    /// `agent:default-agent`), not a hand-built envelope. (C1 audit fix.)
+    /// `from` canonicalization (`agent:root`, not the mechanical
+    /// `agent:root-agent`), not a hand-built envelope. (C1 audit fix.)
     manager: Arc<AwaitSessionManagerImpl>,
     routing: Arc<DynamicRouting>,
     bridge: Arc<AgentIdBridge>,
@@ -149,8 +149,7 @@ impl Drop for Rig {
 /// Compose the production builders + the PerChildLoopManager, then drive a REAL
 /// production `spawn_child` (the observer fires the seams). `skip_loop` /
 /// `skip_routing` toggle the production seam for the two discriminators.
-/// `child_bare` is the spawned child's bare id (normally [`CHILD_BARE`]; the
-/// collision test passes `"default"`, whose mechanical colon hits the root's key).
+/// `child_bare` is the spawned child's bare id (normally [`CHILD_BARE`]).
 async fn build_rig(skip_loop: bool, skip_routing: bool, child_bare: &str) -> Rig {
     let ws = TempDir::new().expect("tempdir");
     let ws_path = ws.path().to_path_buf();
@@ -194,7 +193,7 @@ async fn build_rig(skip_loop: bool, skip_routing: bool, child_bare: &str) -> Rig
     );
     // C1 audit fix: the REAL production send entrypoint over that dispatcher, with
     // the SAME bridge in `ManagerOptions.id_bridge` — so `handle_send(ROOT_BARE, …)`
-    // stamps the canonical `from = agent:default` (the production wiring in
+    // stamps the canonical `from = agent:root` (the production wiring in
     // `await_wiring::build_await_messaging_chain`), driving the genuine root→child
     // routing rather than a hand-built envelope.
     let manager = Arc::new(AwaitSessionManagerImpl::new(
@@ -251,6 +250,7 @@ async fn build_rig(skip_loop: bool, skip_routing: bool, child_bare: &str) -> Rig
     // distinct from harness-supplied routing/loop). The observer fires the seams.
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId(ROOT_BARE.to_string()),
             child_id: AgentId(child_bare.to_string()),
             child_workspace_path: PathBuf::from("children").join(child_bare),
@@ -282,7 +282,7 @@ async fn build_rig(skip_loop: bool, skip_routing: bool, child_bare: &str) -> Rig
 
 /// The genuine root→child send, driven through the PRODUCTION `handle_send` with
 /// the BARE root id — so the manager's `canonical_sender` stamps the real
-/// `from = agent:default` (NOT a hand-built `agent:default-agent`). Returns the
+/// `from = agent:root` (NOT a hand-built `agent:root-agent`). Returns the
 /// same `Result<(), MsgError>` the production send yields.
 async fn root_sends_to_child(rig: &Rig) -> Result<(), MsgError> {
     rig.manager
@@ -325,10 +325,10 @@ async fn sys_ac_279_spawn_yields_live_served_child() {
     );
 
     // The root routes to the child via the PRODUCTION send path: `handle_send`
-    // stamps the canonical `from = agent:default` (its `canonical_sender` resolving
-    // the bare `default-agent` through the bridge), which `validate_routing` over
+    // stamps the canonical `from = agent:root` (its `canonical_sender` resolving
+    // the bare `root` through the bridge), which `validate_routing` over
     // DynamicRouting admits as parent→child — NOT a harness-built `from`, and NOT
-    // the mechanical `agent:default-agent` that would dead-end `no_adjacency`.
+    // the mechanical `agent:root-agent` that would dead-end `no_adjacency`.
     let delivered = root_sends_to_child(&rig).await;
     assert!(
         delivered.is_ok(),
@@ -431,100 +431,72 @@ async fn sys_ac_279_discriminator_routing_entry_absent() {
     );
 }
 
-/// audit r10 (confused-deputy guard): a runtime-spawned child whose BARE id
-/// mechanically maps onto the ROOT's SPECIAL colon (`agent:default`) must NOT be
-/// served — serving a loop on the root's key would hijack the root's mailbox. The
-/// colliding child stays an unserved tree node; `agent:default` keeps the root's
-/// identity, and no loop runs on it.
+/// audit r10 (confused-deputy guard), re-stated under the id/handle model: a
+/// runtime-spawned child whose HANDLE equals the root's handle would be served on
+/// the root's mailbox key (`agent:root`) and hijack it. The guard is now
+/// STRUCTURAL: the tree's handle registry refuses to bind a handle another node
+/// owns, so the spawn is rejected BEFORE the observer fires — no node, no routing
+/// registration, no serve loop. (The colon key is `agent:<handle>`, so two agents
+/// can only collide on it by sharing a handle, which the tree forbids.)
 #[tokio::test]
 async fn sys_ac_279_child_id_colliding_with_root_is_not_served() {
-    // Spawn a child bare-named "default" → key_resolver's mechanical branch yields
-    // colon "agent:default" == the ROOT's serve key (the reachable collision).
-    let rig = build_rig(false, false, "default").await;
-
-    // The spawn RECORDED the tree node (bare "default" != root bare "default-agent").
-    assert!(
-        rig.child_present_post,
-        "the 'default' child tree node was recorded by the real spawn"
-    );
-
-    // But `agent:default` is STILL the ROOT (parent None): the colliding
-    // register_child was REJECTED (first-wins), so no child reparented the root's
-    // colon, and the id-bridge still resolves it to the root pair.
-    assert_eq!(
-        rig.routing.parent_of("agent:default"),
-        None,
-        "agent:default is still the ROOT — the colliding child was not reparented"
-    );
-    assert_eq!(
-        rig.bridge.resolve_owned("agent:default"),
-        Some((ROOT_BARE.to_string(), ROOT_COLON.to_string())),
-        "agent:default still resolves to the root pair (child registration rejected)"
-    );
-    // The root's colon route SURVIVES the collision handling — still a LIVE, routable
-    // ROOT, not merely `parent_of==None` (which is AMBIGUOUS: root OR absent). This
-    // closes a fake-green where a `register_child` overwrite regression would let the
-    // colliding child overwrite the root entry, and the guard's rollback
-    // `unregister_child` would then DELETE the root's route (leaving `parent_of==None`
-    // for the WRONG reason). `agent_exists` + `agent_kind==Root` prove the route is
-    // intact. (audit adversarial r2)
-    assert!(
-        rig.routing.agent_exists(ROOT_COLON),
-        "collision: the root's colon route SURVIVES (not deleted by the rejection)"
-    );
-    assert_eq!(
-        rig.routing.agent_kind(ROOT_COLON),
-        Some(AgentKind::Root),
-        "collision: agent:default is still a live ROOT (not overwritten/absent)"
-    );
-
-    // STRUCTURAL discriminator (audit W1/W2): the colliding child was REJECTED before
-    // the serve spawn, so NO loop handle is retained — a timing-INDEPENDENT proof that
-    // no hijack loop exists on the root's key (the probe-consumption check below is a
-    // secondary, timing-based confirmation). WITHOUT the guard this would be 1.
-    assert_eq!(
-        rig.mgr.active_loop_count(),
-        0,
-        "collision: the rejected child leaves NO retained serve loop on the root's key"
-    );
-
-    // DISCRIMINATOR (audit r11): deliver a message to the ROOT's mailbox key, then
-    // prove it is NOT consumed. This is what makes the fix observable — the
-    // structural assertions above are first-wins-INVARIANT (they hold with or
-    // without the `on_child_spawned` guard, since `register_child`/`register` are
-    // internally first-wins), and a bare `child_turns==0` would be VACUOUS (an empty
-    // mailbox parks at `recv().await`). WITH the guard, no loop serves `agent:default`
-    // so this probe sits UNCONSUMED (depth ≥ 1, 0 turns). WITHOUT the guard (the
-    // confused-deputy bug), the colliding child's loop would be parked on
-    // `recv("agent:default")` and would STEAL this probe — draining the mailbox and
-    // running a turn. Both assertions below FLIP if the fix is reverted.
-    rig.mailbox_store
-        .get_or_create("agent:default")
-        .expect("root mailbox")
-        .deliver(Message {
-            id: "sys-ac-279-collision-probe".to_string(),
-            kind: MessageKind::Agent,
-            from: "user:probe".to_string(),
-            to: "agent:default".to_string(),
-            payload: vec![0x01],
-            context: None,
-            timestamp: std::time::SystemTime::now(),
-            origin: None,
+    let ws = TempDir::new().expect("tempdir");
+    let ws_path = ws.path().to_path_buf();
+    let territory = ws_path.join(ROOT_BARE);
+    std::fs::create_dir_all(&territory).expect("territory");
+    let bare_store = AgentTreeStore::new(ws_path.clone()).expect("bare store");
+    bare_store
+        .insert_root(AgentNode {
+            id: AgentId(ROOT_BARE.to_string()),
+            kind: AgentKind::Root,
+            parent: None,
+            workspace_path: territory.clone(),
+            capabilities: vec![],
+            template_ref: None,
+            status: AgentStatus::Active,
         })
-        .expect("deliver probe to the root's mailbox key");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        rig.mgr.child_turns("agent:default"),
-        0,
-        "no hijack loop consumed the root's key (would be ≥1 if the collision child were served)"
-    );
+        .expect("root");
+    let spawner = DefaultSpawner::new(bare_store.clone(), Arc::new(AllowAllSubset));
+
+    // A fresh (UUID) tree id whose HANDLE is the root's: mechanically `agent:root`.
+    let colliding_id = cap_lifecycle::identity::new_agent_id();
+    let err = spawner
+        .spawn_child(SpawnChildConfig {
+            handle: Some(ROOT_BARE.to_string()),
+            parent_id: AgentId(ROOT_BARE.to_string()),
+            child_id: AgentId(colliding_id.clone()),
+            child_workspace_path: PathBuf::from("children").join("collider"),
+            capabilities: vec![],
+            template_ref: None,
+            binary: Some(CHILD_CORE.to_vec()),
+        })
+        .expect_err("a child may not take the root's handle");
     assert!(
-        rig.mailbox_store
-            .get("agent:default")
-            .map(|mb| mb.depth())
-            .unwrap_or(0)
-            >= 1,
-        "the probe sits UNCONSUMED — no child loop hijacked the root's mailbox (would drain to 0 if served)"
+        matches!(
+            err,
+            SpawnError::TreeStateInvalid(_) | SpawnError::AlreadyExists(_)
+        ),
+        "rejected by the tree's handle registry: {err:?}"
+    );
+
+    // No node was recorded under the colliding id, the root still owns its handle, and
+    // the rejected materialization left no territory behind.
+    let snap = bare_store.snapshot();
+    assert_eq!(
+        snap.nodes.len(),
+        1,
+        "only the root remains: {:?}",
+        snap.nodes
+    );
+    assert!(!bare_store.contains(&AgentId(colliding_id)));
+    let owner = bare_store
+        .node_by_handle(ROOT_BARE)
+        .expect("the root still owns its handle");
+    assert_eq!(owner.kind, AgentKind::Root);
+    assert_eq!(owner.id.0, ROOT_BARE);
+    assert!(
+        !territory.join("children").join("collider").exists(),
+        "the rejected spawn rolled its territory back"
     );
 }
 
@@ -559,7 +531,7 @@ const TRAP_CORE: &[u8] = include_bytes!("fixtures/guest-rust-trap.core.wasm");
 const STATE_AWAIT_WRITE_OK: [u8; 4] = [0xAC, 0x08, 0x14, 0x77];
 const SEND_PAYLOAD: [u8; 4] = [0x5E, 0x4D, 0xB3, 0x01];
 
-// The SYS-AC-280/281/282 root (distinct from the SYS-AC-279 `default-agent`
+// The SYS-AC-280/281/282 root (distinct from the SYS-AC-279 `root`
 // root above): a mechanical `parent`↔`agent:parent` pair.
 const PARENT_BARE: &str = "parent";
 const PARENT_COLON: &str = "agent:parent";
@@ -951,6 +923,7 @@ async fn build_rig_280(skip_loop: bool) -> Rig280 {
         .with_spawn_observer(mgr.clone() as Arc<dyn SpawnObserver>);
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId(PARENT_BARE.to_string()),
             child_id: AgentId(T280_CHILD_BARE.to_string()),
             child_workspace_path: PathBuf::from("children").join(T280_CHILD_BARE),
@@ -1332,6 +1305,7 @@ async fn build_rig_281(
         .with_spawn_observer(mgr.clone() as Arc<dyn SpawnObserver>);
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId(PARENT_BARE.to_string()),
             child_id: AgentId(CHILD_BARE.to_string()),
             child_workspace_path: PathBuf::from("children").join(CHILD_BARE),

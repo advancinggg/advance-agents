@@ -119,6 +119,7 @@ fn ti_t08_spawn_child_with_template_overlays_files() {
     let (_tmp, tree, spawner) = setup_with_resolver(Arc::new(BuiltinTemplateRegistry::new()));
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("agents/foo"),
@@ -208,6 +209,7 @@ fn ti_template_ref_without_resolver_errors() {
     let (_tmp, _tree, spawner) = setup_no_resolver();
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("agents/foo"),
@@ -229,6 +231,7 @@ fn ti_template_ref_unknown_errors_with_rollback() {
     let expected_target_dir = parent_workspace.join("agents").join("foo");
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("agents/foo"),
@@ -272,6 +275,7 @@ fn ti_template_apply_failure_rolls_back_target_dir() {
     let expected_target_dir = parent_workspace.join("agents").join("bar");
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("bar".to_string()),
             child_workspace_path: PathBuf::from("agents/bar"),
@@ -313,6 +317,7 @@ fn ti_template_skill_path_traversal_surfaces_as_path_traversal() {
     let (_tmp, _tree, spawner) = setup_with_resolver(Arc::new(TraversalSkillResolver));
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("baz".to_string()),
             child_workspace_path: PathBuf::from("agents/baz"),
@@ -349,6 +354,7 @@ fn ti_bw_spawn_child_materializes_behavior_wasm() {
     let (_tmp, tree, spawner) = setup_with_resolver(Arc::new(BehaviorWasmResolver));
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("bw".to_string()),
             child_workspace_path: PathBuf::from("agents/bw"),

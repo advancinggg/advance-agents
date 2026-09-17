@@ -128,6 +128,7 @@ impl AgentTreeReader for OneAgentTree {
 impl AgentTreeSnapshot for OneAgentTree {
     fn snapshot(&self) -> AgentTreeSnapshotData {
         AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes: self.nodes.clone(),
             parent_of: HashMap::new(),
             children_of: HashMap::new(),

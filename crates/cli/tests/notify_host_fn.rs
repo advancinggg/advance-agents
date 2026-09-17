@@ -12,8 +12,8 @@
 //!      reaches `NotifyAgentHandler` → `MailboxDispatcherImpl::notify_agent` and
 //!      the payload lands in the target's REAL mailbox (a real bare-keyed
 //!      `cap_lifecycle::AgentTreeStore`). The guest runs under a PRODUCTION-
-//!      FAITHFUL BARE `ctx.agent_id` (`default-agent`) — the Wave-20 seam-(a)
-//!      sender normalization maps it to its canonical colon (`agent:default`) for
+//!      FAITHFUL BARE `ctx.agent_id` (`root`) — the Wave-20 seam-(a)
+//!      sender normalization maps it to its canonical colon (`agent:root`) for
 //!      the `is_safe_id(from)` gate.
 //!   3. **Anti-fake-green discriminator**: the SAME guest call against the SAME
 //!      real chain WITHOUT the id-bridge fails — the bare sender no longer
@@ -53,8 +53,8 @@ const CORE_BYTES: &[u8] =
 const NOTIFY_PAYLOAD: [u8; 4] = [0x07, 0x1F, 0xAB, 0x01];
 const STATE_NOTIFY_AGENT_OK: [u8; 4] = [0x07, 0x1F, 0x0A, 0x01];
 
-const ROOT_BARE: &str = "default-agent";
-const ROOT_COLON: &str = "agent:default";
+const ROOT_BARE: &str = "root";
+const ROOT_COLON: &str = "agent:root";
 const TARGET_BARE: &str = "target";
 const TARGET_COLON: &str = "agent:target"; // == the fixture's NOTIFY_AGENT_TARGET
 
@@ -94,9 +94,9 @@ fn component_bytes() -> Vec<u8> {
         .expect("component encoded")
 }
 
-/// Build a REAL bare-keyed `AgentTreeStore` (root `default-agent` + a child
+/// Build a REAL bare-keyed `AgentTreeStore` (root `root` + a child
 /// `target`) + a `MailboxDispatcherImpl`. When `wire_bridge`, the dispatcher
-/// carries the colon/bare `AgentIdBridge` for BOTH the sender (`default-agent`)
+/// carries the colon/bare `AgentIdBridge` for BOTH the sender (`root`)
 /// and the target (`target`). Returns the `TempDir` (held for the tree's
 /// lifetime), the shared store, and the shared dispatcher as an `Arc`.
 fn build(wire_bridge: bool) -> (TempDir, Arc<MailboxStore>, Arc<MailboxDispatcherImpl>) {
@@ -164,7 +164,7 @@ async fn instantiate(
     let loaded = runtime
         .load_component(&component_bytes())
         .expect("component loads");
-    // PRODUCTION-FAITHFUL: caller_id is BARE for the agent case (default-agent);
+    // PRODUCTION-FAITHFUL: caller_id is BARE for the agent case (root);
     // for the AC-15 case it is the system identity.
     let ctx = ComponentCtx::new(caller_id.into(), "trace-w20".into(), Vec::new());
     runtime

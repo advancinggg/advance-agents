@@ -152,6 +152,7 @@ impl MockAgentTree {
             .collect();
         Arc::new(Self {
             data: AgentTreeSnapshotData {
+                handles: Default::default(),
                 nodes,
                 parent_of,
                 children_of: HashMap::new(),

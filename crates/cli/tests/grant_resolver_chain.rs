@@ -42,8 +42,8 @@ async fn production_builder_injects_live_budget_before_terminal_deny() {
     let run_manager = Arc::new(RunManager::new(bus.clone()));
     let run_id = run_manager
         .ensure_run(
-            "default-agent",
-            "default-agent",
+            "root",
+            "root",
             RunConfig {
                 rounds_limit: Some(1),
                 ..Default::default()
@@ -65,7 +65,7 @@ async fn production_builder_injects_live_budget_before_terminal_deny() {
     let validator: Arc<dyn SubsetValidator> = Arc::new(SubsetValidatorImpl::new());
     let chain = build_grant_resolver_chain(validator, Arc::new(run_manager.budget()), None);
     let result = chain.evaluate(
-        req("default-agent", "fs"),
+        req("root", "fs"),
         ResolverContext {
             parent_grants: &[],
             run_id: Some(run_id.as_ref()),
@@ -88,7 +88,7 @@ async fn production_builder_injects_live_budget_before_terminal_deny() {
         Box::new(AutoDenyResolver::new()),
     ]);
     let legacy = legacy_chain.evaluate(
-        req("default-agent", "fs"),
+        req("root", "fs"),
         ResolverContext {
             parent_grants: &[],
             run_id: Some(run_id.as_ref()),
@@ -111,8 +111,8 @@ fn production_builder_without_channel_port_fails_closed_after_abstains() {
     let run_manager = Arc::new(RunManager::new(bus.clone()));
     let run_id = run_manager
         .ensure_run(
-            "default-agent",
-            "default-agent",
+            "root",
+            "root",
             RunConfig {
                 rounds_limit: Some(10),
                 ..Default::default()
@@ -124,7 +124,7 @@ fn production_builder_without_channel_port_fails_closed_after_abstains() {
     let validator: Arc<dyn SubsetValidator> = Arc::new(SubsetValidatorImpl::new());
     let chain = build_grant_resolver_chain(validator, Arc::new(run_manager.budget()), None);
     let result = chain.evaluate(
-        req("default-agent", "fs"),
+        req("root", "fs"),
         ResolverContext {
             parent_grants: &[],
             run_id: Some(run_id.as_ref()),
@@ -147,8 +147,8 @@ fn production_builder_default_channel_port_fails_closed_at_channel() {
     let run_manager = Arc::new(RunManager::new(bus.clone()));
     let run_id = run_manager
         .ensure_run(
-            "default-agent",
-            "default-agent",
+            "root",
+            "root",
             RunConfig {
                 rounds_limit: Some(10),
                 ..Default::default()
@@ -164,7 +164,7 @@ fn production_builder_default_channel_port_fails_closed_at_channel() {
         Some(default_channel_approval_port()),
     );
     let result = chain.evaluate(
-        req("default-agent", "fs"),
+        req("root", "fs"),
         ResolverContext {
             parent_grants: &[],
             run_id: Some(run_id.as_ref()),

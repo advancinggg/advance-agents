@@ -439,6 +439,7 @@ async fn t_ptr_10_e2e_spawn_child_materializes_pack_template() {
 
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("scout".to_string()),
             child_workspace_path: PathBuf::from("agents/scout"),

@@ -648,6 +648,7 @@ impl AgentTreeSnapshot for HarnessAgentTree {
             }
         }
         AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes: self.nodes.clone(),
             parent_of,
             children_of,
@@ -849,6 +850,7 @@ impl AgentTreeReader for OneAgentTree {
 impl AgentTreeSnapshot for OneAgentTree {
     fn snapshot(&self) -> AgentTreeSnapshotData {
         AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes: self.nodes.clone(),
             parent_of: HashMap::new(),
             children_of: HashMap::new(),
@@ -4426,6 +4428,7 @@ impl advance_shared_types::agent_tree::AgentTreeSnapshot for DelegatesTree {
         let mut children_of = HashMap::new();
         children_of.insert(AgentId(self.parent.clone()), children);
         AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes,
             parent_of,
             children_of,
@@ -5848,6 +5851,7 @@ impl SystemUnderTest {
         match &self.agents {
             Some(a) => a.tree_store.snapshot(),
             None => AgentTreeSnapshotData {
+                handles: Default::default(),
                 nodes: Vec::new(),
                 parent_of: HashMap::new(),
                 children_of: HashMap::new(),

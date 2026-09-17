@@ -404,6 +404,7 @@ impl AgentTreeReader for EmptyAgentTree {
 impl AgentTreeSnapshot for EmptyAgentTree {
     fn snapshot(&self) -> AgentTreeSnapshotData {
         AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes: Vec::new(),
             parent_of: std::collections::HashMap::new(),
             children_of: std::collections::HashMap::new(),
@@ -798,7 +799,7 @@ impl L4TaskSummaryReader for CapMemoryHistoryReader {
 /// **Bare-first owner resolution (the colon/bare keying fix)**: `DefaultDecompositionStore::get`
 /// validates the caller as a registered `AgentTreeStore` node and REJECTS colon-shaped
 /// ids (owner ids are `[A-Za-z0-9_-]`). The assembler passes `ctx.agent_id` (the colon
-/// msg-id `agent:default` in production), so this adapter tries its construction-time
+/// msg-id `agent:root` in production), so this adapter tries its construction-time
 /// alias set `{bare cap write-id, colon routing-id}` BARE-FIRST until one resolves —
 /// fixing the residual the 011 delegates section left open (where the colon key never
 /// matched the bare-recorded nodes). Filters to NON-orphaned subtasks and stringifies
@@ -1663,8 +1664,8 @@ mod tests {
     #[tokio::test]
     async fn knowledge_loader_alias_keying() {
         let store = MemoryStore::new();
-        let bare = "default-agent";
-        let colon = "agent:default";
+        let bare = "root";
+        let colon = "agent:root";
         store
             .insert(bare, fact("k1", bare, "wired knowledge body"))
             .unwrap();
@@ -1688,7 +1689,7 @@ mod tests {
     /// no task hit → router degrades to NewTask). Hermetic: no embedding needed.
     #[tokio::test]
     async fn corpus_ports_inert_this_slice() {
-        let aliases = vec!["agent:a".to_string(), "default-agent".to_string()];
+        let aliases = vec!["agent:a".to_string(), "root".to_string()];
         let q = vec![0.1_f32, 0.2, 0.3];
 
         let search = real_unified_search(&aliases);

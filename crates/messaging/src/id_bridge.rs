@@ -3,14 +3,14 @@
 //! ## The residual this closes (MODULE-006 §3.6 AC-02 *membership* leg)
 //!
 //! Two mutually-incompatible id grammars coexist in the runtime:
-//! - **COLON** msg-id (`agent:default`): what [`crate::id_validation::is_safe_id`]
+//! - **COLON** msg-id (`agent:root`): what [`crate::id_validation::is_safe_id`]
 //!   requires (`"system" | agent:<body> | user:<body>`) — the `MailboxStore` key,
 //!   the serve-loop poll key, the dispatch / reply-registry id.
-//! - **BARE** cap-id (`default-agent`): what `cap-lifecycle`'s `AgentTreeStore` is
+//! - **BARE** cap-id (`root`): what `cap-lifecycle`'s `AgentTreeStore` is
 //!   keyed on and what its `validate_agent_id` accepts (charset `[A-Za-z0-9_-]`,
 //!   ≤64 bytes — a colon is REJECTED).
 //!
-//! The bodies even differ (`agent:default` ≠ `default-agent`), so a plain
+//! The bodies even differ (`agent:root` ≠ `root`), so a plain
 //! `strip_prefix("agent:")` cannot bridge them. The consequence: a production
 //! `notify_agent`/`notify_channel` target passes `is_safe_id` (colon) but then
 //! fails `tree.agent_exists` against the bare-keyed tree → `target_unknown`, and
@@ -27,8 +27,8 @@
 //! via the SAME resolution, so there is no "membership passes / mailbox orphans"
 //! split. A non-member resolves to `None` (the caller then uses the target
 //! verbatim — today's behavior). **There is deliberately NO strip-prefix
-//! fallback**: it would let `agent:default-agent` pass membership via
-//! `strip→default-agent` while keying an orphan mailbox `agent:default-agent`.
+//! fallback**: it would let `agent:root-agent` pass membership via
+//! `strip→root` while keying an orphan mailbox `agent:root-agent`.
 //!
 //! ## Safety
 //!
@@ -240,13 +240,13 @@ mod tests {
     // TB-IDB-01: explicit equivalence-class resolve (both forms → same canonical).
     #[test]
     fn tb_idb_01a_class_resolve_both_forms() {
-        let b = AgentIdBridge::from_pairs([("agent:default", "default-agent")]);
-        let colon = b.resolve("agent:default").expect("colon form is a member");
-        assert_eq!(colon.bare_tree_key, "default-agent");
-        assert_eq!(colon.mailbox_key, "agent:default");
-        let bare = b.resolve("default-agent").expect("bare form is a member");
-        assert_eq!(bare.bare_tree_key, "default-agent");
-        assert_eq!(bare.mailbox_key, "agent:default");
+        let b = AgentIdBridge::from_pairs([("agent:root", "root")]);
+        let colon = b.resolve("agent:root").expect("colon form is a member");
+        assert_eq!(colon.bare_tree_key, "root");
+        assert_eq!(colon.mailbox_key, "agent:root");
+        let bare = b.resolve("root").expect("bare form is a member");
+        assert_eq!(bare.bare_tree_key, "root");
+        assert_eq!(bare.mailbox_key, "agent:root");
         // Both forms resolve to the SAME canonical mailbox key.
         assert_eq!(colon.mailbox_key, bare.mailbox_key);
     }
@@ -254,10 +254,10 @@ mod tests {
     // TB-IDB-01 (cont.): non-members → None (NO strip-prefix orphan path).
     #[test]
     fn tb_idb_01b_non_member_none() {
-        let b = AgentIdBridge::from_pairs([("agent:default", "default-agent")]);
-        // The classic orphan-key trap target: a colon id whose strip (`default-agent`)
+        let b = AgentIdBridge::from_pairs([("agent:root", "root")]);
+        // The classic orphan-key trap target: a colon id whose strip (`root`)
         // would match the tree but is NOT a registered member here.
-        assert!(b.resolve("agent:default-agent").is_none());
+        assert!(b.resolve("agent:root-agent").is_none());
         assert!(b.resolve("agent:other").is_none());
         assert!(b.resolve("default").is_none());
         assert!(b.resolve("user:alice").is_none());
@@ -292,7 +292,7 @@ mod tests {
     fn tb_idb_01d_empty_default_resolves_none() {
         let b = AgentIdBridge::default();
         assert!(b.is_empty());
-        assert!(b.resolve("agent:default").is_none());
+        assert!(b.resolve("agent:root").is_none());
         let b2 = AgentIdBridge::from_pairs(Vec::<(String, String)>::new());
         assert!(b2.is_empty());
     }
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn tb_idb_reg_register_and_resolve_owned() {
         // Seed only the root; register a child at runtime.
-        let b = AgentIdBridge::from_pairs([("agent:default", "default-agent")]);
+        let b = AgentIdBridge::from_pairs([("agent:root", "root")]);
         assert!(b.register("agent:child-1", "child-1"));
         // Both child forms resolve via resolve_owned to the (bare, colon) pair.
         let (bare, mailbox) = b.resolve_owned("agent:child-1").expect("colon child");
@@ -326,12 +326,12 @@ mod tests {
         assert_eq!(bare2, "child-1");
         assert_eq!(mailbox2, "agent:child-1");
         // The seed root still resolves via resolve_owned (seed wins).
-        let (rb, rm) = b.resolve_owned("agent:default").expect("seed root");
-        assert_eq!(rb, "default-agent");
-        assert_eq!(rm, "agent:default");
+        let (rb, rm) = b.resolve_owned("agent:root").expect("seed root");
+        assert_eq!(rb, "root");
+        assert_eq!(rm, "agent:root");
         // The borrowed resolve() stays seed-only (does NOT see registrations).
         assert!(b.resolve("agent:child-1").is_none());
-        assert!(b.resolve("agent:default").is_some());
+        assert!(b.resolve("agent:root").is_some());
         // Unregistered target → None.
         assert!(b.resolve_owned("agent:other").is_none());
     }
@@ -339,15 +339,15 @@ mod tests {
     // TB-IDB-REG: register rejects malformed pairs + seed/registration collisions.
     #[test]
     fn tb_idb_reg_rejects_malformed_and_collisions() {
-        let b = AgentIdBridge::from_pairs([("agent:default", "default-agent")]);
+        let b = AgentIdBridge::from_pairs([("agent:root", "root")]);
         // Malformed: colon in the bare key.
         assert!(!b.register("agent:x", "bad:bare"));
         // Malformed: mailbox key not is_safe_id.
         assert!(!b.register("bare-mailbox", "ok-bare"));
         // Collision with a SEED member (mailbox form).
-        assert!(!b.register("agent:default", "some-bare"));
+        assert!(!b.register("agent:root", "some-bare"));
         // Collision with a SEED member (bare form).
-        assert!(!b.register("agent:zzz", "default-agent"));
+        assert!(!b.register("agent:zzz", "root"));
         // First registration wins; a second on the same form is dropped.
         assert!(b.register("agent:c1", "c1"));
         assert!(!b.register("agent:c1", "c1-other"));
@@ -362,7 +362,7 @@ mod tests {
     // forms) but never a seed class.
     #[test]
     fn tb_idb_reg_unregister_drops_runtime_never_seed() {
-        let b = AgentIdBridge::from_pairs([("agent:default", "default-agent")]);
+        let b = AgentIdBridge::from_pairs([("agent:root", "root")]);
         assert!(b.register("agent:child-1", "child-1"));
         // Both forms resolve before teardown.
         assert!(b.resolve_owned("agent:child-1").is_some());
@@ -374,8 +374,8 @@ mod tests {
         // Idempotent: a second teardown finds nothing to remove.
         assert!(!b.unregister("agent:child-1", "child-1"));
         // A SEED class is immutable — teardown refuses it and the root still resolves.
-        assert!(!b.unregister("agent:default", "default-agent"));
-        assert!(b.resolve_owned("agent:default").is_some());
+        assert!(!b.unregister("agent:root", "root"));
+        assert!(b.resolve_owned("agent:root").is_some());
         // After teardown the id can be RE-registered (a fresh spawn of the same id).
         assert!(b.register("agent:child-1", "child-1"));
         assert!(b.resolve_owned("agent:child-1").is_some());

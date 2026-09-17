@@ -150,7 +150,7 @@ pub fn build_await_messaging_chain(
     // Wave-23 `perchild-daemon-1` (C1 fix): the SAME bridge feeds both the
     // dispatcher (target resolution) AND the manager's `ManagerOptions.id_bridge`
     // (genuine-send `from` canonicalization), so a real root send stamps the
-    // canonical `agent:default` — not the mechanical `agent:default-agent` that
+    // canonical `agent:root` — not the mechanical `agent:root-agent` that
     // would fail the parent→child adjacency check. `None` → byte-identical.
     let manager_bridge = id_bridge.clone();
     if let Some(bridge) = id_bridge {

@@ -962,6 +962,7 @@ async fn dispatch(
         "init-child-workspace" => {
             let child_id = arg_str(params, 0, op)?;
             cap_str(op, &child_id, MAX_AGENT_ID_BYTES)?;
+            let child_id = resolve_guest_agent_ref(&b.tree, child_id);
             // Lift the `list<file-entry>` payload (param 1). Wire shape:
             // a list of Val::Record-shaped `{path, bytes}` OR, for the
             // test/host harness, Val::String "path\0<utf8 bytes>".
@@ -980,6 +981,7 @@ async fn dispatch(
             let child_id = arg_str(params, 0, op)?;
             let version = arg_str(params, 1, op)?;
             cap_str(op, &child_id, MAX_AGENT_ID_BYTES)?;
+            let child_id = resolve_guest_agent_ref(&b.tree, child_id);
             cap_str(op, &version, MAX_TARGET_BYTES)?;
             match b.rollback.rollback_child(
                 &AgentId(caller_id.clone()),
@@ -994,6 +996,7 @@ async fn dispatch(
             let child_id = arg_str(params, 0, op)?;
             let label = arg_str(params, 1, op)?;
             cap_str(op, &child_id, MAX_AGENT_ID_BYTES)?;
+            let child_id = resolve_guest_agent_ref(&b.tree, child_id);
             cap_str(op, &label, MAX_LABEL_BYTES)?;
             match b.rollback.rollback_child_to_checkpoint(
                 &AgentId(caller_id.clone()),
@@ -1007,6 +1010,7 @@ async fn dispatch(
         "terminate-child" => {
             let child_id = arg_str(params, 0, op)?;
             cap_str(op, &child_id, MAX_AGENT_ID_BYTES)?;
+            let child_id = resolve_guest_agent_ref(&b.tree, child_id);
             // MODULE-005-AC-28: pre-call snapshot for removed-set attribution
             // (whole-tree diff; exact for the quiescent case — §3.6 caveat).
             let pre = b.tree.snapshot();
@@ -1028,6 +1032,7 @@ async fn dispatch(
         "terminate-agent" => {
             let agent_id = arg_str(params, 0, op)?;
             cap_str(op, &agent_id, MAX_AGENT_ID_BYTES)?;
+            let agent_id = resolve_guest_agent_ref(&b.tree, agent_id);
             let pre = b.tree.snapshot();
             match b.terminate.terminate_agent(&caller_id, &agent_id) {
                 Ok(()) => {
@@ -1069,6 +1074,7 @@ async fn dispatch(
         "list-child-checkpoints" => {
             let child_id = arg_str(params, 0, op)?;
             cap_str(op, &child_id, MAX_AGENT_ID_BYTES)?;
+            let child_id = resolve_guest_agent_ref(&b.tree, child_id);
             match b.checkpoint.list_child_checkpoints(&caller_id, &child_id) {
                 Ok(v) => Val::Result(Ok(Some(Box::new(Val::List(
                     v.into_iter().map(|c| Val::String(c.label)).collect(),
@@ -1088,6 +1094,7 @@ async fn dispatch(
         "child-stats" => {
             let child_id = arg_str(params, 0, op)?;
             cap_str(op, &child_id, MAX_AGENT_ID_BYTES)?;
+            let child_id = resolve_guest_agent_ref(&b.tree, child_id);
             match b.stats.child_stats(&caller_id, &child_id) {
                 Ok(s) => ok_agent_stats(s),
                 Err(e) => lower_lifecycle_err(e),
@@ -1301,6 +1308,15 @@ fn dispatch_decomposition(
 /// param 2), so the spawner's subset gate validates them against the parent's held
 /// caps; spawn-agent-from-template keeps empty caps (template-sourced). A non-spawn
 /// `op` is a handler bug → host trap.
+/// A guest names other agents by HANDLE (the addressable name it spawned them under);
+/// the tree, cascade and rollback APIs take the immutable tree id. Resolve a handle to its
+/// id when the tree knows it, else pass the argument through (a caller already holding an
+/// id, or an unknown name that the callee reports as not-found).
+fn resolve_guest_agent_ref(tree: &AgentTreeStore, reference: String) -> String {
+    use advance_shared_types::agent_tree::AgentTreeReader as _;
+    tree.id_by_handle(&reference).unwrap_or(reference)
+}
+
 fn dispatch_spawn(
     op: &str,
     spawner: &dyn Spawner,
@@ -1342,6 +1358,7 @@ fn dispatch_spawn(
             cap_str(op, &child_id, MAX_AGENT_ID_BYTES)?;
             let ws = ws_opt.unwrap_or_else(|| child_id.clone());
             match spawner.spawn_child(SpawnChildConfig {
+                handle: None,
                 parent_id: AgentId(caller_id.to_string()),
                 child_id: AgentId(child_id),
                 child_workspace_path: PathBuf::from(ws),
@@ -1401,6 +1418,7 @@ fn dispatch_spawn(
                         // territory guards are inherited from spawn_child.
                         match Path::new(&tp).file_name().and_then(|s| s.to_str()) {
                             Some(child_id) => match spawner.spawn_child(SpawnChildConfig {
+            handle: None,
                                 parent_id: AgentId(caller_id.to_string()),
                                 child_id: AgentId(child_id.to_string()),
                                 child_workspace_path: PathBuf::from(&tp),
@@ -1410,7 +1428,7 @@ fn dispatch_spawn(
                                 // from the resolved template, not an inline binary.
                                 binary: None,
                             }) {
-                                Ok(id) => ok_string(id.0),
+                                Ok(_) => ok_string(child_id.to_string()),
                                 Err(e) => lower_spawn_err(e),
                             },
                             None => err_variant(

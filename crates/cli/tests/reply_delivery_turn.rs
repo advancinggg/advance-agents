@@ -88,7 +88,7 @@ fn one_turn_instance() -> (ComponentConfig, WasmInstance) {
     // ComponentConfig.id carries the cap-layer id (bare); the instance id is a
     // syntactically valid component id (no colon).
     let cfg = ComponentConfig {
-        id: "default-agent".to_string(),
+        id: "root".to_string(),
         config_data: None,
         trigger_context: None,
     };

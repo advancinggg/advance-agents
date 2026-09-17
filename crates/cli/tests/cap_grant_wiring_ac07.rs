@@ -141,7 +141,10 @@ async fn t_ag_01_auto_grant_false_ac_07_verifier() {
     );
 
     // L1 assertion: cap-grant GrantStore has 0 active grants for "secrets".
-    let grants = handles.cap_grant.store.list_by_grantee("default-agent");
+    let grants = handles
+        .cap_grant
+        .store
+        .list_by_grantee(&handles.root_agent_id);
     let secrets_grants: Vec<_> = grants
         .iter()
         .filter(|g| g.capability == "secrets")
@@ -178,7 +181,10 @@ async fn t_ag_02_positive_control_auto_grant_true_creates_grant() {
     // L1 assertion: exactly 1 active Grant for "secrets" (this is the
     // load-bearing positive-control check that catches the silent-cap-drop
     // failure mode — without this, T-AG-01 could pass for the wrong reason).
-    let grants = handles.cap_grant.store.list_by_grantee("default-agent");
+    let grants = handles
+        .cap_grant
+        .store
+        .list_by_grantee(&handles.root_agent_id);
     let secrets_grants: Vec<_> = grants
         .iter()
         .filter(|g| g.capability == "secrets")
@@ -195,12 +201,14 @@ async fn t_ag_02_positive_control_auto_grant_true_creates_grant() {
     // (agent, capability, function) tuple — the symmetric counterpart to
     // T-AG-03's Deny check. Without this, T-AG-02 could pass even if the
     // GrantCheck were wired wrong for the `true` case.
-    let decision = host.grant_check().check(
-        "default-agent",
-        "secrets",
-        "secret-exists",
-        &CapParams::empty(),
-    );
+    let decision =
+        host.grant_check()
+            .check(
+                &handles.root_agent_id,
+                "secrets",
+                "secret-exists",
+                &CapParams::empty(),
+            );
     match decision {
         GrantDecision::Allow => {
             // expected
@@ -231,12 +239,14 @@ async fn t_ag_03_production_grant_check_wired_not_stub() {
     // Behaviour check: with no Grant for "secrets" (auto-grant: false),
     // the wired GrantCheckImpl must return Deny — proving the production
     // GrantCheckImpl is wired in (AllowAllGrantCheck would return Allow).
-    let decision = host.grant_check().check(
-        "default-agent",
-        "secrets",
-        "secret-exists",
-        &CapParams::empty(),
-    );
+    let decision =
+        host.grant_check()
+            .check(
+                &handles.root_agent_id,
+                "secrets",
+                "secret-exists",
+                &CapParams::empty(),
+            );
     match decision {
         GrantDecision::Deny(reason) => {
             assert!(
@@ -262,7 +272,10 @@ async fn t_ag_04_missing_agent_config_graceful_degradation() {
 
     // cap-grant store must be empty for the default agent (no static config
     // to compile from).
-    let grants = handles.cap_grant.store.list_by_grantee("default-agent");
+    let grants = handles
+        .cap_grant
+        .store
+        .list_by_grantee(&handles.root_agent_id);
     assert!(
         grants.is_empty(),
         "T-AG-04: cap-grant store should be empty when `.agent/config.yaml` is absent; got: {grants:?}"

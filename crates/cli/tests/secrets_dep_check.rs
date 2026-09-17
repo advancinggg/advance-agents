@@ -3,7 +3,7 @@
 //! (`register_secrets_capability`) builds a real `DeclaredDependencyPolicy` from
 //! the `secrets.dependencies` config map and registers the GATED `secret-exists`
 //! handler over the REAL production caller identity (`HostCallContext.agent_id`,
-//! the bare `default-agent` stamped at `start.rs:776`).
+//! the bare `root` stamped at `start.rs:776`).
 //!
 //! - T15h: `build_secrets_dependency_policy` config→policy mapping (unit; pins
 //!   the Vec→HashSet conversion + `Some` iff non-empty + fail-closed semantics).
@@ -111,7 +111,7 @@ fn t15h_build_policy_maps_config_to_declared_policy() {
 
     // Non-empty → Some(policy) with the declared allowlist semantics.
     let mut deps = HashMap::new();
-    deps.insert("default-agent".to_string(), vec!["api_key".to_string()]);
+    deps.insert("root".to_string(), vec!["api_key".to_string()]);
     let configured = SecretsConfig {
         master_key_source: MasterKeySource::EnvVar,
         env_var_name: "X".into(),
@@ -122,11 +122,11 @@ fn t15h_build_policy_maps_config_to_declared_policy() {
         .expect("non-empty dependencies map must yield Some(policy)");
 
     assert!(
-        policy.permits(&secret_exists_ctx("default-agent"), "api_key"),
-        "declared (default-agent, api_key) pair must be permitted"
+        policy.permits(&secret_exists_ctx("root"), "api_key"),
+        "declared (root, api_key) pair must be permitted"
     );
     assert!(
-        !policy.permits(&secret_exists_ctx("default-agent"), "other"),
+        !policy.permits(&secret_exists_ctx("root"), "other"),
         "an undeclared NAME must be denied (Vec→HashSet membership)"
     );
     assert!(
@@ -135,7 +135,7 @@ fn t15h_build_policy_maps_config_to_declared_policy() {
     );
 }
 
-/// T15i — PRODUCTION reject path. With `secrets.dependencies: {default-agent:
+/// T15i — PRODUCTION reject path. With `secrets.dependencies: {root:
 /// [api_key]}`, the real `wire_capabilities` registers the GATED handler; the
 /// declared caller passes; an undeclared agent and an undeclared name are both
 /// denied with `permission-denied`.
@@ -145,12 +145,12 @@ fn t15h_build_policy_maps_config_to_declared_policy() {
 /// `DeclaredDependencyPolicy`), but invokes the registered handler with a
 /// HAND-CONSTRUCTED `HostCallContext` rather than through the Wasmtime
 /// `CapabilityInjector` closure. The production injector stamps
-/// `ctx.agent_id = "default-agent"` (the bare cap id at `start.rs:776` →
+/// `ctx.agent_id = "root"` (the bare cap id at `start.rs:776` →
 /// `agent_loop.rs` `ComponentCtx::new` → `capability_injector.rs`
 /// `to_host_call_context`) — a host-owned value a guest cannot influence; that
 /// stamping is exercised by every SUT/daemon-boot path (e.g. `messaging_wiring_b2`
-/// admits the bare `default-agent` caller). So the binding between this test's
-/// `"default-agent"` key and the real production identity is sound; the per-call
+/// admits the bare `root` caller). So the binding between this test's
+/// `"root"` key and the real production identity is sound; the per-call
 /// `CapabilityInjector` lift is the only leg this unit witness does not itself
 /// re-drive (same sanctioned stand-in posture as `sys_j55_notify_agent`'s
 /// `ctx.agent_id="system"` stamp). REQ-183 is a `unit`-verification REQ.
@@ -158,7 +158,7 @@ fn t15h_build_policy_maps_config_to_declared_policy() {
 async fn t15i_production_gate_rejects_undeclared_caller_and_name() {
     let env_var = "SECRETS_MASTER_KEY_T15I";
     std::env::set_var(env_var, MASTER_KEY_HEX);
-    let deps_yaml = "  dependencies:\n    default-agent:\n      - api_key\n";
+    let deps_yaml = "  dependencies:\n    root:\n      - api_key\n";
     let (_g, ws, cfg) = fresh_secrets_workspace(&runtime_yaml(env_var, deps_yaml));
 
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
@@ -172,12 +172,12 @@ async fn t15i_production_gate_rejects_undeclared_caller_and_name() {
         .expect("secrets declared ⇒ secret-exists must be registered");
     let handler = spec.handler.clone();
 
-    // (a) the DECLARED caller (default-agent, api_key) is PERMITTED → it reaches
+    // (a) the DECLARED caller (root, api_key) is PERMITTED → it reaches
     //     the storage probe and returns a bool (the store is empty ⇒ false). The
     //     point is the Ok(Bool) shape — the gate did NOT reject.
     let out = handler
         .call(
-            secret_exists_ctx("default-agent"),
+            secret_exists_ctx("root"),
             vec![Val::String("api_key".into())],
             1,
         )
@@ -208,7 +208,7 @@ async fn t15i_production_gate_rejects_undeclared_caller_and_name() {
     assert_permission_denied(
         &handler
             .call(
-                secret_exists_ctx("default-agent"),
+                secret_exists_ctx("root"),
                 vec![Val::String("not_declared".into())],
                 1,
             )

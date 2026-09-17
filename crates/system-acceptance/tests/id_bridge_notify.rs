@@ -26,8 +26,8 @@ use advance_shared_types::agent_tree::{AgentId, AgentKind, AgentNode, AgentStatu
 use cap_lifecycle::AgentTreeStore;
 use tempfile::TempDir;
 
-const ROOT_BARE: &str = "default-agent";
-const ROOT_COLON: &str = "agent:default";
+const ROOT_BARE: &str = "root";
+const ROOT_COLON: &str = "agent:root";
 const ADAPTER_BARE: &str = "chan-adapter";
 const ADAPTER_COLON: &str = "agent:chan-adapter";
 const CHANNEL: &str = "slack";
@@ -44,7 +44,7 @@ fn node(id: &str, kind: AgentKind, parent: Option<&str>, ws: std::path::PathBuf)
     }
 }
 
-/// Build a REAL bare-keyed `AgentTreeStore` (root `default-agent` + a child
+/// Build a REAL bare-keyed `AgentTreeStore` (root `root` + a child
 /// adapter `chan-adapter`) + a `MailboxDispatcherImpl`. When `wire_bridge`, the
 /// dispatcher carries the colon/bare `AgentIdBridge` for both ids; when
 /// `register_channel`, the static registry maps `slack → agent:chan-adapter`.
@@ -102,8 +102,8 @@ fn build(
 }
 
 // TB-IDB-03 — notify_agent through the REAL bare-keyed AgentTreeStore: the bridge
-// resolves `agent:default` → membership `default-agent` + canonical mailbox key
-// `agent:default`, and DELIVERS. Anti-fake-green: the same call against the same
+// resolves `agent:root` → membership `root` + canonical mailbox key
+// `agent:root`, and DELIVERS. Anti-fake-green: the same call against the same
 // REAL tree WITHOUT the bridge returns `target_unknown`.
 #[tokio::test(flavor = "multi_thread")]
 async fn tb_idb_03_real_tree_notify_agent() {
@@ -111,7 +111,7 @@ async fn tb_idb_03_real_tree_notify_agent() {
     let (_tmp, store, d) = build(true, false);
     d.notify_agent("system", ROOT_COLON, b"hi".to_vec(), None)
         .await
-        .expect("bridge resolves agent:default against the REAL bare tree; delivers");
+        .expect("bridge resolves agent:root against the REAL bare tree; delivers");
     let mb = store.get(ROOT_COLON).expect("canonical mailbox exists");
     let msg = mb.recv().await;
     assert_eq!(msg.from, "system");
@@ -167,7 +167,7 @@ async fn tb_idb_04_real_tree_notify_channel() {
 
 // TB-IDB-05 — safety preserved on the REAL tree: a multi-colon (is_safe_id-
 // malformed) target rejects at the is_safe_id gate; a syntactically-valid but
-// NON-member colon target (`agent:default-agent`, the orphan-key trap) resolves
+// NON-member colon target (`agent:root-agent`, the orphan-key trap) resolves
 // to None → REAL bare tree miss → target_unknown. Neither delivers anything.
 #[tokio::test(flavor = "multi_thread")]
 async fn tb_idb_05_real_tree_malformed_and_nonmember_reject() {
@@ -179,16 +179,16 @@ async fn tb_idb_05_real_tree_malformed_and_nonmember_reject() {
         .unwrap_err();
     assert_eq!(e1, NotifyError::InvalidTarget("invalid_id".into()));
 
-    // `agent:default-agent` is is_safe_id-valid (body `default-agent`) and its
+    // `agent:root-agent` is is_safe_id-valid (body `root`) and its
     // strip WOULD match the bare root, but the no-strip-fallback design means it
     // is NOT a bridge member → REAL tree miss → target_unknown (no orphan).
     let e2 = d
-        .notify_agent("system", "agent:default-agent", b"2".to_vec(), None)
+        .notify_agent("system", "agent:root-agent", b"2".to_vec(), None)
         .await
         .unwrap_err();
     assert_eq!(e2, NotifyError::InvalidTarget("target_unknown".into()));
 
-    assert!(store.get("agent:default-agent").is_none());
+    assert!(store.get("agent:root-agent").is_none());
     assert!(store.get(ROOT_BARE).is_none());
     assert!(store.get(ROOT_COLON).is_none());
 }

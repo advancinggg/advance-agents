@@ -35,7 +35,7 @@ fn cost_event(run_id: &str, cost_usd: f64) -> Event {
     serde_json::from_value(serde_json::json!({
         "id": "evt-seed",
         "timestamp": "2026-06-06T00:00:00Z",
-        "agent_id": "default-agent",
+        "agent_id": "root",
         "task_id": null,
         "run_id": run_id,
         "execution_id": null,
@@ -77,8 +77,8 @@ fn prod_budget_cost_deny_before_provider() {
         .with_cost_tracker(cost_tracker.clone() as Arc<dyn CostTrackerQuery>);
     let rid = rm
         .ensure_run(
-            "default-agent",
-            "default-agent",
+            "root",
+            "root",
             run_config_from(&RunBudgetConfig {
                 default_cost_limit_usd: Some(5.0),
                 ..RunBudgetConfig::default()
@@ -102,8 +102,8 @@ async fn prod_budget_rounds_deny_after_complete_round() {
     let rm = RunManager::new(Arc::new(NoopBus));
     let rid = rm
         .ensure_run(
-            "default-agent",
-            "default-agent",
+            "root",
+            "root",
             run_config_from(&RunBudgetConfig {
                 default_rounds_limit: Some(1),
                 ..RunBudgetConfig::default()
@@ -142,14 +142,14 @@ async fn session_producer_publishes_cell_and_sets_run_id() {
     let bootstrap = RunManagerBootstrap {
         run_manager: rm.clone(),
         run_config: RunConfig::default(),
-        session_agent: "default-agent".to_string(),
+        session_agent: "root".to_string(),
         cell: cell.clone(),
     };
 
     // The driver passes the colon messaging id; the bootstrap IGNORES it and keys
     // on the bare cap id.
     let returned = bootstrap
-        .ensure_run("agent:default")
+        .ensure_run("agent:root")
         .await
         .expect("ensure_run");
 
@@ -157,13 +157,13 @@ async fn session_producer_publishes_cell_and_sets_run_id() {
     assert_eq!(published.as_ref(), returned, "cell holds the minted run id");
 
     // The producer step (as `init` does): set ComponentCtx.run_id from the cell.
-    let mut ctx = ComponentCtx::new("default-agent".into(), "trace".into(), Vec::new());
+    let mut ctx = ComponentCtx::new("root".into(), "trace".into(), Vec::new());
     ctx.run_id = cell.get().map(|r| r.as_ref().to_string());
     assert_eq!(ctx.run_id.as_deref(), Some(returned.as_str()));
 
     // A second ensure_run on the SAME bare task id is idempotent (same run).
     let again = bootstrap
-        .ensure_run("agent:default")
+        .ensure_run("agent:root")
         .await
         .expect("idempotent");
     assert_eq!(again, returned, "ensure_run idempotent on the bare cap id");

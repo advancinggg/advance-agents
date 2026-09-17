@@ -80,7 +80,7 @@ fn inbound(agent: &str, id: &str, payload: &[u8]) -> Message {
 
 fn one_instance() -> (ComponentConfig, WasmInstance) {
     let cfg = ComponentConfig {
-        id: "default-agent".to_string(),
+        id: "root".to_string(),
         config_data: None,
         trigger_context: None,
     };

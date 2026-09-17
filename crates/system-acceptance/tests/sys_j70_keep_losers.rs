@@ -38,8 +38,8 @@ use cap_llm::host_fn::AgentLlmGenerateHandler;
 use h_loopback::{boot_with_retry_overrides, GatewayDeps, ScriptedResponse};
 use wasmtime::component::Val;
 
-const ROOT_BARE: &str = "default-agent";
-const ROOT_COLON: &str = "agent:default";
+const ROOT_BARE: &str = "root";
+const ROOT_COLON: &str = "agent:root";
 const WINNER: &str = "agent:child-win";
 const LOSER_TASK: &str = "agent:child-task";
 const LOSER_GLOBAL: &str = "agent:child-global";

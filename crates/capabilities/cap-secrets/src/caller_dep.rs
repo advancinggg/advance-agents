@@ -15,7 +15,7 @@
 //! [`crate::host_fn::register_agent_secrets`] (operator-opt-in; an absent map
 //! reproduces the pre-Wave-18 default-permissive behaviour byte-identically).
 //! The policy keys on the already-populated `HostCallContext.agent_id` (the
-//! production-stamped bare cap id, e.g. `default-agent`) — NOT per-call
+//! production-stamped bare cap id, e.g. `root`) — NOT per-call
 //! `CapParams`. A future MODULE-001 slice that threads each caller's
 //! *self-declared* `CapParams` list through `CapabilityInjector::inject` would
 //! let an agent narrow its OWN allowlist at call time; the operator-config

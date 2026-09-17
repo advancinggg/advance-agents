@@ -170,6 +170,7 @@ impl AgentTreeReader for ParentTree {
 impl AgentTreeSnapshot for ParentTree {
     fn snapshot(&self) -> AgentTreeSnapshotData {
         AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes: self.nodes.clone(),
             parent_of: HashMap::new(),
             children_of: HashMap::new(),

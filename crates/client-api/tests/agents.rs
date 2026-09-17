@@ -69,10 +69,11 @@ impl MemoryAgentAdmin {
     fn new() -> Arc<Self> {
         let mut agents = BTreeMap::new();
         agents.insert(
-            "default-agent".to_string(),
+            "root".to_string(),
             AgentRecord {
                 summary: ClientAgentSummary {
-                    agent_id: "default-agent".into(),
+                    agent_id: "root".into(),
+                    id: "00000000-0000-4000-8000-000000000001".into(),
                     kind: "root".into(),
                     parent: None,
                     status: "active".into(),
@@ -91,8 +92,9 @@ impl MemoryAgentAdmin {
             AgentRecord {
                 summary: ClientAgentSummary {
                     agent_id: "research".into(),
+                    id: "00000000-0000-4000-8000-000000000002".into(),
                     kind: "child".into(),
-                    parent: Some("default-agent".into()),
+                    parent: Some("root".into()),
                     status: "active".into(),
                     workspace_path: "research".into(),
                     template_ref: Some("explorer".into()),
@@ -191,13 +193,18 @@ impl AgentAdminProvider for MemoryAgentAdmin {
         self.calls.create.fetch_add(1, Ordering::SeqCst);
         *self.last_create.lock().unwrap() = Some(request.clone());
         let mut agents = self.agents.lock().unwrap();
-        if agents.contains_key(&request.agent_id) {
+        // Handle: requested, else derived from the display name (the production rule).
+        let handle = request.agent_id.clone().unwrap_or_else(|| {
+            request
+                .display_name
+                .as_deref()
+                .and_then(advance_shared_types::agent_tree::derive_agent_id)
+                .unwrap_or_else(|| "agent".to_string())
+        });
+        if agents.contains_key(&handle) {
             return Err(ProviderError::AlreadyExists("agent".into()));
         }
-        let parent = request
-            .parent
-            .clone()
-            .unwrap_or_else(|| "default-agent".to_string());
+        let parent = request.parent.clone().unwrap_or_else(|| "root".to_string());
         if !agents.contains_key(&parent) {
             return Err(ProviderError::NotFound("parent".into()));
         }
@@ -211,14 +218,15 @@ impl AgentAdminProvider for MemoryAgentAdmin {
         }
         let rec = AgentRecord {
             summary: ClientAgentSummary {
-                agent_id: request.agent_id.clone(),
+                agent_id: handle.clone(),
+                id: format!("00000000-0000-4000-8000-{:012}", agents.len() + 1),
                 kind: "child".into(),
                 parent: Some(parent.clone()),
                 status: "active".into(),
                 workspace_path: request
                     .workspace_path
                     .clone()
-                    .unwrap_or_else(|| request.agent_id.clone()),
+                    .unwrap_or_else(|| handle.clone()),
                 template_ref: Some(request.template_ref.clone()),
                 display_name: request.display_name.clone(),
             },
@@ -228,9 +236,9 @@ impl AgentAdminProvider for MemoryAgentAdmin {
             llm: request.llm.clone().filter(|l| !l.is_empty()),
         };
         let detail = Self::detail(&rec);
-        agents.insert(request.agent_id.clone(), rec);
+        agents.insert(handle.clone(), rec);
         if let Some(p) = agents.get_mut(&parent) {
-            p.children.push(request.agent_id.clone());
+            p.children.push(handle);
         }
         Ok(detail)
     }
@@ -358,7 +366,7 @@ fn operator(api: &ClientApi) {
 fn create_body() -> Value {
     json!({
         "agent_id": "writer",
-        "parent": "default-agent",
+        "parent": "root",
         "workspace_path": "teams/writer",
         "template_ref": "explorer",
         "capabilities": ["fs", "llm"],
@@ -438,16 +446,13 @@ fn ag02_list_agents_projects_summaries() {
     let agents: Vec<ClientAgentSummary> =
         serde_json::from_value(env.data.clone().unwrap()["agents"].clone()).unwrap();
     assert_eq!(agents.len(), 2);
-    let root = agents
-        .iter()
-        .find(|a| a.agent_id == "default-agent")
-        .unwrap();
+    let root = agents.iter().find(|a| a.agent_id == "root").unwrap();
     assert_eq!(root.kind, "root");
     assert_eq!(root.workspace_path, ".");
     assert_eq!(root.display_name.as_deref(), Some("Home"));
     assert!(root.parent.is_none());
     let child = agents.iter().find(|a| a.agent_id == "research").unwrap();
-    assert_eq!(child.parent.as_deref(), Some("default-agent"));
+    assert_eq!(child.parent.as_deref(), Some("root"));
     assert_eq!(child.template_ref.as_deref(), Some("explorer"));
     // Optional fields are OMITTED (never null) on the wire.
     let raw = &env.data.as_ref().unwrap()["agents"];
@@ -472,9 +477,9 @@ fn ag03_get_agent_detail_and_not_found() {
     let provider = MemoryAgentAdmin::new();
     let (api, _) = api_with(provider.clone());
     operator(&api);
-    let env = api.handle(get("/client/agents/default-agent"));
+    let env = api.handle(get("/client/agents/root"));
     let d = detail(&env);
-    assert_eq!(d.agent.agent_id, "default-agent");
+    assert_eq!(d.agent.agent_id, "root");
     assert_eq!(d.children, vec!["research".to_string()]);
     assert!(d.driver_present);
     assert_eq!(
@@ -507,7 +512,7 @@ fn ag04_create_agent_full_pipeline() {
     let d = detail(&env);
     assert_eq!(d.agent.agent_id, "writer");
     assert_eq!(d.agent.kind, "child");
-    assert_eq!(d.agent.parent.as_deref(), Some("default-agent"));
+    assert_eq!(d.agent.parent.as_deref(), Some("root"));
     assert_eq!(d.agent.workspace_path, "teams/writer");
     assert_eq!(d.agent.display_name.as_deref(), Some("Writer"));
     assert!(
@@ -906,11 +911,7 @@ fn ag10_delete_agent_pipeline() {
     let (api, _) = api_with(provider.clone());
     operator(&api);
 
-    let env = api.handle(post(
-        "/client/agents/default-agent:delete",
-        Value::Null,
-        "k-d-root",
-    ));
+    let env = api.handle(post("/client/agents/root:delete", Value::Null, "k-d-root"));
     assert_eq!(
         code(&env),
         Some(ClientErrorCode::InvalidRequest),
@@ -1179,6 +1180,7 @@ fn ag18_dto_wire_shape() {
     assert!(u.display_name.is_none() && u.config_yaml.is_none() && u.capabilities.is_none());
     let summary = ClientAgentSummary {
         agent_id: "a".into(),
+        id: "00000000-0000-4000-8000-00000000000a".into(),
         kind: "child".into(),
         parent: None,
         status: "active".into(),
@@ -1211,7 +1213,7 @@ fn ag19_capabilities_read_and_update() {
     operator(&api);
     let d = detail(&api.handle(get("/client/agents/research")));
     assert_eq!(d.capabilities, vec!["fs".to_string()]);
-    let root = detail(&api.handle(get("/client/agents/default-agent")));
+    let root = detail(&api.handle(get("/client/agents/root")));
     assert_eq!(root.capabilities, vec!["fs".to_string(), "llm".to_string()]);
     assert_eq!(
         root.config.declared_children[0].capabilities,
@@ -1267,7 +1269,7 @@ fn ag19_capabilities_read_and_update() {
 
     // Provider-side outcomes: root refuses, a superset of the parent is refused.
     let env = api.handle(post(
-        "/client/agents/default-agent:update",
+        "/client/agents/root:update",
         json!({ "capabilities": ["fs"] }),
         "k-caps-root",
     ));

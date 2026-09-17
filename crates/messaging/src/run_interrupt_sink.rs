@@ -39,8 +39,8 @@ use crate::mailbox::MailboxStore;
 /// bypassed — see `deliver_run_interrupted`). The mailbox key MUST be the SAME
 /// id form the agent-loop `StoreMailboxReader::recv` polls on. In production
 /// `RunManager::ensure_run` may store a **bare** controller id (e.g.
-/// `default-agent`) while the agent loop drains the **colon-prefixed**
-/// `agent:default` — if those differ, a `RunInterrupted` enqueued under the bare
+/// `root`) while the agent loop drains the **colon-prefixed**
+/// `agent:root` — if those differ, a `RunInterrupted` enqueued under the bare
 /// id lands in an ORPHAN mailbox that no loop drains (handle-message never
 /// runs). The build-lane witness uses a single matching id so the mechanism is
 /// proven; the harvest that wires this into `advance start` MUST ensure the run's

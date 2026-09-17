@@ -26,7 +26,7 @@ use advance_runtime::config::RunBudgetConfig;
 use advance_shared_types::traits::{EventBusEmit, RepetitionGuardCheck, RunBudget};
 use cap_llm::{ChatMessage, ChatParams, ChatRole, LlmError};
 
-const AGENT: &str = "default-agent";
+const AGENT: &str = "root";
 
 fn user_msg() -> Vec<ChatMessage> {
     vec![ChatMessage {

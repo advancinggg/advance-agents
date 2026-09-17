@@ -727,7 +727,7 @@ mod tests {
         let egress = HttpEgress::new(Arc::new(PanicChain));
         let sub = Subscription::new_with_consumer(
             SubscriptionId::new(),
-            "agent:default",
+            "agent:root",
             ChannelConfig {
                 adapter_type: AdapterType::Telegram,
                 params: vec![],
@@ -741,7 +741,7 @@ mod tests {
             reply_address: vec![],
         };
         let err = egress
-            .send("agent:default", &sub, target, &big)
+            .send("agent:root", &sub, target, &big)
             .await
             .unwrap_err();
         assert!(matches!(err, ChannelError::InvalidConfig(_)));

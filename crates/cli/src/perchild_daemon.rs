@@ -42,7 +42,7 @@ use crate::agent_loop::{
 };
 
 /// Bare→colon key resolver (the crash-cascade pattern): the root is the special
-/// pair (`default-agent`→`agent:default`), children are mechanical
+/// pair (`root`→`agent:root`), children are mechanical
 /// (`child`→`agent:child`). The composition root — which alone knows the root's
 /// special mapping — supplies it.
 pub type KeyResolver = Arc<dyn Fn(&str) -> String + Send + Sync>;
@@ -288,7 +288,7 @@ impl PerChildLoopManager {
         let colon = (self.key_resolver)(bare_id);
         // Root-collision guard (mirrors `on_child_spawned`'s serve-path guard @below):
         // a child whose bare id mechanically maps onto the ROOT's colon (a guest
-        // `spawn-child(id="default")` → `agent:default`, the root's serve/mailbox key)
+        // `spawn-child(id="default")` → `agent:root`, the root's serve/mailbox key)
         // must NOT have the ROOT's mailbox unfrozen/drained — that would be a
         // confused-deputy message-loss on the most-privileged agent. `unregister_child`
         // / `bridge.unregister` already refuse the seed root, so the mailbox drain is
@@ -569,7 +569,7 @@ impl SpawnObserver for PerChildLoopManager {
         // FIRST-WINS and return `false` when `child_colon` (or its bare form) already
         // belongs to another agent. The reachable case is a child whose bare id
         // MECHANICALLY maps onto the ROOT's SPECIAL colon — a guest
-        // `spawn-child(id="default")` resolves to `agent:default`, the root's OWN
+        // `spawn-child(id="default")` resolves to `agent:root`, the root's OWN
         // serve key (`validate_agent_id` is charset-only, no reserved-name guard).
         // Serving a loop on a colliding key would poll the INCUMBENT's mailbox — a
         // confused-deputy / message-theft hijack of the root. So on ANY rejected

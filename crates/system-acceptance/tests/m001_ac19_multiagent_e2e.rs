@@ -283,6 +283,7 @@ impl AgentTreeReader for ParentTree {
 impl AgentTreeSnapshot for ParentTree {
     fn snapshot(&self) -> AgentTreeSnapshotData {
         AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes: vec![AgentNode {
                 id: AgentId(PARENT_ID_BARE.to_string()),
                 kind: AgentKind::Root,
@@ -406,6 +407,7 @@ async fn build_rig(parent_config: &[u8], bridge: bool, child_loop: bool) -> Rig 
     // REAL runtime spawn_child (the cross-module growth path).
     let spawned = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId(PARENT_ID_BARE.to_string()),
             child_id: AgentId(CHILD_ID_BARE.to_string()),
             child_workspace_path: PathBuf::from("children").join(CHILD_ID_BARE),

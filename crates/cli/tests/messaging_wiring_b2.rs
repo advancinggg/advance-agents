@@ -193,11 +193,11 @@ async fn t_b2_02_handler_drives_suspend_on_park_then_cancel_closes() {
     // An Active run on the SAME RunManager the wired sink points to.
     let run_id = handles
         .run_manager
-        .ensure_run("default-agent", "default-agent", RunConfig::default())
+        .ensure_run("root", "root", RunConfig::default())
         .expect("ensure_run");
 
     let ctx = HostCallContext {
-        agent_id: "default-agent".to_string(), // BARE — the handler prepends `agent:`
+        agent_id: "root".to_string(), // BARE — the handler prepends `agent:`
         trace_id: "tr-b2".to_string(),
         turn_id: None,
         capability: "messaging".to_string(),
@@ -224,7 +224,7 @@ async fn t_b2_02_handler_drives_suspend_on_park_then_cancel_closes() {
     }
     assert!(
         suspended,
-        "the parked await-replies must drive RunManager::suspend_run (run → Suspended) — proves the prod RunManagerSuspendSink is wired AND the bare `default-agent` caller was admitted"
+        "the parked await-replies must drive RunManager::suspend_run (run → Suspended) — proves the prod RunManagerSuspendSink is wired AND the bare `root` caller was admitted"
     );
 
     // While Suspended, cancel. The Suspended branch consults `await_session_ref`
@@ -291,13 +291,23 @@ agents:
         .await
         .expect("wire");
 
+    // Runs are keyed by tree ids (the root's per-boot UUID; the declared child's minted id),
+    // and the cascade walks the SAME shared tree.
+    let child_id = handles
+        .agent_tree
+        .as_ref()
+        .expect("fs/messaging ⇒ shared tree")
+        .node_by_handle("child-a")
+        .expect("declared child materialized")
+        .id
+        .0;
     let root_run = handles
         .run_manager
-        .ensure_run("task-root", "default-agent", RunConfig::default())
+        .ensure_run("task-root", &handles.root_agent_id, RunConfig::default())
         .expect("ensure root run");
     let child_run = handles
         .run_manager
-        .ensure_run("task-child", "child-a", RunConfig::default())
+        .ensure_run("task-child", &child_id, RunConfig::default())
         .expect("ensure child run");
     handles
         .run_manager

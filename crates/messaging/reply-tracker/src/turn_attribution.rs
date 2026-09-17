@@ -2350,7 +2350,7 @@ mod tests {
         let registry = Arc::new(registry);
         let spec = QueuedTurnSpec {
             turn_id: "turn-root-alias".into(),
-            expected_agent: "agent:default".into(),
+            expected_agent: "agent:root".into(),
             parent_agent: "agent:parent".into(),
             session_id: SessionId("session-root-alias".into()),
             slot: 0,
@@ -2362,7 +2362,7 @@ mod tests {
         let reservation = registry.reserve_queued(spec).expect("reserve root turn");
         let facts = MailboxEntryFacts {
             turn_id: "turn-root-alias".into(),
-            expected_agent: "agent:default".into(),
+            expected_agent: "agent:root".into(),
             message_id: "turn-root-alias".into(),
             mailbox_incarnation: [0x61; 16],
             staged_entry_id: [0x62; 16],
@@ -2395,17 +2395,14 @@ mod tests {
 
         let reply_inner: Arc<dyn TurnReplyRoutingPort> = registry.clone();
         let cost_inner: Arc<dyn TurnCostAttributionReadPort> = registry;
-        let bridge = Arc::new(AgentIdBridge::from_pairs([(
-            "agent:default",
-            "default-agent",
-        )]));
+        let bridge = Arc::new(AgentIdBridge::from_pairs([("agent:root", "root")]));
         let (reply, cost) = canonical_turn_identity_facades(reply_inner, cost_inner, bridge);
         assert_eq!(
-            reply.classify_send("turn-root-alias", "default-agent", "agent:parent"),
+            reply.classify_send("turn-root-alias", "root", "agent:parent"),
             SendTurnClassification::ActiveParent
         );
         assert!(matches!(
-            cost.cost_attribution("turn-root-alias", "default-agent"),
+            cost.cost_attribution("turn-root-alias", "root"),
             CostAttributionLookup::Tracked(CostAttributionSnapshot {
                 state: CostTurnState::Active,
                 ..

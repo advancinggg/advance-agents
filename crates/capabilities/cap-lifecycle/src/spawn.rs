@@ -174,7 +174,11 @@ pub trait SpawnerSubsetGate: Send + Sync {
 
 pub struct SpawnChildConfig {
     pub parent_id: AgentId,
+    /// The immutable tree id (production: a UUID minted by the caller; see
+    /// [`crate::identity`]). Persisted into the child's `.agent/config.yaml` `id` key.
     pub child_id: AgentId,
+    /// The addressable handle (`agent:<handle>` mailbox); `None` ⇒ the id is its own handle.
+    pub handle: Option<String>,
     /// Relative to parent's workspace_path. Absolute paths are rejected.
     pub child_workspace_path: PathBuf,
     pub capabilities: Vec<Capability>,
@@ -306,6 +310,16 @@ impl Spawner for DefaultSpawner {
         if self.tree.contains(&cfg.child_id) {
             return Err(SpawnError::AlreadyExists(format!("{:?}", cfg.child_id)));
         }
+        // Handle pre-flight (the tree's `bind_handle` is the race-safe authority): reject a
+        // taken or malformed handle BEFORE any filesystem work. A colliding handle would
+        // otherwise be served on another agent's mailbox key (`agent:<handle>`).
+        if let Some(handle) = cfg.handle.as_deref() {
+            validate_agent_id(handle)
+                .map_err(|e| SpawnError::InvalidConfig(format!("handle {handle:?}: {e}")))?;
+            if self.tree.node_by_handle(handle).is_some() {
+                return Err(SpawnError::AlreadyExists(format!("handle {handle:?}")));
+            }
+        }
         if cfg.capabilities.len() > MAX_CAPABILITIES {
             return Err(SpawnError::InvalidConfig(format!(
                 "capabilities.len() {} > {MAX_CAPABILITIES}",
@@ -394,7 +408,22 @@ impl Spawner for DefaultSpawner {
             template_ref: cfg.template_ref,
             status: AgentStatus::Active,
         };
-        if let Err(insert_err) = self.tree.insert_child(&cfg.parent_id, node) {
+        // Persist the immutable id into the child's own document so the next boot adopts
+        // the SAME id (every store keyed by it stays attached across restarts).
+        if let Err(e) = crate::identity::upsert_config_key(
+            &target_dir,
+            crate::identity::ID_KEY,
+            &cfg.child_id.0,
+        ) {
+            rollback_target_dir(&target_dir, target_pre_existed, self.tree.workspace_root());
+            return Err(SpawnError::WorkspaceIoFailure(format!(
+                "persist agent id: {e}"
+            )));
+        }
+        if let Err(insert_err) =
+            self.tree
+                .insert_child_with_handle(&cfg.parent_id, node, cfg.handle.clone())
+        {
             // best-effort rollback of materialization, conditional on
             // target_pre_existed so a caller's pre-existing directory survives.
             rollback_target_dir(&target_dir, target_pre_existed, self.tree.workspace_root());

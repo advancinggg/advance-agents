@@ -125,7 +125,6 @@ use zeroize::Zeroizing;
 /// real agent identities. Shared by cap-grant's grantee, the cap-fs default
 /// agent-tree root, the cap-skills single-agent provider, and cap-llm's
 /// default agent id so the bootstrap surfaces a single coherent default agent.
-const DEFAULT_AGENT_ID: &str = "default-agent";
 
 /// Build the production supervised cap-grant resolver chain.
 ///
@@ -545,6 +544,10 @@ impl std::error::Error for CliWiringError {
 /// registry) is owned by the `HostFunctionSpec` handlers held inside the
 /// `RuntimeHost`'s `HostRegistry`, so no extra handle fields are needed here.
 pub struct WiringHandles {
+    /// The root agent's immutable id (UUID; the cap-layer / persistence key).
+    pub root_agent_id: String,
+    /// The root agent's mailbox / serve key (`agent:<handle>`).
+    pub root_mailbox_id: String,
     pub cap_grant: CapGrantHandles,
     /// Tee slice T3 (ADR 2026-07-22 D5): the turn-end reap handle over cap-llm's
     /// stream registry. `Some` whenever the LLM gateway was registered. `start.rs`
@@ -938,7 +941,10 @@ pub fn materialize_config_tree_with_resolver(
         }
         for d in children {
             if !d.children.is_empty() {
-                queue.push_back((AgentId(d.alias.clone()), &d.children));
+                let child_id = tree.node_by_handle(&d.alias).map(|n| n.id).ok_or_else(|| {
+                    CliWiringError::ConfigTree(format!("declared agent {} not in tree", d.alias))
+                })?;
+                queue.push_back((child_id, &d.children));
             }
         }
     }
@@ -972,8 +978,7 @@ fn materialize_declared_child(
         tree.workspace_root(),
     )
     .map_err(|e| err(format!("invalid target-path: {e}")))?;
-    let alias = AgentId(decl.alias.clone());
-    if let Some(existing) = tree.get_node(&alias) {
+    if let Some(existing) = tree.node_by_handle(&decl.alias) {
         if existing.workspace_path == expected
             && existing.template_ref.as_deref() == Some(decl.template.as_str())
         {
@@ -997,10 +1002,16 @@ fn materialize_declared_child(
             occupant.id
         )));
     }
+    // The declared alias is the child's HANDLE; the immutable id is whatever the child's own
+    // document already carries (a territory materialized by an earlier lifetime whose `.agent/`
+    // marker is gone), else freshly minted (the spawner persists it).
+    let child_id = cap_lifecycle::identity::read_agent_id(&expected)
+        .unwrap_or_else(cap_lifecycle::identity::new_agent_id);
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: Some(decl.alias.clone()),
             parent_id: parent.id.clone(),
-            child_id: alias,
+            child_id: AgentId(child_id),
             child_workspace_path: decl.target_path.clone(),
             capabilities: declared_capabilities(decl),
             template_ref: Some(decl.template.clone()),
@@ -1030,8 +1041,7 @@ fn adopt_existing_declared(
         return Ok(()); // the applier reports ParentNotFound
     };
     for decl in decls {
-        let alias = AgentId(decl.alias.clone());
-        if tree.contains(&alias) {
+        if tree.node_by_handle(&decl.alias).is_some() {
             continue;
         }
         let Ok(target) = cap_lifecycle::workspace::resolve_under_parent(
@@ -1057,10 +1067,15 @@ fn adopt_existing_declared(
             .map_err(|e| {
                 CliWiringError::ConfigTree(format!("adopt declared agent {}: {e}", decl.alias))
             })?;
-        tree.insert_child(
+        // Adopt under the id the territory persisted (so grants, memory and ledger rows written
+        // in the earlier lifetime stay attached); mint + persist one for a pre-`id` territory.
+        let id = cap_lifecycle::identity::ensure_agent_id(&target).map_err(|e| {
+            CliWiringError::ConfigTree(format!("adopt declared agent {}: {e}", decl.alias))
+        })?;
+        tree.insert_child_with_handle(
             parent_id,
             AgentNode {
-                id: alias,
+                id: AgentId(id),
                 kind: AgentKind::Child,
                 parent: Some(parent_id.clone()),
                 workspace_path: target,
@@ -1068,6 +1083,7 @@ fn adopt_existing_declared(
                 template_ref: Some(decl.template.clone()),
                 status: AgentStatus::Active,
             },
+            Some(decl.alias.clone()),
         )
         .map_err(|e| {
             CliWiringError::ConfigTree(format!("adopt declared agent {}: {e}", decl.alias))
@@ -1130,6 +1146,12 @@ async fn wire_capabilities_inner(
     // here observe the SAME bytes. cap-grant's `register_cap_grant` still does
     // its OWN read via `compile_from_path`; that residual window is documented
     // in the Slice-AG history and is bounded by workspace 0o700 perms.
+    // Root identity (id/handle) — resolved and persisted BEFORE the config snapshot so the
+    // bytes read below already carry the `id` / `handle` keys this boot runs under.
+    let root = crate::agent_config::resolve_root_identity(workspace)
+        .map_err(CliWiringError::ConfigTree)?;
+    let root_uid: String = root.id.clone();
+    let root_colon: String = root.mailbox_id();
     let agent_config = workspace.join(".agent/config.yaml");
     // Read the agent config YAML ONCE via the shared helper (bounded 1 MiB read;
     // `None` on absent/oversize/unreadable → graceful degradation). The snapshot
@@ -1270,7 +1292,7 @@ async fn wire_capabilities_inner(
 
     // Step 2b — cap-fs agent-tree + resolver + schema (before EventBus → the
     // fallible `AgentTreeStore::new`/`insert_root` leak nothing on failure).
-    // A single `default-agent` root lets the resolver resolve the default
+    // A single `root` root lets the resolver resolve the default
     // agent's territory. 011 (Wave-11 Lane B): the cap-lifecycle spawn host-fns
     // now SHARE this tree (the 5-spawn `register_agent_spawn` block below), so fs
     // resolves real spawned-agent territories as the tree grows.
@@ -1279,7 +1301,7 @@ async fn wire_capabilities_inner(
     // `WiringHandles` for the context-assembler's `# Available Delegates`
     // section). `AgentTreeStore` impls `AgentTreeSnapshot` and uses interior
     // mutability (so `insert_root` takes `&self`).
-    // await-leg B-2 (2026-06-22): hoist the single `default-agent`-root
+    // await-leg B-2 (2026-06-22): hoist the single `root`-root
     // `AgentTreeStore` so it is built when EITHER cap-fs OR messaging is declared —
     // the messaging dispatcher (`MailboxDispatcherImpl`) needs an `AgentTreeReader`,
     // and reusing ONE tree keeps the agent hierarchy single-sourced. PRE-EventBus,
@@ -1305,15 +1327,18 @@ async fn wire_capabilities_inner(
                     params: CapParams::empty(),
                 })
                 .collect();
-            tree.insert_root(AgentNode {
-                id: AgentId(DEFAULT_AGENT_ID.to_string()),
-                kind: AgentKind::Root,
-                parent: None,
-                workspace_path: workspace.to_path_buf(),
-                capabilities: root_caps,
-                template_ref: None,
-                status: AgentStatus::Active,
-            })
+            tree.insert_root_with_handle(
+                AgentNode {
+                    id: AgentId(root_uid.clone()),
+                    kind: AgentKind::Root,
+                    parent: None,
+                    workspace_path: workspace.to_path_buf(),
+                    capabilities: root_caps,
+                    template_ref: None,
+                    status: AgentStatus::Active,
+                },
+                Some(root.handle.clone()),
+            )
             .map_err(CliWiringError::AgentTree)?;
             Some(tree)
         } else {
@@ -1332,7 +1357,7 @@ async fn wire_capabilities_inner(
             .map_err(|e| CliWiringError::ConfigTree(format!("{e}")))?;
         materialize_config_tree_with_resolver(
             tree,
-            &AgentId(DEFAULT_AGENT_ID.to_string()),
+            &AgentId(root_uid.clone()),
             &decls,
             template_resolver.clone(),
         )?;
@@ -1446,7 +1471,7 @@ async fn wire_capabilities_inner(
             .await
             .map_err(CliWiringError::ConfigTree)?;
             projector
-                .register_agent(DEFAULT_AGENT_ID)
+                .register_agent(root_uid.as_str())
                 .await
                 .map_err(CliWiringError::ConfigTree)?;
             Some(projector)
@@ -1497,7 +1522,7 @@ async fn wire_capabilities_inner(
         builder.sqlite_index_handle(),
         event_bus_dyn.clone(),
         agent_config_arg,
-        DEFAULT_AGENT_ID.to_string(),
+        root_uid.clone(),
         Some(Duration::from_secs(60)), // sweeper tick
     ) {
         Ok(h) => h,
@@ -1556,7 +1581,7 @@ async fn wire_capabilities_inner(
                 workspace,
                 event_bus_dyn.clone(),
                 notify_transport,
-                crate::commands::start::DEFAULT_MSG_AGENT_ID,
+                root_colon.as_str(),
                 notify,
             ) {
                 Ok(driver) => driver,
@@ -1602,13 +1627,16 @@ async fn wire_capabilities_inner(
     // Stage the one reply registry and one channel runtime at the composition
     // root. The channel runtime must exist before joint activation so C215's
     // typed renderer and legacy channel replies share its exact HttpEgress.
-    let reply_registry = Arc::new(ReplyRegistry::new());
+    let reply_registry = Arc::new(match agent_tree.as_ref() {
+        Some(tree) => ReplyRegistry::new().with_tree(tree.clone()),
+        None => ReplyRegistry::new(),
+    });
     let channel_runtime_result = match channel_security_override {
         #[cfg(feature = "test-support")]
         Some(overrides) => {
             crate::channels_boot::build_channel_runtime_with_security_override_for_test(
                 runtime_config.as_ref(),
-                crate::commands::start::DEFAULT_MSG_AGENT_ID,
+                root_colon.as_str(),
                 event_bus_dyn.clone(),
                 builder.config_watcher(),
                 overrides,
@@ -1618,7 +1646,7 @@ async fn wire_capabilities_inner(
         Some(_) => unreachable!("channel security override is test-support only"),
         None => crate::channels_boot::build_channel_runtime_with_config(
             runtime_config.as_ref(),
-            crate::commands::start::DEFAULT_MSG_AGENT_ID,
+            root_colon.as_str(),
             event_bus_dyn.clone(),
             builder.config_watcher(),
         ),
@@ -1643,11 +1671,11 @@ async fn wire_capabilities_inner(
             .clone()
             .expect("declares_messaging ⇒ agent_tree built (declares_fs || declares_messaging)");
         let bridge = Arc::new(AgentIdBridge::from_pairs([(
-            crate::commands::start::DEFAULT_MSG_AGENT_ID.to_string(),
-            DEFAULT_AGENT_ID.to_string(),
+            root_colon.clone(),
+            root_uid.clone(),
         )]));
         let routing = Arc::new(DynamicRouting::new(bare_tree));
-        routing.seed_root(crate::commands::start::DEFAULT_MSG_AGENT_ID);
+        routing.seed_root(root_colon.as_str());
         (Some(bridge), Some(routing))
     } else {
         (None, None)
@@ -1825,8 +1853,12 @@ async fn wire_capabilities_inner(
     // (built later, in the agents-family block) can be installed on it.
     let mut pack_executor: Option<Arc<crate::pack_production::SchedulerWorkflowExecutor>> = None;
     if let Some(component_registry) = component_registry.as_ref() {
-        let subset_gate: Arc<dyn SubmitSubsetGate> =
-            Arc::new(CapGrantSubmitSubsetGate::new(Arc::clone(&cap_grant.store)));
+        let subset_gate: Arc<dyn SubmitSubsetGate> = Arc::new(match agent_tree.as_ref() {
+            Some(tree) => {
+                CapGrantSubmitSubsetGate::new(Arc::clone(&cap_grant.store)).with_tree(tree.clone())
+            }
+            None => CapGrantSubmitSubsetGate::new(Arc::clone(&cap_grant.store)),
+        });
         let api = Arc::new(
             match contract218_runtime.as_ref() {
                 Some(runtime) => InMemoryComponentSubmitApi::new().with_observation_provider(
@@ -1875,27 +1907,18 @@ async fn wire_capabilities_inner(
             perchild_routing.as_ref(),
             perchild_bridge.as_ref(),
         ) {
-            let key_resolver: KeyResolver = Arc::new(|bare: &str| {
-                if bare == DEFAULT_AGENT_ID {
-                    crate::commands::start::DEFAULT_MSG_AGENT_ID.to_string()
-                } else {
-                    format!("agent:{bare}")
-                }
-            });
+            let key_resolver: KeyResolver = {
+                let keys_tree = (**tree).clone();
+                Arc::new(move |bare: &str| crate::agent_config::mailbox_key_for(&keys_tree, bare))
+            };
             // W24 seam (f): one shared crash-cascade sink built from the tree +
             // mailbox store + the SAME bare→colon resolver. It resolves the crashing
             // agent's parent DYNAMICALLY, so one instance serves root + all children.
-            let crash_sink = crate::crash_cascade::build_crash_cascade_sink(
-                (**tree).clone(),
-                store.clone(),
-                |bare: &str| {
-                    if bare == DEFAULT_AGENT_ID {
-                        crate::commands::start::DEFAULT_MSG_AGENT_ID.to_string()
-                    } else {
-                        format!("agent:{bare}")
-                    }
-                },
-            );
+            let crash_sink =
+                crate::crash_cascade::build_crash_cascade_sink((**tree).clone(), store.clone(), {
+                    let keys_tree = (**tree).clone();
+                    move |bare: &str| crate::agent_config::mailbox_key_for(&keys_tree, bare)
+                });
             perchild_crash_sink = Some(crash_sink.clone());
             let mgr = Arc::new(
                 PerChildLoopManager::new(
@@ -1944,9 +1967,9 @@ async fn wire_capabilities_inner(
             let executor = Arc::new(crate::pack_production::SchedulerWorkflowExecutor::new(
                 Arc::clone(&spawner),
                 Arc::clone(tree),
-                AgentId(DEFAULT_AGENT_ID.to_string()),
+                AgentId(root_uid.clone()),
                 Arc::clone(submit),
-                DEFAULT_AGENT_ID,
+                root_uid.as_str(),
                 pack_wiring.registry.clone() as Arc<dyn advance_pack_manager::PackRegistry>,
                 pack_wiring.secret_store.clone() as Arc<dyn advance_pack_manager::SecretStore>,
                 pack_wiring.mcp_entries.clone() as Arc<dyn crate::pack_bridges::McpEntrySink>,
@@ -2040,7 +2063,7 @@ async fn wire_capabilities_inner(
     // Wave-18 Lane-3 (MODULE-012-AC-15): `register_secrets_capability` selects the
     // GATED `secret-exists` handler over a `DeclaredDependencyPolicy` when the
     // operator declares `secrets.dependencies` (keyed on the bare cap
-    // `ctx.agent_id`, e.g. `default-agent`), else the permissive handler
+    // `ctx.agent_id`, e.g. `root`), else the permissive handler
     // (byte-identical to pre-Wave-18 — the gate is operator-opt-in).
     if declares_secrets {
         let store = secret_store
@@ -2116,7 +2139,7 @@ async fn wire_capabilities_inner(
         // This is the memory root, NOT the skills `agent_root` (`<ws>/.agent`).
         let candidate_dir = workspace.join(".agent").join("memory");
         let provider = Arc::new(
-            SingleAgentSkillStoreProvider::new(DEFAULT_AGENT_ID, skills_agent_root.clone())
+            SingleAgentSkillStoreProvider::new(root_uid.as_str(), skills_agent_root.clone())
                 .with_candidate_dir(candidate_dir),
         );
         // Wave-10 Lane C (076/077): when the shared git commit queue exists, wire
@@ -2128,7 +2151,7 @@ async fn wire_capabilities_inner(
         match git_queue_handle.clone() {
             Some(queue) => {
                 let shared = provider
-                    .get(DEFAULT_AGENT_ID)
+                    .get(root_uid.as_str())
                     .await
                     .expect("single-agent provider resolves its own id");
                 let queue_trait: Arc<dyn GitCommitQueue> = queue;
@@ -2138,7 +2161,7 @@ async fn wire_capabilities_inner(
                 // iteration tracker BEFORE the store mutation — the record half of the
                 // discard→rollback bridge. No driver ⇒ byte-identical to pre-Wave-18.
                 let mut coord = cap_skills::SkillPersistenceCoordinator::with_shared_store(
-                    DEFAULT_AGENT_ID.to_string(),
+                    root_uid.clone(),
                     skills_agent_root.clone(),
                     Arc::clone(&shared),
                     queue_trait,
@@ -2174,7 +2197,7 @@ async fn wire_capabilities_inner(
                         workspace.join(".agent").join("memory"),
                     ));
                 let turn_runtime = Arc::new(cap_skills::SkillTurnRuntime::new(
-                    DEFAULT_AGENT_ID,
+                    root_uid.as_str(),
                     skills_agent_root.clone(),
                     Arc::clone(&shared),
                     turn_persistence_driver,
@@ -2376,7 +2399,7 @@ async fn wire_capabilities_inner(
                 builder.config_watcher(),
                 chain.clone(),
                 event_bus_dyn.clone(),
-                DEFAULT_AGENT_ID.to_string(),
+                root_uid.clone(),
             )
             .with_catalog(cap_llm::ModelProfileCatalog::new()),
         );
@@ -2431,7 +2454,7 @@ async fn wire_capabilities_inner(
             event_bus_dyn.clone(),
             // Repetition guard stays NotWired (multi-step agentic run deferred).
             Arc::new(NotWiredRepetitionGuard),
-            DEFAULT_AGENT_ID.to_string(),
+            root_uid.clone(),
             // Tee T2 (step 2 of 2): announcer records Begin keys; inner hub is
             // the ClientApi slot (typed LlmDeltaHub, not the wrapper).
             Arc::new(crate::reply::StreamKeyAnnouncer::new(
@@ -2711,14 +2734,12 @@ async fn wire_capabilities_inner(
     let agent_admin: Option<Arc<crate::client_api_agents::AgentAdminAdapter>> =
         match (agent_tree.as_ref(), agent_spawner.as_ref()) {
             (Some(tree), Some(spawner)) => {
-                let resolver: crate::client_api_agents::MailboxKeyResolver =
-                    Arc::new(|bare: &str| {
-                        if bare == DEFAULT_AGENT_ID {
-                            crate::commands::start::DEFAULT_MSG_AGENT_ID.to_string()
-                        } else {
-                            format!("agent:{bare}")
-                        }
-                    });
+                let resolver: crate::client_api_agents::MailboxKeyResolver = {
+                    let keys_tree = (**tree).clone();
+                    Arc::new(move |bare: &str| {
+                        crate::agent_config::mailbox_key_for(&keys_tree, bare)
+                    })
+                };
                 let loop_cascade: Option<Arc<dyn cap_lifecycle::terminate::LoopCascade>> =
                     perchild_manager.as_ref().map(|mgr| {
                         Arc::new(crate::perchild_daemon::PerChildLoopCascade::new(
@@ -2748,7 +2769,7 @@ async fn wire_capabilities_inner(
                     // Pack lane P1: the same chained resolver, so
                     // `/client/agents/templates` lists installed pack templates too.
                     template_resolver.clone(),
-                    AgentId(DEFAULT_AGENT_ID.to_string()),
+                    AgentId(root_uid.clone()),
                     // Lane agent-llm-policy: `llm.provider` ids validate against the LIVE config
                     // (the builder is consumed by `build()` above; the host owns the watcher).
                     host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
@@ -2834,6 +2855,7 @@ async fn wire_capabilities_inner(
                 crate::client_api_secrets::WiredSecretsAdmin::new(workspace.to_path_buf()),
             );
             let tree_for_api = agent_tree_snapshot.clone();
+            let root_colon_for_api = root_colon.clone();
             match advance_client_api::ClientApiServer::bind_local_factory(0, move |address| {
                 let mut config = advance_client_api::ClientApiConfig::default();
                 config.allowed_origins = vec![format!("http://{address}")];
@@ -2848,6 +2870,7 @@ async fn wire_capabilities_inner(
                     mailbox: Some(ingress_for_api.clone()),
                     ingress: ingress_port.clone(),
                     replies: Some(replies_for_api.clone()),
+                    serve_agent: root_colon_for_api.clone(),
                     tools: None,
                     llm_delta_hub: llm_delta_hub_opt.clone(),
                     agents: agent_admin_for_api
@@ -2920,6 +2943,8 @@ async fn wire_capabilities_inner(
     Ok((
         host,
         WiringHandles {
+            root_agent_id: root_uid.clone(),
+            root_mailbox_id: root_colon.clone(),
             cap_grant,
             grant_approval_intake,
             perchild_manager,
@@ -2995,7 +3020,7 @@ pub(crate) fn load_real_master_key(
 /// returns `None` so [`register_secrets_capability`] selects the permissive
 /// handler (byte-identical to pre-Wave-18 — the gate is operator-opt-in). The
 /// resulting [`DeclaredDependencyPolicy`] keys on the BARE
-/// `HostCallContext.agent_id` (e.g. the production-stamped `default-agent`);
+/// `HostCallContext.agent_id` (e.g. the production-stamped `root`);
 /// each agent's `Vec<String>` allowlist becomes a `HashSet` for O(1) membership.
 ///
 /// `pub` so the cli integration test (`tests/secrets_dep_check.rs::T15h`) can

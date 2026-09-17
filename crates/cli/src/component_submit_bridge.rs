@@ -221,20 +221,38 @@ impl ComponentSubmitGate for SchedulerSubmitBridge {
 /// Real submitter-grant subset adapter required by M014 admission rule 5.
 pub struct CapGrantSubmitSubsetGate {
     grants: Arc<GrantStore>,
+    /// Served-key (`agent:<handle>`) → tree-id resolution; `None` ⇒ mechanical prefix strip.
+    tree: Option<Arc<dyn advance_shared_types::agent_tree::AgentTreeReader>>,
 }
 
 impl CapGrantSubmitSubsetGate {
     pub fn new(grants: Arc<GrantStore>) -> Self {
-        Self { grants }
+        Self { grants, tree: None }
+    }
+
+    pub fn with_tree(
+        mut self,
+        tree: Arc<dyn advance_shared_types::agent_tree::AgentTreeReader>,
+    ) -> Self {
+        self.tree = Some(tree);
+        self
     }
 }
 
 impl SubmitSubsetGate for CapGrantSubmitSubsetGate {
     fn check(&self, submitter: &str, requested: &[Capability]) -> Result<(), SchedulerSpawnError> {
-        let bare = submitter.strip_prefix("agent:").unwrap_or(submitter);
+        // Grants are keyed by the tree id; a colon submitter (`agent:<handle>`) resolves
+        // through the tree (mechanical strip without one).
+        let bare = match self.tree.as_ref() {
+            Some(tree) => crate::agent_config::tree_id_for(tree.as_ref(), submitter),
+            None => submitter
+                .strip_prefix("agent:")
+                .unwrap_or(submitter)
+                .to_string(),
+        };
         let mut grants = self.grants.list_by_grantee(submitter);
         if bare != submitter {
-            grants.extend(self.grants.list_by_grantee(bare));
+            grants.extend(self.grants.list_by_grantee(&bare));
         }
         let parent: Vec<Capability> = grants
             .iter()

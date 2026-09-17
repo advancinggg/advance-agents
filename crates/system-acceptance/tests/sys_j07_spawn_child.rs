@@ -82,6 +82,7 @@ async fn sys_ac_019_spawn_child_materializes_workspace_and_tree_node() {
 
     let child = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".into()),
             child_id: AgentId("gc1".into()),
             child_workspace_path: PathBuf::from("children/gc1"),
@@ -153,6 +154,7 @@ async fn sys_ac_020_021_parent_reads_child_but_write_is_denied() {
 
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".into()),
             child_id: AgentId("gc1".into()),
             child_workspace_path: PathBuf::from("children/gc1"),

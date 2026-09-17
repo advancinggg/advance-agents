@@ -17,7 +17,7 @@ use git2::Oid;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
-const AGENT: &str = "default-agent";
+const AGENT: &str = "root";
 
 #[derive(Default)]
 struct CollectingEventBus {

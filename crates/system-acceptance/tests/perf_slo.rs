@@ -281,6 +281,7 @@ async fn perf_196_spawn_child_under_500ms() {
             // Unique child id per sample (spawn_child registers the child in the tree).
             let child_id = format!("gc{i}");
             let cfg = SpawnChildConfig {
+                handle: None,
                 parent_id: AgentId("root".into()),
                 child_id: AgentId(child_id.clone()),
                 child_workspace_path: PathBuf::from(format!("agents/{child_id}")),
@@ -402,6 +403,7 @@ async fn perf_199_apply_template_under_500ms() {
         async move {
             let child_id = format!("tmplchild{i}");
             let cfg = SpawnChildConfig {
+                handle: None,
                 parent_id: AgentId("root".into()),
                 child_id: AgentId(child_id.clone()),
                 child_workspace_path: PathBuf::from(format!("agents/{child_id}")),

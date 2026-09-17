@@ -42,7 +42,7 @@ fn late_install_absent_then_real_inventory() {
         }],
         vec![],
     ));
-    install_tools_if_real(&api, Some(inventory), None);
+    install_tools_if_real(&api, Some(inventory), "agent:root", None);
 
     let ok = api.handle(ClientRequest::get("/client/tools").with_session("tok"));
     assert!(ok.error.is_none(), "{:?}", ok.error);
@@ -50,7 +50,7 @@ fn late_install_absent_then_real_inventory() {
     assert!(data.wasm.iter().any(|t| t.name == "echo_tool"));
     assert!(data.skills.is_empty());
 
-    install_tools_if_real(&api, None, None);
+    install_tools_if_real(&api, None, "agent:root", None);
 }
 
 #[test]
@@ -87,7 +87,12 @@ fn late_install_reads_bounded_skill_dir() {
         }],
         vec![],
     ));
-    install_tools_if_real(&api, Some(inventory), Some(tmp.path().to_path_buf()));
+    install_tools_if_real(
+        &api,
+        Some(inventory),
+        "agent:root",
+        Some(tmp.path().to_path_buf()),
+    );
 
     let ok = api.handle(ClientRequest::get("/client/tools").with_session("tok"));
     assert!(ok.error.is_none(), "{:?}", ok.error);
@@ -133,7 +138,12 @@ fn late_install_skips_yaml_alias_meta() {
         }],
         vec![],
     ));
-    install_tools_if_real(&api, Some(inventory), Some(tmp.path().to_path_buf()));
+    install_tools_if_real(
+        &api,
+        Some(inventory),
+        "agent:root",
+        Some(tmp.path().to_path_buf()),
+    );
 
     let ok = api.handle(ClientRequest::get("/client/tools").with_session("tok"));
     assert!(ok.error.is_none(), "{:?}", ok.error);
@@ -179,7 +189,12 @@ fn late_install_skips_symlinked_skills_root() {
         }],
         vec![],
     ));
-    install_tools_if_real(&api, Some(inventory), Some(tmp.path().to_path_buf()));
+    install_tools_if_real(
+        &api,
+        Some(inventory),
+        "agent:root",
+        Some(tmp.path().to_path_buf()),
+    );
 
     let ok = api.handle(ClientRequest::get("/client/tools").with_session("tok"));
     assert!(ok.error.is_none(), "{:?}", ok.error);

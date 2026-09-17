@@ -33,7 +33,7 @@ use tokio::sync::Mutex;
 
 /// The cli skills coordinator binds to `DEFAULT_AGENT_ID`; the bridge ignores
 /// `agent_id`, so the witnesses drive the production-identical single agent.
-const AGENT: &str = "default-agent";
+const AGENT: &str = "root";
 
 // ── git + event-bus harness ──────────────────────────────────────────────
 

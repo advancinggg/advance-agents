@@ -129,6 +129,7 @@ async fn sys_ac_157_spawn_under_frozen_parent_rejected() {
     // (spawn.rs:288-296).
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: parent.clone(),
             child_id: AgentId("gc_under_frozen".to_string()),
             child_workspace_path: PathBuf::from("children/gc_under_frozen"),

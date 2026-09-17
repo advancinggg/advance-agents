@@ -253,6 +253,7 @@ fn racing_tree(edges: &[(&str, &str)]) -> Arc<RacingTree> {
 
     Arc::new(RacingTree {
         data: AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes,
             parent_of,
             children_of,

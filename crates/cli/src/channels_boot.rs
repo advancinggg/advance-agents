@@ -776,14 +776,14 @@ post-processor:
     fn no_addr_or_no_channels_returns_none() {
         assert!(build_channel_runtime(
             &cfg_with_channels(None, vec![tg_entry()]),
-            "agent:default",
+            "agent:root",
             noop_bus()
         )
         .unwrap()
         .is_none());
         assert!(build_channel_runtime(
             &cfg_with_channels(Some("127.0.0.1:0"), vec![]),
-            "agent:default",
+            "agent:root",
             noop_bus()
         )
         .unwrap()
@@ -793,7 +793,7 @@ post-processor:
     #[test]
     fn builds_runtime_with_host_pump_sub_route_and_identity() {
         let cfg = cfg_with_channels(Some("127.0.0.1:0"), vec![tg_entry()]);
-        let cr = build_channel_runtime(&cfg, "agent:default", noop_bus())
+        let cr = build_channel_runtime(&cfg, "agent:root", noop_bus())
             .unwrap()
             .unwrap();
         assert_eq!(cr.subs.len(), 1);
@@ -819,13 +819,9 @@ post-processor:
         let err_for = |mutate: &dyn Fn(&mut ChannelEntry)| {
             let mut e = tg_entry();
             mutate(&mut e);
-            build_channel_runtime(
-                &cfg_with_channels(addr, vec![e]),
-                "agent:default",
-                noop_bus(),
-            )
-            .err()
-            .expect("expected boot to reject")
+            build_channel_runtime(&cfg_with_channels(addr, vec![e]), "agent:root", noop_bus())
+                .err()
+                .expect("expected boot to reject")
         };
         assert!(err_for(&|e| e.secret = String::new()).contains("secret"));
         assert!(err_for(&|e| e.secret = "\0".into()).contains("secret")); // NUL secret
@@ -845,7 +841,7 @@ post-processor:
         b.route = "tg2".into();
         let dup_name = build_channel_runtime(
             &cfg_with_channels(addr, vec![a.clone(), b]),
-            "agent:default",
+            "agent:root",
             noop_bus(),
         )
         .err()
@@ -857,7 +853,7 @@ post-processor:
         c.name = "tg-b".into();
         let dup_route = build_channel_runtime(
             &cfg_with_channels(addr, vec![a, c]),
-            "agent:default",
+            "agent:root",
             noop_bus(),
         )
         .err()
@@ -868,7 +864,7 @@ post-processor:
     #[test]
     fn end_to_end_inbound_dispatch_enqueues_then_pump_builds_message() {
         let cfg = cfg_with_channels(Some("127.0.0.1:0"), vec![tg_entry()]);
-        let cr = build_channel_runtime(&cfg, "agent:default", noop_bus())
+        let cr = build_channel_runtime(&cfg, "agent:root", noop_bus())
             .unwrap()
             .unwrap();
         // Simulate a Telegram webhook POST hitting the supervisor route.
@@ -889,7 +885,7 @@ post-processor:
             .poll_host_pump(&cr.subs[0].sub_id)
             .unwrap()
             .unwrap();
-        let msg = build_inbound_message(&cr.identity, raw, "agent:default", 0)
+        let msg = build_inbound_message(&cr.identity, raw, "agent:root", 0)
             .expect("authenticated adapter identity");
         assert_eq!(msg.from, "user:alice"); // resolved sender → unified id
         let origin = msg.origin.unwrap();

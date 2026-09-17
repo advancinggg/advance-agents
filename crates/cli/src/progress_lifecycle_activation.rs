@@ -582,8 +582,8 @@ mod tests {
             None,
             Arc::new(ReplyRegistry::new()),
             Arc::new(AgentIdBridge::from_pairs([(
-                "agent:default".to_string(),
-                "default-agent".to_string(),
+                "agent:root".to_string(),
+                "root".to_string(),
             )])),
             Arc::new(NoopBus),
             1_048_576,

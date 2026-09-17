@@ -320,6 +320,7 @@ pub fn apply_auto_bootstrap(
 
         // Step 6: spawn.
         let cfg = SpawnChildConfig {
+            handle: None,
             parent_id: parent_id.clone(),
             child_id: alias_id.clone(),
             child_workspace_path: entry.target_path.clone(),

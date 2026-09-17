@@ -51,6 +51,7 @@ fn ti01_happy_path_creates_agent_skeleton() {
     let (_tmp, tree, spawner) = setup();
     let id = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("agents/foo"),
@@ -70,6 +71,7 @@ fn ti02_tree_indices_after_spawn() {
     let (_tmp, tree, spawner) = setup();
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("agents/foo"),
@@ -88,6 +90,7 @@ fn ti03_agent_skeleton_files_readable() {
     let (_tmp, tree, spawner) = setup();
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("agents/foo"),
@@ -112,6 +115,7 @@ fn ti04_parent_not_in_tree_rejected() {
     let (_tmp, _tree, spawner) = setup();
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("missing".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("agents/foo"),
@@ -128,6 +132,7 @@ fn ti05_traversal_rejected_no_fs_effect() {
     let (_tmp, _tree, spawner) = setup();
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("../escape"),
@@ -144,6 +149,7 @@ fn ti06_duplicate_child_id_rejected() {
     let (_tmp, _tree, spawner) = setup();
     spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("agents/foo"),
@@ -154,6 +160,7 @@ fn ti06_duplicate_child_id_rejected() {
         .unwrap();
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("agents/foo2"),
@@ -170,6 +177,7 @@ fn ti07_absolute_child_path_rejected() {
     let (_tmp, _tree, spawner) = setup();
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("/etc/passwd"),
@@ -200,6 +208,7 @@ fn ti08_subset_gate_violation_blocks_spawn() {
     let spawner = DefaultSpawner::new(tree.clone(), Arc::new(AlwaysFailGate));
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("agents/foo"),
@@ -266,6 +275,7 @@ fn ti08f_spawn_child_rejects_dot_sub_component() {
     let (_tmp, _tree, spawner) = setup();
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("imposter".to_string()),
             child_workspace_path: PathBuf::from(".sub/imposter"),
@@ -283,6 +293,7 @@ fn ti08h_spawn_child_rejects_dot_agent_component() {
     for (idx, variant) in [".agent/x", ".AGENT/x", ".Agent/x"].iter().enumerate() {
         let err = spawner
             .spawn_child(SpawnChildConfig {
+                handle: None,
                 parent_id: AgentId("root".to_string()),
                 child_id: AgentId(format!("im-{idx}")),
                 child_workspace_path: PathBuf::from(variant),
@@ -304,6 +315,7 @@ fn ti08g_spawn_child_dot_sub_case_insensitive() {
     for (idx, variant) in [".SUB/x", ".Sub/x", ".sUb/x"].iter().enumerate() {
         let err = spawner
             .spawn_child(SpawnChildConfig {
+                handle: None,
                 parent_id: AgentId("root".to_string()),
                 child_id: AgentId(format!("imp-{idx}")),
                 child_workspace_path: PathBuf::from(variant),
@@ -327,6 +339,7 @@ fn ti08e_macos_tempfile_prefix_mismatch_regression() {
     let (_tmp, _tree, spawner) = setup();
     let id = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("foo".to_string()),
             child_workspace_path: PathBuf::from("agents/foo"),

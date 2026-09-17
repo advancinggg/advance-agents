@@ -94,13 +94,13 @@ fn msg01_send_delivers_user_payload() {
         ServeLoopMessagingProvider::for_test(store.clone(), replies),
     ));
     mint(&api, "tok", vec![Scope::SendMessages, Scope::ReadMessages]);
-    let env = send(&api, "agent:default", "hi", "k-send");
+    let env = send(&api, "agent:root", "hi", "k-send");
     assert!(env.is_ok(), "send ok: {:?}", env.error);
     let ack: ClientMessageAck = serde_json::from_value(env.data.clone().unwrap()).unwrap();
-    assert_eq!(ack.to, "agent:default");
+    assert_eq!(ack.to, "agent:root");
     assert_eq!(ack.delivery_state, "delivered");
     let got = store
-        .get("agent:default")
+        .get("agent:root")
         .expect("mailbox")
         .poll()
         .expect("user message");
@@ -115,21 +115,21 @@ fn msg02_status_replied_after_fulfill_without_register() {
         ServeLoopMessagingProvider::for_test(store.clone(), replies.clone()),
     ));
     mint(&api, "tok", vec![Scope::SendMessages, Scope::ReadMessages]);
-    let env = send(&api, "agent:default", "hi", "k-status");
+    let env = send(&api, "agent:root", "hi", "k-status");
     let ack: ClientMessageAck = serde_json::from_value(env.data.clone().unwrap()).unwrap();
     let st0 = get_status(&api, &ack.message_id);
     assert_eq!(st0.reply_state, "none");
-    replies.fulfill("agent:default", Some(b"pong".to_vec()));
+    replies.fulfill("agent:root", Some(b"pong".to_vec()));
     let st1 = get_status(&api, &ack.message_id);
     assert_eq!(st1.reply_state, "replied");
 
-    let mailbox = store.get("agent:default").expect("mailbox from first send");
+    let mailbox = store.get("agent:root").expect("mailbox from first send");
     while mailbox
         .deliver(advance_messaging::Message {
             id: format!("fill-{}", mailbox.depth()),
             kind: advance_messaging::MessageKind::User,
             from: "user:client-api".into(),
-            to: "agent:default".into(),
+            to: "agent:root".into(),
             payload: b"fill".to_vec(),
             context: None,
             timestamp: std::time::SystemTime::now(),
@@ -137,7 +137,7 @@ fn msg02_status_replied_after_fulfill_without_register() {
         })
         .is_ok()
     {}
-    let env_fail = send(&api, "agent:default", "again", "k-full");
+    let env_fail = send(&api, "agent:root", "again", "k-full");
     assert!(!env_fail.is_ok(), "full mailbox must fail send");
     let st2 = get_status(&api, &ack.message_id);
     assert_eq!(
@@ -150,7 +150,7 @@ fn msg02_status_replied_after_fulfill_without_register() {
 fn msg03_bare_api_is_module_unavailable() {
     let api = ClientApi::new(ClientApiConfig::default());
     mint(&api, "tok", vec![Scope::SendMessages]);
-    let env = send(&api, "agent:default", "hi", "k-bare");
+    let env = send(&api, "agent:root", "hi", "k-bare");
     assert!(!env.is_ok());
     let err = env.error.expect("error");
     assert_eq!(err.code.as_str(), "module_unavailable");
@@ -164,11 +164,11 @@ fn msg04_unknown_to_is_not_found() {
         ServeLoopMessagingProvider::for_test(store.clone(), replies),
     ));
     mint(&api, "tok", vec![Scope::SendMessages]);
-    let env = send(&api, "default-agent", "hi", "k-wrong");
+    let env = send(&api, "root", "hi", "k-wrong");
     assert!(!env.is_ok());
     let err = env.error.expect("error");
     assert_eq!(err.code.as_str(), "not_found");
-    assert!(store.get("default-agent").is_none());
+    assert!(store.get("root").is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -224,7 +224,7 @@ async fn msg05_composition_root_installs_provider_and_shares_store() {
         "serve loop recvs the Client API ingress store"
     );
 
-    let env = send(&api, "agent:default", "hi", "k-compose");
+    let env = send(&api, "agent:root", "hi", "k-compose");
     assert!(env.is_ok(), "composition send: {:?}", env.error);
 }
 
@@ -236,11 +236,11 @@ fn msg06_status_stream_key_none_until_recorded() {
         ServeLoopMessagingProvider::for_test(store.clone(), replies.clone()),
     ));
     mint(&api, "tok", vec![Scope::SendMessages, Scope::ReadMessages]);
-    let env = send(&api, "agent:default", "hi", "k-stream-none");
+    let env = send(&api, "agent:root", "hi", "k-stream-none");
     let ack: ClientMessageAck = serde_json::from_value(env.data.clone().unwrap()).unwrap();
     let st0 = get_status(&api, &ack.message_id);
     assert!(st0.stream_key.is_none());
-    replies.record_stream_key("agent:default", "st_abc");
+    replies.record_stream_key("agent:root", "st_abc");
     let st1 = get_status(&api, &ack.message_id);
     assert_eq!(st1.stream_key.as_deref(), Some("st_abc"));
     let json = serde_json::to_value(&st0).unwrap();
@@ -256,21 +256,21 @@ fn msg09_two_sends_isolate_stream_key_per_message_id() {
     ));
     mint(&api, "tok", vec![Scope::SendMessages, Scope::ReadMessages]);
     let ack1: ClientMessageAck = serde_json::from_value(
-        send(&api, "agent:default", "a", "k-iso-1")
+        send(&api, "agent:root", "a", "k-iso-1")
             .data
             .clone()
             .unwrap(),
     )
     .unwrap();
-    replies.record_stream_key("default-agent", "st_one");
+    replies.record_stream_key("root", "st_one");
     let ack2: ClientMessageAck = serde_json::from_value(
-        send(&api, "agent:default", "b", "k-iso-2")
+        send(&api, "agent:root", "b", "k-iso-2")
             .data
             .clone()
             .unwrap(),
     )
     .unwrap();
-    replies.record_stream_key("default-agent", "st_two");
+    replies.record_stream_key("root", "st_two");
     assert_eq!(
         get_status(&api, &ack1.message_id).stream_key.as_deref(),
         Some("st_one")
@@ -321,12 +321,12 @@ async fn msg07_production_wrap_status_sees_begin_on_gateway_sink() {
         .expect("Client API bound");
     let api = server.api();
     mint(&api, "tok", vec![Scope::SendMessages, Scope::ReadMessages]);
-    let env = send(&api, "agent:default", "hi", "k-prodwrap");
+    let env = send(&api, "agent:root", "hi", "k-prodwrap");
     let ack: ClientMessageAck = serde_json::from_value(env.data.clone().unwrap()).unwrap();
 
     let gw = handles.llm_gateway.as_ref().expect("llm: true ⇒ gateway");
     gw.delta_sink().publish(LlmDeltaEvent {
-        agent_id: Arc::from("default-agent"),
+        agent_id: Arc::from("root"),
         stream_key: Arc::from("st_prodwrap"),
         frame: LlmDeltaFrame::Begin {
             run_id: None,
@@ -492,7 +492,7 @@ post-processor:
             StdArc::new(Allow),
             StdArc::new(Bus) as StdArc<dyn EventBusEmit>,
             StdArc::new(Rep),
-            "default-agent".into(),
+            "root".into(),
         )
         .with_delta_sink(sink),
     );
@@ -511,11 +511,11 @@ post-processor:
         ServeLoopMessagingProvider::for_test(store, StdArc::clone(&replies)),
     ));
     mint(&api, "tok", vec![Scope::SendMessages, Scope::ReadMessages]);
-    let env = send(&api, "agent:default", "hi", "k-c235");
+    let env = send(&api, "agent:root", "hi", "k-c235");
     let ack: ClientMessageAck = serde_json::from_value(env.data.clone().unwrap()).unwrap();
 
     let ctx = HostCallContext {
-        agent_id: "default-agent".into(),
+        agent_id: "root".into(),
         trace_id: "t-c235".into(),
         turn_id: None,
         capability: "llm".into(),

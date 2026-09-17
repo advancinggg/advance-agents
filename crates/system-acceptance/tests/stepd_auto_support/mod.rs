@@ -26,9 +26,9 @@
 #![allow(dead_code)]
 
 /// Wave-18 Lane 2 — the production cli skills coordinator binds to
-/// `DEFAULT_AGENT_ID` (`default-agent`); the `build_bridged` chain mirrors that
+/// `DEFAULT_AGENT_ID` (`root`); the `build_bridged` chain mirrors that
 /// so the record-side observer's session gate + the M003 root resolve align.
-const BRIDGE_AGENT: &str = "default-agent";
+const BRIDGE_AGENT: &str = "root";
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -518,9 +518,9 @@ impl AutoWired {
     /// `SkillPersistenceCoordinator` carrying the record-side
     /// `DriverPreActivationObserver`). Mirrors production exactly: ONE disk-backed
     /// `SkillStore` rooted at `<ws>/.agent` (`provider.get()`), a real
-    /// `DefaultGitCommitQueue`, the `default-agent` binding, and a
+    /// `DefaultGitCommitQueue`, the `root` binding, and a
     /// `.agent/config.yaml` so the M003 FullDirectory rollback resolves the
-    /// `default-agent` root to the workspace root. The re-pointed sys_j12
+    /// `root` root to the workspace root. The re-pointed sys_j12
     /// witnesses drive THIS — NOT the test-side `RecordingRealSkillRollback`.
     ///
     /// `WireOpts.skill_rollback` is ignored here (always bridged); `results` and
@@ -537,7 +537,7 @@ impl AutoWired {
         let ws = w.tmp.path().to_path_buf();
         let agent_root = ws.join(".agent");
         std::fs::create_dir_all(&agent_root).expect("mk .agent");
-        // The M003 `DefaultWorkspaceRollback` resolves `default-agent` → the
+        // The M003 `DefaultWorkspaceRollback` resolves `root` → the
         // workspace root only when `<ws>/.agent/config.yaml` declares it (else
         // only the `"root"` sentinel maps to the workdir). `.agent/**` is excluded
         // from the rollback, so this untracked file survives a discard.

@@ -42,6 +42,10 @@ use advance_client_api::agents::{
 };
 use advance_client_api::{AgentAdminProvider, ClientApi, ClientCapParam, ProviderError};
 use advance_home::{TopLevelDisplayName, DISPLAY_NAME_KEY};
+use advance_shared_types::agent_tree::{derive_agent_id, MAX_AGENT_ID_LEN};
+
+/// Bound on the `-n` suffix search when a derived handle collides.
+const MAX_HANDLE_SUFFIX: u32 = 1000;
 use advance_messaging::MailboxStore;
 use advance_run_manager::RunManager;
 use advance_runtime::config::RuntimeConfigProvider;
@@ -113,10 +117,41 @@ impl AgentAdminAdapter {
 
     // ── projections ──────────────────────────────────────────────────────────────────────────
 
-    fn node(&self, agent_id: &str) -> Result<AgentNode, ProviderError> {
+    /// The node addressed by a HANDLE (the family's `{agent_id}` path parameter).
+    fn node(&self, handle: &str) -> Result<AgentNode, ProviderError> {
         self.tree
-            .get_node(&AgentId(agent_id.to_string()))
+            .node_by_handle(handle)
             .ok_or_else(|| ProviderError::NotFound("agent".into()))
+    }
+
+    fn handle_of(&self, id: &AgentId) -> String {
+        self.tree.handle(id).unwrap_or_else(|| id.0.clone())
+    }
+
+    /// The handle a create settles on: the requested one, else derived from the display name
+    /// (`-2`, `-3`… on a collision; `agent-<n>` when nothing derivable survives).
+    fn settle_handle(&self, request: &ClientCreateAgentRequest) -> Result<String, ProviderError> {
+        if let Some(handle) = &request.agent_id {
+            if self.tree.node_by_handle(handle).is_some() {
+                return Err(ProviderError::AlreadyExists("agent id".into()));
+            }
+            return Ok(handle.clone());
+        }
+        let base = request
+            .display_name
+            .as_deref()
+            .and_then(derive_agent_id)
+            .unwrap_or_else(|| "agent".to_string());
+        if self.tree.node_by_handle(&base).is_none() && base != "agent" {
+            return Ok(base);
+        }
+        for n in 2..=MAX_HANDLE_SUFFIX {
+            let candidate = format!("{}-{n}", &base[..base.len().min(MAX_AGENT_ID_LEN - 4)]);
+            if self.tree.node_by_handle(&candidate).is_none() {
+                return Ok(candidate);
+            }
+        }
+        Err(ProviderError::AlreadyExists("agent id".into()))
     }
 
     fn relative_path(&self, workspace: &Path) -> String {
@@ -139,9 +174,10 @@ impl AgentAdminAdapter {
 
     fn summary(&self, node: &AgentNode) -> ClientAgentSummary {
         ClientAgentSummary {
-            agent_id: node.id.0.clone(),
+            agent_id: self.handle_of(&node.id),
+            id: node.id.0.clone(),
             kind: kind_name(&node.kind).to_string(),
-            parent: node.parent.as_ref().map(|p| p.0.clone()),
+            parent: node.parent.as_ref().map(|p| self.handle_of(p)),
             status: status_name(&node.status).to_string(),
             workspace_path: self.relative_path(&node.workspace_path),
             template_ref: node.template_ref.clone(),
@@ -150,7 +186,12 @@ impl AgentAdminAdapter {
     }
 
     fn detail(&self, node: &AgentNode) -> ClientAgentDetail {
-        let mut children = self.tree.children_of(&node.id.0);
+        let mut children: Vec<String> = self
+            .tree
+            .children_of(&node.id.0)
+            .iter()
+            .map(|c| self.handle_of(&AgentId(c.clone())))
+            .collect();
         children.sort();
         let agent_dir = node.workspace_path.join(AGENT_DIR);
         ClientAgentDetail {
@@ -170,7 +211,10 @@ impl AgentAdminAdapter {
     // ── root-config (`agents:` block) persistence ────────────────────────────────────────────
 
     fn root_workspace(&self) -> Result<PathBuf, ProviderError> {
-        Ok(self.node(&self.root_id.0)?.workspace_path)
+        self.tree
+            .get_node(&self.root_id)
+            .map(|n| n.workspace_path)
+            .ok_or_else(|| ProviderError::NotFound("agent".into()))
     }
 
     fn load_document(&self, workspace: &Path) -> Result<Mapping, ProviderError> {
@@ -232,7 +276,7 @@ impl AgentAdminAdapter {
         let agents = decl_sequence_mut(&mut doc);
         // A stale declaration with the same alias (left behind by an older daemon) is replaced.
         remove_decl(agents, alias);
-        if parent_id == self.root_id.0 {
+        if parent_id == self.handle_of(&self.root_id) {
             agents.push(Value::Mapping(entry));
         } else {
             match find_decl_mut(agents, parent_id) {
@@ -285,11 +329,26 @@ impl AgentAdminAdapter {
         Ok(true)
     }
 
+    /// Rename the declaration alias of `alias` to `new_alias` (`Ok(false)` when not declared).
+    fn rename_declared_child(&self, alias: &str, new_alias: &str) -> Result<bool, ProviderError> {
+        let root_ws = self.root_workspace()?;
+        let mut doc = self.load_document(&root_ws)?;
+        let Some(Value::Sequence(agents)) = doc.get_mut(str_value("agents")) else {
+            return Ok(false);
+        };
+        let Some(decl) = find_decl_mut(agents, alias) else {
+            return Ok(false);
+        };
+        decl.insert(str_value("alias"), str_value(new_alias));
+        self.write_document(&root_ws, &doc)?;
+        Ok(true)
+    }
+
     fn restore_declared_child(&self, parent_id: &str, decl: Value) -> Result<(), ProviderError> {
         let root_ws = self.root_workspace()?;
         let mut doc = self.load_document(&root_ws)?;
         let agents = decl_sequence_mut(&mut doc);
-        if parent_id == self.root_id.0 {
+        if parent_id == self.handle_of(&self.root_id) {
             agents.push(decl);
         } else if let Some(parent_decl) = find_decl_mut(agents, parent_id) {
             children_sequence_mut(parent_decl).push(decl);
@@ -402,19 +461,17 @@ impl AgentAdminProvider for AgentAdminAdapter {
         request: &ClientCreateAgentRequest,
     ) -> Result<ClientAgentDetail, ProviderError> {
         let _guard = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let parent_id = request
+        let parent_handle = request
             .parent
             .clone()
-            .unwrap_or_else(|| self.root_id.0.clone());
+            .unwrap_or_else(|| self.handle_of(&self.root_id));
         let parent = self
-            .node(&parent_id)
+            .node(&parent_handle)
             .map_err(|_| ProviderError::NotFound("parent".into()))?;
         if parent.kind == AgentKind::Sub {
             return Err(ProviderError::InvalidRequest("sub parent".into()));
         }
-        if self.tree.contains(&AgentId(request.agent_id.clone())) {
-            return Err(ProviderError::AlreadyExists("agent id".into()));
-        }
+        let handle = self.settle_handle(request)?;
         self.templates
             .resolve(&request.template_ref)
             .map_err(|_| ProviderError::InvalidRequest("template".into()))?;
@@ -431,7 +488,7 @@ impl AgentAdminProvider for AgentAdminAdapter {
         let relative = request
             .workspace_path
             .clone()
-            .unwrap_or_else(|| request.agent_id.clone());
+            .unwrap_or_else(|| handle.clone());
         // Territory pre-checks (clean codes instead of the spawner's stringly tree errors).
         let target = parent.workspace_path.join(&relative);
         if self
@@ -456,15 +513,16 @@ impl AgentAdminProvider for AgentAdminAdapter {
         // Persist FIRST so a spawn failure can roll the declaration back; a successful spawn is
         // never left undeclared.
         let persisted = self.record_declared_child(
-            &parent_id,
-            &request.agent_id,
+            &parent_handle,
+            &handle,
             &request.template_ref,
             &relative,
             &request.capabilities,
         )?;
         let cfg = SpawnChildConfig {
-            parent_id: AgentId(parent_id.clone()),
-            child_id: AgentId(request.agent_id.clone()),
+            handle: Some(handle.clone()),
+            parent_id: parent.id.clone(),
+            child_id: AgentId(cap_lifecycle::identity::new_agent_id()),
             child_workspace_path: PathBuf::from(&relative),
             capabilities,
             template_ref: Some(request.template_ref.clone()),
@@ -472,13 +530,20 @@ impl AgentAdminProvider for AgentAdminAdapter {
         };
         if let Err(e) = self.spawner.spawn_child(cfg) {
             if persisted {
-                let _ = self.remove_declared_child(&request.agent_id);
+                let _ = self.remove_declared_child(&handle);
             }
             return Err(map_spawn_err(e));
         }
-        let node = self.node(&request.agent_id)?;
+        let node = self.node(&handle)?;
         if let Some(yaml) = &request.config_yaml {
             self.write_config_text(&node.workspace_path, yaml)?;
+            // The initial document replaced the spawner's; re-pin the immutable id.
+            cap_lifecycle::identity::upsert_config_key(
+                &node.workspace_path,
+                cap_lifecycle::identity::ID_KEY,
+                &node.id.0,
+            )
+            .map_err(|_| ProviderError::Unavailable("agent id write".into()))?;
         }
         // The llm block goes in AFTER the document so it wins over a block the document carries.
         if let Some(llm) = &request.llm {
@@ -516,14 +581,31 @@ impl AgentAdminProvider for AgentAdminAdapter {
                     carried = true;
                 }
             }
-            // Carry the display name over: a document written without the key (an older
-            // client, or a client editing a document read before the name was set) never
-            // silently renames the agent. A `display_name` in the same request wins below.
-            if !merged.contains_key(str_value(DISPLAY_NAME_KEY)) {
-                if let Some(name) = existing.get(str_value(DISPLAY_NAME_KEY)) {
-                    merged.insert(str_value(DISPLAY_NAME_KEY), name.clone());
-                    carried = true;
+            // Carry the identity keys over: a document written without them (an older client,
+            // or a client editing a document read before they were set) never silently renames
+            // the agent — and never detaches it from its immutable id. A `display_name` /
+            // `handle` in the same request wins below.
+            for key in [
+                DISPLAY_NAME_KEY,
+                cap_lifecycle::identity::ID_KEY,
+                crate::agent_config::HANDLE_KEY,
+            ] {
+                if !merged.contains_key(str_value(key)) {
+                    if let Some(value) = existing.get(str_value(key)) {
+                        merged.insert(str_value(key), value.clone());
+                        carried = true;
+                    }
                 }
+            }
+            // The id is never client-writable: whatever the document says, the node's id wins.
+            if merged.get(str_value(cap_lifecycle::identity::ID_KEY))
+                != Some(&str_value(&node.id.0))
+            {
+                merged.insert(
+                    str_value(cap_lifecycle::identity::ID_KEY),
+                    str_value(&node.id.0),
+                );
+                carried = true;
             }
             if carried {
                 self.write_document(&node.workspace_path, &merged)?;
@@ -542,6 +624,35 @@ impl AgentAdminProvider for AgentAdminAdapter {
             TopLevelDisplayName::set(&node.workspace_path, name)
                 .map_err(|_| ProviderError::Unavailable("display name write".into()))?;
         }
+        if let Some(new_handle) = &request.handle {
+            // A rename moves ONLY the handle: the id (and every store keyed by it) stays. The
+            // declaration alias follows so the next boot re-materializes under the new name.
+            let current = self.handle_of(&node.id);
+            if new_handle != &current {
+                if self.tree.node_by_handle(new_handle).is_some() {
+                    return Err(ProviderError::AlreadyExists("agent id".into()));
+                }
+                match node.kind {
+                    AgentKind::Root => {
+                        cap_lifecycle::identity::upsert_config_key(
+                            &node.workspace_path,
+                            crate::agent_config::HANDLE_KEY,
+                            new_handle,
+                        )
+                        .map_err(|_| ProviderError::Unavailable("handle write".into()))?;
+                    }
+                    AgentKind::Child => {
+                        self.rename_declared_child(&current, new_handle)?;
+                    }
+                    AgentKind::Sub => {
+                        return Err(ProviderError::InvalidRequest("handle on sub".into()));
+                    }
+                }
+                self.tree
+                    .set_handle(&node.id, new_handle)
+                    .map_err(map_spawn_err)?;
+            }
+        }
         if let Some(capabilities) = &request.capabilities {
             // The persisted capability list is a CHILD-declaration concept: the root's operative
             // set is its own config document, and a Sub is never declared.
@@ -554,7 +665,11 @@ impl AgentAdminProvider for AgentAdminAdapter {
                 .parent
                 .clone()
                 .ok_or_else(|| ProviderError::InvalidRequest("orphan agent".into()))?;
-            let parent = self.node(&parent_id.0)?;
+            // `node.parent` is a tree ID (not a handle): look it up directly.
+            let parent = self
+                .tree
+                .get_node(&parent_id)
+                .ok_or_else(|| ProviderError::NotFound("agent".into()))?;
             let requested: Vec<Capability> = capabilities
                 .iter()
                 .map(|c| Capability {
@@ -565,7 +680,7 @@ impl AgentAdminProvider for AgentAdminAdapter {
             CapGrantSubsetAdapter::new()
                 .check(&parent.capabilities, &requested)
                 .map_err(|_| ProviderError::InvalidRequest("capability subset".into()))?;
-            if !self.set_declared_capabilities(agent_id, capabilities)? {
+            if !self.set_declared_capabilities(&self.handle_of(&node.id), capabilities)? {
                 return Err(ProviderError::InvalidRequest("agent not declared".into()));
             }
         }
@@ -610,11 +725,14 @@ impl AgentAdminProvider for AgentAdminAdapter {
             .filter_map(|id| snapshot.nodes.iter().find(|n| &n.id == id).cloned())
             .collect();
 
-        // De-register first (rolled back if the cascade fails); then the MODULE-005 cascade.
+        // De-register first (rolled back if the cascade fails); then the MODULE-005 cascade
+        // (which speaks tree IDS, not handles).
+        let removed_handles: Vec<String> = order.iter().map(|id| snapshot.handle_of(id)).collect();
+        let parent_handle = self.handle_of(&parent);
         let declaration = self.remove_declared_child(agent_id)?;
-        if let Err(e) = self.terminator.terminate_child(&parent.0, agent_id) {
+        if let Err(e) = self.terminator.terminate_child(&parent.0, &node.id.0) {
             if let Some(decl) = declaration {
-                let _ = self.restore_declared_child(&parent.0, decl);
+                let _ = self.restore_declared_child(&parent_handle, decl);
             }
             return Err(map_lifecycle_err(e));
         }
@@ -634,9 +752,10 @@ impl AgentAdminProvider for AgentAdminAdapter {
         Ok(ClientAgentDeleteResult {
             agent_id: agent_id.to_string(),
             removed_agent_ids: order
-                .into_iter()
-                .filter(|id| !self.tree.contains(id))
-                .map(|id| id.0)
+                .iter()
+                .zip(removed_handles)
+                .filter(|(id, _)| !self.tree.contains(id))
+                .map(|(_, handle)| handle)
                 .collect(),
             workspace_removed,
         })
@@ -665,7 +784,7 @@ impl AgentAdminProvider for AgentAdminAdapter {
 
 // ── production terminate controller ──────────────────────────────────────────────────────────
 
-/// Bare-tree-id → served mailbox key (e.g. `default-agent` → `agent:default`, `b` → `agent:b`).
+/// Bare-tree-id → served mailbox key (e.g. `root` → `agent:root`, `b` → `agent:b`).
 pub type MailboxKeyResolver = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// Colon-aware `MailboxCascade`: the terminate cascade hands BARE tree ids, but served mailboxes

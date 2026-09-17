@@ -175,8 +175,8 @@ pub struct MailboxDispatcherImpl {
 impl MailboxDispatcherImpl {
     /// Wave-20 seam (a) — map a sender id to its CANONICAL colon form via the
     /// id-bridge, so a production-stamped BARE `ctx.agent_id` (e.g.
-    /// `default-agent`) passes the `is_safe_id(from)` gate on the notify ingress.
-    /// Returns the canonical `mailbox_key` (e.g. `agent:default`) when `from` is
+    /// `root`) passes the `is_safe_id(from)` gate on the notify ingress.
+    /// Returns the canonical `mailbox_key` (e.g. `agent:root`) when `from` is
     /// a bridge member; otherwise returns `from` unchanged — so with no bridge
     /// (default), an already-colon id, or `system`, the behaviour is
     /// byte-identical. NEVER mutates `ctx.agent_id` (this is local to the notify
@@ -750,7 +750,7 @@ impl MailboxDispatcher for MailboxDispatcherImpl {
         context: Option<MessageContext>,
     ) -> Result<(), NotifyError> {
         // Wave-20 seam (a) — sender canonical-colon normalization. A production
-        // component's `ctx.agent_id` is stamped BARE (e.g. `default-agent`,
+        // component's `ctx.agent_id` is stamped BARE (e.g. `root`,
         // load-bearing for cap-grant keying); the bare form fails
         // `is_safe_id(from)`. Map it to its CANONICAL colon form via the
         // id-bridge BEFORE the gate (no bridge / non-member / already-colon /

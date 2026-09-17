@@ -35,7 +35,7 @@ fn message(task_id: Option<&str>) -> Message {
         id: "msg-satb-1".into(),
         kind: MessageKind::User,
         from: "user:test".into(),
-        to: "agent:default".into(),
+        to: "agent:root".into(),
         payload: b"hello from the user".to_vec(),
         context: task_id.map(|t| MessageContext {
             task_id: Some(t.to_string()),
@@ -261,7 +261,7 @@ async fn t55b_absent_task_id_derives_agent_partition() {
     let pp = PostProcessor::with_components(components);
 
     // context: None ⇒ derive `_agent-agentX`.
-    pp.run("agent:default", &message(None), &result())
+    pp.run("agent:root", &message(None), &result())
         .await
         .expect("run Ok");
 

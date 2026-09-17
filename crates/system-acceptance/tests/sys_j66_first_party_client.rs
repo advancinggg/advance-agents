@@ -31,7 +31,7 @@ use tokio_tungstenite::WebSocketStream;
 const HELLO_LLM: &[u8] =
     include_bytes!("../../runtime/tests/fixtures/guest-rust-hello-llm.core.wasm");
 
-const AGENT: &str = "agent:default";
+const AGENT: &str = "agent:root";
 const TOKEN: &str = "j66-operator-token";
 const CSRF: &str = "j66-csrf";
 const ECHO_TOOL: &str = "echo_tool";

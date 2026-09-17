@@ -150,6 +150,7 @@ impl AgentTreeReader for NullAgentTreeSnapshot {
 impl AgentTreeSnapshot for NullAgentTreeSnapshot {
     fn snapshot(&self) -> AgentTreeSnapshotData {
         AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes: Vec::new(),
             parent_of: std::collections::HashMap::new(),
             children_of: std::collections::HashMap::new(),
@@ -540,6 +541,7 @@ impl AgentTreeReader for FixtureTree {
 impl AgentTreeSnapshot for FixtureTree {
     fn snapshot(&self) -> AgentTreeSnapshotData {
         AgentTreeSnapshotData {
+            handles: Default::default(),
             nodes: self.nodes.clone(),
             parent_of: std::collections::HashMap::new(),
             children_of: std::collections::HashMap::new(),

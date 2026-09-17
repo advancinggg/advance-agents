@@ -146,7 +146,7 @@ async fn setup_prod() -> ProdHarness {
         Arc::ptr_eq(&loop_store, &shared_store),
         "serve loop must read the exact store that wire_capabilities gave notify"
     );
-    assert_eq!(serve_loop.agent_id(), "agent:default");
+    assert_eq!(serve_loop.agent_id(), "agent:root");
 
     ProdHarness {
         _serve_loop: serve_loop,
@@ -264,7 +264,7 @@ async fn poll_file_absent(path: &Path) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sys_ac_265_notify_agent_reaches_production_serve_loop() {
     let h = setup_prod().await;
-    assert_eq!(mailbox_depth(&h.shared_store, "agent:default"), 0);
+    assert_eq!(mailbox_depth(&h.shared_store, "agent:root"), 0);
 
     let out = drive_notify_cron(&h, "cron-265", b"notify-agent-default").await;
     assert_eq!(out, STATE_NOTIFY_AGENT_OK);
@@ -272,7 +272,7 @@ async fn sys_ac_265_notify_agent_reaches_production_serve_loop() {
         poll_file_eq(&h.workspace.join("j01.txt"), &NOTIFY_PAYLOAD).await,
         "target serve loop should consume the notify message and write j01.txt"
     );
-    assert_eq!(mailbox_depth(&h.shared_store, "agent:default"), 0);
+    assert_eq!(mailbox_depth(&h.shared_store, "agent:root"), 0);
 }
 
 /// SYS-AC-266 — the same production caller path sends a block-class secret via
@@ -282,7 +282,7 @@ async fn sys_ac_266_notify_agent_secret_blocked_before_delivery() {
     let h = setup_prod().await;
     let out = drive_notify_cron(&h, "cron-266", b"notify-agent-secret").await;
     assert_eq!(out, STATE_NOTIFY_AGENT_BLOCKED);
-    assert_eq!(mailbox_depth(&h.shared_store, "agent:default"), 0);
+    assert_eq!(mailbox_depth(&h.shared_store, "agent:root"), 0);
     assert!(
         poll_file_absent(&h.workspace.join("j01.txt")).await,
         "blocked notify-agent secret must not wake the target serve loop"
@@ -296,7 +296,7 @@ async fn sys_ac_267_notify_channel_secret_blocked_before_resolution() {
     let h = setup_prod().await;
     let out = drive_notify_cron(&h, "cron-267", b"notify-channel-secret").await;
     assert_eq!(out, STATE_NOTIFY_CHANNEL_BLOCKED);
-    assert_eq!(mailbox_depth(&h.shared_store, "agent:default"), 0);
+    assert_eq!(mailbox_depth(&h.shared_store, "agent:root"), 0);
     assert!(
         poll_file_absent(&h.workspace.join("j01.txt")).await,
         "blocked notify-channel secret must not reach any target mailbox"

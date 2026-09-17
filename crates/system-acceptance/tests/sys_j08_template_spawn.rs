@@ -259,6 +259,7 @@ fn sys_ac_022_template_materializes_behavior_agents_md_and_skills() {
     let (_tmp, tree, spawner, _root_ws) = setup(Arc::new(MaterializingResolver));
     let child = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("mat022".to_string()),
             child_workspace_path: PathBuf::from("agents/mat022"),
@@ -300,6 +301,7 @@ fn sys_ac_023_memory_seed_written_for_child_root_not_sub() {
     let (_tmp, tree, spawner, _root_ws) = setup(Arc::new(MaterializingResolver));
     let child = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("seed023".to_string()),
             child_workspace_path: PathBuf::from("agents/seed023"),
@@ -373,6 +375,7 @@ fn sys_ac_197_unresolved_template_ref_aborts_before_materialization() {
     let (_tmp, tree, spawner, root_ws) = setup(Arc::new(MissingResolver));
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("orphan197".to_string()),
             child_workspace_path: PathBuf::from("agents/orphan197"),
@@ -403,6 +406,7 @@ fn sys_ac_198_template_kind_mismatch_rejected() {
     // Manifest declares `kind: sub`; we request a Child spawn → mismatch.
     let err = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("mm198".to_string()),
             child_workspace_path: PathBuf::from("agents/mm198"),
@@ -495,6 +499,7 @@ async fn sys_ac_024_materialized_agent_registered_and_runnable() {
     let (_tmp, tree, spawner, _root_ws) = setup(Arc::new(RunnableResolver));
     let child = spawner
         .spawn_child(SpawnChildConfig {
+            handle: None,
             parent_id: AgentId("root".to_string()),
             child_id: AgentId("mat024run".to_string()), // BARE (cap-lifecycle rejects a colon)
             child_workspace_path: PathBuf::from("agents/mat024run"),

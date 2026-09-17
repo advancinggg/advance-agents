@@ -78,7 +78,7 @@ pub async fn chat_preflight(
         Arc::new(PreflightAllowBudget),
         event_bus,
         Arc::new(NoopRepetition),
-        "default-agent".into(),
+        "root".into(),
     );
     let params = ChatParams {
         model: None,

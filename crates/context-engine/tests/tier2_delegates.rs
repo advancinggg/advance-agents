@@ -176,19 +176,19 @@ async fn delegates_and_tools_sections_coexist() {
 /// empty-alias form is byte-identical to the single-id form (back-compat).
 #[test]
 fn alias_aware_matches_sub_under_bare_parent_id() {
-    // A Sub recorded under the BARE cap-id "default-agent" (as production
+    // A Sub recorded under the BARE cap-id "root" (as production
     // cap-lifecycle spawns do).
     let tree = FixtureTree {
         nodes: vec![node(
             "researcher",
             AgentKind::Sub,
-            "default-agent",
+            "root",
             vec![cap("web.search")],
         )],
     };
 
     // Single-id under the COLON msg-id → MISS (the pre-Wave-12 production bug).
-    let single = format_available_delegates_section(&tree, "agent:default");
+    let single = format_available_delegates_section(&tree, "agent:root");
     assert_eq!(
         single.lines().filter(|l| l.starts_with("- ")).count(),
         0,
@@ -196,8 +196,8 @@ fn alias_aware_matches_sub_under_bare_parent_id() {
     );
 
     // Alias-aware under the COLON msg-id WITH the {bare, colon} alias set → HIT.
-    let aliases = vec!["default-agent".to_string(), "agent:default".to_string()];
-    let aliased = format_available_delegates_section_with_aliases(&tree, "agent:default", &aliases);
+    let aliases = vec!["root".to_string(), "agent:root".to_string()];
+    let aliased = format_available_delegates_section_with_aliases(&tree, "agent:root", &aliases);
     assert!(
         aliased.contains("- researcher — "),
         "alias bridge lists the Sub"
@@ -210,8 +210,7 @@ fn alias_aware_matches_sub_under_bare_parent_id() {
     );
 
     // Empty alias set ⇒ byte-identical to the 2-arg single-id form.
-    let empty_aliases =
-        format_available_delegates_section_with_aliases(&tree, "agent:default", &[]);
+    let empty_aliases = format_available_delegates_section_with_aliases(&tree, "agent:root", &[]);
     assert_eq!(
         empty_aliases, single,
         "empty aliases == single-id behaviour"

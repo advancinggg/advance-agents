@@ -48,7 +48,49 @@ pub const MAX_AGENTS_PER_STORE: usize = 1024;
 struct AgentTreeInner {
     nodes: HashMap<AgentId, AgentNode>,
     children_by_parent: HashMap<AgentId, Vec<AgentId>>,
+    /// Tree id → handle (addressable name). Absent ⇒ the id is its own handle.
+    handles: HashMap<AgentId, String>,
+    /// Handle → tree id (every registered handle, including implicit id-as-handle).
+    by_handle: HashMap<String, AgentId>,
     revision: u64,
+}
+
+impl AgentTreeInner {
+    fn handle_of(&self, id: &AgentId) -> String {
+        self.handles
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.0.clone())
+    }
+
+    /// Bind `handle` to `id` (or the id itself). Rejects a handle another node owns.
+    fn bind_handle(&mut self, id: &AgentId, handle: Option<String>) -> Result<(), SpawnError> {
+        let handle = handle.unwrap_or_else(|| id.0.clone());
+        validate_agent_id(&handle)
+            .map_err(|e| SpawnError::InvalidConfig(format!("handle {handle:?}: {e}")))?;
+        if let Some(owner) = self.by_handle.get(&handle) {
+            if owner != id {
+                return Err(SpawnError::AlreadyExists(format!(
+                    "handle {handle:?} is owned by agent {owner:?}"
+                )));
+            }
+        }
+        if handle != id.0 {
+            self.handles.insert(id.clone(), handle.clone());
+        } else {
+            self.handles.remove(id);
+        }
+        self.by_handle.insert(handle, id.clone());
+        Ok(())
+    }
+
+    fn unbind_handle(&mut self, id: &AgentId) {
+        let handle = self.handle_of(id);
+        self.handles.remove(id);
+        if self.by_handle.get(&handle) == Some(id) {
+            self.by_handle.remove(&handle);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -107,7 +149,17 @@ impl AgentTreeStore {
     }
 
     /// Insert the (single) Root agent. Rejects if a Root already exists.
-    pub fn insert_root(&self, mut node: AgentNode) -> Result<(), SpawnError> {
+    pub fn insert_root(&self, node: AgentNode) -> Result<(), SpawnError> {
+        self.insert_root_with_handle(node, None)
+    }
+
+    /// [`AgentTreeStore::insert_root`] with an explicit handle (the addressable name;
+    /// `None` ⇒ the id is its own handle).
+    pub fn insert_root_with_handle(
+        &self,
+        mut node: AgentNode,
+        handle: Option<String>,
+    ) -> Result<(), SpawnError> {
         if let Some(p) = node.parent.as_ref() {
             return Err(SpawnError::InvalidConfig(format!(
                 "insert_root expects node.parent == None; got Some({:?})",
@@ -135,6 +187,7 @@ impl AgentTreeStore {
             )));
         }
         let id = node.id.clone();
+        inner.bind_handle(&id, handle)?;
         inner.nodes.insert(id.clone(), node);
         inner.children_by_parent.entry(id).or_default(); // empty children list
         inner.revision = inner.revision.saturating_add(1);
@@ -142,7 +195,17 @@ impl AgentTreeStore {
     }
 
     /// Insert a Child or Sub agent under `parent`.
-    pub fn insert_child(&self, parent: &AgentId, mut node: AgentNode) -> Result<(), SpawnError> {
+    pub fn insert_child(&self, parent: &AgentId, node: AgentNode) -> Result<(), SpawnError> {
+        self.insert_child_with_handle(parent, node, None)
+    }
+
+    /// [`AgentTreeStore::insert_child`] with an explicit handle (`None` ⇒ id-as-handle).
+    pub fn insert_child_with_handle(
+        &self,
+        parent: &AgentId,
+        mut node: AgentNode,
+        handle: Option<String>,
+    ) -> Result<(), SpawnError> {
         // Enforce parent_of consistency: force the parent field.
         if let Some(p) = node.parent.as_ref() {
             if p != parent {
@@ -218,6 +281,7 @@ impl AgentTreeStore {
             )));
         }
         let id = node.id.clone();
+        inner.bind_handle(&id, handle)?;
         inner.nodes.insert(id.clone(), node);
         inner
             .children_by_parent
@@ -248,6 +312,7 @@ impl AgentTreeStore {
         }
         inner.nodes.remove(id);
         inner.children_by_parent.remove(id);
+        inner.unbind_handle(id);
         if let Some(parent) = node.parent.as_ref() {
             if let Some(siblings) = inner.children_by_parent.get_mut(parent) {
                 siblings.retain(|c| c != id);
@@ -278,6 +343,42 @@ impl AgentTreeStore {
         node.status = status;
         inner.revision = inner.revision.saturating_add(1);
         Ok(())
+    }
+
+    /// Re-bind an existing node's handle (a rename). The id — and every store keyed by
+    /// it — is untouched. Rejects an unknown id or a handle another node owns.
+    pub fn set_handle(&self, id: &AgentId, handle: &str) -> Result<(), SpawnError> {
+        let mut inner = self.inner.write().expect("poisoned");
+        if !inner.nodes.contains_key(id) {
+            return Err(SpawnError::TreeStateInvalid(format!("not found: {:?}", id)));
+        }
+        if inner.handle_of(id) == handle {
+            return Ok(());
+        }
+        validate_agent_id(handle)
+            .map_err(|e| SpawnError::InvalidConfig(format!("handle {handle:?}: {e}")))?;
+        if inner.by_handle.contains_key(handle) {
+            return Err(SpawnError::AlreadyExists(format!(
+                "handle {handle:?} is owned by another agent"
+            )));
+        }
+        inner.unbind_handle(id);
+        inner.bind_handle(id, Some(handle.to_string()))?;
+        inner.revision = inner.revision.saturating_add(1);
+        Ok(())
+    }
+
+    /// The handle of `id` (`None` for an unknown id).
+    pub fn handle(&self, id: &AgentId) -> Option<String> {
+        let inner = self.inner.read().expect("poisoned");
+        inner.nodes.contains_key(id).then(|| inner.handle_of(id))
+    }
+
+    /// The node owning `handle`.
+    pub fn node_by_handle(&self, handle: &str) -> Option<AgentNode> {
+        let inner = self.inner.read().expect("poisoned");
+        let id = inner.by_handle.get(handle)?;
+        inner.nodes.get(id).cloned()
     }
 
     fn validate_node_common(node: &AgentNode, workspace_root: &Path) -> Result<(), SpawnError> {
@@ -424,6 +525,15 @@ impl AgentTreeReader for AgentTreeStore {
             .map(|n| n.capabilities.clone())
             .unwrap_or_default()
     }
+
+    fn handle_of(&self, agent_id: &str) -> Option<String> {
+        self.handle(&AgentId(agent_id.to_string()))
+    }
+
+    fn id_by_handle(&self, handle: &str) -> Option<String> {
+        let inner = self.inner.read().expect("poisoned");
+        inner.by_handle.get(handle).map(|id| id.0.clone())
+    }
 }
 
 impl AgentTreeSnapshot for AgentTreeStore {
@@ -447,6 +557,7 @@ impl AgentTreeSnapshot for AgentTreeStore {
         // nodes: preorder DFS (parent-before-children), sorted-by-AgentId children.
         let nodes = build_preorder_nodes(&inner.nodes, &children_of, &parent_of);
         AgentTreeSnapshotData {
+            handles: inner.handles.clone(),
             nodes,
             parent_of,
             children_of,
@@ -555,6 +666,23 @@ impl SnapshotReader {
 }
 
 impl AgentTreeReader for SnapshotReader {
+    fn handle_of(&self, agent_id: &str) -> Option<String> {
+        let id = AgentId(agent_id.to_string());
+        self.data
+            .nodes
+            .iter()
+            .any(|n| n.id == id)
+            .then(|| self.data.handle_of(&id))
+    }
+
+    fn id_by_handle(&self, handle: &str) -> Option<String> {
+        self.data
+            .nodes
+            .iter()
+            .find(|n| self.data.handle_of(&n.id) == handle)
+            .map(|n| n.id.0.clone())
+    }
+
     fn parent_of(&self, agent_id: &str) -> Option<String> {
         if validate_agent_id(agent_id).is_err() {
             return None;
