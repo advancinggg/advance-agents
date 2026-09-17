@@ -1,5 +1,5 @@
-//! Read / rewrite the `secrets:` section of `<home>/.advance/runtime-config.yaml`
-//! (this lane): the one writer the `secrets` Client API family
+//! Read / rewrite the `secrets:` section of `<home>/.advance/runtime-config.yaml`:
+//! the one writer the `secrets` Client API family
 //! (`POST /client/secrets:set-mode`) and `advance secrets migrate` share.
 //!
 //! Same write chain as the selected-provider rewrite: edit the parsed `serde_yml::Value`,

@@ -1,5 +1,6 @@
-//! keychain-sync backend witnesses over `MockSecItemOps`: the factory, the store, the master-key precedence, the kid guard, the migration in
-//! both directions and the synchronizable toggle — all without a real keychain.
+//! keychain-sync backend witnesses over `MockSecItemOps`: the factory, the store, the
+//! master-key precedence, the kid guard, the migration in both directions and the
+//! synchronizable toggle — all without a real keychain.
 //!
 //! Env-var cases are serialized through one mutex (the factory reads the configured env var),
 //! and every case uses its OWN env var name so no case can observe another's value.

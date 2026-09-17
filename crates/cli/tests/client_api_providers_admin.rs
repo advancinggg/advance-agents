@@ -1,5 +1,5 @@
 //! CONTRACT-190 providers family — the PRODUCTION adapter over a real workspace home
-//! (lane providers-family, `docs/llm-providers-policy-keychain.md` §1.5).
+//! (lane providers-family).
 //!
 //! Drives the FULL boot path (`RuntimeHostBuilder::new` → `wire_capabilities`) over a temp
 //! workspace that declares `fs` + `llm` (so the daemon holds a LIVE `SecretStore`), then
@@ -661,7 +661,7 @@ async fn pv03_referenced_provider_delete_is_refused() {
 }
 
 // ── PV-04: the PRODUCTION reference check — an agent's `llm.provider` pin blocks the delete ───
-// (plan §4 step 2: the daemon composes `WorkspaceAgentLlmPolicy` as the `ProviderReferenceCheck`,
+// (cross-lane wiring: the daemon composes `WorkspaceAgentLlmPolicy` as the `ProviderReferenceCheck`,
 // walking the same root + tree the gateway's policy source reads; no injected double here).
 #[tokio::test(flavor = "multi_thread")]
 async fn pv04_agent_pin_blocks_delete_through_production_reference_check() {

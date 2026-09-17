@@ -637,7 +637,8 @@ pub fn conformance_vectors() -> Value {
             },
             {
                 // secrets-family: a mode switch to `keychain-sync` on a host without the
-                // synchronizable data-protection keychain. Same stable code as request validation; `details` carries the reason.
+                // synchronizable data-protection keychain. Same stable code as request
+                // validation; `details` carries the reason.
                 "name": "error_invalid_request_platform_unsupported",
                 "kind": "error",
                 "envelope": {

@@ -1,5 +1,4 @@
-//! keychain-sync — the iCloud-Keychain-synchronized secret backend
-//!.
+//! keychain-sync — the iCloud-Keychain-synchronized secret backend.
 //!
 //! The encryption envelope of [`crate::SecretStore`] (master key → per-secret HKDF-SHA256 →
 //! AES-256-GCM) is unchanged; only WHERE the master key and the ciphertext rows live moves:
@@ -8,7 +7,7 @@
 //! carries them end-to-end between the user's devices. Every home on every device then keeps
 //! only secret NAMES (`llm-providers[].api-key-secret`).
 //!
-//! Item layout (§3.1):
+//! Item layout:
 //!
 //! | item            | service                              | account         | value |
 //! |-----------------|--------------------------------------|-----------------|-------|
@@ -30,7 +29,7 @@
 //! targets only, the one `unsafe` FFI module of this crate) talks to Security.framework;
 //! [`MockSecItemOps`] is the in-memory double every unit test uses, so the storage, master-key
 //! and migration logic is witnessed without a real keychain (which needs a signed, entitled
-//! process — see the plan's S0 spike record).
+//! process: the unsigned spike in `tests/live_keychain_sync_smoke.rs` answers `errSecMissingEntitlement`).
 
 use std::collections::BTreeMap;
 use std::fmt;

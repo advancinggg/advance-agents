@@ -848,7 +848,7 @@ pub enum MasterKeySource {
     Keychain,
     /// The env var only; ciphertext in `<home>/.advance/secrets.json`.
     EnvVar,
-    /// keychain-sync (this lane): master key AND every
+    /// keychain-sync: master key AND every
     /// ciphertext row are synchronizable data-protection keychain items (iCloud Keychain
     /// carries them between devices); the home keeps only secret names. Env var first
     /// (unchanged contract), then the keychain master item; `master.key` / `secrets.json`

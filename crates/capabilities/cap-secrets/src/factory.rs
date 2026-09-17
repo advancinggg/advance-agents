@@ -1,5 +1,5 @@
 //! The ONE place that maps `runtime-config.yaml`'s `secrets:` block to a master key + a
-//! [`SecretStorage`] backend (this lane).
+//! [`SecretStorage`] backend.
 //!
 //! Before this module every composition site (advance-home first-open, `advance start`
 //! wiring, `advance secrets set|list|remove`, `advance init`) hard-coded

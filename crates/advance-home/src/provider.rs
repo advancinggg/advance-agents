@@ -357,8 +357,9 @@ pub fn open_home_secret_store(home: &Path, cfg: &RuntimeConfig) -> Result<Secret
     open_file_store(home, cfg)
 }
 
-/// The home's secret store as `secrets:` selects it: the File layout for the `keychain` / `env-var` sources (byte-identical to the
-/// pre-factory `ensure_master_key` + `FileSecretStorage` pair) or the keychain-sync items.
+/// The home's secret store as `secrets:` selects it: the File layout for the `keychain` /
+/// `env-var` sources (byte-identical to the pre-factory `ensure_master_key` +
+/// `FileSecretStorage` pair) or the keychain-sync items.
 /// First-open semantics: a missing master key is minted when nothing depends on it yet.
 fn open_file_store(home: &Path, cfg: &RuntimeConfig) -> Result<SecretStore, String> {
     open_secret_store(

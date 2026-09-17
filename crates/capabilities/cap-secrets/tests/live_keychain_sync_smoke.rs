@@ -1,4 +1,4 @@
-//! keychain-sync S0 spike — MANUAL, dev-machine only (this lane).
+//! keychain-sync S0 spike — MANUAL, dev-machine only.
 //!
 //! Run explicitly with:
 //!   ADVANCE_LIVE_KEYCHAIN_SYNC=1 cargo test -p cap-secrets --test live_keychain_sync_smoke -- --ignored --nocapture
@@ -70,7 +70,7 @@ mod apple {
 }
 
 #[test]
-#[ignore = "live Security.framework — manual dev-machine spike (plan §3.0); gated by ADVANCE_LIVE_KEYCHAIN_SYNC=1"]
+#[ignore = "live Security.framework — manual dev-machine spike; gated by ADVANCE_LIVE_KEYCHAIN_SYNC=1"]
 fn s0_spike_data_protection_synchronizable_item() {
     if std::env::var("ADVANCE_LIVE_KEYCHAIN_SYNC").as_deref() != Ok("1") {
         println!("SPIKE_SKIPPED: set ADVANCE_LIVE_KEYCHAIN_SYNC=1 to touch the live keychain");

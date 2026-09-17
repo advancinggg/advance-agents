@@ -190,7 +190,7 @@ impl WorkspaceAgentLlmPolicy {
     }
 }
 
-/// The providers family's delete guard (plan §4 step 2): a provider some agent pins through
+/// The providers family's delete guard: a provider some agent pins through
 /// its `llm.provider` cannot be deleted out from under it.
 impl ProviderReferenceCheck for WorkspaceAgentLlmPolicy {
     fn referenced_by(&self, provider_id: &str) -> Vec<String> {

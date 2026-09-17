@@ -22,7 +22,7 @@
 //!
 //! See MODULE-012 §3.7 Change History for slice context.
 //!
-//! keychain-sync (this lane, 2026-09-16): [`keychain_sync`] is
+//! keychain-sync: [`keychain_sync`] is
 //! the iCloud-Keychain-synchronized backend behind the [`SecItemOps`] seam, [`factory`] maps
 //! the `secrets:` config block to a master key + backend for every composition site, and
 //! [`migrate`] moves a home between the File backend and keychain-sync.

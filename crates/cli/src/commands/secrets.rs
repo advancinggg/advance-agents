@@ -15,8 +15,7 @@
 //!   needed).
 //! - `remove <name>` deletes a stored secret (no master key needed).
 //! - `migrate --to file|keychain-sync` moves every secret between the File layout and the
-//!   iCloud-Keychain-synchronized layout and repoints `secrets.master-key-source`
-//!   (this lane).
+//!   iCloud-Keychain-synchronized layout and repoints `secrets.master-key-source`.
 //!
 //! Every store open goes through the cap-secrets factory, so the layout follows the
 //! workspace's `secrets:` block (File sources keep the pre-existing behaviour).
@@ -180,7 +179,7 @@ fn run_remove_inner(name: &str, workspace: Option<PathBuf>) -> Result<bool, Stri
 
 /// `advance secrets migrate --to file|keychain-sync` — move every stored secret into the
 /// target layout (each name round-trip verified), then point `secrets.master-key-source` at
-/// it (this lane).
+/// it.
 pub fn run_migrate(to: String, workspace: Option<PathBuf>) -> ExitCode {
     let Some(target) = MigrationTarget::parse(&to) else {
         eprintln!("advance secrets migrate: --to must be `file` or `keychain-sync` (got {to:?})");

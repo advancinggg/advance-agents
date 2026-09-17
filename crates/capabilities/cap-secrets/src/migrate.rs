@@ -1,5 +1,4 @@
-//! Moving a home between the File backend and keychain-sync
-//! (this lane).
+//! Moving a home between the File backend and keychain-sync.
 //!
 //! - [`migrate_file_to_keychain`]: re-encrypts every `secrets.json` row under the keychain
 //!   master key (env var → keychain item → minted when the namespace is empty), verifies each

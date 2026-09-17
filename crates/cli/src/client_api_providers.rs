@@ -1,7 +1,7 @@
 //! CLI-served `ProviderAdminProvider` (CONTRACT-190 providers family) over the workspace's
 //! `runtime-config.yaml` (advance-home's shared `llm-providers` writer), the daemon's LIVE
 //! `SecretStore`, the config watcher, and the first-open preflight port
-//!.
+//! (lane providers-family, 2026-09-16).
 //!
 //! Invariants this adapter owns:
 //! - **Keys go through the live store.** `FileSecretStorage` caches the whole file at `open`

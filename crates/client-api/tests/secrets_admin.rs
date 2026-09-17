@@ -1,5 +1,5 @@
 //! Secrets family — secrets mode read / switch (`/client/secrets/mode`,
-//! `/client/secrets:set-mode`)
+//! `/client/secrets:set-mode`).
 //!
 //! Drives the REAL `ClientApi::handle()` pipeline (admission, version, session, scope gate,
 //! idempotency reserve/replay, handler-side validation, provider-error projection) against a

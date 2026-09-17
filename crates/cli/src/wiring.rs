@@ -1191,7 +1191,7 @@ async fn wire_capabilities_inner(
     // journal/factory graph before EventBus, host registration, listeners, or
     // any other externally reachable runtime object exists.
     let mut master_key = if needs_key {
-        // keychain-sync (this lane): a home whose config moved
+        // keychain-sync: a home whose config moved
         // to keychain-sync while it still carries `master.key` + `secrets.json` is migrated
         // HERE, before the key is loaded, so the daemon boots on the keychain items (each
         // name is round-trip verified; the files are renamed `*.migrated`). Idempotent — a
@@ -2767,7 +2767,7 @@ async fn wire_capabilities_inner(
     // writer over THIS workspace, the daemon's live secret store, the config watcher (so a
     // write waits for its own applied reload) and the Landing first-open preflight port.
     // A delete is refused while any agent pins the provider through its `llm.provider`
-    // (plan §4 step 2): the reference check walks the SAME tree + root the gateway's
+    // The reference check walks the SAME tree + root the gateway's
     // policy source reads, so the two can never disagree about who pins what.
     let provider_admin: Arc<crate::client_api_providers::WiredProviderAdmin> =
         Arc::new(crate::client_api_providers::WiredProviderAdmin::new(
@@ -2827,7 +2827,7 @@ async fn wire_capabilities_inner(
                     runtime_config.pack.clone(),
                     env!("CARGO_PKG_VERSION"),
                 ));
-            // Secrets family (this lane): the home's secrets
+            // Secrets family: the home's secrets
             // mode over the same runtime-config.yaml write chain the selected-provider
             // rewrite uses; `set-mode` only rewrites YAML (applies at the next start).
             let secrets_admin_for_api: Arc<dyn advance_client_api::SecretsAdminProvider> = Arc::new(
@@ -2973,9 +2973,10 @@ async fn wire_capabilities_inner(
 /// Load the real master key (64 hex chars = 32 bytes) for `RuntimeConfig.secrets` through
 /// the cap-secrets factory. File sources (`env-var` / `keychain`) keep the pre-existing
 /// never-mint precedence (env → workspace file → `keyring`; the whole set→resolve chain uses
-/// one key, cli/tests/secrets_roundtrip.rs). `keychain-sync`  uses env → keychain master item, and mints a keychain
-/// item only when the namespace holds no ciphertext yet (a fresh keychain-sync home has no
-/// `advance init` mint to lean on); `master.key` is never used in that mode.
+/// one key, cli/tests/secrets_roundtrip.rs). `keychain-sync` uses env → keychain master
+/// item, and mints a keychain item only when the namespace holds no ciphertext yet (a fresh
+/// keychain-sync home has no `advance init` mint to lean on); `master.key` is never used in
+/// that mode.
 pub(crate) fn load_real_master_key(
     workspace: &Path,
     secrets: &SecretsConfig,

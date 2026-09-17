@@ -34,7 +34,7 @@ serde_json = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
-# keychain-sync (this lane): the iCloud-Keychain backend calls
+# keychain-sync: the iCloud-Keychain backend calls
 # `SecItemAdd / SecItemCopyMatching / SecItemUpdate / SecItemDelete` directly (the `keyring`
 # crate's macOS backend is the legacy file keychain and cannot set `kSecAttrSynchronizable` /
 # `kSecUseDataProtectionKeychain`). Both crates are already in Cargo.lock through

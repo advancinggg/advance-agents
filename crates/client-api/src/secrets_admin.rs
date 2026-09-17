@@ -1,5 +1,4 @@
-//! Secrets family — the operator-facing secrets-mode surface
-//! (this lane, 2026-09-16).
+//! Secrets family — the operator-facing secrets-mode surface.
 //!
 //! Routes (family `secrets`):
 //! - `GET  /client/secrets/mode`        the home's secrets mode (`Scope::ReadInventory`)

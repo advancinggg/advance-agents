@@ -1,4 +1,4 @@
-//! Secrets family over the PRODUCTION wiring (this lane):
+//! Secrets family over the PRODUCTION wiring:
 //! boot a workspace through `RuntimeHostBuilder::new` → `wire_capabilities`, then drive the
 //! daemon-composed `ClientApi` (`client_api_server.api()`, the instance the loopback
 //! transport serves): `GET /client/secrets/mode` reflects the home's `secrets:` block,

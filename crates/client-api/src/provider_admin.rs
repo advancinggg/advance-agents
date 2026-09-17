@@ -1,5 +1,5 @@
 //! CONTRACT-190 providers family — the operator-facing LLM provider administration surface
-//!.
+//! (lane providers-family, 2026-09-16).
 //!
 //! Routes (family `providers`; `/client/costs/providers/…` stays in the `costs` family):
 //! - `GET  /client/providers`                              list, YAML order, index 0 is `selected` (`Scope::ReadInventory`)

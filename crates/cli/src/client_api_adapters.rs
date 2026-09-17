@@ -542,7 +542,7 @@ pub struct FirstPartyClientCompose {
     /// CONTRACT-190 providers family (LLM provider entries + key custody) over the shared
     /// `llm-providers` writer and the daemon's live secret store.
     pub providers: Option<Arc<dyn ProviderAdminProvider>>,
-    /// Secrets family (this lane): the home's secrets mode
+    /// Secrets family: the home's secrets mode
     /// (File vs keychain-sync) over the runtime-config.yaml `secrets:` block.
     pub secrets: Option<Arc<dyn SecretsAdminProvider>>,
 }

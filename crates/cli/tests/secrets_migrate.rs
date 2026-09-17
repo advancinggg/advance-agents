@@ -1,5 +1,5 @@
-//! `advance secrets migrate --to keychain-sync | file` over a mock keychain
-//! (this lane): the File artifacts move into keychain items
+//! `advance secrets migrate --to keychain-sync | file` over a mock keychain:
+//! the File artifacts move into keychain items
 //! (every name verified), get renamed `*.migrated`, the YAML repoints at `keychain-sync`; the
 //! reverse rebuilds `secrets.json` and repoints at the File source, keychain items untouched.
 //! Hermetic: a mock `SecItemOps` and a NotFound `keyring` seam — the dev machine's real

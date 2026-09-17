@@ -15,7 +15,7 @@
 //!   file, bypassing the API's existence check) to a provider absent from the runtime config
 //!   fails CLOSED on the next call — `ModelNotAvailable`, no network, no fallback.
 //!
-//! Witness boundary (plan §修订 5): the daemon's SSRF guard denies loopback egress, so a real
+//! Witness boundary: the daemon's SSRF guard denies loopback egress, so a real
 //! generate to a local mock endpoint cannot be driven through this wiring; routing to the pinned
 //! provider and cost attribution are witnessed at the cap-llm level (`policy_tests.rs`).
 

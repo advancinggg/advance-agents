@@ -65,8 +65,7 @@ capabilities:
   llm: true
 ";
 
-/// Where a home keeps its master key + provider-key ciphertext
-/// (this lane).
+/// Where a home keeps its master key + provider-key ciphertext.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SecretsMode {
     /// `secrets.master-key-source: keychain` (the `keyring` OS store with the env var as

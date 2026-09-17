@@ -46,7 +46,7 @@ pub mod client_api_packs;
 // `ProviderAdminProvider` over the shared `llm-providers` writer, the daemon's live
 // `SecretStore`, the config watcher and the first-open preflight port.
 pub mod client_api_providers;
-// Secrets family (this lane): the production
+// Secrets family: the production
 // `SecretsAdminProvider` over the home's `secrets:` block (File vs keychain-sync).
 pub mod client_api_secrets;
 pub mod contract218_anchor;

@@ -11,7 +11,7 @@ pub fn create(parent: &Path, name: &str) -> Result<WorkspaceHomeHandle, CreateEr
     create_with_secrets_mode(parent, name, SecretsMode::File)
 }
 
-/// `create` with an explicit secrets mode (this lane). The
+/// `create` with an explicit secrets mode. The
 /// product's `along_home_create` grows the matching parameter (and its ABI version) on its
 /// side.
 pub fn create_with_secrets_mode(

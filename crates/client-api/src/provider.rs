@@ -297,7 +297,7 @@ pub trait ProviderAdminProvider: Send + Sync {
     ) -> Result<ProviderAdminOutcome<ClientProviderSummary>, ProviderError>;
 }
 
-/// Secrets-mode administration provider (this lane) behind the
+/// Secrets-mode administration provider behind the
 /// `secrets` family. The cli adapter reads the home's `secrets:` block through the validating
 /// config loader and rewrites ONLY that block (tmp + `load_config` + rename); a mode change
 /// applies at the next daemon start (the handler attaches `restart_required`). Every request
