@@ -4,9 +4,21 @@ use std::path::Path;
 
 use crate::contract::{CreateError, RecognizeClass, WorkspaceHomeHandle};
 use crate::recognize::{open, recognize};
-use crate::scaffold::{write_create_driver, write_recognizable_home};
+use crate::scaffold::{write_create_driver, write_recognizable_home_with_mode, SecretsMode};
 
+/// File secrets mode (the pre-existing `create`).
 pub fn create(parent: &Path, name: &str) -> Result<WorkspaceHomeHandle, CreateError> {
+    create_with_secrets_mode(parent, name, SecretsMode::File)
+}
+
+/// `create` with an explicit secrets mode (this lane). The
+/// product's `along_home_create` grows the matching parameter (and its ABI version) on its
+/// side.
+pub fn create_with_secrets_mode(
+    parent: &Path,
+    name: &str,
+    mode: SecretsMode,
+) -> Result<WorkspaceHomeHandle, CreateError> {
     let name = name.trim();
     if !valid_name(name) {
         return Err(CreateError::InvalidName);
@@ -29,7 +41,7 @@ pub fn create(parent: &Path, name: &str) -> Result<WorkspaceHomeHandle, CreateEr
             _ => return Err(CreateError::ExistsNotWorkspaceHome),
         }
     }
-    write_recognizable_home(&target).map_err(|_| CreateError::Io)?;
+    write_recognizable_home_with_mode(&target, mode).map_err(|_| CreateError::Io)?;
     if write_create_driver(&target).is_err() {
         rollback_created_home(&target);
         return Err(CreateError::Io);

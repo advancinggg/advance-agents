@@ -42,6 +42,7 @@ use crate::provider_admin::{
 use crate::providers::grants::BoundGrantApprovalPort;
 use crate::providers::history::BoundHistoryReadPort;
 use crate::runs::{ClientAgentTreeNode, ClientRunMutation, ClientRunSummary};
+use crate::secrets_admin::{ClientSecretsMode, ClientSetSecretsModeRequest};
 use crate::tools::ClientToolInventory;
 
 /// The `ClientError.details` token carried by an `invalid_request` whose cause is an agent
@@ -77,6 +78,10 @@ pub enum ProviderError {
     /// not in the live runtime config. → `invalid_request` with details `["unknown_provider"]`
     /// (the ONE stable detail token clients may switch on; the inner id is log-only).
     UnknownProvider(String),
+    /// The request asks for something this build/platform cannot serve (a `keychain-sync`
+    /// secrets mode on a non-Apple host). → `invalid_request` with details
+    /// `["platform_unsupported"]` so a client can distinguish it from a malformed request.
+    PlatformUnsupported(String),
 }
 
 impl ProviderError {
@@ -87,6 +92,10 @@ impl ProviderError {
     /// leak a raw provider reason string into `ClientError.message` even by mistake. Clients switch
     /// on the stable code, not the message (§2.12).
     pub fn into_client_error(self) -> ClientError {
+        if let ProviderError::PlatformUnsupported(_) = self {
+            return ClientError::new(ClientErrorCode::InvalidRequest, "invalid request")
+                .with_details(vec!["platform_unsupported".to_string()]);
+        }
         let (code, message): (ClientErrorCode, &'static str) = match self {
             ProviderError::NotFound(_) => (ClientErrorCode::NotFound, "resource not found"),
             ProviderError::NotAuthorized(_) => {
@@ -104,7 +113,7 @@ impl ProviderError {
             ProviderError::AlreadyExists(_) => {
                 (ClientErrorCode::AlreadyExists, "resource already exists")
             }
-            ProviderError::InvalidRequest(_) => {
+            ProviderError::InvalidRequest(_) | ProviderError::PlatformUnsupported(_) => {
                 (ClientErrorCode::InvalidRequest, "invalid request")
             }
             ProviderError::UnknownProvider(_) => {
@@ -288,6 +297,23 @@ pub trait ProviderAdminProvider: Send + Sync {
     ) -> Result<ProviderAdminOutcome<ClientProviderSummary>, ProviderError>;
 }
 
+/// Secrets-mode administration provider (this lane) behind the
+/// `secrets` family. The cli adapter reads the home's `secrets:` block through the validating
+/// config loader and rewrites ONLY that block (tmp + `load_config` + rename); a mode change
+/// applies at the next daemon start (the handler attaches `restart_required`). Every request
+/// it receives has already passed handler-side validation in [`crate::secrets_admin`].
+///
+/// Error projection: `keychain-sync` requested on a platform without the synchronizable
+/// data-protection keychain → `PlatformUnsupported`; a rewritten config the loader rejects →
+/// `InvalidRequest`; an unreadable config / failed write → `Unavailable`.
+pub trait SecretsAdminProvider: Send + Sync {
+    fn mode(&self) -> Result<ClientSecretsMode, ProviderError>;
+    fn set_mode(
+        &self,
+        request: &ClientSetSecretsModeRequest,
+    ) -> Result<ClientSecretsMode, ProviderError>;
+}
+
 /// An interior-mutable provider slot: `None` until the composition root injects a concrete adapter.
 pub type ProviderSlot<T> = Arc<RwLock<Option<Arc<T>>>>;
 pub type RunProviderSlot = ProviderSlot<dyn RunControlProvider>;
@@ -297,6 +323,7 @@ pub type AgentProviderSlot = ProviderSlot<dyn AgentAdminProvider>;
 pub type CostProviderSlot = ProviderSlot<dyn CostProvider>;
 pub type PackProviderSlot = ProviderSlot<dyn PackAdminProvider>;
 pub type ProviderAdminSlot = ProviderSlot<dyn ProviderAdminProvider>;
+pub type SecretsProviderSlot = ProviderSlot<dyn SecretsAdminProvider>;
 /// m020-s3: event provider / leak detector / cursor codec slots.
 pub type EventProviderSlot = ProviderSlot<dyn ClientEventProvider>;
 pub type LeakDetectorSlot = ProviderSlot<dyn LeakDetector>;

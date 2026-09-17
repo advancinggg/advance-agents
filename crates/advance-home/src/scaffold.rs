@@ -65,10 +65,62 @@ capabilities:
   llm: true
 ";
 
+/// Where a home keeps its master key + provider-key ciphertext
+/// (this lane).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretsMode {
+    /// `secrets.master-key-source: keychain` (the `keyring` OS store with the env var as
+    /// fallback) + `<home>/.advance/master.key` + `<home>/.advance/secrets.json`. The
+    /// pre-existing scaffold.
+    File,
+    /// `secrets.master-key-source: keychain-sync`: master key and ciphertext are
+    /// synchronizable data-protection keychain items; the home carries only names and no
+    /// `master.key` is minted at create.
+    KeychainSync,
+}
+
+impl SecretsMode {
+    /// The YAML `secrets:` block of a starter config in this mode.
+    pub fn starter_secrets_block(self) -> &'static str {
+        match self {
+            SecretsMode::File => {
+                "secrets:\n  master-key-source: keychain\n  env-var-name: SECRETS_MASTER_KEY\n"
+            }
+            SecretsMode::KeychainSync => {
+                "secrets:\n  master-key-source: keychain-sync\n  env-var-name: SECRETS_MASTER_KEY\n  keychain:\n    namespace: default\n    synchronizable: true\n"
+            }
+        }
+    }
+}
+
+/// The File-mode `secrets:` block exactly as [`MINIMAL_STARTER`] carries it.
+const STARTER_SECRETS_FILE_BLOCK: &str =
+    "secrets:\n  master-key-source: keychain\n  env-var-name: SECRETS_MASTER_KEY\n";
+
+/// [`MINIMAL_STARTER`] rendered for `mode` (File = the constant itself).
+pub fn starter_for_mode(mode: SecretsMode) -> String {
+    match mode {
+        SecretsMode::File => MINIMAL_STARTER.to_string(),
+        SecretsMode::KeychainSync => {
+            MINIMAL_STARTER.replacen(STARTER_SECRETS_FILE_BLOCK, mode.starter_secrets_block(), 1)
+        }
+    }
+}
+
 /// Write `.advance/` / `.runtime/` / `.agent/` (+ `.advance/packs/`, the
 /// default MODULE-018 `pack.packs-dir` — Pack lane P1) + starter
 /// files. Parent dirs may already exist (Linux `mkdirat` / create path).
+/// File secrets mode (the pre-existing behaviour, including the `master.key` mint).
 pub fn write_recognizable_home(path: &Path) -> Result<(), std::io::Error> {
+    write_recognizable_home_with_mode(path, SecretsMode::File)
+}
+
+/// [`write_recognizable_home`] for an explicit [`SecretsMode`]: the starter's `secrets:`
+/// block follows the mode and `master.key` is minted only in File mode.
+pub fn write_recognizable_home_with_mode(
+    path: &Path,
+    mode: SecretsMode,
+) -> Result<(), std::io::Error> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => {
             return Err(std::io::Error::new(
@@ -112,12 +164,16 @@ pub fn write_recognizable_home(path: &Path) -> Result<(), std::io::Error> {
     }
     write_new_0600(
         &path.join(".advance").join("runtime-config.yaml"),
-        MINIMAL_STARTER.as_bytes(),
+        starter_for_mode(mode).as_bytes(),
     )?;
     write_new_0600(
         &path.join(".agent").join("config.yaml"),
         AGENT_CONFIG_STARTER.as_bytes(),
     )?;
+    if mode == SecretsMode::KeychainSync {
+        // The master key is a keychain item, minted on first use; never a workspace file.
+        return Ok(());
+    }
     let master_path = path.join(".advance").join("master.key");
     if fs::symlink_metadata(&master_path).is_err() {
         let mut bytes = zeroize::Zeroizing::new([0u8; 32]);

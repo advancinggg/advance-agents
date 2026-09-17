@@ -96,14 +96,26 @@ fn fallback_init(path: &Path) -> Result<PathBuf, String> {
     advance_home::write_recognizable_home(&canonical)
         .map_err(|e| format!("failed to scaffold recognizable home: {e}"))?;
 
-    let mk = cap_secrets::MasterKeyConfig::Keychain {
-        service: cap_secrets::DEFAULT_KEYCHAIN_SERVICE.into(),
-        account: cap_secrets::DEFAULT_KEYCHAIN_ACCOUNT.into(),
-        fallback_env_var: Some("SECRETS_MASTER_KEY".into()),
-    };
-    let _ = cap_secrets::ensure_master_key(&canonical, &mk, &cap_secrets::DefaultEntryProvider);
+    ensure_scaffolded_master_key(&canonical);
 
     Ok(canonical)
+}
+
+/// First-open master key for the freshly written starter, through the cap-secrets factory:
+/// the scaffold's `secrets:` block is File mode, so this mints `<ws>/.advance/master.key`
+/// exactly as before (env → workspace file → `keyring` → mint); a keychain-sync block would
+/// mint a keychain item and no workspace file. Best-effort, as before.
+fn ensure_scaffolded_master_key(home: &Path) {
+    let cfg_path = home.join(".advance").join("runtime-config.yaml");
+    if let Ok(cfg) = advance_runtime::config::load_config(&cfg_path) {
+        let _ = cap_secrets::load_master_key_for(
+            home,
+            &cfg.secrets,
+            &cap_secrets::DefaultEntryProvider,
+            None,
+            cap_secrets::MasterKeyPolicy::Ensure,
+        );
+    }
 }
 
 // ============================================================================
@@ -223,12 +235,7 @@ fn try_linux_hardened(path: &Path) -> Result<String, TryLinuxErr> {
         .write_all(AGENT_CONFIG_STARTER.as_bytes())
         .map_err(|e| TryLinuxErr::Failed(format!("write .agent/config.yaml: {e}")))?;
 
-    let mk = cap_secrets::MasterKeyConfig::Keychain {
-        service: cap_secrets::DEFAULT_KEYCHAIN_SERVICE.into(),
-        account: cap_secrets::DEFAULT_KEYCHAIN_ACCOUNT.into(),
-        fallback_env_var: Some("SECRETS_MASTER_KEY".into()),
-    };
-    let _ = cap_secrets::ensure_master_key(&abs, &mk, &cap_secrets::DefaultEntryProvider);
+    ensure_scaffolded_master_key(&abs);
 
     Ok(abs.display().to_string())
 }

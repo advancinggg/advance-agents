@@ -340,6 +340,15 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
         ] {
             m.insert(name.to_string(), schema);
         }
+        // Secrets family (secrets mode: File vs keychain-sync) DTOs (additive).
+        m.insert(
+            "ClientSecretsMode".to_string(),
+            schema_value::<crate::secrets_admin::ClientSecretsMode>(),
+        );
+        m.insert(
+            "ClientSetSecretsModeRequest".to_string(),
+            schema_value::<crate::secrets_admin::ClientSetSecretsModeRequest>(),
+        );
         // MODULE-023 GenUI DTOs (CONTRACT-220/221).
         m.insert(
             "GenUiDocument".to_string(),
@@ -623,6 +632,23 @@ pub fn conformance_vectors() -> Value {
                     "request_id": "req_example_invalid_provider",
                     "data": null,
                     "error": { "code": "invalid_request", "message": "invalid provider id" },
+                    "warnings": []
+                }
+            },
+            {
+                // secrets-family: a mode switch to `keychain-sync` on a host without the
+                // synchronizable data-protection keychain. Same stable code as request validation; `details` carries the reason.
+                "name": "error_invalid_request_platform_unsupported",
+                "kind": "error",
+                "envelope": {
+                    "api_version": API_VERSION,
+                    "request_id": "req_example_platform_unsupported",
+                    "data": null,
+                    "error": {
+                        "code": "invalid_request",
+                        "message": "invalid request",
+                        "details": ["platform_unsupported"]
+                    },
                     "warnings": []
                 }
             },

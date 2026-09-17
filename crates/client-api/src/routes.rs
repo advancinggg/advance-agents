@@ -100,6 +100,10 @@ pub const TPL_PROVIDER_SET_KEY: &str = "/client/providers/{provider_id}:set-key"
 pub const TPL_PROVIDER_CLEAR_KEY: &str = "/client/providers/{provider_id}:clear-key";
 pub const TPL_PROVIDER_PREFLIGHT: &str = "/client/providers/{provider_id}:preflight";
 pub const TPL_PROVIDER_SELECT: &str = "/client/providers/{provider_id}:select";
+/// Secrets family (this lane): the home's secrets mode (GET)
+/// and the mode switch (POST). Its own family (`secrets`); no templated routes.
+pub const PATH_SECRETS_MODE: &str = "/client/secrets/mode";
+pub const PATH_SECRETS_SET_MODE: &str = "/client/secrets:set-mode";
 /// One segment of a templated route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Seg {

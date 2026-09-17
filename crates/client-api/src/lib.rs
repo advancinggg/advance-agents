@@ -40,6 +40,7 @@ pub mod request;
 pub mod routes;
 pub mod runs;
 pub mod schema;
+pub mod secrets_admin;
 pub mod session;
 pub mod tools;
 pub mod transport;
@@ -84,7 +85,8 @@ pub use packs::{
 pub use pagination::{Cursor, Page};
 pub use provider::{
     AgentAdminProvider, CostProvider, MessagingProvider, PackAdminProvider, ProviderAdminProvider,
-    ProviderError, RunControlProvider, ToolsProvider, UNKNOWN_PROVIDER_DETAIL,
+    ProviderError, RunControlProvider, SecretsAdminProvider, ToolsProvider,
+    UNKNOWN_PROVIDER_DETAIL,
 };
 pub use provider_admin::{
     ClientCreateProviderRequest, ClientProviderCost, ClientProviderDeleteResult, ClientProviderKey,
@@ -105,6 +107,7 @@ pub use providers::history::{
 };
 pub use request::{ClientRequest, Method};
 pub use runs::{ClientAgentTreeNode, ClientRunMutation, ClientRunSummary};
+pub use secrets_admin::{ClientSecretsMode, ClientSetSecretsModeRequest};
 pub use session::{ClientSession, Platform, Principal, Scope};
 pub use tools::{ClientMcpEntry, ClientSkillEntry, ClientToolEntry, ClientToolInventory};
 pub use transport::{client_api_router, ClientApiServer, CLIENT_WS_PROTOCOL};

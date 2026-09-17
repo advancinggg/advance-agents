@@ -8,12 +8,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use advance_runtime::config::{load_config, LlmProviderConfig, MasterKeySource, RuntimeConfig};
+use advance_runtime::config::{load_config, LlmProviderConfig, RuntimeConfig};
 use cap_http::{DefaultHttpSecurityChain, DefaultLeakDetector, DefaultRateLimiter};
 use cap_llm::{chat_preflight, StaticConfig};
 use cap_secrets::{
-    ensure_master_key, DefaultEntryProvider, FileSecretStorage, InMemorySecretStorage,
-    MasterKeyConfig, SecretStore, DEFAULT_KEYCHAIN_ACCOUNT, DEFAULT_KEYCHAIN_SERVICE,
+    open_secret_store, DefaultEntryProvider, InMemorySecretStorage, MasterKeyPolicy, SecretStore,
 };
 use secrecy::ExposeSecret;
 use zeroize::Zeroizing;
@@ -358,23 +357,19 @@ pub fn open_home_secret_store(home: &Path, cfg: &RuntimeConfig) -> Result<Secret
     open_file_store(home, cfg)
 }
 
+/// The home's secret store as `secrets:` selects it: the File layout for the `keychain` / `env-var` sources (byte-identical to the
+/// pre-factory `ensure_master_key` + `FileSecretStorage` pair) or the keychain-sync items.
+/// First-open semantics: a missing master key is minted when nothing depends on it yet.
 fn open_file_store(home: &Path, cfg: &RuntimeConfig) -> Result<SecretStore, String> {
-    let mk = master_key_config(cfg);
-    let key = ensure_master_key(home, &mk, &DefaultEntryProvider).map_err(|e| e.to_string())?;
-    let storage = FileSecretStorage::open(home.join(".advance").join("secrets.json"))
-        .map_err(|e| e.to_string())?;
-    Ok(SecretStore::new(key, Arc::new(storage)))
-}
-
-fn master_key_config(cfg: &RuntimeConfig) -> MasterKeyConfig {
-    match cfg.secrets.master_key_source {
-        MasterKeySource::EnvVar => MasterKeyConfig::EnvVar(cfg.secrets.env_var_name.clone()),
-        MasterKeySource::Keychain => MasterKeyConfig::Keychain {
-            service: DEFAULT_KEYCHAIN_SERVICE.to_string(),
-            account: DEFAULT_KEYCHAIN_ACCOUNT.to_string(),
-            fallback_env_var: Some(cfg.secrets.env_var_name.clone()),
-        },
-    }
+    open_secret_store(
+        home,
+        &cfg.secrets,
+        &DefaultEntryProvider,
+        None,
+        MasterKeyPolicy::Ensure,
+    )
+    .map(|opened| opened.into_store())
+    .map_err(|e| e.to_string())
 }
 
 impl PreflightPort for GeneratePathPreflight {

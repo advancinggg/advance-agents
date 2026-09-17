@@ -13,7 +13,7 @@ use advance_client_api::{
     ClientMessageAck, ClientMessageStatus, ClientRunMutation, ClientRunSummary, ClientSkillEntry,
     ClientToolEntry, ClientToolInventory, CostProvider, LlmDeltaHub, MessagingProvider,
     NormalizedEventFilter, PackAdminProvider, ProviderAdminProvider, ProviderError, RawEventRow,
-    RunControlProvider, ToolsProvider,
+    RunControlProvider, SecretsAdminProvider, ToolsProvider,
 };
 use advance_event_bus::{EventFilter, ObservabilityReadApi, ReadApiError, ReadCursor, ReadEvent};
 use advance_messaging::{MailboxStore, Message, MessageKind, MsgError};
@@ -542,6 +542,9 @@ pub struct FirstPartyClientCompose {
     /// CONTRACT-190 providers family (LLM provider entries + key custody) over the shared
     /// `llm-providers` writer and the daemon's live secret store.
     pub providers: Option<Arc<dyn ProviderAdminProvider>>,
+    /// Secrets family (this lane): the home's secrets mode
+    /// (File vs keychain-sync) over the runtime-config.yaml `secrets:` block.
+    pub secrets: Option<Arc<dyn SecretsAdminProvider>>,
 }
 
 pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCompose) -> ClientApi {
@@ -586,6 +589,9 @@ pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCom
     }
     if let Some(providers) = parts.providers {
         api = api.with_provider_admin(providers);
+    }
+    if let Some(secrets) = parts.secrets {
+        api = api.with_secrets_provider(secrets);
     }
     api
 }

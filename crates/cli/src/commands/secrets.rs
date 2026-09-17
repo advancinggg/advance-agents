@@ -14,16 +14,26 @@
 //! - `list` prints stored secret NAMES only (never values; no master key
 //!   needed).
 //! - `remove <name>` deletes a stored secret (no master key needed).
+//! - `migrate --to file|keychain-sync` moves every secret between the File layout and the
+//!   iCloud-Keychain-synchronized layout and repoints `secrets.master-key-source`
+//!   (this lane).
+//!
+//! Every store open goes through the cap-secrets factory, so the layout follows the
+//! workspace's `secrets:` block (File sources keep the pre-existing behaviour).
 //!
 //! Workspace resolution mirrors `advance start`: `--workspace` →
 //! `$ADVANCE_WORKSPACE` → current dir.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use cap_secrets::{FileSecretStorage, SecretStorage, SecretStore};
+use advance_runtime::config::SecretsConfig;
+use cap_secrets::{
+    open_secret_storage_unkeyed, open_secret_store, DefaultEntryProvider, MasterKeyPolicy,
+    MigrationReport, MigrationTarget, SecItemOps, SecretStorage, SecretsBackend,
+};
 
 /// `advance secrets set <name>` — read the value from stdin and store it
 /// encrypted in `<ws>/.advance/secrets.json`.
@@ -70,25 +80,49 @@ fn run_set_inner(name: &str, workspace: Option<PathBuf>) -> Result<(), String> {
             cfg_path.display()
         )
     })?;
-    let key = crate::wiring::load_real_master_key(&workspace, &cfg.secrets).map_err(|e| {
+    // The factory picks the layout `secrets:` selects (File sources keep the never-mint
+    // precedence env → workspace file → keyring; keychain-sync mints a keychain item only for
+    // an empty namespace) — the same mapping `advance start` uses (wiring.rs).
+    let policy = match cap_secrets::backend_of(&cfg.secrets) {
+        SecretsBackend::File => MasterKeyPolicy::Resolve,
+        SecretsBackend::KeychainSync => MasterKeyPolicy::Ensure,
+    };
+    let store = open_secret_store(
+        &workspace,
+        &cfg.secrets,
+        &DefaultEntryProvider,
+        None,
+        policy,
+    )
+    .map_err(|e| {
         // Name the ACTUAL env var the config points at (env-var-name), which may
         // be customized from the SECRETS_MASTER_KEY default.
         format!(
             "{e}; provision the master key (set ${} to 64 hex chars, or store it in the OS keychain) before `advance secrets set`",
             cfg.secrets.env_var_name
         )
-    })?;
-
-    let secrets_path = workspace.join(".advance").join("secrets.json");
-    let storage: Arc<dyn SecretStorage> = Arc::new(
-        FileSecretStorage::open(&secrets_path)
-            .map_err(|e| format!("could not open {}: {e}", secrets_path.display()))?,
-    );
-    let store = SecretStore::new(key, storage);
+    })?
+    .into_store();
     store
         .store(name, value)
         .map_err(|e| format!("failed to store secret {name:?}: {e}"))?;
     Ok(())
+}
+
+/// The `secrets:` block of the workspace config, or the File-layout view when the config is
+/// absent/unreadable (`list` / `remove` never needed the config before this lane; an
+/// un-inited directory still answers the empty File layout).
+fn secrets_config_or_file(workspace: &Path) -> SecretsConfig {
+    let cfg_path = workspace.join(".advance").join("runtime-config.yaml");
+    match advance_runtime::config::load_config(&cfg_path) {
+        Ok(cfg) => cfg.secrets,
+        Err(_) => SecretsConfig {
+            master_key_source: advance_runtime::config::MasterKeySource::EnvVar,
+            env_var_name: "SECRETS_MASTER_KEY".into(),
+            keychain: None,
+            dependencies: Default::default(),
+        },
+    }
 }
 
 /// `advance secrets list` — print stored secret names (NOT values).
@@ -109,10 +143,10 @@ pub fn run_list(workspace: Option<PathBuf>) -> ExitCode {
 
 fn run_list_inner(workspace: Option<PathBuf>) -> Result<Vec<String>, String> {
     let workspace = resolve_workspace(workspace)?;
-    let secrets_path = workspace.join(".advance").join("secrets.json");
     // No master key needed — names are not secret. Absent file → empty list.
-    let storage = FileSecretStorage::open(&secrets_path)
-        .map_err(|e| format!("could not open {}: {e}", secrets_path.display()))?;
+    let storage: Arc<dyn SecretStorage> =
+        open_secret_storage_unkeyed(&workspace, &secrets_config_or_file(&workspace), None)
+            .map_err(|e| format!("could not open the secret store: {e}"))?;
     Ok(storage.names())
 }
 
@@ -136,12 +170,89 @@ pub fn run_remove(name: String, workspace: Option<PathBuf>) -> ExitCode {
 
 fn run_remove_inner(name: &str, workspace: Option<PathBuf>) -> Result<bool, String> {
     let workspace = resolve_workspace(workspace)?;
-    let secrets_path = workspace.join(".advance").join("secrets.json");
-    let storage = FileSecretStorage::open(&secrets_path)
-        .map_err(|e| format!("could not open {}: {e}", secrets_path.display()))?;
+    let storage: Arc<dyn SecretStorage> =
+        open_secret_storage_unkeyed(&workspace, &secrets_config_or_file(&workspace), None)
+            .map_err(|e| format!("could not open the secret store: {e}"))?;
     storage
         .remove(name)
         .map_err(|e| format!("failed to remove secret {name:?}: {e}"))
+}
+
+/// `advance secrets migrate --to file|keychain-sync` — move every stored secret into the
+/// target layout (each name round-trip verified), then point `secrets.master-key-source` at
+/// it (this lane).
+pub fn run_migrate(to: String, workspace: Option<PathBuf>) -> ExitCode {
+    let Some(target) = MigrationTarget::parse(&to) else {
+        eprintln!("advance secrets migrate: --to must be `file` or `keychain-sync` (got {to:?})");
+        return ExitCode::from(2);
+    };
+    match run_migrate_with(target, workspace, None, &DefaultEntryProvider) {
+        Ok(report) if report.nothing_to_do => {
+            println!("advance secrets migrate: nothing to migrate; config now targets {to}");
+            ExitCode::SUCCESS
+        }
+        Ok(report) => {
+            println!(
+                "advance secrets migrate: moved {} secret(s) to {to} ({} file(s) renamed)",
+                report.migrated.len(),
+                report.renamed.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(msg) => {
+            eprintln!("advance secrets migrate: {msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// [`run_migrate`] with an injectable keychain (`ops = None` → the platform's real
+/// Security.framework; tests pass a `MockSecItemOps`) and `keyring` seam (`entries`; the
+/// File target's master key follows the scaffold `keychain` source: env → `master.key` →
+/// `keyring` → mint). On success the YAML `secrets:` block is rewritten to the target
+/// (`keychain-sync`, or the scaffold default `keychain` File source) through the validating
+/// tmp+rename chain.
+pub fn run_migrate_with(
+    target: MigrationTarget,
+    workspace: Option<PathBuf>,
+    ops: Option<Arc<dyn SecItemOps>>,
+    entries: &dyn cap_secrets::EntryProvider,
+) -> Result<MigrationReport, String> {
+    let workspace = resolve_workspace(workspace)?;
+    let cfg_path = workspace.join(".advance").join("runtime-config.yaml");
+    let cfg = advance_runtime::config::load_config(&cfg_path).map_err(|e| {
+        format!(
+            "could not load {} (run `advance init <workspace>` first): {e}",
+            cfg_path.display()
+        )
+    })?;
+    let (report, mode) = match target {
+        MigrationTarget::KeychainSync => {
+            if !cap_secrets::platform_supports_keychain_sync() {
+                return Err(cap_secrets::PLATFORM_UNSUPPORTED_MSG.to_string());
+            }
+            let report =
+                cap_secrets::migrate_file_to_keychain(&workspace, &cfg.secrets, entries, ops)
+                    .map_err(|e| format!("file → keychain-sync migration failed: {e}"))?;
+            (report, advance_home::SecretsMode::KeychainSync)
+        }
+        MigrationTarget::File => {
+            let report =
+                cap_secrets::migrate_keychain_to_file(&workspace, &cfg.secrets, entries, ops)
+                    .map_err(|e| format!("keychain-sync → file migration failed: {e}"))?;
+            (report, advance_home::SecretsMode::File)
+        }
+    };
+    advance_home::rewrite_secrets_mode(
+        &workspace,
+        &advance_home::SecretsModeChange {
+            mode,
+            synchronizable: None,
+            namespace: None,
+        },
+    )
+    .map_err(|e| format!("secrets migrated but the config rewrite failed: {e}"))?;
+    Ok(report)
 }
 
 /// Resolve the workspace dir: `--workspace` → `$ADVANCE_WORKSPACE` → CWD.

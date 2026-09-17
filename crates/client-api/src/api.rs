@@ -267,6 +267,8 @@ pub struct ClientApi {
     pack_provider: crate::provider::PackProviderSlot,
     /// Providers family (LLM provider administration) provider slot.
     provider_admin: crate::provider::ProviderAdminSlot,
+    /// Secrets family (secrets mode: File vs keychain-sync) provider slot.
+    secrets_provider: crate::provider::SecretsProviderSlot,
     /// m020-s3 CONTRACT-191 slots (event provider / leak detector / cursor codec).
     event_provider: EventProviderSlot,
     leak_detector: LeakDetectorSlot,
@@ -331,6 +333,7 @@ impl ClientApi {
             cost_provider: Arc::new(RwLock::new(None)),
             pack_provider: Arc::new(RwLock::new(None)),
             provider_admin: Arc::new(RwLock::new(None)),
+            secrets_provider: Arc::new(RwLock::new(None)),
             event_provider: Arc::new(RwLock::new(None)),
             leak_detector: Arc::new(RwLock::new(None)),
             cursor_codec: Arc::new(RwLock::new(None)),
@@ -384,6 +387,9 @@ impl ClientApi {
         // slot.
         let provider_admin_slot = Arc::clone(&self.provider_admin);
         crate::provider_admin::register(self, provider_admin_slot);
+        // Secrets family (secrets mode read / switch) over the SecretsAdminProvider slot.
+        let secrets_slot = Arc::clone(&self.secrets_provider);
+        crate::secrets_admin::register(self, secrets_slot);
         let event_slot = Arc::clone(&self.event_provider);
         let detector_slot = Arc::clone(&self.leak_detector);
         let codec_slot = Arc::clone(&self.cursor_codec);
@@ -510,6 +516,24 @@ impl ClientApi {
         provider: Arc<dyn crate::provider::ProviderAdminProvider>,
     ) {
         *self.provider_admin.write().unwrap() = Some(provider);
+    }
+
+    /// Inject the secrets-family provider (composition root / witness). Overwrites the slot
+    /// the secrets-family closures read; `None` (default) → `module_unavailable`.
+    pub fn with_secrets_provider(
+        self,
+        provider: Arc<dyn crate::provider::SecretsAdminProvider>,
+    ) -> Self {
+        *self.secrets_provider.write().unwrap() = Some(provider);
+        self
+    }
+
+    /// Late-install the secrets-family provider into an already-bound `Arc<ClientApi>`.
+    pub fn install_secrets_provider(
+        &self,
+        provider: Arc<dyn crate::provider::SecretsAdminProvider>,
+    ) {
+        *self.secrets_provider.write().unwrap() = Some(provider);
     }
 
     /// Inject the event provider (m020-s3 / Wave-25 composition root).

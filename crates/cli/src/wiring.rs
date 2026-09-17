@@ -45,9 +45,7 @@ use advance_reply_tracker::{
     ComponentResolutionSink, RunSuspendSink,
 };
 use advance_runtime::bootstrap::{BootstrapError, RuntimeHost, RuntimeHostBuilder};
-use advance_runtime::config::{
-    MasterKeySource, RunBudgetConfig, RuntimeConfigProvider, SecretsConfig,
-};
+use advance_runtime::config::{RunBudgetConfig, RuntimeConfigProvider, SecretsConfig};
 use advance_runtime::register_agent_genui;
 use advance_scheduler::{ComponentSubmitApi, InMemoryComponentSubmitApi, SubmitSubsetGate};
 use advance_scheduler_auto_loop::DefaultAutoLoopDriver;
@@ -109,10 +107,8 @@ use cap_memory::{
     PersistError, DEFAULT_MAX_ACTIVE_PER_AGENT,
 };
 use cap_secrets::{
-    load_master_key, register_agent_secrets, register_agent_secrets_with_policy,
-    CallerDependencyPolicy, DeclaredDependencyPolicy, DefaultEntryProvider, FileSecretStorage,
-    MasterKeyConfig, SecretError, SecretStorage, SecretStore, DEFAULT_KEYCHAIN_ACCOUNT,
-    DEFAULT_KEYCHAIN_SERVICE,
+    register_agent_secrets, register_agent_secrets_with_policy, CallerDependencyPolicy,
+    DeclaredDependencyPolicy, DefaultEntryProvider, SecretError, SecretStorage, SecretStore,
 };
 use cap_skills::provider::{SingleAgentSkillStoreProvider, SkillStoreProvider};
 use cap_tools::web::{
@@ -1195,6 +1191,25 @@ async fn wire_capabilities_inner(
     // journal/factory graph before EventBus, host registration, listeners, or
     // any other externally reachable runtime object exists.
     let mut master_key = if needs_key {
+        // keychain-sync (this lane): a home whose config moved
+        // to keychain-sync while it still carries `master.key` + `secrets.json` is migrated
+        // HERE, before the key is loaded, so the daemon boots on the keychain items (each
+        // name is round-trip verified; the files are renamed `*.migrated`). Idempotent — a
+        // File-mode home or an already-migrated home is untouched.
+        match cap_secrets::auto_migrate_if_needed(
+            workspace,
+            &builder.config().secrets,
+            &DefaultEntryProvider,
+            None,
+        ) {
+            Ok(Some(report)) => eprintln!(
+                "advance: migrated {} secret(s) into the synchronized keychain ({} file(s) renamed)",
+                report.migrated.len(),
+                report.renamed.len()
+            ),
+            Ok(None) => {}
+            Err(e) => return Err(CliWiringError::MasterKey(e)),
+        }
         Some(load_real_master_key(workspace, &builder.config().secrets)?)
     } else {
         None
@@ -1229,14 +1244,15 @@ async fn wire_capabilities_inner(
         let key = master_key
             .take()
             .expect("secrets/llm declaration is included in needs_key");
-        // WS-A: persistent on-disk backend so the daemon resolves provider keys
-        // (provisioned via `advance secrets set` → `<ws>/.advance/secrets.json`)
-        // at request time. Was `InMemorySecretStorage`, which started EMPTY every
-        // boot, so a provider `api-key-secret` reference never resolved.
-        let storage: Arc<dyn SecretStorage> = Arc::new(
-            FileSecretStorage::open(workspace.join(".advance/secrets.json"))
-                .map_err(|e| CliWiringError::SecretStorage(SecretError::from(e)))?,
-        );
+        // WS-A: persistent backend so the daemon resolves provider keys (provisioned via
+        // `advance secrets set` / the providers family) at request time. Was
+        // `InMemorySecretStorage`, which started EMPTY every boot, so a provider
+        // `api-key-secret` reference never resolved. The factory picks the layout the
+        // `secrets:` block selects: `<ws>/.advance/secrets.json` (File sources) or the
+        // synchronized keychain items (`keychain-sync`).
+        let storage: Arc<dyn SecretStorage> =
+            cap_secrets::open_storage(workspace, &builder.config().secrets, None, Some(&*key))
+                .map_err(CliWiringError::SecretStorage)?;
         Some(Arc::new(SecretStore::new(key, storage)))
     } else {
         drop(master_key.take());
@@ -2811,6 +2827,12 @@ async fn wire_capabilities_inner(
                     runtime_config.pack.clone(),
                     env!("CARGO_PKG_VERSION"),
                 ));
+            // Secrets family (this lane): the home's secrets
+            // mode over the same runtime-config.yaml write chain the selected-provider
+            // rewrite uses; `set-mode` only rewrites YAML (applies at the next start).
+            let secrets_admin_for_api: Arc<dyn advance_client_api::SecretsAdminProvider> = Arc::new(
+                crate::client_api_secrets::WiredSecretsAdmin::new(workspace.to_path_buf()),
+            );
             let tree_for_api = agent_tree_snapshot.clone();
             match advance_client_api::ClientApiServer::bind_local_factory(0, move |address| {
                 let mut config = advance_client_api::ClientApiConfig::default();
@@ -2837,6 +2859,7 @@ async fn wire_capabilities_inner(
                     packs: Some(pack_admin_for_api.clone()),
                     providers: Some(provider_admin_for_api.clone()
                         as Arc<dyn advance_client_api::ProviderAdminProvider>),
+                    secrets: Some(secrets_admin_for_api.clone()),
                     ..Default::default()
                 };
                 if let Some((history, events, projector)) = history_events {
@@ -2947,33 +2970,22 @@ async fn wire_capabilities_inner(
     ))
 }
 
-/// Map `RuntimeConfig.secrets` → [`MasterKeyConfig`] and load the real master
-/// key (64 hex chars = 32 bytes). `EnvVar` is the fully-wired + tested source;
-/// `Keychain` is best-effort (delegates to the loader's keychain→env fallback
-/// using the crate-provided default service/account constants — live OS
-/// keychain integration is deferred per MODULE-012 §3.6, so REQ-095 stays
-/// Partial).
+/// Load the real master key (64 hex chars = 32 bytes) for `RuntimeConfig.secrets` through
+/// the cap-secrets factory. File sources (`env-var` / `keychain`) keep the pre-existing
+/// never-mint precedence (env → workspace file → `keyring`; the whole set→resolve chain uses
+/// one key, cli/tests/secrets_roundtrip.rs). `keychain-sync`  uses env → keychain master item, and mints a keychain
+/// item only when the namespace holds no ciphertext yet (a fresh keychain-sync home has no
+/// `advance init` mint to lean on); `master.key` is never used in that mode.
 pub(crate) fn load_real_master_key(
     workspace: &Path,
     secrets: &SecretsConfig,
 ) -> Result<Zeroizing<[u8; 32]>, CliWiringError> {
-    let cfg = match secrets.master_key_source {
-        MasterKeySource::EnvVar => MasterKeyConfig::EnvVar(secrets.env_var_name.clone()),
-        MasterKeySource::Keychain => MasterKeyConfig::Keychain {
-            service: DEFAULT_KEYCHAIN_SERVICE.to_string(),
-            account: DEFAULT_KEYCHAIN_ACCOUNT.to_string(),
-            fallback_env_var: Some(secrets.env_var_name.clone()),
-        },
+    let policy = match cap_secrets::backend_of(secrets) {
+        cap_secrets::SecretsBackend::File => cap_secrets::MasterKeyPolicy::Resolve,
+        cap_secrets::SecretsBackend::KeychainSync => cap_secrets::MasterKeyPolicy::Ensure,
     };
-    // Precedence must mirror cap_secrets::ensure_master_key: an explicitly
-    // configured key (env/keychain) wins over the workspace-minted file, so the
-    // whole set→resolve chain uses one key (cli/tests/secrets_roundtrip.rs).
-    if let Some(key) = cap_secrets::resolve_master_key(workspace, &cfg, &DefaultEntryProvider)
-        .map_err(CliWiringError::MasterKey)?
-    {
-        return Ok(key);
-    }
-    load_master_key(&cfg, &DefaultEntryProvider).map_err(CliWiringError::MasterKey)
+    cap_secrets::load_master_key_for(workspace, secrets, &DefaultEntryProvider, None, policy)
+        .map_err(CliWiringError::MasterKey)
 }
 
 /// Build the AC-15 caller-dependency policy from `secrets.dependencies`

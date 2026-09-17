@@ -317,7 +317,9 @@ fn run_fixture(config: ClientApiConfig) -> RunFixture {
         mgr: Arc::clone(&mgr),
         bus: Arc::clone(&bus),
     };
-    let api = ClientApi::new(config).with_run_provider(Arc::new(adapter));
+    let api = ClientApi::new(config)
+        .with_run_provider(Arc::new(adapter))
+        .with_secrets_provider(Arc::new(PlatformUnsupportedSecrets));
     mint(
         &api,
         "tok",
@@ -340,6 +342,33 @@ fn pause_req(run_id: &str, key: &str, reason: &str) -> ClientRequest {
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 // Semantic 1 — ERROR: real requests produce the declared typed error codes
 // ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// A secrets-family provider standing in for a non-Apple host: every mode switch answers
+/// `PlatformUnsupported` (→ `invalid_request` + details `["platform_unsupported"]`).
+struct PlatformUnsupportedSecrets;
+
+impl advance_client_api::SecretsAdminProvider for PlatformUnsupportedSecrets {
+    fn mode(
+        &self,
+    ) -> Result<advance_client_api::ClientSecretsMode, advance_client_api::ProviderError> {
+        Ok(advance_client_api::ClientSecretsMode {
+            mode: "file".into(),
+            master_key_source: "env-var".into(),
+            synchronizable: true,
+            namespace: "default".into(),
+            access_group: None,
+            platform_supported: false,
+        })
+    }
+    fn set_mode(
+        &self,
+        _request: &advance_client_api::ClientSetSecretsModeRequest,
+    ) -> Result<advance_client_api::ClientSecretsMode, advance_client_api::ProviderError> {
+        Err(advance_client_api::ProviderError::PlatformUnsupported(
+            "keychain-sync".into(),
+        ))
+    }
+}
 
 /// Drive the real API through failure paths and return `(scenario, observed_code)` pairs.
 fn exercise_error_semantics() -> Vec<(&'static str, String)> {
@@ -458,6 +487,35 @@ fn exercise_error_semantics() -> Vec<(&'static str, String)> {
         "validation_invalid_transition",
         fx.api.handle(pause_req(&run_done_id, "k-inv", "witness")),
     ));
+
+    // invalid_request + details ["platform_unsupported"] — the secrets family refuses a
+    // keychain-sync mode switch on a host without the synchronizable keychain.
+    mint(
+        &fx.api,
+        "tok-secrets",
+        vec![Scope::ReadInventory, Scope::ApproveGrants],
+        None,
+        u64::MAX,
+    );
+    let unsupported = fx.api.handle(
+        ClientRequest::post(
+            "/client/secrets:set-mode",
+            json!({ "mode": "keychain-sync" }),
+        )
+        .with_session("tok-secrets")
+        .with_idempotency_key("k-secrets-unsupported"),
+    );
+    assert_eq!(
+        unsupported
+            .error
+            .as_ref()
+            .map(|e| e.details.clone())
+            .unwrap_or_default(),
+        vec!["platform_unsupported".to_string()],
+        "platform_unsupported detail: {:?}",
+        unsupported.error
+    );
+    observed.push(("secrets_set_mode_platform_unsupported", unsupported));
 
     // origin_not_allowed — browser Origin outside the exact-match allowlist.
     observed.push((
@@ -592,6 +650,7 @@ fn ac12_error_semantics_exercised_against_every_surface() {
         ("validation_bad_history_request", "projection_rejected"),
         ("validation_invalid_agent_request", "invalid_request"),
         ("validation_invalid_provider_request", "invalid_request"),
+        ("secrets_set_mode_platform_unsupported", "invalid_request"),
         ("idempotency_conflict", "idempotency_conflict"),
         ("provider_not_found", "not_found"),
         ("module_unavailable", "module_unavailable"),

@@ -93,6 +93,7 @@ pub const RESPONSE_COMPONENTS: &[&str] = &[
     "ClientProviderList",
     "ClientProviderKeyResult",
     "ClientProviderDeleteResult",
+    "ClientSecretsMode",
 ];
 
 /// Request / filter bodies — not a response-field bag.
@@ -116,6 +117,7 @@ pub const EXCLUDED_COMPONENTS: &[&str] = &[
     "ClientCreateProviderRequest",
     "ClientUpdateProviderRequest",
     "ClientSetProviderKeyRequest",
+    "ClientSetSecretsModeRequest",
 ];
 
 /// Git path of the on-disk honesty baseline, relative to the repo root.

@@ -189,6 +189,17 @@ enum SecretsCmd {
         #[arg(long)]
         workspace: Option<std::path::PathBuf>,
     },
+    /// Move the stored secrets between the File layout (`.advance/secrets.json` +
+    /// `.advance/master.key`) and the iCloud-Keychain-synchronized layout
+    /// (`keychain-sync`), verifying every name round-trips, then point
+    /// `secrets.master-key-source` at the target. `keychain-sync` is Apple-only.
+    Migrate {
+        /// `file` or `keychain-sync`.
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        workspace: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -242,6 +253,7 @@ fn main() -> ExitCode {
             SecretsCmd::Remove { name, workspace } => {
                 commands::secrets::run_remove(name, workspace)
             }
+            SecretsCmd::Migrate { to, workspace } => commands::secrets::run_migrate(to, workspace),
         },
         Cmd::Stop | Cmd::Status | Cmd::Breaker { .. } => {
             eprintln!(
