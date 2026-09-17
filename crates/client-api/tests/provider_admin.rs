@@ -226,10 +226,14 @@ impl ProviderAdminProvider for MemoryProviders {
             })
             .with_warning(ProviderAdminWarning::PreflightSkipped));
         }
+        // ONE guard: locking the same std Mutex twice inside a single struct-literal
+        // statement self-deadlocks (the first temporary guard lives to the end of the
+        // statement) — this is what stalled pa05/pa06 for hours.
+        let reason = self.preflight_reason.lock().unwrap().clone();
         let verdict = ClientProviderPreflightResult {
-            ok: self.preflight_reason.lock().unwrap().is_none(),
+            ok: reason.is_none(),
             checked_at_ms: 1_700_000_000_000,
-            reason: self.preflight_reason.lock().unwrap().clone(),
+            reason,
         };
         if verdict.ok {
             self.keys
