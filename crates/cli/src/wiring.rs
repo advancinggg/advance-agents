@@ -2466,7 +2466,7 @@ async fn wire_capabilities_inner(
             Some(
                 Arc::new(crate::agent_llm_policy::WorkspaceAgentLlmPolicy::new(
                     agent_tree.clone(),
-                    DEFAULT_AGENT_ID,
+                    root_uid.as_str(),
                     workspace.to_path_buf(),
                     event_bus_dyn.clone(),
                 )) as Arc<dyn cap_llm::AgentLlmPolicySource>,
@@ -2798,7 +2798,7 @@ async fn wire_capabilities_inner(
             Arc::new(advance_home::GeneratePathPreflight::default()),
             Arc::new(crate::agent_llm_policy::WorkspaceAgentLlmPolicy::new(
                 agent_tree.clone(),
-                DEFAULT_AGENT_ID,
+                root_uid.as_str(),
                 workspace.to_path_buf(),
                 event_bus_dyn.clone(),
             )),

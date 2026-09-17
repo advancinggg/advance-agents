@@ -201,14 +201,12 @@ async fn t_ag_02_positive_control_auto_grant_true_creates_grant() {
     // (agent, capability, function) tuple — the symmetric counterpart to
     // T-AG-03's Deny check. Without this, T-AG-02 could pass even if the
     // GrantCheck were wired wrong for the `true` case.
-    let decision =
-        host.grant_check()
-            .check(
-                &handles.root_agent_id,
-                "secrets",
-                "secret-exists",
-                &CapParams::empty(),
-            );
+    let decision = host.grant_check().check(
+        &handles.root_agent_id,
+        "secrets",
+        "secret-exists",
+        &CapParams::empty(),
+    );
     match decision {
         GrantDecision::Allow => {
             // expected
@@ -239,14 +237,12 @@ async fn t_ag_03_production_grant_check_wired_not_stub() {
     // Behaviour check: with no Grant for "secrets" (auto-grant: false),
     // the wired GrantCheckImpl must return Deny — proving the production
     // GrantCheckImpl is wired in (AllowAllGrantCheck would return Allow).
-    let decision =
-        host.grant_check()
-            .check(
-                &handles.root_agent_id,
-                "secrets",
-                "secret-exists",
-                &CapParams::empty(),
-            );
+    let decision = host.grant_check().check(
+        &handles.root_agent_id,
+        "secrets",
+        "secret-exists",
+        &CapParams::empty(),
+    );
     match decision {
         GrantDecision::Deny(reason) => {
             assert!(

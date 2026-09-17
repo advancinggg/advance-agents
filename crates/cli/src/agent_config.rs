@@ -912,6 +912,10 @@ mod llm_tests {
                 "{c:?}"
             );
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Root identity — three names, three jobs (MODULE-005; `cap_lifecycle::identity`):
 // the immutable `id` (UUID, every store's key), the addressable `handle`
 // (mailbox `agent:<handle>`), and the free-text `display-name`.
