@@ -2750,15 +2750,21 @@ async fn wire_capabilities_inner(
     // Providers family (CONTRACT-190 LLM provider administration): the shared `llm-providers`
     // writer over THIS workspace, the daemon's live secret store, the config watcher (so a
     // write waits for its own applied reload) and the Landing first-open preflight port.
-    // Agent references (`llm.provider` pins) are checked through `NoReferences` until the
-    // agent-llm-policy lane's tree walk is wired.
+    // A delete is refused while any agent pins the provider through its `llm.provider`
+    // (plan §4 step 2): the reference check walks the SAME tree + root the gateway's
+    // policy source reads, so the two can never disagree about who pins what.
     let provider_admin: Arc<crate::client_api_providers::WiredProviderAdmin> =
         Arc::new(crate::client_api_providers::WiredProviderAdmin::new(
             workspace.to_path_buf(),
             host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
             secret_store.clone(),
             Arc::new(advance_home::GeneratePathPreflight::default()),
-            Arc::new(crate::client_api_providers::NoReferences),
+            Arc::new(crate::agent_llm_policy::WorkspaceAgentLlmPolicy::new(
+                agent_tree.clone(),
+                DEFAULT_AGENT_ID,
+                workspace.to_path_buf(),
+                event_bus_dyn.clone(),
+            )),
         ));
     let provider_admin_for_api = provider_admin.clone();
     let client_api_server = match observability_read_api.as_ref() {

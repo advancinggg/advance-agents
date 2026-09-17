@@ -21,11 +21,13 @@ use std::time::SystemTime;
 use advance_event_bus::taxonomy::extensions::AGENT_LLM_POLICY_INVALID;
 use advance_shared_types::agent_tree::AgentId;
 use advance_shared_types::event::Event;
+use advance_shared_types::traits::AgentTreeSnapshot;
 use advance_shared_types::traits::EventBusEmit;
 use cap_lifecycle::AgentTreeStore;
 use cap_llm::{parse_constraint, AgentLlmPolicy, AgentLlmPolicySource};
 
 use crate::agent_config::{parse_agent_llm_config, read_agent_yaml, AgentLlmDecl};
+use crate::client_api_providers::ProviderReferenceCheck;
 
 /// Convert a validated block into the gateway's policy. `None` when the block is empty or its
 /// constraint does not parse (validation already rejects that; defensive).
@@ -158,6 +160,44 @@ impl AgentLlmPolicySource for WorkspaceAgentLlmPolicy {
     }
 }
 
+impl WorkspaceAgentLlmPolicy {
+    /// Every agent — the root plus every tree node — whose `.agent/config.yaml` `llm.provider`
+    /// names `provider_id`, sorted and de-duplicated. Reads the files directly (not the
+    /// per-agent cache) so a pin written a moment ago is seen. A malformed block pins nothing
+    /// (the same posture as [`AgentLlmPolicySource::policy_for`]).
+    pub fn pinned_agents(&self, provider_id: &str) -> Vec<String> {
+        let mut agents: Vec<(String, PathBuf)> = vec![(self.root_id.clone(), self.root.clone())];
+        if let Some(tree) = &self.tree {
+            for node in tree.snapshot().nodes {
+                if node.id.0 != self.root_id {
+                    agents.push((node.id.0.clone(), node.workspace_path.clone()));
+                }
+            }
+        }
+        let mut pinned: Vec<String> = agents
+            .into_iter()
+            .filter(|(_, workspace)| {
+                matches!(
+                    Self::load(workspace),
+                    Ok(Some(policy)) if policy.provider.as_deref() == Some(provider_id)
+                )
+            })
+            .map(|(id, _)| id)
+            .collect();
+        pinned.sort();
+        pinned.dedup();
+        pinned
+    }
+}
+
+/// The providers family's delete guard (plan §4 step 2): a provider some agent pins through
+/// its `llm.provider` cannot be deleted out from under it.
+impl ProviderReferenceCheck for WorkspaceAgentLlmPolicy {
+    fn referenced_by(&self, provider_id: &str) -> Vec<String> {
+        self.pinned_agents(provider_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +278,33 @@ mod tests {
         bump_mtime(&ws);
         assert!(src.policy_for("default-agent").is_some());
         assert_eq!(bus.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn root_only_source_reports_pinned_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_path_buf();
+        let bus = Arc::new(RecBus::default());
+        let src = WorkspaceAgentLlmPolicy::new(None, "default-agent", &ws, bus.clone());
+        // No config at all → nothing pinned.
+        assert!(src.pinned_agents("openai").is_empty());
+        write_config(
+            &ws,
+            "capabilities:\n  llm: true\nllm:\n  provider: openai\n",
+        );
+        assert_eq!(
+            src.pinned_agents("openai"),
+            vec!["default-agent".to_string()]
+        );
+        assert!(src.pinned_agents("anthropic").is_empty());
+        assert_eq!(
+            src.referenced_by("openai"),
+            vec!["default-agent".to_string()]
+        );
+        // A malformed block pins nothing (and the delete guard emits no event).
+        write_config(&ws, "llm:\n  providr: openai\n");
+        assert!(src.pinned_agents("openai").is_empty());
+        assert!(bus.0.lock().unwrap().is_empty());
     }
 
     #[test]

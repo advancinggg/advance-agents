@@ -659,3 +659,90 @@ async fn pv03_referenced_provider_delete_is_refused() {
     assert!(env.is_ok(), "{env:?}");
     assert_eq!(ids(&ws), vec!["openai"]);
 }
+
+// ── PV-04: the PRODUCTION reference check — an agent's `llm.provider` pin blocks the delete ───
+// (plan §4 step 2: the daemon composes `WorkspaceAgentLlmPolicy` as the `ProviderReferenceCheck`,
+// walking the same root + tree the gateway's policy source reads; no injected double here).
+#[tokio::test(flavor = "multi_thread")]
+async fn pv04_agent_pin_blocks_delete_through_production_reference_check() {
+    let (_g, ws, cfg) = fresh_workspace();
+    let (_host, handles) = boot(&ws, &cfg).await;
+    let api = handles
+        .client_api_server
+        .as_ref()
+        .expect("EventBus up ⇒ Client API bound")
+        .api();
+    mint(&api, "tok", Scope::operator_default());
+
+    // Two providers, so `last-provider` is not what refuses the delete.
+    let created: ClientProviderSummary = data(&post(
+        &api,
+        "/client/providers",
+        anthropic_body(),
+        "k-pv04-create",
+    ));
+    assert_eq!(created.provider_id, "anthropic");
+    assert_eq!(ids(&ws), vec!["openai", "anthropic"]);
+
+    // Pin the root agent to `openai` through the agents family (Lane 2's surface).
+    let env = post(
+        &api,
+        "/client/agents/default-agent:update",
+        json!({ "llm": { "provider": "openai" } }),
+        "k-pv04-pin",
+    );
+    assert!(env.is_ok(), "{env:?}");
+    assert!(std::fs::read_to_string(ws.join(".agent/config.yaml"))
+        .unwrap()
+        .contains("provider: openai"));
+
+    // The pinned provider cannot be deleted: invalid_state, document untouched.
+    let env = post(
+        &api,
+        "/client/providers/openai:delete",
+        Value::Null,
+        "k-pv04-del-pinned",
+    );
+    assert_eq!(
+        env.error_code(),
+        Some(ClientErrorCode::InvalidState),
+        "{env:?}"
+    );
+    assert_eq!(ids(&ws), vec!["openai", "anthropic"]);
+
+    // The other provider is not pinned by anyone: its delete goes through.
+    let env = post(
+        &api,
+        "/client/providers/anthropic:delete",
+        Value::Null,
+        "k-pv04-del-free",
+    );
+    let result: ClientProviderDeleteResult = data(&env);
+    assert_eq!(result.provider_id, "anthropic");
+    assert_eq!(result.selected_provider_id.as_deref(), Some("openai"));
+    assert_eq!(ids(&ws), vec!["openai"]);
+
+    // Clear the pin (`{}`), re-create the second provider, and the former pin target deletes.
+    let env = post(
+        &api,
+        "/client/agents/default-agent:update",
+        json!({ "llm": {} }),
+        "k-pv04-unpin",
+    );
+    assert!(env.is_ok(), "{env:?}");
+    let _: ClientProviderSummary = data(&post(
+        &api,
+        "/client/providers",
+        anthropic_body(),
+        "k-pv04-create-2",
+    ));
+    let env = post(
+        &api,
+        "/client/providers/openai:delete",
+        Value::Null,
+        "k-pv04-del-unpinned",
+    );
+    let result: ClientProviderDeleteResult = data(&env);
+    assert_eq!(result.selected_provider_id.as_deref(), Some("anthropic"));
+    assert_eq!(ids(&ws), vec!["anthropic"]);
+}
