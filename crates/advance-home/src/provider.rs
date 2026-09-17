@@ -224,7 +224,9 @@ pub fn list_provider_entries(home: &Path) -> Result<Vec<LlmProviderConfig>, Prov
 
 /// Create or update one `llm-providers` entry. `entry` is the YAML mapping in the runtime's
 /// kebab-case spelling (`id`, `endpoint`, `api-key-secret`, `model-aliases`, …); its `id` key
-/// names the entry. Runs the atomic tmp → validate → rename chain.
+/// names the entry. A `null` value means "no such key": it is dropped on create and REMOVES the
+/// stored key on update (so a caller can replace an optional group wholesale). Runs the atomic
+/// tmp → validate → rename chain.
 pub fn upsert_provider_entry(
     home: &Path,
     entry: serde_yml::Value,
@@ -246,6 +248,10 @@ pub fn upsert_provider_entry(
         match (mode, existing) {
             (UpsertMode::Create, Some(_)) => Err(ProviderWriteError::AlreadyExists),
             (UpsertMode::Create, None) => {
+                let mapping: serde_yml::Mapping = mapping
+                    .into_iter()
+                    .filter(|(_, value)| !value.is_null())
+                    .collect();
                 seq.push(serde_yml::Value::Mapping(mapping));
                 Ok(())
             }
@@ -258,7 +264,11 @@ pub fn upsert_provider_entry(
                     if key.as_str() == Some("id") {
                         continue;
                     }
-                    target.insert(key, value);
+                    if value.is_null() {
+                        target.remove(&key);
+                    } else {
+                        target.insert(key, value);
+                    }
                 }
                 Ok(())
             }

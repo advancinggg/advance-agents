@@ -520,14 +520,15 @@ fn cost_into(m: &mut Mapping, cost: &ClientProviderCost) {
             cost.cache_write_1h_per_mtoken,
         ),
     ] {
-        match value {
-            Some(v) => {
-                m.insert(key(name), Value::from(v));
-            }
-            None => {
-                m.remove(name);
-            }
-        }
+        // `null` = "no such key": dropped on create, removes the stored key on update — the
+        // cost group is replaced wholesale, never merged.
+        m.insert(
+            key(name),
+            match value {
+                Some(v) => Value::from(v),
+                None => Value::Null,
+            },
+        );
     }
 }
 
@@ -733,7 +734,10 @@ mod tests {
         assert_eq!(v["api-key-secret"], "anthropic-api-key");
         assert_eq!(v["model-aliases"]["sonnet"], "claude-sonnet-4-5");
         assert_eq!(v["cost-per-mtoken-cache-read"], 0.3);
-        assert!(v.get("cost-per-mtoken-cache-write").is_none());
+        // Absent optional prices travel as `null` (the writer drops them on create and
+        // removes the stored key on update — the cost group is never merged).
+        assert!(v["cost-per-mtoken-cache-write"].is_null());
+        assert!(v["cost-per-mtoken-cache-write-1h"].is_null());
         assert_eq!(v["rate-limit"]["requests-per-minute"], 100);
         // The rendered mapping parses as a runtime provider entry.
         let parsed: LlmProviderConfig = serde_yml::from_value(v).expect("runtime parses");
