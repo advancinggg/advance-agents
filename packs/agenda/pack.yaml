@@ -12,6 +12,8 @@ provides:
     - agenda
   meta-schema-extensions:
     - agenda
+  presets:
+    - agenda-editor
 checksums:
   algo: sha256
   files: {}

@@ -219,6 +219,10 @@ where
     /// struct preserves its existing ownership semantics. The provider
     /// itself reads through to the watcher's snapshot on each `current()`.
     tunables: Arc<dyn crate::TunablesProvider>,
+    /// Entity-data lane E1: projects each `.md` file into entity rows during the rebuild
+    /// (cap-fs implements it over the live schema; this crate cannot depend on cap-fs).
+    /// `None` = the entity tables stay empty after a rebuild.
+    entity_projector: Option<Arc<dyn advance_shared_types::entity::EntityProjector>>,
 }
 
 impl<H, E> R2d2IndexRebuildImpl<H, E>
@@ -232,7 +236,18 @@ where
             embedder,
             workspace_root,
             tunables: crate::default_tunables_provider(),
+            entity_projector: None,
         }
+    }
+
+    /// Entity-data lane E1: wire the frontmatter → entity projector so `rebuild_*` also
+    /// refills `entity_index` / `entity_aspect` / `entity_occurrence` from the files.
+    pub fn with_entity_projector(
+        mut self,
+        projector: Arc<dyn advance_shared_types::entity::EntityProjector>,
+    ) -> Self {
+        self.entity_projector = Some(projector);
+        self
     }
 
     /// Slice G: production wiring with a live `TunablesProvider`. Threads
@@ -249,6 +264,7 @@ where
             embedder,
             workspace_root,
             tunables,
+            entity_projector: None,
         }
     }
 }
@@ -286,6 +302,14 @@ where
                 &mut report,
             )
             .await?;
+            scan_entities(
+                &self.handle,
+                &self.workspace_root,
+                terr,
+                self.entity_projector.as_deref(),
+                &mut report,
+            )
+            .await?;
         }
 
         report.elapsed_ms = start.elapsed().as_millis() as u64;
@@ -318,10 +342,88 @@ where
             &mut report,
         )
         .await?;
+        scan_entities(
+            &self.handle,
+            &self.workspace_root,
+            &target,
+            self.entity_projector.as_deref(),
+            &mut report,
+        )
+        .await?;
 
         report.elapsed_ms = start.elapsed().as_millis() as u64;
         Ok(report)
     }
+}
+
+/// Entity-data lane E1: project every Markdown file of the territory through the wired
+/// [`advance_shared_types::entity::EntityProjector`] and replace its rows in the entity
+/// tables. No-op without a projector. Per-file failures are reported, never fatal.
+async fn scan_entities<H>(
+    handle: &H,
+    workspace_root: &Path,
+    terr: &AgentTerritory,
+    projector: Option<&dyn advance_shared_types::entity::EntityProjector>,
+    report: &mut RebuildReport,
+) -> Result<(), DbError>
+where
+    H: SqliteIndexHandle + Clone + 'static,
+{
+    use advance_shared_types::entity::EntityIndex;
+    let Some(projector) = projector else {
+        return Ok(());
+    };
+    let index = crate::entity_index::SqliteEntityIndex::new(Arc::new(handle.clone()));
+    let mut files = Vec::new();
+    for entry in WalkDir::new(&terr.agent_root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|e| !is_hidden_dir(e.file_name()))
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let is_md = entry
+            .path()
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+            .unwrap_or(false);
+        if is_md {
+            files.push(entry.path().to_path_buf());
+        }
+    }
+    let now = Utc::now();
+    for path in files {
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                report.push_error(format!("read entity source {}: {e}", path.display()));
+                continue;
+            }
+        };
+        let ws_path = normalize_workspace_path(workspace_root, &path);
+        let entity_path = ws_path.trim_start_matches('/').to_string();
+        let rows = match projector.project(&terr.agent_id, &entity_path, &bytes, now) {
+            Ok(rows) => rows,
+            Err(e) => {
+                report.push_error(format!("project entities {}: {e}", path.display()));
+                continue;
+            }
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        if let Err(e) = index.replace_path(&terr.agent_id, &entity_path, rows).await {
+            report.push_error(format!("entity index {}: {e}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -346,6 +448,9 @@ async fn truncate_all<H: SqliteIndexHandle + Clone + 'static>(handle: &H) -> Res
             "DELETE FROM memory_index",
             "DELETE FROM task_index",
             "DELETE FROM turn_index",
+            "DELETE FROM entity_occurrence",
+            "DELETE FROM entity_aspect",
+            "DELETE FROM entity_index",
         ] {
             tx.execute(stmt, [])?;
         }
@@ -378,6 +483,9 @@ async fn truncate_agent<H: SqliteIndexHandle + Clone + 'static>(
             "DELETE FROM memory_index WHERE agent_id = ?1",
             "DELETE FROM task_index WHERE agent_id = ?1",
             "DELETE FROM turn_index WHERE agent_id = ?1",
+            "DELETE FROM entity_occurrence WHERE agent_id = ?1",
+            "DELETE FROM entity_aspect WHERE agent_id = ?1",
+            "DELETE FROM entity_index WHERE agent_id = ?1",
         ] {
             tx.execute(join_stmt, params![agent])?;
         }

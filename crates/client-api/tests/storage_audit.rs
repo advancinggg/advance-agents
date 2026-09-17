@@ -840,7 +840,7 @@ fn t11u_comma_joined_protocols() {
     let mut snap = ClientStorageSnapshot::default();
     snap.local_storage.insert(
         "cache".into(),
-        format!("advance.client.2026-06-30, advance.bearer.{HEX64}"),
+        format!("advance.client.2026-09-17, advance.bearer.{HEX64}"),
     );
     assert_err(
         &snap,
@@ -866,7 +866,7 @@ fn t11v_authorization_bearer_hex64() {
 #[test]
 fn t11w_json_array_ws_protocols() {
     let mut snap = ClientStorageSnapshot::default();
-    let body = format!(r#"["advance.client.2026-06-30","advance.bearer.{HEX64}"]"#);
+    let body = format!(r#"["advance.client.2026-09-17","advance.bearer.{HEX64}"]"#);
     snap.local_storage.insert("cache".into(), body);
     assert_err(
         &snap,

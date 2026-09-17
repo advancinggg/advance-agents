@@ -1,5 +1,4 @@
-#![cfg(feature = "lane-e1")]
-//! Lane E1 — meta-schema v2 grammar (the internal entity-data lane plan §1.4 / §2.3): the shipped
+//! Lane E1 — meta-schema v2 grammar: the shipped
 //! `packs/agenda` aspect file is parsed key by key, `default` is optional, unknown keys are
 //! rejected, the expression language is closed, and the schema hash is content-addressed.
 
@@ -29,8 +28,12 @@ fn e1_agenda_fields_parse_with_every_v2_attribute() {
     let s = agenda();
     let aspect = &s.aspects["agenda"];
     assert_eq!(aspect.key, vec!["status".to_string(), "starts".to_string()]);
+    // Aspect fields are namespaced under their aspect: the `.meta.yaml` entry vocabulary
+    // (`optional`) is untouched, so an entry `status` and an agenda `status` cannot collide.
+    assert!(s.optional.is_empty());
+    let fields = &aspect.fields;
 
-    let status = &s.optional["status"];
+    let status = &fields["status"];
     assert_eq!(
         status.field_type,
         FieldType::EnumString(vec![
@@ -45,13 +48,13 @@ fn e1_agenda_fields_parse_with_every_v2_attribute() {
     assert_eq!(transitions["todo"].len(), 3);
     assert!(status.default.is_none(), "no default: absent = not an item");
 
-    assert_eq!(s.optional["due"].field_type, FieldType::DateTime);
-    assert_eq!(s.optional["exdates"].field_type, FieldType::ListDateTime);
-    assert_eq!(s.optional["priority"].field_type, FieldType::Integer);
-    assert!(s.optional["assignee"].inherit);
-    assert!(!s.optional["due"].inherit);
+    assert_eq!(fields["due"].field_type, FieldType::DateTime);
+    assert_eq!(fields["exdates"].field_type, FieldType::ListDateTime);
+    assert_eq!(fields["priority"].field_type, FieldType::Integer);
+    assert!(fields["assignee"].inherit);
+    assert!(!fields["due"].inherit);
 
-    let derive = s.optional["completed_at"]
+    let derive = fields["completed_at"]
         .derive
         .as_ref()
         .expect("derive declared");
@@ -63,13 +66,15 @@ fn e1_agenda_fields_parse_with_every_v2_attribute() {
     assert_eq!(derive.else_, DeriveElse::Unset);
 
     assert_eq!(
-        s.optional["ends"].ensure,
+        fields["ends"].ensure,
         Some(EnsureRule {
             op: Cmp::Gt,
             field: "starts".into()
         })
     );
-    assert_eq!(s.optional.len(), 11, "{:?}", s.optional.keys());
+    assert_eq!(fields.len(), 11, "{:?}", fields.keys());
+    assert_eq!(s.aspect_field("status"), Some(&fields["status"]));
+    assert_eq!(s.record_field("nope"), None);
 }
 
 #[test]
@@ -170,11 +175,19 @@ fn e1_default_is_optional_and_unknown_keys_are_rejected() {
         ),
         (
             "view of an undeclared query",
-            "aspect: a\nkey: [x]\noptional:\n  x:\n    type: string\nviews:\n  v: { kind: list, query: missing }\n",
+            "aspect: a\nkey: [x]\nfields:\n  x:\n    type: string\nviews:\n  v: { kind: list, query: missing }\n",
         ),
         (
             "unknown view kind",
-            "aspect: a\nkey: [x]\noptional:\n  x:\n    type: string\nviews:\n  v: { kind: gantt }\n",
+            "aspect: a\nkey: [x]\nfields:\n  x:\n    type: string\nviews:\n  v: { kind: gantt }\n",
+        ),
+        (
+            "key field not declared",
+            "aspect: a\nkey: [nope]\nfields:\n  x:\n    type: string\n",
+        ),
+        (
+            "two aspects disagree on a shared field",
+            "aspects:\n  a:\n    key: [x]\n    fields:\n      x:\n        type: string\n  b:\n    key: [x]\n    fields:\n      x:\n        type: integer\n",
         ),
     ] {
         assert!(load(yaml).is_err(), "{why} must be rejected: {yaml}");
@@ -183,16 +196,16 @@ fn e1_default_is_optional_and_unknown_keys_are_rejected() {
 
 #[test]
 fn e1_expression_language_is_closed() {
-    let base = "aspect: a\nkey: [x]\noptional:\n  x:\n    type: datetime\nqueries:\n  q:\n";
+    let base = "aspect: a\nkey: [x]\nfields:\n  x:\n    type: datetime\nqueries:\n  q:\n";
     for (why, tail) in [
-        ("arithmetic other than +/- duration", "    any_between: [$now, $now * 2]\n"),
+        (
+            "arithmetic other than +/- duration",
+            "    any_between: [$now, $now * 2]\n",
+        ),
         ("undeclared arg", "    any_between: [$args.missing, $now]\n"),
         ("unknown variable", "    any_between: [$today, $now]\n"),
         ("bad duration unit", "    any_between: [$now, $now + 3y]\n"),
-        (
-            "where on an undeclared field",
-            "    where: { nope: 1 }\n",
-        ),
+        ("where on an undeclared field", "    where: { nope: 1 }\n"),
     ] {
         assert!(
             load(&format!("{base}{tail}")).is_err(),

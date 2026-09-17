@@ -1,5 +1,4 @@
-#![cfg(feature = "lane-e4")]
-//! Lane E4 — signing and bundling a pack for the registry (the internal entity-data lane plan §5):
+//! Lane E4 — signing and bundling a pack for the registry:
 //! `sign` writes a `pack.sig` a trust root accepts, `bundle` produces an installable tarball
 //! and merges the registry index the production `HttpsRegistryClient` reads.
 
@@ -43,7 +42,10 @@ fn e4_sign_writes_a_pack_sig_that_a_trust_root_accepts() {
     let public_hex = sign_pack(&dir, &SECRET).expect("sign");
     assert_eq!(public_hex.len(), 64);
     let sig = std::fs::read_to_string(dir.join("pack.sig")).unwrap();
-    assert!(sig.contains("alg: ed25519") && sig.contains(&public_hex), "{sig}");
+    assert!(
+        sig.contains("alg: ed25519") && sig.contains(&public_hex),
+        "{sig}"
+    );
 
     let manifest = std::fs::read(dir.join("pack.yaml")).unwrap();
     assert_eq!(
@@ -84,7 +86,10 @@ async fn e4_bundle_produces_an_installable_tarball_and_merges_the_index() {
     assert_eq!(v["sha256"], serde_json::json!(report.sha256));
     assert_eq!(v["size"], serde_json::json!(report.size));
     assert!(
-        v["tarball"].as_str().unwrap().ends_with("agenda-0.1.0.tar.gz"),
+        v["tarball"]
+            .as_str()
+            .unwrap()
+            .ends_with("agenda-0.1.0.tar.gz"),
         "{index}"
     );
 
@@ -108,7 +113,11 @@ async fn e4_bundle_produces_an_installable_tarball_and_merges_the_index() {
     let bumped = tmp.path().join("agenda-0.2.0");
     copy_tree(&dir, &bumped);
     let manifest = std::fs::read_to_string(bumped.join("pack.yaml")).unwrap();
-    std::fs::write(bumped.join("pack.yaml"), manifest.replace("version: 0.1.0", "version: 0.2.0")).unwrap();
+    std::fs::write(
+        bumped.join("pack.yaml"),
+        manifest.replace("version: 0.1.0", "version: 0.2.0"),
+    )
+    .unwrap();
     let _ = std::fs::remove_file(bumped.join("pack.sig"));
     sign_pack(&bumped, &SECRET).unwrap();
     bundle_pack(&bumped, &out).expect("bundle 0.2.0");

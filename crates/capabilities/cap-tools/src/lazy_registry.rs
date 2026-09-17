@@ -194,6 +194,52 @@ pub trait HostTool: Send + Sync {
     /// Run `method` with the raw `params` bytes. The registry applies the
     /// invoke timeout and the result cap around this call.
     async fn execute(&self, method: &str, params: &[u8]) -> Result<Vec<u8>, ToolError>;
+
+    /// Entity-data lane E1: run `method` on behalf of `agent_id` (the guest whose
+    /// `tool-invoke` reached the registry). Identity-bearing tools such as `data`
+    /// implement this and refuse the anonymous [`execute`](Self::execute); the default
+    /// forwards to `execute` so identity-agnostic tools need no change.
+    async fn execute_as(
+        &self,
+        agent_id: &str,
+        method: &str,
+        params: &[u8],
+    ) -> Result<Vec<u8>, ToolError> {
+        let _ = agent_id;
+        self.execute(method, params).await
+    }
+}
+
+/// Entity-data lane E1: the frozen clock + seeded randomness a pure reducer sees under
+/// [`LazyToolRegistry::invoke_deterministic`]. Equal inputs + equal ctx ⇒ equal outputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeterministicCtx {
+    /// The wall clock the guest observes (also its monotonic clock's origin).
+    pub now: chrono::DateTime<chrono::Utc>,
+    /// Seeds `wasi:random` (secure and insecure) and the insecure seed.
+    pub seed: u64,
+}
+
+struct FrozenWallClock(std::time::Duration);
+
+impl wasmtime_wasi::HostWallClock for FrozenWallClock {
+    fn resolution(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(1)
+    }
+    fn now(&self) -> std::time::Duration {
+        self.0
+    }
+}
+
+struct FrozenMonotonicClock(u64);
+
+impl wasmtime_wasi::HostMonotonicClock for FrozenMonotonicClock {
+    fn resolution(&self) -> u64 {
+        1_000_000_000
+    }
+    fn now(&self) -> u64 {
+        self.0
+    }
 }
 
 /// Registered host tool + its cached description and load-time-compiled
@@ -442,6 +488,18 @@ impl LazyToolRegistry {
         method: &str,
         params: &[u8],
     ) -> Result<Vec<u8>, ToolError> {
+        self.invoke_host_as(entry, None, method, params).await
+    }
+
+    /// Host-tool dispatch; `agent_id = Some(_)` routes through
+    /// [`HostTool::execute_as`] (entity-data lane E1), `None` through `execute`.
+    async fn invoke_host_as(
+        &self,
+        entry: &HostToolEntry,
+        agent_id: Option<&str>,
+        method: &str,
+        params: &[u8],
+    ) -> Result<Vec<u8>, ToolError> {
         if !entry.description.methods.iter().any(|m| m.name == method) {
             return Err(ToolError::MethodNotFound(method.to_string()));
         }
@@ -455,7 +513,13 @@ impl LazyToolRegistry {
             GateSide::Input,
         )
         .await?;
-        let bytes = tokio::time::timeout(timeout, entry.tool.execute(method, params))
+        let call = async {
+            match agent_id {
+                Some(agent) => entry.tool.execute_as(agent, method, params).await,
+                None => entry.tool.execute(method, params).await,
+            }
+        };
+        let bytes = tokio::time::timeout(timeout, call)
             .await
             .map_err(|_| ToolError::InvocationFailed("invoke timeout".into()))??;
         validate_schema_gate(
@@ -466,6 +530,70 @@ impl LazyToolRegistry {
             GateSide::Output,
         )
         .await?;
+        if bytes.len() > max_result {
+            return Err(ToolError::OutputValidationFailed(format!(
+                "tool result exceeds max_result_bytes ({} > {})",
+                bytes.len(),
+                max_result
+            )));
+        }
+        Ok(bytes)
+    }
+
+    /// Entity-data lane E1: run a WASM tool method under a frozen clock + seeded
+    /// randomness (see [`DeterministicCtx`]). Same gates, timeout, fuel and result cap as
+    /// [`ToolRegistry::invoke`]; retries are never attempted (a reducer is called once).
+    /// Host tools have no sandbox to freeze and are refused.
+    pub async fn invoke_deterministic(
+        &self,
+        tool_id: &str,
+        method: &str,
+        params: &[u8],
+        ctx: DeterministicCtx,
+    ) -> Result<Vec<u8>, ToolError> {
+        if self.host_entry(tool_id).await.is_some() {
+            return Err(ToolError::InvocationFailed(format!(
+                "tool {tool_id:?} is a host tool; deterministic invocation needs a WASM tool"
+            )));
+        }
+        let loaded = load_inner(self, tool_id).await?;
+        let engine = match self.tool_engine.as_ref() {
+            Some(h) => h,
+            None => {
+                return Err(ToolError::InvocationFailed(
+                    "no tool engine: deterministic invocation needs the engine-bearing registry"
+                        .into(),
+                ));
+            }
+        };
+        let component = loaded
+            .component
+            .as_ref()
+            .ok_or_else(|| {
+                ToolError::InvocationFailed(
+                    "tool component absent post-load (Slice C invariant violated)".into(),
+                )
+            })?
+            .clone();
+        let timeout = self.config.tool_invoke_timeout;
+        let fuel = self.config.tool_fuel_per_call;
+        let max_result = self.config.max_result_bytes;
+        validate_cached_input(&loaded, method, params, timeout).await?;
+        let bytes = tokio::time::timeout(
+            timeout,
+            execute_in_wasm_with(
+                engine.engine().clone(),
+                component,
+                method.to_string(),
+                params.to_vec(),
+                fuel,
+                max_result,
+                Some(ctx),
+            ),
+        )
+        .await
+        .map_err(|_| ToolError::InvocationFailed("invoke timeout".into()))??;
+        validate_cached_output(&loaded, method, &bytes, timeout).await?;
         if bytes.len() > max_result {
             return Err(ToolError::OutputValidationFailed(format!(
                 "tool result exceeds max_result_bytes ({} > {})",
@@ -503,6 +631,23 @@ impl ToolRegistry for LazyToolRegistry {
         load_inner(self, tool_id).await.map(|loaded| ToolInstance {
             tool_id: loaded.tool_id.clone(),
         })
+    }
+
+    async fn invoke_as(
+        &self,
+        agent_id: &str,
+        tool_id: &str,
+        method: &str,
+        params: &[u8],
+    ) -> Result<Vec<u8>, ToolError> {
+        // Entity-data lane E1: host tools receive the caller; the WASM path is
+        // identity-agnostic (a tool component links only WASI).
+        if let Some(entry) = self.host_entry(tool_id).await {
+            return self
+                .invoke_host_as(&entry, Some(agent_id), method, params)
+                .await;
+        }
+        self.invoke(tool_id, method, params).await
     }
 
     async fn invoke(
@@ -925,7 +1070,31 @@ impl wasmtime_wasi::WasiView for ToolStoreData {
 const TOOL_MAX_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
 fn make_tool_store(engine: &wasmtime::Engine) -> wasmtime::Store<ToolStoreData> {
-    let wasi_ctx = wasmtime_wasi::WasiCtxBuilder::new().build();
+    make_tool_store_with(engine, None)
+}
+
+/// Entity-data lane E1: with `Some(ctx)` the WASI context carries a frozen wall clock, a
+/// frozen monotonic clock and seeded randomness, so a pure reducer cannot observe time or
+/// entropy that differs between two runs.
+fn make_tool_store_with(
+    engine: &wasmtime::Engine,
+    ctx: Option<&DeterministicCtx>,
+) -> wasmtime::Store<ToolStoreData> {
+    let wasi_ctx = match ctx {
+        None => wasmtime_wasi::WasiCtxBuilder::new().build(),
+        Some(c) => {
+            let secs = c.now.timestamp().max(0) as u64;
+            let nanos = c.now.timestamp_subsec_nanos();
+            let seed_bytes = c.seed.to_le_bytes().to_vec();
+            wasmtime_wasi::WasiCtxBuilder::new()
+                .wall_clock(FrozenWallClock(std::time::Duration::new(secs, nanos)))
+                .monotonic_clock(FrozenMonotonicClock(secs.saturating_mul(1_000_000_000)))
+                .secure_random(wasmtime_wasi::Deterministic::new(seed_bytes.clone()))
+                .insecure_random(wasmtime_wasi::Deterministic::new(seed_bytes))
+                .insecure_random_seed(c.seed as u128)
+                .build()
+        }
+    };
     let limits = wasmtime::StoreLimitsBuilder::new()
         .memory_size(TOOL_MAX_MEMORY_BYTES)
         .build();
@@ -1174,9 +1343,31 @@ async fn execute_in_wasm(
     fuel: Option<u64>,
     max_result_bytes: usize,
 ) -> Result<Vec<u8>, ToolError> {
+    execute_in_wasm_with(
+        engine,
+        component,
+        method,
+        params,
+        fuel,
+        max_result_bytes,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_in_wasm_with(
+    engine: wasmtime::Engine,
+    component: wasmtime::component::Component,
+    method: String,
+    params: Vec<u8>,
+    fuel: Option<u64>,
+    max_result_bytes: usize,
+    deterministic: Option<DeterministicCtx>,
+) -> Result<Vec<u8>, ToolError> {
     use wasmtime::component::Val;
 
-    let mut store = make_tool_store(&engine);
+    let mut store = make_tool_store_with(&engine, deterministic.as_ref());
     if let Some(f) = fuel {
         // Silently ignored when engine.consume_fuel() == false.
         let _ = store.set_fuel(f);

@@ -325,7 +325,12 @@ impl HostFunctionHandler for AgentToolsInvokeHandler {
 
             let start = Instant::now();
             let result = tools
-                .invoke(&decoded.tool_id, &decoded.method, &decoded.params)
+                .invoke_as(
+                    &ev_ctx.agent_id,
+                    &decoded.tool_id,
+                    &decoded.method,
+                    &decoded.params,
+                )
                 .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             match &result {
@@ -488,7 +493,12 @@ impl HostFunctionHandler for WebAwareInvokeHandler {
             }
             let start = Instant::now();
             let result = tools
-                .invoke(&decoded.tool_id, &decoded.method, &decoded.params)
+                .invoke_as(
+                    &agent_id,
+                    &decoded.tool_id,
+                    &decoded.method,
+                    &decoded.params,
+                )
                 .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             match &result {

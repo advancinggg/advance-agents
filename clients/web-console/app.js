@@ -1,5 +1,5 @@
-const API_VERSION = "2026-06-30";
-const WS_PROTOCOL = "advance.client.2026-06-30";
+const API_VERSION = "2026-09-17";
+const WS_PROTOCOL = "advance.client.2026-09-17";
 const state = { token: "", csrf: "", socket: null, eventCursor: null, reconnectTimer: null };
 const cf = /[\u00ad\u0600-\u0605\u061c\u06dd\u070f\u0890-\u0891\u08e2\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb]/gu;
 

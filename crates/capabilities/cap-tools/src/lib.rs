@@ -41,7 +41,7 @@ pub use host_fn::{
     AgentToolsInvokeHandler, AgentToolsListHandler, MAX_TOOL_PARAMS_BYTES,
     MAX_TOOL_STRING_PARAM_BYTES,
 };
-pub use lazy_registry::{HostTool, LazyRegistryConfig, LazyToolRegistry};
+pub use lazy_registry::{DeterministicCtx, HostTool, LazyRegistryConfig, LazyToolRegistry};
 pub use registry::{
     InMemoryToolRegistry, MethodInfo, ToolDescription, ToolError, ToolInfo, ToolInstance,
     ToolRegistry,

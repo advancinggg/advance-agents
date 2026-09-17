@@ -53,6 +53,9 @@ pub enum AutoRule {
     /// the directory/scope → `collection` case is set explicitly at the
     /// directory sites (`ensure_dir_meta`, reconcile) which know `is_dir`.
     EntityTypeDefault,
+    /// `id` field — a host-minted `e-` + ULID entity id (entity-data lane E1). Stable across
+    /// moves / promotion; the frontmatter codec assigns it to every record lacking one.
+    Ulid,
 }
 
 /// Field type constraint.
@@ -61,20 +64,53 @@ pub enum FieldType {
     String,
     Integer,
     Boolean,
+    /// RFC 3339 with offset, or `YYYY-MM-DD` (= 00:00 UTC). Stored as text.
+    DateTime,
+    /// `30m` / `2h` / `1d` / `7d` / `2w`.
+    Duration,
     EnumString(Vec<String>),
     ListString,
+    ListDateTime,
 }
 
 /// Field declaration.
 ///
 /// `PartialEq` (hotreload pre-build, 2026-06-10) powers the watcher's
 /// [`schema_changes`] diff; `serde_yml::Value` is `PartialEq`, so the derive
-/// is purely additive.
+/// is purely additive. The v2 attributes (`transitions` / `derive` / `ensure` /
+/// `inherit`, entity-data lane E1) take part in the comparison too.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldSpec {
     pub field_type: FieldType,
     pub auto: Option<AutoRule>,
+    /// Optional since v2; when present it is only a `describe` / projection default and is
+    /// never written into a record.
     pub default: Option<serde_yml::Value>,
+    /// Enum fields only: `from -> [to…]`; absent = any transition.
+    pub transitions: Option<BTreeMap<String, Vec<String>>>,
+    pub derive: Option<DeriveRule>,
+    pub ensure: Option<EnsureRule>,
+    /// Inline items inherit the parent file's value when they lack their own (projection only).
+    pub inherit: bool,
+}
+
+impl FieldSpec {
+    /// A plain field (no v2 attributes).
+    pub fn plain(
+        field_type: FieldType,
+        auto: Option<AutoRule>,
+        default: Option<serde_yml::Value>,
+    ) -> Self {
+        Self {
+            field_type,
+            auto,
+            default,
+            transitions: None,
+            derive: None,
+            ensure: None,
+            inherit: false,
+        }
+    }
 }
 
 /// Parsed meta-schema (in-memory representation).
@@ -82,19 +118,36 @@ pub struct FieldSpec {
 pub struct MetaSchema {
     pub required: BTreeMap<String, FieldSpec>,
     pub optional: BTreeMap<String, FieldSpec>,
+    /// Aspects (entity-data lane v2): one owner per aspect, fields namespaced under it.
+    pub aspects: BTreeMap<String, AspectSpec>,
     /// Maximum description length cap — from `meta.description_max_chars` config (default 500).
     pub description_max_chars: usize,
 }
 
+pub use crate::schema_v2::{
+    AspectSpec, Cmp, DeriveElse, DeriveRule, EnsureRule, OperationBinding, QuerySpec, ValueExpr,
+    ViewKind, ViewSpec, WhereClause,
+};
+
 impl Default for MetaSchema {
     fn default() -> Self {
         let mut required = BTreeMap::new();
+        // Entity id (entity-data lane E1): minted by the frontmatter codec, never by the
+        // `.meta.yaml` maintainer (which repairs only name / slug / description).
+        required.insert(
+            "id".to_string(),
+            FieldSpec::plain(FieldType::String, Some(AutoRule::Ulid), None),
+        );
         required.insert(
             "name".to_string(),
             FieldSpec {
                 field_type: FieldType::String,
                 auto: Some(AutoRule::Filename),
                 default: None,
+                transitions: None,
+                derive: None,
+                ensure: None,
+                inherit: false,
             },
         );
         required.insert(
@@ -103,6 +156,10 @@ impl Default for MetaSchema {
                 field_type: FieldType::String,
                 auto: Some(AutoRule::FilenameToSlug),
                 default: None,
+                transitions: None,
+                derive: None,
+                ensure: None,
+                inherit: false,
             },
         );
         required.insert(
@@ -111,6 +168,10 @@ impl Default for MetaSchema {
                 field_type: FieldType::String,
                 auto: Some(AutoRule::ContentExtract),
                 default: None,
+                transitions: None,
+                derive: None,
+                ensure: None,
+                inherit: false,
             },
         );
         // Entity `type` — first-class required discriminator (ADR 2026-06-29
@@ -122,6 +183,10 @@ impl Default for MetaSchema {
                 field_type: FieldType::String,
                 auto: Some(AutoRule::EntityTypeDefault),
                 default: None,
+                transitions: None,
+                derive: None,
+                ensure: None,
+                inherit: false,
             },
         );
         let mut optional = BTreeMap::new();
@@ -131,6 +196,10 @@ impl Default for MetaSchema {
                 field_type: FieldType::ListString,
                 auto: None,
                 default: Some(serde_yml::Value::Sequence(vec![])),
+                transitions: None,
+                derive: None,
+                ensure: None,
+                inherit: false,
             },
         );
         optional.insert(
@@ -143,11 +212,16 @@ impl Default for MetaSchema {
                 ]),
                 auto: None,
                 default: Some(serde_yml::Value::String("active".to_string())),
+                transitions: None,
+                derive: None,
+                ensure: None,
+                inherit: false,
             },
         );
         Self {
             required,
             optional,
+            aspects: BTreeMap::new(),
             description_max_chars: 500,
         }
     }
@@ -171,6 +245,11 @@ impl MetaSchema {
                 file_name,
                 false,
                 parse_frontmatter_type(body).as_deref(),
+            )),
+            Some(AutoRule::Ulid) => Some(format!(
+                "{}{}",
+                advance_shared_types::entity::ENTITY_ID_PREFIX,
+                ulid::Ulid::new()
             )),
             None => None,
         }
@@ -369,25 +448,6 @@ fn content_extract(body: &[u8], max_chars: usize) -> String {
     String::new()
 }
 
-/// Yaml structure of meta-schema.yaml. Used internally by parse.
-#[derive(Debug, Deserialize, Serialize)]
-struct YamlSchemaFile {
-    #[serde(default)]
-    required: BTreeMap<String, YamlFieldSpec>,
-    #[serde(default)]
-    optional: BTreeMap<String, YamlFieldSpec>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct YamlFieldSpec {
-    #[serde(rename = "type", default)]
-    field_type: Option<serde_yml::Value>,
-    #[serde(default)]
-    auto: Option<String>,
-    #[serde(default)]
-    default: Option<serde_yml::Value>,
-}
-
 /// Errors during schema parsing / validation.
 #[derive(Debug)]
 pub enum MetaSchemaError {
@@ -476,68 +536,15 @@ impl MetaSchemaLoader {
     }
 }
 
+/// Parse + validate a schema document. Grammar v2 (entity-data lane E1) lives in
+/// [`crate::schema_v2`]: v1 documents (`required` / `optional`) parse unchanged except that an
+/// optional field may omit `default` and unknown keys are rejected.
 fn parse_and_validate(yaml: &str) -> Result<MetaSchema, MetaSchemaError> {
-    let parsed: YamlSchemaFile =
-        serde_yml::from_str(yaml).map_err(|e| MetaSchemaError::Parse(format!("{e}")))?;
-
-    let mut required: BTreeMap<String, FieldSpec> = BTreeMap::new();
-    for (name, ys) in parsed.required {
-        let auto = match ys.auto.as_deref() {
-            Some("filename") => Some(AutoRule::Filename),
-            Some("filename-to-slug") => Some(AutoRule::FilenameToSlug),
-            Some("content-extract") => Some(AutoRule::ContentExtract),
-            Some("entity-type-default") => Some(AutoRule::EntityTypeDefault),
-            Some(other) => {
-                return Err(MetaSchemaError::Validation(format!(
-                    "unknown auto-rule for required field {name}: {other}"
-                )));
-            }
-            None => {
-                return Err(MetaSchemaError::Validation(format!(
-                    "required field {name} has no auto-generation rule"
-                )));
-            }
-        };
-        let field_type = parse_field_type(&ys.field_type, &name)?;
-        required.insert(
-            name,
-            FieldSpec {
-                field_type,
-                auto,
-                default: None,
-            },
-        );
-    }
-
-    let mut optional: BTreeMap<String, FieldSpec> = BTreeMap::new();
-    for (name, ys) in parsed.optional {
-        let field_type = parse_field_type(&ys.field_type, &name)?;
-        let default = ys.default.ok_or_else(|| {
-            MetaSchemaError::Validation(format!("optional field {name} has no default value"))
-        })?;
-        // Validate that the default value matches the declared field_type so
-        // misconfigured schemas are rejected at load time, not silently dropped
-        // when add_entry_for_write reads the default later.
-        validate_default_matches_type(&name, &field_type, &default)?;
-        optional.insert(
-            name,
-            FieldSpec {
-                field_type,
-                auto: None,
-                default: Some(default),
-            },
-        );
-    }
-
-    Ok(MetaSchema {
-        required,
-        optional,
-        description_max_chars: 500,
-    })
+    crate::schema_v2::parse_document(yaml)
 }
 
 /// Validate that an optional field's default value matches its declared FieldType.
-fn validate_default_matches_type(
+pub(crate) fn validate_default_matches_type(
     field_name: &str,
     field_type: &FieldType,
     default: &serde_yml::Value,
@@ -558,6 +565,22 @@ fn validate_default_matches_type(
             serde_yml::Value::String(s) => variants.iter().any(|v| v == s),
             _ => false,
         },
+        FieldType::DateTime => default
+            .as_str()
+            .and_then(crate::schema_v2::parse_datetime)
+            .is_some(),
+        FieldType::Duration => default
+            .as_str()
+            .and_then(crate::schema_v2::parse_duration)
+            .is_some(),
+        FieldType::ListDateTime => match default {
+            serde_yml::Value::Sequence(items) => items.iter().all(|i| {
+                i.as_str()
+                    .and_then(crate::schema_v2::parse_datetime)
+                    .is_some()
+            }),
+            _ => false,
+        },
     };
     if !ok {
         return Err(MetaSchemaError::Validation(format!(
@@ -567,7 +590,7 @@ fn validate_default_matches_type(
     Ok(())
 }
 
-fn parse_field_type(
+pub(crate) fn parse_field_type(
     ys_type: &Option<serde_yml::Value>,
     field_name: &str,
 ) -> Result<FieldType, MetaSchemaError> {
@@ -580,6 +603,9 @@ fn parse_field_type(
             "integer" => Ok(FieldType::Integer),
             "boolean" => Ok(FieldType::Boolean),
             "list<string>" => Ok(FieldType::ListString),
+            "datetime" => Ok(FieldType::DateTime),
+            "duration" => Ok(FieldType::Duration),
+            "list<datetime>" => Ok(FieldType::ListDateTime),
             other if other.starts_with("enum") => Err(MetaSchemaError::Validation(format!(
                 "field {field_name} enum types must be specified via list syntax"
             ))),
@@ -650,6 +676,13 @@ pub struct SchemaChanges {
     pub optional_added: Vec<String>,
     pub optional_removed: Vec<String>,
     pub optional_changed: Vec<String>,
+    /// Aspect NAMES added / removed / changed (entity-data lane v2).
+    #[serde(default)]
+    pub aspects_added: Vec<String>,
+    #[serde(default)]
+    pub aspects_removed: Vec<String>,
+    #[serde(default)]
+    pub aspects_changed: Vec<String>,
 }
 
 impl SchemaChanges {
@@ -662,6 +695,9 @@ impl SchemaChanges {
             && self.optional_added.is_empty()
             && self.optional_removed.is_empty()
             && self.optional_changed.is_empty()
+            && self.aspects_added.is_empty()
+            && self.aspects_removed.is_empty()
+            && self.aspects_changed.is_empty()
     }
 }
 
@@ -694,6 +730,21 @@ pub fn schema_changes(old: &MetaSchema, new: &MetaSchema) -> SchemaChanges {
         diff_maps(&old.required, &new.required);
     let (optional_added, optional_removed, optional_changed) =
         diff_maps(&old.optional, &new.optional);
+    let mut aspects_added = Vec::new();
+    let mut aspects_removed = Vec::new();
+    let mut aspects_changed = Vec::new();
+    for (name, spec) in &new.aspects {
+        match old.aspects.get(name) {
+            None => aspects_added.push(name.clone()),
+            Some(o) if o != spec => aspects_changed.push(name.clone()),
+            Some(_) => {}
+        }
+    }
+    for name in old.aspects.keys() {
+        if !new.aspects.contains_key(name) {
+            aspects_removed.push(name.clone());
+        }
+    }
     SchemaChanges {
         required_added,
         required_removed,
@@ -701,6 +752,9 @@ pub fn schema_changes(old: &MetaSchema, new: &MetaSchema) -> SchemaChanges {
         optional_added,
         optional_removed,
         optional_changed,
+        aspects_added,
+        aspects_removed,
+        aspects_changed,
     }
 }
 
@@ -1136,10 +1190,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_schema_has_four_required_fields() {
-        // ADR 2026-06-29 Decision 1: entity `type` is a 4th required field.
+    fn default_schema_has_five_required_fields() {
+        // ADR 2026-06-29 Decision 1: entity `type` is a 4th required field; the entity-data
+        // lane adds the auto-generated `id` (ULID) as the 5th.
         let s = MetaSchema::default();
-        assert_eq!(s.required.len(), 4);
+        assert_eq!(s.required.len(), 5);
+        assert!(matches!(s.required["id"].auto, Some(AutoRule::Ulid)));
         assert!(s.required.contains_key("name"));
         assert!(s.required.contains_key("slug"));
         assert!(s.required.contains_key("description"));
@@ -1420,18 +1476,17 @@ optional: {}
     }
 
     #[test]
-    fn parse_rejects_optional_without_default() {
+    fn parse_accepts_optional_without_default() {
+        // Meta-schema v2: `default` is optional (an absent field simply stays absent).
         let yaml = r#"
 required: {}
 optional:
   priority:
     type: integer
 "#;
-        let err = parse_and_validate(yaml).unwrap_err();
-        match err {
-            MetaSchemaError::Validation(s) => assert!(s.contains("default")),
-            other => panic!("expected Validation, got {other:?}"),
-        }
+        let s = parse_and_validate(yaml).unwrap();
+        assert_eq!(s.optional["priority"].field_type, FieldType::Integer);
+        assert!(s.optional["priority"].default.is_none());
     }
 
     #[test]
@@ -1455,7 +1510,7 @@ optional: {}
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("schema.yaml");
         let loader = MetaSchemaLoader::new_with_default(path.clone());
-        assert_eq!(loader.current().required.len(), 4);
+        assert_eq!(loader.current().required.len(), 5);
 
         let yaml = r#"
 required:
@@ -1496,7 +1551,7 @@ required:
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.yaml");
         let loader = MetaSchemaLoader::load_from_disk(&path).unwrap();
-        assert_eq!(loader.current().required.len(), 4);
+        assert_eq!(loader.current().required.len(), 5);
     }
 
     #[test]

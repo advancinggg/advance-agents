@@ -128,6 +128,12 @@ impl DefaultCatalog {
         self.components.values().map(|c| &c.entry)
     }
 
+    /// The vetted component entry named `name`, if any (inherent alias of
+    /// [`ComponentCatalog::lookup`]).
+    pub fn component(&self, name: &str) -> Option<&CatalogEntry> {
+        self.components.get(name).map(|c| &c.entry)
+    }
+
     pub fn action_entries(&self) -> impl Iterator<Item = &ActionEntry> {
         self.actions.values().map(|a| &a.entry)
     }
@@ -324,6 +330,19 @@ impl DefaultCatalog {
                         GenUiError::InvalidProps {
                             component: "Button".into(),
                             reason: format!("malformed action: {e}"),
+                        }
+                    })?;
+                self.validate_action(&action_ref)?;
+            }
+        }
+        // An entity form's submit action is a catalog action like a button's (lane E3).
+        if node.component == "EntityForm" {
+            if let Some(action_val) = node.props.get("submit_action") {
+                let action_ref: ActionRef =
+                    serde_json::from_value(action_val.clone()).map_err(|e| {
+                        GenUiError::InvalidProps {
+                            component: "EntityForm".into(),
+                            reason: format!("malformed submit_action: {e}"),
                         }
                     })?;
                 self.validate_action(&action_ref)?;

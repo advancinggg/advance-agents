@@ -12,7 +12,63 @@ use crate::error::DbError;
 // is rejected outright. Forward migrations (v2+) will append to MIGRATIONS and
 // bump SCHEMA_VERSION; the same gate handles stale-on-disk vs current-in-memory
 // version comparisons.
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+/// v2 (entity-data lane E1) adds the entity projection tables. A v1 database is upgraded in
+/// place: the three tables are created and `user_version` moves to 2 (the index is
+/// truncate-and-rebuild at boot, so no data migration is needed).
+pub(crate) const SCHEMA_VERSION: u32 = 2;
+
+const MIGRATIONS_V2: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS entity_index (
+        agent_id TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        anchor TEXT,
+        parent TEXT,
+        kind TEXT NOT NULL,
+        type TEXT NOT NULL,
+        title TEXT,
+        status TEXT,
+        due_at TEXT,
+        starts_at TEXT,
+        ends_at TEXT,
+        priority INTEGER,
+        fields_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(agent_id, entity_id)
+    )",
+    "CREATE TABLE IF NOT EXISTS entity_aspect (
+        entity_rowid INTEGER NOT NULL,
+        agent_id TEXT NOT NULL,
+        aspect TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS entity_occurrence (
+        entity_rowid INTEGER NOT NULL,
+        agent_id TEXT NOT NULL,
+        starts_at TEXT NOT NULL,
+        ends_at TEXT
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_entity_agent_path ON entity_index(agent_id, path)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_agent_parent ON entity_index(agent_id, parent)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_agent_status ON entity_index(agent_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_agent_due ON entity_index(agent_id, due_at)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_agent_starts ON entity_index(agent_id, starts_at)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_aspect_row ON entity_aspect(entity_rowid, aspect)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_occurrence_agent_starts ON entity_occurrence(agent_id, starts_at)",
+    "CREATE INDEX IF NOT EXISTS idx_entity_occurrence_row ON entity_occurrence(entity_rowid)",
+];
+
+/// The version this build upgrades in place (v1: the 11 original tables).
+const PREVIOUS_SCHEMA_VERSION: u32 = 1;
+/// Every table name the shape checks expect at `SCHEMA_VERSION` (v1's 11 + v2's 3).
+const EXPECTED_TABLES: u32 = 14;
+const EXPECTED_TABLES_V1: u32 = 11;
+/// SQL `IN (…)` bodies, lower-case, for the structural checks.
+const V1_TABLE_NAMES: &str = "'meta_index','content_index','content_fts','memory_index',\
+    'task_index','turn_index','meta_vec','content_vec','memory_vec','task_vec','turn_vec'";
+const V2_TABLE_NAMES: &str = "'entity_index','entity_aspect','entity_occurrence'";
+const ALL_TABLE_NAMES: &str = "'meta_index','content_index','content_fts','memory_index',\
+    'task_index','turn_index','meta_vec','content_vec','memory_vec','task_vec','turn_vec',\
+    'entity_index','entity_aspect','entity_occurrence'";
 
 const MIGRATIONS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS meta_index (
@@ -120,18 +176,21 @@ pub(crate) fn apply(conn: &mut Connection) -> Result<(), DbError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     let stored: u32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if stored != 0 && stored != SCHEMA_VERSION {
+    // v1 → v2 upgrade (entity-data lane E1): a database at the previous version is
+    // accepted (after the same structural checks a current-version file gets, over the
+    // tables v1 promises) and gains the entity tables; any other foreign version is refused.
+    if stored != 0 && stored != SCHEMA_VERSION && stored != PREVIOUS_SCHEMA_VERSION {
         // Rollback is automatic when `tx` drops without commit.
         return Err(DbError::SchemaMismatch {
             stored,
             expected: SCHEMA_VERSION,
         });
     }
-    if stored == SCHEMA_VERSION {
-        // user_version matches but the file may have been pre-seeded with the
-        // version marker only — empty (no tables) or attacker-shaped (some
+    if stored != 0 {
+        // user_version matches (or is the upgradable predecessor) but the file may have been
+        // pre-seeded with the version marker only — empty (no tables) or attacker-shaped (some
         // expected tables missing, others forged). Defense-in-depth: require
-        // ALL 11 expected names to exist as type='table' rows in sqlite_master
+        // ALL expected names of that version to exist as type='table' rows in sqlite_master
         // (FTS5 + vec0 virtual tables both appear under type='table'; their
         // shadow tables get separate rows but are not counted by this filter).
         // Filtering on type='table' specifically defeats round-9's
@@ -140,16 +199,21 @@ pub(crate) fn apply(conn: &mut Connection) -> Result<(), DbError> {
         // count to 11 but type='table' rejects them.
         // Full column-shape validation (forged-table-with-matching-shape)
         // remains deferred per §3.6.
+        let (name_list, expected) = if stored == PREVIOUS_SCHEMA_VERSION {
+            (V1_TABLE_NAMES, EXPECTED_TABLES_V1)
+        } else {
+            (ALL_TABLE_NAMES, EXPECTED_TABLES)
+        };
         let existing: u32 = tx.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND LOWER(name) IN \
-             ('meta_index','content_index','content_fts','memory_index','task_index',\
-              'turn_index','meta_vec','content_vec','memory_vec','task_vec','turn_vec')",
+            &format!(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND LOWER(name) IN ({name_list})"
+            ),
             [],
             |r| r.get(0),
         )?;
-        if existing != 11 {
+        if existing != expected {
             return Err(DbError::InvalidConfig(format!(
-                "user_version={SCHEMA_VERSION} but only {existing}/11 expected tables \
+                "user_version={stored} but only {existing}/{expected} expected tables \
                  present (type='table' filter, case-insensitive) — refusing to trust \
                  pre-seeded version marker without the corresponding schema; this likely \
                  indicates a tampered file"
@@ -179,11 +243,30 @@ pub(crate) fn apply(conn: &mut Connection) -> Result<(), DbError> {
         )?;
         if virtuals_ok != 6 {
             return Err(DbError::InvalidConfig(format!(
-                "user_version={SCHEMA_VERSION} but only {virtuals_ok}/6 virtual-table \
+                "user_version={stored} but only {virtuals_ok}/6 virtual-table \
                  expected-name rows have the correct module token (fts5/vec0) in their \
                  CREATE SQL — likely an ordinary-table impersonation of FTS5/vec0 \
                  surfaces at one of the expected names"
             )));
+        }
+        if stored == PREVIOUS_SCHEMA_VERSION {
+            // A v1 file must not already carry objects under the v2 names (any object kind,
+            // case-insensitive — the same rule the fresh-database check applies): the
+            // CREATE-IF-NOT-EXISTS upgrade would otherwise bless a planted shape as v2.
+            let planted: u32 = tx.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE LOWER(name) IN ({V2_TABLE_NAMES})"
+                ),
+                [],
+                |r| r.get(0),
+            )?;
+            if planted > 0 {
+                return Err(DbError::InvalidConfig(format!(
+                    "user_version={stored} but {planted} object(s) already use the version-\
+                     {SCHEMA_VERSION} table names — refusing to upgrade over an unknown shape; \
+                     this likely indicates a tampered file"
+                )));
+            }
         }
     }
     if stored == 0 {
@@ -212,9 +295,7 @@ pub(crate) fn apply(conn: &mut Connection) -> Result<(), DbError> {
         // case-sensitive IN-list. Lowercasing both sides forecloses every
         // case variant the attacker could plant.
         let preexisting: u32 = tx.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE LOWER(name) IN \
-             ('meta_index','content_index','content_fts','memory_index','task_index',\
-              'turn_index','meta_vec','content_vec','memory_vec','task_vec','turn_vec')",
+            &format!("SELECT COUNT(*) FROM sqlite_master WHERE LOWER(name) IN ({ALL_TABLE_NAMES})"),
             [],
             |r| r.get(0),
         )?;
@@ -227,6 +308,9 @@ pub(crate) fn apply(conn: &mut Connection) -> Result<(), DbError> {
         }
     }
     for stmt in MIGRATIONS {
+        tx.execute(stmt, [])?;
+    }
+    for stmt in MIGRATIONS_V2 {
         tx.execute(stmt, [])?;
     }
     // PRAGMA user_version takes a literal integer, not a bound parameter

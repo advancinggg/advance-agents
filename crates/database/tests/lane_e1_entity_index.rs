@@ -1,5 +1,4 @@
-#![cfg(feature = "lane-e1")]
-//! Lane E1 — `SqliteEntityIndex` over the workspace index DB (the internal entity-data lane plan §2.2).
+//! Lane E1 — `SqliteEntityIndex` over the workspace index DB.
 
 use std::sync::Arc;
 
@@ -36,7 +35,7 @@ fn row(id: &str, path: &str, anchor: Option<&str>, kind: EntityKind) -> EntityRo
 
 async fn index() -> (tempfile::TempDir, SqliteEntityIndex) {
     let tmp = tempfile::TempDir::new().unwrap();
-    let handle = R2d2SqliteIndexHandle::open(tmp.path().join("index.sqlite"), 2).expect("open");
+    let handle = R2d2SqliteIndexHandle::new(&tmp.path().join("index.sqlite"), 2).expect("open");
     handle
         .run_migrations()
         .expect("migrations incl. entity tables");
@@ -123,16 +122,29 @@ async fn e1_query_filters_windows_order_and_bounds() {
 
     let mut q = EntityQuery::for_agent("alice");
     q.aspect = Some("agenda".into());
-    assert_eq!(idx.query(&q).await.unwrap().len(), 3, "the plain file has no aspect");
+    assert_eq!(
+        idx.query(&q).await.unwrap().len(),
+        3,
+        "the plain file has no aspect"
+    );
 
     let mut q = EntityQuery::for_agent("alice");
     q.status = Some(vec!["todo".into(), "doing".into()]);
-    assert_eq!(idx.query(&q).await.unwrap().len(), 1, "status is an IN filter");
+    assert_eq!(
+        idx.query(&q).await.unwrap().len(),
+        1,
+        "status is an IN filter"
+    );
 
     let mut q = EntityQuery::for_agent("alice");
     q.due_between = Some((ts("2026-09-01T00:00:00Z"), ts("2026-10-01T00:00:00Z")));
     assert_eq!(
-        idx.query(&q).await.unwrap().iter().map(|r| r.id.0.as_str()).collect::<Vec<_>>(),
+        idx.query(&q)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id.0.as_str())
+            .collect::<Vec<_>>(),
         vec!["e-soon"]
     );
 

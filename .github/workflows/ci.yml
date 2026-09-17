@@ -142,9 +142,18 @@ jobs:
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
       # Guest fixtures are excluded + prebuilt (.core.wasm committed), so the
-      # workspace test run loads them as bytes and needs no wasm target. Add the
-      # target ONLY when rebuilding a fixture:
-      #   - run: rustup target add wasm32-unknown-unknown
+      # workspace test run loads them as bytes. The wasm target is needed for the
+      # pack build below (the agenda pack's skill tool.wasm is built from
+      # `crates/packs/agenda-tools`, a workspace `exclude`), which the packs-dir
+      # guard and the E2 pack witness then install with the real installer.
+      - run: rustup target add wasm32-unknown-unknown
+      - name: advance pack build (every packs/*.build.yaml)
+        run: |
+          set -euo pipefail
+          for m in packs/*.build.yaml; do
+            name="$(basename "$m" .build.yaml)"
+            cargo run -p advance-cli --locked -- pack build "packs/$name" --out target/packs
+          done
       - name: cargo test --workspace --locked
         run: cargo test --workspace --locked
       # Feature-gated suites: `advance-reply-tracker`'s integration tests

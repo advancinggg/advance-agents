@@ -99,6 +99,28 @@ impl HttpsRegistryClient {
         Ok(url)
     }
 
+    /// The tarball URL of an index entry: an absolute URL (validated like the base) or a bare
+    /// file name (`<name>-<version>.tar.gz`, what `advance pack bundle` writes without
+    /// `--base-url`) resolved to `{base}/{file}` — so one static registry tree can be served
+    /// from any host. A bare name must be a single segment (no `/`, `..`, `@`, leading `.`).
+    fn tarball_url(&self, raw: &str) -> Result<Url, PackError> {
+        if raw.contains("://") {
+            return parse_registry_url(raw, "tarball URL");
+        }
+        validate_segment(raw, "tarball")?;
+        let mut url = self.base.clone();
+        {
+            let mut segs = url
+                .path_segments_mut()
+                .map_err(|_| PackError::ConstraintViolation {
+                    reason: "registry base URL cannot be a base".into(),
+                })?;
+            segs.pop_if_empty();
+            segs.push(raw);
+        }
+        parse_registry_url(url.as_str(), "tarball URL")
+    }
+
     async fn fetch_index(&self, name: &str) -> Result<IndexDoc, PackError> {
         let url = self.index_url(name)?;
         let fail = |reason: String| PackError::RegistryFetchFailed {
@@ -162,7 +184,7 @@ impl RegistryClient for HttpsRegistryClient {
             )));
         }
         let expected = decode_sha256(&entry.sha256).map_err(fail)?;
-        let tarball_url = parse_registry_url(&entry.tarball, "tarball URL")?;
+        let tarball_url = self.tarball_url(&entry.tarball)?;
 
         std::fs::create_dir_all(dest_dir).map_err(|e| PackError::Io {
             path: dest_dir.to_path_buf(),
@@ -362,6 +384,36 @@ fn validate_segment(segment: &str, label: &str) -> Result<(), PackError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_tarball_names_resolve_against_the_base_absolute_urls_are_revalidated() {
+        let t = Duration::from_secs(1);
+        let c = HttpsRegistryClient::new("https://registry.example.com/packs", t).unwrap();
+        assert_eq!(
+            c.tarball_url("agenda-0.1.0.tar.gz").unwrap().as_str(),
+            "https://registry.example.com/packs/agenda-0.1.0.tar.gz"
+        );
+        let c = HttpsRegistryClient::new("https://registry.example.com/packs/", t).unwrap();
+        assert_eq!(
+            c.tarball_url("agenda-0.1.0.tar.gz").unwrap().as_str(),
+            "https://registry.example.com/packs/agenda-0.1.0.tar.gz"
+        );
+        assert_eq!(
+            c.tarball_url("https://cdn.example.com/a.tar.gz")
+                .unwrap()
+                .as_str(),
+            "https://cdn.example.com/a.tar.gz"
+        );
+        for bad in [
+            "../x.tar.gz",
+            "sub/x.tar.gz",
+            ".hidden.tar.gz",
+            "http://10.0.0.1/x.tar.gz",
+            "",
+        ] {
+            assert!(c.tarball_url(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn url_policy_https_any_host_http_loopback_only_no_userinfo() {

@@ -55,6 +55,9 @@ pub enum Scope {
     ReadEvents,
     /// Tee T2 (CONTRACT-235) — subscribe to the LLM token-delta stream (§2.4).
     ReadLlmDeltas,
+    /// Entity-data lane E3 — the entities-family mutations (create / patch / apply / promote /
+    /// demote). Reads (`/client/schema`, `:query`, one row) stay under `ReadInventory`.
+    WriteEntities,
 }
 
 impl Scope {
@@ -69,6 +72,7 @@ impl Scope {
             Scope::ReadInventory,
             Scope::ReadEvents,
             Scope::ReadLlmDeltas,
+            Scope::WriteEntities,
         ]
     }
 }

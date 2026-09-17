@@ -13,8 +13,6 @@ publish = false
 # witnesses drive linger/cadence values without wall-clock sleeps. Precedent: crates/cli,
 # crates/shared-types, crates/scheduler self dev-dep feature unification.
 test-support = []
-# entity-data lane gated witness tests (the internal entity-data lane plan §0.2)
-lane-e3 = []
 
 [lib]
 name = "advance_client_api"

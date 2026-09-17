@@ -139,6 +139,7 @@ pub mod component;
 pub mod context;
 pub mod contract218_previsible;
 pub mod cost;
+pub mod entity;
 pub mod event;
 pub mod inference;
 pub mod mailbox;
@@ -160,6 +161,7 @@ pub mod token_estimate;
 pub mod traits;
 pub mod turn_attribution;
 pub mod web_search;
+pub mod yaml_guard;
 
 pub use component::ComponentType;
 

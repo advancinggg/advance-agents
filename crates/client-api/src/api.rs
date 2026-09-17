@@ -269,6 +269,8 @@ pub struct ClientApi {
     provider_admin: crate::provider::ProviderAdminSlot,
     /// Secrets family (secrets mode: File vs keychain-sync) provider slot.
     secrets_provider: crate::provider::SecretsProviderSlot,
+    /// Schema + entities families (entity-data lane E3) provider slot.
+    entity_provider: crate::provider::EntityProviderSlot,
     /// m020-s3 CONTRACT-191 slots (event provider / leak detector / cursor codec).
     event_provider: EventProviderSlot,
     leak_detector: LeakDetectorSlot,
@@ -334,6 +336,7 @@ impl ClientApi {
             pack_provider: Arc::new(RwLock::new(None)),
             provider_admin: Arc::new(RwLock::new(None)),
             secrets_provider: Arc::new(RwLock::new(None)),
+            entity_provider: Arc::new(RwLock::new(None)),
             event_provider: Arc::new(RwLock::new(None)),
             leak_detector: Arc::new(RwLock::new(None)),
             cursor_codec: Arc::new(RwLock::new(None)),
@@ -390,6 +393,9 @@ impl ClientApi {
         // Secrets family (secrets mode read / switch) over the SecretsAdminProvider slot.
         let secrets_slot = Arc::clone(&self.secrets_provider);
         crate::secrets_admin::register(self, secrets_slot);
+        // Schema + entities families (entity-data lane E3) over the EntityProvider slot.
+        let entity_slot = Arc::clone(&self.entity_provider);
+        crate::entities::register(self, entity_slot);
         let event_slot = Arc::clone(&self.event_provider);
         let detector_slot = Arc::clone(&self.leak_detector);
         let codec_slot = Arc::clone(&self.cursor_codec);
@@ -498,6 +504,19 @@ impl ClientApi {
     /// Late-install the packs-family provider into an already-bound `Arc<ClientApi>`.
     pub fn install_pack_provider(&self, provider: Arc<dyn crate::provider::PackAdminProvider>) {
         *self.pack_provider.write().unwrap() = Some(provider);
+    }
+
+    /// Inject the schema + entities families' provider (composition root / witness).
+    /// Overwrites the slot the entities-family closures read; `None` (default) →
+    /// `module_unavailable`.
+    pub fn with_entity_provider(self, provider: Arc<dyn crate::provider::EntityProvider>) -> Self {
+        *self.entity_provider.write().unwrap() = Some(provider);
+        self
+    }
+
+    /// Late-install the entities-family provider into an already-bound `Arc<ClientApi>`.
+    pub fn install_entity_provider(&self, provider: Arc<dyn crate::provider::EntityProvider>) {
+        *self.entity_provider.write().unwrap() = Some(provider);
     }
 
     /// Inject the providers-family provider (composition root / witness). Overwrites the slot

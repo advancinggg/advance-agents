@@ -27,6 +27,11 @@ use crate::costs::{
     ValidatedCostWindow,
 };
 use crate::cursor::ClientCursorCodec;
+use crate::entities::{
+    ClientEntityApplyRequest, ClientEntityCreateRequest, ClientEntityPage,
+    ClientEntityPatchRequest, ClientEntityQueryRequest, ClientEntityRow, ClientEntityTarget,
+    ClientSchema,
+};
 use crate::envelope::{ClientError, ClientErrorCode};
 use crate::events::ClientEventProvider;
 use crate::messages::{ClientMessageAck, ClientMessageStatus};
@@ -247,6 +252,47 @@ pub trait PackAdminProvider: Send + Sync {
     ) -> Result<ClientPackUninstallResult, ProviderError>;
 }
 
+/// Entity data provider (entity-data lane E3) behind the `schema` + `entities` families. The
+/// cli adapter wraps the ONE production `DataStore` the `data` host tool uses, so a client
+/// write runs the same host-owned transaction an agent write runs (validation, transitions,
+/// derived fields, canonical write, commit, index, `data.entity_changed`). Every id / request
+/// it receives has already passed handler-side validation in [`crate::entities`].
+///
+/// Error projection: unknown entity → `NotFound`; an undeclared transition, a failed
+/// operation precondition, or a container at its item cap → `InvalidState`; a malformed
+/// record / op / target the host refuses → `InvalidRequest`; a territory the agent may not
+/// touch → `Forbidden`; an operation whose tool is not installed, or a store IO failure →
+/// `Unavailable`.
+pub trait EntityProvider: Send + Sync {
+    /// The merged meta-schema (aspects, fields, queries, views, operations + availability).
+    fn describe(&self) -> Result<ClientSchema, ProviderError>;
+    /// A named or ad-hoc query over one agent's entities (bounded page, newest first by
+    /// default).
+    fn query(&self, request: &ClientEntityQueryRequest) -> Result<ClientEntityPage, ProviderError>;
+    /// One row by entity id.
+    fn get(&self, agent_id: &str, entity_id: &str) -> Result<ClientEntityRow, ProviderError>;
+    /// A new inline item under the file at `request.parent`.
+    fn create(&self, request: &ClientEntityCreateRequest)
+        -> Result<ClientEntityRow, ProviderError>;
+    /// Set / unset fields of one record.
+    fn patch(
+        &self,
+        entity_id: &str,
+        request: &ClientEntityPatchRequest,
+    ) -> Result<ClientEntityRow, ProviderError>;
+    /// Run a schema-declared logic operation; returns every row it touched.
+    fn apply(
+        &self,
+        entity_id: &str,
+        request: &ClientEntityApplyRequest,
+    ) -> Result<Vec<ClientEntityRow>, ProviderError>;
+    /// Item → its own file; file → a directory with `index.md`.
+    fn promote(&self, agent_id: &str, entity_id: &str)
+        -> Result<ClientEntityTarget, ProviderError>;
+    /// The inverse of `promote`.
+    fn demote(&self, agent_id: &str, entity_id: &str) -> Result<ClientEntityTarget, ProviderError>;
+}
+
 /// LLM provider administration provider (MODULE-001 `llm-providers` config + MODULE-012 key
 /// custody) behind the `providers` family (lane providers-family). The cli adapter owns the
 /// workspace's `runtime-config.yaml` writer (advance-home), the daemon's LIVE `SecretStore`
@@ -322,6 +368,7 @@ pub type ToolsProviderSlot = ProviderSlot<dyn ToolsProvider>;
 pub type AgentProviderSlot = ProviderSlot<dyn AgentAdminProvider>;
 pub type CostProviderSlot = ProviderSlot<dyn CostProvider>;
 pub type PackProviderSlot = ProviderSlot<dyn PackAdminProvider>;
+pub type EntityProviderSlot = ProviderSlot<dyn EntityProvider>;
 pub type ProviderAdminSlot = ProviderSlot<dyn ProviderAdminProvider>;
 pub type SecretsProviderSlot = ProviderSlot<dyn SecretsAdminProvider>;
 /// m020-s3: event provider / leak detector / cursor codec slots.

@@ -134,6 +134,17 @@ pub struct MetaMaintainer {
 }
 
 impl MetaMaintainer {
+    /// The live schema snapshot (entity-data lane E1: the `fs.write` frontmatter normalize
+    /// hook validates against the same schema `.meta.yaml` entries use).
+    pub fn schema(&self) -> Arc<crate::meta_schema::MetaSchema> {
+        self.schema.current()
+    }
+
+    /// The shared loader (for `SchemaEntityProjector` / cap-data construction).
+    pub fn schema_loader(&self) -> Arc<MetaSchemaLoader> {
+        Arc::clone(&self.schema)
+    }
+
     pub fn new(schema: Arc<MetaSchemaLoader>, writer: Arc<dyn AtomicWriter>) -> Self {
         Self {
             schema,

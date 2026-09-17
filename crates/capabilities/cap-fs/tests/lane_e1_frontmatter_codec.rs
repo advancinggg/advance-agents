@@ -1,5 +1,4 @@
-#![cfg(feature = "lane-e1")]
-//! Lane E1 — frontmatter parse / canonicalize / normalize (the internal entity-data lane plan §2.3).
+//! Lane E1 — frontmatter parse / canonicalize / normalize.
 //! The schema is the shipped `packs/agenda` aspect file, so the codec is exercised against the
 //! exact vocabulary the first-party pack declares (transitions, derive, ensure included).
 
@@ -16,11 +15,9 @@ const AGENDA_YAML: &str =
     include_str!("../../../../packs/agenda/meta-schema-extensions/agenda.yaml");
 
 fn schema() -> MetaSchema {
-    let loader = MetaSchemaLoader::from_yaml(
-        PathBuf::from("/nonexistent/meta-schema.yaml"),
-        AGENDA_YAML,
-    )
-    .expect("the shipped agenda aspect file parses with the v2 grammar");
+    let loader =
+        MetaSchemaLoader::from_yaml(PathBuf::from("/nonexistent/meta-schema.yaml"), AGENDA_YAML)
+            .expect("the shipped agenda aspect file parses with the v2 grammar");
     (*loader.current()).clone()
 }
 
@@ -75,8 +72,8 @@ fn e1_canonical_is_schema_ordered_and_idempotent() {
 
 #[test]
 fn e1_normalize_assigns_ids_validates_and_preserves_body() {
-    let out = normalize(DOC.as_bytes(), None, &schema(), &mut Counter(0), now())
-        .expect("normalize");
+    let out =
+        normalize(DOC.as_bytes(), None, &schema(), &mut Counter(0), now()).expect("normalize");
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.ends_with("---\n# body\n\nkeep me exactly\r\n"),
@@ -115,9 +112,10 @@ fn e1_normalize_checks_status_transitions_against_the_previous_document() {
     )
     .unwrap_err();
     assert!(
-        matches!(&err, FrontmatterError::Schema(m) if m.contains("transition")),
+        matches!(&err, FrontmatterError::Transition { field, from, to, .. } if field == "status" && from == "done" && to == "doing"),
         "done -> doing is not declared: {err:?}"
     );
+    assert!(err.to_string().contains("transition"));
     // done -> todo is declared; a brand-new document (no previous) may start anywhere.
     normalize(
         b"---\nid: e-1\ntype: work-item\ntitle: t\nstatus: todo\n---\n",

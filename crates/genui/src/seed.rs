@@ -151,6 +151,127 @@ fn seed_components() -> Vec<CatalogEntry> {
             description: "Tabular data with per-column formatting.".into(),
             degradation_fallback: None,
         },
+        // Entity view vocabulary (entity-data lane E3; `views::component_for_view_kind`).
+        CatalogEntry {
+            name: "Board".into(),
+            props_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "columns": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "key": { "type": "string" },
+                                "label": { "type": "string" }
+                            },
+                            "required": ["key", "label"]
+                        }
+                    },
+                    "cards": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "entity_id": { "type": "string" },
+                                "column": { "type": "string" },
+                                "title": { "type": "string" },
+                                "subtitle": { "type": "string" }
+                            },
+                            "required": ["entity_id", "column", "title"]
+                        }
+                    },
+                    "empty_message": { "type": "string", "default": "Nothing here yet" }
+                },
+                "required": ["columns"]
+            }),
+            allows_children: false,
+            selectable: true,
+            description: "Kanban board: entity cards grouped into columns by a status-like field."
+                .into(),
+            degradation_fallback: None,
+        },
+        CatalogEntry {
+            name: "Calendar".into(),
+            props_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "range": {
+                        "type": "object",
+                        "properties": {
+                            "start": { "type": "string" },
+                            "end": { "type": "string" }
+                        },
+                        "required": ["start", "end"]
+                    },
+                    "events": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "entity_id": { "type": "string" },
+                                "title": { "type": "string" },
+                                "starts": { "type": "string" },
+                                "ends": { "type": "string" },
+                                "all_day": { "type": "boolean", "default": false }
+                            },
+                            "required": ["entity_id", "title", "starts"]
+                        }
+                    }
+                },
+                "required": ["range", "events"]
+            }),
+            allows_children: false,
+            selectable: true,
+            description:
+                "Calendar of entity occurrences (RFC 3339 `starts`/`ends`) over a date range."
+                    .into(),
+            degradation_fallback: None,
+        },
+        CatalogEntry {
+            name: "EntityForm".into(),
+            props_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "key": { "type": "string" },
+                                "label": { "type": "string" },
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["string", "integer", "boolean", "datetime", "duration", "enum", "list<string>", "list<datetime>"]
+                                },
+                                "enum": { "type": "array", "items": { "type": "string" } },
+                                "value": {},
+                                "required": { "type": "boolean", "default": false }
+                            },
+                            "required": ["key", "label", "type"]
+                        }
+                    },
+                    "submit_action": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "params": { "type": "object" }
+                        },
+                        "required": ["name"]
+                    }
+                },
+                "required": ["fields", "submit_action"]
+            }),
+            allows_children: false,
+            selectable: true,
+            description:
+                "Form over one entity's schema fields; submit dispatches a catalog action.".into(),
+            degradation_fallback: None,
+        },
         CatalogEntry {
             name: "TreeView".into(),
             props_schema: json!({

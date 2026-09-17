@@ -31,9 +31,11 @@
 #![forbid(unsafe_code)]
 
 pub mod atomic;
+pub mod entity_projection;
 pub mod entry;
 pub mod error;
 pub mod events;
+pub mod frontmatter;
 pub mod git_sync;
 pub mod history_provider;
 pub mod host_fn;
@@ -41,9 +43,11 @@ pub mod meta_maintainer;
 pub mod meta_schema;
 pub mod reconcile;
 pub mod resolver;
+pub mod schema_v2;
 pub mod sqlite_sync;
 
 pub use atomic::{atomic_write, AtomicWriter, DefaultAtomicWriter, MAX_WRITE_BYTES};
+pub use entity_projection::{dir_of_index, project_bytes, project_entities, SchemaEntityProjector};
 pub use entry::{
     child_meta_to_val, entry_to_val, scan_result_to_val, scope_meta_to_val, version_entry_to_val,
     ChildMeta, Entry, ScanResult, ScopeMeta, VersionEntry,
@@ -53,20 +57,27 @@ pub use events::{
     emit_fs_event, emit_runtime_degraded, emit_schema_reloaded, event_type_for, FsEvent, FsSource,
     MetaSource, RebuildReportSummary, SCHEMA_RELOADED_EVENT_TYPE,
 };
+pub use frontmatter::{
+    canonicalize, normalize, normalize_doc, parse_frontmatter, FrontmatterDoc, FrontmatterError,
+    IdSource, UlidIdSource, MAX_FRONTMATTER_BLOCK_BYTES, MAX_ITEMS_PER_FILE,
+};
 pub use git_sync::{Adv003GitSync, GitSync, GitSyncError, GitSyncOp};
 pub use history_provider::{FileHistoryProvider, StubFileHistoryProvider};
 pub use host_fn::{
-    list_over_limit_msg, register_agent_fs, register_agent_fs_default, FsChildFileHistoryHandler,
-    FsDeleteHandler, FsFileHistoryHandler, FsListChildHandler, FsListHandler, FsListSlugHandler,
-    FsReadAtHandler, FsReadChildAtHandler, FsReadChildHandler, FsReadHandler, FsReadSlugHandler,
-    FsScanChildHandler, FsScanHandler, FsScanSlugHandler, FsSlugFileHistoryHandler,
-    FsUpdateEntryMetaHandler, FsUpdateScopeHandler, FsWriteHandler, DEFAULT_FS_CONCURRENCY,
-    DEFAULT_MAX_LIST_ENTRIES, MAX_PATH_BYTES, MAX_READ_BYTES,
+    list_over_limit_msg, register_agent_fs, register_agent_fs_default,
+    register_agent_fs_with_maintainer, FsChildFileHistoryHandler, FsDeleteHandler,
+    FsFileHistoryHandler, FsListChildHandler, FsListHandler, FsListSlugHandler, FsReadAtHandler,
+    FsReadChildAtHandler, FsReadChildHandler, FsReadHandler, FsReadSlugHandler, FsScanChildHandler,
+    FsScanHandler, FsScanSlugHandler, FsSlugFileHistoryHandler, FsUpdateEntryMetaHandler,
+    FsUpdateScopeHandler, FsWriteHandler, DEFAULT_FS_CONCURRENCY, DEFAULT_MAX_LIST_ENTRIES,
+    MAX_PATH_BYTES, MAX_READ_BYTES,
 };
 pub use meta_maintainer::{EntryMetaValues, MetaFile, MetaMaintainer};
 pub use meta_schema::{
-    schema_changes, AutoRule, FieldSpec, FieldType, MetaSchema, MetaSchemaError, MetaSchemaLoader,
-    MetaSchemaWatcher, SchemaChanges, DEFAULT_SCHEMA_POLL_INTERVAL, MAX_META_SCHEMA_SIZE,
+    schema_changes, AspectSpec, AutoRule, Cmp, DeriveElse, DeriveRule, EnsureRule, FieldSpec,
+    FieldType, MetaSchema, MetaSchemaError, MetaSchemaLoader, MetaSchemaWatcher, OperationBinding,
+    QuerySpec, SchemaChanges, ValueExpr, ViewKind, ViewSpec, WhereClause,
+    DEFAULT_SCHEMA_POLL_INTERVAL, MAX_META_SCHEMA_SIZE,
 };
 pub use reconcile::{
     is_reconciler_skipped_name, ReconcileReport, WorkspaceReconciler, MAX_RECONCILE_ERRORS,
@@ -75,6 +86,7 @@ pub use resolver::{
     apply_hidden_name_walk, is_agent_internal_hidden_name, is_workspace_hidden_name,
     DefaultVirtualPathResolver, VirtualPathResolver, MAX_PATH_DEPTH,
 };
+pub use schema_v2::{format_datetime, parse_datetime, parse_duration, schema_hash};
 pub use sqlite_sync::{
     agent_id_for_m004, is_text_for_sql_index, normalize_ws_path, Db030SqliteSync, FsSyncError,
     SqliteSync, MAX_SQL_PREVIEW_CHARS,

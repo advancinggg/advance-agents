@@ -26,6 +26,7 @@ pub mod costs;
 pub mod cursor;
 pub mod deltas;
 pub mod durable_idempotency;
+pub mod entities;
 pub mod envelope;
 pub mod events;
 pub mod idempotency;
@@ -71,6 +72,13 @@ pub use deltas::{
     LlmDeltaTerminal, LlmDeltaUsage, LlmDeltaWirePage, ReauthDeadline, DELTA_CURSOR_STREAM_DOMAIN,
     LLM_DELTA_ABSENT_NOTE,
 };
+pub use entities::{
+    ClientAspect, ClientAspectField, ClientAspectOperation, ClientAspectQuery, ClientAspectView,
+    ClientEntityAgentRequest, ClientEntityApplyRequest, ClientEntityCreateRequest,
+    ClientEntityFilter, ClientEntityPage, ClientEntityPatchRequest, ClientEntityQueryRequest,
+    ClientEntityRow, ClientEntityTarget, ClientEntityWindow, ClientNamedQuery, ClientOrderKey,
+    ClientPatchOp, ClientPatchSet, ClientPatchUnset, ClientSchema,
+};
 pub use envelope::{ClientEnvelope, ClientError, ClientErrorCode, ClientWarning, API_VERSION};
 pub use events::{
     stream_id_for_filter, ClientEvent, ClientEventCursor, ClientEventFilter, ClientEventPage,
@@ -84,8 +92,8 @@ pub use packs::{
 };
 pub use pagination::{Cursor, Page};
 pub use provider::{
-    AgentAdminProvider, CostProvider, MessagingProvider, PackAdminProvider, ProviderAdminProvider,
-    ProviderError, RunControlProvider, SecretsAdminProvider, ToolsProvider,
+    AgentAdminProvider, CostProvider, EntityProvider, MessagingProvider, PackAdminProvider,
+    ProviderAdminProvider, ProviderError, RunControlProvider, SecretsAdminProvider, ToolsProvider,
     UNKNOWN_PROVIDER_DETAIL,
 };
 pub use provider_admin::{

@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// The canonical Client API version this build speaks (a date string, per §1.4.1).
-pub const API_VERSION: &str = "2026-06-30";
+pub const API_VERSION: &str = "2026-09-17";
 
 /// The versioned response envelope. `data` XOR `error` is non-null; `warnings` may accompany
 /// either. Matches MODULE-020 §2.3 / §2.4.

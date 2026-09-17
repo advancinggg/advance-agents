@@ -54,7 +54,7 @@ const DELTA_INBOUND_DRAIN_PER_BEAT: usize = 32;
 
 /// Browser-visible WebSocket protocol.  The bearer token is sent as a second, unselected
 /// `advance.bearer.<hex>` protocol so it does not enter the URL, browser history, or proxy logs.
-pub const CLIENT_WS_PROTOCOL: &str = "advance.client.2026-06-30";
+pub const CLIENT_WS_PROTOCOL: &str = "advance.client.2026-09-17";
 
 #[derive(Clone)]
 struct TransportState {

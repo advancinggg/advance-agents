@@ -165,6 +165,47 @@ enum PackCmd {
         #[arg(long)]
         packs_dir: Option<std::path::PathBuf>,
     },
+    /// Build a text-only source pack (`packs/<name>`) into `<out>/<name>`: copies the
+    /// layout, builds every guest crate named in `packs/<name>.build.yaml` into its skill's
+    /// `tool.wasm`, and fills the output manifest's checksums. The source is never modified.
+    Build {
+        /// Source pack directory (e.g. `packs/agenda`).
+        source: std::path::PathBuf,
+        /// Output root; the built pack lands at `<out>/<name>`.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Generate an ed25519 pack-signing key (64 hex chars, created exclusively with mode
+    /// 0600) and print the public key operators add to `pack.trust-roots`.
+    Keygen {
+        /// Where to write the key file (refused if it exists).
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Sign `<dir>/pack.yaml` (exact bytes) with a key file from `keygen` and write
+    /// `<dir>/pack.sig`. Sign a BUILT pack (its checksums cover `tool.wasm`).
+    Sign {
+        /// The (built) pack directory.
+        dir: std::path::PathBuf,
+        /// Key file: 64 hex chars or 32 raw bytes.
+        #[arg(long)]
+        key: std::path::PathBuf,
+    },
+    /// Archive a (built, optionally signed) pack into a static registry directory:
+    /// `<out>/<name>-<version>.tar.gz` plus a merged `<out>/index/<name>.json`, the layout
+    /// `pack.registry-url` consumers read.
+    Bundle {
+        /// The pack directory.
+        dir: std::path::PathBuf,
+        /// Registry directory (created if missing; other versions are kept).
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Absolute URL the registry is served from; written into the index's tarball
+        /// entries. Without it the entries are bare file names resolved against
+        /// `pack.registry-url` at install time.
+        #[arg(long)]
+        base_url: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -245,6 +286,12 @@ fn main() -> ExitCode {
             PackCmd::List { packs_dir } => commands::pack::run_list(packs_dir),
             PackCmd::Uninstall { spec, packs_dir } => {
                 commands::pack::run_uninstall(spec, packs_dir)
+            }
+            PackCmd::Build { source, out } => commands::pack::run_build(source, out),
+            PackCmd::Keygen { out } => commands::pack::run_keygen(out),
+            PackCmd::Sign { dir, key } => commands::pack::run_sign(dir, key),
+            PackCmd::Bundle { dir, out, base_url } => {
+                commands::pack::run_bundle(dir, out, base_url)
             }
         },
         Cmd::Secrets { sub } => match sub {

@@ -31,11 +31,19 @@ pub fn session_op(method: Method, path: &str) -> Option<SessionOp> {
 }
 
 /// The resource family for a path (used for idempotency scoping + audit labels). Returns the
-/// first segment after `/client/` (e.g. `session`, `health`, `runs`). Works for templated paths too
-/// (`/client/runs/{id}:pause` → `runs`), so mutation idempotency scoping is unaffected.
+/// first segment after `/client/` (e.g. `session`, `health`, `runs`) without a `:verb` suffix,
+/// so a collection-level action (`/client/entities:query`, `/client/packs:install`) and its
+/// templated siblings (`/client/entities/{id}:patch`, `/client/runs/{id}:pause`) share one
+/// family and mutation idempotency scoping is unaffected by the route shape.
 pub fn family_of(path: &str) -> String {
     let trimmed = path.strip_prefix("/client/").unwrap_or(path);
-    let seg = trimmed.split('/').next().unwrap_or("");
+    let seg = trimmed
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
     if seg.is_empty() {
         "root".to_string()
     } else {
@@ -104,6 +112,18 @@ pub const TPL_PROVIDER_SELECT: &str = "/client/providers/{provider_id}:select";
 /// and the mode switch (POST). Its own family (`secrets`); no templated routes.
 pub const PATH_SECRETS_MODE: &str = "/client/secrets/mode";
 pub const PATH_SECRETS_SET_MODE: &str = "/client/secrets:set-mode";
+/// Schema family (entity-data lane E3): the merged meta-schema (GET). Its own family.
+pub const PATH_SCHEMA: &str = "/client/schema";
+/// Entities family: query (a POST read) and create (POST mutation).
+pub const PATH_ENTITIES_QUERY: &str = "/client/entities:query";
+pub const PATH_ENTITIES_CREATE: &str = "/client/entities:create";
+/// Entities family templated routes: one row (the agent rides the path — `ClientRequest` has
+/// no query string), patch, apply, promote, demote.
+pub const TPL_ENTITY_GET: &str = "/client/entities/{agent_id}/{entity_id}";
+pub const TPL_ENTITY_PATCH: &str = "/client/entities/{entity_id}:patch";
+pub const TPL_ENTITY_APPLY: &str = "/client/entities/{entity_id}:apply";
+pub const TPL_ENTITY_PROMOTE: &str = "/client/entities/{entity_id}:promote";
+pub const TPL_ENTITY_DEMOTE: &str = "/client/entities/{entity_id}:demote";
 /// One segment of a templated route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Seg {

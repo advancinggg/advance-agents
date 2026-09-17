@@ -1,0 +1,30 @@
+[package]
+name = "agenda-tools"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Source of `packs/agenda/skills/agenda/tool.wasm` (entity-data lane E2): a pure
+# `tool-exports` component with the agenda pack's series operations. Built by
+# `advance pack build packs/agenda --out <dir>` for `wasm32-unknown-unknown` and encoded into a
+# component (zero imports: no clock, no randomness, no I/O). Excluded from the workspace like
+# every other guest crate.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

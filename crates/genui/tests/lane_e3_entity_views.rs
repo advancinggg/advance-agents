@@ -1,6 +1,5 @@
-#![cfg(feature = "lane-e3")]
-//! Lane E3 — the entity view vocabulary in the GenUI catalog (the internal entity-data lane plan
-//! §4.3): `Board`, `Calendar` and `EntityForm` are vetted components, and every schema view
+//! Lane E3 — the entity view vocabulary in the GenUI catalog:
+//! `Board`, `Calendar` and `EntityForm` are vetted components, and every schema view
 //! kind maps to exactly one component so an agent-pushed document and a client view render
 //! through the same code.
 
@@ -75,7 +74,10 @@ fn e3_new_components_validate_their_props() {
         gate().admit(&bad_range).unwrap_err(),
         GenUiError::InvalidProps { ref component, .. } if component == "Calendar"
     ));
-    let no_fields = doc(vec![node("EntityForm", json!({ "submit_action": { "name": "refresh_data" } }))]);
+    let no_fields = doc(vec![node(
+        "EntityForm",
+        json!({ "submit_action": { "name": "refresh_data" } }),
+    )]);
     assert!(matches!(
         gate().admit(&no_fields).unwrap_err(),
         GenUiError::InvalidProps { ref component, .. } if component == "EntityForm"

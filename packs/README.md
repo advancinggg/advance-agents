@@ -37,5 +37,33 @@ advance pack install packs/agenda --packs-dir .advance/packs   # text-only insta
    host tool. A pack declares vocabulary (fields, invariants, queries, views, operation
    bindings) in `meta-schema-extensions/`; it never ships code that touches storage.
 
-See `the internal entity-data lane plan` for the entity model and the `agenda` pack that declares
-the first aspect.
+The `agenda` pack declares the first aspect and is the reference for the entity model
+(frontmatter records, inline items, the `data` host tool).
+
+## Signing and publishing
+
+```bash
+advance pack keygen --out ~/.advance/pack-signing.key        # 64 hex chars, mode 0600; prints the public key
+advance pack sign target/packs/agenda --key ~/.advance/pack-signing.key   # pack.sig over the exact pack.yaml bytes
+advance pack bundle target/packs/agenda --out target/registry --base-url https://packs.example.com
+```
+
+`bundle` writes `<out>/<name>-<version>.tar.gz` and merges `<out>/index/<name>.json` — the
+static layout `pack.registry-url` consumers read for `registry:<name>@<version>` sources.
+Serve `<out>` from any HTTPS host (loopback HTTP is accepted for local testing). Without
+`--base-url` the index carries bare file names, which the runtime resolves against
+`pack.registry-url`, so one tree can move between hosts. A published version is immutable:
+re-bundling the same `name@version` with different bytes is refused — bump the version.
+
+Tarballs are reproducible (entries sorted, zero mtimes / uid / gid, ustar headers, no gzip
+timestamp), so a rebuild from the same source tree yields the same sha256. The release
+workflow (`.github/workflows/pack-release.yml`) runs on every `v*` tag: build every
+`packs/*.build.yaml` pack, sign with the `PACK_SIGNING_KEY` repository secret when it is
+configured, bundle, build a second time and compare digests, then attach the tarballs and
+index documents to the GitHub release.
+
+Trust: operators list maintainers' public keys in `runtime-config.yaml` `pack.trust-roots`;
+a `pack.sig` from a listed key makes a `trust-level: trusted` claim effective at install.
+The maintainer public key is published here in the same commit that configures
+`PACK_SIGNING_KEY` (until then, releases are unsigned and every pack installs as
+`untrusted`).

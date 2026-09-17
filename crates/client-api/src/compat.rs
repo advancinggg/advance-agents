@@ -94,6 +94,15 @@ pub const RESPONSE_COMPONENTS: &[&str] = &[
     "ClientProviderKeyResult",
     "ClientProviderDeleteResult",
     "ClientSecretsMode",
+    "ClientSchema",
+    "ClientAspect",
+    "ClientAspectField",
+    "ClientAspectQuery",
+    "ClientAspectView",
+    "ClientAspectOperation",
+    "ClientEntityRow",
+    "ClientEntityPage",
+    "ClientEntityTarget",
 ];
 
 /// Request / filter bodies — not a response-field bag.
@@ -118,6 +127,18 @@ pub const EXCLUDED_COMPONENTS: &[&str] = &[
     "ClientUpdateProviderRequest",
     "ClientSetProviderKeyRequest",
     "ClientSetSecretsModeRequest",
+    "ClientNamedQuery",
+    "ClientEntityWindow",
+    "ClientOrderKey",
+    "ClientEntityFilter",
+    "ClientEntityQueryRequest",
+    "ClientEntityCreateRequest",
+    "ClientPatchSet",
+    "ClientPatchUnset",
+    "ClientPatchOp",
+    "ClientEntityPatchRequest",
+    "ClientEntityApplyRequest",
+    "ClientEntityAgentRequest",
 ];
 
 /// Git path of the on-disk honesty baseline, relative to the repo root.

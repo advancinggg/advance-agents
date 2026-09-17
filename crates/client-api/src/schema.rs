@@ -283,6 +283,95 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
         ] {
             m.insert(name.to_string(), schema);
         }
+        // Schema + entities families (entity-data lane E3) DTOs (additive).
+        for (name, schema) in [
+            (
+                "ClientSchema",
+                schema_value::<crate::entities::ClientSchema>(),
+            ),
+            (
+                "ClientAspect",
+                schema_value::<crate::entities::ClientAspect>(),
+            ),
+            (
+                "ClientAspectField",
+                schema_value::<crate::entities::ClientAspectField>(),
+            ),
+            (
+                "ClientAspectQuery",
+                schema_value::<crate::entities::ClientAspectQuery>(),
+            ),
+            (
+                "ClientAspectView",
+                schema_value::<crate::entities::ClientAspectView>(),
+            ),
+            (
+                "ClientAspectOperation",
+                schema_value::<crate::entities::ClientAspectOperation>(),
+            ),
+            (
+                "ClientEntityRow",
+                schema_value::<crate::entities::ClientEntityRow>(),
+            ),
+            (
+                "ClientEntityPage",
+                schema_value::<crate::entities::ClientEntityPage>(),
+            ),
+            (
+                "ClientEntityTarget",
+                schema_value::<crate::entities::ClientEntityTarget>(),
+            ),
+            (
+                "ClientNamedQuery",
+                schema_value::<crate::entities::ClientNamedQuery>(),
+            ),
+            (
+                "ClientEntityWindow",
+                schema_value::<crate::entities::ClientEntityWindow>(),
+            ),
+            (
+                "ClientOrderKey",
+                schema_value::<crate::entities::ClientOrderKey>(),
+            ),
+            (
+                "ClientEntityFilter",
+                schema_value::<crate::entities::ClientEntityFilter>(),
+            ),
+            (
+                "ClientEntityQueryRequest",
+                schema_value::<crate::entities::ClientEntityQueryRequest>(),
+            ),
+            (
+                "ClientEntityCreateRequest",
+                schema_value::<crate::entities::ClientEntityCreateRequest>(),
+            ),
+            (
+                "ClientPatchSet",
+                schema_value::<crate::entities::ClientPatchSet>(),
+            ),
+            (
+                "ClientPatchUnset",
+                schema_value::<crate::entities::ClientPatchUnset>(),
+            ),
+            (
+                "ClientPatchOp",
+                schema_value::<crate::entities::ClientPatchOp>(),
+            ),
+            (
+                "ClientEntityPatchRequest",
+                schema_value::<crate::entities::ClientEntityPatchRequest>(),
+            ),
+            (
+                "ClientEntityApplyRequest",
+                schema_value::<crate::entities::ClientEntityApplyRequest>(),
+            ),
+            (
+                "ClientEntityAgentRequest",
+                schema_value::<crate::entities::ClientEntityAgentRequest>(),
+            ),
+        ] {
+            m.insert(name.to_string(), schema);
+        }
         // Providers family (LLM provider administration) DTOs (additive).
         for (name, schema) in [
             (
@@ -477,7 +566,7 @@ pub fn conformance_vectors() -> Value {
                     "error": {
                         "code": "unsupported_api_version",
                         "message": "unsupported api_version",
-                        "details": ["2026-06-30"]
+                        "details": [API_VERSION]
                     },
                     "warnings": []
                 }

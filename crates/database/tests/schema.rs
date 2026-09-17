@@ -12,7 +12,7 @@ fn t01_migrations_idempotent() {
     handle
         .run_migrations()
         .expect("third migration must be a no-op");
-    assert_eq!(handle.schema_version(), 1);
+    assert_eq!(handle.schema_version(), 2);
 }
 
 #[test]
@@ -134,7 +134,7 @@ fn schema_version_persisted_via_pragma_user_version() {
     let v: u32 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .expect("user_version");
-    assert_eq!(v, 1, "PRAGMA user_version must be persisted to 1");
+    assert_eq!(v, 2, "PRAGMA user_version must be persisted to 2");
 }
 
 #[test]
@@ -158,11 +158,69 @@ fn migrations_committed_in_single_transaction_with_user_version() {
             |r| r.get(0),
         )
         .expect("count");
-    assert_eq!(v, 1);
+    assert_eq!(v, 2);
     assert_eq!(
-        table_count, 5,
-        "expected 5 *_index primary tables to coexist with user_version=1"
+        table_count, 6,
+        "expected the 5 v1 *_index primary tables + entity_index to coexist with user_version=2"
     );
+}
+
+#[test]
+fn v1_database_upgrades_in_place_to_v2() {
+    // Entity-data lane E1: a database left at user_version=1 by an older build (all 11 v1
+    // tables, none of the v2 ones) is upgraded in place — the three entity tables appear and
+    // user_version moves to 2. A v1 file that already carries a v2 table name is refused.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("v1.db");
+    {
+        let handle = R2d2SqliteIndexHandle::new(&path, 1).expect("create a v2 database");
+        let conn = handle.get_conn().expect("get conn");
+        conn.execute_batch(
+            "DROP TABLE entity_occurrence; DROP TABLE entity_aspect; DROP TABLE entity_index;
+             PRAGMA user_version = 1;",
+        )
+        .expect("downgrade to the v1 shape");
+    }
+    let handle = R2d2SqliteIndexHandle::new(&path, 1).expect("v1 file upgrades");
+    let conn = handle.get_conn().expect("get conn");
+    let v: u32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("user_version");
+    assert_eq!(v, 2, "upgraded in place");
+    let entity_tables: u32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
+             ('entity_index','entity_aspect','entity_occurrence')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(entity_tables, 3);
+    drop(conn);
+    drop(handle);
+
+    // Planted v2 name on a v1 file → refused.
+    let planted = dir.path().join("v1_planted.db");
+    {
+        let handle = R2d2SqliteIndexHandle::new(&planted, 1).expect("create");
+        let conn = handle.get_conn().expect("get conn");
+        conn.execute_batch(
+            "DROP TABLE entity_occurrence; DROP TABLE entity_aspect; DROP TABLE entity_index;
+             CREATE VIEW entity_index AS SELECT 1 AS id;
+             PRAGMA user_version = 1;",
+        )
+        .expect("plant");
+    }
+    match R2d2SqliteIndexHandle::new(&planted, 1) {
+        Err(DbError::InvalidConfig(msg)) => {
+            assert!(
+                msg.contains("user_version=1") && msg.contains("already use"),
+                "{msg}"
+            )
+        }
+        Err(other) => panic!("expected InvalidConfig, got {other:?}"),
+        Ok(_) => panic!("expected rejection of a v1 file with a planted v2 name"),
+    }
 }
 
 #[test]
@@ -417,7 +475,7 @@ fn schema_mismatch_rejects_unknown_version() {
     match result {
         Err(DbError::SchemaMismatch { stored, expected }) => {
             assert_eq!(stored, 99);
-            assert_eq!(expected, 1);
+            assert_eq!(expected, 2);
         }
         Err(other) => panic!("expected SchemaMismatch, got {other:?}"),
         Ok(_) => panic!("expected SchemaMismatch error"),

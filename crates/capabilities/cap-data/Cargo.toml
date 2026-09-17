@@ -4,7 +4,7 @@ version.workspace = true
 repository.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Structured-data capability (`data`): the entity model over frontmatter (file / inline items / index.md), host-owned canonical writes, tiers and promotion, the `apply` reducer transaction and the `data` host tool. Skeleton — see the internal entity-data lane plan (lane E1)."
+description = "Structured-data capability (`data`): the entity model over frontmatter (file / inline items / index.md), host-owned canonical writes, tiers and promotion, the `apply` reducer transaction and the `data` host tool."
 
 publish = false
 
@@ -14,15 +14,26 @@ path = "src/lib.rs"
 
 [dependencies]
 advance-shared-types = { path = "../../shared-types" }
+cap-fs = { path = "../cap-fs" }
+cap-tools = { path = "../cap-tools" }
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
+cap-data = { path = ".", features = ["test-support"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [features]
-# entity-data lane gated witness tests (the internal entity-data lane plan §0.2)
-lane-e1 = []
+# In-memory / plain-directory doubles (`cap_data::test_support`) for witnesses and the cli
+# composition tests.
+test-support = []
 
 [lints]
 workspace = true

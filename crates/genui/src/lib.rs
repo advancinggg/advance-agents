@@ -9,6 +9,7 @@ pub mod degrade;
 pub mod document;
 pub mod error;
 pub mod seed;
+pub mod views;
 
 pub use catalog::{
     ActionEntry, ActionRef, CatalogEntry, ComponentCatalog, ConfirmMetadata, ConfirmVariant,

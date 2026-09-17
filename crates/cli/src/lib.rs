@@ -33,6 +33,7 @@ pub mod channels_boot;
 pub mod commands;
 pub mod component_submit_bridge;
 pub mod context_wiring;
+pub mod data_wiring;
 // Wave-25A Order-2 build-and-hold platform anchor.  This module is deliberately
 // not wired into `advance start` until the later atomic composition lane.
 pub mod client_api_adapters;
@@ -41,6 +42,7 @@ pub mod client_api_adapters;
 // production terminate-controller composition the family drives.
 pub mod client_api_agents;
 pub mod client_api_costs;
+pub mod client_api_entities;
 pub mod client_api_packs;
 // CONTRACT-190 providers family (lane providers-family, 2026-09-16): the production
 // `ProviderAdminProvider` over the shared `llm-providers` writer, the daemon's live

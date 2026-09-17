@@ -22,13 +22,12 @@ walkdir = { workspace = true }
 serde = { workspace = true }
 serde_yml = { workspace = true }
 serde_json = { workspace = true }
+# Entity-data lane E1: entity port + RRULE expansion for the occurrence table.
+advance-shared-types = { path = "../shared-types" }
+rrule = "=0.13.0"
 
 [dev-dependencies]
 tempfile = { workspace = true }
 
 [lints]
 workspace = true
-
-[features]
-# entity-data lane gated witness tests (the internal entity-data lane plan §0.2)
-lane-e1 = []

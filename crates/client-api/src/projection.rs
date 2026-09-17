@@ -329,7 +329,7 @@ fn valid_entity_ref(s: &str) -> bool {
     })
 }
 
-// ── Exact 33-row table ────────────────────────────────────────────────────────────────────
+// ── Exact 34-row table ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
 struct LeafSpec {
@@ -402,7 +402,13 @@ pub fn is_accepted_event_type(event_type: &str) -> bool {
     table_spec(event_type).is_some()
 }
 
-/// Exact 33 accepted literals (for tests).
+/// The projected leaf names of an accepted event type, in table order (`None` for a type the
+/// table does not accept).
+pub fn leaf_names(event_type: &str) -> Option<Vec<&'static str>> {
+    table_spec(event_type).map(|s| s.leaves.iter().map(|l| l.name).collect())
+}
+
+/// Exact 34 accepted literals (for tests).
 pub fn accepted_event_literals() -> &'static [&'static str] {
     &[
         "run.created",
@@ -438,6 +444,7 @@ pub fn accepted_event_literals() -> &'static [&'static str] {
         "genui.rejected",
         "genui.action_dispatched",
         "genui.degraded",
+        "data.entity_changed",
     ]
 }
 
@@ -921,6 +928,39 @@ static TABLE: &[EventSpec] = &[
             },
             LeafSpec {
                 name: "reason",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+        ],
+    },
+    // Entity-data lane E3: one per committed `data` write (create / patch / promote / demote /
+    // apply). `entity_ids` / `commit` stay host-side; clients re-read through the entities
+    // family.
+    EventSpec {
+        literal: "data.entity_changed",
+        priority: ClientEventPriority::Normal,
+        leaves: &[
+            LeafSpec {
+                name: "entity_id",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "path",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "op",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "kind",
                 kind: LeafKind::StringScanned,
                 min_u32: None,
                 max_u32: None,

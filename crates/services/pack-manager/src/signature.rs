@@ -100,6 +100,32 @@ pub fn verify_pack_signature(
     Ok(known.then_some(public_key_hex))
 }
 
+/// Sign `pack_yaml_bytes` with an ed25519 secret key (entity-data lane E4, `advance pack
+/// sign`): returns the `pack.sig` document text (`alg` / `public-key` / `signature`) and the
+/// lower-case hex public key the operator publishes as a trust root. The document is what
+/// [`verify_pack_signature`] reads back.
+pub fn sign_pack_yaml(pack_yaml_bytes: &[u8], secret: &[u8; 32]) -> (String, String) {
+    use ed25519_dalek::{Signer, SigningKey};
+    let key = SigningKey::from_bytes(secret);
+    let public_hex = hex::encode(key.verifying_key().to_bytes());
+    let signature = key.sign(pack_yaml_bytes);
+    let text = format!(
+        "alg: ed25519\npublic-key: {public_hex}\nsignature: {}\n",
+        hex::encode(signature.to_bytes())
+    );
+    (text, public_hex)
+}
+
+/// The lower-case hex ed25519 public key of a secret key (what `advance pack keygen` prints
+/// and operators put in `pack.trust-roots`).
+pub fn public_key_hex(secret: &[u8; 32]) -> String {
+    hex::encode(
+        ed25519_dalek::SigningKey::from_bytes(secret)
+            .verifying_key()
+            .to_bytes(),
+    )
+}
+
 /// Parse the `pack.sig` text and verify it over `message`. Returns the
 /// lower-case hex public key on success; the error is the human-readable
 /// reason (wrapped into `SignatureInvalid` by the caller).

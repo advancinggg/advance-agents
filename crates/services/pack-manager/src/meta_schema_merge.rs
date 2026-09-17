@@ -194,6 +194,13 @@ pub fn merge_meta_schema_extension_file_with(
 /// Pure merge of two in-memory documents → `(merged single-document YAML,
 /// report)`. `target_yaml == None` means "no target yet" (fresh
 /// `{optional: …}` document).
+///
+/// Grammar v2 (entity-data lane E1): an extension may additionally declare ONE aspect
+/// (`aspect` / `key` / `fields` / `queries` / `views` / `operations`); the block lands under
+/// the target's `aspects.<name>`. An aspect has exactly one owner (a second declaration with
+/// different content is a conflict; an identical one is idempotent), and a field name shared
+/// by two aspects must carry an identical spec. Field specs may omit `default` and may carry
+/// the v2 attributes (`transitions` / `derive` / `ensure` / `inherit`).
 pub fn merge_documents(
     target_yaml: Option<&str>,
     extension_yaml: &str,
@@ -256,7 +263,7 @@ pub fn merge_documents(
     };
 
     let mut report = MetaSchemaMergeReport::default();
-    for (name, spec) in extension {
+    for (name, spec) in extension.optional {
         // Collision checks FIRST: a redeclaration is judged against what the
         // target already has (identical → idempotent, different → conflict)
         // before the incoming spec's own grammar — so a type clash reports as
@@ -270,7 +277,7 @@ pub fn merge_documents(
         }
         match optional.get(Value::from(name.as_str())) {
             None => {
-                validate_optional_spec(&name, &spec)?;
+                validate_field_spec(&name, &spec)?;
                 optional.insert(Value::from(name.as_str()), spec);
                 report.added.push(name);
             }
@@ -289,6 +296,77 @@ pub fn merge_documents(
     // section order `required` → `optional` → rest is what cap-fs documents).
     target.insert(Value::from("optional"), Value::Mapping(optional));
 
+    if let Some((aspect_name, block)) = extension.aspect {
+        let mut aspects: Mapping = match target.remove(Value::from("aspects")) {
+            None | Some(Value::Null) => Mapping::new(),
+            Some(Value::Mapping(m)) => m,
+            Some(other) => {
+                return Err(MetaSchemaMergeError::InvalidTarget(format!(
+                    "`aspects` must be a mapping, got {}",
+                    value_kind(&other)
+                )))
+            }
+        };
+        let incoming_fields: Mapping = match block.get(Value::from("fields")) {
+            Some(Value::Mapping(m)) => m.clone(),
+            _ => Mapping::new(),
+        };
+        match aspects.get(Value::from(aspect_name.as_str())) {
+            Some(existing) if *existing == Value::Mapping(block.clone()) => {
+                for k in incoming_fields.keys() {
+                    if let Some(n) = k.as_str() {
+                        report.unchanged.push(n.to_string());
+                    }
+                }
+            }
+            Some(existing) => {
+                return Err(MetaSchemaMergeError::Conflict {
+                    field: aspect_name,
+                    existing: render_inline(existing),
+                    incoming: render_inline(&Value::Mapping(block)),
+                });
+            }
+            None => {
+                // A field name another aspect already declares must be identical.
+                let mut seen_elsewhere: Vec<String> = Vec::new();
+                for (fname, fspec) in &incoming_fields {
+                    let Some(fname) = fname.as_str() else {
+                        continue;
+                    };
+                    validate_field_spec(fname, fspec)?;
+                    for (_, other_block) in aspects.iter() {
+                        let other_fields = other_block
+                            .as_mapping()
+                            .and_then(|m| m.get(Value::from("fields")))
+                            .and_then(Value::as_mapping);
+                        if let Some(existing) = other_fields.and_then(|m| m.get(Value::from(fname)))
+                        {
+                            if existing != fspec {
+                                return Err(MetaSchemaMergeError::Conflict {
+                                    field: fname.to_string(),
+                                    existing: render_inline(existing),
+                                    incoming: render_inline(fspec),
+                                });
+                            }
+                            seen_elsewhere.push(fname.to_string());
+                        }
+                    }
+                }
+                for k in incoming_fields.keys() {
+                    if let Some(n) = k.as_str() {
+                        if seen_elsewhere.iter().any(|s| s == n) {
+                            report.unchanged.push(n.to_string());
+                        } else {
+                            report.added.push(n.to_string());
+                        }
+                    }
+                }
+                aspects.insert(Value::from(aspect_name.as_str()), Value::Mapping(block));
+            }
+        }
+        target.insert(Value::from("aspects"), Value::Mapping(aspects));
+    }
+
     let mut merged = serde_yml::to_string(&Value::Mapping(target))
         .map_err(|e| MetaSchemaMergeError::InvalidTarget(format!("yaml emit: {e}")))?;
     if !merged.ends_with('\n') {
@@ -297,9 +375,18 @@ pub fn merge_documents(
     Ok((merged, report))
 }
 
-/// Parse + structurally validate an extension document → `(field, spec)` in
-/// declaration order (per-field grammar is applied by [`merge_documents`]).
-fn parse_extension(yaml: &str) -> Result<Vec<(String, Value)>, MetaSchemaMergeError> {
+/// A parsed extension: v1 `optional` fields plus, in v2, at most one aspect block.
+struct ParsedExtension {
+    optional: Vec<(String, Value)>,
+    /// `(aspect name, {key, fields, queries, views, operations})`.
+    aspect: Option<(String, Mapping)>,
+}
+
+const ASPECT_BLOCK_KEYS: &[&str] = &["key", "fields", "queries", "views", "operations"];
+
+/// Parse + structurally validate an extension document (per-field grammar is applied by
+/// [`merge_documents`] for NEW fields; redeclarations are judged against the existing spec).
+fn parse_extension(yaml: &str) -> Result<ParsedExtension, MetaSchemaMergeError> {
     guard_yaml(yaml).map_err(MetaSchemaMergeError::InvalidExtension)?;
     let root: Value = serde_yml::from_str(yaml)
         .map_err(|e| MetaSchemaMergeError::InvalidExtension(format!("yaml parse: {e}")))?;
@@ -314,10 +401,12 @@ fn parse_extension(yaml: &str) -> Result<Vec<(String, Value)>, MetaSchemaMergeEr
     };
     for key in root.keys() {
         match key.as_str() {
-            Some("optional") | Some("required") => {}
+            Some("optional") | Some("required") | Some("aspect") => {}
+            Some(k) if ASPECT_BLOCK_KEYS.contains(&k) => {}
             Some(other) => {
                 return Err(MetaSchemaMergeError::InvalidExtension(format!(
-                    "unknown top-level key `{other}` (only `optional` is accepted)"
+                    "unknown top-level key `{other}` (only `optional`, `aspect`, `key`, `fields`, \
+                     `queries`, `views`, `operations` are accepted)"
                 )))
             }
             None => {
@@ -337,33 +426,121 @@ fn parse_extension(yaml: &str) -> Result<Vec<(String, Value)>, MetaSchemaMergeEr
             ))
         }
     }
-    let optional = match root.get(Value::from("optional")) {
-        None | Some(Value::Null) => return Ok(Vec::new()),
-        Some(Value::Mapping(m)) => m,
+    let mut optional = Vec::new();
+    match root.get(Value::from("optional")) {
+        None | Some(Value::Null) => {}
+        Some(Value::Mapping(m)) => {
+            if m.len() > MAX_FIELDS_PER_EXTENSION {
+                return Err(MetaSchemaMergeError::InvalidExtension(format!(
+                    "`optional` declares {} fields (max {MAX_FIELDS_PER_EXTENSION})",
+                    m.len()
+                )));
+            }
+            for (k, spec) in m {
+                let name = k.as_str().ok_or_else(|| {
+                    MetaSchemaMergeError::InvalidExtension("field names must be strings".into())
+                })?;
+                validate_field_name(name)?;
+                optional.push((name.to_string(), spec.clone()));
+            }
+        }
         Some(other) => {
             return Err(MetaSchemaMergeError::InvalidExtension(format!(
                 "`optional` must be a mapping, got {}",
                 value_kind(other)
             )))
         }
+    }
+
+    let aspect = match root.get(Value::from("aspect")) {
+        None | Some(Value::Null) => {
+            if let Some(stray) = ASPECT_BLOCK_KEYS
+                .iter()
+                .find(|k| root.contains_key(Value::from(**k)))
+            {
+                return Err(MetaSchemaMergeError::InvalidExtension(format!(
+                    "`{stray}` needs a top-level `aspect:`"
+                )));
+            }
+            None
+        }
+        Some(Value::String(name)) => {
+            validate_field_name(name)?;
+            let key = match root.get(Value::from("key")) {
+                Some(Value::Sequence(items)) if !items.is_empty() => Value::Sequence(items.clone()),
+                _ => {
+                    return Err(MetaSchemaMergeError::InvalidExtension(format!(
+                        "aspect {name}: `key` must be a non-empty list of field names"
+                    )))
+                }
+            };
+            let fields = match root.get(Value::from("fields")) {
+                None | Some(Value::Null) => Mapping::new(),
+                Some(Value::Mapping(m)) => {
+                    if m.len() > MAX_FIELDS_PER_EXTENSION {
+                        return Err(MetaSchemaMergeError::InvalidExtension(format!(
+                            "aspect {name}: `fields` declares {} fields (max {MAX_FIELDS_PER_EXTENSION})",
+                            m.len()
+                        )));
+                    }
+                    for k in m.keys() {
+                        let n = k.as_str().ok_or_else(|| {
+                            MetaSchemaMergeError::InvalidExtension(
+                                "field names must be strings".into(),
+                            )
+                        })?;
+                        validate_field_name(n)?;
+                    }
+                    m.clone()
+                }
+                Some(other) => {
+                    return Err(MetaSchemaMergeError::InvalidExtension(format!(
+                        "aspect {name}: `fields` must be a mapping, got {}",
+                        value_kind(other)
+                    )))
+                }
+            };
+            if let Value::Sequence(items) = &key {
+                for k in items {
+                    let Some(kn) = k.as_str() else {
+                        return Err(MetaSchemaMergeError::InvalidExtension(format!(
+                            "aspect {name}: key entries must be strings"
+                        )));
+                    };
+                    if !fields.contains_key(Value::from(kn)) {
+                        return Err(MetaSchemaMergeError::InvalidExtension(format!(
+                            "aspect {name}: key field {kn:?} is not declared in `fields`"
+                        )));
+                    }
+                }
+            }
+            let mut block = Mapping::new();
+            block.insert(Value::from("key"), key);
+            block.insert(Value::from("fields"), Value::Mapping(fields));
+            for section in ["queries", "views", "operations"] {
+                match root.get(Value::from(section)) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::Mapping(m)) => {
+                        block.insert(Value::from(section), Value::Mapping(m.clone()));
+                    }
+                    Some(other) => {
+                        return Err(MetaSchemaMergeError::InvalidExtension(format!(
+                            "aspect {name}: `{section}` must be a mapping, got {}",
+                            value_kind(other)
+                        )))
+                    }
+                }
+            }
+            Some((name.clone(), block))
+        }
+        Some(other) => {
+            return Err(MetaSchemaMergeError::InvalidExtension(format!(
+                "`aspect` must be a string, got {}",
+                value_kind(other)
+            )))
+        }
     };
-    if optional.len() > MAX_FIELDS_PER_EXTENSION {
-        return Err(MetaSchemaMergeError::InvalidExtension(format!(
-            "`optional` declares {} fields (max {MAX_FIELDS_PER_EXTENSION})",
-            optional.len()
-        )));
-    }
-    let mut out = Vec::with_capacity(optional.len());
-    for (k, spec) in optional {
-        let name = k.as_str().ok_or_else(|| {
-            MetaSchemaMergeError::InvalidExtension("field names must be strings".into())
-        })?;
-        validate_field_name(name)?;
-        // The per-field grammar (`type` / `default`) is checked by the merge for
-        // NEW fields; redeclarations are judged against the existing spec first.
-        out.push((name.to_string(), spec.clone()));
-    }
-    Ok(out)
+    Ok(ParsedExtension { optional, aspect })
 }
 
 fn guard_yaml(text: &str) -> Result<(), String> {
@@ -401,17 +578,27 @@ fn validate_field_name(name: &str) -> Result<(), MetaSchemaMergeError> {
     Ok(())
 }
 
-/// The cap-fs `optional` field grammar: `type` (scalar name or enum list),
-/// `default` present + type-matching, no `auto` (auto rules are for `required`).
-fn validate_optional_spec(name: &str, spec: &Value) -> Result<(), MetaSchemaMergeError> {
+const FIELD_SPEC_KEYS: &[&str] = &[
+    "type",
+    "default",
+    "transitions",
+    "derive",
+    "ensure",
+    "inherit",
+];
+
+/// The cap-fs field grammar: `type` (scalar name or enum list), an optional `default` that
+/// matches the type, no `auto` (auto rules are for `required`), and the v2 attributes
+/// (their internal consistency is checked by cap-fs's own parser at the pre-write dry run).
+fn validate_field_spec(name: &str, spec: &Value) -> Result<(), MetaSchemaMergeError> {
     let m = spec.as_mapping().ok_or_else(|| {
         MetaSchemaMergeError::InvalidExtension(format!(
-            "field {name}: spec must be a mapping with `type` and `default`"
+            "field {name}: spec must be a mapping with `type`"
         ))
     })?;
     for key in m.keys() {
         match key.as_str() {
-            Some("type") | Some("default") => {}
+            Some(k) if FIELD_SPEC_KEYS.contains(&k) => {}
             Some("auto") => {
                 return Err(MetaSchemaMergeError::InvalidExtension(format!(
                     "field {name}: `auto` rules apply to required fields only"
@@ -432,34 +619,25 @@ fn validate_optional_spec(name: &str, spec: &Value) -> Result<(), MetaSchemaMerg
     let ty = m.get(Value::from("type")).ok_or_else(|| {
         MetaSchemaMergeError::InvalidExtension(format!("field {name}: missing `type`"))
     })?;
-    let default = m.get(Value::from("default")).ok_or_else(|| {
-        MetaSchemaMergeError::InvalidExtension(format!(
-            "field {name}: optional fields need a `default`"
-        ))
-    })?;
-    let ok = match ty {
+    let variants: Option<Vec<&str>> = match ty {
         Value::String(s) => match s.as_str() {
-            "string" => matches!(default, Value::String(_)),
-            "integer" => matches!(default, Value::Number(n) if n.is_i64() || n.is_u64()),
-            "boolean" => matches!(default, Value::Bool(_)),
-            "list<string>" => {
-                matches!(default, Value::Sequence(items) if items.iter().all(|i| matches!(i, Value::String(_))))
-            }
+            "string" | "integer" | "boolean" | "datetime" | "duration" | "list<string>"
+            | "list<datetime>" => None,
             other => {
                 return Err(MetaSchemaMergeError::InvalidExtension(format!(
-                    "field {name}: unknown type `{other}` (string / integer / boolean / \
-                     list<string> / [enum, variants])"
+                    "field {name}: unknown type `{other}` (string / integer / boolean / datetime / \
+                     duration / list<string> / list<datetime> / [enum, variants])"
                 )))
             }
         },
-        Value::Sequence(variants) => {
-            if variants.is_empty() || variants.len() > MAX_ENUM_VARIANTS {
+        Value::Sequence(items) => {
+            if items.is_empty() || items.len() > MAX_ENUM_VARIANTS {
                 return Err(MetaSchemaMergeError::InvalidExtension(format!(
                     "field {name}: enum type needs 1..={MAX_ENUM_VARIANTS} string variants"
                 )));
             }
-            let mut names = Vec::with_capacity(variants.len());
-            for v in variants {
+            let mut names = Vec::with_capacity(items.len());
+            for v in items {
                 match v {
                     Value::String(s) => names.push(s.as_str()),
                     _ => {
@@ -469,7 +647,7 @@ fn validate_optional_spec(name: &str, spec: &Value) -> Result<(), MetaSchemaMerg
                     }
                 }
             }
-            matches!(default, Value::String(d) if names.contains(&d.as_str()))
+            Some(names)
         }
         _ => {
             return Err(MetaSchemaMergeError::InvalidExtension(format!(
@@ -477,10 +655,58 @@ fn validate_optional_spec(name: &str, spec: &Value) -> Result<(), MetaSchemaMerg
             )))
         }
     };
-    if !ok {
-        return Err(MetaSchemaMergeError::InvalidExtension(format!(
-            "field {name}: `default` does not match the declared type"
-        )));
+    if let Some(default) = m.get(Value::from("default")) {
+        let ok = match (ty, &variants) {
+            (Value::String(s), None) => match s.as_str() {
+                "string" | "datetime" | "duration" => matches!(default, Value::String(_)),
+                "integer" => matches!(default, Value::Number(n) if n.is_i64() || n.is_u64()),
+                "boolean" => matches!(default, Value::Bool(_)),
+                _ => {
+                    matches!(default, Value::Sequence(items) if items.iter().all(|i| matches!(i, Value::String(_))))
+                }
+            },
+            (_, Some(names)) => matches!(default, Value::String(d) if names.contains(&d.as_str())),
+            _ => false,
+        };
+        if !ok {
+            return Err(MetaSchemaMergeError::InvalidExtension(format!(
+                "field {name}: `default` does not match the declared type"
+            )));
+        }
+    }
+    if let Some(t) = m.get(Value::from("transitions")) {
+        let Some(names) = &variants else {
+            return Err(MetaSchemaMergeError::InvalidExtension(format!(
+                "field {name}: `transitions` is only valid on an enum field"
+            )));
+        };
+        let Some(tm) = t.as_mapping() else {
+            return Err(MetaSchemaMergeError::InvalidExtension(format!(
+                "field {name}: `transitions` must be a mapping"
+            )));
+        };
+        for (from, tos) in tm {
+            let ok_from = from.as_str().map(|f| names.contains(&f)).unwrap_or(false);
+            let ok_tos = tos
+                .as_sequence()
+                .map(|s| {
+                    s.iter()
+                        .all(|t| t.as_str().map(|x| names.contains(&x)).unwrap_or(false))
+                })
+                .unwrap_or(false);
+            if !ok_from || !ok_tos {
+                return Err(MetaSchemaMergeError::InvalidExtension(format!(
+                    "field {name}: transitions must map declared variants to lists of declared variants"
+                )));
+            }
+        }
+    }
+    if let Some(i) = m.get(Value::from("inherit")) {
+        if !matches!(i, Value::Bool(_)) {
+            return Err(MetaSchemaMergeError::InvalidExtension(format!(
+                "field {name}: `inherit` must be a boolean"
+            )));
+        }
     }
     Ok(())
 }
@@ -603,7 +829,6 @@ mod tests {
     fn extension_grammar_is_enforced() {
         for bad in [
             "required:\n  x:\n    type: string\n    auto: filename\n",
-            "optional:\n  x:\n    type: string\n",
             "optional:\n  x:\n    type: integer\n    default: nope\n",
             "optional:\n  x:\n    type: string\n    default: a\n    auto: filename\n",
             "optional:\n  \"bad name\":\n    type: string\n    default: a\n",
@@ -620,6 +845,8 @@ mod tests {
             );
         }
         assert!(merge_documents(None, EXT_ENUM).is_ok());
+        // Meta-schema v2: `default` is optional.
+        assert!(merge_documents(None, "optional:\n  x:\n    type: string\n").is_ok());
         assert!(merge_documents(None, "a: &x 1\noptional: *x\n").is_err());
     }
 

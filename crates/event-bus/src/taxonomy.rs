@@ -444,6 +444,16 @@ pub mod pack {
     pub const REGISTRY_RELOADED: &str = "pack.registry_reloaded";
 }
 
+/// Entity-data lane E1 — `data.*` events emitted by cap-data's `DataStore` after every
+/// committed transaction. In `ALL_EVENT_TYPES` and deliberately ABSENT from
+/// `TRIGGER_BUS_WHITELIST` (PRD §15.4 pins 12 entries; data changes never trigger components,
+/// pack components are cron-driven).
+pub mod data {
+    /// One per committed `create` / `patch` / `promote` / `demote` / `apply` (payload:
+    /// `agent_id`, `path`, `entity_id`, `op`, `kind`, `commit`).
+    pub const ENTITY_CHANGED: &str = "data.entity_changed";
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // 12-event Trigger Bus whitelist (MODULE-019 §1.3.2a / PRD §15.4).
 // Locked by `whitelist_has_12_entries` regression test.
@@ -639,6 +649,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     pack::INSTALLED,
     pack::UNINSTALLED,
     pack::REGISTRY_RELOADED,
+    // Entity-data lane E1 (1)
+    data::ENTITY_CHANGED,
     // NOTE: extensions::RUNTIME_DEGRADED_PREFIX is intentionally NOT enumerated —
     // concrete strings are dynamic (`runtime.degraded.{reason}`); T72 prefix-exempts.
 ];

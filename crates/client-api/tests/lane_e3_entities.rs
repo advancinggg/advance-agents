@@ -1,5 +1,4 @@
-#![cfg(feature = "lane-e3")]
-//! Lane E3 — CONTRACT-190 `schema` + `entities` families (the internal entity-data lane plan §4):
+//! Lane E3 — CONTRACT-190 `schema` + `entities` families:
 //! `/client/schema`, `/client/entities:query`, `/client/entities/{id}`, `:create`, `:patch`,
 //! `:apply`, `:promote`, `:demote` over a recording in-memory `EntityProvider`, driving the REAL
 //! `ClientApi::handle()` pipeline (admission, version, session, scope gate, idempotency
@@ -143,14 +142,22 @@ impl EntityProvider for MemoryEntities {
         assert_eq!(req.op, "detach_occurrence");
         Ok(vec![row(entity_id, "todo"), row("e-10", "todo")])
     }
-    fn promote(&self, _agent_id: &str, entity_id: &str) -> Result<ClientEntityTarget, ProviderError> {
+    fn promote(
+        &self,
+        _agent_id: &str,
+        entity_id: &str,
+    ) -> Result<ClientEntityTarget, ProviderError> {
         self.gate()?;
         Ok(ClientEntityTarget {
             path: format!("{entity_id}.md"),
             anchor: None,
         })
     }
-    fn demote(&self, _agent_id: &str, entity_id: &str) -> Result<ClientEntityTarget, ProviderError> {
+    fn demote(
+        &self,
+        _agent_id: &str,
+        entity_id: &str,
+    ) -> Result<ClientEntityTarget, ProviderError> {
         self.gate()?;
         Ok(ClientEntityTarget {
             path: "launch.md".into(),
@@ -218,16 +225,44 @@ fn en01_absent_provider_is_module_unavailable_not_unknown_route() {
     operator(&api);
     for req in [
         get(routes::PATH_SCHEMA),
-        post(routes::PATH_ENTITIES_QUERY, json!({ "agent_id": "alice" }), "k0"),
+        post(
+            routes::PATH_ENTITIES_QUERY,
+            json!({ "agent_id": "alice" }),
+            "k0",
+        ),
         get("/client/entities/alice/e-1"),
-        post(routes::PATH_ENTITIES_CREATE, json!({ "agent_id": "alice", "parent": "launch.md", "record": {} }), "k1"),
-        post("/client/entities/e-1:patch", json!({ "agent_id": "alice", "ops": [] }), "k2"),
-        post("/client/entities/e-1:apply", json!({ "agent_id": "alice", "op": "x", "args": {} }), "k3"),
-        post("/client/entities/e-1:promote", json!({ "agent_id": "alice" }), "k4"),
-        post("/client/entities/e-1:demote", json!({ "agent_id": "alice" }), "k5"),
+        post(
+            routes::PATH_ENTITIES_CREATE,
+            json!({ "agent_id": "alice", "parent": "launch.md", "record": {} }),
+            "k1",
+        ),
+        post(
+            "/client/entities/e-1:patch",
+            json!({ "agent_id": "alice", "ops": [] }),
+            "k2",
+        ),
+        post(
+            "/client/entities/e-1:apply",
+            json!({ "agent_id": "alice", "op": "x", "args": {} }),
+            "k3",
+        ),
+        post(
+            "/client/entities/e-1:promote",
+            json!({ "agent_id": "alice" }),
+            "k4",
+        ),
+        post(
+            "/client/entities/e-1:demote",
+            json!({ "agent_id": "alice" }),
+            "k5",
+        ),
     ] {
         let env = api.handle(req);
-        assert_eq!(code(&env), Some(ClientErrorCode::ModuleUnavailable), "{env:?}");
+        assert_eq!(
+            code(&env),
+            Some(ClientErrorCode::ModuleUnavailable),
+            "{env:?}"
+        );
     }
     assert_eq!(family_of(routes::PATH_SCHEMA), "schema");
     assert_eq!(family_of(routes::PATH_ENTITIES_QUERY), "entities");
@@ -267,12 +302,20 @@ fn en02_schema_query_and_get_project_rows() {
         ("unknown field", json!({ "agent_id": "alice", "nope": 1 })),
     ] {
         let env = api.handle(post(routes::PATH_ENTITIES_QUERY, body, "qv"));
-        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{why}: {env:?}");
+        assert_eq!(
+            code(&env),
+            Some(ClientErrorCode::InvalidRequest),
+            "{why}: {env:?}"
+        );
     }
     assert_eq!(provider.calls.query.load(Ordering::SeqCst), before);
     let calls = provider.calls.get.load(Ordering::SeqCst);
     let env = api.handle(get("/client/entities/.hidden/e-1"));
-    assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "malformed agent id segment");
+    assert_eq!(
+        code(&env),
+        Some(ClientErrorCode::InvalidRequest),
+        "malformed agent id segment"
+    );
     assert_eq!(provider.calls.get.load(Ordering::SeqCst), calls);
 }
 
@@ -284,14 +327,16 @@ fn en03_writes_are_idempotent_mutations_behind_write_entities() {
     operator(&api);
 
     let body = json!({ "agent_id": "alice", "ops": [{ "set": "status", "value": "done" }] });
-    let first: ClientEntityRow = data(&api.handle(post("/client/entities/e-1:patch", body.clone(), "p1")));
+    let first: ClientEntityRow =
+        data(&api.handle(post("/client/entities/e-1:patch", body.clone(), "p1")));
     assert_eq!(first.fields["status"], json!("done"));
     let seen = provider.last_patch.lock().unwrap().clone().unwrap();
     assert_eq!(seen.0, "e-1");
     assert_eq!(seen.1.ops.len(), 1);
 
     // Same key + same body → replay, provider not called again; same key + other body → conflict.
-    let replay: ClientEntityRow = data(&api.handle(post("/client/entities/e-1:patch", body.clone(), "p1")));
+    let replay: ClientEntityRow =
+        data(&api.handle(post("/client/entities/e-1:patch", body.clone(), "p1")));
     assert_eq!(replay, first);
     assert_eq!(provider.calls.patch.load(Ordering::SeqCst), 1);
     let env = api.handle(post(
@@ -333,7 +378,11 @@ fn en03_writes_are_idempotent_mutations_behind_write_entities() {
     assert!(Scope::operator_default().contains(&Scope::WriteEntities));
     // A write without an idempotency key is refused like every other mutation.
     let env = api.handle(
-        ClientRequest::post("/client/entities/e-1:demote", json!({ "agent_id": "alice" })).with_session("tok"),
+        ClientRequest::post(
+            "/client/entities/e-1:demote",
+            json!({ "agent_id": "alice" }),
+        )
+        .with_session("tok"),
     );
     assert_eq!(code(&env), Some(ClientErrorCode::IdempotencyRequired));
 }
@@ -342,10 +391,22 @@ fn en03_writes_are_idempotent_mutations_behind_write_entities() {
 #[test]
 fn en04_provider_errors_project() {
     for (err, expected) in [
-        (ProviderError::NotFound("e".into()), ClientErrorCode::NotFound),
-        (ProviderError::InvalidState("done → doing".into()), ClientErrorCode::InvalidState),
-        (ProviderError::Forbidden("territory".into()), ClientErrorCode::Forbidden),
-        (ProviderError::Unavailable("op".into()), ClientErrorCode::ModuleUnavailable),
+        (
+            ProviderError::NotFound("e".into()),
+            ClientErrorCode::NotFound,
+        ),
+        (
+            ProviderError::InvalidState("done → doing".into()),
+            ClientErrorCode::InvalidState,
+        ),
+        (
+            ProviderError::Forbidden("territory".into()),
+            ClientErrorCode::Forbidden,
+        ),
+        (
+            ProviderError::Unavailable("op".into()),
+            ClientErrorCode::ModuleUnavailable,
+        ),
     ] {
         let (api, _sink) = api_with(MemoryEntities::failing(err));
         operator(&api);
@@ -369,7 +430,7 @@ fn en05_entity_changed_is_projected_with_its_leaves() {
 // ── EN-06: the DTOs are schema components with compat coverage ───────────────────────────────
 #[test]
 fn en06_dtos_are_in_the_schema_inventory() {
-    let artifact = generate_schema_artifact();
+    let artifact = generate_schema_artifact().schema_json();
     for name in [
         "ClientSchema",
         "ClientAspect",
@@ -381,9 +442,20 @@ fn en06_dtos_are_in_the_schema_inventory() {
         "ClientEntityPatchRequest",
         "ClientEntityApplyRequest",
     ] {
-        assert!(artifact.contains(name), "{name} missing from the schema artifact");
+        assert!(
+            artifact.contains(name),
+            "{name} missing from the schema artifact"
+        );
     }
-    for name in ["ClientSchema", "ClientEntityRow", "ClientEntityPage", "ClientEntityTarget"] {
-        assert!(RESPONSE_COMPONENTS.contains(&name), "{name} needs a compat baseline");
+    for name in [
+        "ClientSchema",
+        "ClientEntityRow",
+        "ClientEntityPage",
+        "ClientEntityTarget",
+    ] {
+        assert!(
+            RESPONSE_COMPONENTS.contains(&name),
+            "{name} needs a compat baseline"
+        );
     }
 }

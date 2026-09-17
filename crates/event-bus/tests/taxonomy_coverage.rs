@@ -233,6 +233,9 @@ const KNOWN_EXTENSIONS: &[&str] = &[
     "pack.installed",
     "pack.uninstalled",
     "pack.registry_reloaded",
+    // Entity-data lane E1 (`taxonomy::data::ENTITY_CHANGED`): one per committed `data` write.
+    // Never a trigger (PRD §15.4 stays at 12 entries).
+    "data.entity_changed",
 ];
 
 /// Events whose concrete strings are formed at the call site (not enumerated in

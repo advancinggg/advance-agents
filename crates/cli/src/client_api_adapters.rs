@@ -11,9 +11,9 @@ use advance_client_api::{
     AgentAdminProvider, BoundGrantApprovalPort, BoundHistoryPage, BoundHistoryReadPort,
     ClientAgentTreeNode, ClientApi, ClientCursorCodec, ClientEventProvider, ClientMcpEntry,
     ClientMessageAck, ClientMessageStatus, ClientRunMutation, ClientRunSummary, ClientSkillEntry,
-    ClientToolEntry, ClientToolInventory, CostProvider, LlmDeltaHub, MessagingProvider,
-    NormalizedEventFilter, PackAdminProvider, ProviderAdminProvider, ProviderError, RawEventRow,
-    RunControlProvider, SecretsAdminProvider, ToolsProvider,
+    ClientToolEntry, ClientToolInventory, CostProvider, EntityProvider, LlmDeltaHub,
+    MessagingProvider, NormalizedEventFilter, PackAdminProvider, ProviderAdminProvider,
+    ProviderError, RawEventRow, RunControlProvider, SecretsAdminProvider, ToolsProvider,
 };
 use advance_event_bus::{EventFilter, ObservabilityReadApi, ReadApiError, ReadCursor, ReadEvent};
 use advance_messaging::{MailboxStore, Message, MessageKind, MsgError};
@@ -558,6 +558,9 @@ pub struct FirstPartyClientCompose {
     /// Secrets family: the home's secrets mode
     /// (File vs keychain-sync) over the runtime-config.yaml `secrets:` block.
     pub secrets: Option<Arc<dyn SecretsAdminProvider>>,
+    /// CONTRACT-190 schema + entities families (entity-data lane E3) over the production
+    /// `DataStore` (the `data` host tool's store).
+    pub entities: Option<Arc<dyn EntityProvider>>,
 }
 
 pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCompose) -> ClientApi {
@@ -611,6 +614,9 @@ pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCom
     }
     if let Some(secrets) = parts.secrets {
         api = api.with_secrets_provider(secrets);
+    }
+    if let Some(entities) = parts.entities {
+        api = api.with_entity_provider(entities);
     }
     api
 }

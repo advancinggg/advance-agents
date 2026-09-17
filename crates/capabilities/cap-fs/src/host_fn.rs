@@ -323,6 +323,7 @@ async fn sqlite_sync_after_write(
     file_name: &str,
     data: &[u8],
     meta_new: &MetaFile,
+    schema: &crate::meta_schema::MetaSchema,
 ) {
     let (Some(sync), Some(ws), Some(tree)) = (
         db_sync.as_ref(),
@@ -446,6 +447,37 @@ async fn sqlite_sync_after_write(
             }),
         );
     }
+
+    // Entity-data lane E1: the entity projection of a Markdown file (its frontmatter record
+    // + inline items) replaces the path's rows in the entity index. Entity paths carry no
+    // leading slash.
+    if crate::meta_schema::is_markdown_name(file_name) {
+        let entity_path = ws_path.trim_start_matches('/').to_string();
+        let projected = crate::entity_projection::project_bytes(
+            data,
+            schema,
+            &m004_agent,
+            &entity_path,
+            chrono::Utc::now(),
+        );
+        let outcome = match projected {
+            Ok(rows) => sync.upsert_entities(&m004_agent, &entity_path, rows).await,
+            Err(e) => Err(FsSyncError(e)),
+        };
+        if let Err(FsSyncError(msg)) = outcome {
+            emit_runtime_degraded(
+                emitter,
+                &ctx.agent_id,
+                &ctx.trace_id,
+                "sqlite_sync_failed",
+                serde_json::json!({
+                    "vpath": path,
+                    "op": "upsert_entities",
+                    "error": msg,
+                }),
+            );
+        }
+    }
 }
 
 /// Slice C: SQL leg for FsDeleteHandler. Runs AFTER FS + meta delete, BEFORE
@@ -535,6 +567,24 @@ async fn sqlite_sync_after_delete(
                 "error": msg,
             }),
         );
+    }
+
+    // Entity-data lane E1: drop the deleted file's entity rows (idempotent).
+    if crate::meta_schema::is_markdown_name(file_name) {
+        let entity_path = ws_path.trim_start_matches('/');
+        if let Err(FsSyncError(msg)) = sync.delete_entities(&m004_agent, entity_path).await {
+            emit_runtime_degraded(
+                emitter,
+                &ctx.agent_id,
+                &ctx.trace_id,
+                "sqlite_sync_failed",
+                serde_json::json!({
+                    "vpath": path,
+                    "op": "delete_entities",
+                    "error": msg,
+                }),
+            );
+        }
     }
 }
 
@@ -844,7 +894,7 @@ impl HostFunctionHandler for FsWriteHandler {
             // Step 3: under the semaphore, take an owning copy of the path
             // and convert the Val::List into a Vec<u8>. The semaphore caps
             // peak amplification.
-            let (path, data) = match params.as_slice() {
+            let (path, mut data) = match params.as_slice() {
                 [Val::String(s), Val::List(d)] => {
                     let path = s.clone();
                     let mut data = Vec::with_capacity(d.len());
@@ -898,6 +948,37 @@ impl HostFunctionHandler for FsWriteHandler {
                     )));
                 }
             };
+
+            // Entity-data lane E1: a Markdown write goes through the frontmatter codec
+            // (schema validation, host-assigned ids, status transitions, derived fields,
+            // `ensure`) BEFORE anything is committed. The block is rewritten in canonical
+            // form; the body bytes are preserved exactly. Fail-closed: an invalid record
+            // rejects the whole write and nothing on disk changes.
+            let schema = maintainer.schema();
+            if crate::meta_schema::is_markdown_name(&file_name) {
+                let previous = match tokio::fs::read(&physical).await {
+                    Ok(bytes) => crate::frontmatter::parse_frontmatter(&bytes)
+                        .ok()
+                        .flatten()
+                        .map(|(doc, _)| doc),
+                    Err(_) => None,
+                };
+                let mut ids = crate::frontmatter::UlidIdSource;
+                match crate::frontmatter::normalize(
+                    &data,
+                    previous.as_ref(),
+                    &schema,
+                    &mut ids,
+                    chrono::Utc::now(),
+                ) {
+                    Ok(normalized) => data = normalized,
+                    Err(e) => {
+                        return Ok(ok_err_variant(&FsError::IoError(format!(
+                            "frontmatter: {e}"
+                        ))));
+                    }
+                }
+            }
 
             // is_new_file: best-effort async pre-check. TOCTOU race acknowledged.
             let is_new_file = tokio::fs::metadata(&physical).await.is_err();
@@ -1036,6 +1117,7 @@ impl HostFunctionHandler for FsWriteHandler {
                 &file_name,
                 &data,
                 &meta_new,
+                &schema,
             )
             .await;
 
@@ -3010,6 +3092,45 @@ pub fn register_agent_fs(
     agent_tree: Option<Arc<dyn AgentTreeSnapshot>>,
     git_sync: Option<Arc<dyn GitSync>>,
 ) {
+    let maintainer = Arc::new(MetaMaintainer::new(
+        Arc::clone(&schema),
+        Arc::clone(&atomic_writer),
+    ));
+    register_agent_fs_with_maintainer(
+        registry,
+        resolver,
+        emitter,
+        schema,
+        history,
+        atomic_writer,
+        preview_max_bytes,
+        db_sync,
+        workspace_root,
+        agent_tree,
+        git_sync,
+        maintainer,
+    );
+}
+
+/// [`register_agent_fs`] with a caller-owned [`MetaMaintainer`] (entity-data lane E1): the
+/// composition root shares ONE maintainer — and therefore ONE `.meta.yaml` write lock —
+/// between the `fs.write` handlers and cap-data's `DataStore`, which writes through the same
+/// primitives.
+#[allow(clippy::too_many_arguments)]
+pub fn register_agent_fs_with_maintainer(
+    registry: &dyn HostRegistry,
+    resolver: Arc<dyn VirtualPathResolver>,
+    emitter: Arc<dyn EventBusEmit>,
+    schema: Arc<MetaSchemaLoader>,
+    history: Arc<dyn FileHistoryProvider>,
+    atomic_writer: Arc<dyn AtomicWriter>,
+    preview_max_bytes: Option<usize>,
+    db_sync: Option<Arc<dyn SqliteSync>>,
+    workspace_root: Option<PathBuf>,
+    agent_tree: Option<Arc<dyn AgentTreeSnapshot>>,
+    git_sync: Option<Arc<dyn GitSync>>,
+    maintainer: Arc<MetaMaintainer>,
+) {
     // Slice C invariant: db_sync, workspace_root, agent_tree must be all-Some
     // or all-None. Caller-side configuration error → panic at registration
     // time (matches slice A/B's policy of asserting invariants on registration
@@ -3034,10 +3155,7 @@ pub fn register_agent_fs(
     // is unreachable from any real guest (the reply-tracker `agent-messaging@0.1.0`
     // registration is the working precedent). See MODULE-001 §3.6 namespace-version discovery.
     let ns = "advance:runtime/agent-fs@0.1.0".to_string();
-    let maintainer = Arc::new(MetaMaintainer::new(
-        Arc::clone(&schema),
-        Arc::clone(&atomic_writer),
-    ));
+    let _ = &schema;
 
     // ---- core 4 (slice A) ----
     registry.register(HostFunctionSpec {

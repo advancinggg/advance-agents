@@ -1,4 +1,4 @@
-# Build manifest for packs/agenda (the internal entity-data lane plan §3.4). Lives OUTSIDE the pack
+# Build manifest for packs/agenda (entity-data lane E2). Lives OUTSIDE the pack
 # directory because the install layout allow-list has no room for it. `advance pack build
 # packs/agenda --out <dir>` builds each entry to `<out>/agenda/skills/<skill>/tool.wasm` and
 # fills the output pack.yaml's checksums. The source pack stays text-only.

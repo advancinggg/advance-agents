@@ -1,5 +1,4 @@
-#![cfg(feature = "lane-e1")]
-//! Lane E1 — structured meta-schema merge, v2 grammar (the internal entity-data lane plan §2.4):
+//! Lane E1 — structured meta-schema merge, v2 grammar:
 //! an extension's aspect block lands in the workspace document, an aspect has exactly one
 //! owner, and every field attribute takes part in the identical / conflict decision.
 
@@ -55,18 +54,23 @@ fn e1_aspect_block_lands_in_the_target_document() {
         v["aspects"]["agenda"]["operations"]["shift_series"]["method"],
         Value::from("shift-series")
     );
-    assert_eq!(
-        v["optional"]["status"]["transitions"]["done"],
-        yaml("[todo]")
+    let fields = &v["aspects"]["agenda"]["fields"];
+    assert_eq!(fields["status"]["transitions"]["done"], yaml("[todo]"));
+    assert!(
+        fields["due"].get("default").is_none(),
+        "no default is invented for a field declared without one"
     );
     assert!(
-        v["optional"]["due"].get("default").is_none(),
-        "no default is invented for a field declared without one"
+        v["optional"].get("status").is_none(),
+        "aspect fields stay under their aspect, never in the entry vocabulary"
     );
     // The target's own content survives verbatim.
     assert_eq!(v["optional"]["stage"]["default"], Value::from("draft"));
     assert_eq!(v["required"]["name"]["auto"], Value::from("filename"));
-    assert!(added.contains(&"status".to_string()) && added.len() == 11, "{added:?}");
+    assert!(
+        added.contains(&"status".to_string()) && added.len() == 11,
+        "{added:?}"
+    );
 }
 
 #[test]
@@ -81,7 +85,7 @@ fn e1_merging_the_same_extension_again_is_idempotent() {
 #[test]
 fn e1_an_aspect_has_exactly_one_owner() {
     let (merged, _, _) = merge(BASE, AGENDA_YAML).unwrap();
-    let rival = "aspect: agenda\nkey: [starts]\noptional:\n  starts:\n    type: datetime\n";
+    let rival = "aspect: agenda\nkey: [starts]\nfields:\n  starts:\n    type: datetime\n";
     let err = merge(&merged, rival).unwrap_err();
     assert!(
         matches!(err, MetaSchemaMergeError::Conflict { .. }),
@@ -92,14 +96,14 @@ fn e1_an_aspect_has_exactly_one_owner() {
 #[test]
 fn e1_field_attributes_participate_in_the_conflict_decision() {
     let (merged, _, _) = merge(BASE, AGENDA_YAML).unwrap();
-    let other = "aspect: other\nkey: [status]\noptional:\n  status:\n    type: [todo, doing, done, cancelled]\n    transitions:\n      todo: [done]\n";
+    let other = "aspect: other\nkey: [status]\nfields:\n  status:\n    type: [todo, doing, done, cancelled]\n    transitions:\n      todo: [done]\n";
     let err = merge(&merged, other).unwrap_err();
     assert!(
         matches!(&err, MetaSchemaMergeError::Conflict { field, .. } if field == "status"),
         "same type, different transitions: {err:?}"
     );
     // Identical redeclaration (attributes included) is fine: `status` reported unchanged.
-    let same = "aspect: other\nkey: [status]\noptional:\n  status:\n    type: [todo, doing, done, cancelled]\n    transitions:\n      todo: [doing, done, cancelled]\n      doing: [todo, done, cancelled]\n      done: [todo]\n      cancelled: [todo]\n";
+    let same = "aspect: other\nkey: [status]\nfields:\n  status:\n    type: [todo, doing, done, cancelled]\n    transitions:\n      todo: [doing, done, cancelled]\n      doing: [todo, done, cancelled]\n      done: [todo]\n      cancelled: [todo]\n";
     let (_, added, unchanged) = merge(&merged, same).unwrap();
     assert!(added.is_empty() && unchanged == vec!["status".to_string()]);
 }
@@ -111,5 +115,8 @@ fn e1_v1_extension_still_merges_and_default_is_optional() {
     assert!(yaml(&merged)["optional"]["priority"]
         .get("default")
         .is_none());
-    assert!(yaml(&merged).get("aspects").is_none(), "no aspect block without `aspect:`");
+    assert!(
+        yaml(&merged).get("aspects").is_none(),
+        "no aspect block without `aspect:`"
+    );
 }

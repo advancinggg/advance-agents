@@ -76,6 +76,25 @@ pub trait SqliteSync: Send + Sync {
         directory: &str,
         entry_name: &str,
     ) -> Result<(), FsSyncError>;
+
+    /// Entity-data lane E1: replace every entity row projected from `path` (a `.md` file's
+    /// frontmatter record + inline items). Default = no entity index wired (a no-op), so
+    /// pre-existing implementors keep compiling.
+    async fn upsert_entities(
+        &self,
+        agent_id: &str,
+        path: &str,
+        rows: Vec<advance_shared_types::entity::EntityRow>,
+    ) -> Result<(), FsSyncError> {
+        let _ = (agent_id, path, rows);
+        Ok(())
+    }
+
+    /// Entity-data lane E1: drop every entity row of `path`.
+    async fn delete_entities(&self, agent_id: &str, path: &str) -> Result<(), FsSyncError> {
+        let _ = (agent_id, path);
+        Ok(())
+    }
 }
 
 /// Production [`SqliteSync`] adapter wrapping `Arc<dyn SqliteIndexHandle>`.
@@ -84,16 +103,47 @@ pub trait SqliteSync: Send + Sync {
 #[derive(Clone)]
 pub struct Db030SqliteSync {
     handle: Arc<dyn advance_database::SqliteIndexHandle>,
+    /// Entity-data lane E1: the entity projection over the same index DB.
+    entities: Arc<advance_database::SqliteEntityIndex>,
 }
 
 impl Db030SqliteSync {
     pub fn new(handle: Arc<dyn advance_database::SqliteIndexHandle>) -> Self {
-        Self { handle }
+        let entities = Arc::new(advance_database::SqliteEntityIndex::new(Arc::clone(
+            &handle,
+        )));
+        Self { handle, entities }
+    }
+
+    /// The entity index this sync writes through (shared with cap-data's `DataStore`).
+    pub fn entity_index(&self) -> Arc<advance_database::SqliteEntityIndex> {
+        Arc::clone(&self.entities)
     }
 }
 
 #[async_trait]
 impl SqliteSync for Db030SqliteSync {
+    async fn upsert_entities(
+        &self,
+        agent_id: &str,
+        path: &str,
+        rows: Vec<advance_shared_types::entity::EntityRow>,
+    ) -> Result<(), FsSyncError> {
+        use advance_shared_types::entity::EntityIndex;
+        self.entities
+            .replace_path(agent_id, path, rows)
+            .await
+            .map_err(|e| FsSyncError(e.to_string()))
+    }
+
+    async fn delete_entities(&self, agent_id: &str, path: &str) -> Result<(), FsSyncError> {
+        use advance_shared_types::entity::EntityIndex;
+        self.entities
+            .delete_path(agent_id, path)
+            .await
+            .map_err(|e| FsSyncError(e.to_string()))
+    }
+
     async fn upsert_content(
         &self,
         agent_id: &str,

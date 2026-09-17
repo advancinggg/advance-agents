@@ -409,13 +409,15 @@ async fn ac07_apply_hidden_name_walk_allows_agent_non_underscore() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn ac08_schema_loader_default_has_four_required_fields() {
+async fn ac08_schema_loader_default_has_five_required_fields() {
     // ADR 2026-06-29 Decision 1 added a 4th required field: entity `type`
-    // (strengthening — a new required field, not a criterion weakening).
+    // (strengthening — a new required field, not a criterion weakening). The entity-data
+    // lane added the 5th: the host-assigned `id` (auto `ulid`), so every record is addressable.
     let loader = MetaSchemaLoader::new_with_default(PathBuf::new());
     let schema = loader.current();
-    assert_eq!(schema.required.len(), 4);
+    assert_eq!(schema.required.len(), 5);
     assert!(schema.required.contains_key("type"));
+    assert!(schema.required.contains_key("id"));
 }
 
 #[tokio::test]

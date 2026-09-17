@@ -63,8 +63,9 @@ use advance_shared_types::traits::{
     ToolsGrantReader,
 };
 use cap_fs::{
-    register_agent_fs, Adv003GitSync, DefaultAtomicWriter, DefaultVirtualPathResolver, GitSync,
-    MetaSchemaLoader, StubFileHistoryProvider, VirtualPathResolver,
+    register_agent_fs_with_maintainer, Adv003GitSync, AtomicWriter, DefaultAtomicWriter,
+    DefaultVirtualPathResolver, GitSync, MetaMaintainer, MetaSchemaLoader, StubFileHistoryProvider,
+    VirtualPathResolver,
 };
 use cap_grant::{
     register_agent_grant, register_cap_grant, AgentGrantBundle, AutoDenyResolver,
@@ -2102,25 +2103,45 @@ async fn wire_capabilities_inner(
     } else {
         None
     };
+    // Entity-data lane E1: the cap-fs primitives the `data` host tool writes through are the
+    // SAME instances the `fs.*` handlers use (one `.meta.yaml` maintainer = one write lock).
+    let mut data_fs_parts: Option<crate::data_wiring::DataFsParts> = None;
+    // Lane E3: the built `DataStore`, handed to the Client API's entities family below.
+    let mut data_store_for_api: Option<Arc<cap_data::DataStore>> = None;
     if let Some((resolver, schema)) = fs_handles {
         // cap-fs git_sync consumes the SHARED queue handle (clone) when present.
         let git_sync: Option<Arc<dyn GitSync>> = git_queue_handle.clone().map(|queue| {
             let queue_trait: Arc<dyn GitCommitQueue> = queue;
             Arc::new(Adv003GitSync::new(queue_trait)) as Arc<dyn GitSync>
         });
-        register_agent_fs(
+        let atomic_writer: Arc<dyn AtomicWriter> = Arc::new(DefaultAtomicWriter);
+        let maintainer = Arc::new(MetaMaintainer::new(
+            Arc::clone(&schema),
+            Arc::clone(&atomic_writer),
+        ));
+        register_agent_fs_with_maintainer(
             &*registry,
-            resolver,
+            Arc::clone(&resolver),
             event_bus_dyn.clone(),
-            schema,
+            Arc::clone(&schema),
             Arc::new(StubFileHistoryProvider),
-            Arc::new(DefaultAtomicWriter),
+            Arc::clone(&atomic_writer),
             Some(FS_PREVIEW_MAX_BYTES),
             None, // db_sync
             None, // workspace_root
             None, // agent_tree
-            git_sync,
+            git_sync.clone(),
+            Arc::clone(&maintainer),
         );
+        data_fs_parts = Some(crate::data_wiring::DataFsParts {
+            workspace_root: workspace.to_path_buf(),
+            resolver,
+            schema,
+            writer: atomic_writer,
+            maintainer,
+            git_sync,
+            history: Arc::new(StubFileHistoryProvider),
+        });
     }
 
     // 5c — cap-skills (single-agent provider rooted at `<workspace>/.agent`).
@@ -2612,6 +2633,34 @@ async fn wire_capabilities_inner(
         if let Some(root) = skills_root.as_deref() {
             let _registered = register_skill_tools(&tools_concrete, root).await;
         }
+        // Entity-data lane E1: the `data` host tool — registered BEFORE `start.rs` snapshots
+        // `ToolRegistry::list()` into the context assembler's tool inventory, so the model sees
+        // it. Needs the fs primitives (a `tools`-but-no-`fs` agent has no workspace to index).
+        if let Some(parts) = data_fs_parts.take() {
+            let entity_index: Arc<dyn advance_shared_types::entity::EntityIndex> = Arc::new(
+                advance_database::SqliteEntityIndex::new(host.sqlite_index_handle()),
+            );
+            let reducer = crate::data_wiring::deterministic_reducer(Arc::clone(&tools_concrete));
+            let store = crate::data_wiring::build_data_store(
+                parts,
+                entity_index,
+                event_bus_dyn.clone(),
+                reducer,
+                root_uid.as_str(),
+            )
+            .await;
+            // Lane E3: the Client API's schema + entities families serve the SAME store.
+            data_store_for_api = Some(Arc::clone(&store));
+            if let Err(e) = crate::data_wiring::register_data_tool(
+                &tools_concrete,
+                store,
+                cap_grant.grant_check.clone(),
+            )
+            .await
+            {
+                eprintln!("advance: WARN data tool not registered: {e}");
+            }
+        }
         // Pack lane P2: every installed pack
         // resource-capability's `tools[].name` must be a registered HOST tool to
         // be callable; report the gap at boot (WARN — never blocks: an agent just
@@ -2854,6 +2903,13 @@ async fn wire_capabilities_inner(
             let secrets_admin_for_api: Arc<dyn advance_client_api::SecretsAdminProvider> = Arc::new(
                 crate::client_api_secrets::WiredSecretsAdmin::new(workspace.to_path_buf()),
             );
+            // Schema + entities families (lane E3): over the `data` host tool's store, when the
+            // fs primitives gave us one (otherwise the routes answer `module_unavailable`).
+            let entities_for_api: Option<Arc<dyn advance_client_api::EntityProvider>> =
+                data_store_for_api.clone().map(|store| {
+                    Arc::new(crate::client_api_entities::WiredEntityProvider::new(store))
+                        as Arc<dyn advance_client_api::EntityProvider>
+                });
             let tree_for_api = agent_tree_snapshot.clone();
             let root_colon_for_api = root_colon.clone();
             match advance_client_api::ClientApiServer::bind_local_factory(0, move |address| {
@@ -2883,6 +2939,7 @@ async fn wire_capabilities_inner(
                     providers: Some(provider_admin_for_api.clone()
                         as Arc<dyn advance_client_api::ProviderAdminProvider>),
                     secrets: Some(secrets_admin_for_api.clone()),
+                    entities: entities_for_api.clone(),
                     ..Default::default()
                 };
                 if let Some((history, events, projector)) = history_events {

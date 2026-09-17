@@ -29,6 +29,20 @@ pub trait ToolRegistry: Send + Sync {
         params: &[u8],
     ) -> Result<Vec<u8>, ToolError>;
 
+    /// Entity-data lane E1: invoke on behalf of `agent_id` — the identity the
+    /// `tool-invoke` host function carries. Registries that hold identity-bearing
+    /// host tools route it to `HostTool::execute_as`; the default ignores it.
+    async fn invoke_as(
+        &self,
+        agent_id: &str,
+        tool_id: &str,
+        method: &str,
+        params: &[u8],
+    ) -> Result<Vec<u8>, ToolError> {
+        let _ = agent_id;
+        self.invoke(tool_id, method, params).await
+    }
+
     /// Enumerate the currently-loaded tools. Slice A: empty.
     async fn list(&self) -> Vec<ToolInfo>;
 

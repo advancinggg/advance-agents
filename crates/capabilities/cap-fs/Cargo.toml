@@ -26,6 +26,10 @@ uuid = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 walkdir = { workspace = true }
+# Entity-data lane E1: host-assigned entity ids (`e-` + ULID) and the content-addressed
+# schema hash (`describe` / `GET /client/schema`).
+ulid = { workspace = true }
+sha2 = { workspace = true }
 
 # Hotreload pre-build (2026-06-10) — `O_NOFOLLOW | O_NONBLOCK` constants for
 # MetaSchemaWatcher's hardened schema-file open (`OpenOptionsExt::custom_flags`
@@ -41,7 +45,3 @@ git2 = { workspace = true }
 
 [lints]
 workspace = true
-
-[features]
-# entity-data lane gated witness tests (the internal entity-data lane plan §0.2)
-lane-e1 = []

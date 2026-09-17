@@ -1,10 +1,10 @@
-# Aspect `agenda` — the one aspect this pack owns (the internal entity-data lane plan §1.2 / §1.4).
+# Aspect `agenda` — the one aspect this pack owns.
 # An entity has it iff `status` or `starts` is present. Grammar = meta-schema v2 (lane E1):
 # installing this pack only checks the file exists; the boot-time structured merge needs E1.
 aspect: agenda
 key: [status, starts]
 
-optional:
+fields:
   status:
     type: [todo, doing, done, cancelled]
     transitions:

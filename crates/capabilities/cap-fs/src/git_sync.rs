@@ -97,6 +97,27 @@ pub trait GitSync: Send + Sync {
         physical_path: PathBuf,
         meta_yaml_path: PathBuf,
     ) -> Result<(), GitSyncError>;
+
+    /// Entity-data lane E1: the same commit with a caller-supplied message (the `data`
+    /// transaction records `Advance-Data-Op: <op>` as a trailer) over any number of paths,
+    /// returning the commit id when the backend reports one. Default: forwards to
+    /// [`submit_fs_commit`](Self::submit_fs_commit) for the first two paths and reports no id.
+    async fn submit_commit_with_message(
+        &self,
+        agent_id: &str,
+        op: GitSyncOp,
+        vpath: &str,
+        paths: Vec<PathBuf>,
+        message: &str,
+    ) -> Result<Option<String>, GitSyncError> {
+        let _ = message;
+        let mut it = paths.into_iter();
+        let (Some(a), Some(b)) = (it.next(), it.next()) else {
+            return Ok(None);
+        };
+        self.submit_fs_commit(agent_id, op, vpath, a, b).await?;
+        Ok(None)
+    }
 }
 
 /// Production [`GitSync`] adapter wrapping
@@ -137,6 +158,31 @@ impl GitSync for Adv003GitSync {
         let rx = self.queue.submit(req);
         match rx.await {
             Ok(Ok(_oid)) => Ok(()),
+            Ok(Err(e)) => Err(GitSyncError(format!("{e:?}"))),
+            Err(_) => Err(GitSyncError(
+                "commit queue worker closed (oneshot canceled)".into(),
+            )),
+        }
+    }
+
+    async fn submit_commit_with_message(
+        &self,
+        agent_id: &str,
+        _op: GitSyncOp,
+        _vpath: &str,
+        paths: Vec<PathBuf>,
+        message: &str,
+    ) -> Result<Option<String>, GitSyncError> {
+        let req = advance_git::CommitRequest::new(
+            agent_id,
+            message.to_string(),
+            paths,
+            advance_git::CommitType::Turn,
+            format!("agent:{agent_id}"),
+        );
+        let rx = self.queue.submit(req);
+        match rx.await {
+            Ok(Ok(oid)) => Ok(Some(format!("{oid}"))),
             Ok(Err(e)) => Err(GitSyncError(format!("{e:?}"))),
             Err(_) => Err(GitSyncError(
                 "commit queue worker closed (oneshot canceled)".into(),

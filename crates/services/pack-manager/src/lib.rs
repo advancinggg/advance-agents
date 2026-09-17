@@ -62,6 +62,7 @@
 //!   live in the cli composition root (`pack_bridges`, `pack_production`).
 
 pub mod admin;
+pub mod bundle;
 pub mod catalog;
 pub(crate) mod component_manifest;
 pub mod deps;
@@ -83,6 +84,7 @@ pub mod verify;
 pub mod workflow;
 
 pub use admin::InteractiveApproval;
+pub use bundle::{bundle_pack, BundleReport};
 pub use catalog::{CapabilityCatalog, CatalogCheckedApproval, StaticCapabilityCatalog};
 pub use component_manifest::{resource_capability_id, resource_capability_tool_names};
 pub use deps::DependencyResolver;
@@ -115,8 +117,9 @@ pub use registry::{
     PackComponentResolution, PackMetadata, PackProvideEntry, PackRegistry, PackResolution,
 };
 pub use registry_client::{MockRegistryClient, RegistryClient};
-pub use signature::{verify_pack_signature, PACK_SIG_FILENAME};
+pub use signature::{public_key_hex, sign_pack_yaml, verify_pack_signature, PACK_SIG_FILENAME};
 pub use source::{is_commit_sha, parse_source, redact_userinfo, SourceRef};
+pub use verify::verify_checksums;
 pub use workflow::{
     SecretStore, SecretValue, TriggerEventBody, WorkflowApplier, WorkflowExecutor, WorkflowStep,
     WorkflowTemplate, WorkflowTrigger,

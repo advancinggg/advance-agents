@@ -1,6 +1,5 @@
-#![cfg(feature = "lane-e1")]
 //! Lane E1 — caller identity for host tools + deterministic tool invocation
-//! (the internal entity-data lane plan §2.5). `data` needs the calling agent; `data.apply` needs a
+//! (lane E1). `data` needs the calling agent; `data.apply` needs a
 //! reducer whose clock and randomness the host controls.
 
 use std::sync::{Arc, Mutex};
@@ -8,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use advance_runtime::component_loader::{ComponentRuntime, ToolEngineHandle};
 use advance_runtime::config::WasmConfig;
 use cap_tools::{
-    DeterministicCtx, HostTool, LazyRegistryConfig, LazyToolRegistry, MethodInfo,
-    ToolDescription, ToolError, ToolRegistry,
+    DeterministicCtx, HostTool, LazyRegistryConfig, LazyToolRegistry, MethodInfo, ToolDescription,
+    ToolError, ToolRegistry,
 };
 use chrono::{DateTime, Utc};
 
@@ -75,7 +74,10 @@ async fn e1_invoke_as_delivers_the_calling_agent_to_host_tools() {
     });
     reg.register_host("whoami", tool.clone()).await.unwrap();
 
-    let out = reg.invoke_as("alice", "whoami", "who", b"{}").await.unwrap();
+    let out = reg
+        .invoke_as("alice", "whoami", "who", b"{}")
+        .await
+        .unwrap();
     assert_eq!(out, b"alice");
     assert_eq!(*tool.seen.lock().unwrap(), vec!["alice".to_string()]);
 

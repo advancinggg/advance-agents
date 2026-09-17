@@ -60,9 +60,5 @@ cap-http = { path = "../cap-http" }
 cap-secrets = { path = "../cap-secrets" }
 zeroize = { workspace = true }
 
-[features]
-# entity-data lane gated witness tests (the internal entity-data lane plan §0.2)
-lane-e1 = []
-
 [lints]
 workspace = true

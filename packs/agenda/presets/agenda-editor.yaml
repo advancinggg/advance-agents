@@ -1,0 +1,14 @@
+# Grant bundle for an agent that manages agenda items: the `tools` capability (to reach the
+# `data` host tool) and the `data` L1 grant with both modes. Applied once by the operator
+# (`/client/presets/agenda-editor:apply` or the grant CLI); the pack only makes it known.
+name: agenda-editor
+default-ttl: persistent
+grants:
+  - capability: tools
+    params: []
+    ttl: persistent
+  - capability: data
+    params:
+      - key: mode
+        value: "read,write"
+    ttl: persistent

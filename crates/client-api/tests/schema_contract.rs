@@ -467,6 +467,10 @@ fn t14_live() -> CompatSnapshot {
     live_snapshot().expect("live inventory")
 }
 
+/// A calendar version strictly later than the live `API_VERSION` (the T14 scenarios simulate
+/// "the next bump"). Move it forward whenever `API_VERSION` catches up to it.
+const T14_LATER: &str = "2027-01-15";
+
 fn t14_drop(mut snap: CompatSnapshot, component: &str, field: &str) -> CompatSnapshot {
     snap.fields
         .get_mut(component)
@@ -479,7 +483,7 @@ fn t14_drop(mut snap: CompatSnapshot, component: &str, field: &str) -> CompatSna
 fn t14_covering(removed: &[&str]) -> CompatMigration {
     CompatMigration {
         from: API_VERSION.to_string(),
-        to: "2026-09-01".into(),
+        to: T14_LATER.into(),
         removed: removed.iter().map(|s| (*s).to_string()).collect(),
         notes: "intentional response-field removal".into(),
     }
@@ -523,7 +527,7 @@ fn t14a_drop_required_field_same_version() {
 fn t14b_drop_later_date_no_notes() {
     let prev = t14_live();
     let mut curr = t14_drop(prev.clone(), "ClientRunSummary", "updated_at");
-    curr.api_version = "2026-09-01".into();
+    curr.api_version = T14_LATER.into();
     let err = check_response_compat(&prev, &curr, &[]).expect_err("T14-b");
     assert_without_notes(err, Some("ClientRunSummary.updated_at"));
 }
@@ -532,7 +536,7 @@ fn t14b_drop_later_date_no_notes() {
 fn t14c_drop_increment_and_notes() {
     let prev = t14_live();
     let mut curr = t14_drop(prev.clone(), "ClientRunSummary", "updated_at");
-    curr.api_version = "2026-09-01".into();
+    curr.api_version = T14_LATER.into();
     check_response_compat(
         &prev,
         &curr,
@@ -545,10 +549,10 @@ fn t14c_drop_increment_and_notes() {
 fn t14_cover_misses_removed() {
     let prev = t14_live();
     let mut curr = t14_drop(prev.clone(), "ClientRunSummary", "updated_at");
-    curr.api_version = "2026-09-01".into();
+    curr.api_version = T14_LATER.into();
     let notes = CompatMigration {
         from: API_VERSION.to_string(),
-        to: "2026-09-01".into(),
+        to: T14_LATER.into(),
         removed: vec!["ClientRunSummary.other".into()],
         notes: "notes exist but removed does not cover the drop".into(),
     };
@@ -589,11 +593,11 @@ fn t14e_rename_same_version() {
 fn t14f_empty_or_whitespace_notes() {
     let prev = t14_live();
     let mut curr = t14_drop(prev.clone(), "ClientRunSummary", "updated_at");
-    curr.api_version = "2026-09-01".into();
+    curr.api_version = T14_LATER.into();
     for notes in ["", "   "] {
         let m = CompatMigration {
             from: API_VERSION.to_string(),
-            to: "2026-09-01".into(),
+            to: T14_LATER.into(),
             removed: vec!["ClientRunSummary.updated_at".into()],
             notes: notes.into(),
         };
@@ -1113,7 +1117,7 @@ fn t14_union_per_variant_field_drop() {
 fn t14_ver_version_only_bump() {
     let prev = t14_live();
     let mut curr = prev.clone();
-    curr.api_version = "2026-09-01".into();
+    curr.api_version = T14_LATER.into();
     let err = check_response_compat(&prev, &curr, &[]).expect_err("T14-ver");
     assert_without_notes(err, None);
 }

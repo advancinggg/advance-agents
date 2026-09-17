@@ -1,4 +1,4 @@
-//! `packs/` directory CI guard (the internal entity-data lane plan §3.1 rule 4).
+//! `packs/` directory CI guard.
 //!
 //! Every subdirectory of the repository's `packs/` is a first-party or community pack. This
 //! test drives the REAL `advance_pack_manager::Installer` over each one into a fresh temporary
@@ -112,6 +112,57 @@ async fn every_pack_in_packs_dir_installs_with_the_real_installer() {
         }
     }
     assert_eq!(registry.list_installed().len(), dirs.len());
+}
+
+/// `<repo>/target/packs/*` — the output of `advance pack build` (CI runs it before the tests;
+/// locally the test is a no-op until a build ran). Each built pack installs into ITS OWN fresh
+/// packs dir (it shares `name@version` with its source directory) and its skill `tool.wasm`
+/// passes the installer's tool-exports validation.
+#[tokio::test]
+async fn every_built_pack_installs_with_the_real_installer() {
+    let built_root = packs_root().join("../target/packs");
+    let Ok(built_root) = built_root.canonicalize() else {
+        eprintln!("target/packs absent — run `advance pack build` first; skipping");
+        return;
+    };
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&built_root)
+        .expect("read target/packs")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.join("pack.yaml").is_file())
+        .collect();
+    dirs.sort();
+    for dir in &dirs {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let packs_dir = tmp.path().join("packs");
+        let registry = Arc::new(InMemoryPackRegistry::new(packs_dir.clone()));
+        let installer = Installer::new(
+            &packs_dir,
+            registry.clone(),
+            env!("CARGO_PKG_VERSION"),
+            Arc::new(AutoApprove),
+        );
+        let report = installer
+            .install(dir.to_str().unwrap())
+            .await
+            .unwrap_or_else(|e| panic!("{}: built pack install failed: {e}", dir.display()));
+        assert!(registry.has(&report.name, &report.version));
+        for p in registry
+            .provides(&report.name, &report.version)
+            .expect("provides")
+        {
+            if p.kind == ComponentKind::Skill {
+                let fq = format!("{}@{}/skills/{}", report.name, report.version, p.name);
+                let resolved = registry.resolve(&fq).expect("skill resolves");
+                if dir.join("skills").join(&p.name).join("tool.wasm").is_file() {
+                    assert!(
+                        resolved.local_path.join("tool.wasm").is_file(),
+                        "{fq}: tool.wasm installed"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

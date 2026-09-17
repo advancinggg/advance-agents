@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+pub mod entity_index;
 pub mod error;
 pub mod fts_adapter;
 pub mod handle;
@@ -10,6 +11,10 @@ pub mod score;
 pub mod unified_search;
 mod vec_adapter;
 
+pub use entity_index::{
+    expand_occurrences, normalize_entity_path, SqliteEntityIndex, MAX_OCCURRENCES_PER_ENTITY,
+    OCCURRENCE_HORIZON_DAYS,
+};
 pub use error::DbError;
 pub use handle::{
     upsert_memory_index_row, PooledConnection, R2d2SqliteIndexHandle, SqliteIndexHandle,

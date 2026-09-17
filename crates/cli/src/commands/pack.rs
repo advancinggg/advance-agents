@@ -39,7 +39,7 @@ use std::time::Duration;
 use advance_pack_manager::meta::read_meta_index;
 use advance_pack_manager::{
     resource_capability_id, ApprovalStrategy, AutoReject, CatalogCheckedApproval, ComponentKind,
-    InMemoryPackRegistry, Installer, InteractiveApproval, PackError, PackRegistry,
+    InMemoryPackRegistry, Installer, InteractiveApproval, PackError, PackManifest, PackRegistry,
     RejectUnlessTrivial, StaticCapabilityCatalog,
 };
 use advance_runtime::config::{load_config, PackApprovalPolicy, PackConfig};
@@ -283,6 +283,535 @@ async fn run_list_async(packs_dir: Option<PathBuf>) -> ExitCode {
         println!("{}\t{trust}\t{}", safe_msg(&key), safe_msg(installed_at));
     }
     ExitCode::SUCCESS
+}
+
+// ── `advance pack build` (entity-data lane E2, plan §3.4) ───────────────────────────────────
+
+/// Source pack directories stay text-only; `packs/<name>.build.yaml` beside the pack names
+/// the guest crates whose `tool.wasm` a build produces.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackBuildManifest {
+    #[serde(default)]
+    pub tools: Vec<PackBuildTool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackBuildTool {
+    /// The skill (`skills/<skill>/`) that receives `tool.wasm`.
+    pub skill: String,
+    /// The guest crate, relative to the repository root (the manifest's grandparent).
+    #[serde(rename = "crate")]
+    pub crate_dir: PathBuf,
+    /// Cargo target; `wasm32-unknown-unknown` (core module, encoded here) by default,
+    /// `wasm32-wasip2` (already a component) also accepted.
+    #[serde(default = "default_target")]
+    pub target: String,
+}
+
+fn default_target() -> String {
+    "wasm32-unknown-unknown".to_string()
+}
+
+#[derive(Debug)]
+pub enum PackBuildError {
+    Manifest(String),
+    Io(String),
+    Cargo(String),
+    Encode(String),
+    Checksum(String),
+    /// A pack-manager failure while signing / bundling.
+    Pack(String),
+}
+
+impl std::fmt::Display for PackBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Manifest(m) => write!(f, "build manifest: {m}"),
+            Self::Io(m) => write!(f, "io: {m}"),
+            Self::Cargo(m) => write!(f, "cargo: {m}"),
+            Self::Encode(m) => write!(f, "component encode: {m}"),
+            Self::Checksum(m) => write!(f, "checksums: {m}"),
+            Self::Pack(m) => write!(f, "pack: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for PackBuildError {}
+
+/// What a build produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltPack {
+    /// `<out>/<pack name>` — installable with `advance pack install`.
+    pub dir: PathBuf,
+    /// Every `tool.wasm` written, in manifest order.
+    pub tools: Vec<PathBuf>,
+}
+
+const PACK_LAYOUT_DIRS: &[&str] = &[
+    "behavior-binaries",
+    "agent-templates",
+    "skills",
+    "components",
+    "channel-adapters",
+    "mcp-servers",
+    "presets",
+    "workflows",
+    "memory-seeds",
+    "meta-schema-extensions",
+    "resource-capabilities",
+];
+
+impl PackBuildManifest {
+    pub fn load(path: &Path) -> Result<Self, PackBuildError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| PackBuildError::Manifest(format!("{}: {e}", path.display())))?;
+        let m: PackBuildManifest = serde_yml::from_str(&text)
+            .map_err(|e| PackBuildError::Manifest(format!("{}: {e}", path.display())))?;
+        for t in &m.tools {
+            let ok = |s: &str| {
+                !s.is_empty()
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            };
+            if !ok(&t.skill) {
+                return Err(PackBuildError::Manifest(format!(
+                    "bad skill name {:?}",
+                    t.skill
+                )));
+            }
+            if t.crate_dir.is_absolute()
+                || t.crate_dir
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(PackBuildError::Manifest(format!(
+                    "crate path must be relative without `..`: {}",
+                    t.crate_dir.display()
+                )));
+            }
+            if !matches!(
+                t.target.as_str(),
+                "wasm32-unknown-unknown" | "wasm32-wasip2"
+            ) {
+                return Err(PackBuildError::Manifest(format!(
+                    "unsupported target {:?}",
+                    t.target
+                )));
+            }
+        }
+        Ok(m)
+    }
+
+    /// `packs/<name>.build.yaml` beside `pack_dir`, if any.
+    pub fn for_pack(pack_dir: &Path) -> Result<Option<Self>, PackBuildError> {
+        let name = pack_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| PackBuildError::Manifest("pack dir has no name".into()))?;
+        let path = pack_dir
+            .parent()
+            .map(|p| p.join(format!("{name}.build.yaml")))
+            .ok_or_else(|| PackBuildError::Manifest("pack dir has no parent".into()))?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Self::load(&path).map(Some)
+    }
+}
+
+fn copy_layout(src: &Path, dst: &Path) -> Result<(), PackBuildError> {
+    std::fs::create_dir_all(dst).map_err(|e| PackBuildError::Io(e.to_string()))?;
+    for entry in std::fs::read_dir(src).map_err(|e| PackBuildError::Io(e.to_string()))? {
+        let entry = entry.map_err(|e| PackBuildError::Io(e.to_string()))?;
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy().to_string();
+        let ft = entry
+            .file_type()
+            .map_err(|e| PackBuildError::Io(e.to_string()))?;
+        if ft.is_symlink() {
+            return Err(PackBuildError::Io(format!(
+                "symlink in pack source: {name_s}"
+            )));
+        }
+        let keep = name_s == "pack.yaml"
+            || name_s == "pack.sig"
+            || PACK_LAYOUT_DIRS.contains(&name_s.as_str());
+        if !keep {
+            continue;
+        }
+        copy_tree(&entry.path(), &dst.join(&name))?;
+    }
+    Ok(())
+}
+
+fn copy_tree(src: &Path, dst: &Path) -> Result<(), PackBuildError> {
+    let md = std::fs::symlink_metadata(src).map_err(|e| PackBuildError::Io(e.to_string()))?;
+    if md.file_type().is_symlink() {
+        return Err(PackBuildError::Io(format!(
+            "symlink in pack source: {}",
+            src.display()
+        )));
+    }
+    if md.is_dir() {
+        std::fs::create_dir_all(dst).map_err(|e| PackBuildError::Io(e.to_string()))?;
+        for entry in std::fs::read_dir(src).map_err(|e| PackBuildError::Io(e.to_string()))? {
+            let entry = entry.map_err(|e| PackBuildError::Io(e.to_string()))?;
+            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else {
+        std::fs::copy(src, dst).map_err(|e| PackBuildError::Io(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// `true` for a WASM component (`\0asm` + layer 0x01), `false` for a core module.
+fn is_component(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && &bytes[0..4] == b"\0asm" && bytes[6] == 0x01
+}
+
+fn build_tool(repo_root: &Path, tool: &PackBuildTool) -> Result<Vec<u8>, PackBuildError> {
+    let crate_dir = repo_root.join(&tool.crate_dir);
+    let manifest = crate_dir.join("Cargo.toml");
+    if !manifest.is_file() {
+        return Err(PackBuildError::Cargo(format!(
+            "no Cargo.toml at {}",
+            manifest.display()
+        )));
+    }
+    // An explicit target dir inside the guest crate: never the workspace's (a `cargo test`
+    // that drives this build holds the workspace build-dir lock, and `CARGO_TARGET_DIR`
+    // must not redirect the guest build into it).
+    let target_dir = crate_dir.join("target");
+    let status = std::process::Command::new("cargo")
+        .args([
+            "build",
+            "--release",
+            "--target",
+            &tool.target,
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .env_remove("CARGO_TARGET_DIR")
+        .status()
+        .map_err(|e| PackBuildError::Cargo(format!("spawn cargo: {e}")))?;
+    if !status.success() {
+        return Err(PackBuildError::Cargo(format!(
+            "cargo build failed for {} ({status})",
+            tool.crate_dir.display()
+        )));
+    }
+    let release = crate_dir.join("target").join(&tool.target).join("release");
+    let mut wasms: Vec<PathBuf> = std::fs::read_dir(&release)
+        .map_err(|e| PackBuildError::Cargo(format!("{}: {e}", release.display())))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("wasm"))
+        .collect();
+    wasms.sort();
+    let wasm = wasms
+        .first()
+        .ok_or_else(|| PackBuildError::Cargo(format!("no .wasm in {}", release.display())))?;
+    let bytes = std::fs::read(wasm).map_err(|e| PackBuildError::Io(e.to_string()))?;
+    if is_component(&bytes) {
+        Ok(bytes)
+    } else {
+        build_agent::encode_core_to_component(&bytes)
+            .map_err(|e| PackBuildError::Encode(e.to_string()))
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let d = sha2::Sha256::digest(bytes);
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Fill `checksums.files` of `<dir>/pack.yaml` with the digest of every other file.
+fn write_checksums(dir: &Path) -> Result<(), PackBuildError> {
+    let manifest_path = dir.join("pack.yaml");
+    let text =
+        std::fs::read_to_string(&manifest_path).map_err(|e| PackBuildError::Io(e.to_string()))?;
+    let mut doc: serde_yml::Value = serde_yml::from_str(&text)
+        .map_err(|e| PackBuildError::Checksum(format!("pack.yaml: {e}")))?;
+    let mut files = serde_yml::Mapping::new();
+    for entry in walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
+        let entry = entry.map_err(|e| PackBuildError::Io(e.to_string()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(dir)
+            .map_err(|e| PackBuildError::Io(e.to_string()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel == "pack.yaml" || rel == "pack.sig" {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path()).map_err(|e| PackBuildError::Io(e.to_string()))?;
+        files.insert(
+            serde_yml::Value::String(rel),
+            serde_yml::Value::String(sha256_hex(&bytes)),
+        );
+    }
+    let checksums = doc
+        .as_mapping_mut()
+        .and_then(|m| m.get_mut(serde_yml::Value::String("checksums".into())))
+        .and_then(serde_yml::Value::as_mapping_mut)
+        .ok_or_else(|| PackBuildError::Checksum("pack.yaml has no `checksums` mapping".into()))?;
+    checksums.insert(
+        serde_yml::Value::String("files".into()),
+        serde_yml::Value::Mapping(files),
+    );
+    let out = serde_yml::to_string(&doc).map_err(|e| PackBuildError::Checksum(e.to_string()))?;
+    std::fs::write(&manifest_path, out).map_err(|e| PackBuildError::Io(e.to_string()))?;
+    // Self-check with the installer's own verifier.
+    let manifest = PackManifest::from_yaml(
+        &std::fs::read_to_string(&manifest_path).map_err(|e| PackBuildError::Io(e.to_string()))?,
+    )
+    .map_err(|e| PackBuildError::Checksum(e.to_string()))?;
+    advance_pack_manager::verify_checksums(dir, &manifest.checksums)
+        .map_err(|e| PackBuildError::Checksum(e.to_string()))
+}
+
+/// Build the source pack at `src` into `<out_root>/<name>`: copy the allow-listed layout,
+/// build + encode every tool the sibling build manifest names, fill the output manifest's
+/// checksums. The source directory is never modified.
+pub fn build_pack(src: &Path, out_root: &Path) -> Result<BuiltPack, PackBuildError> {
+    let src = src
+        .canonicalize()
+        .map_err(|e| PackBuildError::Io(format!("{}: {e}", src.display())))?;
+    if !src.join("pack.yaml").is_file() {
+        return Err(PackBuildError::Manifest(format!(
+            "{} has no pack.yaml",
+            src.display()
+        )));
+    }
+    let name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| PackBuildError::Manifest("pack dir has no name".into()))?
+        .to_string();
+    let out = out_root.join(&name);
+    if out.exists() {
+        std::fs::remove_dir_all(&out).map_err(|e| PackBuildError::Io(e.to_string()))?;
+    }
+    copy_layout(&src, &out)?;
+    let manifest = PackBuildManifest::for_pack(&src)?;
+    let repo_root = src
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| PackBuildError::Manifest("pack dir is not under <repo>/packs/".into()))?;
+    let mut tools = Vec::new();
+    if let Some(m) = manifest {
+        for tool in &m.tools {
+            let skill_dir = out.join("skills").join(&tool.skill);
+            if !skill_dir.is_dir() {
+                return Err(PackBuildError::Manifest(format!(
+                    "skill {:?} is not part of the pack (no skills/{}/ directory)",
+                    tool.skill, tool.skill
+                )));
+            }
+            let bytes = build_tool(&repo_root, tool)?;
+            let dest = skill_dir.join("tool.wasm");
+            std::fs::write(&dest, bytes).map_err(|e| PackBuildError::Io(e.to_string()))?;
+            tools.push(dest);
+        }
+    }
+    write_checksums(&out)?;
+    Ok(BuiltPack { dir: out, tools })
+}
+
+// ── `advance pack keygen` / `sign` / `bundle` (entity-data lane E4, plan §5) ────────────────
+
+/// Sign `<dir>/pack.yaml` with `secret` (an ed25519 seed), write `<dir>/pack.sig`, and return
+/// the lower-case hex public key (the trust root operators list in `pack.trust-roots`).
+/// Re-signing overwrites an existing `pack.sig` — the normal flow after editing the manifest.
+/// The written signature is verified with the installer's own verifier before returning.
+pub fn sign_pack(dir: &Path, secret: &[u8; 32]) -> Result<String, PackBuildError> {
+    let manifest_path = dir.join("pack.yaml");
+    let bytes = std::fs::read(&manifest_path)
+        .map_err(|e| PackBuildError::Io(format!("{}: {e}", manifest_path.display())))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|e| PackBuildError::Manifest(format!("pack.yaml is not UTF-8: {e}")))?;
+    let manifest =
+        PackManifest::from_yaml(text).map_err(|e| PackBuildError::Manifest(e.to_string()))?;
+    let (sig_text, public_hex) = advance_pack_manager::sign_pack_yaml(&bytes, secret);
+    let sig_path = dir.join(advance_pack_manager::PACK_SIG_FILENAME);
+    std::fs::write(&sig_path, sig_text)
+        .map_err(|e| PackBuildError::Io(format!("{}: {e}", sig_path.display())))?;
+    match advance_pack_manager::verify_pack_signature(
+        dir,
+        &bytes,
+        &manifest.name,
+        std::slice::from_ref(&public_hex),
+    ) {
+        Ok(Some(signer)) if signer == public_hex => Ok(public_hex),
+        other => Err(PackBuildError::Pack(format!(
+            "signature self-check failed: {other:?}"
+        ))),
+    }
+}
+
+/// Archive `dir` into the static registry at `out` (see `advance_pack_manager::bundle`); the
+/// index's `tarball` entry is the bare file name (resolved against the registry base URL).
+pub fn bundle_pack(
+    dir: &Path,
+    out: &Path,
+) -> Result<advance_pack_manager::BundleReport, PackBuildError> {
+    bundle_pack_with(dir, out, None)
+}
+
+/// [`bundle_pack`] with an absolute `base_url` written into the index's `tarball` entries.
+pub fn bundle_pack_with(
+    dir: &Path,
+    out: &Path,
+    base_url: Option<&str>,
+) -> Result<advance_pack_manager::BundleReport, PackBuildError> {
+    if let Some(base) = base_url {
+        if !(base.starts_with("https://") || base.starts_with("http://")) {
+            return Err(PackBuildError::Manifest(
+                "--base-url must be an http(s) URL".into(),
+            ));
+        }
+    }
+    advance_pack_manager::bundle_pack(dir, out, base_url)
+        .map_err(|e| PackBuildError::Pack(e.to_string()))
+}
+
+/// Read a signing key file: 64 hex chars (what `keygen` writes; surrounding whitespace
+/// ignored) or exactly 32 raw bytes.
+pub fn read_signing_key(path: &Path) -> Result<[u8; 32], PackBuildError> {
+    let raw =
+        std::fs::read(path).map_err(|e| PackBuildError::Io(format!("{}: {e}", path.display())))?;
+    if raw.len() == 32 {
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&raw);
+        return Ok(seed);
+    }
+    let text = std::str::from_utf8(&raw)
+        .map_err(|_| {
+            PackBuildError::Manifest("signing key must be 64 hex chars or 32 raw bytes".into())
+        })?
+        .trim();
+    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(PackBuildError::Manifest(
+            "signing key must be 64 hex chars or 32 raw bytes".into(),
+        ));
+    }
+    let bytes = hex::decode(text).map_err(|e| PackBuildError::Manifest(e.to_string()))?;
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes);
+    Ok(seed)
+}
+
+/// Generate an ed25519 signing key from OS randomness, write it to `out` as 64 hex chars
+/// (created exclusively, mode 0600 on Unix), and return the public key hex.
+pub fn generate_signing_key(out: &Path) -> Result<String, PackBuildError> {
+    use rand::RngCore;
+    use std::io::Write;
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(out)
+        .map_err(|e| PackBuildError::Io(format!("{}: {e}", out.display())))?;
+    file.write_all(format!("{}\n", hex::encode(seed)).as_bytes())
+        .map_err(|e| PackBuildError::Io(format!("{}: {e}", out.display())))?;
+    Ok(advance_pack_manager::public_key_hex(&seed))
+}
+
+/// Sync entry point for `advance pack keygen`.
+pub fn run_keygen(out: PathBuf) -> ExitCode {
+    match generate_signing_key(&out) {
+        Ok(public_hex) => {
+            println!("wrote signing key to {}", safe_path(&out));
+            println!("public key (add to pack.trust-roots): {public_hex}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("advance pack keygen: {}", safe_msg(&e.to_string()));
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Sync entry point for `advance pack sign`.
+pub fn run_sign(dir: PathBuf, key: PathBuf) -> ExitCode {
+    let secret = match read_signing_key(&key) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("advance pack sign: {}", safe_msg(&e.to_string()));
+            return ExitCode::from(1);
+        }
+    };
+    match sign_pack(&dir, &secret) {
+        Ok(public_hex) => {
+            println!("signed {} (public key {public_hex})", safe_path(&dir));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("advance pack sign: {}", safe_msg(&e.to_string()));
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Sync entry point for `advance pack bundle`.
+pub fn run_bundle(dir: PathBuf, out: PathBuf, base_url: Option<String>) -> ExitCode {
+    match bundle_pack_with(&dir, &out, base_url.as_deref()) {
+        Ok(report) => {
+            println!(
+                "bundled {}@{} -> {} ({} bytes, sha256 {})",
+                report.name,
+                report.version,
+                safe_path(&report.tarball),
+                report.size,
+                report.sha256
+            );
+            println!("index {}", safe_path(&report.index));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("advance pack bundle: {}", safe_msg(&e.to_string()));
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Sync entry point for `advance pack build`.
+pub fn run_build(source: PathBuf, out: PathBuf) -> ExitCode {
+    match build_pack(&source, &out) {
+        Ok(built) => {
+            println!(
+                "built {} ({} tool wasm)",
+                safe_path(&built.dir),
+                built.tools.len()
+            );
+            for t in &built.tools {
+                println!("  {}", safe_path(t));
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("advance pack build: {}", safe_msg(&e.to_string()));
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// Sync entry point for `advance pack uninstall`. `spec` is `<name>@<version>`.

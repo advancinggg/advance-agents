@@ -1,0 +1,86 @@
+# Pack release chain (entity-data lane E4).
+#
+# On a `v*` tag: build every pack that has a `packs/<name>.build.yaml` (skill tool.wasm from
+# its guest crate), sign the built packs when the `PACK_SIGNING_KEY` repository secret is
+# configured (64 hex chars from `advance pack keygen`), bundle them into a static registry
+# tree, rebuild once more and compare digests (reproducibility gate), then attach the
+# tarballs and index documents to the GitHub release. Operators point `pack.registry-url`
+# at a mirror of the registry tree (or at the release's download URL prefix, which the
+# index's `tarball` entries already carry).
+name: pack-release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  packs:
+    name: build · sign · bundle · verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup target add wasm32-unknown-unknown
+
+      - name: Build every pack with a build manifest
+        run: |
+          set -euo pipefail
+          for m in packs/*.build.yaml; do
+            name="$(basename "$m" .build.yaml)"
+            cargo run -p advance-cli --locked -- pack build "packs/$name" --out target/packs
+            cargo run -p advance-cli --locked -- pack build "packs/$name" --out target/packs-rebuild
+          done
+
+      - name: Sign (only when PACK_SIGNING_KEY is configured)
+        env:
+          PACK_SIGNING_KEY: ${{ secrets.PACK_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PACK_SIGNING_KEY:-}" ]; then
+            echo "PACK_SIGNING_KEY is not configured; packs are published unsigned"
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "$PACK_SIGNING_KEY" > "$RUNNER_TEMP/pack-signing.key"
+          for d in target/packs/*/ target/packs-rebuild/*/; do
+            cargo run -p advance-cli --locked -- pack sign "$d" --key "$RUNNER_TEMP/pack-signing.key"
+          done
+          rm -f "$RUNNER_TEMP/pack-signing.key"
+
+      - name: Bundle into a static registry tree
+        run: |
+          set -euo pipefail
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          for d in target/packs/*/; do
+            cargo run -p advance-cli --locked -- pack bundle "$d" --out target/registry --base-url "$base"
+          done
+          for d in target/packs-rebuild/*/; do
+            cargo run -p advance-cli --locked -- pack bundle "$d" --out target/registry-rebuild --base-url "$base"
+          done
+          find target/registry -type f | sort
+
+      - name: Reproducibility gate (two builds, identical digests)
+        run: |
+          set -euo pipefail
+          (cd target/registry && sha256sum *.tar.gz) > first.sum
+          (cd target/registry-rebuild && sha256sum *.tar.gz) > second.sum
+          diff first.sum second.sum
+          cat first.sum
+
+      - name: Attach to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/registry/*.tar.gz
+            target/registry/index/*.json

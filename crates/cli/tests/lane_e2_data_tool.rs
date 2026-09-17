@@ -1,7 +1,6 @@
-#![cfg(feature = "lane-e2")]
 //! Lane E2 — the `data` host tool is wired into the production registry, the `agenda` pack
 //! builds to a real `tool.wasm` and installs, and `describe` sees the bound operations
-//! (the internal entity-data lane plan §3). The build test needs `wasm32-unknown-unknown`
+//! (lane E2). The build test needs `wasm32-unknown-unknown`
 //! installed (`rustup target add wasm32-unknown-unknown`), as CI does from E2 on.
 
 use std::path::{Path, PathBuf};
@@ -18,7 +17,9 @@ use cap_data::test_support::{
     agenda_schema, AllowAll, DirWorkspaceFs, FixedClock, MemoryEntityIndex, SequentialIds,
 };
 use cap_data::DataStore;
-use cap_tools::{wasm_tool_entries, CallableInventory, LazyRegistryConfig, LazyToolRegistry, ToolRegistry};
+use cap_tools::{
+    wasm_tool_entries, CallableInventory, LazyRegistryConfig, LazyToolRegistry, ToolRegistry,
+};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -46,14 +47,20 @@ async fn e2_data_tool_is_listed_and_enters_the_callable_inventory() {
         .expect("register data tool");
 
     let listed = registry.list().await;
-    let data = listed.iter().find(|t| t.id == "data").expect("`data` is a listed tool");
+    let data = listed
+        .iter()
+        .find(|t| t.id == "data")
+        .expect("`data` is a listed tool");
     assert_eq!(data.methods.len(), 9);
     assert!(data.methods.iter().any(|m| m.name == "apply"));
 
     // The same snapshot `start.rs` takes for the context assembler's `# Available Tools`.
     let inventory = CallableInventory::new(wasm_tool_entries(&registry).await, vec![]);
     assert!(
-        inventory.list_wasm_tools("alice").iter().any(|t| t.name == "data"),
+        inventory
+            .list_wasm_tools("alice")
+            .iter()
+            .any(|t| t.name == "data"),
         "the model can see `data`"
     );
 }
@@ -68,10 +75,14 @@ fn e2_entity_changed_is_registered_but_never_a_trigger() {
 
 #[test]
 fn e2_build_manifest_parses() {
-    let m = PackBuildManifest::load(&repo_root().join("packs/agenda.build.yaml")).expect("manifest");
+    let m =
+        PackBuildManifest::load(&repo_root().join("packs/agenda.build.yaml")).expect("manifest");
     assert_eq!(m.tools.len(), 1);
     assert_eq!(m.tools[0].skill, "agenda");
-    assert_eq!(m.tools[0].crate_dir, PathBuf::from("crates/packs/agenda-tools"));
+    assert_eq!(
+        m.tools[0].crate_dir,
+        PathBuf::from("crates/packs/agenda-tools")
+    );
     assert!(
         PackBuildManifest::load(&repo_root().join("packs/nope.build.yaml")).is_err(),
         "a missing manifest is an error for the loader; `build_pack` treats it as text-only"
@@ -92,8 +103,14 @@ async fn e2_pack_build_emits_tool_wasm_with_checksums_installs_and_binds_operati
     let source_manifest = std::fs::read_to_string(src.join("pack.yaml")).unwrap();
     assert!(source_manifest.contains("files: {}"));
     let out_manifest = std::fs::read_to_string(built.dir.join("pack.yaml")).unwrap();
-    assert!(out_manifest.contains("skills/agenda/tool.wasm"), "{out_manifest}");
-    assert!(out_manifest.contains("skills/agenda/SKILL.md"), "{out_manifest}");
+    assert!(
+        out_manifest.contains("skills/agenda/tool.wasm"),
+        "{out_manifest}"
+    );
+    assert!(
+        out_manifest.contains("skills/agenda/SKILL.md"),
+        "{out_manifest}"
+    );
     let parsed = PackManifest::from_yaml(&out_manifest).unwrap();
     verify_checksums(&built.dir, &parsed.checksums).expect("self-consistent checksums");
 
@@ -107,9 +124,14 @@ async fn e2_pack_build_emits_tool_wasm_with_checksums_installs_and_binds_operati
         env!("CARGO_PKG_VERSION"),
         Arc::new(AutoApprove),
     );
-    let report = installer.install(built.dir.to_str().unwrap()).await.expect("install built pack");
+    let report = installer
+        .install(built.dir.to_str().unwrap())
+        .await
+        .expect("install built pack");
     assert_eq!(report.name, "agenda");
-    let skill = registry.resolve("agenda@0.1.0/skills/agenda").expect("skill resolves");
+    let skill = registry
+        .resolve("agenda@0.1.0/skills/agenda")
+        .expect("skill resolves");
     assert!(skill.local_path.join("tool.wasm").is_file());
 
     // Once the skill tool is registered under its canonical id, `describe` marks the bound
@@ -125,10 +147,16 @@ async fn e2_pack_build_emits_tool_wasm_with_checksums_installs_and_binds_operati
         Arc::new(FixedClock::at("2026-09-17T08:00:00Z")),
     )
     .with_reducer(reducer.clone());
-    assert!(s.describe("alice").aspects[0].operations.iter().all(|o| !o.available));
+    assert!(s.describe("alice").await.aspects[0]
+        .operations
+        .iter()
+        .all(|o| !o.available));
     reducer
         .registry()
         .register_binary("skill::agenda", std::fs::read(&wasm).unwrap())
         .await;
-    assert!(s.describe("alice").aspects[0].operations.iter().all(|o| o.available));
+    assert!(s.describe("alice").await.aspects[0]
+        .operations
+        .iter()
+        .all(|o| o.available));
 }
