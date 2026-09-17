@@ -124,7 +124,14 @@ jobs:
           if [ "$EVENT_NAME" = "pull_request" ]; then
             echo "COMPAT_PARENT_SHA=${PR_BASE_SHA}" >> "$GITHUB_ENV"
           elif [ "$EVENT_NAME" = "push" ]; then
-            echo "COMPAT_PARENT_SHA=${PUSH_BEFORE_SHA}" >> "$GITHUB_ENV"
+            # `before` is all zeros on a branch's first push and unreachable after a
+            # force-push (history rewrite); leave the variable unset then, and the
+            # compat gate falls back to HEAD^ of this full-depth checkout.
+            if git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+              echo "COMPAT_PARENT_SHA=${PUSH_BEFORE_SHA}" >> "$GITHUB_ENV"
+            else
+              echo "push before-SHA ${PUSH_BEFORE_SHA} is not in this checkout; compat gate uses HEAD^"
+            fi
           fi
       - name: Install pinned toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
