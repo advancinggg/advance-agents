@@ -144,7 +144,18 @@ async fn secrets_mode_read_and_switch_over_production_wiring() {
         json!({ "mode": "keychain-sync", "namespace": "work", "synchronizable": false }),
         "k-to-keychain-sync",
     );
-    #[cfg(target_vendor = "apple")]
+    if !current.platform_supported {
+        // Non-Apple host: the switch is refused with the stable detail and the file is untouched.
+        assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
+        assert_eq!(
+            env.error.as_ref().unwrap().details,
+            vec!["platform_unsupported".to_string()]
+        );
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), raw_before);
+        assert!(!ws.join(".advance/runtime-config.yaml.tmp").exists());
+        let _ = WARNING_RESTART_REQUIRED;
+        return;
+    }
     {
         let switched = mode(&env);
         assert_eq!(switched.mode, "keychain-sync");
@@ -201,14 +212,5 @@ async fn secrets_mode_read_and_switch_over_production_wiring() {
         let raw = std::fs::read_to_string(&cfg).unwrap();
         assert!(!raw.contains("keychain:"), "{raw}");
         assert!(raw.contains("master-key-source: keychain\n"), "{raw}");
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
-        assert_eq!(
-            env.error.as_ref().unwrap().details,
-            vec!["platform_unsupported".to_string()]
-        );
-        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), raw_before);
     }
 }

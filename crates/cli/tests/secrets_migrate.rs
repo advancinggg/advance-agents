@@ -49,9 +49,22 @@ fn item(namespace: &str, kind: &str, account: &str) -> KeychainItem {
     }
 }
 
-#[cfg(target_vendor = "apple")]
 #[test]
 fn migrate_to_keychain_sync_then_back_to_file() {
+    // `--to keychain-sync` is refused on a non-Apple host before anything is touched; the
+    // mock-backed round trip below is an Apple-only witness (CI on Linux exercises the refusal).
+    if !cap_secrets::platform_supports_keychain_sync() {
+        let (_dir, ws) = seeded_file_home();
+        let err = run_migrate_with(
+            MigrationTarget::KeychainSync,
+            Some(ws),
+            Some(MockSecItemOps::new() as Arc<dyn SecItemOps>),
+            &NoKeyring,
+        )
+        .unwrap_err();
+        assert!(err.contains("unsupported on this platform"), "{err}");
+        return;
+    }
     // The keychain-sync target reads the configured env var first; keep the test independent
     // of the developer's shell.
     std::env::remove_var("SECRETS_MASTER_KEY");
