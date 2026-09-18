@@ -1,27 +1,42 @@
 # Pack release chain (entity-data lane E4).
 #
-# On a `v*` tag: build every pack that has a `packs/<name>.build.yaml` (skill tool.wasm from
-# its guest crate), sign the built packs when the `PACK_SIGNING_KEY` repository secret is
-# configured (64 hex chars from `advance pack keygen`), bundle them into a static registry
-# tree, rebuild once more and compare digests (reproducibility gate), then attach the
-# tarballs and index documents to the GitHub release. Operators point `pack.registry-url`
-# at a mirror of the registry tree (or at the release's download URL prefix, which the
-# index's `tarball` entries already carry).
+# On a `v*` tag (or a manual run): build every pack that has a `packs/<name>.build.yaml` (skill
+# tool.wasm from its guest crate) twice, sign both builds when the `PACK_SIGNING_KEY` repository
+# secret is configured (64 hex chars from `advance pack keygen`), compare the two builds'
+# tarball digests (reproducibility gate), publish every NEW `name@version` into the static
+# registry tree on the `gh-pages` branch under `packs/`, and on a tag attach the tarballs to
+# the GitHub release as plain downloads.
+#
+# The registry tree must be served without redirects: the runtime's registry client refuses
+# 3xx responses by design, and GitHub release downloads always redirect, so the release page
+# itself cannot act as a registry. Operators point `pack.registry-url` at
+#   https://raw.githubusercontent.com/<owner>/<repo>/gh-pages/packs   (works with no setup)
+#   https://<owner>.github.io/<repo>/packs                             (once GitHub Pages serves gh-pages)
+# Index `tarball` entries are bare file names, resolved against that base.
+#
+# Published versions are immutable: a rebuilt `name@version` whose bytes differ from the
+# published tarball is skipped with a warning. Bump the pack version to publish a change.
 name: pack-release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+# Two runs must never race on the gh-pages tree.
+concurrency:
+  group: pack-release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   packs:
-    name: build · sign · bundle · verify
+    name: build · sign · bundle · verify · publish
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -33,7 +48,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: rustup target add wasm32-unknown-unknown
 
-      - name: Build every pack with a build manifest
+      - name: Build every pack with a build manifest (twice, for the digest gate)
         run: |
           set -euo pipefail
           for m in packs/*.build.yaml; do
@@ -58,15 +73,14 @@ jobs:
           done
           rm -f "$RUNNER_TEMP/pack-signing.key"
 
-      - name: Bundle into a static registry tree
+      - name: Bundle both builds into scratch registry trees
         run: |
           set -euo pipefail
-          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
           for d in target/packs/*/; do
-            cargo run -p advance-cli --locked -- pack bundle "$d" --out target/registry --base-url "$base"
+            cargo run -p advance-cli --locked -- pack bundle "$d" --out target/registry
           done
           for d in target/packs-rebuild/*/; do
-            cargo run -p advance-cli --locked -- pack bundle "$d" --out target/registry-rebuild --base-url "$base"
+            cargo run -p advance-cli --locked -- pack bundle "$d" --out target/registry-rebuild
           done
           find target/registry -type f | sort
 
@@ -78,9 +92,56 @@ jobs:
           diff first.sum second.sum
           cat first.sum
 
-      - name: Attach to the GitHub release
+      - name: Publish new versions to the gh-pages registry tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          site="$RUNNER_TEMP/site"
+          if git ls-remote --exit-code --heads "$remote" gh-pages >/dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch gh-pages "$remote" "$site"
+          else
+            git init --quiet -b gh-pages "$site"
+            git -C "$site" remote add origin "$remote"
+          fi
+          mkdir -p "$site/packs"
+          touch "$site/.nojekyll"
+          for d in target/packs/*/; do
+            name="$(sed -n 's/^name:[[:space:]]*//p' "$d/pack.yaml" | head -n1 | tr -d "\"'")"
+            version="$(sed -n 's/^version:[[:space:]]*//p' "$d/pack.yaml" | head -n1 | tr -d "\"'")"
+            if [ -z "$name" ] || [ -z "$version" ]; then
+              echo "::error::cannot read name/version from $d/pack.yaml"
+              exit 1
+            fi
+            fresh="$(sha256sum "target/registry/${name}-${version}.tar.gz" | cut -d' ' -f1)"
+            published=""
+            if [ -f "$site/packs/index/${name}.json" ]; then
+              published="$(jq -r --arg v "$version" '.versions[$v].sha256 // empty' "$site/packs/index/${name}.json")"
+            fi
+            if [ -z "$published" ]; then
+              cargo run -p advance-cli --locked -- pack bundle "$d" --out "$site/packs"
+              echo "published ${name}@${version} (sha256 ${fresh})"
+            elif [ "$published" = "$fresh" ]; then
+              echo "${name}@${version} already published with identical bytes"
+            else
+              echo "::warning::${name}@${version} is already published with different bytes (published ${published}, rebuilt ${fresh}); bump the pack version to publish the change"
+            fi
+          done
+          cd "$site"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "registry tree unchanged"
+          else
+            git -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                commit --quiet -m "packs: publish from ${GITHUB_SHA::8}"
+            git push --quiet origin gh-pages
+          fi
+          find packs -type f | sort
+
+      - name: Attach the tarballs to the GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            target/registry/*.tar.gz
-            target/registry/index/*.json
+          files: target/registry/*.tar.gz

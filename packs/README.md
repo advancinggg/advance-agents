@@ -50,20 +50,39 @@ advance pack bundle target/packs/agenda --out target/registry --base-url https:/
 
 `bundle` writes `<out>/<name>-<version>.tar.gz` and merges `<out>/index/<name>.json` — the
 static layout `pack.registry-url` consumers read for `registry:<name>@<version>` sources.
-Serve `<out>` from any HTTPS host (loopback HTTP is accepted for local testing). Without
-`--base-url` the index carries bare file names, which the runtime resolves against
+Serve `<out>` from any HTTPS host that answers without redirects (loopback HTTP is accepted
+for local testing). The runtime's registry client refuses 3xx responses by design, so a
+host that redirects downloads (GitHub release assets always do) cannot serve a registry.
+Without `--base-url` the index carries bare file names, which the runtime resolves against
 `pack.registry-url`, so one tree can move between hosts. A published version is immutable:
 re-bundling the same `name@version` with different bytes is refused — bump the version.
 
-Tarballs are reproducible (entries sorted, zero mtimes / uid / gid, ustar headers, no gzip
-timestamp), so a rebuild from the same source tree yields the same sha256. The release
-workflow (`.github/workflows/pack-release.yml`) runs on every `v*` tag: build every
-`packs/*.build.yaml` pack, sign with the `PACK_SIGNING_KEY` repository secret when it is
-configured, bundle, build a second time and compare digests, then attach the tarballs and
-index documents to the GitHub release.
+The archive format is deterministic (entries sorted, zero mtimes / uid / gid, ustar headers,
+no gzip timestamp): bundling the same built pack always yields the same sha256, and two
+builds in the same environment (same toolchain, same paths) yield identical tarballs. Builds
+on different machines can differ, because the compiler embeds dependency source paths in
+`tool.wasm`; the published digest is the one the release workflow built. The release
+workflow (`.github/workflows/pack-release.yml`) runs on every `v*` tag and on demand: it
+builds every `packs/*.build.yaml` pack twice and compares the tarball digests, signs with the
+`PACK_SIGNING_KEY` repository secret when it is configured, publishes every new
+`name@version` into the registry tree on the `gh-pages` branch (`packs/`), and attaches the
+tarballs to the GitHub release as plain downloads. A version that is already published is
+never rewritten; a rebuild with different bytes is skipped with a warning.
+
+The first-party registry, for `pack.registry-url` in `runtime-config.yaml`:
+
+```yaml
+pack:
+  registry-url: https://raw.githubusercontent.com/advancinggg/advance-agents/gh-pages/packs
+```
+
+Once GitHub Pages serves the `gh-pages` branch, `https://advancinggg.github.io/advance-agents/packs`
+serves the same tree. Then `advance pack install registry:agenda@0.1.0` installs the built
+agenda pack, `tool.wasm` included.
 
 Trust: operators list maintainers' public keys in `runtime-config.yaml` `pack.trust-roots`;
 a `pack.sig` from a listed key makes a `trust-level: trusted` claim effective at install.
 The maintainer public key is published here in the same commit that configures
-`PACK_SIGNING_KEY` (until then, releases are unsigned and every pack installs as
-`untrusted`).
+`PACK_SIGNING_KEY`. Until then, releases are unsigned and every pack installs as
+`untrusted`. Signing applies to versions published after the key is configured; a version
+that was already published unsigned stays as published.
