@@ -129,6 +129,36 @@ pub use crate::schema_v2::{
     ViewKind, ViewSpec, WhereClause,
 };
 
+/// The built-in default schema as a meta-schema document; [`MetaSchema::default`] is its
+/// parsed form (a unit test pins the two together). A composition root that merges pack
+/// extensions into the live schema starts from this text when the workspace has no schema
+/// file of its own: merging into an empty document would drop the required fields.
+pub const DEFAULT_META_SCHEMA_YAML: &str = "\
+required:
+  id:
+    type: string
+    auto: ulid
+  name:
+    type: string
+    auto: filename
+  slug:
+    type: string
+    auto: filename-to-slug
+  description:
+    type: string
+    auto: content-extract
+  type:
+    type: string
+    auto: entity-type-default
+optional:
+  tags:
+    type: list<string>
+    default: []
+  status:
+    type: [draft, active, archived]
+    default: active
+";
+
 impl Default for MetaSchema {
     fn default() -> Self {
         let mut required = BTreeMap::new();
@@ -1188,6 +1218,14 @@ fn panic_payload_to_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_schema_yaml_is_the_default_schema() {
+        // Pack extensions are merged into this text; it must parse to exactly the
+        // built-in default so a merge never loses (or adds) a default field.
+        let parsed = parse_and_validate(DEFAULT_META_SCHEMA_YAML).expect("default yaml parses");
+        assert_eq!(parsed, MetaSchema::default());
+    }
 
     #[test]
     fn default_schema_has_five_required_fields() {

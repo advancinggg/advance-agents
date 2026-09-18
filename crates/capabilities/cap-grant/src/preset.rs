@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use chrono::{DateTime, Utc};
 use serde_yml::Value;
@@ -99,8 +100,13 @@ pub struct ApplyPresetResult {
 }
 
 /// Registry of built-in + custom presets.
+///
+/// Interior-mutable: the ONE registry is shared as `Arc<PresetRegistry>` by the approval
+/// intake, the resolver chain and the agent-grant bundle, and installed packs add / remove
+/// their presets while the runtime runs ([`insert`](Self::insert) / [`remove`](Self::remove)).
+/// The three built-ins can never be replaced or removed.
 pub struct PresetRegistry {
-    presets: HashMap<String, Preset>,
+    presets: RwLock<HashMap<String, Arc<Preset>>>,
 }
 
 impl PresetRegistry {
@@ -144,28 +150,61 @@ impl PresetRegistry {
                 grants: Vec::new(),
             },
         );
-        Self { presets }
+        Self {
+            presets: RwLock::new(
+                presets
+                    .into_iter()
+                    .map(|(name, preset)| (name, Arc::new(preset)))
+                    .collect(),
+            ),
+        }
     }
 
-    pub fn get(&self, name: &str) -> Option<&Preset> {
-        self.presets.get(name)
+    fn read(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<Preset>>> {
+        self.presets.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn names(&self) -> Vec<&str> {
-        self.presets.keys().map(|s| s.as_str()).collect()
+    fn write(&self) -> RwLockWriteGuard<'_, HashMap<String, Arc<Preset>>> {
+        self.presets.write().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Load a custom preset from a YAML file at `path`. Reuses Slice A's
-    /// compile.rs safety posture (1 MiB cap + charset gates) and adds a
-    /// 16-level structural-depth gate on the parsed `serde_yml::Value` tree.
-    ///
-    /// Audit-fix R4 (Adversarial Critical 4): refuses to overwrite the 3
-    /// built-in preset names (`restrict`, `supervised`, `autonomous`). A
-    /// workspace-writer who could otherwise drop a custom YAML file named
-    /// `restrict.yaml` with a permissive chain would silently downgrade
-    /// the security baseline; this gate forces custom presets to use a
-    /// distinct name.
-    pub fn load_custom_yaml(&mut self, path: &Path) -> Result<&Preset> {
+    pub fn get(&self, name: &str) -> Option<Arc<Preset>> {
+        self.read().get(name).cloned()
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.read().contains_key(name)
+    }
+
+    /// Every registered preset name, sorted.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.read().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Register (or replace) a custom preset through a shared reference — the path an
+    /// installed pack's preset takes while the runtime runs. Built-in names are refused
+    /// exactly as [`load_custom_yaml`](Self::load_custom_yaml) refuses them.
+    pub fn insert(&self, preset: Preset) -> Result<()> {
+        reject_builtin_shadow(&preset.name)?;
+        self.write().insert(preset.name.clone(), Arc::new(preset));
+        Ok(())
+    }
+
+    /// Remove a custom preset (pack uninstall). Built-ins are never removed. Returns whether
+    /// a preset of that name was registered. Grants a preset already issued are untouched.
+    pub fn remove(&self, name: &str) -> bool {
+        if reject_builtin_shadow(name).is_err() {
+            return false;
+        }
+        self.write().remove(name).is_some()
+    }
+
+    /// Parse and validate a custom preset file WITHOUT registering it — the same checks
+    /// [`load_custom_yaml`](Self::load_custom_yaml) applies (1 MiB cap, depth gate, grammar,
+    /// built-in shadow refusal), so a caller can inspect the declared name first.
+    pub fn parse_custom_yaml(path: &Path) -> Result<Preset> {
         let meta = std::fs::metadata(path)
             .map_err(|e| CapGrantError::InvalidConfig(format!("stat {path:?}: {e}")))?;
         if meta.len() > MAX_PRESET_YAML_BYTES {
@@ -186,9 +225,25 @@ impl PresetRegistry {
         check_yaml_depth(&root, 0)?;
         let preset = parse_preset(&root)?;
         reject_builtin_shadow(&preset.name)?;
+        Ok(preset)
+    }
+
+    /// Load a custom preset from a YAML file at `path`. Reuses Slice A's
+    /// compile.rs safety posture (1 MiB cap + charset gates) and adds a
+    /// 16-level structural-depth gate on the parsed `serde_yml::Value` tree.
+    ///
+    /// Audit-fix R4 (Adversarial Critical 4): refuses to overwrite the 3
+    /// built-in preset names (`restrict`, `supervised`, `autonomous`). A
+    /// workspace-writer who could otherwise drop a custom YAML file named
+    /// `restrict.yaml` with a permissive chain would silently downgrade
+    /// the security baseline; this gate forces custom presets to use a
+    /// distinct name.
+    pub fn load_custom_yaml(&mut self, path: &Path) -> Result<&Preset> {
+        let preset = Self::parse_custom_yaml(path)?;
         let name = preset.name.clone();
-        self.presets.insert(name.clone(), preset);
-        Ok(self.presets.get(&name).expect("just inserted"))
+        let map = self.presets.get_mut().unwrap_or_else(|e| e.into_inner());
+        map.insert(name.clone(), Arc::new(preset));
+        Ok(&**map.get(&name).expect("just inserted"))
     }
 
     /// Direct-from-Value form, used by tests that build a Value in-process.
@@ -198,8 +253,9 @@ impl PresetRegistry {
         let preset = parse_preset(root)?;
         reject_builtin_shadow(&preset.name)?;
         let name = preset.name.clone();
-        self.presets.insert(name.clone(), preset);
-        Ok(self.presets.get(&name).expect("just inserted"))
+        let map = self.presets.get_mut().unwrap_or_else(|e| e.into_inner());
+        map.insert(name.clone(), Arc::new(preset));
+        Ok(&**map.get(&name).expect("just inserted"))
     }
 
     /// `apply_preset` (MODULE-013 §1.4.4 steps 1-4 + 6).
@@ -309,7 +365,6 @@ impl PresetRegistry {
 
         // Step 1: validate name.
         let preset = self
-            .presets
             .get(name)
             .ok_or_else(|| CapGrantError::PresetNotFound(name.to_string()))?;
 

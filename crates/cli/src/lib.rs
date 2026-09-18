@@ -71,6 +71,7 @@ pub mod pack_wiring;
 // (`registry:name@version` sources; index GET + sha256-verified, bounded tarball
 // download), wired by `commands/pack.rs` from `pack.registry-url`.
 pub mod pack_registry_client;
+pub mod pack_runtime;
 pub mod reap;
 pub mod webhook_listener;
 // /dev Wave-20 Lane `search` (2026-06-27) — the cross-crate adapter bridging

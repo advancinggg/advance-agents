@@ -318,7 +318,7 @@ const FS_PREVIEW_MAX_BYTES: usize = 4096;
 /// Per-`tool.wasm` size cap for the L2 skill-tool bridge (mirrors cap-skills'
 /// `MAX_TOOL_WASM_BYTES`). A larger sidecar is skipped so one malformed/huge file
 /// never bloats the boot registry.
-const MAX_SKILL_TOOL_WASM_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_SKILL_TOOL_WASM_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Upper bound on `.agent/skills/` directory ENTRIES SCANNED at boot (and hence on
 /// skill tools registered) — bounds the O(N) boot-time stat/read I/O over a
@@ -333,7 +333,7 @@ const MAX_SKILL_TOOLS: usize = 256;
 /// cannot hang). `None` on any hazard. Mirrors cli `context_wiring::read_regular_capped`
 /// (the same disclosed residual: a host-side TOCTOU race-swap to a FIFO between the stat
 /// and the open — the cap-skills out-of-scope host-compromise trust level).
-fn read_regular_capped_bytes(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+pub(crate) fn read_regular_capped_bytes(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
     use std::io::Read;
     let meta = std::fs::symlink_metadata(path).ok()?;
     if !meta.file_type().is_file() || meta.len() > max_bytes {
@@ -744,6 +744,9 @@ pub struct WiringHandles {
     /// shares, the evaluator resolver the auto-loop driver holds, and the
     /// materializer. Always present (an absent packs dir boots an empty registry).
     pub pack: PackWiring,
+    /// Installed packs → the running runtime (schema extensions, presets, skill tools);
+    /// re-applied on every install / uninstall. See [`crate::pack_runtime`].
+    pub pack_runtime: Arc<crate::pack_runtime::PackRuntime>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1193,6 +1196,14 @@ async fn wire_capabilities_inner(
             .await
             .map_err(CliWiringError::Pack)?;
     let template_resolver: Arc<dyn TemplateResolver> = pack_wiring.template_resolver.clone();
+    // Installed packs → the running runtime: meta-schema extensions (merged in memory into the
+    // live schema), presets and skill tools. The parts attach below as they are built; applied
+    // at boot and again on every install / uninstall (Client API, or the packs-dir watcher for
+    // installs made by another process).
+    let pack_runtime = Arc::new(crate::pack_runtime::PackRuntime::new(
+        pack_wiring.registry.clone(),
+        pack_wiring.packs_dir.clone(),
+    ));
     let evidence_ids = Arc::new(EvidenceIdStore::new());
     // await-leg B-2 (2026-06-22): gate the production messaging chain (await-replies
     // + heartbeat host-fns + the suspend sink). await-leg B-4a (2026-06-22) flipped
@@ -1380,6 +1391,12 @@ async fn wire_capabilities_inner(
         let schema = Arc::new(MetaSchemaLoader::new_with_default(
             workspace.join(".agent/meta-schema.yaml"),
         ));
+        // The workspace file (when present) is the merge base; installed packs' extensions
+        // merge on top at the first `pack_runtime.apply()` below.
+        pack_runtime.attach_schema(
+            Arc::clone(&schema),
+            workspace.join(".agent/meta-schema.yaml"),
+        );
         Some((resolver, schema))
     } else {
         None
@@ -2325,6 +2342,8 @@ async fn wire_capabilities_inner(
         // the resolver chain, and the agent-grant bundle.
         let validator: Arc<dyn SubsetValidator> = Arc::new(SubsetValidatorImpl::new());
         let presets = Arc::new(PresetRegistry::with_builtins());
+        // Installed packs' presets join the built-ins (and leave on uninstall).
+        pack_runtime.attach_presets(Arc::clone(&presets));
         // Build the operator approval intake (CONTRACT-123) and inject it as the
         // Channel resolver's approval port (replacing the fail-closed default) —
         // a parked `grant-decision::pending` routes THROUGH it and the CONTRACT-120
@@ -2605,6 +2624,14 @@ async fn wire_capabilities_inner(
         }
     };
 
+    // Installed packs: meta-schema extensions + presets now; their skill tools join once the
+    // tool registry exists (step 7). Conflicts are logged and skipped, never fatal.
+    let _ = pack_runtime.apply().await;
+    // Installs / uninstalls made by ANOTHER process (`advance pack install` from a shell while
+    // the daemon runs) reach the runtime through the packs dir's `.meta.yaml` index. The task
+    // holds a weak reference and ends with the runtime.
+    let _packs_watcher = pack_runtime.spawn_packs_watcher(crate::pack_runtime::PACKS_POLL_INTERVAL);
+
     // Step 7 — cap-tools, POST-build. The `LazyToolRegistry` engine handle only
     // exists once `ComponentRuntime` is built. `host.host_registry()` is the
     // SAME Arc the CapabilityInjector wraps (Arc identity preserved across
@@ -2635,6 +2662,10 @@ async fn wire_capabilities_inner(
         if let Some(root) = skills_root.as_deref() {
             let _registered = register_skill_tools(&tools_concrete, root).await;
         }
+        // Installed packs' skill tools (`skill::<name>`), registered BEFORE the `data` store is
+        // built so its schema operations find them; a workspace skill of the same name wins.
+        pack_runtime.attach_tools(Arc::clone(&tools_concrete));
+        let _ = pack_runtime.apply().await;
         // Entity-data lane E1: the `data` host tool — registered BEFORE `start.rs` snapshots
         // `ToolRegistry::list()` into the context assembler's tool inventory, so the model sees
         // it. Needs the fs primitives (a `tools`-but-no-`fs` agent has no workspace to index).
@@ -2645,12 +2676,19 @@ async fn wire_capabilities_inner(
             let reducer = crate::data_wiring::deterministic_reducer(Arc::clone(&tools_concrete));
             let store = crate::data_wiring::build_data_store(
                 parts,
-                entity_index,
+                Arc::clone(&entity_index),
                 event_bus_dyn.clone(),
                 reducer,
                 root_uid.as_str(),
             )
             .await;
+            // A later schema change (pack install / uninstall) re-projects the workspace's
+            // Markdown files into the SAME index, so existing records gain / lose aspects.
+            pack_runtime.attach_entity_reindex(
+                workspace.to_path_buf(),
+                root_uid.as_str().to_string(),
+                entity_index,
+            );
             // Lane E3: the Client API's schema + entities families serve the SAME store.
             data_store_for_api = Some(Arc::clone(&store));
             if let Err(e) = crate::data_wiring::register_data_tool(
@@ -2891,14 +2929,18 @@ async fn wire_capabilities_inner(
                 .map(|activation| activation.execution_ingress.clone());
             let run_mgr_for_api = run_manager.clone();
             // Packs family: the ONE production registry + an installer over `RuntimeConfig.pack`
-            // (same trust roots / registry url / catalog rules as `advance pack install`).
-            let pack_admin_for_api: Arc<dyn advance_client_api::PackAdminProvider> =
-                Arc::new(crate::client_api_packs::WiredPackAdminProvider::new(
+            // (same trust roots / registry url / catalog rules as `advance pack install`). A
+            // successful install / uninstall applies the pack set to the running runtime before
+            // the response returns.
+            let pack_admin_for_api: Arc<dyn advance_client_api::PackAdminProvider> = Arc::new(
+                crate::client_api_packs::WiredPackAdminProvider::new(
                     pack_wiring.registry.clone(),
                     pack_wiring.packs_dir.clone(),
                     runtime_config.pack.clone(),
                     env!("CARGO_PKG_VERSION"),
-                ));
+                )
+                .with_pack_runtime(Arc::clone(&pack_runtime)),
+            );
             // Secrets family: the home's secrets
             // mode over the same runtime-config.yaml write chain the selected-provider
             // rewrite uses; `set-mode` only rewrites YAML (applies at the next start).
@@ -3050,6 +3092,7 @@ async fn wire_capabilities_inner(
             tools_grant_reader,
             web_grant: web_grant_handle,
             pack: pack_wiring,
+            pack_runtime,
         },
     ))
 }

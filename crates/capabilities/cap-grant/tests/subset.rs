@@ -429,3 +429,37 @@ fn bx_unknown_capability_fails_closed() {
     let err = v.validate(&pa, &ch).unwrap_err();
     assert!(matches!(err, CapGrantError::SubsetViolation(_)));
 }
+
+// The `data` host tool's L1 family (entity-data lanes): `mode` is a csv set. The tool asks
+// for `mode: read` or `mode: write` per call, so a `read,write` grant must cover either, and a
+// read-only grant must never cover a write.
+#[test]
+fn data_mode_is_a_set_subset() {
+    let v = SubsetValidatorImpl::new();
+    let rw = parent("data", vec![p("mode", "read,write")]);
+    let ro = parent("data", vec![p("mode", "read")]);
+    assert!(v
+        .validate(&rw, &draft("data", vec![p("mode", "read")]))
+        .is_ok());
+    assert!(v
+        .validate(&rw, &draft("data", vec![p("mode", "write")]))
+        .is_ok());
+    assert!(v
+        .validate(&rw, &draft("data", vec![p("mode", "read,write")]))
+        .is_ok());
+    assert!(matches!(
+        v.validate(&ro, &draft("data", vec![p("mode", "write")])),
+        Err(CapGrantError::SubsetViolation(_))
+    ));
+    assert!(matches!(
+        v.validate(&ro, &draft("data", vec![])),
+        Err(CapGrantError::SubsetViolation(_))
+    ));
+    // An unrestricted data grant covers any mode.
+    assert!(v
+        .validate(
+            &parent("data", vec![]),
+            &draft("data", vec![p("mode", "write")])
+        )
+        .is_ok());
+}

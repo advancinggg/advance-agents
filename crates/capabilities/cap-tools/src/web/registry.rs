@@ -71,6 +71,22 @@ impl ToolRegistry for CompositeToolRegistry {
         self.wasm.invoke(tool_id, method, params).await
     }
 
+    /// Forward the caller identity. This composite is the registry the production
+    /// `tool-invoke` host fn holds; the trait default would drop `agent_id` and route
+    /// through the anonymous `invoke`, which identity-bearing host tools (`data`) refuse.
+    async fn invoke_as(
+        &self,
+        agent_id: &str,
+        tool_id: &str,
+        method: &str,
+        params: &[u8],
+    ) -> Result<Vec<u8>, ToolError> {
+        if self.host.get(tool_id).await.is_some() {
+            return Err(ToolError::NotFound(tool_id.to_string()));
+        }
+        self.wasm.invoke_as(agent_id, tool_id, method, params).await
+    }
+
     async fn list(&self) -> Vec<ToolInfo> {
         let mut out = self.host.list().await;
         out.extend(self.wasm.list().await);

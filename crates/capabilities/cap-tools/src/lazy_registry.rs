@@ -391,6 +391,27 @@ impl LazyToolRegistry {
         inner.cache.pop(&id);
     }
 
+    /// Remove a WASM tool registered with [`register_binary`](Self::register_binary) (an
+    /// installed pack's skill tool on uninstall). Drops the cached instance, a recorded
+    /// failure and any in-flight load slot: a load already running for `id` then finds its
+    /// epoch slot gone and publishes nothing (the Phase 3 guard in `load_inner`), and a new
+    /// invoke answers `NotFound`. Host tools are never removed here. Returns whether a binary
+    /// was registered under `id`.
+    pub async fn unregister_binary(&self, id: &str) -> bool {
+        let mut inner = self.inner.lock().await;
+        let existed = inner.registry.remove(id).is_some();
+        inner.cache.pop(id);
+        inner.failed.remove(id);
+        inner.loading.remove(id);
+        existed
+    }
+
+    /// `true` when `id` is taken, as a WASM binary or as a host tool.
+    pub async fn is_registered(&self, id: &str) -> bool {
+        let inner = self.inner.lock().await;
+        inner.registry.contains_key(id) || inner.host.contains_key(id)
+    }
+
     /// Pack lane P2: register a host-native tool under `id`.
     ///
     /// Fail-closed at registration (not at first invoke):

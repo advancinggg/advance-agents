@@ -19,6 +19,22 @@ advance pack install target/packs/agenda --packs-dir .advance/packs
 advance pack install packs/agenda --packs-dir .advance/packs   # text-only install (no series operations)
 ```
 
+## Installing into a running runtime
+
+An install takes effect without a restart, whether it goes through the Client API
+(`POST /client/packs:install`) or through `advance pack install` from a shell (the daemon
+notices the packs dir's index change within a few seconds). The pack's meta-schema extensions
+merge into the live schema in memory: the workspace's own `.agent/meta-schema.yaml` is the
+base and is never rewritten. Its presets become known to the grant preset registry, and its
+skills' `tool.wasm` sidecars register as `skill::<name>` tools. Existing records are
+re-indexed, so they gain the pack's aspects. Uninstalling takes all of it away again.
+
+Conflicts never block. A pack whose schema extension conflicts with the schema, or with a
+pack applied before it in pack-name order, is skipped with a warning in the runtime log. So
+is a preset or skill tool whose name is already taken, and a workspace skill wins over a pack
+skill of the same name. When several versions of a pack are installed, only the highest
+applies.
+
 ## Contribution rules
 
 1. `trust-level: untrusted` always. A `trusted` pack must ship a `pack.sig` (ed25519 over

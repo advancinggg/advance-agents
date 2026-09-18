@@ -60,6 +60,9 @@ pub struct WiredPackAdminProvider {
     packs_dir: PathBuf,
     config: PackConfig,
     runtime_version: String,
+    /// Applies the installed pack set to the running runtime after a successful install /
+    /// uninstall (schema extensions, presets, skill tools), before the response returns.
+    pack_runtime: Option<Arc<crate::pack_runtime::PackRuntime>>,
 }
 
 impl WiredPackAdminProvider {
@@ -74,7 +77,24 @@ impl WiredPackAdminProvider {
             packs_dir,
             config,
             runtime_version: runtime_version.into(),
+            pack_runtime: None,
         }
+    }
+
+    /// Apply every install / uninstall to the running runtime (hot, no restart).
+    pub fn with_pack_runtime(mut self, runtime: Arc<crate::pack_runtime::PackRuntime>) -> Self {
+        self.pack_runtime = Some(runtime);
+        self
+    }
+
+    /// The pack set changed on disk and in the shared registry; bring the running runtime in
+    /// line. Apply problems are per-pack warnings (logged), never an install failure.
+    fn apply_to_runtime(&self) -> Result<(), ProviderError> {
+        if let Some(runtime) = &self.pack_runtime {
+            let runtime = Arc::clone(runtime);
+            Self::block_on(async move { runtime.apply().await })?;
+        }
+        Ok(())
     }
 
     /// Run an async pack-manager call on an owned current-thread runtime (see module docs).
@@ -244,6 +264,7 @@ impl PackAdminProvider for WiredPackAdminProvider {
         let source = request.source.clone();
         let report = Self::block_on(async move { installer.install(&source).await })?
             .map_err(map_pack_error)?;
+        self.apply_to_runtime()?;
         let install_path = report
             .install_path
             .strip_prefix(&self.packs_dir)
@@ -266,6 +287,7 @@ impl PackAdminProvider for WiredPackAdminProvider {
         let (name, version) = (name.to_string(), version.to_string());
         let report = Self::block_on(async move { installer.uninstall(&name, &version).await })?
             .map_err(map_pack_error)?;
+        self.apply_to_runtime()?;
         Ok(ClientPackUninstallResult {
             name: report.name,
             version: report.version,
