@@ -14,10 +14,10 @@ path = "src/lib.rs"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
-advance-runtime = { path = "../runtime", version = "0.1.18" }
-advance-shared-types = { path = "../shared-types", version = "0.1.18" }
-cap-grant = { path = "../capabilities/cap-grant", version = "0.1.18" }
-cap-lifecycle = { path = "../capabilities/cap-lifecycle", version = "0.1.18" }
+advance-runtime = { path = "../runtime", version = "0.1.19" }
+advance-shared-types = { path = "../shared-types", version = "0.1.19" }
+cap-grant = { path = "../capabilities/cap-grant", version = "0.1.19" }
+cap-lifecycle = { path = "../capabilities/cap-lifecycle", version = "0.1.19" }
 chrono = { workspace = true, features = ["clock"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
