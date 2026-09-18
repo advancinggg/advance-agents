@@ -55,11 +55,11 @@ use advance_shared_types::agent_tree::{
 use advance_shared_types::await_session::AwaitSessionRef;
 use advance_shared_types::capability::CapParams;
 use advance_shared_types::repetition::{OutputHash, RepetitionDecision, ToolCallSignature};
-use advance_shared_types::security_validator::{HttpRequest, HttpResponse, RedirectCheck};
 /// Only the `test-support` composition witness takes an injected SSRF guard; in a plain build
 /// the import would be unused, and CI compiles the production binary under `-D warnings`.
 #[cfg(feature = "test-support")]
 use advance_shared_types::security_validator::SsrfGuard;
+use advance_shared_types::security_validator::{HttpRequest, HttpResponse, RedirectCheck};
 use advance_shared_types::traits::{
     EventBusEmit, GrantCheck, HttpStreamingChain, LeakDetector, RepetitionGuardCheck, RunBudget,
     ToolsGrantReader,
