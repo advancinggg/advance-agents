@@ -1,0 +1,10 @@
+{
+  "name": "agenda",
+  "versions": {
+    "0.1.0": {
+      "sha256": "51a50783cd613ef8da414b339a657b5a508f7f1e28a40e0712add3c6397cba65",
+      "size": 50380,
+      "tarball": "agenda-0.1.0.tar.gz"
+    }
+  }
+}
