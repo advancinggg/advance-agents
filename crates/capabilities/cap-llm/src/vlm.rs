@@ -591,6 +591,7 @@ mod tests {
             sidecar: None,
             profile_id: None,
             device_id: None,
+            agent_cli: None,
         };
         let mut cfg = fixture_runtime_config();
         cfg.llm_providers.insert(0, local);
@@ -640,6 +641,7 @@ mod tests {
             sidecar: None,
             profile_id: None,
             device_id: None,
+            agent_cli: None,
         };
         let mut cfg = fixture_runtime_config();
         cfg.llm_providers = vec![local];

@@ -46,6 +46,20 @@ impl CapabilityDescriptor {
             max_output: None,
         }
     }
+
+    /// `agent-cli` entries (ADR 2026-09-28): a tools-disabled, text-in/text-out vendor CLI.
+    /// Structured output is NOT advertised — the CLI cannot be handed a schema, and the
+    /// gateway's corrective retries would each spawn another child.
+    pub fn agent_cli() -> Self {
+        Self {
+            tool_calling: ToolCallingLevel::Disabled,
+            structured_output: false,
+            embeddings: false,
+            image: false,
+            max_context: None,
+            max_output: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +110,7 @@ pub fn descriptor_for(
         InferenceBackendClass::Local | InferenceBackendClass::MeshRemote => {
             CapabilityDescriptor::unbound_local(cfg.embedding_model.is_some())
         }
+        InferenceBackendClass::AgentCli => CapabilityDescriptor::agent_cli(),
         InferenceBackendClass::CloudHttp => CapabilityDescriptor::unbound_cloud_http(),
     })
 }
@@ -208,6 +223,7 @@ mod tests {
             sidecar: None,
             profile_id: None,
             device_id: None,
+            agent_cli: None,
         }
     }
 

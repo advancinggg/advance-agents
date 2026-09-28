@@ -18,6 +18,8 @@ advance-shared-types = { path = "../shared-types" }
 cap-secrets = { path = "../capabilities/cap-secrets" }
 cap-llm = { path = "../capabilities/cap-llm" }
 cap-http = { path = "../capabilities/cap-http" }
+# Providers-family adapter (`provider_admin`, hoisted 2026-09-28 from advance-cli).
+advance-client-api = { path = "../client-api" }
 tokio = { workspace = true }
 zeroize = { workspace = true }
 serde = { workspace = true }

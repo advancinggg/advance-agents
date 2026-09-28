@@ -14,6 +14,7 @@ pub mod display_name;
 pub mod impls;
 pub mod ports;
 pub mod provider;
+pub mod provider_admin;
 pub mod recognize;
 pub mod runtime_state;
 pub mod scaffold;

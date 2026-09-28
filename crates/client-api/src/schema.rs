@@ -391,6 +391,10 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
                 schema_value::<crate::provider_admin::ClientProviderSidecar>(),
             ),
             (
+                "ClientProviderAgentCli",
+                schema_value::<crate::provider_admin::ClientProviderAgentCli>(),
+            ),
+            (
                 "ClientProviderKey",
                 schema_value::<crate::provider_admin::ClientProviderKey>(),
             ),

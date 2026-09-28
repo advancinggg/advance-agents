@@ -528,7 +528,51 @@ impl LlmGateway {
             {
                 Err(LlmError::ProviderError("mesh-remote: not wired".into()))
             }
+            None if resolved.backend_class
+                == advance_runtime::config::InferenceBackendClass::AgentCli =>
+            {
+                Err(LlmError::ProviderError("agent-cli: not wired".into()))
+            }
             None => Err(LlmError::ProviderError("local transport: not wired".into())),
+        }
+    }
+
+    /// ADR 2026-09-28 `agent-cli`: prompt bytes leave this host inside the vendor binary, so
+    /// the MODULE-012 scan point moves in front of the hand-off. Without a detector the entry
+    /// fails closed — it is never handed a prompt unscanned.
+    fn scan_remote_egress(&self, messages: &[InferenceMessage]) -> Result<(), LlmError> {
+        use advance_shared_types::security_validator::{ScanContext, ScanResult};
+        let Some(detector) = self.decoded_detector.as_ref() else {
+            return Err(LlmError::ProviderError(
+                "agent-cli: egress scan not wired".into(),
+            ));
+        };
+        for m in messages {
+            if let ScanResult::Blocked { .. } = detector.scan(&m.content, ScanContext::HttpOutbound)
+            {
+                return Err(LlmError::ProviderError(
+                    "agent-cli: egress scan blocked the prompt".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The buffered reply of an `agent-cli` turn is scanned inbound like an HTTP body
+    /// (the live stream path scans deltas through `DecodedPipeline`).
+    fn scan_remote_ingress(&self, text: String) -> Result<String, LlmError> {
+        use advance_shared_types::security_validator::{ScanContext, ScanResult};
+        let Some(detector) = self.decoded_detector.as_ref() else {
+            return Err(LlmError::ProviderError(
+                "agent-cli: egress scan not wired".into(),
+            ));
+        };
+        match detector.scan(&text, ScanContext::HttpInbound) {
+            ScanResult::Blocked { .. } => Err(LlmError::ProviderError(
+                "agent-cli: reply failed leak scan".into(),
+            )),
+            ScanResult::Redacted { redacted, .. } => Ok(redacted),
+            ScanResult::Clean | ScanResult::Warned { .. } => Ok(text),
         }
     }
 
@@ -598,6 +642,16 @@ impl LlmGateway {
                 });
             }
             let req = to_inference_chat_req(resolved, ctx, deadline);
+            if resolved.backend_class.is_remote_egress() {
+                if let Err(err) = self.scan_remote_egress(&req.messages) {
+                    self.note_port_error_terminal(ctx, tee, commit_tokens, commit_cost);
+                    return Err(DispatchError {
+                        err,
+                        request_emitted: true,
+                        tokens_released: hop_had_completion || commit_tokens > 0,
+                    });
+                }
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 self.note_port_error_terminal(ctx, tee, commit_tokens, commit_cost);
@@ -607,7 +661,7 @@ impl LlmGateway {
                     tokens_released: hop_had_completion || commit_tokens > 0,
                 });
             }
-            let resp = match tokio::time::timeout(remaining, port.chat(req)).await {
+            let mut resp = match tokio::time::timeout(remaining, port.chat(req)).await {
                 Err(_) => {
                     self.note_port_error_terminal(ctx, tee, commit_tokens, commit_cost);
                     return Err(DispatchError {
@@ -632,6 +686,19 @@ impl LlmGateway {
                     r
                 }
             };
+            if resolved.backend_class.is_remote_egress() {
+                match self.scan_remote_ingress(std::mem::take(&mut resp.text)) {
+                    Ok(text) => resp.text = text,
+                    Err(err) => {
+                        self.note_port_error_terminal(ctx, tee, commit_tokens, commit_cost);
+                        return Err(DispatchError {
+                            err,
+                            request_emitted: true,
+                            tokens_released: true,
+                        });
+                    }
+                }
+            }
             let clamped_in = resp.input_tokens.min(MAX_TOKENS_PER_ATTEMPT);
             let clamped_out = resp.output_tokens.min(MAX_TOKENS_PER_ATTEMPT);
             // `InferenceChatResponse` (local/mesh backends) carries no cache
@@ -1121,6 +1188,9 @@ impl LlmGateway {
             let mut live_ctx = ctx.clone();
             live_ctx.params = params;
             let inf_req = to_inference_chat_req(&resolved, &live_ctx, live_deadline);
+            if resolved.backend_class.is_remote_egress() {
+                self.scan_remote_egress(&inf_req.messages)?;
+            }
             let input_est = inf_req.reservation_bytes();
             (input_est, LiveUpstream::Local { port, req: inf_req })
         } else {
@@ -4939,6 +5009,7 @@ mod tests {
             sidecar: None,
             profile_id: None,
             device_id: None,
+            agent_cli: None,
         };
         let cap1 = build_http_cap(&p1, &cfg1).unwrap();
         assert_eq!(
@@ -4983,6 +5054,7 @@ mod tests {
             sidecar: None,
             profile_id: None,
             device_id: None,
+            agent_cli: None,
         };
         let cap2 = build_http_cap(&p2, &cfg2).unwrap();
         assert_eq!(
@@ -5037,6 +5109,7 @@ mod tests {
                     sidecar: None,
                     profile_id: None,
                     device_id: None,
+                    agent_cli: None,
                 },
             )
         };

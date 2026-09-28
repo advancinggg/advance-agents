@@ -286,6 +286,7 @@ dependencies = [
 name = "advance-home"
 version = "0.1.20"
 dependencies = [
+ "advance-client-api",
  "advance-runtime",
  "advance-shared-types",
  "async-trait",

@@ -39,6 +39,7 @@ use advance_client_api::{
 use advance_home::{CancelToken, PreflightFail, PreflightPort, SecretBytes};
 use advance_runtime::bootstrap::RuntimeHostBuilder;
 use advance_runtime::config::{load_config, LlmProviderConfig, RuntimeConfigProvider};
+use cap_secrets::SecretError;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 
@@ -745,4 +746,171 @@ async fn pv04_agent_pin_blocks_delete_through_production_reference_check() {
     let result: ClientProviderDeleteResult = data(&env);
     assert_eq!(result.selected_provider_id.as_deref(), Some("anthropic"));
     assert_eq!(ids(&ws), vec!["anthropic"]);
+}
+
+// ── ADR 2026-09-28 `agent-cli`: the providers family over a subscription-CLI entry ──────────
+
+/// A sign-in probe whose verdict the test sets; records the spec it was asked about.
+struct ScriptedProbe {
+    signed_in: std::sync::atomic::AtomicBool,
+    asked: Mutex<Vec<String>>,
+}
+
+impl cap_llm::AgentCliAuthProbe for ScriptedProbe {
+    fn probe(&self, spec: &advance_runtime::config::AgentCliSpec) -> cap_llm::AuthProbe {
+        self.asked.lock().unwrap().push(spec.command.clone());
+        let signed_in = self.signed_in.load(std::sync::atomic::Ordering::SeqCst);
+        cap_llm::AuthProbe {
+            signed_in,
+            cli_present: true,
+            detail: if signed_in {
+                "signed-in".into()
+            } else {
+                "not-signed-in (Not logged in)".into()
+            },
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pv05_agent_cli_entry_over_production_wiring() {
+    let (_g, ws, cfg) = fresh_workspace();
+    let (host, handles) = boot(&ws, &cfg).await;
+    let server = handles
+        .client_api_server
+        .as_ref()
+        .expect("EventBus up ⇒ Client API bound");
+    let api = server.api();
+    let probe = Arc::new(ScriptedProbe {
+        signed_in: std::sync::atomic::AtomicBool::new(true),
+        asked: Mutex::new(Vec::new()),
+    });
+    let preflight = ScriptedPreflight::passing();
+    let adapter = Arc::new(
+        WiredProviderAdmin::new(
+            ws.clone(),
+            host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
+            handles.secret_store.clone(),
+            preflight.clone(),
+            Arc::new(NoReferences),
+        )
+        .with_agent_cli_probe(probe.clone()),
+    );
+    install_provider_admin(&api, adapter);
+    mint(&api, "tok", Scope::operator_default());
+
+    // A fake vendor binary: an absolute, executable path (never spawned by the scripted probe).
+    let fake = ws.join("fake-claude.sh");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    let body = json!({
+        "provider_id": "claude-sub",
+        "backend_class": "agent-cli",
+        "agent_cli": { "vendor": "claude", "command": fake.to_string_lossy() },
+        "model_aliases": { "sonnet": "sonnet" },
+        "cost": { "input_per_mtoken": 0.001, "output_per_mtoken": 0.001 },
+        "rate_limit": { "requests_per_minute": 6, "tokens_per_minute": 60000 }
+    });
+    // Without the block the class is refused before any write.
+    let mut headless = body.clone();
+    headless.as_object_mut().unwrap().remove("agent_cli");
+    let env = post(&api, "/client/providers", headless, "k-cli-0");
+    assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
+    assert_eq!(ids(&ws), vec!["openai"]);
+    // A relative command is refused too.
+    let mut relative = body.clone();
+    relative["agent_cli"]["command"] = json!("claude");
+    let env = post(&api, "/client/providers", relative, "k-cli-1");
+    assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
+
+    let env = post(&api, "/client/providers", body, "k-cli-2");
+    let created: ClientProviderSummary = data(&env);
+    assert_eq!(created.backend_class, "agent-cli");
+    let spec = created.agent_cli.as_ref().expect("agent_cli echoed");
+    assert_eq!(spec.vendor, "claude");
+    assert_eq!(spec.command, fake.to_string_lossy());
+    assert!(
+        created.key.present,
+        "the placeholder secret makes the entry usable"
+    );
+    let pre = created
+        .last_preflight
+        .as_ref()
+        .expect("sign-in probed at create");
+    assert!(pre.ok && pre.reason.is_none());
+    assert!(
+        has_warning(&env, WARNING_RESTART_REQUIRED),
+        "the port registry is built at boot"
+    );
+    assert_eq!(
+        probe.asked.lock().unwrap().as_slice(),
+        &[fake.to_string_lossy().to_string()]
+    );
+    // The YAML re-parses strictly with the block; the placeholder resolves in the live store.
+    let on_disk = entries(&ws);
+    let e = on_disk
+        .iter()
+        .find(|p| p.id == "claude-sub")
+        .expect("on disk");
+    assert_eq!(
+        e.backend_class,
+        advance_runtime::config::InferenceBackendClass::AgentCli
+    );
+    assert_eq!(
+        e.agent_cli.as_ref().unwrap().vendor,
+        advance_runtime::config::AgentCliVendor::Claude
+    );
+    let store = handles.secret_store.clone().expect("live store");
+    let placeholder = store
+        .resolve("claude-sub-api-key")
+        .expect("placeholder stored");
+    assert_eq!(placeholder.expose_secret(), "agent-cli");
+
+    // `:preflight` is the sign-in probe: sign out → not-signed-in, no key involved.
+    probe
+        .signed_in
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let env = post(
+        &api,
+        "/client/providers/claude-sub:preflight",
+        Value::Null,
+        "k-cli-3",
+    );
+    let verdict: ClientProviderPreflightResult = data(&env);
+    assert!(!verdict.ok);
+    assert_eq!(verdict.reason.as_deref(), Some("not-signed-in"));
+    let one: ClientProviderSummary = data(&get(&api, "/client/providers/claude-sub"));
+    assert_eq!(
+        one.last_preflight.as_ref().unwrap().reason.as_deref(),
+        Some("not-signed-in")
+    );
+    assert!(one.key.present);
+    // The daemon's own gateway registry answers for the entry only after a restart: the
+    // running gateway (built at boot) knows nothing about it, which is what restart_required
+    // told the client.
+    let known = host
+        .config_watcher()
+        .current()
+        .llm_providers
+        .iter()
+        .any(|p| p.id == "claude-sub");
+    let pending = has_warning(&env, WARNING_RELOAD_PENDING);
+    eprintln!("PV-05 create: watcher_reloaded={known} reload_pending_warning={pending}");
+
+    // `:delete` removes the entry AND its placeholder secret (nothing accumulates).
+    let env = post(
+        &api,
+        "/client/providers/claude-sub:delete",
+        Value::Null,
+        "k-cli-4",
+    );
+    let gone: ClientProviderDeleteResult = data(&env);
+    assert_eq!(gone.provider_id, "claude-sub");
+    assert_eq!(ids(&ws), vec!["openai"]);
+    assert!(
+        matches!(
+            store.resolve("claude-sub-api-key"),
+            Err(SecretError::NotFound(_))
+        ),
+        "placeholder secret removed with the entry"
+    );
 }

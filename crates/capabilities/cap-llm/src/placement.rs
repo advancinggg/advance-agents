@@ -148,6 +148,17 @@ pub fn is_pre_token_failover(err: &LlmError) -> bool {
     if rest.starts_with(advance_shared_types::inference::LOCAL_TRANSPORT_PREFIX) {
         return false;
     }
+    // ADR 2026-09-28 `agent-cli`: an absent / unwired / signed-out / paused subscription CLI
+    // has spent no tokens — the walker moves on. A blocked egress scan never hops.
+    if let Some(cli) = rest.strip_prefix(crate::backend_cli::AGENT_CLI_PREFIX) {
+        let cli = cli.trim_start();
+        return cli == "not wired"
+            || cli.starts_with("cli not found")
+            || cli.starts_with("not signed in")
+            || cli.starts_with("subscription usage limit")
+            || cli.starts_with("daemon identity unknown")
+            || cli.starts_with("egress scan not wired");
+    }
     rest == "not wired" || rest == "unavailable" || crate::retry::is_transport_provider_error(rest)
 }
 
@@ -306,7 +317,11 @@ pub fn place(
                 filtered.retain(|c| c.backend_class == InferenceBackendClass::Local);
             }
             UserHardConstraint::NeverCloud => {
-                filtered.retain(|c| c.backend_class != InferenceBackendClass::CloudHttp);
+                // `agent-cli` egresses to the vendor inside the CLI: it is cloud too.
+                filtered.retain(|c| {
+                    c.backend_class != InferenceBackendClass::CloudHttp
+                        && !c.backend_class.is_remote_egress()
+                });
             }
             UserHardConstraint::DevicePin(id) => {
                 filtered.retain(|c| c.device_id.as_deref() == Some(id.as_str()));
@@ -641,6 +656,7 @@ mod t133_helpers {
             sidecar: None,
             profile_id: None,
             device_id: None,
+            agent_cli: None,
         }
     }
 }

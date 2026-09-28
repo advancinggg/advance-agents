@@ -87,6 +87,7 @@ pub const RESPONSE_COMPONENTS: &[&str] = &[
     "ClientProviderCost",
     "ClientProviderRateLimit",
     "ClientProviderRetry",
+    "ClientProviderAgentCli",
     "ClientProviderKey",
     "ClientProviderPreflightResult",
     "ClientProviderSummary",

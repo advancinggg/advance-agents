@@ -80,6 +80,7 @@ fn summary(id: &str, selected: bool) -> ClientProviderSummary {
         profile_id: None,
         device_id: None,
         sidecar_present: false,
+        agent_cli: None,
         key: ClientProviderKey {
             secret_name: format!("{id}-api-key"),
             present: false,

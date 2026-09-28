@@ -539,6 +539,13 @@ pub enum InferenceBackendClass {
     Local,
     #[serde(rename = "mesh-remote")]
     MeshRemote,
+    /// A vendor coding-agent CLI installed on this host, driven per request as a
+    /// tools-disabled, text-in/text-out subprocess on the user's own subscription
+    /// (ADR 2026-09-28 agent-cli backend class). Cloud egress happens inside the
+    /// vendor binary, so the gateway leak-scans before hand-off and never treats
+    /// the entry as on-device.
+    #[serde(rename = "agent-cli")]
+    AgentCli,
 }
 
 impl InferenceBackendClass {
@@ -547,8 +554,59 @@ impl InferenceBackendClass {
     }
 
     pub fn uses_inference_port(self) -> bool {
-        matches!(self, Self::Local | Self::MeshRemote)
+        matches!(self, Self::Local | Self::MeshRemote | Self::AgentCli)
     }
+
+    /// Prompt bytes leave this host through a channel the gateway does not carry
+    /// itself (`agent-cli`: the vendor binary). `cloud-http` egress is scanned by
+    /// the HTTP chain; `local` / `mesh-remote` stay inside the mesh.
+    pub fn is_remote_egress(self) -> bool {
+        matches!(self, Self::AgentCli)
+    }
+}
+
+/// Which vendor CLI an `agent-cli` entry drives. The recipe (flags, prompt
+/// transport, output parser, auth probe) is fixed per vendor in `cap-llm`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "lowercase")]
+pub enum AgentCliVendor {
+    /// Anthropic Claude Code (`claude -p`), Claude Pro/Max sign-in.
+    Claude,
+    /// OpenAI Codex CLI (`codex exec --json`), ChatGPT sign-in.
+    Codex,
+    /// xAI Grok Build (`grok --prompt-file`), SuperGrok / X Premium sign-in.
+    Grok,
+}
+
+impl AgentCliVendor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Grok => "grok",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "grok" => Some(Self::Grok),
+            _ => None,
+        }
+    }
+}
+
+/// The subprocess an `agent-cli` backend-class provider drives. `command` is the
+/// absolute path of the user's own, unmodified vendor binary; `args` are appended
+/// after the fixed no-tools recipe (never before it).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCliSpec {
+    pub vendor: AgentCliVendor,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 /// Supervised sidecar command for a `local` backend-class provider.
@@ -613,6 +671,8 @@ pub struct LlmProviderConfig {
     pub sidecar: Option<SidecarSpec>,
     pub profile_id: Option<String>,
     pub device_id: Option<String>,
+    /// `agent-cli` backend class only: the vendor CLI recipe target.
+    pub agent_cli: Option<AgentCliSpec>,
 }
 
 #[derive(Deserialize)]
@@ -653,6 +713,8 @@ struct LlmProviderConfigRaw {
     profile_id: Option<String>,
     #[serde(rename = "device-id", default)]
     device_id: Option<String>,
+    #[serde(rename = "agent-cli", default)]
+    agent_cli: Option<AgentCliSpec>,
 }
 
 impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
@@ -725,6 +787,33 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
                 );
             }
         }
+        if backend_class == InferenceBackendClass::AgentCli {
+            if raw.agent_cli.is_none() {
+                return Err(
+                    "backend-class: agent-cli requires an agent-cli block (vendor + command)"
+                        .into(),
+                );
+            }
+            if raw.sidecar.is_some() {
+                return Err("sidecar is invalid on backend-class: agent-cli".into());
+            }
+            if raw.device_id.is_some() {
+                return Err("device-id is invalid on backend-class: agent-cli".into());
+            }
+            if matches!(
+                backend,
+                Some(ProviderBackend::AnthropicMessages | ProviderBackend::OpenAiResponses)
+            ) {
+                return Err(
+                    "backend-class: agent-cli carries no wire dialect (omit backend)".into(),
+                );
+            }
+            if backend.is_none() {
+                backend = Some(ProviderBackend::OpenAiChat);
+            }
+        } else if raw.agent_cli.is_some() {
+            return Err("agent-cli block is only valid on backend-class: agent-cli".into());
+        }
         Ok(Self {
             id: raw.id,
             endpoint: raw.endpoint,
@@ -744,6 +833,7 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
             sidecar: raw.sidecar,
             profile_id: raw.profile_id,
             device_id: raw.device_id,
+            agent_cli: raw.agent_cli,
         })
     }
 }
@@ -778,6 +868,7 @@ impl fmt::Debug for LlmProviderConfig {
             .field("sidecar", &self.sidecar)
             .field("profile_id", &self.profile_id)
             .field("device_id", &self.device_id)
+            .field("agent_cli", &self.agent_cli)
             .finish()
     }
 }
@@ -2105,6 +2196,29 @@ fn validate_config(path: &Path, cfg: &RuntimeConfig) -> Result<(), ConfigError> 
             if let Some(sc) = &p.sidecar {
                 if !std::path::Path::new(&sc.command).is_absolute() {
                     return invalid("llm-providers[].sidecar.command must be an absolute path");
+                }
+            }
+            if p.backend_class == InferenceBackendClass::AgentCli {
+                let Some(spec) = &p.agent_cli else {
+                    return invalid(
+                        "llm-providers[].agent-cli is required on backend-class: agent-cli",
+                    );
+                };
+                if !std::path::Path::new(&spec.command).is_absolute() {
+                    return invalid("llm-providers[].agent-cli.command must be an absolute path");
+                }
+                if spec.command.chars().any(|c| c.is_control()) {
+                    return invalid(
+                        "llm-providers[].agent-cli.command must not contain control characters",
+                    );
+                }
+                if spec.args.len() > 32 {
+                    return invalid("llm-providers[].agent-cli.args holds at most 32 entries");
+                }
+                if spec.args.iter().any(|a| a.chars().any(|c| c.is_control())) {
+                    return invalid(
+                        "llm-providers[].agent-cli.args must not contain control characters",
+                    );
                 }
             }
         } else {

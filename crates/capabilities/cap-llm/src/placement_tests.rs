@@ -67,6 +67,7 @@ fn provider(
         sidecar: None,
         profile_id: profile_id.map(str::to_string),
         device_id: None,
+        agent_cli: None,
     }
 }
 

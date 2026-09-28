@@ -216,6 +216,23 @@ pub fn build_llm_gateway(
             }
         }
     }
+    // ADR 2026-09-28 `agent-cli`: one per-request vendor-CLI port per entry. The scratch root
+    // is per user + daemon; each call gets its own 0700 subdirectory.
+    for p in config.current().llm_providers.iter() {
+        let (advance_runtime::config::InferenceBackendClass::AgentCli, Some(spec)) =
+            (p.backend_class, p.agent_cli.as_ref())
+        else {
+            continue;
+        };
+        registry.insert(
+            p.id.clone(),
+            Arc::new(cap_llm::AgentCliBackend::new(
+                spec.clone(),
+                p.id.clone(),
+                cap_llm::backend_cli::default_work_root().join(&p.id),
+            )),
+        );
+    }
     for p in config.current().llm_providers.iter() {
         if p.backend_class != advance_runtime::config::InferenceBackendClass::MeshRemote {
             continue;

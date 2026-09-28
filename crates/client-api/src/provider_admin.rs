@@ -65,7 +65,14 @@ pub const MAX_SIDECAR_ARG_LEN: usize = 1024;
 pub const MAX_OPTIONAL_STRING_LEN: usize = 256;
 
 /// Closed spellings of `backend_class` (`InferenceBackendClass`).
-pub const BACKEND_CLASSES: &[&str] = &["cloud-http", "local", "mesh-remote"];
+pub const BACKEND_CLASSES: &[&str] = &["cloud-http", "local", "mesh-remote", "agent-cli"];
+/// Closed spellings of `agent_cli.vendor` (`AgentCliVendor`, ADR 2026-09-28).
+pub const AGENT_CLI_VENDORS: &[&str] = &["claude", "codex", "grok"];
+/// The `backend_class` of a subscription-CLI entry.
+pub const AGENT_CLI_BACKEND_CLASS: &str = "agent-cli";
+/// Bound on `agent_cli.args` — the runtime loader's own cap, so a create that passes here is
+/// never refused at reload.
+pub const MAX_AGENT_CLI_ARGS: usize = 32;
 /// Closed spellings of `backend` (`ProviderBackend`).
 pub const BACKENDS: &[&str] = &["openai-chat", "openai-responses", "anthropic-messages"];
 /// Closed spellings of `auth_scheme` (`AuthScheme`).
@@ -123,6 +130,19 @@ pub struct ClientProviderSidecar {
     pub args: Vec<String>,
 }
 
+/// An `agent-cli` entry's vendor CLI (ADR 2026-09-28): which vendor, the absolute path of the
+/// user's own unmodified binary, and extra args appended after the fixed no-tools recipe.
+/// Echoed in summaries (a client renders the vendor and offers the vendor's own sign-in
+/// command); it carries no credential.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientProviderAgentCli {
+    /// `claude` | `codex` | `grok`.
+    pub vendor: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 /// The provider's key reference: the secret NAME and whether a value is stored. Never a value.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientProviderKey {
@@ -132,7 +152,9 @@ pub struct ClientProviderKey {
 
 /// One preflight verdict (`:set-key` / `:preflight`). `reason` is a fixed vocabulary: the
 /// `LlmError` variant name (`model-not-available`, `provider-error`, …), `timeout`, `cancelled`,
-/// `missing-key`, `missing-provider`, or `unsupported-backend-class`.
+/// `missing-key`, `missing-provider`, or `unsupported-backend-class`. For an `agent-cli` entry
+/// the check is the vendor CLI's own sign-in status: ok = signed in; else `not-signed-in`,
+/// `cli-not-found`, `cli-failed`, `daemon-identity-unknown`, `timeout`, `cancelled`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientProviderPreflightResult {
     pub ok: bool,
@@ -172,10 +194,11 @@ pub struct ClientProviderSummary {
     pub device_id: Option<String>,
     /// Whether the entry carries a sidecar launch spec (the spec itself is never echoed).
     pub sidecar_present: bool,
+    /// `agent-cli` entries only: the vendor CLI this entry drives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_cli: Option<ClientProviderAgentCli>,
     pub key: ClientProviderKey,
-    /// `true` for the first YAML entry — the provider the runtime resolves by default.
     pub selected: bool,
-    /// The last preflight verdict recorded by this daemon (in-memory; cleared at restart).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_preflight: Option<ClientProviderPreflightResult>,
 }
@@ -220,14 +243,13 @@ pub struct ClientCreateProviderRequest {
     pub sidecar: Option<ClientProviderSidecar>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
-    /// Required by the runtime for `mesh-remote`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
+    /// Required for (and only valid on) `backend_class: agent-cli`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_cli: Option<ClientProviderAgentCli>,
 }
 
-/// The body of `POST /client/providers/{provider_id}:update`. Every field is optional; at least
-/// one is required. A present field REPLACES the stored one; an absent field (and any YAML key
-/// this DTO does not model) is left untouched. The id is immutable.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClientUpdateProviderRequest {
@@ -257,10 +279,11 @@ pub struct ClientUpdateProviderRequest {
     pub profile_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_cli: Option<ClientProviderAgentCli>,
 }
 
 impl ClientUpdateProviderRequest {
-    /// Whether the update names at least one field.
     pub fn is_empty(&self) -> bool {
         self.backend_class.is_none()
             && self.backend.is_none()
@@ -275,6 +298,7 @@ impl ClientUpdateProviderRequest {
             && self.sidecar.is_none()
             && self.profile_id.is_none()
             && self.device_id.is_none()
+            && self.agent_cli.is_none()
     }
 }
 
@@ -510,6 +534,29 @@ pub fn validate_sidecar(sidecar: &ClientProviderSidecar) -> Result<(), ClientErr
     Ok(())
 }
 
+/// `agent_cli`: a known vendor, an absolute command with no control characters, bounded args.
+pub fn validate_agent_cli(spec: &ClientProviderAgentCli) -> Result<(), ClientError> {
+    validate_enum(&spec.vendor, AGENT_CLI_VENDORS, "invalid agent_cli.vendor")?;
+    if spec.command.is_empty()
+        || spec.command.len() > MAX_SIDECAR_COMMAND_LEN
+        || !spec.command.starts_with('/')
+        || spec.command.chars().any(|c| c.is_control())
+    {
+        return Err(invalid(
+            "invalid agent_cli.command (absolute path required)",
+        ));
+    }
+    if spec.args.len() > MAX_AGENT_CLI_ARGS {
+        return Err(invalid("too many agent_cli args"));
+    }
+    for arg in &spec.args {
+        if arg.len() > MAX_SIDECAR_ARG_LEN || arg.chars().any(|c| c.is_control()) {
+            return Err(invalid("invalid agent_cli arg"));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a create request (everything the handler can decide without the runtime).
 pub fn validate_create_request(req: &ClientCreateProviderRequest) -> Result<(), ClientError> {
     validate_provider_id(&req.provider_id)?;
@@ -548,6 +595,32 @@ pub fn validate_create_request(req: &ClientCreateProviderRequest) -> Result<(), 
             return Err(invalid("sidecar is only valid for local providers"));
         }
         validate_sidecar(sidecar)?;
+    }
+    match &req.agent_cli {
+        Some(spec) => {
+            if class != AGENT_CLI_BACKEND_CLASS {
+                return Err(invalid("agent_cli is only valid for agent-cli providers"));
+            }
+            validate_agent_cli(spec)?;
+        }
+        None if class == AGENT_CLI_BACKEND_CLASS => {
+            return Err(invalid("agent_cli is required for agent-cli providers"));
+        }
+        None => {}
+    }
+    if class == AGENT_CLI_BACKEND_CLASS {
+        // The loader accepts only the (unused) default dialect on this class.
+        if matches!(req.backend.as_deref(), Some(b) if b != "openai-chat") {
+            return Err(invalid(
+                "agent-cli providers carry no wire dialect (omit backend)",
+            ));
+        }
+        if req.sidecar.is_some() {
+            return Err(invalid("sidecar is only valid for local providers"));
+        }
+        if req.device_id.is_some() {
+            return Err(invalid("device_id is only valid for mesh-remote providers"));
+        }
     }
     if let Some(profile) = &req.profile_id {
         validate_optional_string(profile, "invalid profile_id")?;
@@ -595,6 +668,9 @@ pub fn validate_update_request(req: &ClientUpdateProviderRequest) -> Result<(), 
     }
     if let Some(sidecar) = &req.sidecar {
         validate_sidecar(sidecar)?;
+    }
+    if let Some(spec) = &req.agent_cli {
+        validate_agent_cli(spec)?;
     }
     if let Some(profile) = &req.profile_id {
         validate_optional_string(profile, "invalid profile_id")?;
@@ -847,6 +923,86 @@ mod tests {
         for bad in ["", "a b", "a/b", "a.b", "é", &"x".repeat(65)] {
             assert!(validate_provider_id(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn agent_cli_create_request_rules() {
+        fn cli_req() -> ClientCreateProviderRequest {
+            let mut req = create_req();
+            req.backend_class = Some("agent-cli".into());
+            req.endpoint = None;
+            req.backend = None;
+            req.auth_scheme = None;
+            req.agent_cli = Some(ClientProviderAgentCli {
+                vendor: "claude".into(),
+                command: "/Users/me/.local/bin/claude".into(),
+                args: vec![],
+            });
+            req
+        }
+        assert!(validate_create_request(&cli_req()).is_ok());
+        // The block is required on the class and refused elsewhere.
+        let mut headless = cli_req();
+        headless.agent_cli = None;
+        assert!(validate_create_request(&headless).is_err());
+        let mut elsewhere = create_req();
+        elsewhere.agent_cli = cli_req().agent_cli.clone();
+        assert!(validate_create_request(&elsewhere).is_err());
+        // Vendor, command shape, args bound.
+        let mut vendor = cli_req();
+        vendor.agent_cli.as_mut().unwrap().vendor = "gemini".into();
+        assert!(validate_create_request(&vendor).is_err());
+        let mut relative = cli_req();
+        relative.agent_cli.as_mut().unwrap().command = "claude".into();
+        assert!(validate_create_request(&relative).is_err());
+        let mut control = cli_req();
+        control.agent_cli.as_mut().unwrap().command = "/x/cl\naude".into();
+        assert!(validate_create_request(&control).is_err());
+        let mut many = cli_req();
+        many.agent_cli.as_mut().unwrap().args = vec!["--x".to_string(); MAX_AGENT_CLI_ARGS + 1];
+        assert!(
+            validate_create_request(&many).is_err(),
+            "33 args refused at the family"
+        );
+        let mut at_cap = cli_req();
+        at_cap.agent_cli.as_mut().unwrap().args = vec!["--x".to_string(); MAX_AGENT_CLI_ARGS];
+        assert!(validate_create_request(&at_cap).is_ok());
+        // No foreign dialect, sidecar or device on the class.
+        let mut dialect = cli_req();
+        dialect.backend = Some("anthropic-messages".into());
+        assert!(validate_create_request(&dialect).is_err());
+        let mut default_dialect = cli_req();
+        default_dialect.backend = Some("openai-chat".into());
+        assert!(validate_create_request(&default_dialect).is_ok());
+        let mut sidecar = cli_req();
+        sidecar.sidecar = Some(ClientProviderSidecar {
+            command: "/x/y".into(),
+            args: vec![],
+        });
+        assert!(validate_create_request(&sidecar).is_err());
+        let mut device = cli_req();
+        device.device_id = Some("peer".into());
+        assert!(validate_create_request(&device).is_err());
+        // Updates validate the block's shape.
+        let upd = ClientUpdateProviderRequest {
+            agent_cli: Some(ClientProviderAgentCli {
+                vendor: "codex".into(),
+                command: "relative/codex".into(),
+                args: vec![],
+            }),
+            ..Default::default()
+        };
+        assert!(validate_update_request(&upd).is_err());
+        let upd_ok = ClientUpdateProviderRequest {
+            agent_cli: Some(ClientProviderAgentCli {
+                vendor: "codex".into(),
+                command: "/opt/homebrew/bin/codex".into(),
+                args: vec!["--profile".into(), "along".into()],
+            }),
+            ..Default::default()
+        };
+        assert!(validate_update_request(&upd_ok).is_ok());
+        assert!(BACKEND_CLASSES.contains(&AGENT_CLI_BACKEND_CLASS));
     }
 
     #[test]

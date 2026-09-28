@@ -1980,3 +1980,112 @@ fn genui_max_document_bytes_range() {
     reject(0);
     reject(262_145);
 }
+
+// ── ADR 2026-09-28 `agent-cli` backend class ─────────────────────────────────────────────────
+
+fn agent_cli_yaml(block: &str) -> String {
+    format!(
+        "{}\n",
+        minimal_yaml().trim_end_matches('\n').replace(
+            "llm-providers: []",
+            &format!(
+                "llm-providers:\n  - id: claude-sub\n    api-key-secret: claude-sub-api-key\n    backend-class: agent-cli\n{block}    model-aliases:\n      sonnet: sonnet\n    cost-per-mtoken-in: 0.001\n    cost-per-mtoken-out: 0.001\n    rate-limit:\n      requests-per-minute: 6\n      tokens-per-minute: 60000"
+            )
+        )
+    )
+}
+
+#[test]
+fn agent_cli_entry_parses_with_its_block() {
+    let yaml = agent_cli_yaml(
+        "    agent-cli:\n      vendor: claude\n      command: /Users/me/.local/bin/claude\n      args: [\"--effort\", \"low\"]\n",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("runtime-config.yaml");
+    write_config(&config_path, &yaml);
+    let cfg = load_config(&config_path).expect("agent-cli entry must load");
+    let p = &cfg.llm_providers[0];
+    assert_eq!(
+        p.backend_class,
+        advance_runtime::config::InferenceBackendClass::AgentCli
+    );
+    assert!(p.backend_class.uses_inference_port());
+    assert!(p.backend_class.is_remote_egress());
+    assert!(!p.backend_class.uses_http_egress());
+    let spec = p.agent_cli.as_ref().expect("spec");
+    assert_eq!(spec.vendor, advance_runtime::config::AgentCliVendor::Claude);
+    assert_eq!(spec.command, "/Users/me/.local/bin/claude");
+    assert_eq!(spec.args, vec!["--effort", "low"]);
+    assert_eq!(
+        p.backend,
+        Some(advance_runtime::config::ProviderBackend::OpenAiChat)
+    );
+    assert!(p.endpoint.is_empty());
+    // The other classes stay off the remote-egress path.
+    assert!(!advance_runtime::config::InferenceBackendClass::Local.is_remote_egress());
+    assert!(!advance_runtime::config::InferenceBackendClass::CloudHttp.is_remote_egress());
+}
+
+#[test]
+fn agent_cli_requires_its_block_and_refuses_sidecar_device_and_dialect() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("runtime-config.yaml");
+    let cases: Vec<(&str, &str)> = vec![
+        ("", "requires an agent-cli block"),
+        (
+            "    agent-cli:\n      vendor: codex\n      command: /opt/homebrew/bin/codex\n    sidecar:\n      command: /x/y\n",
+            "sidecar is invalid on backend-class: agent-cli",
+        ),
+        (
+            "    agent-cli:\n      vendor: codex\n      command: /opt/homebrew/bin/codex\n    device-id: peer\n",
+            "device-id is invalid",
+        ),
+        (
+            "    agent-cli:\n      vendor: grok\n      command: /Users/me/.grok/bin/grok\n    backend: anthropic-messages\n",
+            "carries no wire dialect",
+        ),
+        (
+            "    agent-cli:\n      vendor: grok\n      command: relative/grok\n",
+            "must be an absolute path",
+        ),
+        (
+            "    agent-cli:\n      vendor: gemini\n      command: /usr/bin/gemini\n",
+            "unknown variant",
+        ),
+    ];
+    let mut cases = cases;
+    let thirty_three = (0..33).map(|_| "\"--x\"").collect::<Vec<_>>().join(", ");
+    let many_args = format!(
+        "    agent-cli:\n      vendor: claude\n      command: /Users/me/.local/bin/claude\n      args: [{thirty_three}]\n"
+    );
+    cases.push((Box::leak(many_args.into_boxed_str()), "at most 32 entries"));
+    fn chain(err: &dyn std::error::Error) -> String {
+        let mut out = err.to_string();
+        let mut cur = err.source();
+        while let Some(e) = cur {
+            out.push_str(" / ");
+            out.push_str(&e.to_string());
+            cur = e.source();
+        }
+        out
+    }
+    for (block, needle) in cases {
+        write_config(&config_path, &agent_cli_yaml(block));
+        let err = load_config(&config_path).expect_err(needle);
+        let text = chain(&err);
+        assert!(text.contains(needle), "block {block:?}: {text}");
+    }
+    // The block on a cloud-http entry is refused too.
+    let yaml = agent_cli_yaml("    agent-cli:\n      vendor: claude\n      command: /x/claude\n")
+        .replace(
+            "backend-class: agent-cli",
+            "backend-class: cloud-http\n    endpoint: https://api.example.com",
+        );
+    write_config(&config_path, &yaml);
+    let err = load_config(&config_path).expect_err("block on cloud-http");
+    let text = chain(&err);
+    assert!(
+        text.contains("only valid on backend-class: agent-cli"),
+        "{text}"
+    );
+}

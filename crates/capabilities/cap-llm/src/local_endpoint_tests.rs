@@ -36,6 +36,7 @@ fn local_cfg() -> LlmProviderConfig {
         sidecar: None,
         profile_id: None,
         device_id: None,
+        agent_cli: None,
     }
 }
 
