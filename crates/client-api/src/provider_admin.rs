@@ -10,6 +10,8 @@
 //! - `POST /client/providers/{provider_id}:set-key`        SENSITIVE body; loopback peers only; preflight before store
 //! - `POST /client/providers/{provider_id}:clear-key`
 //! - `POST /client/providers/{provider_id}:preflight`      re-check the stored key
+//! - `GET  /client/providers/{provider_id}/usage`          `agent-cli`: the vendor CLI's own
+//!                                                         subscription allowance (no key, no turn)
 //! - `POST /client/providers/{provider_id}:select`         move to index 0
 //!
 //! The family reuses the packs-family scopes on purpose: `Scope` is a closed enum inventoried by
@@ -164,6 +166,50 @@ pub struct ClientProviderPreflightResult {
     pub reason: Option<String>,
 }
 
+/// One allowance window an `agent-cli` vendor reported (`GET /client/providers/{id}/usage`).
+/// `used_percent` is 0..=100 as the vendor states it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientProviderUsageWindow {
+    /// `session` (Claude's 5-hour window) | `week` | `week-model` | `primary` | `secondary`
+    /// (Codex's rolling windows) | `period` (Grok's weekly or monthly pool) | `other`.
+    pub kind: String,
+    /// The vendor's own wording (`Current week (all models)`, `5-hour`, `Weekly limit`).
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub used_percent: f64,
+    /// Unix milliseconds when the window resets, when the vendor states an instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<u64>,
+    /// The vendor's own reset wording when only text is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_minutes: Option<u64>,
+}
+
+/// The subscription allowance behind an `agent-cli` entry, read through the vendor CLI's own
+/// account surface (ADR 2026-09-28 §usage): Claude Code's `/usage`, Codex's app-server
+/// `account/rateLimits/read`, Grok Build's `x.ai/billing`. Never a model turn, never a token
+/// read. `reason` (when not ok) is the sign-in probe's vocabulary plus `unparsed` (the CLI
+/// answered something this version does not read) and `unsupported-backend-class`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientProviderUsage {
+    pub ok: bool,
+    /// Unix milliseconds of the read.
+    pub checked_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The plan the vendor names (`max`, `plus`, `supergrok_heavy`, …), verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// The signed-in account's own label (an email) — shown back to the user, never persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<ClientProviderUsageWindow>,
+}
+
 /// One provider entry (`GET /client/providers` rows, `GET /client/providers/{id}`, and the
 /// response of every entry mutation).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -201,6 +247,9 @@ pub struct ClientProviderSummary {
     pub selected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_preflight: Option<ClientProviderPreflightResult>,
+    /// `agent-cli` entries: the last allowance read this daemon made (in-memory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_usage: Option<ClientProviderUsage>,
 }
 
 /// `GET /client/providers`.
@@ -870,6 +919,23 @@ pub(crate) fn register(api: &mut ClientApi, slot: ProviderAdminSlot) {
             Ok(serde_json::to_value(result).expect("ClientProviderPreflightResult serializes"))
         })
         .with_scopes(vec![Scope::ApproveGrants]),
+    );
+
+    // GET /client/providers/{provider_id}/usage — the vendor CLI's own allowance (agent-cli).
+    let s = slot.clone();
+    api.register_templated(
+        Method::Get,
+        routes::TPL_PROVIDER_USAGE,
+        HandlerSpec::read(true, move |ctx| {
+            let id = ctx.path_param("provider_id")?;
+            validate_provider_id(&id)?;
+            let provider = provider_or_unavailable(&s)?;
+            let usage = provider
+                .usage(&id)
+                .map_err(ProviderError::into_client_error)?;
+            Ok(serde_json::to_value(usage).expect("ClientProviderUsage serializes"))
+        })
+        .with_scopes(vec![Scope::ReadInventory]),
     );
 
     // POST /client/providers/{provider_id}:select — move to index 0.

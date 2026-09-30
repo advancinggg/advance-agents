@@ -90,6 +90,8 @@ pub const RESPONSE_COMPONENTS: &[&str] = &[
     "ClientProviderAgentCli",
     "ClientProviderKey",
     "ClientProviderPreflightResult",
+    "ClientProviderUsageWindow",
+    "ClientProviderUsage",
     "ClientProviderSummary",
     "ClientProviderList",
     "ClientProviderKeyResult",

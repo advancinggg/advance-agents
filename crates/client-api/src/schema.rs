@@ -403,6 +403,14 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
                 schema_value::<crate::provider_admin::ClientProviderPreflightResult>(),
             ),
             (
+                "ClientProviderUsageWindow",
+                schema_value::<crate::provider_admin::ClientProviderUsageWindow>(),
+            ),
+            (
+                "ClientProviderUsage",
+                schema_value::<crate::provider_admin::ClientProviderUsage>(),
+            ),
+            (
                 "ClientProviderSummary",
                 schema_value::<crate::provider_admin::ClientProviderSummary>(),
             ),

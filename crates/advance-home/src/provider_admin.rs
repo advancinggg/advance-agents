@@ -36,15 +36,17 @@ use advance_client_api::provider_admin::{
     ClientCreateProviderRequest, ClientProviderAgentCli, ClientProviderCost,
     ClientProviderDeleteResult, ClientProviderKey, ClientProviderKeyResult,
     ClientProviderPreflightResult, ClientProviderRateLimit, ClientProviderRetry,
-    ClientProviderSidecar, ClientProviderSummary, ClientUpdateProviderRequest,
-    ProviderAdminOutcome, ProviderAdminWarning, DEFAULT_BACKEND_CLASS,
+    ClientProviderSidecar, ClientProviderSummary, ClientProviderUsage, ClientProviderUsageWindow,
+    ClientUpdateProviderRequest, ProviderAdminOutcome, ProviderAdminWarning, DEFAULT_BACKEND_CLASS,
 };
 use advance_client_api::{ClientApi, ProviderAdminProvider, ProviderError};
 use advance_runtime::config::{
     AgentCliSpec, AuthScheme, InferenceBackendClass, LlmProviderConfig, ProviderBackend,
     RuntimeConfig, RuntimeConfigProvider,
 };
-use cap_llm::backend_cli::{AgentCliAuthProbe, ProcessAuthProbe};
+use cap_llm::backend_cli::{
+    AgentCliAuthProbe, AgentCliUsageProbe, ProcessAuthProbe, ProcessUsageProbe,
+};
 use cap_secrets::{SecretError, SecretStore};
 use secrecy::ExposeSecret;
 use serde_yml::{Mapping, Value};
@@ -90,10 +92,14 @@ pub struct WiredProviderAdmin {
     references: Arc<dyn ProviderReferenceCheck>,
     /// ADR 2026-09-28: the sign-in probe behind `:preflight` for `agent-cli` entries.
     agent_cli_probe: Arc<dyn AgentCliAuthProbe>,
+    /// The allowance read behind `GET …/usage` for `agent-cli` entries.
+    agent_cli_usage_probe: Arc<dyn AgentCliUsageProbe>,
     /// Serializes every mutation: YAML rewrites + key writes must not interleave.
     write_lock: Mutex<()>,
     /// The last preflight verdict per provider id (in-memory; cleared at restart).
     last_preflight: Mutex<HashMap<String, ClientProviderPreflightResult>>,
+    /// The last allowance read per provider id (in-memory; cleared at restart).
+    last_usage: Mutex<HashMap<String, ClientProviderUsage>>,
     reload_wait: Duration,
     preflight_timeout: Duration,
 }
@@ -113,8 +119,10 @@ impl WiredProviderAdmin {
             preflight,
             references,
             agent_cli_probe: Arc::new(ProcessAuthProbe::default()),
+            agent_cli_usage_probe: Arc::new(ProcessUsageProbe::default()),
             write_lock: Mutex::new(()),
             last_preflight: Mutex::new(HashMap::new()),
+            last_usage: Mutex::new(HashMap::new()),
             reload_wait: RELOAD_WAIT,
             preflight_timeout: PREFLIGHT_TIMEOUT,
         }
@@ -123,6 +131,12 @@ impl WiredProviderAdmin {
     /// Override the `agent-cli` sign-in probe (tests / product composition roots).
     pub fn with_agent_cli_probe(mut self, probe: Arc<dyn AgentCliAuthProbe>) -> Self {
         self.agent_cli_probe = probe;
+        self
+    }
+
+    /// Override the `agent-cli` allowance read (tests / product composition roots).
+    pub fn with_agent_cli_usage_probe(mut self, probe: Arc<dyn AgentCliUsageProbe>) -> Self {
+        self.agent_cli_usage_probe = probe;
         self
     }
 
@@ -189,6 +203,12 @@ impl WiredProviderAdmin {
             .unwrap_or_else(|e| e.into_inner())
             .get(&entry.id)
             .cloned();
+        let last_usage = self
+            .last_usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&entry.id)
+            .cloned();
         ClientProviderSummary {
             provider_id: entry.id.clone(),
             backend_class: backend_class_str(entry.backend_class).to_string(),
@@ -231,6 +251,7 @@ impl WiredProviderAdmin {
             },
             selected,
             last_preflight,
+            last_usage,
         }
     }
 
@@ -341,6 +362,19 @@ impl WiredProviderAdmin {
         }
     }
 
+    /// `agent-cli`: the vendor CLI's own allowance, projected onto the wire shape. The probe's
+    /// fixed tokens become `reason`; `ok` carries the windows.
+    fn run_agent_cli_usage(&self, spec: &AgentCliSpec) -> ClientProviderUsage {
+        project_usage(self.agent_cli_usage_probe.probe_usage(spec), now_ms())
+    }
+
+    fn record_usage(&self, provider_id: &str, usage: &ClientProviderUsage) {
+        self.last_usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(provider_id.to_string(), usage.clone());
+    }
+
     /// An `agent-cli` entry is created with its placeholder secret so the "no key, no
     /// provider" rule reads it as usable; nothing ever resolves the value.
     fn store_agent_cli_placeholder(&self, entry: &LlmProviderConfig) {
@@ -356,6 +390,33 @@ impl WiredProviderAdmin {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(provider_id.to_string(), result.clone());
+    }
+}
+
+/// The wire shape of a usage probe: the probe's fixed token becomes `reason` when it failed.
+pub fn project_usage(
+    probe: cap_llm::backend_cli::UsageProbe,
+    checked_at_ms: u64,
+) -> ClientProviderUsage {
+    ClientProviderUsage {
+        ok: probe.ok,
+        checked_at_ms,
+        reason: if probe.ok { None } else { Some(probe.detail) },
+        plan: probe.plan,
+        account: probe.account,
+        windows: probe
+            .windows
+            .into_iter()
+            .map(|w| ClientProviderUsageWindow {
+                kind: w.kind,
+                label: w.label,
+                model: w.model,
+                used_percent: w.used_percent,
+                resets_at_ms: w.resets_at_ms,
+                resets_label: w.resets_label,
+                window_minutes: w.window_minutes,
+            })
+            .collect(),
     }
 }
 
@@ -525,6 +586,21 @@ impl ProviderAdminProvider for WiredProviderAdmin {
             .remove(&entry.api_key_secret)
             .map_err(|_| ProviderError::Unavailable("secret store write".into()))?;
         Ok(self.summary(&entry, idx == 0))
+    }
+
+    fn usage(&self, provider_id: &str) -> Result<ClientProviderUsage, ProviderError> {
+        let (_, entry) = self.find(provider_id)?;
+        let usage = match (entry.backend_class, &entry.agent_cli) {
+            (InferenceBackendClass::AgentCli, Some(spec)) => self.run_agent_cli_usage(spec),
+            _ => ClientProviderUsage {
+                ok: false,
+                checked_at_ms: now_ms(),
+                reason: Some(REASON_UNSUPPORTED_CLASS.to_string()),
+                ..ClientProviderUsage::default()
+            },
+        };
+        self.record_usage(provider_id, &usage);
+        Ok(usage)
     }
 
     fn preflight(&self, provider_id: &str) -> Result<ClientProviderPreflightResult, ProviderError> {
@@ -865,6 +941,54 @@ mod tests {
         let m = v.as_mapping().unwrap();
         assert_eq!(m.len(), 2, "id + endpoint only: {m:?}");
         assert_eq!(v["endpoint"], "https://proxy.example");
+    }
+
+    #[test]
+    fn usage_projection_keeps_windows_and_names_the_failure() {
+        use cap_llm::backend_cli::{UsageProbe, UsageWindow};
+        let ok = project_usage(
+            UsageProbe {
+                ok: true,
+                detail: "ok".into(),
+                plan: Some("max".into()),
+                account: Some("me@example.com".into()),
+                windows: vec![UsageWindow {
+                    kind: "week".into(),
+                    label: "Current week (all models)".into(),
+                    model: None,
+                    used_percent: 69.0,
+                    resets_at_ms: None,
+                    resets_label: Some("Sep 30 at 3pm (America/Los_Angeles)".into()),
+                    window_minutes: None,
+                }],
+            },
+            42,
+        );
+        assert!(ok.ok);
+        assert_eq!(ok.checked_at_ms, 42);
+        assert_eq!(ok.reason, None);
+        assert_eq!(ok.plan.as_deref(), Some("max"));
+        assert_eq!(ok.windows.len(), 1);
+        assert_eq!(ok.windows[0].kind, "week");
+        assert_eq!(ok.windows[0].used_percent, 69.0);
+        assert_eq!(
+            ok.windows[0].resets_label.as_deref(),
+            Some("Sep 30 at 3pm (America/Los_Angeles)")
+        );
+
+        let failed = project_usage(
+            UsageProbe {
+                ok: false,
+                detail: "not-signed-in".into(),
+                plan: None,
+                account: None,
+                windows: Vec::new(),
+            },
+            7,
+        );
+        assert!(!failed.ok);
+        assert_eq!(failed.reason.as_deref(), Some("not-signed-in"));
+        assert!(failed.windows.is_empty());
     }
 
     #[test]

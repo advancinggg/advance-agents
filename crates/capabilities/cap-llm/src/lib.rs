@@ -79,7 +79,8 @@ mod policy_tests;
 mod test_support;
 
 pub use backend_cli::{
-    probe_auth, AgentCliAuthProbe, AgentCliBackend, AgentCliEnv, AuthProbe, ProcessAuthProbe,
+    probe_auth, probe_usage, AgentCliAuthProbe, AgentCliBackend, AgentCliEnv, AgentCliUsageProbe,
+    AuthProbe, ProcessAuthProbe, ProcessUsageProbe, UsageProbe, UsageWindow,
 };
 pub use backend_local::{
     FailedSpawnBackend, OwnedHandoffSupervisor, ProcessSupervisor, SidecarClient,

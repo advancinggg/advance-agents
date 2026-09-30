@@ -307,3 +307,115 @@ fn agent_cli_failovers_are_pre_token() {
         &LlmError::ProviderError("agent-cli: egress scan blocked the prompt".into())
     ));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Usage probe parsers (fixtures = the vendor CLIs' live answers, 2026-09-29)
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn claude_usage_text_yields_session_week_and_per_model_windows() {
+    let text = "You are currently using your subscription to power your Claude Code usage\n\n\
+Current session: 60% used · resets Sep 29 at 11pm (America/Los_Angeles)\n\
+Current week (all models): 69% used · resets Sep 30 at 3pm (America/Los_Angeles)\n\
+Current week (Fable): 79% used · resets Sep 30 at 3pm (America/Los_Angeles)\n\n\
+What's contributing to your limits usage?\nLast 24h · 2312 requests · 4 sessions\n  99% of your usage came from subagent-heavy sessions\n";
+    let windows = crate::backend_cli::parse_claude_usage_text(text);
+    assert_eq!(windows.len(), 3, "{windows:?}");
+    assert_eq!(windows[0].kind, "session");
+    assert_eq!(windows[0].used_percent, 60.0);
+    assert_eq!(
+        windows[0].resets_label.as_deref(),
+        Some("Sep 29 at 11pm (America/Los_Angeles)")
+    );
+    assert_eq!(windows[1].kind, "week");
+    assert_eq!(windows[1].label, "Current week (all models)");
+    assert_eq!(windows[1].used_percent, 69.0);
+    assert_eq!(windows[2].kind, "week-model");
+    assert_eq!(windows[2].model.as_deref(), Some("Fable"));
+    assert_eq!(windows[2].used_percent, 79.0);
+    assert!(windows.iter().all(|w| w.resets_at_ms.is_none()));
+    assert!(crate::backend_cli::parse_claude_usage_text("Not logged in").is_empty());
+}
+
+#[test]
+fn codex_usage_reads_account_and_both_windows_and_names_signed_out() {
+    let ok = vec![
+        serde_json::json!({"id":1,"result":{"userAgent":"x"}}),
+        serde_json::json!({"id":2,"result":{"account":{"type":"chatgpt","email":"me@example.com","planType":"plus"},"requiresOpenaiAuth":false}}),
+        serde_json::json!({"id":3,"result":{"rateLimits":{"limitId":"codex","planType":"plus","primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":1790700000},"secondary":{"usedPercent":30,"windowDurationMins":10080,"resetsAt":1791200000}},"rateLimitsByLimitId":null}}),
+    ];
+    let probe = crate::backend_cli::codex_usage_from_responses(&ok);
+    assert!(probe.ok, "{probe:?}");
+    assert_eq!(probe.plan.as_deref(), Some("plus"));
+    assert_eq!(probe.account.as_deref(), Some("me@example.com"));
+    assert_eq!(probe.windows.len(), 2);
+    assert_eq!(probe.windows[0].kind, "primary");
+    assert_eq!(probe.windows[0].label, "5-hour");
+    assert_eq!(probe.windows[0].used_percent, 12.0);
+    assert_eq!(probe.windows[0].resets_at_ms, Some(1_790_700_000_000));
+    assert_eq!(probe.windows[0].window_minutes, Some(300));
+    assert_eq!(probe.windows[1].label, "Weekly");
+    assert_eq!(probe.windows[1].used_percent, 30.0);
+
+    // The live signed-out answer of codex-cli 0.144.1.
+    let signed_out = vec![
+        serde_json::json!({"id":1,"result":{"userAgent":"x"}}),
+        serde_json::json!({"id":2,"result":{"account":null,"requiresOpenaiAuth":true}}),
+        serde_json::json!({"error":{"code":-32600,"message":"codex account authentication required to read rate limits"},"id":3}),
+    ];
+    let probe = crate::backend_cli::codex_usage_from_responses(&signed_out);
+    assert!(!probe.ok);
+    assert_eq!(probe.detail, "not-signed-in");
+    assert!(probe.windows.is_empty());
+
+    let nothing = crate::backend_cli::codex_usage_from_responses(&[]);
+    assert_eq!(nothing.detail, "unparsed");
+}
+
+#[test]
+fn grok_usage_reads_tier_account_and_the_weekly_pool() {
+    // The live answers of grok 1.0.41 (email redacted).
+    let ok = vec![
+        serde_json::json!({"id":1,"result":{"protocolVersion":1}}),
+        serde_json::json!({"id":2,"result":{"_meta":{"email":"me@example.com","auth_mode":"Oidc","subscription_tier":"supergrok_heavy","backend_billed":false}}}),
+        serde_json::json!({"id":3,"result":{"config":{"creditUsagePercent":11.0,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-09-28T01:32:38.043435+00:00","end":"2026-10-05T01:32:38.043435+00:00"},"onDemandCap":{"val":0},"prepaidBalance":{"val":0},"isUnifiedBillingUser":true}}}),
+    ];
+    let probe = crate::backend_cli::grok_usage_from_responses(&ok);
+    assert!(probe.ok, "{probe:?}");
+    assert_eq!(probe.plan.as_deref(), Some("supergrok_heavy"));
+    assert_eq!(probe.account.as_deref(), Some("me@example.com"));
+    assert_eq!(probe.windows.len(), 1);
+    let w = &probe.windows[0];
+    assert_eq!(w.kind, "period");
+    assert_eq!(w.label, "Weekly limit");
+    assert_eq!(w.used_percent, 11.0);
+    assert_eq!(w.resets_at_ms, Some(1_791_163_958_043));
+    assert_eq!(w.window_minutes, Some(7 * 24 * 60));
+
+    let signed_out = vec![
+        serde_json::json!({"id":1,"result":{"protocolVersion":1}}),
+        serde_json::json!({"id":2,"error":{"code":-32000,"message":"Authentication required"}}),
+    ];
+    let probe = crate::backend_cli::grok_usage_from_responses(&signed_out);
+    assert_eq!(probe.detail, "not-signed-in");
+
+    let billing_refused = vec![
+        serde_json::json!({"id":2,"result":{"_meta":{"subscription_tier":"free"}}}),
+        serde_json::json!({"id":3,"error":{"code":-32000,"message":"Authentication required to fetch billing data","data":"Billing data requires auth with grok.com. Run `grok login` to authenticate."}}),
+    ];
+    let probe = crate::backend_cli::grok_usage_from_responses(&billing_refused);
+    assert_eq!(probe.detail, "not-signed-in");
+}
+
+#[test]
+fn usage_probe_refuses_a_missing_cli_before_spawning() {
+    let spec = AgentCliSpec {
+        vendor: AgentCliVendor::Claude,
+        command: "/definitely/not/here/claude".into(),
+        args: Vec::new(),
+    };
+    let env = crate::backend_cli::AgentCliEnv::from_process_env();
+    let probe = crate::backend_cli::probe_usage(&spec, &env);
+    assert!(!probe.ok);
+    assert_eq!(probe.detail, "cli-not-found");
+}

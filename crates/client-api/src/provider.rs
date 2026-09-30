@@ -41,8 +41,8 @@ use crate::packs::{
 };
 use crate::provider_admin::{
     ClientCreateProviderRequest, ClientProviderDeleteResult, ClientProviderKeyResult,
-    ClientProviderPreflightResult, ClientProviderSummary, ClientUpdateProviderRequest,
-    ProviderAdminOutcome,
+    ClientProviderPreflightResult, ClientProviderSummary, ClientProviderUsage,
+    ClientUpdateProviderRequest, ProviderAdminOutcome,
 };
 use crate::providers::grants::BoundGrantApprovalPort;
 use crate::providers::history::BoundHistoryReadPort;
@@ -336,6 +336,13 @@ pub trait ProviderAdminProvider: Send + Sync {
     fn clear_key(&self, provider_id: &str) -> Result<ClientProviderSummary, ProviderError>;
     /// Re-check the stored key against the provider's generate path.
     fn preflight(&self, provider_id: &str) -> Result<ClientProviderPreflightResult, ProviderError>;
+    /// `agent-cli`: the vendor CLI's own subscription allowance (no key, no turn). Other
+    /// classes answer `ok: false` / `unsupported-backend-class`. The default answers
+    /// `Unavailable` for adapters that predate the read.
+    fn usage(&self, provider_id: &str) -> Result<ClientProviderUsage, ProviderError> {
+        let _ = provider_id;
+        Err(ProviderError::Unavailable("usage".into()))
+    }
     /// Move the entry to index 0 (the runtime's default provider).
     fn select_provider(
         &self,

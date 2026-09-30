@@ -108,6 +108,7 @@ pub const TPL_PROVIDER_SET_KEY: &str = "/client/providers/{provider_id}:set-key"
 pub const TPL_PROVIDER_CLEAR_KEY: &str = "/client/providers/{provider_id}:clear-key";
 pub const TPL_PROVIDER_PREFLIGHT: &str = "/client/providers/{provider_id}:preflight";
 pub const TPL_PROVIDER_SELECT: &str = "/client/providers/{provider_id}:select";
+pub const TPL_PROVIDER_USAGE: &str = "/client/providers/{provider_id}/usage";
 /// Secrets family: the home's secrets mode (GET)
 /// and the mode switch (POST). Its own family (`secrets`); no templated routes.
 pub const PATH_SECRETS_MODE: &str = "/client/secrets/mode";

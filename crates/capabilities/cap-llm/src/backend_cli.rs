@@ -1183,6 +1183,607 @@ pub fn probe_auth(spec: &AgentCliSpec, env: &AgentCliEnv) -> AuthProbe {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Usage probe (subscription allowance)
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A usage probe drives the vendor CLI's own account surface (no model turn, no token read):
+/// Claude Code's `/usage` slash command through `-p` (a local command: zero tokens, zero cost),
+/// Codex's `codex app-server` JSON-RPC `account/read` + `account/rateLimits/read`, and Grok
+/// Build's ACP `authenticate` + `x.ai/billing` extension. Slower than the sign-in probe: the
+/// CLIs talk to their vendor.
+pub const USAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// One allowance window the vendor CLI reported. `used_percent` is 0..=100 as the vendor
+/// states it (Claude and Codex report percentages; Grok reports `creditUsagePercent`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageWindow {
+    /// `session` (Claude's 5-hour window) | `week` | `week-model` (Claude's per-model weekly
+    /// cap) | `primary` / `secondary` (Codex's rolling windows) | `period` (Grok's weekly or
+    /// monthly credit pool) | `other`.
+    pub kind: String,
+    /// The vendor's own wording (`Current week (all models)`, `5-hour`, `Weekly limit`).
+    pub label: String,
+    /// `week-model` only: the model the cap applies to.
+    pub model: Option<String>,
+    pub used_percent: f64,
+    /// Unix milliseconds when the window resets, when the vendor states an instant.
+    pub resets_at_ms: Option<u64>,
+    /// The vendor's own reset wording when only text is known (`Sep 29 at 11pm (America/Los_Angeles)`).
+    pub resets_label: Option<String>,
+    /// The window's length when the vendor states it (Codex: 300 / 10080).
+    pub window_minutes: Option<u64>,
+}
+
+/// What a usage probe found. `detail` is a fixed token: `ok` | `not-signed-in` |
+/// `cli-not-found` | `daemon-identity-unknown` | `timeout` | `cancelled` | `cli-failed` |
+/// `unparsed`. `account` is the signed-in account's own label (an email) — the user's own
+/// device data, shown back to the user, never persisted by the probe.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageProbe {
+    pub ok: bool,
+    pub detail: String,
+    /// The plan the vendor names (`max`, `pro`, `plus`, `supergrok_heavy`, …), verbatim.
+    pub plan: Option<String>,
+    pub account: Option<String>,
+    pub windows: Vec<UsageWindow>,
+}
+
+impl UsageProbe {
+    fn failed(detail: &str) -> Self {
+        Self {
+            ok: false,
+            detail: detail.to_string(),
+            plan: None,
+            account: None,
+            windows: Vec::new(),
+        }
+    }
+}
+
+/// Seam for the providers family: the production impl runs the vendor CLI; tests inject.
+pub trait AgentCliUsageProbe: Send + Sync {
+    fn probe_usage(&self, spec: &AgentCliSpec) -> UsageProbe;
+}
+
+/// Runs the vendor's own usage surface under the allowlisted environment.
+pub struct ProcessUsageProbe {
+    pub env: AgentCliEnv,
+}
+
+impl Default for ProcessUsageProbe {
+    fn default() -> Self {
+        Self {
+            env: AgentCliEnv::from_process_env(),
+        }
+    }
+}
+
+impl AgentCliUsageProbe for ProcessUsageProbe {
+    fn probe_usage(&self, spec: &AgentCliSpec) -> UsageProbe {
+        probe_usage(spec, &self.env)
+    }
+}
+
+pub fn probe_usage(spec: &AgentCliSpec, env: &AgentCliEnv) -> UsageProbe {
+    let command = Path::new(&spec.command);
+    if !command.is_absolute() || !command.is_file() {
+        return UsageProbe::failed("cli-not-found");
+    }
+    if !env.identity_complete() {
+        return UsageProbe::failed("daemon-identity-unknown");
+    }
+    let deadline = Instant::now() + USAGE_PROBE_TIMEOUT;
+    match spec.vendor {
+        AgentCliVendor::Claude => probe_usage_claude(command, env, deadline),
+        AgentCliVendor::Codex => probe_usage_codex(command, env, deadline),
+        AgentCliVendor::Grok => probe_usage_grok(command, env, deadline),
+    }
+}
+
+/// One supervised run with fresh cancel flags and the temp dir as cwd.
+fn run_once(
+    command: &Path,
+    argv: &[&str],
+    env: &AgentCliEnv,
+    vendor: AgentCliVendor,
+    stdin_bytes: Option<Vec<u8>>,
+    deadline: Instant,
+) -> Result<ChildRun, StopReason> {
+    let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+    let cancel = AtomicBool::new(false);
+    let abort = AtomicBool::new(false);
+    let cwd = std::env::temp_dir();
+    run_supervised(
+        command,
+        &argv,
+        env,
+        vendor,
+        &cwd,
+        stdin_bytes,
+        deadline,
+        &cancel,
+        &abort,
+    )
+    .map_err(|(stop, _)| stop)
+}
+
+fn stop_detail(stop: StopReason) -> &'static str {
+    match stop {
+        StopReason::Deadline => "timeout",
+        _ => "cancelled",
+    }
+}
+
+// Claude Code: `auth status` for the plan and account, then `/usage` through `-p` (a local
+// slash command: the result carries `num_turns: 0` and zero tokens).
+fn probe_usage_claude(command: &Path, env: &AgentCliEnv, deadline: Instant) -> UsageProbe {
+    let status = match run_once(
+        command,
+        &["auth", "status"],
+        env,
+        AgentCliVendor::Claude,
+        None,
+        deadline,
+    ) {
+        Ok(r) => r,
+        Err(stop) => return UsageProbe::failed(stop_detail(stop)),
+    };
+    let status_json = String::from_utf8_lossy(&status.stdout)
+        .find('{')
+        .and_then(|i| {
+            serde_json::from_str::<Value>(&String::from_utf8_lossy(&status.stdout)[i..]).ok()
+        });
+    let Some(status_json) = status_json else {
+        return UsageProbe::failed(if status.exit_code.is_none() {
+            "cli-failed"
+        } else {
+            "not-signed-in"
+        });
+    };
+    if status_json.get("loggedIn").and_then(Value::as_bool) != Some(true) {
+        return UsageProbe::failed("not-signed-in");
+    }
+    let plan = status_json
+        .get("subscriptionType")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let account = status_json
+        .get("email")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let run = match run_once(
+        command,
+        &[
+            "-p",
+            "--output-format",
+            "json",
+            "--tools",
+            "",
+            "--max-turns",
+            "1",
+            "--no-session-persistence",
+        ],
+        env,
+        AgentCliVendor::Claude,
+        Some(b"/usage\n".to_vec()),
+        deadline,
+    ) {
+        Ok(r) => r,
+        Err(stop) => return UsageProbe::failed(stop_detail(stop)),
+    };
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let text = stdout
+        .find('{')
+        .and_then(|i| serde_json::from_str::<Value>(&stdout[i..]).ok())
+        .and_then(|v| v.get("result").and_then(Value::as_str).map(str::to_string));
+    let Some(text) = text else {
+        return UsageProbe::failed(if run.exit_code.is_none() {
+            "cli-failed"
+        } else {
+            "unparsed"
+        });
+    };
+    let windows = parse_claude_usage_text(&text);
+    if windows.is_empty() {
+        return UsageProbe {
+            ok: false,
+            detail: "unparsed".into(),
+            plan,
+            account,
+            windows,
+        };
+    }
+    UsageProbe {
+        ok: true,
+        detail: "ok".into(),
+        plan,
+        account,
+        windows,
+    }
+}
+
+/// The `/usage` lines: `Current session: 60% used · resets Sep 29 at 11pm (America/Los_Angeles)`,
+/// `Current week (all models): 69% used · resets …`, `Current week (Fable): 79% used · resets …`.
+/// Anything else with `% used` is kept as `other`.
+pub fn parse_claude_usage_text(text: &str) -> Vec<UsageWindow> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        let Some((label, rest)) = line.split_once(": ") else {
+            continue;
+        };
+        let Some(pct_end) = rest.find("% used") else {
+            continue;
+        };
+        let Ok(used_percent) = rest[..pct_end].trim().parse::<f64>() else {
+            continue;
+        };
+        let resets_label = rest
+            .find("resets ")
+            .map(|i| rest[i + "resets ".len()..].trim().to_string())
+            .filter(|s| !s.is_empty());
+        let (kind, model) = if label.starts_with("Current session") {
+            ("session", None)
+        } else if label.starts_with("Current week (all models)") {
+            ("week", None)
+        } else if let Some(inner) = label
+            .strip_prefix("Current week (")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            ("week-model", Some(inner.to_string()))
+        } else {
+            ("other", None)
+        };
+        out.push(UsageWindow {
+            kind: kind.to_string(),
+            label: label.to_string(),
+            model,
+            used_percent,
+            resets_at_ms: None,
+            resets_label,
+            window_minutes: None,
+        });
+    }
+    out
+}
+
+// Codex: the app-server over stdio. Requests are answered in order; the server exits on EOF,
+// so the session keeps stdin open until every answer arrived.
+fn probe_usage_codex(command: &Path, env: &AgentCliEnv, deadline: Instant) -> UsageProbe {
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"advance-agent-cli","title":"Advance","version":env!("CARGO_PKG_VERSION")}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"account/read","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"account/rateLimits/read","params":{}}),
+    ];
+    match run_jsonrpc(
+        command,
+        &["app-server"],
+        env,
+        AgentCliVendor::Codex,
+        &requests,
+        deadline,
+    ) {
+        Ok(responses) => codex_usage_from_responses(&responses),
+        Err(stop) => UsageProbe::failed(stop_detail(stop)),
+    }
+}
+
+/// `account/read` (id 2) + `account/rateLimits/read` (id 3) → windows. Signed out answers a
+/// JSON-RPC error `codex account authentication required …`.
+pub fn codex_usage_from_responses(responses: &[Value]) -> UsageProbe {
+    let by_id = |id: u64| {
+        responses
+            .iter()
+            .find(|r| r.get("id").and_then(Value::as_u64) == Some(id))
+    };
+    let account = by_id(2)
+        .and_then(|r| r.get("result"))
+        .and_then(|r| r.get("account"));
+    let mut plan = None;
+    let mut account_label = None;
+    if let Some(acc) = account.filter(|a| !a.is_null()) {
+        match acc.get("type").and_then(Value::as_str) {
+            Some("chatgpt") => {
+                plan = acc
+                    .get("planType")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                account_label = acc.get("email").and_then(Value::as_str).map(str::to_string);
+            }
+            Some(other) => plan = Some(other.to_string()),
+            None => {}
+        }
+    }
+    let Some(limits) = by_id(3) else {
+        return UsageProbe::failed("unparsed");
+    };
+    if let Some(err) = limits.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_lowercase();
+        return UsageProbe::failed(if msg.contains("authentication required") {
+            "not-signed-in"
+        } else {
+            "cli-failed"
+        });
+    }
+    let Some(snapshot) = limits.get("result").and_then(|r| r.get("rateLimits")) else {
+        return UsageProbe::failed("unparsed");
+    };
+    if plan.is_none() {
+        plan = snapshot
+            .get("planType")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    let mut windows = Vec::new();
+    for kind in ["primary", "secondary"] {
+        let Some(w) = snapshot.get(kind).filter(|w| !w.is_null()) else {
+            continue;
+        };
+        let Some(used_percent) = w.get("usedPercent").and_then(Value::as_f64) else {
+            continue;
+        };
+        let window_minutes = w.get("windowDurationMins").and_then(Value::as_u64);
+        let label = match window_minutes {
+            Some(300) => "5-hour".to_string(),
+            Some(m) if m >= 7 * 24 * 60 => "Weekly".to_string(),
+            Some(m) if m % 60 == 0 => format!("{}-hour", m / 60),
+            Some(m) => format!("{m}-minute"),
+            None => kind.to_string(),
+        };
+        windows.push(UsageWindow {
+            kind: kind.to_string(),
+            label,
+            model: None,
+            used_percent,
+            resets_at_ms: w.get("resetsAt").and_then(Value::as_u64).map(|s| s * 1000),
+            resets_label: None,
+            window_minutes,
+        });
+    }
+    if windows.is_empty() {
+        return UsageProbe {
+            ok: false,
+            detail: "unparsed".into(),
+            plan,
+            account: account_label,
+            windows,
+        };
+    }
+    UsageProbe {
+        ok: true,
+        detail: "ok".into(),
+        plan,
+        account: account_label,
+        windows,
+    }
+}
+
+// Grok Build: the ACP server over stdio. `authenticate` with the CLI's own cached token, then
+// the `x.ai/billing` extension (`_`-prefixed on the wire, as ACP spells extension methods).
+fn probe_usage_grok(command: &Path, env: &AgentCliEnv, deadline: Instant) -> UsageProbe {
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"advance-agent-cli","version":env!("CARGO_PKG_VERSION")}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"authenticate","params":{"methodId":"cached_token"}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"_x.ai/billing","params":{}}),
+    ];
+    match run_jsonrpc(
+        command,
+        &["agent", "stdio"],
+        env,
+        AgentCliVendor::Grok,
+        &requests,
+        deadline,
+    ) {
+        Ok(responses) => grok_usage_from_responses(&responses),
+        Err(stop) => UsageProbe::failed(stop_detail(stop)),
+    }
+}
+
+/// `authenticate` (id 2: `_meta.subscription_tier`, `_meta.email`) + `x.ai/billing` (id 3:
+/// `config.creditUsagePercent`, `config.currentPeriod.{type,end}`, `subscription_tier`).
+pub fn grok_usage_from_responses(responses: &[Value]) -> UsageProbe {
+    let by_id = |id: u64| {
+        responses
+            .iter()
+            .find(|r| r.get("id").and_then(Value::as_u64) == Some(id))
+    };
+    let Some(auth) = by_id(2) else {
+        return UsageProbe::failed("unparsed");
+    };
+    if auth.get("error").is_some() {
+        return UsageProbe::failed("not-signed-in");
+    }
+    let meta = auth.get("result").and_then(|r| r.get("_meta"));
+    let mut plan = meta
+        .and_then(|m| m.get("subscription_tier"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let account = meta
+        .and_then(|m| m.get("email"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let Some(billing) = by_id(3) else {
+        return UsageProbe::failed("unparsed");
+    };
+    if let Some(err) = billing.get("error") {
+        let msg = serde_json::to_string(err)
+            .unwrap_or_default()
+            .to_lowercase();
+        return UsageProbe::failed(if msg.contains("auth") {
+            "not-signed-in"
+        } else {
+            "cli-failed"
+        });
+    }
+    let result = billing.get("result").cloned().unwrap_or(Value::Null);
+    if let Some(tier) = result.get("subscription_tier").and_then(Value::as_str) {
+        plan = Some(tier.to_string());
+    }
+    let Some(config) = result.get("config").filter(|c| !c.is_null()) else {
+        return UsageProbe {
+            ok: false,
+            detail: "unparsed".into(),
+            plan,
+            account,
+            windows: Vec::new(),
+        };
+    };
+    let Some(used_percent) = config.get("creditUsagePercent").and_then(Value::as_f64) else {
+        return UsageProbe {
+            ok: false,
+            detail: "unparsed".into(),
+            plan,
+            account,
+            windows: Vec::new(),
+        };
+    };
+    let period = config.get("currentPeriod");
+    let period_type = period
+        .and_then(|p| p.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let (label, window_minutes) = if period_type.ends_with("WEEKLY") {
+        ("Weekly limit".to_string(), Some(7 * 24 * 60))
+    } else if period_type.ends_with("MONTHLY") {
+        ("Monthly limit".to_string(), None)
+    } else {
+        ("Usage".to_string(), None)
+    };
+    let resets_at_ms = period
+        .and_then(|p| p.get("end"))
+        .and_then(Value::as_str)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.timestamp_millis().max(0) as u64);
+    UsageProbe {
+        ok: true,
+        detail: "ok".into(),
+        plan,
+        account,
+        windows: vec![UsageWindow {
+            kind: "period".into(),
+            label,
+            model: None,
+            used_percent,
+            resets_at_ms,
+            resets_label: None,
+            window_minutes,
+        }],
+    }
+}
+
+/// Drive a line-delimited JSON-RPC child: each request with an `id` is written and answered
+/// before the next is sent; notifications are written straight away. Answers (and only
+/// answers: lines carrying an `id`) come back in arrival order. The child is stopped with
+/// its process group afterwards, whatever happened.
+pub fn run_jsonrpc(
+    command: &Path,
+    argv: &[&str],
+    env: &AgentCliEnv,
+    vendor: AgentCliVendor,
+    requests: &[Value],
+    deadline: Instant,
+) -> Result<Vec<Value>, StopReason> {
+    let mut cmd = Command::new(command);
+    cmd.args(argv)
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    env.apply(&mut cmd, vendor);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().map_err(|_| StopReason::Dropped)?;
+    let pid = child.id();
+    let Some(mut stdin) = child.stdin.take() else {
+        kill_group(pid, libc::SIGKILL);
+        let _ = child.wait();
+        return Err(StopReason::Dropped);
+    };
+    let lines: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&lines);
+    let reader = child.stdout.take().map(|out| {
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut total = 0usize;
+            for line in std::io::BufReader::new(out).lines() {
+                let Ok(line) = line else { break };
+                total += line.len();
+                if total > MAX_STDOUT_BYTES {
+                    break;
+                }
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                    if v.get("id").is_some() {
+                        sink.lock().unwrap_or_else(|e| e.into_inner()).push(v);
+                    }
+                }
+            }
+        })
+    });
+    let mut stop: Option<StopReason> = None;
+    'requests: for req in requests {
+        let mut bytes = serde_json::to_vec(req).unwrap_or_default();
+        bytes.push(b'\n');
+        if stdin.write_all(&bytes).and_then(|_| stdin.flush()).is_err() {
+            stop = Some(StopReason::Dropped);
+            break;
+        }
+        let Some(id) = req.get("id").and_then(Value::as_u64) else {
+            continue;
+        };
+        loop {
+            if lines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|v| v.get("id").and_then(Value::as_u64) == Some(id))
+            {
+                break;
+            }
+            if let Ok(Some(_)) = child.try_wait() {
+                stop = Some(StopReason::Dropped);
+                break 'requests;
+            }
+            if Instant::now() >= deadline {
+                stop = Some(StopReason::Deadline);
+                break 'requests;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+    drop(stdin);
+    kill_group(pid, libc::SIGTERM);
+    let grace = Instant::now() + KILL_GRACE;
+    loop {
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+        if Instant::now() >= grace {
+            kill_group(pid, libc::SIGKILL);
+            let _ = child.wait();
+            break;
+        }
+        std::thread::sleep(POLL);
+    }
+    if let Some(h) = reader {
+        let _ = h.join();
+    }
+    let collected = lines.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match stop {
+        Some(StopReason::Deadline) => Err(StopReason::Deadline),
+        Some(StopReason::Dropped) if collected.is_empty() => Err(StopReason::Dropped),
+        _ => Ok(collected),
+    }
+}
+
 /// The per-user scratch root a composition root uses when it has no home-scoped one:
 /// `<tmp>/advance-agent-cli-<uid>` (0700 on creation).
 pub fn default_work_root() -> PathBuf {

@@ -20,8 +20,8 @@ use advance_client_api::envelope::{
 use advance_client_api::provider_admin::{
     ClientCreateProviderRequest, ClientProviderCost, ClientProviderDeleteResult, ClientProviderKey,
     ClientProviderKeyResult, ClientProviderList, ClientProviderPreflightResult,
-    ClientProviderRateLimit, ClientProviderSummary, ClientUpdateProviderRequest,
-    ProviderAdminOutcome, ProviderAdminWarning, MAX_KEY_BYTES,
+    ClientProviderRateLimit, ClientProviderSummary, ClientProviderUsage, ClientProviderUsageWindow,
+    ClientUpdateProviderRequest, ProviderAdminOutcome, ProviderAdminWarning, MAX_KEY_BYTES,
 };
 use advance_client_api::routes;
 use advance_client_api::schema::generate_schema_artifact;
@@ -87,6 +87,7 @@ fn summary(id: &str, selected: bool) -> ClientProviderSummary {
         },
         selected,
         last_preflight: None,
+        last_usage: None,
     }
 }
 
@@ -254,6 +255,34 @@ impl ProviderAdminProvider for MemoryProviders {
         self.keys.lock().unwrap().remove(&entry.key.secret_name);
         self.find(provider_id)
     }
+    fn usage(&self, provider_id: &str) -> Result<ClientProviderUsage, ProviderError> {
+        self.gate()?;
+        let entry = self.find(provider_id)?;
+        if entry.backend_class != "agent-cli" {
+            return Ok(ClientProviderUsage {
+                ok: false,
+                checked_at_ms: 1_700_000_000_003,
+                reason: Some("unsupported-backend-class".into()),
+                ..ClientProviderUsage::default()
+            });
+        }
+        Ok(ClientProviderUsage {
+            ok: true,
+            checked_at_ms: 1_700_000_000_004,
+            reason: None,
+            plan: Some("max".into()),
+            account: Some("me@example.com".into()),
+            windows: vec![ClientProviderUsageWindow {
+                kind: "session".into(),
+                label: "Current session".into(),
+                model: None,
+                used_percent: 60.0,
+                resets_at_ms: None,
+                resets_label: Some("Sep 29 at 11pm (America/Los_Angeles)".into()),
+                window_minutes: None,
+            }],
+        })
+    }
     fn preflight(&self, provider_id: &str) -> Result<ClientProviderPreflightResult, ProviderError> {
         self.calls.preflight.fetch_add(1, Ordering::SeqCst);
         self.gate()?;
@@ -390,6 +419,7 @@ fn pa01_absent_provider_is_module_unavailable_not_unknown_route() {
         post("/client/providers/openai:clear-key", Value::Null, "k5"),
         post("/client/providers/openai:preflight", Value::Null, "k6"),
         post("/client/providers/openai:select", Value::Null, "k7"),
+        get("/client/providers/openai/usage"),
     ] {
         let env = api.handle(req);
         assert_eq!(
@@ -881,4 +911,45 @@ fn pa09_schema_components_inventoried() {
     let excluded: std::collections::BTreeSet<&str> = EXCLUDED_COMPONENTS.iter().copied().collect();
     assert!(response.is_disjoint(&excluded));
     assert_eq!(response.len() + excluded.len(), components.len());
+}
+
+// ── PA-11: GET …/usage — the vendor CLI's own allowance is a read; other classes answer a
+//    fixed reason as DATA; an unknown id is not_found; a bad id never reaches the provider ──
+#[test]
+fn pa11_usage_read() {
+    let provider = MemoryProviders::new();
+    let (api, _sink) = api_with(provider.clone());
+    operator(&api);
+
+    let cloud: ClientProviderUsage = data(&api.handle(get("/client/providers/openai/usage")));
+    assert!(!cloud.ok);
+    assert_eq!(cloud.reason.as_deref(), Some("unsupported-backend-class"));
+    assert!(cloud.windows.is_empty());
+
+    let entry = ClientProviderSummary {
+        provider_id: "claude-sub".into(),
+        backend_class: "agent-cli".into(),
+        ..summary("claude-sub", false)
+    };
+    provider.entries.lock().unwrap().push(entry);
+    let usage: ClientProviderUsage = data(&api.handle(get("/client/providers/claude-sub/usage")));
+    assert!(usage.ok);
+    assert_eq!(usage.plan.as_deref(), Some("max"));
+    assert_eq!(usage.account.as_deref(), Some("me@example.com"));
+    assert_eq!(usage.windows.len(), 1);
+    assert_eq!(usage.windows[0].kind, "session");
+    assert_eq!(usage.windows[0].used_percent, 60.0);
+    assert_eq!(
+        usage.windows[0].resets_label.as_deref(),
+        Some("Sep 29 at 11pm (America/Los_Angeles)")
+    );
+
+    let missing = api.handle(get("/client/providers/ghost/usage"));
+    assert_eq!(
+        code(&missing),
+        Some(ClientErrorCode::NotFound),
+        "{missing:?}"
+    );
+    let bad = api.handle(get("/client/providers/a.b/usage"));
+    assert_eq!(code(&bad), Some(ClientErrorCode::InvalidRequest), "{bad:?}");
 }
