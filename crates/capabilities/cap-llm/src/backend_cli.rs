@@ -298,6 +298,20 @@ pub enum PromptTransport {
     Stdin,
     /// The user prompt is written to `prompt.txt` and named on argv (`--prompt-file`).
     File,
+    /// The user prompt is written to the child's stdin as one NDJSON `user` event (the
+    /// Antigravity CLI's `--input-format stream-json`); never on argv.
+    StdinJsonl,
+}
+
+/// The one stdin line the Antigravity CLI reads in `--input-format stream-json` mode.
+pub fn jsonl_user_event(text: &str) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "event": "user",
+        "message": { "content": text }
+    }))
+    .unwrap_or_default();
+    line.push(b'\n');
+    line
 }
 
 /// Paths a recipe may reference (all inside the per-request scratch directory).
@@ -312,6 +326,7 @@ pub fn prompt_transport(vendor: AgentCliVendor) -> PromptTransport {
     match vendor {
         AgentCliVendor::Claude | AgentCliVendor::Codex => PromptTransport::Stdin,
         AgentCliVendor::Grok => PromptTransport::File,
+        AgentCliVendor::Gemini => PromptTransport::StdinJsonl,
     }
 }
 
@@ -319,7 +334,7 @@ pub fn prompt_transport(vendor: AgentCliVendor) -> PromptTransport {
 /// for Claude, `--system-prompt-override` for Grok). Codex has none: the system text is
 /// folded into the stdin transcript by [`fold_system_into_user`].
 pub fn has_system_channel(vendor: AgentCliVendor) -> bool {
-    !matches!(vendor, AgentCliVendor::Codex)
+    !matches!(vendor, AgentCliVendor::Codex | AgentCliVendor::Gemini)
 }
 
 /// The stdin text for a vendor without a system channel: the system block first, delimited,
@@ -423,6 +438,22 @@ pub fn build_argv(
             }
             v
         }
+        AgentCliVendor::Gemini => {
+            // Antigravity CLI: the prompt is one NDJSON `user` event on stdin; the reply is
+            // stream-json so every tool step is visible to the zero-tool proof; the
+            // terminal sandbox is on; the cwd is the empty per-request scratch directory, so
+            // the auto-allowed workspace file tools have nothing to read. agy has no flag
+            // that removes its tools and no system channel (system text is folded).
+            vec![
+                "--input-format".into(),
+                "stream-json".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "--sandbox".into(),
+                "--model".into(),
+                model.to_string(),
+            ]
+        }
     };
     argv.extend(extra.iter().cloned());
     argv
@@ -434,6 +465,9 @@ pub fn auth_probe_argv(vendor: AgentCliVendor) -> Vec<&'static str> {
         AgentCliVendor::Claude => vec!["auth", "status"],
         AgentCliVendor::Codex => vec!["login", "status"],
         AgentCliVendor::Grok => vec!["models"],
+        // `agy models` answers `Please sign in …` with exit 0 when signed out: the probe
+        // reads the text, not the status.
+        AgentCliVendor::Gemini => vec!["models"],
     }
 }
 
@@ -444,6 +478,9 @@ pub fn sign_in_argv(vendor: AgentCliVendor) -> Vec<&'static str> {
         AgentCliVendor::Claude => vec!["auth", "login"],
         AgentCliVendor::Codex => vec!["login"],
         AgentCliVendor::Grok => vec!["login"],
+        // The Antigravity CLI signs in on its first interactive launch (Google Sign-In in
+        // the browser, credential in the OS keyring); there is no `login` subcommand.
+        AgentCliVendor::Gemini => vec![],
     }
 }
 
@@ -513,6 +550,7 @@ pub fn classify_failure(text: &str) -> InferenceBackendError {
         "please run /login",
         "please log in",
         "please login",
+        "please sign in",
         "run codex login",
         "run `codex login`",
         "authentication_failed",
@@ -596,6 +634,7 @@ pub fn parse_output(
         AgentCliVendor::Claude => parse_claude(&out),
         AgentCliVendor::Codex => parse_codex(&out),
         AgentCliVendor::Grok => parse_grok(&out),
+        AgentCliVendor::Gemini => parse_gemini(&out),
     };
     match parsed {
         Ok(turn) => Ok(turn),
@@ -875,6 +914,111 @@ fn parse_grok(out: &str) -> Result<CliTurn, InferenceBackendError> {
             .and_then(Value::as_str)
             .unwrap_or("end_turn")
             .to_string(),
+        quota_note: None,
+    })
+}
+
+/// Antigravity CLI stream-json: `init` (once), any number of `step_update` events, one
+/// `result`. The zero-tool proof: no `step_update` with `step_type == "tool"`, and the
+/// result's `num_turns` at most one. `status` other than `SUCCESS` is a typed failure.
+fn parse_gemini(out: &str) -> Result<CliTurn, InferenceBackendError> {
+    let mut tool_steps: Vec<String> = Vec::new();
+    let mut result: Option<Value> = None;
+    let mut model: Option<String> = None;
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match v.get("event").and_then(Value::as_str) {
+            Some("init") => {
+                model = v
+                    .pointer("/init/model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            Some("step_update") => {
+                let step = &v["step_update"];
+                if step.get("step_type").and_then(Value::as_str) == Some("tool") {
+                    let name = step
+                        .get("tool_name")
+                        .or_else(|| step.pointer("/tool_info/name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool");
+                    tool_steps.push(name.to_string());
+                }
+            }
+            Some("result") => result = Some(v["result"].clone()),
+            _ => {}
+        }
+    }
+    let Some(r) = result else {
+        // A single-envelope answer (`--output-format json`) is accepted as well.
+        let trimmed = out.trim();
+        if let Some(i) = trimmed.find('{') {
+            if let Ok(v) = serde_json::from_str::<Value>(&trimmed[i..]) {
+                if v.get("status").is_some() {
+                    return gemini_result(v, &tool_steps, None);
+                }
+            }
+        }
+        return Err(err("no result"));
+    };
+    gemini_result(r, &tool_steps, model)
+}
+
+fn gemini_result(
+    r: Value,
+    tool_steps: &[String],
+    model: Option<String>,
+) -> Result<CliTurn, InferenceBackendError> {
+    let status = r.get("status").and_then(Value::as_str).unwrap_or("");
+    let text = r
+        .get("response")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if status != "SUCCESS" {
+        let said = r
+            .get("error")
+            .and_then(Value::as_str)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if text.is_empty() {
+                    format!("status {status}")
+                } else {
+                    text.clone()
+                }
+            });
+        return Err(classify_failure(&said));
+    }
+    if !tool_steps.is_empty() {
+        return Err(err(format!(
+            "tools proof failed (tool steps: {})",
+            tool_steps.join(",")
+        )));
+    }
+    if r.get("num_turns").and_then(Value::as_u64).unwrap_or(1) > 1 {
+        return Err(err("tools proof failed (more than one turn)"));
+    }
+    let u = &r["usage"];
+    let cache_read = u64_of(&u["cache_read_tokens"]);
+    let input = u64_of(&u["input_tokens"]) + cache_read;
+    let output = u64_of(&u["output_tokens"]) + u64_of(&u["thinking_tokens"]);
+    Ok(CliTurn {
+        text,
+        model,
+        usage: CliUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: cache_read,
+        },
+        finish_reason: "end_turn".to_string(),
         quota_note: None,
     })
 }
@@ -1163,6 +1307,12 @@ pub fn probe_auth(spec: &AgentCliSpec, env: &AgentCliEnv) -> AuthProbe {
             run.exit_code == Some(0) && stdout.to_lowercase().contains("logged in")
         }
         AgentCliVendor::Grok => run.exit_code == Some(0),
+        AgentCliVendor::Gemini => {
+            let lower = stdout.to_lowercase();
+            run.exit_code == Some(0)
+                && !lower.contains("please sign in")
+                && !lower.contains("sign in to view")
+        }
     };
     let detail = if signed_in {
         "signed-in".to_string()
@@ -1217,7 +1367,7 @@ pub struct UsageWindow {
 
 /// What a usage probe found. `detail` is a fixed token: `ok` | `not-signed-in` |
 /// `cli-not-found` | `daemon-identity-unknown` | `timeout` | `cancelled` | `cli-failed` |
-/// `unparsed`. `account` is the signed-in account's own label (an email) — the user's own
+/// `unparsed` | `not-provided` (the vendor CLI has no usage surface at all — Gemini). `account` is the signed-in account's own label (an email) — the user's own
 /// device data, shown back to the user, never persisted by the probe.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageProbe {
@@ -1278,6 +1428,8 @@ pub fn probe_usage(spec: &AgentCliSpec, env: &AgentCliEnv) -> UsageProbe {
         AgentCliVendor::Claude => probe_usage_claude(command, env, deadline),
         AgentCliVendor::Codex => probe_usage_codex(command, env, deadline),
         AgentCliVendor::Grok => probe_usage_grok(command, env, deadline),
+        // The Antigravity CLI shows its quota only in its own UI: nothing to read.
+        AgentCliVendor::Gemini => UsageProbe::failed("not-provided"),
     }
 }
 
@@ -1898,6 +2050,7 @@ impl AgentCliBackend {
         let argv = build_argv(self.spec.vendor, &req.model, &files, &self.spec.args);
         let stdin_bytes = match prompt_transport(self.spec.vendor) {
             PromptTransport::Stdin => Some(user_text.into_bytes()),
+            PromptTransport::StdinJsonl => Some(jsonl_user_event(&user_text)),
             PromptTransport::File => None,
         };
         let abort = Arc::new(AtomicBool::new(false));
@@ -2358,6 +2511,179 @@ mod tests {
             .chars()
             .collect();
         assert_eq!(left, vec!['0']);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Antigravity CLI's documented stream-json answer (init, one result, no tool step).
+    const GEMINI_OK: &str = r#"{"event":"init","conversation_id":"c3b66b04-872b-4fbe-a3a4-058a026ef20a","init":{"cwd":"/tmp/x","tools":["ask_permission","run_command","write_to_file"],"permission_mode":"request-review"}}
+{"event":"result","result":{"conversation_id":"c3b66b04-872b-4fbe-a3a4-058a026ef20a","status":"SUCCESS","response":"OK","duration_seconds":6.88,"num_turns":1,"usage":{"input_tokens":10418,"output_tokens":589,"thinking_tokens":551,"cache_read_tokens":8113,"total_tokens":11007}}}"#;
+
+    #[test]
+    fn gemini_recipe_is_stream_json_on_stdin_with_the_sandbox_on() {
+        let dir = scratch("gemini-argv");
+        let argv = build_argv(
+            AgentCliVendor::Gemini,
+            "gemini-3.5-flash-medium",
+            &files(&dir),
+            &["--effort".into(), "low".into()],
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--sandbox",
+                "--model",
+                "gemini-3.5-flash-medium",
+                "--effort",
+                "low",
+            ]
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("prompt")),
+            "the prompt never rides argv"
+        );
+        assert_eq!(
+            prompt_transport(AgentCliVendor::Gemini),
+            PromptTransport::StdinJsonl
+        );
+        assert!(!has_system_channel(AgentCliVendor::Gemini));
+        let line = String::from_utf8(jsonl_user_event("say \"OK\"\nplease")).unwrap();
+        assert_eq!(
+            line,
+            "{\"event\":\"user\",\"message\":{\"content\":\"say \\\"OK\\\"\\nplease\"}}\n"
+        );
+        assert_eq!(auth_probe_argv(AgentCliVendor::Gemini), vec!["models"]);
+        assert!(
+            sign_in_argv(AgentCliVendor::Gemini).is_empty(),
+            "agy signs in on its first launch"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gemini_parser_accepts_a_clean_turn_and_rejects_tool_steps_and_failures() {
+        let t = parse_output(AgentCliVendor::Gemini, GEMINI_OK.as_bytes(), b"", Some(0)).unwrap();
+        assert_eq!(t.text, "OK");
+        assert_eq!(t.usage.input_tokens, 10418 + 8113);
+        assert_eq!(t.usage.output_tokens, 589 + 551);
+        assert_eq!(t.usage.cached_tokens, 8113);
+        assert_eq!(t.finish_reason, "end_turn");
+
+        let with_tool = format!(
+            "{}\n{}\n{}",
+            GEMINI_OK.lines().next().unwrap(),
+            r#"{"event":"step_update","step_update":{"conversation_id":"c","step_index":4,"state":"DONE","step_type":"tool","tool_name":"run_command","duration_seconds":0.07,"tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hi"},"output":"hi\n"}}}"#,
+            GEMINI_OK.lines().nth(1).unwrap()
+        );
+        let e =
+            parse_output(AgentCliVendor::Gemini, with_tool.as_bytes(), b"", Some(0)).unwrap_err();
+        assert!(e.to_string().contains("tools proof failed"), "{e}");
+        assert!(e.to_string().contains("run_command"), "{e}");
+
+        let two_turns = GEMINI_OK.replace("\"num_turns\":1", "\"num_turns\":2");
+        let e =
+            parse_output(AgentCliVendor::Gemini, two_turns.as_bytes(), b"", Some(0)).unwrap_err();
+        assert!(e.to_string().contains("more than one turn"), "{e}");
+
+        let failed = r#"{"event":"result","result":{"conversation_id":"c","status":"ERROR","response":"","error":"Please sign in to continue. Launch the CLI without arguments to sign in.","num_turns":0}}"#;
+        let e = parse_output(AgentCliVendor::Gemini, failed.as_bytes(), b"", Some(1)).unwrap_err();
+        assert!(e.to_string().contains("not signed in"), "{e}");
+
+        // The single-envelope form (`--output-format json`) is read as well.
+        let envelope = r#"{"conversation_id":"0","status":"SUCCESS","response":"hi","duration_seconds":1.0,"num_turns":1,"usage":{"input_tokens":5,"output_tokens":2,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":7}}"#;
+        let t = parse_output(AgentCliVendor::Gemini, envelope.as_bytes(), b"", Some(0)).unwrap();
+        assert_eq!(t.text, "hi");
+        assert_eq!(t.usage.output_tokens, 2);
+
+        let e = parse_output(
+            AgentCliVendor::Gemini,
+            b"",
+            b"Please sign in to view available models.",
+            Some(0),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("not signed in"), "{e}");
+    }
+
+    #[test]
+    fn gemini_sign_in_probe_reads_the_text_not_the_exit_code() {
+        // `agy models` exits 0 both ways; only the wording tells them apart.
+        let dir = scratch("gemini-probe");
+        let signed_out = write_fake_cli(
+            &dir,
+            "printf 'Fetching available models...\\nError: Please sign in to view available models. Launch the CLI without arguments to sign in.\\n'; exit 0",
+        );
+        let probe = probe_auth(
+            &spec(AgentCliVendor::Gemini, signed_out.to_str().unwrap()),
+            &test_env(),
+        );
+        assert!(!probe.signed_in, "{probe:?}");
+        assert!(probe.detail.starts_with("not-signed-in"), "{probe:?}");
+        let usage = probe_usage(
+            &spec(AgentCliVendor::Gemini, signed_out.to_str().unwrap()),
+            &test_env(),
+        );
+        assert_eq!(
+            usage.detail, "not-provided",
+            "agy has no usage surface, signed in or not"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("gemini-probe-in");
+        let signed_in = write_fake_cli(&dir, "printf 'Fetching available models...\\ngemini-3.5-flash-medium\\ngemini-3.5-pro-medium\\n'; exit 0");
+        let probe = probe_auth(
+            &spec(AgentCliVendor::Gemini, signed_in.to_str().unwrap()),
+            &test_env(),
+        );
+        assert!(probe.signed_in, "{probe:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fake_gemini_reads_the_stdin_event_and_reports_usage() {
+        let dir = scratch("gemini");
+        let log = dir.join("log");
+        let body = format!(
+            "printf '%s\\n' \"$@\" > {log}.argv\ncat > {log}.stdin\ncat <<'EOF'\n{GEMINI_OK}\nEOF",
+            log = log.display()
+        );
+        let cli = write_fake_cli(&dir, &body);
+        let backend = AgentCliBackend::new(
+            spec(AgentCliVendor::Gemini, cli.to_str().unwrap()),
+            "sub",
+            dir.join("work"),
+        )
+        .with_env(test_env());
+        let (head, mut stream) = backend
+            .start_stream(req(
+                "gemini-3.5-flash-medium",
+                vec![("system", "Be terse."), ("user", "say OK")],
+            ))
+            .await
+            .unwrap();
+        assert!(head.snapshot_only);
+        let delta = stream.next_chunk().await.unwrap().unwrap();
+        assert_eq!(delta.text, "OK");
+        assert!(delta.terminal);
+        assert_eq!(
+            delta.usage.as_ref().map(|u| u.output_tokens),
+            Some(589 + 551)
+        );
+        assert!(stream.next_chunk().await.is_none());
+        let stdin = std::fs::read_to_string(format!("{}.stdin", log.display())).unwrap();
+        let v: Value = serde_json::from_str(stdin.trim()).unwrap();
+        assert_eq!(v["event"], "user");
+        let content = v["message"]["content"].as_str().unwrap();
+        assert!(
+            content.starts_with("[System instructions]\nBe terse."),
+            "{content}"
+        );
+        assert!(content.ends_with("say OK"), "{content}");
+        let argv = std::fs::read_to_string(format!("{}.argv", log.display())).unwrap();
+        assert!(argv.contains("--sandbox"));
+        assert!(!argv.contains("say OK"), "the prompt never rides argv");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

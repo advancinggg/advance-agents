@@ -69,7 +69,7 @@ pub const MAX_OPTIONAL_STRING_LEN: usize = 256;
 /// Closed spellings of `backend_class` (`InferenceBackendClass`).
 pub const BACKEND_CLASSES: &[&str] = &["cloud-http", "local", "mesh-remote", "agent-cli"];
 /// Closed spellings of `agent_cli.vendor` (`AgentCliVendor`, ADR 2026-09-28).
-pub const AGENT_CLI_VENDORS: &[&str] = &["claude", "codex", "grok"];
+pub const AGENT_CLI_VENDORS: &[&str] = &["claude", "codex", "grok", "gemini"];
 /// The `backend_class` of a subscription-CLI entry.
 pub const AGENT_CLI_BACKEND_CLASS: &str = "agent-cli";
 /// Bound on `agent_cli.args` — the runtime loader's own cap, so a create that passes here is
@@ -1016,7 +1016,7 @@ mod tests {
         assert!(validate_create_request(&elsewhere).is_err());
         // Vendor, command shape, args bound.
         let mut vendor = cli_req();
-        vendor.agent_cli.as_mut().unwrap().vendor = "gemini".into();
+        vendor.agent_cli.as_mut().unwrap().vendor = "copilot".into();
         assert!(validate_create_request(&vendor).is_err());
         let mut relative = cli_req();
         relative.agent_cli.as_mut().unwrap().command = "claude".into();

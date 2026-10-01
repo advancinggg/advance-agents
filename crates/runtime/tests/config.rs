@@ -1996,6 +1996,30 @@ fn agent_cli_yaml(block: &str) -> String {
 }
 
 #[test]
+fn agent_cli_gemini_vendor_parses_as_the_antigravity_cli() {
+    // ADR 2026-09-28 addendum 2026-09-30 (D9): the fourth vendor is Google's Antigravity CLI
+    // (`agy`), the consumer Gemini path; the YAML spelling is `gemini`.
+    let yaml = agent_cli_yaml(
+        "    agent-cli:\n      vendor: gemini\n      command: /Users/me/.local/bin/agy\n",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("runtime-config.yaml");
+    write_config(&config_path, &yaml);
+    let cfg = load_config(&config_path).expect("gemini agent-cli entry must load");
+    let spec = cfg.llm_providers[0].agent_cli.as_ref().expect("spec");
+    assert_eq!(spec.vendor, advance_runtime::config::AgentCliVendor::Gemini);
+    assert_eq!(spec.vendor.as_str(), "gemini");
+    assert_eq!(
+        advance_runtime::config::AgentCliVendor::parse("gemini"),
+        Some(advance_runtime::config::AgentCliVendor::Gemini)
+    );
+    assert_eq!(
+        advance_runtime::config::AgentCliVendor::parse("antigravity"),
+        None
+    );
+}
+
+#[test]
 fn agent_cli_entry_parses_with_its_block() {
     let yaml = agent_cli_yaml(
         "    agent-cli:\n      vendor: claude\n      command: /Users/me/.local/bin/claude\n      args: [\"--effort\", \"low\"]\n",
@@ -2049,7 +2073,7 @@ fn agent_cli_requires_its_block_and_refuses_sidecar_device_and_dialect() {
             "must be an absolute path",
         ),
         (
-            "    agent-cli:\n      vendor: gemini\n      command: /usr/bin/gemini\n",
+            "    agent-cli:\n      vendor: copilot\n      command: /usr/bin/copilot\n",
             "unknown variant",
         ),
     ];

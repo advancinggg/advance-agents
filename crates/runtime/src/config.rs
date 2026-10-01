@@ -576,6 +576,10 @@ pub enum AgentCliVendor {
     Codex,
     /// xAI Grok Build (`grok --prompt-file`), SuperGrok / X Premium sign-in.
     Grok,
+    /// Google Antigravity CLI (`agy --input-format stream-json`), Google AI Pro / Ultra
+    /// sign-in (the consumer Gemini path since 2026-06-18; Gemini CLI itself serves only
+    /// Code Assist Standard / Enterprise or API keys).
+    Gemini,
 }
 
 impl AgentCliVendor {
@@ -584,6 +588,7 @@ impl AgentCliVendor {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Grok => "grok",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -592,6 +597,7 @@ impl AgentCliVendor {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "grok" => Some(Self::Grok),
+            "gemini" => Some(Self::Gemini),
             _ => None,
         }
     }
