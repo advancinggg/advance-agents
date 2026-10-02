@@ -33,6 +33,7 @@ const EMBEDDED_TEMPLATE_YAML: &str = "name: researcher\nversion: 1.0.0\ndescript
 const PACKREF_TEMPLATE_YAML: &str =
     "name: researcher\nbehavior:\n  type: pack-ref\n  ref: other-pack@1.0.0/behavior-binaries/x\n";
 const NOBEHAVIOR_TEMPLATE_YAML: &str = "name: researcher\ndescription: no behavior block\n";
+const SEED_JSONL: &str = "{\"fact\":\"seeded\"}\n";
 const AGENTS_MD_MARKER: &str = "RESEARCHER-TEMPLATE-MARKER";
 const TINY_WASM: &[u8] = b"\0asm\x01\0\0\0";
 const SKILL_REL: &str = "web-search/SKILL.md";
@@ -56,6 +57,8 @@ struct PackOpts {
     /// Also declare top-level `provides: skills: [web-search]` + materialize the
     /// matching top-level `skills/web-search/SKILL.md` (drives the wrong-kind case).
     declare_skill: bool,
+    /// Also ship top-level `behavior-binaries/driver.wasm` and `memory-seeds/base.jsonl`.
+    pack_binary_and_seed: bool,
 }
 
 impl Default for PackOpts {
@@ -67,6 +70,7 @@ impl Default for PackOpts {
             skill: Some((SKILL_REL, SKILL_CONTENT)),
             bulk_skills: None,
             declare_skill: false,
+            pack_binary_and_seed: false,
         }
     }
 }
@@ -102,6 +106,13 @@ fn write_source(src: &Path, opts: &PackOpts) {
         let sp = src.join("skills").join("web-search");
         std::fs::create_dir_all(&sp).unwrap();
         std::fs::write(sp.join("SKILL.md"), b"# top-level skill").unwrap();
+    }
+    if opts.pack_binary_and_seed {
+        provides.push_str("  behavior-binaries: [driver]\n  memory-seeds: [base]\n");
+        std::fs::create_dir_all(src.join("behavior-binaries")).unwrap();
+        std::fs::write(src.join("behavior-binaries/driver.wasm"), TINY_WASM).unwrap();
+        std::fs::create_dir_all(src.join("memory-seeds")).unwrap();
+        std::fs::write(src.join("memory-seeds/base.jsonl"), SEED_JSONL).unwrap();
     }
     let pack_yaml = format!(
         "name: {PACK}\nversion: {VER}\nruntime-version: \">=0.0.1\"\ndependencies: []\nprovides:\n{provides}required-capabilities: []\ntrust-level: untrusted\nchecksums:\n  algo: sha256\n  files: {{}}\n"
@@ -157,19 +168,40 @@ async fn t_ptr_01_resolve_happy_embedded() {
 }
 
 #[tokio::test]
-async fn t_ptr_02_behavior_pack_ref_yields_none() {
+async fn t_ptr_02_behavior_pack_ref_reads_the_pack_binary() {
+    let (_tmp, reg) = install_pack(PackOpts {
+        template_yaml: Some(format!(
+            "name: researcher\nbehavior:\n  type: pack-ref\n  ref: {PACK}@{VER}/behavior-binaries/driver\nmemory-seed: base\n"
+        )),
+        behavior_wasm: None,
+        pack_binary_and_seed: true,
+        ..Default::default()
+    })
+    .await;
+    let resolver = PackTemplateResolver::new(reg);
+    let tc = resolver.resolve(FQ).expect("resolve");
+    assert_eq!(tc.behavior_wasm.as_deref(), Some(TINY_WASM));
+    assert_eq!(tc.memory_seed_jsonl.as_deref(), Some(SEED_JSONL));
+}
+
+#[tokio::test]
+async fn t_ptr_02b_unresolvable_pack_ref_or_seed_is_invalid() {
     let (_tmp, reg) = install_pack(PackOpts {
         template_yaml: Some(PACKREF_TEMPLATE_YAML.to_string()),
         behavior_wasm: None,
         ..Default::default()
     })
     .await;
-    let resolver = PackTemplateResolver::new(reg);
-    let tc = resolver.resolve(FQ).expect("resolve");
-    assert_eq!(
-        tc.behavior_wasm, None,
-        "pack-ref behavior must not be read (recursion TODO)"
-    );
+    let err = PackTemplateResolver::new(reg).resolve(FQ).unwrap_err();
+    assert!(matches!(err, TemplateError::InvalidContent(_)), "{err:?}");
+
+    let (_tmp, reg) = install_pack(PackOpts {
+        template_yaml: Some(format!("{EMBEDDED_TEMPLATE_YAML}memory-seed: missing\n")),
+        ..Default::default()
+    })
+    .await;
+    let err = PackTemplateResolver::new(reg).resolve(FQ).unwrap_err();
+    assert!(matches!(err, TemplateError::InvalidContent(_)), "{err:?}");
 }
 
 #[tokio::test]

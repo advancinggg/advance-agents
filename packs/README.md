@@ -57,11 +57,13 @@ applies.
 ## What the runtime activates
 
 Of the eleven content kinds, the runtime activates `agent-templates` (when an agent is
-spawned from one), `presets`, `meta-schema-extensions` and the `tool.wasm` of `skills`. The
-others (`behavior-binaries`, `components`, `channel-adapters`, `mcp-servers`, `workflows`,
-`memory-seeds`, `resource-capabilities`) install and list, and nothing consumes them yet;
-install says so. A skill's `SKILL.md` is listed under the agent's available skills when the
-agent can reach tools. A pack's `dependencies:` are installed from the
+spawned from one), `presets`, `meta-schema-extensions` and `skills` (the `tool.wasm` as a
+tool, the `SKILL.md` under the agent's available skills when it can reach tools). A template
+brings two more kinds with it: `behavior: { type: pack-ref, ref: <pack>@<version>/behavior-binaries/<name> }`
+gives the spawned agent that behavior binary, and `memory-seed: <name>` starts it with the
+pack's `memory-seeds/<name>.jsonl` as its knowledge file. The others (`components`,
+`channel-adapters`, `mcp-servers`, `workflows`, `resource-capabilities`) install and list,
+and nothing consumes them yet; install says so. A pack's `dependencies:` are installed from the
 configured registry when they are not present already.
 
 ## Contribution rules

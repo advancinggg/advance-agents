@@ -13,13 +13,13 @@
 //!
 //! # Scope (minimal bridge)
 //!
-//! - `behavior.type: embedded` only → reads `behavior.wasm` bytes. A
-//!   `behavior.type: pack-ref` (a template whose behavior points at another
-//!   pack component) yields `behavior_wasm: None` — the recursion (the literal
-//!   §1.4.3 step-1 trigger) is a documented TODO for the mainline harvest.
-//! - `memory_seed_jsonl` is always `None`: memory-seeds are a SEPARATE pack
+//! - `behavior.type: embedded` reads the template's own `behavior.wasm`;
+//!   `behavior.type: pack-ref` reads the `behavior-binaries` component its `ref` names,
+//!   from this or another installed pack.
+//! - `memory_seed_jsonl` comes from the pack's `memory-seeds/` when the template names one
+//!   (top-level `memory-seed: <name>`); memory-seeds are a SEPARATE pack
 //!   content type (`ComponentKind::MemorySeed`, `memory-seeds/*.jsonl` at pack
-//!   root), NOT an in-template field — inventing a mapping would be wrong.
+//!   root).
 //! - `list()` (Pack lane P1) enumerates every installed pack's
 //!   `agent-templates` provides as FQ refs
 //!   (`{pack}@{version}/agent-templates/{name}`) via `PackRegistry::provides`;
@@ -95,6 +95,59 @@ impl PackTemplateResolver {
     pub fn new(registry: Arc<dyn PackRegistry>) -> Self {
         Self { registry }
     }
+}
+
+impl PackTemplateResolver {
+    /// The bytes of the `behavior-binaries` component `reference` names
+    /// (`{pack}@{version}/behavior-binaries/{name}`), from this or another installed pack.
+    fn read_behavior_binary(&self, reference: &str) -> Result<Vec<u8>, TemplateError> {
+        let resolution = self.registry.resolve(reference).map_err(|e| {
+            TemplateError::InvalidContent(format!("behavior.ref '{reference}': {e}"))
+        })?;
+        if resolution.component_kind != ComponentKind::Binary {
+            return Err(TemplateError::InvalidContent(format!(
+                "behavior.ref '{reference}' resolved to {:?}, not a behavior binary",
+                resolution.component_kind
+            )));
+        }
+        let path = resolution.local_path.as_path();
+        let root = path.parent().and_then(Path::parent).ok_or_else(|| {
+            TemplateError::InvalidContent(format!(
+                "cannot derive pack install root from {}",
+                path.display()
+            ))
+        })?;
+        checked_read(root, root, path, MAX_BYTES)
+            .map_err(|e| missing_to_invalid(e, "behavior-binaries entry"))
+    }
+}
+
+/// `behavior.ref` of a template whose `behavior.type` is `pack-ref`.
+fn pack_ref_behavior(parsed: &serde_yml::Value) -> Result<Option<String>, TemplateError> {
+    let Some(behavior) = parsed
+        .as_mapping()
+        .and_then(|m| m.get(serde_yml::Value::String("behavior".to_string())))
+        .and_then(|v| v.as_mapping())
+    else {
+        return Ok(None);
+    };
+    if behavior
+        .get(serde_yml::Value::String("type".to_string()))
+        .and_then(|v| v.as_str())
+        != Some("pack-ref")
+    {
+        return Ok(None);
+    }
+    behavior
+        .get(serde_yml::Value::String("ref".to_string()))
+        .and_then(|v| v.as_str())
+        .map(|r| Some(r.to_string()))
+        .ok_or_else(|| {
+            TemplateError::InvalidContent(
+                "behavior.type pack-ref needs `ref: {pack}@{version}/behavior-binaries/{name}`"
+                    .to_string(),
+            )
+        })
 }
 
 impl TemplateResolver for PackTemplateResolver {
@@ -177,12 +230,18 @@ impl TemplateResolver for PackTemplateResolver {
             .map(|s| s.to_string())
             .unwrap_or_else(|| resolution.manifest_snippet.name.clone());
 
-        let behavior_wasm = read_embedded_behavior(install_root, local_path, &parsed)?;
+        let behavior_wasm = match pack_ref_behavior(&parsed)? {
+            Some(reference) => Some(self.read_behavior_binary(&reference)?),
+            None => read_embedded_behavior(install_root, local_path, &parsed)?,
+        };
+        let memory_seed_jsonl = read_memory_seed(install_root, &parsed)?;
         // Seed the skills walk's running aggregate with the already-read fields so
         // the resolver's transient payload is bounded by MAX_TEMPLATE_TOTAL_BYTES
         // at read time (not only by apply_template's write-side check).
-        let prior_bytes =
-            manifest_yaml.len() + agents_md.len() + behavior_wasm.as_ref().map_or(0, |b| b.len());
+        let prior_bytes = manifest_yaml.len()
+            + agents_md.len()
+            + behavior_wasm.as_ref().map_or(0, |b| b.len())
+            + memory_seed_jsonl.as_ref().map_or(0, |s| s.len());
         let skills = collect_skills(install_root, local_path, prior_bytes)?;
 
         Ok(TemplateContent {
@@ -190,8 +249,7 @@ impl TemplateResolver for PackTemplateResolver {
             manifest_yaml,
             agents_md,
             skills,
-            // Memory-seeds are a separate pack content type, not in-template.
-            memory_seed_jsonl: None,
+            memory_seed_jsonl,
             behavior_wasm,
         })
     }
@@ -344,7 +402,7 @@ fn read_embedded_behavior(
         .get(serde_yml::Value::String("type".to_string()))
         .and_then(|v| v.as_str());
     if btype != Some("embedded") {
-        // pack-ref / unset / unknown → no embedded bytes (TODO: pack-ref recursion).
+        // pack-ref is resolved by the caller (it needs the registry); unset / unknown → none.
         return Ok(None);
     }
     let binary = behavior
@@ -360,6 +418,32 @@ fn read_embedded_behavior(
     )
     .map_err(|e| missing_to_invalid(e, "behavior.wasm"))?;
     Ok(Some(bytes))
+}
+
+/// The pack's `memory-seeds/<name>.jsonl` a template names with top-level
+/// `memory-seed: <name>`: the spawned agent starts with it as its knowledge file.
+fn read_memory_seed(
+    install_root: &Path,
+    parsed: &serde_yml::Value,
+) -> Result<Option<String>, TemplateError> {
+    let Some(name) = parsed
+        .as_mapping()
+        .and_then(|m| m.get(serde_yml::Value::String("memory-seed".to_string())))
+    else {
+        return Ok(None);
+    };
+    let name = name.as_str().ok_or_else(|| {
+        TemplateError::InvalidContent("`memory-seed` must be a memory-seeds name".to_string())
+    })?;
+    validate_single_component(name)?;
+    let path = install_root
+        .join("memory-seeds")
+        .join(format!("{name}.jsonl"));
+    let bytes = checked_read(install_root, install_root, &path, MAX_BYTES)
+        .map_err(|e| missing_to_invalid(e, "memory-seeds entry"))?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| TemplateError::InvalidContent("memory seed is not valid UTF-8".to_string()))
 }
 
 /// Reject a `behavior.binary` value that is anything other than a single, safe
