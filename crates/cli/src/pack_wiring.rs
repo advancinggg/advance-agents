@@ -31,11 +31,11 @@
 //! tampered installed pack must not be silently ignored). A `packs_dir` that is
 //! a symlink or a file is refused.
 //!
-//! The daemon path is READ-ONLY over the packs dir: installs go through
-//! `advance pack install` (`commands/pack.rs`), which runs the `Installer`
-//! against the same directory under the cross-process install lock. A running
-//! daemon sees a new pack after restart (rescan-on-boot); live rescan is a
-//! later lane.
+//! Installs reach the packs dir two ways, both under the cross-process install lock:
+//! `advance pack install` (`commands/pack.rs`) from a shell, and the Client API
+//! (`client_api_packs.rs`) inside the daemon. A running daemon applies either one without
+//! a restart (`pack_runtime.rs`: at once for a Client API install, within a few seconds
+//! for one made by another process).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

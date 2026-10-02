@@ -112,6 +112,24 @@ pub fn compose_schema(base: &str, packs: &[PackSchemaExtensions]) -> ComposedSch
     }
 }
 
+/// The content kinds among `provides` that no part of the runtime consumes: they install
+/// and list, and nothing activates them.
+pub fn inert_kinds(provides: &[advance_pack_manager::PackProvideEntry]) -> Vec<&'static str> {
+    [
+        (ComponentKind::Binary, "behavior-binaries"),
+        (ComponentKind::RunnableComponent, "components"),
+        (ComponentKind::ChannelAdapter, "channel-adapters"),
+        (ComponentKind::McpServer, "mcp-servers"),
+        (ComponentKind::Workflow, "workflows"),
+        (ComponentKind::MemorySeed, "memory-seeds"),
+        (ComponentKind::ResourceCapability, "resource-capabilities"),
+    ]
+    .into_iter()
+    .filter(|(kind, _)| provides.iter().any(|p| p.kind == *kind))
+    .map(|(_, label)| label)
+    .collect()
+}
+
 fn label(pack: &PackMetadata) -> String {
     format!("{}@{}", pack.name, pack.version)
 }
@@ -445,6 +463,61 @@ impl PackRuntime {
                 }
             }
         })
+    }
+
+    /// What an operator should know about `name@version` after an apply: the warnings of
+    /// that pack in `report`, the parts this runtime could not apply because the root agent
+    /// does not declare the capability that owns them, and the content kinds no part of the
+    /// runtime consumes. Empty when everything the pack ships is live.
+    pub fn notes_for(&self, name: &str, version: &str, report: &PackApplyReport) -> Vec<String> {
+        let id = format!("{name}@{version}");
+        let prefix = format!("pack {id}: ");
+        let mut notes: Vec<String> = report
+            .warnings
+            .iter()
+            .filter_map(|w| w.strip_prefix(&prefix).map(str::to_string))
+            .collect();
+        if !report.packs.contains(&id) {
+            notes.push("not applied: a higher version of this pack is installed".to_string());
+            return notes;
+        }
+        let provides = self.registry.provides(name, version).unwrap_or_default();
+        let has = |kind: ComponentKind| provides.iter().any(|p| p.kind == kind);
+        for (kind, attached, what, capability) in [
+            (
+                ComponentKind::MetaSchemaExtension,
+                self.schema.get().is_some(),
+                "meta-schema extensions",
+                "fs",
+            ),
+            (
+                ComponentKind::Preset,
+                self.presets.get().is_some(),
+                "presets",
+                "grant",
+            ),
+            (
+                ComponentKind::Skill,
+                self.tools.get().is_some(),
+                "skill tools",
+                "tools",
+            ),
+        ] {
+            if has(kind) && !attached {
+                notes.push(format!(
+                    "{what} not applied: the root agent's .agent/config.yaml does not declare \
+                     `{capability}` (add `{capability}: true` and restart)"
+                ));
+            }
+        }
+        let inert = inert_kinds(&provides);
+        if !inert.is_empty() {
+            notes.push(format!(
+                "installed but not activated by this runtime: {}",
+                inert.join(", ")
+            ));
+        }
+        notes
     }
 
     fn provides_of(&self, pack: &PackMetadata, kind: ComponentKind) -> Vec<String> {

@@ -121,6 +121,7 @@ impl PackAdminProvider for MemoryPacks {
             name: "new".into(),
             version: "0.1.0".into(),
             install_path: "new@0.1.0".into(),
+            warnings: Vec::new(),
         })
     }
     fn uninstall_pack(

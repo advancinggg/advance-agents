@@ -51,7 +51,7 @@ pub const PACK_REGISTRY_RELOADED_EVENT: &str = "pack.registry_reloaded";
 pub const PACK_UNINSTALLED_EVENT: &str = "pack.uninstalled";
 
 use crate::{
-    deps::DependencyResolver,
+    deps::{DependencyResolver, NoDependencyResolver},
     error::PackError,
     fetch::{copy_dir_no_symlinks, FetchContext},
     manifest::{PackManifest, PackProvides, TrustLevel},
@@ -69,9 +69,8 @@ pub struct Installer {
     pub current_runtime_version: String,
     pub approval: Arc<dyn ApprovalStrategy>,
     pub trace_sink: Arc<dyn InstallTraceSink>,
-    /// Slice B: optional dependency resolver. When `None` and a pack declares
-    /// non-empty `dependencies:`, step ⑤ returns
-    /// `InvalidManifest("dependencies declared but no DependencyResolver configured")`.
+    /// Optional dependency resolver. A dependency that is already installed needs none;
+    /// when `None`, a dependency that is missing fails step ⑤ with `DependencyNotFound`.
     pub dep_resolver: Option<Arc<dyn DependencyResolver>>,
     /// Slice C: optional EventBus emit hook (CONTRACT-180). When `Some`,
     /// the public `install` method emits **exactly one**
@@ -601,14 +600,14 @@ impl Installer {
         );
         trace.push(InstallStep::Step5RecursiveDeps);
         if !manifest.dependencies.is_empty() {
-            let resolver = self.dep_resolver.as_ref().ok_or_else(|| {
-                PackError::InvalidManifest(
-                    "dependencies declared but no DependencyResolver configured".into(),
-                )
-            })?;
+            // A resolver is needed only for a dependency that is not installed yet.
+            let resolver: &dyn DependencyResolver = match self.dep_resolver.as_deref() {
+                Some(r) => r,
+                None => &NoDependencyResolver,
+            };
             crate::deps::install_deps_recursive(
                 self,
-                resolver.as_ref(),
+                resolver,
                 &manifest.dependencies,
                 depth,
                 in_flight,
@@ -629,7 +628,52 @@ impl Installer {
             path: self.packs_dir.clone(),
             source: e,
         })?;
-        copy_dir_no_symlinks(tmp.path(), &install_path)?;
+        // Everything from the copy to the index write either completes or leaves no
+        // directory behind: a half-installed `{name}@{version}/` would make the next
+        // attempt answer "already installed".
+        let installed = self.copy_validate_and_index(
+            tmp.path(),
+            &install_path,
+            &manifest,
+            &signed_by,
+            &mut trace,
+        );
+        if let Err(e) = installed {
+            let _ = std::fs::remove_dir_all(&install_path);
+            return Err(e);
+        }
+
+        // ⑧ runtime pack-registry rescan — async no-arg per §1.3.2 line 124
+        self.trace_sink
+            .trace(InstallStep::Step8RegistryRescan, json!({}));
+        trace.push(InstallStep::Step8RegistryRescan);
+        self.registry.rescan().await?;
+
+        // Slice C: AC-15 `pack.registry_reloaded` event is emitted ONCE
+        // per TOP-LEVEL `Installer::install` call, from the public `install`
+        // method above — NOT here. Recursive sub-installs share their
+        // parent's install action and must NOT each fire their own event.
+
+        Ok(PackInstallReport {
+            name: manifest.name,
+            version: manifest.version,
+            install_path,
+            trace_steps: trace,
+        })
+    }
+
+    /// Steps ⑥ (copy + layout / provides / skill-export / resource-capability checks) and ⑦
+    /// (index write). The caller removes `install_path` when this fails.
+    fn copy_validate_and_index(
+        &self,
+        source: &Path,
+        install_path: &Path,
+        manifest: &PackManifest,
+        signed_by: &Option<String>,
+        trace: &mut Vec<InstallStep>,
+    ) -> Result<(), PackError> {
+        let install_path = install_path.to_path_buf();
+        copy_dir_no_symlinks(source, &install_path)?;
 
         // Slice C: AC-03 layout discipline. Inline inside the step ⑥ window
         // (no new InstallStep enum variant, no new trace event — preserves
@@ -681,24 +725,7 @@ impl Installer {
             },
         );
         write_meta_index_atomic(&self.packs_dir, &idx)?;
-
-        // ⑧ runtime pack-registry rescan — async no-arg per §1.3.2 line 124
-        self.trace_sink
-            .trace(InstallStep::Step8RegistryRescan, json!({}));
-        trace.push(InstallStep::Step8RegistryRescan);
-        self.registry.rescan().await?;
-
-        // Slice C: AC-15 `pack.registry_reloaded` event is emitted ONCE
-        // per TOP-LEVEL `Installer::install` call, from the public `install`
-        // method above — NOT here. Recursive sub-installs share their
-        // parent's install action and must NOT each fire their own event.
-
-        Ok(PackInstallReport {
-            name: manifest.name,
-            version: manifest.version,
-            install_path,
-            trace_steps: trace,
-        })
+        Ok(())
     }
 }
 

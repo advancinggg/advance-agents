@@ -199,7 +199,7 @@ async fn run_install_async(source: String, packs_dir: Option<PathBuf>, no_input:
     let approval = Arc::new(CatalogCheckedApproval::new(inner, Arc::new(catalog)));
     let mut installer = Installer::new(
         settings.packs_dir.clone(),
-        registry,
+        Arc::clone(&registry),
         CURRENT_RUNTIME_VERSION,
         approval,
     )
@@ -210,7 +210,17 @@ async fn run_install_async(source: String, packs_dir: Option<PathBuf>, no_input:
     // it; the client re-applies the https / loopback-http policy).
     if let Some(url) = &settings.registry_url {
         match HttpsRegistryClient::new(url, settings.fetch_timeout) {
-            Ok(client) => installer = installer.with_registry_client(Arc::new(client)),
+            Ok(client) => {
+                // The same registry resolves a pack's `dependencies:` that are not installed.
+                let client: Arc<dyn advance_pack_manager::RegistryClient> = Arc::new(client);
+                installer = installer
+                    .with_dep_resolver(Arc::new(
+                        crate::pack_production::RegistryDependencyResolver::new(Arc::clone(
+                            &client,
+                        )),
+                    ))
+                    .with_registry_client(client);
+            }
             Err(e) => {
                 eprintln!(
                     "advance pack install: cannot build the registry client: {}",
@@ -229,6 +239,18 @@ async fn run_install_async(source: String, packs_dir: Option<PathBuf>, no_input:
                 safe_msg(&report.version),
                 safe_path(&report.install_path)
             );
+            // What takes effect is decided by the running daemon (it applies an install
+            // within seconds, per capability the root agent declares); say what never does.
+            let provides = registry
+                .provides(&report.name, &report.version)
+                .unwrap_or_default();
+            let inert = crate::pack_runtime::inert_kinds(&provides);
+            if !inert.is_empty() {
+                println!(
+                    "note: installed but not activated by this runtime: {}",
+                    inert.join(", ")
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

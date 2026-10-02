@@ -149,3 +149,17 @@ pub(crate) fn install_deps_recursive<'a>(
         Ok(())
     })
 }
+
+/// The resolver of an installer that was given none: already-installed dependencies are
+/// satisfied without it, and a missing one is reported as not found.
+pub(crate) struct NoDependencyResolver;
+
+#[async_trait]
+impl DependencyResolver for NoDependencyResolver {
+    async fn resolve(&self, name: &str, req: &semver::VersionReq) -> Result<SourceRef, PackError> {
+        Err(PackError::DependencyNotFound {
+            name: name.to_string(),
+            version_req: req.to_string(),
+        })
+    }
+}

@@ -88,13 +88,18 @@ impl WiredPackAdminProvider {
     }
 
     /// The pack set changed on disk and in the shared registry; bring the running runtime in
-    /// line. Apply problems are per-pack warnings (logged), never an install failure.
-    fn apply_to_runtime(&self) -> Result<(), ProviderError> {
-        if let Some(runtime) = &self.pack_runtime {
-            let runtime = Arc::clone(runtime);
-            Self::block_on(async move { runtime.apply().await })?;
+    /// line. Apply problems are per-pack warnings (logged, and returned to the caller of an
+    /// install), never an install failure.
+    fn apply_to_runtime(
+        &self,
+    ) -> Result<Option<crate::pack_runtime::PackApplyReport>, ProviderError> {
+        match &self.pack_runtime {
+            Some(runtime) => {
+                let runtime = Arc::clone(runtime);
+                Ok(Some(Self::block_on(async move { runtime.apply().await })?))
+            }
+            None => Ok(None),
         }
-        Ok(())
     }
 
     /// Run an async pack-manager call on an owned current-thread runtime (see module docs).
@@ -138,7 +143,12 @@ impl WiredPackAdminProvider {
             let client = HttpsRegistryClient::new(url, fetch_timeout).map_err(|e| {
                 ProviderError::Unavailable(format!("cannot build the registry client: {e}"))
             })?;
-            installer = installer.with_registry_client(Arc::new(client));
+            let client: Arc<dyn advance_pack_manager::RegistryClient> = Arc::new(client);
+            installer = installer
+                .with_dep_resolver(Arc::new(
+                    crate::pack_production::RegistryDependencyResolver::new(Arc::clone(&client)),
+                ))
+                .with_registry_client(client);
         }
         Ok(installer)
     }
@@ -264,7 +274,13 @@ impl PackAdminProvider for WiredPackAdminProvider {
         let source = request.source.clone();
         let report = Self::block_on(async move { installer.install(&source).await })?
             .map_err(map_pack_error)?;
-        self.apply_to_runtime()?;
+        let applied = self.apply_to_runtime()?;
+        let warnings = match (&self.pack_runtime, &applied) {
+            (Some(runtime), Some(applied)) => {
+                runtime.notes_for(&report.name, &report.version, applied)
+            }
+            _ => Vec::new(),
+        };
         let install_path = report
             .install_path
             .strip_prefix(&self.packs_dir)
@@ -274,6 +290,7 @@ impl PackAdminProvider for WiredPackAdminProvider {
             name: report.name,
             version: report.version,
             install_path,
+            warnings,
         })
     }
 

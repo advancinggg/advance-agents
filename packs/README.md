@@ -47,10 +47,21 @@ tool declares `required-capabilities: [tools, fs]`. A preset that grants the ret
 family (agenda 0.1.0 shipped one) is skipped with a warning.
 
 Conflicts never block. A pack whose schema extension conflicts with the schema, or with a
-pack applied before it in pack-name order, is skipped with a warning in the runtime log. So
+pack applied before it in pack-name order, is skipped with a warning. The Client API install
+response lists, under `warnings`, everything of the pack that did not take effect; the same
+lines go to the runtime log. So
 is a preset or skill tool whose name is already taken, and a workspace skill wins over a pack
 skill of the same name. When several versions of a pack are installed, only the highest
 applies.
+
+## What the runtime activates
+
+Of the eleven content kinds, the runtime activates `agent-templates` (when an agent is
+spawned from one), `presets`, `meta-schema-extensions` and the `tool.wasm` of `skills`. The
+others (`behavior-binaries`, `components`, `channel-adapters`, `mcp-servers`, `workflows`,
+`memory-seeds`, `resource-capabilities`, and a skill's `SKILL.md`) install and list, and
+nothing consumes them yet; install says so. A pack's `dependencies:` are installed from the
+configured registry when they are not present already.
 
 ## Contribution rules
 

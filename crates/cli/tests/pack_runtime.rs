@@ -341,3 +341,41 @@ async fn a_preset_naming_the_retired_data_family_is_skipped() {
     assert!(rig.loader.current().aspects.contains_key("agenda"));
     assert_eq!(report.tools, vec!["skill::agenda"]);
 }
+
+// The caller of an install is told what did not take effect, instead of having to read the
+// daemon's log.
+#[tokio::test]
+async fn notes_name_what_did_not_take_effect() {
+    let rig = Rig::new();
+    let agenda = agenda_with_tool(rig.tmp.path());
+    let rival = rival_pack(rig.tmp.path());
+    rig.installer()
+        .install(agenda.to_str().unwrap())
+        .await
+        .unwrap();
+    rig.installer()
+        .install(rival.to_str().unwrap())
+        .await
+        .unwrap();
+    let report = rig.runtime.apply().await;
+    assert!(rig.runtime.notes_for("agenda", "0.1.1", &report).is_empty());
+    let notes = rig.runtime.notes_for("rival", "1.0.0", &report);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].starts_with("meta-schema extensions skipped"),
+        "{notes:?}"
+    );
+
+    // A runtime whose root agent declares neither `tools` nor `grant`: those parts of the
+    // pack are reported as not applied, with the config line that would apply them.
+    let bare = Arc::new(PackRuntime::new(
+        rig.registry.clone(),
+        rig.packs_dir.clone(),
+    ));
+    let report = bare.apply().await;
+    let notes = bare.notes_for("agenda", "0.1.1", &report);
+    assert_eq!(notes.len(), 3, "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("`fs`")));
+    assert!(notes.iter().any(|n| n.contains("`grant`")));
+    assert!(notes.iter().any(|n| n.contains("`tools`")));
+}

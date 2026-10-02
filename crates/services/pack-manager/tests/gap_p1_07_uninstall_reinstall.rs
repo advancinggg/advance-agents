@@ -201,3 +201,50 @@ async fn g07_uninstall_with_dependents_is_refused_until_dependents_go() {
     inst.uninstall("a", "1.0.0").await.expect("a is free now");
     assert!(inst.registry.list_installed().is_empty());
 }
+
+// A dependency that is already installed needs no resolver; a missing one is reported as
+// not found rather than as a configuration error.
+#[tokio::test]
+async fn dependencies_already_installed_need_no_resolver() {
+    let work = tempfile::TempDir::new().unwrap();
+    let packs = tempfile::TempDir::new().unwrap();
+    let base = write_pack(work.path(), "base", "1.2.0", &[]);
+    let app = write_pack(work.path(), "app", "1.0.0", &[("base", "^1.0.0")]);
+    let inst = installer(packs.path(), Arc::new(RecordingTraceSink::new()));
+
+    let err = inst.install(app.to_str().unwrap()).await.unwrap_err();
+    assert!(
+        matches!(err, PackError::DependencyNotFound { ref name, .. } if name == "base"),
+        "{err:?}"
+    );
+    assert!(!packs.path().join("app@1.0.0").exists());
+
+    inst.install(base.to_str().unwrap()).await.expect("base");
+    inst.install(app.to_str().unwrap())
+        .await
+        .expect("app installs once its dependency is present");
+}
+
+// A pack that fails a check made after the copy leaves nothing behind, so fixing the pack
+// and installing again works without an uninstall in between.
+#[tokio::test]
+async fn a_failed_install_leaves_no_directory() {
+    let work = tempfile::TempDir::new().unwrap();
+    let packs = tempfile::TempDir::new().unwrap();
+    let src = write_pack(work.path(), "a", "1.0.0", &[]);
+    // Declared but missing on disk: fails the provides check, which runs after the copy.
+    std::fs::remove_file(src.join("behavior-binaries/dummy.wasm")).unwrap();
+    let inst = installer(packs.path(), Arc::new(RecordingTraceSink::new()));
+
+    let err = inst.install(src.to_str().unwrap()).await.unwrap_err();
+    assert!(
+        !matches!(err, PackError::AlreadyInstalled { .. }),
+        "{err:?}"
+    );
+    assert!(!packs.path().join("a@1.0.0").exists(), "copied dir removed");
+
+    std::fs::write(src.join("behavior-binaries/dummy.wasm"), b"\0asm\x01\0\0\0").unwrap();
+    inst.install(src.to_str().unwrap())
+        .await
+        .expect("the retry is not blocked by a stale directory");
+}

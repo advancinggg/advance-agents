@@ -102,6 +102,12 @@ pub struct ClientPackInstallResult {
     pub version: String,
     /// The install directory, relative to the packs dir (`{name}@{version}`).
     pub install_path: String,
+    /// What did not take effect in the running runtime, in plain sentences: a contribution
+    /// skipped for a conflict, a part the root agent's declared capabilities leave out, a
+    /// content kind the runtime does not activate. Empty when everything the pack ships is
+    /// live.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// `POST /client/packs/{pack_id}:uninstall` result.

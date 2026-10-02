@@ -232,11 +232,9 @@ checksums:
         trust_roots: Vec::new(),
     };
     match installer.install(pack_src.to_string_lossy().as_ref()).await {
-        Err(PackError::InvalidManifest(msg)) => assert!(
-            msg.contains("DependencyResolver"),
-            "expected DependencyResolver missing message, got: {msg}"
-        ),
-        other => panic!("expected InvalidManifest(DependencyResolver), got {other:?}"),
+        // No resolver and the dependency is not installed: reported as not found.
+        Err(PackError::DependencyNotFound { name, .. }) => assert_eq!(name, "bar"),
+        other => panic!("expected DependencyNotFound(bar), got {other:?}"),
     }
 }
 
