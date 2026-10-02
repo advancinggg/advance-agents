@@ -1,4 +1,4 @@
-//! Entity-data lane E1 (plan §2.8) — composition-root wiring of the `data` host tool.
+//! Composition-root wiring of the `data` host tool.
 //!
 //! - [`ChainedWorkspaceFs`]: cap-data's `WorkspaceFs` over the SAME cap-fs primitives the
 //!   `fs.*` host functions use (territory resolver, `.meta.yaml` maintainer + its write lock,

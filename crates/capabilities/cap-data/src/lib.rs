@@ -1,5 +1,4 @@
-//! `cap-data` — the structured-data capability behind the `data` host tool (the internal
-//! entity-data lane plan §2.6).
+//! `cap-data` — the structured-data capability behind the `data` host tool.
 //!
 //! Structured data lives ONLY in frontmatter; SQLite is a derived projection. This crate is
 //! the operations layer on top of cap-fs's representation (frontmatter codec, meta-schema v2,

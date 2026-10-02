@@ -21,7 +21,7 @@
 //!   [`DefaultMaterializer::merge_meta_schema_extension_report`] exposes the
 //!   `added` / `unchanged` field lists the cli bridge reports;
 //! - `materialize_channel_adapter` is an explicit `NotImplemented` (cap-channel
-//!   has no path-loaded adapter surface — decision recorded in the plan) instead
+//!   has no path-loaded adapter surface) instead
 //!   of a silent directory copy nothing ever loads; `install` still accepts the
 //!   `channel-adapters:` declaration.
 //! The skills / presets / memory-seeds legs are bridged in the cli composition

@@ -16,9 +16,10 @@ use serde::{Deserialize, Serialize};
 /// The host tool id every agent reaches the entity model through (`tool-invoke("data", …)`).
 pub const DATA_TOOL_ID: &str = "data";
 
-/// The L1 grant family the `data` tool checks (`GrantCheck::check(agent, "data", method, params)`).
-/// Grants carry one param, `mode`, a csv of `read` / `write`.
-pub const DATA_GRANT_CAPABILITY: &str = "data";
+/// A retired L1 grant family. The `data` tool once checked it; the tool is now authorized by
+/// the caller's `fs` grant. The name stays parseable so persisted grants and old pack presets
+/// still load, and nothing consults it.
+pub const RETIRED_DATA_GRANT_CAPABILITY: &str = "data";
 
 /// Hard cap on `EntityQuery::limit`; a larger limit is an error, never clamped silently.
 pub const MAX_ENTITY_QUERY_LIMIT: usize = 1000;
@@ -54,7 +55,7 @@ impl std::fmt::Display for EntityId {
     }
 }
 
-/// Which storage tier a row comes from (plan §1.3).
+/// Which storage tier a row comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EntityKind {
@@ -177,7 +178,7 @@ impl std::fmt::Display for EntityIndexError {
 
 impl std::error::Error for EntityIndexError {}
 
-/// The derived projection of the entity model (plan §2.1 / §2.2).
+/// The derived projection of the entity model.
 #[async_trait]
 pub trait EntityIndex: Send + Sync {
     /// Replace every row of `path` (the file row + its inline items) with `rows` and recompute

@@ -29,6 +29,23 @@ base and is never rewritten. Its presets become known to the grant preset regist
 skills' `tool.wasm` sidecars register as `skill::<name>` tools. Existing records are
 re-indexed, so they gain the pack's aspects. Uninstalling takes all of it away again.
 
+Each part applies only where the root agent's `.agent/config.yaml` declares the capability
+that owns it: schema extensions need `fs`, presets need `grant`, skill tools need `tools`.
+The `data` tool exists when both `tools` and `fs` are declared. A workspace from
+`advance init` declares `fs` and `llm`, so add `tools: true` and restart before an agent can
+use a pack's tools. A tool registered by a hot install is callable at once, but the tool list
+shown to the model is built when the agent starts.
+
+## Capabilities a pack relies on
+
+A pack never adds a capability. Its content runs under the ones the runtime already has:
+`tools` reaches a tool, and the capability that governs a resource authorizes what the tool
+does with it. The `data` tool reads and writes workspace files, so it is authorized by the
+caller's `fs` grant: reads need read access to the record's file, writes need write access,
+and `query`, `promote` and `demote` need the whole territory. A pack that uses the `data`
+tool declares `required-capabilities: [tools, fs]`. A preset that grants the retired `data`
+family (agenda 0.1.0 shipped one) is skipped with a warning.
+
 Conflicts never block. A pack whose schema extension conflicts with the schema, or with a
 pack applied before it in pack-name order, is skipped with a warning in the runtime log. So
 is a preset or skill tool whose name is already taken, and a workspace skill wins over a pack
@@ -49,9 +66,11 @@ applies.
    `changelog:` line (the layout allow-list has no room for a CHANGELOG file).
 5. A skill's `tool.wasm` is pure computation: no clock, no randomness, no I/O. `data.apply`
    invokes it with a fixed clock and seed, so equal inputs must give equal outputs.
-6. Structured data lives in frontmatter and is read and written through the runtime's `data`
-   host tool. A pack declares vocabulary (fields, invariants, queries, views, operation
-   bindings) in `meta-schema-extensions/`; it never ships code that touches storage.
+6. Structured data lives in frontmatter. A pack declares vocabulary (fields, invariants,
+   queries, views, operation bindings) in `meta-schema-extensions/`; it never ships code that
+   touches storage. The runtime enforces the declared invariants on every write of a Markdown
+   file, through the `data` host tool and through `fs.write` alike; only the `data` tool
+   updates the entity index and emits the change event.
 
 The `agenda` pack declares the first aspect and is the reference for the entity model
 (frontmatter records, inline items, the `data` host tool).
@@ -93,7 +112,7 @@ pack:
 ```
 
 Once GitHub Pages serves the `gh-pages` branch, `https://advancinggg.github.io/advance-agents/packs`
-serves the same tree. Then `advance pack install registry:agenda@0.1.0` installs the built
+serves the same tree. Then `advance pack install registry:agenda@0.1.1` installs the built
 agenda pack, `tool.wasm` included.
 
 Trust: operators list maintainers' public keys in `runtime-config.yaml` `pack.trust-roots`;

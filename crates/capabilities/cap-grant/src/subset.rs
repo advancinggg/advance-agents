@@ -84,8 +84,8 @@ impl SubsetValidator for SubsetValidatorImpl {
             "secrets" => check_list_subset(&parent.params, &child.params, &["names"]),
             "tools" => check_list_subset(&parent.params, &child.params, &["ids"]),
             "notify" => check_list_subset(&parent.params, &child.params, &["targets"]),
-            // The `data` host tool's L1 family: `mode` is a csv set of `read` / `write`; a
-            // `read,write` grant covers a `read` or a `write` request, never the reverse.
+            // Retired family: the `data` host tool is authorized by `fs` and nothing consults a
+            // `data` grant. The arm stays so persisted grants still narrow and revoke cleanly.
             "data" => check_list_subset(&parent.params, &child.params, &["mode"]),
             "mcp" => check_mcp(&parent.params, &child.params),
             "skills" => check_skills(&parent.params, &child.params),

@@ -1,4 +1,4 @@
-//! The effect list a pure reducer returns from `data.apply` (plan §2.6).
+//! The effect list a pure reducer returns from `data.apply`.
 //!
 //! ```json
 //! { "effects": [

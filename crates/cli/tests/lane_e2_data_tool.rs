@@ -130,7 +130,7 @@ async fn e2_pack_build_emits_tool_wasm_with_checksums_installs_and_binds_operati
         .expect("install built pack");
     assert_eq!(report.name, "agenda");
     let skill = registry
-        .resolve("agenda@0.1.0/skills/agenda")
+        .resolve("agenda@0.1.1/skills/agenda")
         .expect("skill resolves");
     assert!(skill.local_path.join("tool.wasm").is_file());
 

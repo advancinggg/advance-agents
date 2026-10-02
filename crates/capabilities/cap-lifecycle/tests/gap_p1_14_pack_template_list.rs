@@ -1,6 +1,6 @@
 //! GAP-14 (P1, cap-lifecycle half) — `PackTemplateResolver::list()` enumerates installed
 //! pack templates as FQ refs (was a sanctioned empty Vec because `PackRegistry` had no
-//! provides enumeration). See the internal pack gap-closure plan §2.3.
+//! provides enumeration).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

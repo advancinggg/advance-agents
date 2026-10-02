@@ -6,15 +6,17 @@ use std::sync::Arc;
 
 use cap_grant::preset::PresetRegistry;
 
+/// The preset file agenda 0.1.0 published (frozen: that version is immutable in the registry).
+/// It names the retired `data` family; it must keep parsing, and the pack runtime skips it.
 fn agenda_editor() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packs/agenda/presets/agenda-editor.yaml")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agenda-0.1.0-editor.yaml")
 }
 
 #[test]
 fn a_pack_preset_is_added_and_removed_through_a_shared_registry() {
     let shared = Arc::new(PresetRegistry::with_builtins());
     let preset = PresetRegistry::parse_custom_yaml(&agenda_editor())
-        .expect("the shipped agenda-editor preset parses");
+        .expect("the agenda 0.1.0 preset still parses");
     assert_eq!(preset.name, "agenda-editor");
     assert_eq!(preset.grants.len(), 2);
     assert!(!shared.contains("agenda-editor"));

@@ -1,6 +1,6 @@
 # Aspect `agenda` — the one aspect this pack owns.
-# An entity has it iff `status` or `starts` is present. Grammar = meta-schema v2 (lane E1):
-# installing this pack only checks the file exists; the boot-time structured merge needs E1.
+# An entity has it iff `status` or `starts` is present. Grammar = meta-schema v2. Install only
+# checks the file exists; the runtime merges it into the live schema when the pack applies.
 aspect: agenda
 key: [status, starts]
 

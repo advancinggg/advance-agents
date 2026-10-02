@@ -3,12 +3,12 @@
 //!
 //! - a pack installed before boot is live at boot: `/client/schema` carries its aspect with
 //!   the bound operations available, existing records are indexed with the aspect, its skill
-//!   tool is registered and its preset is known to the grant preset registry;
+//!   tool is registered;
 //! - `POST /client/packs:install` takes effect before the response returns, and
 //!   `:uninstall` takes the pack's contributions away again (no restart);
 //! - an install made by ANOTHER process into the packs dir reaches the running daemon;
 //! - the `data` host tool is reachable through the production tool registry with the
-//!   caller's identity, and serves an agent that holds a `data` grant.
+//!   caller's identity, and serves an agent that holds an `fs` grant (no grant of its own).
 //!
 //! Fixture discipline: env-var master key (never read), no network, the agenda skill's
 //! `tool.wasm` is the cap-tools clock fixture (any component exporting `tool-exports` passes
@@ -232,7 +232,7 @@ async fn a_pack_installed_before_boot_is_live_at_boot() {
     assert!(has_tool(&handles, "skill::agenda").await);
 
     let report = handles.pack_runtime.apply().await;
-    assert_eq!(report.presets, vec!["agenda-editor"]);
+    assert!(report.presets.is_empty(), "the pack ships no preset");
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 }
 
@@ -247,7 +247,7 @@ async fn client_api_install_is_hot_and_uninstall_withdraws() {
     let env = post(
         &api,
         "/client/packs:install",
-        json!({ "source": ws.agenda_src.to_str().unwrap(), "accepted_capabilities": ["tools"] }),
+        json!({ "source": ws.agenda_src.to_str().unwrap(), "accepted_capabilities": ["tools", "fs"] }),
         "install-1",
     );
     assert!(env.is_ok(), "{:?}", env.error);
@@ -262,7 +262,7 @@ async fn client_api_install_is_hot_and_uninstall_withdraws() {
 
     let env = post(
         &api,
-        "/client/packs/agenda@0.1.0:uninstall",
+        "/client/packs/agenda@0.1.1:uninstall",
         json!({}),
         "uninstall-1",
     );
@@ -301,7 +301,7 @@ async fn an_install_by_another_process_reaches_the_running_daemon() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_agent_holding_a_data_grant_reaches_the_data_tool_through_the_production_registry() {
+async fn an_agent_holding_fs_and_tools_reaches_the_data_tool_through_the_production_registry() {
     let ws = workspace();
     shell_installer(&ws)
         .install(ws.agenda_src.to_str().unwrap())
@@ -311,21 +311,22 @@ async fn an_agent_holding_a_data_grant_reaches_the_data_tool_through_the_product
     let root = handles.root_agent_id.clone();
     let tools = handles.tool_registry.clone().expect("tools declared");
 
-    // The caller identity survives the production registry wrapper: the refusal comes from
-    // the grant check, not from the anonymous path an identity-less call would take.
+    // The caller identity survives the production registry wrapper, and the tool is
+    // authorized by the caller's `fs` grant: an identity without one is refused.
     let denied = tools
-        .invoke_as(&root, "data", "describe", b"{}")
+        .invoke_as("nobody", "data", "describe", b"{}")
         .await
-        .expect_err("no data grant yet");
+        .expect_err("no fs grant");
     let msg = format!("{denied:?}");
-    assert!(msg.contains("no active grant covers data"), "{msg}");
+    assert!(msg.contains("needs fs"), "{msg}");
 
+    // A leftover grant of the retired `data` family authorizes nothing.
     handles
         .cap_grant
         .store
         .insert(Grant {
-            id: GrantId::new("g-data-root"),
-            grantee: root.clone(),
+            id: GrantId::new("g-data-nobody"),
+            grantee: "nobody".into(),
             capability: "data".into(),
             params: vec![CapParam {
                 key: "mode".into(),
@@ -338,13 +339,18 @@ async fn an_agent_holding_a_data_grant_reaches_the_data_tool_through_the_product
             created_at: chrono::Utc::now(),
             expires_at: None,
         })
-        .expect("grant data to the root agent");
+        .expect("insert a legacy data grant");
+    tools
+        .invoke_as("nobody", "data", "describe", b"{}")
+        .await
+        .expect_err("a legacy data grant alone does not open the tool");
 
+    // The root declares `fs` and `tools`; that is all the tool needs.
     let described: Value = serde_json::from_slice(
         &tools
             .invoke_as(&root, "data", "describe", b"{}")
             .await
-            .expect("describe with a read,write grant"),
+            .expect("describe with the root's fs grant"),
     )
     .unwrap();
     assert_eq!(described["aspects"][0]["name"], "agenda");

@@ -1,6 +1,6 @@
 //! Doubles for witnesses and composition tests: a plain-directory [`WorkspaceFs`], an
 //! in-memory [`EntityIndex`], deterministic ids / clock, a recording event sink, a scripted
-//! reducer, and grant checks that always allow / deny.
+//! reducer, and grant checks that always allow / deny or scope `fs` by path.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -452,6 +452,42 @@ impl GrantCheck for DenyAll {
         _params: &CapParams,
     ) -> GrantDecision {
         GrantDecision::Deny("denied by test".into())
+    }
+}
+
+/// An `fs` grant with path prefixes: allows a request iff the capability is `fs` and every
+/// requested `read-paths` / `write-paths` value lies under one of the held prefixes (a
+/// param-less request only needs the grant to exist). Any other capability is denied.
+pub struct FsScoped {
+    pub read: Vec<String>,
+    pub write: Vec<String>,
+}
+
+impl GrantCheck for FsScoped {
+    fn check(
+        &self,
+        _agent_id: &str,
+        capability: &str,
+        _function: &str,
+        params: &CapParams,
+    ) -> GrantDecision {
+        if capability != "fs" {
+            return GrantDecision::Deny(format!("no active grant for {capability}"));
+        }
+        let under = |held: &[String], path: &str| {
+            held.iter().any(|h| {
+                let h = h.trim_end_matches('/');
+                h.is_empty() || path == h || path.starts_with(&format!("{h}/"))
+            })
+        };
+        for (key, held) in [("read-paths", &self.read), ("write-paths", &self.write)] {
+            if let Some(path) = params.as_value().get(key).and_then(Value::as_str) {
+                if !under(held, path) {
+                    return GrantDecision::Deny(format!("fs.{key}: {path} not covered"));
+                }
+            }
+        }
+        GrantDecision::Allow
     }
 }
 

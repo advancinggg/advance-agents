@@ -23,7 +23,7 @@
 //!
 //! `channel-adapters` have no bridge by decision: cap-channel has no
 //! path-loaded adapter surface, so `DefaultMaterializer::materialize_channel_adapter`
-//! is an explicit `NotImplemented` (see the plan §3.1).
+//! is an explicit `NotImplemented`.
 
 pub mod mcp;
 pub mod memory_seed;
@@ -39,7 +39,7 @@ pub use skills::{ImportedSkill, PackSkillBridge};
 
 use advance_pack_manager::{ComponentKind, PackError, PackRegistry, PackResolution, TrustLevel};
 
-/// Shared bridge error (plan §3).
+/// Shared bridge error.
 #[derive(Debug)]
 pub enum PackBridgeError {
     /// Pack-manager resolution / parse / validation failure.

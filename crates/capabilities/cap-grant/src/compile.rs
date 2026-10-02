@@ -16,6 +16,7 @@ use crate::data::{
     CapParam, ComponentId, Grant, GrantId, GrantIssuer, GrantProvenance, GrantStatus, GrantTtl,
 };
 use crate::error::{CapGrantError, Result};
+use advance_shared_types::entity::RETIRED_DATA_GRANT_CAPABILITY;
 
 /// 1 MiB cap on YAML input — DoS posture mirroring m002/m004 Slice A.
 pub const MAX_YAML_BYTES: u64 = 1 << 20;
@@ -115,6 +116,16 @@ fn compile_from_value(root: &Value, workspace_root_agent: &str) -> Result<Vec<Gr
             )));
         }
 
+        // A retired family: nothing consults a `data` grant any more (the `data` tool is
+        // authorized by `fs`), so the key is skipped instead of minting an inert grant.
+        if capability_name == RETIRED_DATA_GRANT_CAPABILITY {
+            eprintln!(
+                "advance: WARN `capabilities.data` is retired and ignored; the data tool is \
+                 authorized by the `fs` capability (reach it with `tools`)"
+            );
+            continue;
+        }
+
         let params = match v {
             Value::Bool(true) => Vec::new(),
             Value::Mapping(m) => {
@@ -135,13 +146,9 @@ fn compile_from_value(root: &Value, workspace_root_agent: &str) -> Result<Vec<Gr
                         // auto-grant: true is the default — do not emit as a param.
                         continue;
                     }
-                    let value_str = serde_yml::to_string(sv)
-                        .map_err(CapGrantError::Yaml)?
-                        .trim_end_matches('\n')
-                        .to_string();
                     params.push(CapParam {
-                        key: sk_str.to_string(),
-                        value: value_str,
+                        key: param_key(capability_name, sk_str).to_string(),
+                        value: param_value(capability_name, sk_str, sv)?,
                     });
                 }
                 if auto_grant_false {
@@ -176,4 +183,48 @@ fn compile_from_value(root: &Value, workspace_root_agent: &str) -> Result<Vec<Gr
         });
     }
     Ok(out)
+}
+
+/// `fs` accepts `read` / `write` as aliases of the keys the subset rules read.
+fn param_key<'a>(capability: &str, key: &'a str) -> &'a str {
+    match (capability, key) {
+        ("fs", "read") => "read-paths",
+        ("fs", "write") => "write-paths",
+        _ => key,
+    }
+}
+
+/// The stored form of one param value. The subset rules split on `,`, so a YAML sequence of
+/// scalars becomes a comma-separated list; a scalar is stored as its text.
+fn param_value(capability: &str, key: &str, value: &Value) -> Result<String> {
+    let scalar = |v: &Value| -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Bool(b) => Some(b.to_string()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }
+    };
+    if let Some(s) = scalar(value) {
+        return Ok(s);
+    }
+    match value {
+        Value::Sequence(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let s = scalar(item).filter(|s| !s.contains(',')).ok_or_else(|| {
+                    CapGrantError::InvalidConfig(format!(
+                        "capability `{capability}` param `{key}`: list items must be scalars \
+                         without `,`; got: {item:?}"
+                    ))
+                })?;
+                out.push(s.trim().to_string());
+            }
+            Ok(out.join(","))
+        }
+        other => Err(CapGrantError::InvalidConfig(format!(
+            "capability `{capability}` param `{key}` must be a scalar or a list of scalars; \
+             got: {other:?}"
+        ))),
+    }
 }

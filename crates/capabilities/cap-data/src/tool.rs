@@ -1,10 +1,24 @@
-//! [`DataTool`] — the `data` host tool (plan §2.6): nine methods, JSON in / JSON out,
-//! grant-checked per call, every error projected to a `tool-error` arm.
+//! [`DataTool`] — the `data` host tool: nine methods, JSON in / JSON out, every error
+//! projected to a `tool-error` arm.
+//!
+//! Authorization: the tool is a second interface onto the files the `fs` capability governs,
+//! so it asks the caller's `fs` grant and has no grant family of its own. Reach is the `tools`
+//! capability (checked by the injector before the call gets here).
+//!
+//! | method | `fs` request |
+//! |---|---|
+//! | `describe` | any Active `fs` grant |
+//! | `get`, `history` | `read-paths` on the target's file (an anchored `get` on the row's indexed path) |
+//! | `create`, `patch`, `apply` | `read-paths` + `write-paths` on the file |
+//! | `query` | `read-paths` on `/` |
+//! | `promote`, `demote` | `read-paths` + `write-paths` on `/` (the second file is computed by the store) |
+//!
+//! A param-less `fs` grant covers every request. Paths are territory-relative with a leading `/`.
 
 use std::sync::Arc;
 
 use advance_shared_types::capability::{CapParams, GrantDecision};
-use advance_shared_types::entity::{EntityQuery, DATA_GRANT_CAPABILITY};
+use advance_shared_types::entity::EntityQuery;
 use advance_shared_types::traits::GrantCheck;
 use async_trait::async_trait;
 use cap_tools::{HostTool, MethodInfo, ToolDescription, ToolError};
@@ -38,18 +52,78 @@ impl DataTool {
         Arc::clone(&self.store)
     }
 
-    fn check(&self, agent_id: &str, method: &str) -> Result<(), ToolError> {
-        let mode = if is_read(method) { "read" } else { "write" };
-        match self.grant.check(
-            agent_id,
-            DATA_GRANT_CAPABILITY,
-            method,
-            &CapParams::new(json!({ "mode": mode })),
-        ) {
+    fn check_fs(
+        &self,
+        agent_id: &str,
+        method: &str,
+        params: CapParams,
+        what: &str,
+    ) -> Result<(), ToolError> {
+        match self
+            .grant
+            .check(agent_id, FS_CAPABILITY, &format!("data.{method}"), &params)
+        {
             GrantDecision::Allow => Ok(()),
             GrantDecision::Deny(reason) => Err(ToolError::PermissionDenied(format!(
-                "data.{method} ({mode}) denied for {agent_id}: {reason}"
+                "data.{method} needs fs {what} for {agent_id}: {reason}"
             ))),
+        }
+    }
+
+    /// The `fs` gate of one call (see the module table). `Ok(true)` asks the caller to check
+    /// read on the returned row's path as well (anchored `get`).
+    fn authorize(&self, agent_id: &str, method: &str, params: &[u8]) -> Result<bool, ToolError> {
+        // Holding `fs` at all comes first, so an agent without it never learns more.
+        self.check_fs(agent_id, method, CapParams::empty(), "access")?;
+        let root = String::from("/");
+        match method {
+            "describe" => Ok(false),
+            "query" => self
+                .check_fs(agent_id, method, fs_request(Some(&root), None), "read on /")
+                .map(|()| false),
+            "promote" | "demote" => self
+                .check_fs(
+                    agent_id,
+                    method,
+                    fs_request(Some(&root), Some(&root)),
+                    "read and write on /",
+                )
+                .map(|()| false),
+            _ => {
+                let key = if method == "create" {
+                    "parent"
+                } else {
+                    "target"
+                };
+                // A target that does not parse is reported by `dispatch` as invalid input.
+                let Some(target) = serde_json::from_slice::<Value>(params)
+                    .ok()
+                    .and_then(|v| v.get(key).and_then(Value::as_str).map(str::to_string))
+                    .and_then(|t| Target::parse(&t).ok())
+                else {
+                    return Ok(false);
+                };
+                if method == "get" && matches!(target, Target::Anchored { .. }) {
+                    return Ok(true);
+                }
+                let path = grant_path(target.path());
+                if is_read(method) {
+                    self.check_fs(
+                        agent_id,
+                        method,
+                        fs_request(Some(&path), None),
+                        &format!("read on {path}"),
+                    )
+                } else {
+                    self.check_fs(
+                        agent_id,
+                        method,
+                        fs_request(Some(&path), Some(&path)),
+                        &format!("read and write on {path}"),
+                    )
+                }
+                .map(|()| false)
+            }
         }
     }
 
@@ -228,6 +302,35 @@ impl DataTool {
     }
 }
 
+/// The grant family that governs the files this tool touches.
+const FS_CAPABILITY: &str = "fs";
+
+/// A territory-relative path in the form `fs` grant params use (leading `/`). A path the grant
+/// grammar cannot carry (a comma, edge whitespace, control bytes) asks for `/` instead, which
+/// can only require a broader grant.
+fn grant_path(path: &str) -> String {
+    let safe = !path.is_empty()
+        && path.trim() == path
+        && !path.contains(',')
+        && !path.chars().any(|c| c.is_control());
+    if safe {
+        format!("/{path}")
+    } else {
+        "/".to_string()
+    }
+}
+
+fn fs_request(read: Option<&str>, write: Option<&str>) -> CapParams {
+    let mut m = serde_json::Map::new();
+    if let Some(p) = read {
+        m.insert("read-paths".into(), Value::String(p.to_string()));
+    }
+    if let Some(p) = write {
+        m.insert("write-paths".into(), Value::String(p.to_string()));
+    }
+    CapParams::new(Value::Object(m))
+}
+
 fn parse<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, DataError> {
     serde_json::from_value(v).map_err(|e| DataError::Invalid(format!("params: {e}")))
 }
@@ -295,11 +398,22 @@ impl HostTool for DataTool {
         if !METHODS.contains(&method) {
             return Err(ToolError::MethodNotFound(method.to_string()));
         }
-        self.check(agent_id, method)?;
+        let check_row_path = self.authorize(agent_id, method, params)?;
         let value = self
             .dispatch(agent_id, method, params)
             .await
             .map_err(map_error)?;
+        if check_row_path {
+            // An anchored `get` is answered from the index, so the file that holds the record
+            // is known only now; nothing is returned unless the caller may read it.
+            let path = grant_path(value.get("path").and_then(Value::as_str).unwrap_or(""));
+            self.check_fs(
+                agent_id,
+                method,
+                fs_request(Some(&path), None),
+                &format!("read on {path}"),
+            )?;
+        }
         serde_json::to_vec(&value).map_err(|e| ToolError::InvocationFailed(e.to_string()))
     }
 }

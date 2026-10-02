@@ -1,4 +1,4 @@
-//! GAP-07 (P1) — uninstall / reinstall semantics. See the internal pack gap-closure plan §2.2.
+//! GAP-07 (P1) — uninstall / reinstall semantics.
 //!
 //! Contract under test:
 //! - `Installer::uninstall(name, version)` removes `packs_dir/{name}@{version}`, drops the
@@ -8,7 +8,7 @@
 //!   `PackError::AlreadyInstalled` BEFORE checksum/approval (no Step4 trace), judged from
 //!   disk state (dir or `.meta.yaml` key), not the in-memory registry.
 //!
-//! Activation: delete the `#![cfg]` line once the API exists (plan §0.2).
+//! Activation: delete the `#![cfg]` line once the API exists.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

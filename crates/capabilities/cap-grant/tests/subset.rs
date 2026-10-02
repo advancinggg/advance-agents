@@ -430,9 +430,8 @@ fn bx_unknown_capability_fails_closed() {
     assert!(matches!(err, CapGrantError::SubsetViolation(_)));
 }
 
-// The `data` host tool's L1 family (entity-data lanes): `mode` is a csv set. The tool asks
-// for `mode: read` or `mode: write` per call, so a `read,write` grant must cover either, and a
-// read-only grant must never cover a write.
+// `data` is a retired family (the data tool is authorized by `fs`). Its rule stays so grants
+// persisted by earlier releases can still be narrowed and compared.
 #[test]
 fn data_mode_is_a_set_subset() {
     let v = SubsetValidatorImpl::new();

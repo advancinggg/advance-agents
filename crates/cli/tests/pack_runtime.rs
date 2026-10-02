@@ -45,6 +45,25 @@ fn agenda_with_tool(root: &Path) -> PathBuf {
         dir.join("skills/agenda/tool.wasm"),
     )
     .unwrap();
+    // The shipped pack has no preset; add one so preset registration stays covered.
+    let manifest = dir.join("pack.yaml");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    assert!(text.contains("  meta-schema-extensions:\n    - agenda\n"));
+    std::fs::write(
+        &manifest,
+        text.replace(
+            "  meta-schema-extensions:\n    - agenda\n",
+            "  meta-schema-extensions:\n    - agenda\n  presets:\n    - agenda-editor\n",
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("presets")).unwrap();
+    std::fs::write(
+        dir.join("presets/agenda-editor.yaml"),
+        "name: agenda-editor\ndefault-ttl: persistent\ngrants:\n  - capability: tools\n    \
+         params: []\n    ttl: persistent\n",
+    )
+    .unwrap();
     dir
 }
 
@@ -126,8 +145,8 @@ async fn install_applies_and_uninstall_withdraws() {
     let report = rig.runtime.apply().await;
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     assert!(report.schema_changed);
-    assert_eq!(report.packs, vec!["agenda@0.1.0"]);
-    assert_eq!(report.schema_packs, vec!["agenda@0.1.0"]);
+    assert_eq!(report.packs, vec!["agenda@0.1.1"]);
+    assert_eq!(report.schema_packs, vec!["agenda@0.1.1"]);
     assert_eq!(report.aspects, vec!["agenda"]);
     assert_eq!(report.presets, vec!["agenda-editor"]);
     assert_eq!(report.tools, vec!["skill::agenda"]);
@@ -145,7 +164,7 @@ async fn install_applies_and_uninstall_withdraws() {
     assert!(!again.schema_changed);
 
     rig.installer()
-        .uninstall("agenda", "0.1.0")
+        .uninstall("agenda", "0.1.1")
         .await
         .expect("uninstall");
     let gone = rig.runtime.apply().await;
@@ -170,10 +189,10 @@ async fn a_conflicting_pack_is_skipped_with_a_warning() {
         .await
         .unwrap();
     let report = rig.runtime.apply().await;
-    assert_eq!(report.packs, vec!["agenda@0.1.0", "rival@1.0.0"]);
+    assert_eq!(report.packs, vec!["agenda@0.1.1", "rival@1.0.0"]);
     assert_eq!(
         report.schema_packs,
-        vec!["agenda@0.1.0"],
+        vec!["agenda@0.1.1"],
         "pack-name order: agenda first"
     );
     assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
@@ -207,7 +226,7 @@ async fn a_workspace_skill_of_the_same_name_wins() {
         "{:?}",
         report.warnings
     );
-    rig.installer().uninstall("agenda", "0.1.0").await.unwrap();
+    rig.installer().uninstall("agenda", "0.1.1").await.unwrap();
     rig.runtime.apply().await;
     assert!(
         rig.tools.is_registered("skill::agenda").await,
@@ -253,7 +272,7 @@ async fn existing_records_gain_and_lose_the_aspect() {
         .unwrap();
     assert_eq!(row.aspects, vec!["agenda"]);
 
-    rig.installer().uninstall("agenda", "0.1.0").await.unwrap();
+    rig.installer().uninstall("agenda", "0.1.1").await.unwrap();
     rig.runtime.apply().await;
     assert_eq!(agenda_rows(&index).await, 0);
 }
@@ -286,7 +305,7 @@ async fn the_watcher_applies_an_install_made_by_another_process() {
     assert!(rig.presets.contains("agenda-editor"));
     assert!(rig.tools.is_registered("skill::agenda").await);
 
-    other.uninstall("agenda", "0.1.0").await.unwrap();
+    other.uninstall("agenda", "0.1.1").await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while rig.loader.current().aspects.contains_key("agenda") {
         assert!(
@@ -296,4 +315,29 @@ async fn the_watcher_applies_an_install_made_by_another_process() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(!rig.tools.is_registered("skill::agenda").await);
+}
+
+// agenda 0.1.0 is immutable in the registry and its preset grants the retired `data` family.
+// The pack still applies; that preset is never registered.
+#[tokio::test]
+async fn a_preset_naming_the_retired_data_family_is_skipped() {
+    let rig = Rig::new();
+    let src = agenda_with_tool(rig.tmp.path());
+    std::fs::copy(
+        repo().join("crates/capabilities/cap-grant/tests/fixtures/agenda-0.1.0-editor.yaml"),
+        src.join("presets/agenda-editor.yaml"),
+    )
+    .unwrap();
+    rig.installer()
+        .install(src.to_str().unwrap())
+        .await
+        .unwrap();
+    let report = rig.runtime.apply().await;
+    assert!(report.presets.is_empty(), "{:?}", report.presets);
+    assert!(!rig.presets.contains("agenda-editor"));
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(report.warnings[0].contains("retired `data` family"));
+    // Everything else the pack ships is live.
+    assert!(rig.loader.current().aspects.contains_key("agenda"));
+    assert_eq!(report.tools, vec!["skill::agenda"]);
 }

@@ -24,6 +24,7 @@
 //!   workspace's Markdown files into the entity index, so records gain (or lose) the pack's
 //!   aspects without being rewritten.
 
+use advance_shared_types::entity::RETIRED_DATA_GRANT_CAPABILITY;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
@@ -496,6 +497,22 @@ impl PackRuntime {
                         continue;
                     }
                 };
+                // A preset that names a retired grant family is never registered: applying it
+                // would mint grants nothing consults and revoke the target's dynamic grants.
+                if preset
+                    .grants
+                    .iter()
+                    .any(|g| g.capability == RETIRED_DATA_GRANT_CAPABILITY)
+                {
+                    warnings.push(format!(
+                        "pack {}: preset {} skipped: it grants the retired `{}` family (the \
+                         data tool is authorized by `fs`)",
+                        label(pack),
+                        preset.name,
+                        RETIRED_DATA_GRANT_CAPABILITY
+                    ));
+                    continue;
+                }
                 if let Some((owner, _)) = wanted.get(&preset.name) {
                     warnings.push(format!(
                         "pack {}: preset {} skipped: already provided by {owner}",

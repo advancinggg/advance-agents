@@ -80,9 +80,8 @@ fn allowed_param_keys(capability: &str) -> Option<&'static [&'static str]> {
         "mcp" => Some(&["servers", "tool-patterns"]),
         "skills" => Some(&["allowed-actions", "max-active-skills"]),
         "web" => Some(&[]),
-        // Entity-data lane E1: the `data` host tool's L1 grant family; `mode` is a csv of
-        // `read` / `write` (`describe` / `query` / `get` / `history` need `read`, the rest
-        // `write`).
+        // Retired family (the `data` host tool is authorized by `fs`); kept parseable for
+        // grants persisted by earlier releases.
         "data" => Some(&["mode"]),
         _ => None,
     }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use advance_shared_types::entity::EntityQuery;
 use cap_data::test_support::{
-    agenda_schema, AllowAll, DenyAll, DirWorkspaceFs, FixedClock, MemoryEntityIndex,
+    agenda_schema, AllowAll, DenyAll, DirWorkspaceFs, FixedClock, FsScoped, MemoryEntityIndex,
     RecordingEvents, ScriptedReducer, SequentialIds,
 };
 use cap_data::{
@@ -731,5 +731,111 @@ async fn e1_data_tool_requires_identity_and_maps_errors() {
     assert!(
         matches!(err, ToolError::PermissionDenied(_)),
         "grant denied: {err:?}"
+    );
+}
+
+// The tool has no grant family of its own: it asks the caller's `fs` grant for the file each
+// method touches, so read-only and path-scoped `fs` grants bind through this door too.
+#[tokio::test]
+async fn data_tool_is_authorized_by_the_fs_grant_of_the_touched_file() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let (s, _) = store(&ws);
+    let s = Arc::new(s);
+    let id = s
+        .create("alice", launch(), item("t", "todo"))
+        .await
+        .unwrap();
+    let target = format!("launch.md#{}", id.0);
+    let get = serde_json::to_vec(&json!({ "target": target })).unwrap();
+    let get_file = serde_json::to_vec(&json!({ "target": "launch.md" })).unwrap();
+    let patch = serde_json::to_vec(
+        &json!({ "target": target, "ops": [{ "set": "status", "value": "doing" }] }),
+    )
+    .unwrap();
+    let create = serde_json::to_vec(
+        &json!({ "parent": "launch.md", "record": { "type": "work-item", "title": "x", "status": "todo" } }),
+    )
+    .unwrap();
+    let query = serde_json::to_vec(&json!({ "query": "open" })).unwrap();
+    let promote = serde_json::to_vec(&json!({ "target": target, "to": "file" })).unwrap();
+    let denied = |r: Result<Vec<u8>, ToolError>, what: &str| {
+        let err = r.expect_err(what);
+        assert!(
+            matches!(err, ToolError::PermissionDenied(_)),
+            "{what}: {err:?}"
+        );
+    };
+    let scoped = |read: &[&str], write: &[&str]| {
+        DataTool::new(
+            s.clone(),
+            Arc::new(FsScoped {
+                read: read.iter().map(|p| p.to_string()).collect(),
+                write: write.iter().map(|p| p.to_string()).collect(),
+            }),
+        )
+    };
+
+    // Read everywhere, write nowhere: every read works, every write is refused.
+    let ro = scoped(&["/"], &[]);
+    ro.execute_as("alice", "describe", b"{}")
+        .await
+        .expect("describe");
+    ro.execute_as("alice", "query", &query)
+        .await
+        .expect("query");
+    ro.execute_as("alice", "get", &get)
+        .await
+        .expect("anchored get");
+    ro.execute_as("alice", "get", &get_file)
+        .await
+        .expect("file get");
+    denied(ro.execute_as("alice", "patch", &patch).await, "patch");
+    denied(ro.execute_as("alice", "create", &create).await, "create");
+    denied(ro.execute_as("alice", "promote", &promote).await, "promote");
+
+    // Confined to another subtree: this file is out of reach, read or write, and the
+    // whole-workspace methods need `/`.
+    let elsewhere = scoped(&["/notes"], &["/notes"]);
+    elsewhere
+        .execute_as("alice", "describe", b"{}")
+        .await
+        .expect("describe needs only the grant");
+    denied(
+        elsewhere.execute_as("alice", "get", &get_file).await,
+        "file get",
+    );
+    denied(
+        elsewhere.execute_as("alice", "get", &get).await,
+        "anchored get",
+    );
+    denied(
+        elsewhere.execute_as("alice", "patch", &patch).await,
+        "patch",
+    );
+    denied(
+        elsewhere.execute_as("alice", "query", &query).await,
+        "query",
+    );
+
+    // Confined to the file itself: single-file methods work, multi-file ones do not.
+    let here = scoped(&["/launch.md"], &["/launch.md"]);
+    here.execute_as("alice", "patch", &patch)
+        .await
+        .expect("patch");
+    here.execute_as("alice", "create", &create)
+        .await
+        .expect("create");
+    denied(here.execute_as("alice", "query", &query).await, "query");
+    denied(
+        here.execute_as("alice", "promote", &promote).await,
+        "promote",
+    );
+
+    // A grant of some other family (the retired `data` one included) opens nothing.
+    denied(
+        DataTool::new(s.clone(), Arc::new(DenyAll))
+            .execute_as("alice", "describe", b"{}")
+            .await,
+        "no fs grant",
     );
 }

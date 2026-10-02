@@ -135,7 +135,7 @@ pub(crate) fn build_capability_catalog(
     Ok(StaticCapabilityCatalog::new(names))
 }
 
-/// Operator-facing rendering of a `PackError` (plan §2.7: `PackNotFound` reads
+/// Operator-facing rendering of a `PackError` (`PackNotFound` reads
 /// "not installed"; everything else is the error's Display).
 fn render_error(e: &PackError) -> String {
     match e {
@@ -285,7 +285,7 @@ async fn run_list_async(packs_dir: Option<PathBuf>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-// ── `advance pack build` (entity-data lane E2, plan §3.4) ───────────────────────────────────
+// ── `advance pack build` ───────────────────────────────────
 
 /// Source pack directories stay text-only; `packs/<name>.build.yaml` beside the pack names
 /// the guest crates whose `tool.wasm` a build produces.
@@ -630,7 +630,7 @@ pub fn build_pack(src: &Path, out_root: &Path) -> Result<BuiltPack, PackBuildErr
     Ok(BuiltPack { dir: out, tools })
 }
 
-// ── `advance pack keygen` / `sign` / `bundle` (entity-data lane E4, plan §5) ────────────────
+// ── `advance pack keygen` / `sign` / `bundle` ────────────────
 
 /// Sign `<dir>/pack.yaml` with `secret` (an ed25519 seed), write `<dir>/pack.sig`, and return
 /// the lower-case hex public key (the trust root operators list in `pack.trust-roots`).

@@ -34,7 +34,7 @@ use advance_shared_types::agent_tree::{AgentId, AgentKind, AgentTreeReader, Agen
 use advance_shared_types::capability::CapRequest;
 use advance_shared_types::mailbox::AgentActionDispatcher;
 use advance_shared_types::traits::EventBusEmit;
-use cap_grant::{GrantDraft, GrantStore, GrantTtl, SubsetValidatorImpl};
+use cap_grant::{GrantDraft, GrantStatus, GrantStore, GrantTtl, SubsetValidatorImpl};
 use cap_lifecycle::{AgentTreeStore, SpawnObserver};
 
 use crate::agent_loop::{
@@ -409,28 +409,44 @@ impl PerChildLoopManager {
         let Some(grant_store) = self.grant_store.as_ref() else {
             return;
         };
+        let now = chrono::Utc::now();
         let parent_grants = grant_store.list_by_grantee(parent_bare);
         let validator = SubsetValidatorImpl::new();
         for cap in caps {
             let cap_name = cap.capability.as_str();
-            let Some(pg) = parent_grants
-                .iter()
-                .find(|g| g.capability.as_str() == cap_name)
-            else {
+            // Only a grant that still authorizes the parent can be delegated from.
+            let Some(pg) = parent_grants.iter().find(|g| {
+                g.capability.as_str() == cap_name
+                    && g.status == GrantStatus::Active
+                    && g.expires_at.map_or(true, |t| t > now)
+            }) else {
                 continue;
             };
+            // The child gets what the parent holds: a restricted parent grant is delegated
+            // with the same params (a whole-capability draft would be refused as a widening).
+            // `fs` path params are relative to the grantee's own territory, so they do not
+            // carry over to a child; that case is reported instead of delegated.
+            if cap_name == "fs" && !pg.params.is_empty() {
+                eprintln!(
+                    "advance: WARN child {child_bare} gets no `fs` grant: the parent's `fs` \
+                     grant is path-restricted and paths do not carry across territories"
+                );
+                continue;
+            }
             let draft = GrantDraft {
                 capability: cap_name.to_string(),
-                params: Vec::new(),
+                params: pg.params.clone(),
                 ttl: GrantTtl::Persistent,
             };
-            let _ = grant_store.delegate_grant(
+            if let Err(e) = grant_store.delegate_grant(
                 pg.id.as_str(),
                 child_bare,
                 draft,
                 parent_bare,
                 &validator,
-            );
+            ) {
+                eprintln!("advance: WARN child {child_bare} gets no `{cap_name}` grant: {e}");
+            }
         }
     }
 }

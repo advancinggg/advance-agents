@@ -1,5 +1,5 @@
 //! GAP-05 (P2, exposure leg) — installed resource-capabilities' `tools[]` reconciled against
-//! host-native tools in the ToolRegistry. See the internal pack gap-closure plan §3.3.
+//! host-native tools in the ToolRegistry.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
