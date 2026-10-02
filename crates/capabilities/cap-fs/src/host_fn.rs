@@ -1130,6 +1130,11 @@ impl HostFunctionHandler for FsWriteHandler {
             // leg.
             git_sync_after_write(&git_sync, &*emitter, &ctx, &path, &physical, &parent_dir).await;
 
+            // A raw Markdown write changes records too: let the entity index follow it.
+            maintainer
+                .notify_record_file_changed(&ctx.agent_id, &path)
+                .await;
+
             emit_fs_event(
                 &*emitter,
                 &ctx.agent_id,
@@ -1480,6 +1485,10 @@ impl HostFunctionHandler for FsDeleteHandler {
             // deletion. Failure emits runtime.degraded.git_sync_failed but
             // fs.delete still returns Ok().
             git_sync_after_delete(&git_sync, &*emitter, &ctx, &path, &physical, &parent_dir).await;
+
+            maintainer
+                .notify_record_file_changed(&ctx.agent_id, &path)
+                .await;
 
             emit_fs_event(
                 &*emitter,

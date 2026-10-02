@@ -131,9 +131,36 @@ pub struct MetaMaintainer {
     /// Per-instance global mutex serializing ALL .meta.yaml writes. Slice B's
     /// pin (acknowledged limitation in plan Risk #14): accept the contention.
     meta_lock: Mutex<()>,
+    /// Told about every Markdown file the `fs` handlers wrote or deleted (see
+    /// [`RecordObserver`]); bound once by the composition root, absent otherwise.
+    record_observer: std::sync::OnceLock<Arc<dyn RecordObserver>>,
+}
+
+/// Follows raw `fs.write` / `fs.delete` of Markdown files, so whatever is derived from their
+/// frontmatter records (the entity index, the change event) stays in step with writes that
+/// did not go through the structured-data path. Called after the file and its `.meta.yaml`
+/// entry are committed; `path` is the caller's virtual path.
+#[async_trait::async_trait]
+pub trait RecordObserver: Send + Sync {
+    async fn record_file_changed(&self, agent_id: &str, path: &str);
 }
 
 impl MetaMaintainer {
+    /// Bind the observer of raw Markdown writes and deletes (first call wins).
+    pub fn set_record_observer(&self, observer: Arc<dyn RecordObserver>) {
+        let _ = self.record_observer.set(observer);
+    }
+
+    /// Report a committed raw write or delete of `path` to the bound observer, if any.
+    pub async fn notify_record_file_changed(&self, agent_id: &str, path: &str) {
+        if !crate::meta_schema::is_markdown_name(path) {
+            return;
+        }
+        if let Some(observer) = self.record_observer.get() {
+            observer.record_file_changed(agent_id, path).await;
+        }
+    }
+
     /// The live schema snapshot (entity-data lane E1: the `fs.write` frontmatter normalize
     /// hook validates against the same schema `.meta.yaml` entries use).
     pub fn schema(&self) -> Arc<crate::meta_schema::MetaSchema> {
@@ -150,6 +177,7 @@ impl MetaMaintainer {
             schema,
             writer,
             meta_lock: Mutex::new(()),
+            record_observer: std::sync::OnceLock::new(),
         }
     }
 

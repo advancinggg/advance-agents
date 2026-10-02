@@ -379,3 +379,24 @@ async fn notes_name_what_did_not_take_effect() {
     assert!(notes.iter().any(|n| n.contains("`grant`")));
     assert!(notes.iter().any(|n| n.contains("`tools`")));
 }
+
+// A pack skill's SKILL.md is what the model reads about it.
+#[tokio::test]
+async fn pack_skill_docs_are_listed_for_the_prompt() {
+    use advance_cli::context_wiring::PackSkillSummaryReader;
+    use advance_context_engine::ports::SkillSummaryReader;
+    let rig = Rig::new();
+    let src = agenda_with_tool(rig.tmp.path());
+    rig.installer()
+        .install(src.to_str().unwrap())
+        .await
+        .unwrap();
+    let reader = PackSkillSummaryReader::new(rig.runtime.clone());
+    let skills = reader.list_skill_summaries("anyone").await;
+    assert_eq!(skills.len(), 1, "{skills:?}");
+    assert_eq!(skills[0].name, "agenda");
+    assert!(!skills[0].summary.is_empty());
+
+    rig.installer().uninstall("agenda", "0.1.1").await.unwrap();
+    assert!(reader.list_skill_summaries("anyone").await.is_empty());
+}

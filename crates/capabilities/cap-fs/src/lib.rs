@@ -72,7 +72,7 @@ pub use host_fn::{
     FsUpdateScopeHandler, FsWriteHandler, DEFAULT_FS_CONCURRENCY, DEFAULT_MAX_LIST_ENTRIES,
     MAX_PATH_BYTES, MAX_READ_BYTES,
 };
-pub use meta_maintainer::{EntryMetaValues, MetaFile, MetaMaintainer};
+pub use meta_maintainer::{EntryMetaValues, MetaFile, MetaMaintainer, RecordObserver};
 pub use meta_schema::{
     schema_changes, AspectSpec, AutoRule, Cmp, DeriveElse, DeriveRule, EnsureRule, FieldSpec,
     FieldType, MetaSchema, MetaSchemaError, MetaSchemaLoader, MetaSchemaWatcher, OperationBinding,

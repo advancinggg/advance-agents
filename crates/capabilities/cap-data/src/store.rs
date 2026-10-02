@@ -525,6 +525,44 @@ impl DataStore {
         Ok((rows, receipt.commit))
     }
 
+    /// Bring the index in line with `path` as it is on disk now, after a write or delete that
+    /// did not go through this store (a raw `fs.write` / `fs.delete`): replace the path's rows
+    /// with the file's current projection, or drop them when the file is gone or holds no
+    /// record, and emit one `data.entity_changed`. Best-effort: the file is the source of
+    /// truth, so a failure here leaves a stale index, never a failed write.
+    pub async fn sync_path(&self, agent: &str, path: &str) {
+        let path = path.trim_start_matches('/');
+        let _guard = self.lock_for(path);
+        let _guard = _guard.lock().await;
+        let bytes = match self.fs.read(agent, path).await {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let rows = match &bytes {
+            Some(bytes) => match parse_frontmatter(bytes) {
+                Ok(Some((doc, _))) => {
+                    project_entities(&doc, &self.schema(), agent, path, self.clock.now())
+                }
+                _ => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        let ids: Vec<EntityId> = rows.iter().map(|r| r.id.clone()).collect();
+        let outcome = if rows.is_empty() {
+            self.index.delete_path(agent, path).await
+        } else {
+            self.index.replace_path(agent, path, rows).await
+        };
+        if outcome.is_ok() {
+            let op = if bytes.is_some() {
+                "fs_write"
+            } else {
+                "fs_delete"
+            };
+            self.emit(agent, path, op, &ids, None);
+        }
+    }
+
     fn emit(&self, agent: &str, path: &str, op: &str, touched: &[EntityId], commit: Option<&str>) {
         let Some(bus) = &self.events else { return };
         let ids: Vec<&str> = touched.iter().map(|t| t.0.as_str()).collect();
@@ -853,6 +891,112 @@ impl DataStore {
         )
         .await?;
         Ok(id)
+    }
+
+    /// Create a new Markdown file at `path` whose frontmatter record is `record`, with
+    /// `body` as its text. The file must not exist; its directory must.
+    pub async fn create_file(
+        &self,
+        agent: &str,
+        path: Target,
+        record: Record,
+        body: &str,
+    ) -> Result<EntityId, DataError> {
+        let Target::Path(path) = path else {
+            return Err(DataError::Invalid("create path must be a file path".into()));
+        };
+        if !cap_fs::meta_schema::is_markdown_name(&path) {
+            return Err(DataError::Invalid(format!(
+                "{path}: a record file is a Markdown file"
+            )));
+        }
+        if record.0.contains_key("items") {
+            return Err(DataError::Invalid("a record cannot carry `items`".into()));
+        }
+        let lock = self.lock_for(&path);
+        let _guard = lock.lock().await;
+        if self.fs.read(agent, &path).await?.is_some() {
+            return Err(DataError::Invalid(format!("{path} already exists")));
+        }
+        let mut fields = json_map_to_yaml(&record.0);
+        if !fields.contains_key(Yaml::String("id".into())) {
+            fields.insert(Yaml::String("id".into()), Yaml::String(self.ids.next_id()));
+        }
+        let id = EntityId(
+            fields
+                .get(Yaml::String("id".into()))
+                .and_then(Yaml::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        );
+        let doc = FrontmatterDoc {
+            fields,
+            items: Vec::new(),
+        };
+        self.commit_doc(
+            agent,
+            &path,
+            doc,
+            None,
+            body.as_bytes(),
+            "create",
+            &[id.clone()],
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Delete a record: an inline item is removed from its file; a file record deletes the
+    /// file (and with it every inline item it holds).
+    pub async fn delete(&self, agent: &str, target: Target) -> Result<(), DataError> {
+        let path = target.path().to_string();
+        let lock = self.lock_for(&path);
+        let _guard = lock.lock().await;
+        let (prev, body) = self.read_doc(agent, &path).await?;
+        match &target {
+            Target::Anchored { id, .. } => {
+                let mut doc = prev.clone();
+                let before = doc.items.len();
+                doc.items.retain(|it| {
+                    it.get(Yaml::String("id".into())).and_then(Yaml::as_str) != Some(id.0.as_str())
+                });
+                if doc.items.len() == before {
+                    return Err(DataError::NotFound(target.render()));
+                }
+                self.commit_doc(
+                    agent,
+                    &path,
+                    doc,
+                    Some(&prev),
+                    &body,
+                    "delete",
+                    std::slice::from_ref(id),
+                )
+                .await?;
+            }
+            Target::Path(_) => {
+                let mut ids: Vec<EntityId> = prev
+                    .id()
+                    .map(|i| EntityId(i.to_string()))
+                    .into_iter()
+                    .collect();
+                ids.extend(prev.items.iter().filter_map(|it| {
+                    it.get(Yaml::String("id".into()))
+                        .and_then(Yaml::as_str)
+                        .map(|i| EntityId(i.to_string()))
+                }));
+                let receipt = self
+                    .fs
+                    .remove(agent, &path, &commit_message("delete", &path))
+                    .await?;
+                self.index
+                    .delete_path(agent, &path)
+                    .await
+                    .map_err(|e| DataError::Io(e.to_string()))?;
+                self.emit(agent, &path, "delete", &ids, receipt.commit.as_deref());
+            }
+        }
+        Ok(())
     }
 
     pub async fn patch(

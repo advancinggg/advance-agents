@@ -292,6 +292,7 @@ pub async fn build_data_store(
 ) -> Arc<DataStore> {
     let schema = Arc::clone(&parts.schema);
     let workspace_root = parts.workspace_root.clone();
+    let maintainer = Arc::clone(&parts.maintainer);
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let store = DataStore::new(
         Arc::new(ChainedWorkspaceFs::new(parts)),
@@ -304,7 +305,11 @@ pub async fn build_data_store(
     .with_reducer(reducer);
     let projector = SchemaEntityProjector::new(schema);
     seed_entity_index(&workspace_root, seed_agent_id, &projector, index.as_ref()).await;
-    Arc::new(store)
+    let store = Arc::new(store);
+    // The `fs.*` handlers share this maintainer: from here on their Markdown writes and
+    // deletes reach the index and emit the change event, like writes through the store.
+    maintainer.set_record_observer(Arc::new(StoreRecordObserver(Arc::clone(&store))));
+    store
 }
 
 /// Project every `.md` under `workspace_root` (hidden dirs skipped) for `agent_id`.
@@ -316,6 +321,8 @@ pub async fn seed_entity_index(
     projector: &dyn EntityProjector,
     index: &dyn EntityIndex,
 ) -> usize {
+    // The index is derived: start from nothing so rows of files that are gone do not linger.
+    let _ = index.truncate(agent_id).await;
     let mut files = Vec::new();
     for entry in walkdir::WalkDir::new(workspace_root)
         .follow_links(false)
@@ -362,6 +369,16 @@ pub async fn seed_entity_index(
         }
     }
     projected
+}
+
+/// Keeps the entity index in step with raw `fs.write` / `fs.delete` of Markdown files.
+pub struct StoreRecordObserver(pub Arc<DataStore>);
+
+#[async_trait]
+impl cap_fs::RecordObserver for StoreRecordObserver {
+    async fn record_file_changed(&self, agent_id: &str, path: &str) {
+        self.0.sync_path(agent_id, path).await;
+    }
 }
 
 /// Register the `data` host tool. Call BEFORE the tool-inventory snapshot.

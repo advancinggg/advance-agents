@@ -1,4 +1,4 @@
-//! [`DataTool`] — the `data` host tool: nine methods, JSON in / JSON out, every error
+//! [`DataTool`] — the `data` host tool: ten methods, JSON in / JSON out, every error
 //! projected to a `tool-error` arm.
 //!
 //! Authorization: the tool is a second interface onto the files the `fs` capability governs,
@@ -9,7 +9,7 @@
 //! |---|---|
 //! | `describe` | any Active `fs` grant |
 //! | `get`, `history` | `read-paths` on the target's file (an anchored `get` on the row's indexed path) |
-//! | `create`, `patch`, `apply` | `read-paths` + `write-paths` on the file |
+//! | `create`, `patch`, `delete`, `apply` | `read-paths` + `write-paths` on the file |
 //! | `query` | `read-paths` on `/` |
 //! | `promote`, `demote` | `read-paths` + `write-paths` on `/` (the second file is computed by the store) |
 //!
@@ -29,9 +29,10 @@ use crate::store::{
     DataError, DataStore, IdempotencyKey, PatchOp, QueryRequest, Record, Target, Tier,
 };
 
-/// The nine methods, in the order `describe()` lists them.
+/// The methods, in the order `describe()` lists them.
 pub const METHODS: &[&str] = &[
-    "describe", "query", "get", "create", "patch", "promote", "demote", "history", "apply",
+    "describe", "query", "get", "create", "patch", "delete", "promote", "demote", "history",
+    "apply",
 ];
 
 fn is_read(method: &str) -> bool {
@@ -90,15 +91,19 @@ impl DataTool {
                 )
                 .map(|()| false),
             _ => {
-                let key = if method == "create" {
-                    "parent"
+                // `create` names the file it writes as `parent` (a new inline item) or `path`
+                // (a new file). A target that does not parse is reported by `dispatch`.
+                let keys: &[&str] = if method == "create" {
+                    &["parent", "path"]
                 } else {
-                    "target"
+                    &["target"]
                 };
-                // A target that does not parse is reported by `dispatch` as invalid input.
                 let Some(target) = serde_json::from_slice::<Value>(params)
                     .ok()
-                    .and_then(|v| v.get(key).and_then(Value::as_str).map(str::to_string))
+                    .and_then(|v| {
+                        keys.iter()
+                            .find_map(|k| v.get(*k).and_then(Value::as_str).map(str::to_string))
+                    })
                     .and_then(|t| Target::parse(&t).ok())
                 else {
                     return Ok(false);
@@ -180,21 +185,61 @@ impl DataTool {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct P {
-                    parent: String,
+                    #[serde(default)]
+                    parent: Option<String>,
+                    #[serde(default)]
+                    path: Option<String>,
                     record: Value,
+                    #[serde(default)]
+                    body: Option<String>,
                 }
                 let p: P = parse(params)?;
-                let id = self
-                    .store
-                    .create(
-                        agent,
-                        Target::parse(&p.parent)?,
-                        Record::from_json(p.record),
-                    )
-                    .await?;
-                Ok(
-                    json!({ "id": id.0, "target": format!("{}#{}", p.parent.trim_start_matches('/'), id.0) }),
-                )
+                match (p.parent, p.path) {
+                    (Some(parent), None) => {
+                        if p.body.is_some() {
+                            return Err(DataError::Invalid(
+                                "`body` goes with `path` (a new file)".into(),
+                            ));
+                        }
+                        let id = self
+                            .store
+                            .create(agent, Target::parse(&parent)?, Record::from_json(p.record))
+                            .await?;
+                        Ok(
+                            json!({ "id": id.0, "target": format!("{}#{}", parent.trim_start_matches('/'), id.0) }),
+                        )
+                    }
+                    (None, Some(path)) => {
+                        let target = Target::parse(&path)?;
+                        let rendered = target.render();
+                        let id = self
+                            .store
+                            .create_file(
+                                agent,
+                                target,
+                                Record::from_json(p.record),
+                                p.body.as_deref().unwrap_or(""),
+                            )
+                            .await?;
+                        Ok(json!({ "id": id.0, "target": rendered }))
+                    }
+                    _ => Err(DataError::Invalid(
+                        "create takes either `parent` (a new inline item) or `path` (a new file)"
+                            .into(),
+                    )),
+                }
+            }
+            "delete" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct P {
+                    target: String,
+                }
+                let p: P = parse(params)?;
+                let target = Target::parse(&p.target)?;
+                let rendered = target.render();
+                self.store.delete(agent, target).await?;
+                Ok(json!({ "deleted": rendered }))
             }
             "patch" => {
                 #[derive(Deserialize)]
@@ -368,13 +413,14 @@ impl HostTool for DataTool {
         let row = json!({ "type": "object" });
         let rows = json!({ "type": "array", "items": { "type": "object" } });
         ToolDescription {
-            description: "Structured data over frontmatter: describe the schema, query the index, and create / patch / promote / demote / apply operations on entities. Every write is validated against the schema and committed by the host.".into(),
+            description: "Structured data over frontmatter: describe the schema, query the index, and create / patch / delete / promote / demote / apply operations on entities. Every write is validated against the schema and committed by the host.".into(),
             methods: vec![
                 method("describe", "The merged schema: aspects, fields, queries, views, operations", obj(json!({}), vec![]), json!({ "type": "object" })),
                 method("query", "Run a named query (`query` + `args`) or an ad-hoc `filter`", obj(json!({ "query": { "type": "string" }, "args": { "type": "object" }, "filter": { "type": "object" } }), vec![]), rows.clone()),
                 method("get", "One record", obj(json!({ "target": target }), vec!["target"]), row.clone()),
-                method("create", "Add an inline item under a file", obj(json!({ "parent": { "type": "string" }, "record": { "type": "object" } }), vec!["parent", "record"]), json!({ "type": "object", "properties": { "id": { "type": "string" }, "target": { "type": "string" } } })),
+                method("create", "Add an inline item under a file (`parent`), or create a new Markdown file whose frontmatter is the record (`path`, optional `body`)", obj(json!({ "parent": { "type": "string" }, "path": { "type": "string" }, "body": { "type": "string" }, "record": { "type": "object" } }), vec!["record"]), json!({ "type": "object", "properties": { "id": { "type": "string" }, "target": { "type": "string" } } })),
                 method("patch", "Set / unset fields of a record", obj(json!({ "target": target, "ops": { "type": "array", "items": { "type": "object" } } }), vec!["target", "ops"]), row.clone()),
+                method("delete", "Delete a record: an inline item, or a file with every item it holds", obj(json!({ "target": target }), vec!["target"]), json!({ "type": "object" })),
                 method("promote", "Inline item → file, or file → directory", obj(json!({ "target": target, "to": { "type": "string", "enum": ["file", "dir"] } }), vec!["target", "to"]), json!({ "type": "object" })),
                 method("demote", "File → inline item of its parent", obj(json!({ "target": target }), vec!["target"]), json!({ "type": "object" })),
                 method("history", "Versions of one record, newest first", obj(json!({ "target": target, "limit": { "type": "integer", "minimum": 1, "maximum": 200 } }), vec!["target"]), rows),

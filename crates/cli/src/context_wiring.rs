@@ -368,6 +368,58 @@ impl SkillSummaryReader for DiskSkillSummaryReader {
     }
 }
 
+/// The skills installed packs ship, read from each pack's `skills/<name>/SKILL.md` (bounded,
+/// stat-before-open, like [`DiskSkillSummaryReader`]). The pack set is read on every call, so
+/// a hot install or uninstall shows on the next turn.
+pub struct PackSkillSummaryReader {
+    runtime: Arc<crate::pack_runtime::PackRuntime>,
+}
+
+impl PackSkillSummaryReader {
+    pub fn new(runtime: Arc<crate::pack_runtime::PackRuntime>) -> Self {
+        Self { runtime }
+    }
+}
+
+#[async_trait]
+impl SkillSummaryReader for PackSkillSummaryReader {
+    async fn list_skill_summaries(&self, _agent_id: &str) -> Vec<SkillSummaryEntry> {
+        self.runtime
+            .skill_docs()
+            .into_iter()
+            .take(MAX_VISIBLE_SKILLS)
+            .filter_map(|(name, doc)| {
+                let content = read_regular_capped(&doc, MAX_SKILL_READ_BYTES)?;
+                Some(SkillSummaryEntry {
+                    name,
+                    summary: extract_skill_summary(&content),
+                    score: 0.0,
+                })
+            })
+            .collect()
+    }
+}
+
+/// The agent's own skills followed by pack skills; a pack skill whose name the agent
+/// already has is dropped (the workspace skill wins, as for skill tools).
+struct ChainedSkillSummary {
+    own: Arc<dyn SkillSummaryReader>,
+    packs: Arc<dyn SkillSummaryReader>,
+}
+
+#[async_trait]
+impl SkillSummaryReader for ChainedSkillSummary {
+    async fn list_skill_summaries(&self, agent_id: &str) -> Vec<SkillSummaryEntry> {
+        let mut out = self.own.list_skill_summaries(agent_id).await;
+        for entry in self.packs.list_skill_summaries(agent_id).await {
+            if !out.iter().any(|e| e.name == entry.name) {
+                out.push(entry);
+            }
+        }
+        out
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Real-able ports the caller supplies (with reusable production constructors).
 // ─────────────────────────────────────────────────────────────────────────
@@ -1212,12 +1264,50 @@ pub fn build_context_assembler_for_agent_with_decomposition(
     skills_agent_root: Option<&Path>,
     decomposition: Arc<dyn DecompositionReader>,
 ) -> Arc<dyn ContextAssembler> {
+    build_context_assembler_for_agent_with_pack_skills(
+        event_bus,
+        callable_inventory,
+        host_fn_inventory,
+        agent_tree,
+        memory,
+        write_agent_id,
+        query_aliases,
+        memory_root,
+        skills_agent_root,
+        decomposition,
+        None,
+    )
+}
+
+/// [`build_context_assembler_for_agent_with_decomposition`] plus `pack_skills`: the skills of
+/// installed packs, listed after the agent's own in `# Available Skills`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_context_assembler_for_agent_with_pack_skills(
+    event_bus: Arc<dyn EventBusEmit>,
+    callable_inventory: Arc<dyn CallableInventoryReader>,
+    host_fn_inventory: Arc<dyn HostFnInventoryReader>,
+    agent_tree: Arc<dyn AgentTreeSnapshot>,
+    memory: Option<Arc<MemoryStore>>,
+    write_agent_id: &str,
+    query_aliases: &[String],
+    memory_root: Option<&Path>,
+    skills_agent_root: Option<&Path>,
+    decomposition: Arc<dyn DecompositionReader>,
+    pack_skills: Option<Arc<dyn SkillSummaryReader>>,
+) -> Arc<dyn ContextAssembler> {
     // The skill-summary reader is INDEPENDENT of the memory capability. `Some` →
     // the real DiskSkillSummaryReader over the agent's on-disk activated skills;
     // `None` → StubSkillSummary (byte-identical to pre-satellite, in BOTH arms).
     let skill_summary: Arc<dyn SkillSummaryReader> = match skills_agent_root {
         Some(root) => Arc::new(DiskSkillSummaryReader::new(root.to_path_buf())),
         None => Arc::new(StubSkillSummary),
+    };
+    let skill_summary: Arc<dyn SkillSummaryReader> = match pack_skills {
+        Some(packs) => Arc::new(ChainedSkillSummary {
+            own: skill_summary,
+            packs,
+        }),
+        None => skill_summary,
     };
     match memory {
         Some(store) => {

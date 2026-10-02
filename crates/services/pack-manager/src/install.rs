@@ -836,8 +836,11 @@ impl Installer {
             source: e,
         })?;
 
-        // Disk truth under the lock.
-        self.registry.rescan().await?;
+        // Disk truth under the lock. A registry that cannot be rescanned (some installed
+        // pack is damaged) must not make removal impossible: removing the damaged pack is
+        // the repair. In that case the on-disk index decides, and the dependents check,
+        // which needs every manifest, is skipped.
+        let scanned = self.registry.rescan().await.is_ok();
         let install_path = self.packs_dir.join(&key);
         let dir_present = match std::fs::symlink_metadata(&install_path) {
             Ok(md) => {
@@ -857,11 +860,19 @@ impl Installer {
                 });
             }
         };
-        let indexed = self.registry.has(name, version);
+        let indexed = if scanned {
+            self.registry.has(name, version)
+        } else {
+            read_meta_index(&self.packs_dir)?.packs.contains_key(&key)
+        };
         if !dir_present && !indexed {
             return Err(PackError::PackNotFound(name.into(), version.into()));
         }
-        let dependents = self.registry.dependents_of(name, version);
+        let dependents = if scanned {
+            self.registry.dependents_of(name, version)
+        } else {
+            Vec::new()
+        };
         if !dependents.is_empty() {
             return Err(PackError::DependentsExist {
                 name: name.into(),
@@ -879,7 +890,12 @@ impl Installer {
         if idx.packs.remove(&key).is_some() {
             write_meta_index_atomic(&self.packs_dir, &idx)?;
         }
-        self.registry.rescan().await?;
+        // After a degraded removal another damaged pack may still fail the rescan; the
+        // removal itself is done.
+        let rescanned = self.registry.rescan().await;
+        if scanned {
+            rescanned?;
+        }
         if let Some(bus) = &self.event_bus {
             bus.emit(pack_event(
                 PACK_UNINSTALLED_EVENT,

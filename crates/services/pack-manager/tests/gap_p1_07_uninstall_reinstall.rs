@@ -248,3 +248,32 @@ async fn a_failed_install_leaves_no_directory() {
         .await
         .expect("the retry is not blocked by a stale directory");
 }
+
+// A damaged installed pack fails every rescan; uninstall must still remove it (and any
+// other pack), otherwise the only repair is deleting directories by hand.
+#[tokio::test]
+async fn a_damaged_pack_can_still_be_uninstalled() {
+    let work = tempfile::TempDir::new().unwrap();
+    let packs = tempfile::TempDir::new().unwrap();
+    let good = write_pack(work.path(), "good", "1.0.0", &[]);
+    let bad = write_pack(work.path(), "bad", "1.0.0", &[]);
+    let inst = installer(packs.path(), Arc::new(RecordingTraceSink::new()));
+    inst.install(good.to_str().unwrap()).await.unwrap();
+    inst.install(bad.to_str().unwrap()).await.unwrap();
+
+    std::fs::remove_file(packs.path().join("bad@1.0.0/pack.yaml")).unwrap();
+    assert!(
+        inst.registry.rescan().await.is_err(),
+        "the registry is broken"
+    );
+
+    inst.uninstall("bad", "1.0.0")
+        .await
+        .expect("the damaged pack is removable");
+    assert!(!packs.path().join("bad@1.0.0").exists());
+    inst.registry
+        .rescan()
+        .await
+        .expect("the registry is healthy again");
+    assert!(inst.registry.has("good", "1.0.0"));
+}

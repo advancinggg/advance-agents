@@ -465,6 +465,21 @@ impl PackRuntime {
         })
     }
 
+    /// `(skill name, SKILL.md path)` of every skill the applied packs ship (highest version
+    /// per pack, pack-name order), for the agent's `# Available Skills` section.
+    pub fn skill_docs(&self) -> Vec<(String, PathBuf)> {
+        let mut ignored = Vec::new();
+        let mut out = Vec::new();
+        for pack in effective_packs(self.registry.list_installed(), &mut ignored) {
+            for skill in self.provides_of(&pack, ComponentKind::Skill) {
+                let doc = path_for_kind(&pack.install_path, ComponentKind::Skill, &skill)
+                    .join("SKILL.md");
+                out.push((skill, doc));
+            }
+        }
+        out
+    }
+
     /// What an operator should know about `name@version` after an apply: the warnings of
     /// that pack in `report`, the parts this runtime could not apply because the root agent
     /// does not declare the capability that owns them, and the content kinds no part of the

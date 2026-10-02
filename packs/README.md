@@ -59,8 +59,9 @@ applies.
 Of the eleven content kinds, the runtime activates `agent-templates` (when an agent is
 spawned from one), `presets`, `meta-schema-extensions` and the `tool.wasm` of `skills`. The
 others (`behavior-binaries`, `components`, `channel-adapters`, `mcp-servers`, `workflows`,
-`memory-seeds`, `resource-capabilities`, and a skill's `SKILL.md`) install and list, and
-nothing consumes them yet; install says so. A pack's `dependencies:` are installed from the
+`memory-seeds`, `resource-capabilities`) install and list, and nothing consumes them yet;
+install says so. A skill's `SKILL.md` is listed under the agent's available skills when the
+agent can reach tools. A pack's `dependencies:` are installed from the
 configured registry when they are not present already.
 
 ## Contribution rules
@@ -80,8 +81,8 @@ configured registry when they are not present already.
 6. Structured data lives in frontmatter. A pack declares vocabulary (fields, invariants,
    queries, views, operation bindings) in `meta-schema-extensions/`; it never ships code that
    touches storage. The runtime enforces the declared invariants on every write of a Markdown
-   file, through the `data` host tool and through `fs.write` alike; only the `data` tool
-   updates the entity index and emits the change event.
+   file, through the `data` host tool and through `fs.write` alike, and both keep the entity
+   index and the change event in step.
 
 The `agenda` pack declares the first aspect and is the reference for the entity model
 (frontmatter records, inline items, the `data` host tool).

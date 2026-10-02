@@ -4,7 +4,7 @@
 //! the operations layer on top of cap-fs's representation (frontmatter codec, meta-schema v2,
 //! entity projection) and the [`EntityIndex`] port:
 //!
-//! - [`DataStore`]: `describe` / `query` / `get` / `create` / `patch` / `promote` / `demote` /
+//! - [`DataStore`]: `describe` / `query` / `get` / `create` / `patch` / `delete` / `promote` / `demote` /
 //!   `history` / `apply`, every write running the ONE host-owned transaction — lock the path →
 //!   read → compute the new document → `normalize` (types, enums, transitions, derived fields,
 //!   `ensure`) → canonical write + commit → index → one `data.entity_changed` event. Any failure

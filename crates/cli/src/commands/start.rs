@@ -454,6 +454,7 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
         wiring_handles.tool_registry.clone(),
         wiring_handles.tools_grant_reader.clone(),
         wiring_handles.web_grant.clone(),
+        Some(wiring_handles.pack_runtime.clone()),
     )
     .await
     {
@@ -892,6 +893,7 @@ async fn try_spawn_agent_loop(
     tool_registry: Option<Arc<dyn cap_tools::ToolRegistry>>,
     tools_grant_reader: Option<Arc<dyn advance_shared_types::traits::ToolsGrantReader>>,
     web_grant: Option<Arc<dyn advance_shared_types::traits::GrantCheck>>,
+    pack_runtime: Option<Arc<crate::pack_runtime::PackRuntime>>,
 ) -> Result<Option<SpawnedAgentLoop>, String> {
     // MODULE-001-AC-20 (024): resolve the canonical materialized name + (if a core
     // module) encode it to a Component on the fly. `None` → no driver deployed → park.
@@ -1173,7 +1175,7 @@ async fn try_spawn_agent_loop(
             Arc::new(crate::context_wiring::EmptyCallableInventory)
         };
         client_api_tools = tool_registry.as_ref().map(|_| Arc::clone(&callable));
-        let inner = crate::context_wiring::build_context_assembler_for_agent_with_decomposition(
+        let inner = crate::context_wiring::build_context_assembler_for_agent_with_pack_skills(
             assembler_bus,
             callable,
             Arc::new(crate::context_wiring::FixedHostFnInventory::new(
@@ -1191,6 +1193,13 @@ async fn try_spawn_agent_loop(
             // (Some iff `skills` declared — already gated in wiring.rs).
             skills_root.as_deref(),
             decomposition,
+            // Installed packs' skills, for an agent that can reach their tools.
+            pack_runtime
+                .filter(|_| tool_registry.is_some())
+                .map(|runtime| {
+                    Arc::new(crate::context_wiring::PackSkillSummaryReader::new(runtime))
+                        as Arc<dyn advance_context_engine::ports::SkillSummaryReader>
+                }),
         );
         // Wave-12 (SYS-AC-122): LATE-BIND THIS per-agent assembler into the
         // process-global tool-path RepetitionGuard (built at wire_capabilities
@@ -1417,6 +1426,7 @@ pub async fn spawn_test_agent_loop(
         handles.tool_registry.clone(),
         handles.tools_grant_reader.clone(),
         handles.web_grant.clone(),
+        Some(handles.pack_runtime.clone()),
     )
     .await
     .map(|spawned| spawned.map(|inner| TestServeLoop { inner }))

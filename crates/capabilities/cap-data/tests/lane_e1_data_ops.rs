@@ -35,6 +35,13 @@ fn store(ws: &tempfile::TempDir) -> (DataStore, Arc<RecordingEvents>) {
     (s, events)
 }
 
+async fn open_count(s: &DataStore) -> usize {
+    s.query("alice", QueryRequest::named("open", Value::Null))
+        .await
+        .unwrap()
+        .len()
+}
+
 fn launch() -> Target {
     Target::Path("launch.md".into())
 }
@@ -648,7 +655,7 @@ async fn e1_describe_reports_aspects_and_operation_availability() {
 // ── the `data` host tool ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn e1_data_tool_describes_nine_methods_with_schemas() {
+async fn e1_data_tool_describes_its_methods_with_schemas() {
     let ws = tempfile::TempDir::new().unwrap();
     let (s, _) = store(&ws);
     let tool = DataTool::new(Arc::new(s), Arc::new(AllowAll));
@@ -657,7 +664,8 @@ async fn e1_data_tool_describes_nine_methods_with_schemas() {
     assert_eq!(
         names,
         vec![
-            "describe", "query", "get", "create", "patch", "promote", "demote", "history", "apply"
+            "describe", "query", "get", "create", "patch", "delete", "promote", "demote",
+            "history", "apply"
         ]
     );
     for m in &d.methods {
@@ -838,4 +846,108 @@ async fn data_tool_is_authorized_by_the_fs_grant_of_the_touched_file() {
             .await,
         "no fs grant",
     );
+}
+
+// The tool covers the whole life of a record: a new file, an inline item, and their removal.
+#[tokio::test]
+async fn data_tool_creates_a_record_file_and_deletes_records() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let (s, events) = store(&ws);
+    let s = Arc::new(s);
+    let tool = DataTool::new(s.clone(), Arc::new(AllowAll));
+    let call = |method: &'static str, params: Value| {
+        let tool = &tool;
+        async move {
+            tool.execute_as("alice", method, &serde_json::to_vec(&params).unwrap())
+                .await
+        }
+    };
+
+    let made: Value = serde_json::from_slice(
+        &call(
+            "create",
+            json!({ "path": "review.md", "body": "# Review\n", "record": { "type": "work-item", "title": "review", "status": "todo" } }),
+        )
+        .await
+        .expect("create a record file"),
+    )
+    .unwrap();
+    assert_eq!(made["target"], "review.md");
+    let text = std::fs::read_to_string(ws.path().join("review.md")).unwrap();
+    assert!(
+        text.contains("status: todo") && text.ends_with("# Review\n"),
+        "{text}"
+    );
+    assert!(matches!(
+        call(
+            "create",
+            json!({ "path": "review.md", "record": { "type": "work-item" } })
+        )
+        .await,
+        Err(ToolError::InputValidationFailed(_))
+    ));
+    assert!(matches!(
+        call(
+            "create",
+            json!({ "path": "notes.txt", "record": { "type": "work-item" } })
+        )
+        .await,
+        Err(ToolError::InputValidationFailed(_))
+    ));
+
+    let item: Value = serde_json::from_slice(
+        &call(
+            "create",
+            json!({ "parent": "review.md", "record": { "type": "work-item", "title": "sub", "status": "todo" } }),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let item_target = item["target"].as_str().unwrap().to_string();
+    assert_eq!(open_count(&s).await, 2);
+
+    call("delete", json!({ "target": item_target }))
+        .await
+        .expect("delete the item");
+    assert_eq!(open_count(&s).await, 1);
+    assert!(matches!(
+        call("delete", json!({ "target": item_target })).await,
+        Err(ToolError::NotFound(_))
+    ));
+
+    call("delete", json!({ "target": "review.md" }))
+        .await
+        .expect("delete the file");
+    assert!(!ws.path().join("review.md").exists());
+    assert_eq!(open_count(&s).await, 0);
+    assert_eq!(events.snapshot().last().unwrap().payload["op"], "delete");
+}
+
+// A file written or removed outside the store (a raw `fs.write` / `fs.delete`) is picked up
+// by `sync_path`, which the fs handlers call.
+#[tokio::test]
+async fn sync_path_follows_raw_writes_and_deletes() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let (s, events) = store(&ws);
+    assert_eq!(open_count(&s).await, 0);
+
+    std::fs::write(
+        ws.path().join("raw.md"),
+        "---\nid: e-raw\ntype: work-item\nname: raw\nstatus: todo\n---\nbody\n",
+    )
+    .unwrap();
+    assert_eq!(
+        open_count(&s).await,
+        0,
+        "the index has not seen the raw write"
+    );
+    s.sync_path("alice", "/raw.md").await;
+    assert_eq!(open_count(&s).await, 1);
+    assert_eq!(events.snapshot().last().unwrap().payload["op"], "fs_write");
+
+    std::fs::remove_file(ws.path().join("raw.md")).unwrap();
+    s.sync_path("alice", "raw.md").await;
+    assert_eq!(open_count(&s).await, 0);
+    assert_eq!(events.snapshot().last().unwrap().payload["op"], "fs_delete");
 }
