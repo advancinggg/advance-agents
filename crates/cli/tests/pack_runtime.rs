@@ -400,3 +400,29 @@ async fn pack_skill_docs_are_listed_for_the_prompt() {
     rig.installer().uninstall("agenda", "0.1.1").await.unwrap();
     assert!(reader.list_skill_summaries("anyone").await.is_empty());
 }
+
+// The core's own lifecycle marker is `lifecycle`, so a pack aspect owns `status` outright:
+// installing agenda takes nothing away from the base vocabulary, and uninstalling it leaves
+// `status` unconstrained again.
+#[tokio::test]
+async fn a_pack_status_field_does_not_collide_with_the_core_lifecycle_field() {
+    let rig = Rig::new();
+    let base = rig.loader.current();
+    assert!(base.record_field("lifecycle").is_some());
+    assert!(base.record_field("status").is_none());
+
+    let src = agenda_with_tool(rig.tmp.path());
+    rig.installer()
+        .install(src.to_str().unwrap())
+        .await
+        .unwrap();
+    let report = rig.runtime.apply().await;
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    let live = rig.loader.current();
+    assert!(live.record_field("lifecycle").is_some(), "base field kept");
+    assert!(live.aspects["agenda"].fields.contains_key("status"));
+
+    rig.installer().uninstall("agenda", "0.1.1").await.unwrap();
+    rig.runtime.apply().await;
+    assert!(rig.loader.current().record_field("status").is_none());
+}

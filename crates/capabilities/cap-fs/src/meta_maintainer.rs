@@ -37,8 +37,9 @@ pub struct EntryMetaValues {
     pub r#type: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// The entry's lifecycle marker (`draft` / `active` / `archived`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
+    pub lifecycle: Option<String>,
     /// Schema-extension fields (e.g. `priority: 0`, `published: false`).
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, serde_yml::Value>,
@@ -290,7 +291,7 @@ impl MetaMaintainer {
                                     .collect();
                             }
                         }
-                        "status" => {
+                        "lifecycle" => {
                             if let serde_yml::Value::String(s) = default {
                                 status = Some(s.clone());
                             }
@@ -308,7 +309,7 @@ impl MetaMaintainer {
                 description,
                 r#type,
                 tags,
-                status,
+                lifecycle: status,
                 extra,
             };
             meta.entries.insert(file_name.to_string(), entry);
@@ -505,7 +506,7 @@ impl MetaMaintainer {
             raw_desc
         };
         scope.tags = Vec::new();
-        scope.status = None;
+        scope.lifecycle = None;
         MetaFile {
             scope,
             entries: BTreeMap::new(),
@@ -607,9 +608,9 @@ fn serialize_meta_yaml(meta: &MetaFile) -> Result<String, FsError> {
             ),
         );
     }
-    if let Some(status) = &meta.scope.status {
+    if let Some(status) = &meta.scope.lifecycle {
         scope_map.insert(
-            serde_yml::Value::String("status".to_string()),
+            serde_yml::Value::String("lifecycle".to_string()),
             serde_yml::Value::String(status.clone()),
         );
     }
@@ -660,9 +661,9 @@ fn serialize_meta_yaml(meta: &MetaFile) -> Result<String, FsError> {
                 ),
             );
         }
-        if let Some(status) = &entry.status {
+        if let Some(status) = &entry.lifecycle {
             em.insert(
-                serde_yml::Value::String("status".to_string()),
+                serde_yml::Value::String("lifecycle".to_string()),
                 serde_yml::Value::String(status.clone()),
             );
         }
@@ -748,9 +749,9 @@ fn parse_scope_block(v: serde_yml::Value) -> Result<ScopeMeta, FsError> {
                         .collect();
                 }
             }
-            "status" => {
+            "lifecycle" => {
                 if let serde_yml::Value::String(s) = val {
-                    scope.status = Some(s);
+                    scope.lifecycle = Some(s);
                 }
             }
             // Explicit `_scope.type` overrides the `Default` (`collection`);
@@ -816,7 +817,7 @@ fn parse_entry_block(_name: &str, v: serde_yml::Value) -> Result<EntryMetaValues
                         .collect();
                 }
             }
-            "status" => {
+            "lifecycle" => {
                 if let serde_yml::Value::String(s) = val {
                     status = Some(s);
                 }
@@ -839,7 +840,7 @@ fn parse_entry_block(_name: &str, v: serde_yml::Value) -> Result<EntryMetaValues
         description,
         r#type,
         tags,
-        status,
+        lifecycle: status,
         extra,
     })
 }
@@ -878,7 +879,7 @@ mod tests {
                 description: "the x file".into(),
                 r#type: "document".into(),
                 tags: vec![],
-                status: None,
+                lifecycle: None,
                 extra: BTreeMap::new(),
             },
         );

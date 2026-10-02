@@ -154,7 +154,7 @@ optional:
   tags:
     type: list<string>
     default: []
-  status:
+  lifecycle:
     type: [draft, active, archived]
     default: active
 ";
@@ -232,8 +232,10 @@ impl Default for MetaSchema {
                 inherit: false,
             },
         );
+        // The entry's lifecycle marker. It is named `lifecycle`, not `status`, so that a pack
+        // aspect is free to give `status` its own meaning (a task state, an order state).
         optional.insert(
-            "status".to_string(),
+            "lifecycle".to_string(),
             FieldSpec {
                 field_type: FieldType::EnumString(vec![
                     "draft".to_string(),
@@ -1239,7 +1241,7 @@ mod tests {
         assert!(s.required.contains_key("description"));
         assert!(s.required.contains_key("type"));
         assert!(s.optional.contains_key("tags"));
-        assert!(s.optional.contains_key("status"));
+        assert!(s.optional.contains_key("lifecycle"));
     }
 
     // --- AC-18: entity `type` deterministic auto-population (MODULE-002-T52) ---

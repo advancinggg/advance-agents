@@ -910,7 +910,7 @@ async fn round1_add_entry_for_write_applies_optional_defaults() {
     let entry = meta.entries.get("x.md").unwrap();
     // Default schema's optional fields: tags=[], status=active.
     assert_eq!(entry.tags, Vec::<String>::new());
-    assert_eq!(entry.status, Some("active".to_string()));
+    assert_eq!(entry.lifecycle, Some("active".to_string()));
 }
 
 // Round 1 fix: schema-load validation rejects mismatched default value types.

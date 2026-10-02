@@ -78,7 +78,9 @@ pub struct ScopeMeta {
     pub slug: Option<String>,
     pub description: String,
     pub tags: Vec<String>,
-    pub status: Option<String>,
+    /// The scope's lifecycle marker. The guest interface record still names this field
+    /// `status`: prebuilt guests are bound to that record shape.
+    pub lifecycle: Option<String>,
     #[serde(rename = "type", default = "default_scope_type")]
     pub r#type: Option<String>,
 }
@@ -89,7 +91,7 @@ impl Default for ScopeMeta {
             slug: None,
             description: String::new(),
             tags: Vec::new(),
-            status: None,
+            lifecycle: None,
             // A scope always represents a directory → `collection` (ADR Decision 1).
             r#type: Some("collection".to_string()),
         }
@@ -147,7 +149,7 @@ pub fn scope_meta_to_val(s: &ScopeMeta) -> Val {
         ),
         (
             "status".to_string(),
-            match &s.status {
+            match &s.lifecycle {
                 Some(v) => Val::Option(Some(Box::new(Val::String(v.clone())))),
                 None => Val::Option(None),
             },
