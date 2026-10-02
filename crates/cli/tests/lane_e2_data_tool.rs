@@ -51,7 +51,7 @@ async fn e2_data_tool_is_listed_and_enters_the_callable_inventory() {
         .iter()
         .find(|t| t.id == "data")
         .expect("`data` is a listed tool");
-    assert_eq!(data.methods.len(), 9);
+    assert_eq!(data.methods.len(), 10);
     assert!(data.methods.iter().any(|m| m.name == "apply"));
 
     // The same snapshot `start.rs` takes for the context assembler's `# Available Tools`.
