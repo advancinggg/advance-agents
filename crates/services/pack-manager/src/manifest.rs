@@ -14,6 +14,7 @@
 //!   review; other files in the pack (.wasm, .yaml in subdirs) ARE checksummed
 //!   by entries in `checksums.files`).
 
+use serde::de::IgnoredAny;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -80,10 +81,26 @@ pub struct PackProvides {
     pub memory_seeds: Vec<String>,
     #[serde(rename = "meta-schema-extensions", default)]
     pub meta_schema_extensions: Vec<String>,
-    /// Type 11 (AC-17, REQ-380) — pack-provided resource capabilities. Each name maps to
-    /// the directory `resource-capabilities/{name}/` with a required `capability.yaml`.
-    #[serde(rename = "resource-capabilities", default)]
-    pub resource_capabilities: Vec<String>,
+    /// Retired content kind. `resource-capabilities` still parses, whatever its value, so a
+    /// pack installed by an older runtime keeps loading, but nothing reads it. Install and
+    /// [`bundle_pack`](crate::bundle_pack) refuse a manifest that declares it
+    /// ([`PackManifest::refuse_retired_provides`]). It is no provides entry and has no length
+    /// cap, name check or on-disk check.
+    #[serde(
+        rename = "resource-capabilities",
+        default,
+        deserialize_with = "declared_retired_key"
+    )]
+    pub retired_resource_capabilities: Option<IgnoredAny>,
+}
+
+/// A retired key counts as declared whatever its value, `null` included (a plain `Option`
+/// would read `null` as absent).
+fn declared_retired_key<'de, D>(deserializer: D) -> Result<Option<IgnoredAny>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    IgnoredAny::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -313,10 +330,6 @@ impl PackManifest {
                 "meta-schema-extensions",
                 &parsed.provides.meta_schema_extensions,
             ),
-            (
-                "resource-capabilities",
-                &parsed.provides.resource_capabilities,
-            ),
         ] {
             if list.len() > MAX_PROVIDES_PER_KIND {
                 return Err(PackError::InvalidManifest(format!(
@@ -351,13 +364,6 @@ impl PackManifest {
         validate_provides_names(
             "meta-schema-extensions",
             &parsed.provides.meta_schema_extensions,
-        )?;
-        // AC-17: same bare-identifier gate as the other 10 categories — rejects `/`, `\`,
-        // `..`, leading-`.`, whitespace, control bytes. Without this, resource-capabilities
-        // would be the ONE category feeding unvalidated names into `path_for_kind`.
-        validate_provides_names(
-            "resource-capabilities",
-            &parsed.provides.resource_capabilities,
         )?;
 
         // checksums: algo enforced by enum. `files` MAY be empty (pack with no
@@ -414,6 +420,21 @@ impl PackManifest {
                 required: self.runtime_version.clone(),
                 current: current.into(),
             });
+        }
+        Ok(())
+    }
+
+    /// Refuse a manifest that declares a retired `provides:` key. Install (right after the
+    /// step ③ parse) and [`bundle_pack`](crate::bundle_pack) call this; rescan does not, so a
+    /// pack installed by an older runtime keeps loading with the key ignored.
+    pub fn refuse_retired_provides(&self) -> Result<(), PackError> {
+        if self.provides.retired_resource_capabilities.is_some() {
+            return Err(PackError::InvalidManifest(format!(
+                "pack {}@{} declares `provides: resource-capabilities`: this runtime no longer \
+                 supports pack resource capabilities; remove the key and any \
+                 `resource-capabilities/` directory from the pack",
+                self.name, self.version
+            )));
         }
         Ok(())
     }
@@ -664,75 +685,48 @@ checksums:
         }
     }
 
-    // ── MODULE-018-T93 (AC-17): validate_provides_names + length-cap parity for
-    //    the resource-capabilities category (both non-compiler-forced wiring sites).
-    //    Without the wired gate, resource-capabilities would be the ONE category
-    //    feeding unvalidated names into path_for_kind (a traversal surface).
+    // `provides: resource-capabilities` is a retired content kind. It parses whatever its
+    // value (`null` included), so a pack installed by an older runtime keeps loading; nothing
+    // validates the value, and install / bundle refuse the declaration by name.
     #[test]
-    fn t93_resource_capabilities_name_rejects_extension() {
-        let yaml = "name: x\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides:\n  resource-capabilities: [\"cap.yaml\"]\nchecksums:\n  algo: sha256\n  files: {}";
-        match PackManifest::from_yaml(yaml) {
-            Err(PackError::InvalidManifest(_)) => {}
-            other => panic!("expected InvalidManifest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t93_resource_capabilities_name_rejects_path_separator() {
-        let yaml = "name: x\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides:\n  resource-capabilities: [\"a/b\"]\nchecksums:\n  algo: sha256\n  files: {}";
-        match PackManifest::from_yaml(yaml) {
-            Err(PackError::InvalidManifest(_)) => {}
-            other => panic!("expected InvalidManifest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t93_resource_capabilities_name_rejects_traversal() {
-        let yaml = "name: x\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides:\n  resource-capabilities: [\"..\"]\nchecksums:\n  algo: sha256\n  files: {}";
-        match PackManifest::from_yaml(yaml) {
-            Err(PackError::InvalidManifest(_)) => {}
-            other => panic!("expected InvalidManifest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t93_resource_capabilities_name_rejects_nul_byte() {
-        let yaml = "name: x\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides:\n  resource-capabilities: [\"foo\\0bar\"]\nchecksums:\n  algo: sha256\n  files: {}";
-        match PackManifest::from_yaml(yaml) {
-            Err(PackError::InvalidManifest(_)) => {}
-            other => panic!("expected InvalidManifest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t93_resource_capabilities_name_rejects_whitespace() {
-        let yaml = "name: x\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides:\n  resource-capabilities: [\"has space\"]\nchecksums:\n  algo: sha256\n  files: {}";
-        match PackManifest::from_yaml(yaml) {
-            Err(PackError::InvalidManifest(_)) => {}
-            other => panic!("expected InvalidManifest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t93_resource_capabilities_name_rejects_control_bytes() {
-        // Adversarial round 12: newline/CR/ESC and other control bytes are rejected
-        // (terminal-/log-injection defense) — parity with the pack-`name` gate.
-        for bad in ["cap\\ncap", "cap\\rcap", "cap\\x1bcap"] {
+    fn retired_resource_capabilities_key_parses_and_is_refused() {
+        for value in [
+            " [structured-data]",
+            " []",
+            "",
+            " ~",
+            " {store: sqlite}",
+            " [\"../escape\"]",
+        ] {
             let yaml = format!(
-                "name: x\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides:\n  resource-capabilities: [\"{bad}\"]\nchecksums:\n  algo: sha256\n  files: {{}}"
+                "name: x\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides:\n  \
+                 resource-capabilities:{value}\n  skills: [s]\nchecksums:\n  algo: sha256\n  \
+                 files: {{}}"
             );
-            match PackManifest::from_yaml(&yaml) {
-                Err(PackError::InvalidManifest(_)) => {}
-                other => panic!("expected InvalidManifest for {bad:?}, got {other:?}"),
+            let m = PackManifest::from_yaml(&yaml)
+                .unwrap_or_else(|e| panic!("{value:?} must parse: {e}"));
+            assert!(
+                m.provides.retired_resource_capabilities.is_some(),
+                "{value:?} counts as declared"
+            );
+            assert_eq!(m.provides.skills, vec!["s".to_string()]);
+            match m.refuse_retired_provides() {
+                Err(PackError::InvalidManifest(msg)) => assert!(
+                    msg.contains("x@1.0.0") && msg.contains("`provides: resource-capabilities`"),
+                    "{msg}"
+                ),
+                other => panic!("expected InvalidManifest for {value:?}, got {other:?}"),
             }
         }
-    }
-
-    #[test]
-    fn t93_resource_capabilities_name_rejects_non_ascii() {
-        let yaml = "name: x\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides:\n  resource-capabilities: [\"cap\u{200b}x\"]\nchecksums:\n  algo: sha256\n  files: {}";
-        match PackManifest::from_yaml(yaml) {
-            Err(PackError::InvalidManifest(_)) => {}
+        let m = PackManifest::from_yaml(VALID_PACK).unwrap();
+        assert!(m.provides.retired_resource_capabilities.is_none());
+        m.refuse_retired_provides()
+            .expect("a manifest without the key");
+        // Every other unknown `provides:` key is still a parse error.
+        let unknown = "name: x\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides:\n  \
+                       widgets: []\nchecksums:\n  algo: sha256\n  files: {}";
+        match PackManifest::from_yaml(unknown) {
+            Err(PackError::InvalidManifest(msg)) => assert!(msg.contains("widgets"), "{msg}"),
             other => panic!("expected InvalidManifest, got {other:?}"),
         }
     }
@@ -752,32 +746,6 @@ checksums:
                 assert!(m.contains("nesting") || m.contains("deep"), "got: {m}")
             }
             other => panic!("expected InvalidManifest (deep nesting), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t93_resource_capabilities_valid_name_accepted() {
-        // Positive control: a bare identifier passes, so the rejections above are
-        // load-bearing (not a blanket reject of the new category).
-        let yaml = "name: x\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides:\n  resource-capabilities: [structured-data]\nchecksums:\n  algo: sha256\n  files: {}";
-        let m = PackManifest::from_yaml(yaml).unwrap();
-        assert_eq!(
-            m.provides.resource_capabilities,
-            vec!["structured-data".to_string()]
-        );
-    }
-
-    #[test]
-    fn t93_resource_capabilities_length_cap_enforced() {
-        // MAX_PROVIDES_PER_KIND is a fn-local const (256) in from_yaml; 257 exceeds it.
-        let names: Vec<String> = (0..257).map(|i| format!("cap{i}")).collect();
-        let yaml = format!(
-            "name: x\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides:\n  resource-capabilities: [{}]\nchecksums:\n  algo: sha256\n  files: {{}}",
-            names.join(", ")
-        );
-        match PackManifest::from_yaml(&yaml) {
-            Err(PackError::InvalidManifest(msg)) => assert!(msg.contains("resource-capabilities")),
-            other => panic!("expected InvalidManifest (length cap), got {other:?}"),
         }
     }
 

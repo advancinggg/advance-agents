@@ -11,8 +11,7 @@
 //! the inner strategies.
 //!
 //! The composition root builds the catalog from the runtime's known capability
-//! names plus the ids of every installed pack's resource-capabilities (see
-//! `crates/cli/src/commands/pack.rs`).
+//! names (see `crates/cli/src/commands/pack.rs`); a pack never adds a name.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

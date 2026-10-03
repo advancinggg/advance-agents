@@ -35,7 +35,7 @@ use std::sync::Arc;
 use crate::error::PackError;
 use crate::fetch::copy_dir_no_symlinks;
 use crate::materialize::{
-    GrantId, MaterializeAction, McpServerId, ResourceCapabilityId, WorkflowContext, WorkflowReport,
+    GrantId, MaterializeAction, McpServerId, WorkflowContext, WorkflowReport,
 };
 use crate::meta_schema_merge::{merge_meta_schema_extension_file, MetaSchemaMergeReport};
 use crate::registry::{ComponentKind, PackRegistry};
@@ -568,25 +568,5 @@ impl MaterializeAction for DefaultMaterializer {
     ) -> Result<(), PackError> {
         self.merge_meta_schema_extension_report(pack_ref, target_schema)
             .map(|_| ())
-    }
-
-    /// AC-17 (m018-rescap) — register-not-copy REGISTRATION surface for the
-    /// `resource-capabilities` category (the `apply_preset` precedent). Resolves the
-    /// pack ref to `ComponentKind::ResourceCapability` (wrong-kind → `MaterializeMissingProvide`),
-    /// parses + validates the on-disk `capability.yaml` (bounded / symlink-safe /
-    /// alias-guarded, via `parse_resource_capability_manifest`), and returns the
-    /// content-derived `ResourceCapabilityId` (the manifest `id`). Nothing is copied into
-    /// a workspace — there is no `target`. The live runtime-ToolRegistry bridge +
-    /// exposure (MODULE-017 §3.6 (ddd)) that makes the capability's tools callable by
-    /// agents is deferred.
-    fn register_resource_capability(
-        &self,
-        pack_ref: &str,
-    ) -> Result<ResourceCapabilityId, PackError> {
-        // resolve_kind returns the capability DIRECTORY
-        // (`{install}/resource-capabilities/{name}`) and enforces the kind guard.
-        let cap_dir = self.resolve_kind(pack_ref, ComponentKind::ResourceCapability)?;
-        let manifest = crate::component_manifest::parse_resource_capability_manifest(&cap_dir)?;
-        Ok(ResourceCapabilityId(manifest.id))
     }
 }

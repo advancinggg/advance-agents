@@ -2,9 +2,8 @@
 //!
 //! Slice A:
 //! - `resolve(fq_ref)` supports prefixed `{pack}@{ver}/{kind-dir}/{name}` AND
-//!   bare-name `{pack}@{ver}/{name}` (kind inferred by scanning all 11 `provides:`
-//!   lists — the 10 §19.3 kinds + the AC-17 `resource-capabilities` category;
-//!   ambiguity → `AmbiguousComponent`).
+//!   bare-name `{pack}@{ver}/{name}` (kind inferred by scanning all 10 `provides:`
+//!   lists of the §19.3 kinds; ambiguity → `AmbiguousComponent`).
 //! - Prefixed form verifies `{name}` is actually in the matching `provides:` list.
 //! - `parse_fq_ref` rejects unversioned / empty-tail / null-byte / `..` traversal.
 //! - `rescan(&self)` is async no-arg per §1.3.2 line 124; atomic read-build-swap.
@@ -35,7 +34,7 @@ pub trait PackRegistry: Send + Sync {
     /// PRD §4.7.4 / REQ-073 — Slice A returns `NotImplemented` (AC-14 waived).
     fn resolve_pack_component(&self, fq_ref: &str) -> Result<PackComponentResolution, PackError>;
 
-    /// Pack lane P1: every `provides:` entry (all 11 component
+    /// Pack lane P1: every `provides:` entry (all 10 component
     /// kinds) of the installed pack `{name}@{version}`, in declaration order per
     /// kind; `None` when the pack is not installed. Default `None` keeps
     /// third-party / test registries (e.g. the cli `MockPackRegistry`) source
@@ -68,11 +67,6 @@ pub enum ComponentKind {
     Workflow,
     MemorySeed,
     MetaSchemaExtension,
-    /// Type 11 (AC-17, REQ-380) — pack-provided resource capability. Directory-backed:
-    /// `resource-capabilities/{name}/capability.yaml`. Registered-not-copied (the preset
-    /// precedent): install/rescan validate the manifest and the pack registry resolves the
-    /// capability; nothing materializes into agent workspaces.
-    ResourceCapability,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -324,16 +318,9 @@ impl InMemoryPackRegistry {
             // intentionally NOT done here (Slice B concern — would
             // multiply rescan cost by total declared bytes).
             verify_provides_on_disk(&install_path, &manifest.provides)?;
-            // AC-17: rescan re-checks resource-capability EXISTENCE (dir + inner
-            // `capability.yaml`) cheaply via `verify_provides_on_disk` above. The full
-            // ADR-shape PARSE (`verify_resource_capabilities`) is INSTALL-ONLY — matching
-            // the `verify_skill_tool_exports` precedent and honoring this function's own
-            // "don't multiply rescan cost by total declared bytes" invariant (a per-pack
-            // 1-MiB × ≤256-capability parse on every rescan would be an availability
-            // regression + would repeatedly re-run the bounded parse). A post-install
-            // manifest-shape tamper is instead caught on-demand by
-            // `register_resource_capability` (which re-parses + validates). (Adversarial
-            // round 12: rescan re-parse fan-out + deep-nesting parse-DoS amplifier.)
+            // A retired `provides:` key is not refused here: a pack installed by an older
+            // runtime keeps loading, the key is ignored, and
+            // `declares_retired_resource_capabilities` lets the runtime say so.
             let metadata = PackMetadata {
                 name: name.into(),
                 version: version.into(),
@@ -515,10 +502,10 @@ pub(crate) fn validate_meta_key(key: &str) -> Result<(&str, &str), PackError> {
 }
 
 /// Flatten a manifest's `provides:` into `(kind, name)` entries, in the canonical
-/// 11-kind order (the `find_kind_by_name_strict` order) and declaration order
+/// 10-kind order (the `find_kind_by_name_strict` order) and declaration order
 /// within a kind.
 fn provides_entries(p: &PackProvides) -> Vec<PackProvideEntry> {
-    const KINDS: [ComponentKind; 11] = [
+    const KINDS: [ComponentKind; 10] = [
         ComponentKind::Binary,
         ComponentKind::AgentTemplate,
         ComponentKind::Skill,
@@ -529,7 +516,6 @@ fn provides_entries(p: &PackProvides) -> Vec<PackProvideEntry> {
         ComponentKind::Workflow,
         ComponentKind::MemorySeed,
         ComponentKind::MetaSchemaExtension,
-        ComponentKind::ResourceCapability,
     ];
     let mut out = Vec::new();
     for kind in KINDS {
@@ -568,6 +554,23 @@ impl InMemoryPackRegistry {
             .map(|((n, v), _)| format!("{n}@{v}"))
             .collect()
     }
+
+    /// Whether the installed pack `{name}@{version}` declares the retired
+    /// `provides: resource-capabilities` key (see [`PackProvides`]). Such a pack loads with
+    /// the key ignored; the runtime reports it. `false` when the pack is not installed.
+    pub fn declares_retired_resource_capabilities(&self, name: &str, version: &str) -> bool {
+        self.packs
+            .read()
+            .unwrap()
+            .get(&(name.into(), version.into()))
+            .is_some_and(|entry| {
+                entry
+                    .manifest
+                    .provides
+                    .retired_resource_capabilities
+                    .is_some()
+            })
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -585,7 +588,6 @@ fn kind_from_dir(prefix: &str) -> Option<ComponentKind> {
         "workflows" => ComponentKind::Workflow,
         "memory-seeds" => ComponentKind::MemorySeed,
         "meta-schema-extensions" => ComponentKind::MetaSchemaExtension,
-        "resource-capabilities" => ComponentKind::ResourceCapability,
         _ => return None,
     })
 }
@@ -602,7 +604,6 @@ fn list_for_kind(p: &PackProvides, kind: ComponentKind) -> &Vec<String> {
         ComponentKind::Workflow => &p.workflows,
         ComponentKind::MemorySeed => &p.memory_seeds,
         ComponentKind::MetaSchemaExtension => &p.meta_schema_extensions,
-        ComponentKind::ResourceCapability => &p.resource_capabilities,
     }
 }
 
@@ -623,7 +624,6 @@ fn find_kind_by_name_strict(
         ComponentKind::Workflow,
         ComponentKind::MemorySeed,
         ComponentKind::MetaSchemaExtension,
-        ComponentKind::ResourceCapability,
     ];
     let mut hits: Vec<ComponentKind> = Vec::new();
     for k in kinds {
@@ -670,10 +670,6 @@ pub fn path_for_kind(install_path: &Path, kind: ComponentKind, name: &str) -> Pa
         ComponentKind::Skill => install_path.join("skills").join(name),
         ComponentKind::RunnableComponent => install_path.join("components").join(name),
         ComponentKind::ChannelAdapter => install_path.join("channel-adapters").join(name),
-        // Directory-backed (type 11): `resource-capabilities/{name}/` holds the required
-        // `capability.yaml` + capability-owned payload. verify_provides_on_disk checks the
-        // inner manifest exists; verify_resource_capabilities parses/validates its shape.
-        ComponentKind::ResourceCapability => install_path.join("resource-capabilities").join(name),
     }
 }
 
@@ -884,44 +880,56 @@ mod tests {
         }
     }
 
-    // ── MODULE-018-T94 (AC-17): bare-name resolution + cross-kind ambiguity for
-    //    the resource-capabilities category. Pins the `find_kind_by_name_strict`
-    //    11-array (non-compiler-forced — a missing element would silently drop the
-    //    resource-capability hit and mis-resolve / mask ambiguity). Prefixed-ref
-    //    resolution is covered by tests/materialize.rs + T89.
     #[test]
-    fn t94_bare_resource_capability_resolves() {
-        let p = PackProvides {
-            resource_capabilities: vec!["structured-data".to_string()],
-            ..Default::default()
-        };
-        let (kind, name) = find_kind_by_name_strict(&p, "structured-data", "pk", "1.0.0").unwrap();
-        assert_eq!(kind, ComponentKind::ResourceCapability);
-        assert_eq!(name, "structured-data");
-    }
-
-    #[test]
-    fn t94_bare_resource_capability_ambiguous_across_kinds() {
-        let p = PackProvides {
-            resource_capabilities: vec!["dup".to_string()],
-            skills: vec!["dup".to_string()],
-            ..Default::default()
-        };
-        match find_kind_by_name_strict(&p, "dup", "pk", "1.0.0") {
-            Err(PackError::AmbiguousComponent { kinds, .. }) => {
-                assert!(kinds.contains(&ComponentKind::ResourceCapability));
-                assert!(kinds.contains(&ComponentKind::Skill));
-            }
-            other => panic!("expected AmbiguousComponent, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t94_bare_resource_capability_not_found() {
+    fn bare_name_in_no_provides_list_is_component_not_found() {
         let p = PackProvides::default();
         match find_kind_by_name_strict(&p, "nope", "pk", "1.0.0") {
             Err(PackError::ComponentNotFound { .. }) => {}
             other => panic!("expected ComponentNotFound, got {other:?}"),
+        }
+    }
+
+    // A pack installed by an older runtime may declare `provides: resource-capabilities`. It
+    // loads with the key ignored: no provides entry, no ref resolves through it, and the
+    // registry reports the declaration so the runtime can warn.
+    #[test]
+    fn a_retired_resource_capabilities_key_is_no_provides_entry() {
+        let manifest = PackManifest::from_yaml(
+            "name: p\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides:\n  skills: [x]\n  \
+             resource-capabilities: [x, y]\nchecksums:\n  algo: sha256\n  files: {}",
+        )
+        .unwrap();
+        let registry = InMemoryPackRegistry::new(PathBuf::from("/packs"));
+        registry.upsert_for_test(
+            PackMetadata {
+                name: "p".into(),
+                version: "1.0.0".into(),
+                install_path: PathBuf::from("/packs/p@1.0.0"),
+                trust_level: TrustLevel::Untrusted,
+                required_capabilities: vec![],
+                signed_by: None,
+            },
+            manifest,
+        );
+        assert!(registry.declares_retired_resource_capabilities("p", "1.0.0"));
+        assert!(!registry.declares_retired_resource_capabilities("p", "2.0.0"));
+        assert_eq!(
+            registry.provides("p", "1.0.0").unwrap(),
+            vec![PackProvideEntry {
+                kind: ComponentKind::Skill,
+                name: "x".into()
+            }]
+        );
+        // `x` is a skill only: the retired list does not make the bare name ambiguous.
+        assert_eq!(
+            registry.resolve("p@1.0.0/x").unwrap().component_kind,
+            ComponentKind::Skill
+        );
+        for fq in ["p@1.0.0/resource-capabilities/y", "p@1.0.0/y"] {
+            match registry.resolve(fq) {
+                Err(PackError::ComponentNotFound { .. }) => {}
+                other => panic!("{fq}: expected ComponentNotFound, got {other:?}"),
+            }
         }
     }
 }

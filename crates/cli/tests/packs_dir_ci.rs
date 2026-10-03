@@ -3,7 +3,7 @@
 //! Every subdirectory of the repository's `packs/` is a first-party or community pack. This
 //! test drives the REAL `advance_pack_manager::Installer` over each one into a fresh temporary
 //! packs dir: layout allow-list, manifest grammar, provides-on-disk, skill tool-exports,
-//! resource-capability manifests, `.meta.yaml` index and registry rescan all run for real.
+//! `.meta.yaml` index and registry rescan all run for real.
 //! `AutoApprove` is deliberate — CI validates structure, not the operator's capability decision
 //! (a pack's `required-capabilities` are checked against the runtime catalog at real install).
 //!
@@ -17,7 +17,7 @@ use advance_pack_manager::{
 };
 
 /// The MODULE-018 install-layout directory of each provide kind (the `{kind-dir}` segment of a
-/// prefixed FQ ref). Exhaustive on purpose: a 12th kind must be added here too.
+/// prefixed FQ ref). Exhaustive on purpose: an 11th kind must be added here too.
 fn kind_dir(kind: ComponentKind) -> &'static str {
     match kind {
         ComponentKind::Binary => "behavior-binaries",
@@ -30,7 +30,6 @@ fn kind_dir(kind: ComponentKind) -> &'static str {
         ComponentKind::Workflow => "workflows",
         ComponentKind::MemorySeed => "memory-seeds",
         ComponentKind::MetaSchemaExtension => "meta-schema-extensions",
-        ComponentKind::ResourceCapability => "resource-capabilities",
     }
 }
 
@@ -185,7 +184,6 @@ fn packs_dir_has_no_stray_top_level_files() {
                         | "workflows"
                         | "memory-seeds"
                         | "meta-schema-extensions"
-                        | "resource-capabilities"
                 );
             assert!(ok, "{}: stray top-level entry {name:?}", dir.display());
         }

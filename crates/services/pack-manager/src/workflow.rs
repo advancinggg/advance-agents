@@ -186,7 +186,7 @@ impl WorkflowApplier {
                     .into(),
             ));
         }
-        // Adversarial round 18 (crate-wide DoS parity — the 5th untrusted serde_yml entry
+        // Adversarial round 18 (crate-wide DoS parity for every untrusted serde_yml entry
         // point): bound flow-nesting/indentation depth before serde_yml. A pack-shipped
         // `workflows/{name}.yaml` is attacker-controlled; a deep-flow-nested one drives
         // serde_yml super-linear (measured 320 KB → ~83 s; ~15 min at the 1 MiB cap). See

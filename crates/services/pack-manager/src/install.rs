@@ -469,6 +469,8 @@ impl Installer {
         })?;
         // `mut`: step ③b may downgrade `trust_level` (P3 §4.1).
         let mut manifest = PackManifest::from_yaml(&yaml)?;
+        // A retired `provides:` key parses (installed packs keep loading) but never installs.
+        manifest.refuse_retired_provides()?;
         // Pack lane P1: reinstall judgement from DISK (install dir
         // present OR `.meta.yaml` key present) — never the in-memory registry — BEFORE
         // checksum verification and BEFORE the step ④ admin prompt, so a refused
@@ -540,7 +542,7 @@ impl Installer {
         //     unsigned `trusted` claim is DOWNGRADED here, before the admin
         //     prompt, so every later consumer (trace, approval, `.meta.yaml`,
         //     registry) sees the effective level. No new InstallStep / trace
-        //     event (the ⑥/⑥a/⑥b/⑥c discipline).
+        //     event (the ⑥/⑥a/⑥b discipline).
         let signed_by = verify_pack_signature(
             tmp.path(),
             yaml.as_bytes(),
@@ -662,8 +664,8 @@ impl Installer {
         })
     }
 
-    /// Steps ⑥ (copy + layout / provides / skill-export / resource-capability checks) and ⑦
-    /// (index write). The caller removes `install_path` when this fails.
+    /// Steps ⑥ (copy + layout / provides / skill-export checks) and ⑦ (index write). The
+    /// caller removes `install_path` when this fails.
     fn copy_validate_and_index(
         &self,
         source: &Path,
@@ -707,16 +709,6 @@ impl Installer {
         //     / trace event — preserves the verbatim 8-step PRD §19.5 order, same
         //     discipline as ⑥ layout / ⑥a provides checks.
         verify_skill_tool_exports(&install_path, &manifest.provides.skills)?;
-
-        // ⑥c AC-17 (m018-rescap): validate each declared resource-capability's
-        //     `capability.yaml` shape (ADR Decision 3). Runs after ⑥a existence + ⑥b
-        //     skill exports; a malformed manifest fails install with
-        //     InvalidManifest/ConstraintViolation. Same no-new-InstallStep / no-new-trace
-        //     discipline as ⑥ layout / ⑥a provides / ⑥b skill-exports. INSTALL-ONLY (matching
-        //     `verify_skill_tool_exports`): rescan (registry.rs) re-checks existence via
-        //     `verify_provides_on_disk`, and a post-install shape tamper is caught on-demand at
-        //     `register_resource_capability` — see this fn's doc + the round-12 rescan-fan-out note.
-        verify_resource_capabilities(&install_path, &manifest.provides.resource_capabilities)?;
 
         // ⑦ update /.advance/packs/.meta.yaml (atomic rename)
         self.trace_sink
@@ -1048,105 +1040,6 @@ pub(crate) fn verify_provides_on_disk(
                 )));
             }
         }
-    }
-    // AC-17: resource-capabilities are directory-backed WITH a required inner
-    // `capability.yaml`. verify_provides_on_disk enforces EXISTENCE (dir + manifest
-    // file) at install AND on rescan (both call this fn); shape validation is the
-    // separate `verify_resource_capabilities` pass. Same symlink-reject + canonicalize
-    // ancestor discipline as the dir_groups loop above, plus the inner-file check.
-    for name in &provides.resource_capabilities {
-        let dir = path_for_kind(install_path, ComponentKind::ResourceCapability, name);
-        let md = std::fs::symlink_metadata(&dir).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => PackError::InvalidManifest(format!(
-                "provides[ResourceCapability] declares '{name}' but missing on disk: {}",
-                dir.display()
-            )),
-            _ => PackError::Io {
-                path: dir.clone(),
-                source: e,
-            },
-        })?;
-        if md.file_type().is_symlink() {
-            return Err(PackError::InvalidManifest(format!(
-                "provides[ResourceCapability] '{name}' is a symlink (rejected): {}",
-                dir.display()
-            )));
-        }
-        if !md.is_dir() {
-            return Err(PackError::InvalidManifest(format!(
-                "provides[ResourceCapability] '{name}' must be a directory: {}",
-                dir.display()
-            )));
-        }
-        let canon = std::fs::canonicalize(&dir).map_err(|e| PackError::Io {
-            path: dir.clone(),
-            source: e,
-        })?;
-        if !canon.starts_with(&install_canon) {
-            return Err(PackError::InvalidManifest(format!(
-                "provides[ResourceCapability] '{name}' escapes install_path via intermediate symlink: {}",
-                dir.display()
-            )));
-        }
-        // Required inner manifest.
-        let manifest = dir.join("capability.yaml");
-        let mmd = std::fs::symlink_metadata(&manifest).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => PackError::InvalidManifest(format!(
-                "provides[ResourceCapability] '{name}' missing required capability.yaml: {}",
-                manifest.display()
-            )),
-            _ => PackError::Io {
-                path: manifest.clone(),
-                source: e,
-            },
-        })?;
-        if mmd.file_type().is_symlink() {
-            return Err(PackError::InvalidManifest(format!(
-                "provides[ResourceCapability] '{name}' capability.yaml is a symlink (rejected): {}",
-                manifest.display()
-            )));
-        }
-        if !mmd.is_file() {
-            return Err(PackError::InvalidManifest(format!(
-                "provides[ResourceCapability] '{name}' capability.yaml must be a regular file: {}",
-                manifest.display()
-            )));
-        }
-        let mcanon = std::fs::canonicalize(&manifest).map_err(|e| PackError::Io {
-            path: manifest.clone(),
-            source: e,
-        })?;
-        if !mcanon.starts_with(&install_canon) {
-            return Err(PackError::InvalidManifest(format!(
-                "provides[ResourceCapability] '{name}' capability.yaml escapes install_path: {}",
-                manifest.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// AC-17 (m018-rescap) — validate the ADR Decision-3 shape of each declared
-/// `resource-capabilities/{name}/capability.yaml`. Runs at INSTALL (step ⑥c) ONLY —
-/// matching the `verify_skill_tool_exports` precedent (deep validation at install; cheap
-/// existence re-check at rescan). Rescan re-checks EXISTENCE (dir + inner manifest) via
-/// `verify_provides_on_disk`; a post-install shape tamper is caught on-demand by
-/// `register_resource_capability`. Running this per-capability 1-MiB parse on every rescan
-/// was an availability regression (adversarial round 12: rescan re-parse fan-out +
-/// deep-nesting parse-DoS amplifier), so it is deliberately install-only. This pass PARSES
-/// + validates via the same bounded / symlink-safe / alias-guarded / nesting-bounded read
-/// gates. Registered-not-copied: read + validate only, nothing written.
-///
-/// `pub(crate)` so the §3.3 integration suite can exercise it directly.
-pub(crate) fn verify_resource_capabilities(
-    install_path: &Path,
-    resource_capabilities: &[String],
-) -> Result<(), PackError> {
-    for name in resource_capabilities {
-        let cap_dir = path_for_kind(install_path, ComponentKind::ResourceCapability, name);
-        // Parse + validate; discard the manifest (this is the validation half). A
-        // malformed manifest fails install/rescan with InvalidManifest/ConstraintViolation.
-        let _ = crate::component_manifest::parse_resource_capability_manifest(&cap_dir)?;
     }
     Ok(())
 }

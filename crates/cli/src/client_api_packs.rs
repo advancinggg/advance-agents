@@ -4,9 +4,9 @@
 //! Same rules as `advance pack install|list|uninstall` (commands/pack.rs), minus stdin: the
 //! request's `accepted_capabilities` IS the operator's approval decision
 //! ([`AcceptedCapabilitiesApproval`]), wrapped in the same `CatalogCheckedApproval` over
-//! `KNOWN_CAPABILITIES` ∪ installed resource-capability ids, with the same trust roots and
-//! registry client. Installs and uninstalls rescan the shared registry, so the live runtime
-//! (template resolver, evaluator resolver, tool exposure) sees the change without a restart.
+//! `KNOWN_CAPABILITIES`, with the same trust roots and registry client. Installs and
+//! uninstalls rescan the shared registry, so the live runtime (template resolver, evaluator
+//! resolver, pack runtime) sees the change without a restart.
 //!
 //! `ClientApi::handle()` is SYNC and may run on a tokio worker (the transport wraps it in
 //! `spawn_blocking`); the installer is async. Each call therefore runs on an OWNED
@@ -30,7 +30,7 @@ use advance_pack_manager::{
 use advance_runtime::config::PackConfig;
 use async_trait::async_trait;
 
-use crate::commands::pack::build_capability_catalog;
+use crate::commands::pack::capability_catalog;
 use crate::pack_registry_client::HttpsRegistryClient;
 
 /// Approves a manifest iff every `required-capabilities` entry was accepted by the request.
@@ -150,10 +150,10 @@ impl WiredPackAdminProvider {
     }
 
     fn installer(&self, approval: Arc<dyn ApprovalStrategy>) -> Result<Installer, ProviderError> {
-        let catalog = build_capability_catalog(&self.registry).map_err(|e| {
-            ProviderError::Unavailable(format!("cannot build the capability catalog: {e}"))
-        })?;
-        let approval = Arc::new(CatalogCheckedApproval::new(approval, Arc::new(catalog)));
+        let approval = Arc::new(CatalogCheckedApproval::new(
+            approval,
+            Arc::new(capability_catalog()),
+        ));
         let fetch_timeout = Duration::from_secs(self.config.fetch_timeout_sec);
         let mut installer = Installer::new(
             self.packs_dir.clone(),
@@ -197,7 +197,6 @@ fn kind_str(kind: ComponentKind) -> &'static str {
         ComponentKind::Workflow => "workflows",
         ComponentKind::MemorySeed => "memory-seeds",
         ComponentKind::MetaSchemaExtension => "meta-schema-extensions",
-        ComponentKind::ResourceCapability => "resource-capabilities",
     }
 }
 

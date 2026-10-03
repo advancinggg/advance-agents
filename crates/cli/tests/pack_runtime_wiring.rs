@@ -236,6 +236,77 @@ async fn a_pack_installed_before_boot_is_live_at_boot() {
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 }
 
+// A pack that an older runtime installed with the retired `provides: resource-capabilities` key
+// does not stop the daemon: it boots, the rest of the pack is live, and the key is reported as
+// ignored, once for the pack. A new install declaring the key is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pack_declaring_the_retired_resource_capabilities_key_still_boots() {
+    let ws = workspace();
+    let installed = shell_installer(&ws)
+        .install(ws.agenda_src.to_str().unwrap())
+        .await
+        .expect("install before boot");
+    let manifest = installed.install_path.join("pack.yaml");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    let with_key = text.replacen(
+        "provides:\n",
+        "provides:\n  resource-capabilities:\n    - structured-data\n",
+        1,
+    );
+    assert_ne!(with_key, text);
+    std::fs::write(&manifest, &with_key).unwrap();
+
+    let (_host, handles) = boot(&ws).await;
+    let api = operator_api(&handles);
+    assert_agenda_live(&schema(&api));
+    assert!(has_tool(&handles, "skill::agenda").await);
+    let report = handles.pack_runtime.apply().await;
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].starts_with(&format!(
+            "pack {}@{}: `provides: resource-capabilities` is ignored",
+            installed.name, installed.version
+        )),
+        "{:?}",
+        report.warnings
+    );
+    let notes = handles
+        .pack_runtime
+        .notes_for(&installed.name, &installed.version, &report);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("resource-capabilities"), "{notes:?}");
+
+    let src = ws.root.parent().unwrap().join("src/legacy");
+    std::fs::create_dir_all(src.join("behavior-binaries")).unwrap();
+    std::fs::write(src.join("behavior-binaries/dummy.wasm"), b"\0asm\x01\0\0\0").unwrap();
+    let plain = "name: legacy\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\n\
+                 trust-level: untrusted\nprovides:\n  behavior-binaries:\n    - dummy\n\
+                 checksums:\n  algo: sha256\n  files: {}\n";
+    std::fs::write(
+        src.join("pack.yaml"),
+        plain.replacen("provides:\n", "provides:\n  resource-capabilities: []\n", 1),
+    )
+    .unwrap();
+    let body = json!({ "source": src.to_str().unwrap(), "accepted_capabilities": [] });
+    let env = post(
+        &api,
+        "/client/packs:install",
+        body.clone(),
+        "install-legacy",
+    );
+    let error = env.error.expect("the retired key is refused");
+    assert_eq!(
+        error.code,
+        advance_client_api::ClientErrorCode::InvalidRequest,
+        "{error:?}"
+    );
+    assert!(!ws.root.join(".advance/packs/legacy@1.0.0").exists());
+    // The same pack without the key installs.
+    std::fs::write(src.join("pack.yaml"), plain).unwrap();
+    let env = post(&api, "/client/packs:install", body, "install-legacy-2");
+    assert!(env.is_ok(), "{:?}", env.error);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn client_api_install_is_hot_and_uninstall_withdraws() {
     let ws = workspace();

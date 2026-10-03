@@ -2766,27 +2766,6 @@ async fn wire_capabilities_inner(
                 eprintln!("advance: WARN data tool not registered: {e}");
             }
         }
-        // Pack lane P2: every installed pack
-        // resource-capability's `tools[].name` must be a registered HOST tool to
-        // be callable; report the gap at boot (WARN — never blocks: an agent just
-        // does not see a tool nobody provides).
-        let exposure = crate::tool_exposure::reconcile_pack_tool_exposure(
-            &tools_concrete,
-            pack_wiring.registry.as_ref(),
-        )
-        .await;
-        if !exposure.missing.is_empty() || !exposure.errors.is_empty() {
-            eprintln!(
-                "advance: WARN {}; missing host tools: [{}]{}",
-                exposure.summary(),
-                exposure.missing.join(", "),
-                if exposure.errors.is_empty() {
-                    String::new()
-                } else {
-                    format!("; unreadable: [{}]", exposure.errors.join("; "))
-                }
-            );
-        }
         let host_slots = Arc::new(HostToolRegistry::new());
         let web_family_active = declares_web && web_cfg_snapshot.mode != WebRunMode::Offline;
         let dispatcher = if web_family_active {

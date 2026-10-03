@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use advance_pack_manager::{
-    AutoApprove, DependencyResolver, InMemoryPackRegistry, InstallStep, Installer, PackError,
-    PackRegistry, RecordingTraceSink, SourceRef,
+    AutoApprove, ComponentKind, DependencyResolver, InMemoryPackRegistry, InstallStep, Installer,
+    PackError, PackRegistry, RecordingTraceSink, SourceRef,
 };
 use async_trait::async_trait;
 
@@ -276,4 +276,64 @@ async fn a_damaged_pack_can_still_be_uninstalled() {
         .await
         .expect("the registry is healthy again");
     assert!(inst.registry.has("good", "1.0.0"));
+}
+
+// `provides: resource-capabilities` is a retired content kind. Install refuses a manifest that
+// declares it, right after the manifest parse (before approval, nothing left behind). A pack
+// that an older runtime installed with the key keeps loading, the key ignored, so neither boot
+// nor `pack list` breaks, and it uninstalls normally.
+#[tokio::test]
+async fn the_retired_resource_capabilities_key_is_refused_at_install_and_ignored_at_rescan() {
+    let work = tempfile::TempDir::new().unwrap();
+    let packs = tempfile::TempDir::new().unwrap();
+    let src = write_pack(work.path(), "a", "1.0.0", &[]);
+    let manifest = src.join("pack.yaml");
+    let plain = std::fs::read_to_string(&manifest).unwrap();
+    let with_key = plain.replacen(
+        "provides:\n",
+        "provides:\n  resource-capabilities:\n    - structured-data\n",
+        1,
+    );
+    assert_ne!(with_key, plain);
+
+    std::fs::write(&manifest, &with_key).unwrap();
+    let trace = Arc::new(RecordingTraceSink::new());
+    let inst = installer(packs.path(), trace.clone());
+    match inst.install(src.to_str().unwrap()).await {
+        Err(PackError::InvalidManifest(msg)) => assert!(
+            msg.contains("a@1.0.0") && msg.contains("`provides: resource-capabilities`"),
+            "{msg}"
+        ),
+        other => panic!("expected InvalidManifest, got {other:?}"),
+    }
+    let steps = trace.steps();
+    assert!(steps.contains(&InstallStep::Step3VerifyChecksums));
+    assert!(
+        !steps.contains(&InstallStep::Step4AdminApproval),
+        "refused before the approval step; trace = {steps:?}"
+    );
+    assert!(!packs.path().join("a@1.0.0").exists());
+    assert!(inst.registry.list_installed().is_empty());
+
+    // What a runtime that still accepted the key left installed.
+    std::fs::write(&manifest, &plain).unwrap();
+    inst.install(src.to_str().unwrap())
+        .await
+        .expect("install without the key");
+    std::fs::write(packs.path().join("a@1.0.0/pack.yaml"), &with_key).unwrap();
+    inst.registry
+        .rescan()
+        .await
+        .expect("rescan ignores the retired key");
+    assert!(inst.registry.has("a", "1.0.0"));
+    assert!(inst
+        .registry
+        .declares_retired_resource_capabilities("a", "1.0.0"));
+    let provides = inst.registry.provides("a", "1.0.0").unwrap();
+    assert_eq!(provides.len(), 1, "{provides:?}");
+    assert_eq!(provides[0].kind, ComponentKind::Binary);
+
+    inst.uninstall("a", "1.0.0").await.expect("uninstall");
+    assert!(!packs.path().join("a@1.0.0").exists());
+    assert!(inst.registry.list_installed().is_empty());
 }

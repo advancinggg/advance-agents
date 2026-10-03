@@ -483,47 +483,21 @@ fn is_trigger_empty(value: &serde_yml::Value) -> bool {
     }
 }
 
-// ── AC-17 (REQ-380): resource-capability `capability.yaml` parser ──────────────
-//
-// Directory-backed 11th provide category. The manifest shape is defined by ADR
-// 2026-06-29 Decision 3 ("Pack-Provided Resource Capabilities"). Parsing mirrors
-// `parse_component_manifest` (leaf symlink pre-check → O_NOFOLLOW/fstat/bounded
-// read → YAML alias-bomb guard → deserialize → constraint validation) and uses
-// the SAME bounded / symlink-safe read gates the other 10 categories use.
-
-/// Maximum permitted `capability.yaml` size (matches `MAX_COMPONENT_YAML_BYTES`).
-const MAX_RESOURCE_CAPABILITY_YAML_BYTES: u64 = 1024 * 1024;
-
-/// Bounded counts on the ADR manifest lists — defense-in-depth against a
-/// pathological manifest (same bounded posture as the other categories).
-const MAX_CANONICAL_SURFACES: usize = 8;
-const MAX_CAPABILITY_TOOLS: usize = 256;
-const MAX_CAPABILITY_WIDGETS: usize = 256;
-const MAX_SUPPORTS_LIST: usize = 64;
-const MAX_CAPABILITY_ID_LEN: usize = 256;
-const MAX_TOOL_NAME_LEN: usize = 256;
-
-/// ADR Decision-3 taxonomy of durable source-of-truth surfaces.
-const CANONICAL_SURFACE_KINDS: &[&str] = &[
-    "body-native",
-    "projection-native",
-    "asset-native",
-    "external-owned",
-];
+// ── Shared YAML nesting guard (every pack-shipped YAML document) ───────────────
 
 /// Max TOTAL flow-open bytes (`[` + `{`) allowed. The real YAML flow-nesting DEPTH is
 /// bounded by the count of `[`/`{` opens, so capping the count caps the depth — and thus
-/// libyaml's O(depth²) deep-nesting term. Legit manifests use ≤~260 opens even in
-/// worst-case all-flow form (`MAX_CAPABILITY_TOOLS` = 256 `{…}` + a handful of `[…]`
-/// lists); 1000 leaves ~4× headroom.
+/// libyaml's O(depth²) deep-nesting term. Pack documents are normally block style, which
+/// opens none; even a `pack.yaml` declaring the maximum 256 dependencies as flow mappings
+/// uses about 260 opens.
 const MAX_YAML_FLOW_OPENS: usize = 1000;
 /// Max `flow_opens × input_len` "work" product allowed. libyaml's flow scan ALSO has an
 /// O(depth × width) term (each scalar token at flow depth D pays ~O(D)), which the depth
 /// bound alone does NOT bound: a `<1 MiB` doc at depth 1000 with ~500k scalars parses in
 /// ~1.1 s (adversarial round 18 Finding 2). Bounding `opens × len` bounds that product
 /// (`opens ≥ depth`, `len ≥ width`), holding the worst-case pre-parse cost to sub-second on
-/// every guarded (≤1 MiB pack-shipped) entry point. 2e8 keeps realistic high-opens manifests
-/// (256-flow-tool capability.yaml, ~40 KB → ~3e7) well clear.
+/// every guarded (≤1 MiB pack-shipped) entry point. 2e8 keeps realistic high-opens documents
+/// well clear (that 256-dependency flow-style `pack.yaml`: ~260 opens over ~9 KB → ~2.4e6).
 const MAX_YAML_FLOW_WORK: usize = 200_000_000;
 /// Max leading-whitespace (block-indentation depth proxy) allowed on any line — bounds
 /// block-style nesting depth (each level ≥ 1 space).
@@ -554,15 +528,15 @@ const MAX_YAML_LEADING_INDENT: usize = 1024;
 /// parser's real nesting grew unbounded. No legitimate manifest carries 1000 flow-open
 /// bytes, a 2e8 opens×len product, or 1 KiB of leading indentation.
 ///
-/// `pub(crate)` — adversarial rounds 16 + 18 extended this guard to every UNTRUSTED
-/// PACK-SHIPPED YAML file: `pack.yaml` (`manifest::PackManifest::from_yaml`), `component.yaml`
-/// + `capability.yaml` (`component_manifest`), and `workflows/{name}.yaml`
-/// (`workflow::WorkflowApplier::apply`) — not just `capability.yaml`, since the same
-/// deep-flow-nesting parse-DoS (measured ~5–6 min for a 1 MiB deep-nested pack.yaml; ~15 min
-/// for a workflow) applies to every one of them. These are BOUNDED manifests (no legitimate
-/// one carries 1000 flow-open bytes / a 2e8 opens×len product / 1 KiB of leading indentation).
-/// If a NEW `serde_yml::from_str` on untrusted PACK-SHIPPED content is added, it MUST call this
-/// guard first (alongside `yaml_has_alias_refs`).
+/// `pub(crate)` — every UNTRUSTED PACK-SHIPPED YAML document goes through this guard:
+/// `pack.yaml` (`manifest::PackManifest::from_yaml`), `component.yaml`
+/// (`parse_component_manifest`), `workflows/{name}.yaml` (`workflow::WorkflowApplier::apply`),
+/// `meta-schema-extensions/{name}.yaml` (`meta_schema_merge`) and `mcp-servers/{name}.yaml`
+/// (`mcp_server_manifest`), since the same deep-flow-nesting parse-DoS (measured ~5–6 min for a
+/// 1 MiB deep-nested pack.yaml; ~15 min for a workflow) applies to every one of them. These are
+/// BOUNDED documents (no realistic one carries 1000 flow-open bytes / a 2e8 opens×len product /
+/// 1 KiB of leading indentation). If a NEW `serde_yml::from_str` on untrusted PACK-SHIPPED
+/// content is added, it MUST call this guard first (alongside `yaml_has_alias_refs`).
 ///
 /// EXCLUDED — `.meta.yaml` (`meta::read_meta_index`): it is a MANAGER-GENERATED index that
 /// `write_meta_index_atomic` always re-serializes (block style), so pack-controlled content is
@@ -605,288 +579,10 @@ pub(crate) fn yaml_nesting_within_bound(yaml: &str) -> bool {
     true
 }
 
-/// Deserialised view of `resource-capabilities/{name}/capability.yaml` (AC-17).
-/// Permissive parse (no `deny_unknown_fields`) — forward-compat accept-and-ignore,
-/// matching `ComponentSubmitConfig`. The `#[derive(Debug)]` also keeps every field
-/// "read" for the dead-code lint (the pack-manager tier consumes `id` +
-/// bound-validates the structural fields; `store`/`mcp`/`read_only`/`description`
-/// are captured for the M017 exposure legs (deferred) + forward-compat).
-#[derive(Debug, Deserialize)]
-pub(crate) struct ResourceCapabilityManifest {
-    /// Canonical capability id (e.g. `advance.structured-data`) → the returned
-    /// `ResourceCapabilityId`. Required, non-empty, ASCII, no control bytes.
-    pub id: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub supports: SupportsDecl,
-    #[serde(default)]
-    pub canonical_surfaces: Vec<String>,
-    #[serde(default)]
-    pub store: Option<StoreDecl>,
-    #[serde(default)]
-    pub tools: Vec<ResourceToolDecl>,
-    #[serde(default)]
-    pub mcp: Option<McpExposureDecl>,
-    #[serde(default)]
-    pub widgets: Vec<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub(crate) struct SupportsDecl {
-    #[serde(default)]
-    pub resource_types: Vec<String>,
-    #[serde(default)]
-    pub mime_types: Vec<String>,
-    #[serde(default)]
-    pub ref_schemes: Vec<String>,
-    #[serde(default)]
-    pub projection_schemas: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct StoreDecl {
-    #[serde(default)]
-    pub default_backend: Option<String>,
-    #[serde(default)]
-    pub ownership: Option<String>,
-    #[serde(default)]
-    pub projection_format: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ResourceToolDecl {
-    pub name: String,
-    #[serde(default)]
-    pub read_only: bool,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub(crate) struct McpExposureDecl {
-    #[serde(default)]
-    pub expose_tools: bool,
-    #[serde(default)]
-    pub expose_resources: bool,
-}
-
-/// Pack lane P1: the canonical `id` of the resource-capability at
-/// `cap_dir` (`{install}/resource-capabilities/{name}`), read through the same
-/// bounded / symlink-safe / alias-guarded parse as install-time validation. The
-/// composition root folds these ids into the `required-capabilities` catalog so a
-/// pack may require a capability another installed pack provides.
-pub fn resource_capability_id(cap_dir: &Path) -> Result<String, PackError> {
-    Ok(parse_resource_capability_manifest(cap_dir)?.id)
-}
-
-/// Pack lane P2: the `tools[].name` list of the
-/// resource-capability at `cap_dir`, in declaration order, through the same
-/// bounded / symlink-safe / alias-guarded parse. The composition root reconciles
-/// these names against the host-native tools registered in the `ToolRegistry`
-/// (`advance_cli::tool_exposure::reconcile_pack_tool_exposure`).
-pub fn resource_capability_tool_names(cap_dir: &Path) -> Result<Vec<String>, PackError> {
-    Ok(parse_resource_capability_manifest(cap_dir)?
-        .tools
-        .into_iter()
-        .map(|t| t.name)
-        .collect())
-}
-
-/// Parse + validate `{cap_dir}/capability.yaml` (AC-17). `cap_dir` is the capability
-/// directory (`{install}/resource-capabilities/{name}`). Register-not-copy: this only
-/// reads + validates; nothing is written. Errors mirror `parse_component_manifest`:
-/// `InvalidManifest` (missing / symlink / oversize / non-UTF-8 / alias-bomb / parse) or
-/// `ConstraintViolation` (ADR-shape violation).
-pub(crate) fn parse_resource_capability_manifest(
-    cap_dir: &Path,
-) -> Result<ResourceCapabilityManifest, PackError> {
-    let yaml_path = cap_dir.join("capability.yaml");
-
-    // Pre-parse leaf symlink check for a friendly diagnostic (the O_NOFOLLOW open
-    // below is the authoritative gate against a leaf-symlink swap at read time).
-    match std::fs::symlink_metadata(&yaml_path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(PackError::InvalidManifest(format!(
-                "capability.yaml missing for resource-capability at {}",
-                yaml_path.display()
-            )));
-        }
-        Err(e) => {
-            return Err(PackError::Io {
-                path: yaml_path.clone(),
-                source: e,
-            });
-        }
-        Ok(leaf_md) => {
-            if leaf_md.file_type().is_symlink() {
-                return Err(PackError::InvalidManifest(format!(
-                    "capability.yaml is a symlink (rejected): {}",
-                    yaml_path.display()
-                )));
-            }
-        }
-    }
-
-    let yaml = open_text_nofollow_bounded(
-        &yaml_path,
-        MAX_RESOURCE_CAPABILITY_YAML_BYTES,
-        "capability.yaml",
-    )?;
-    if yaml_has_alias_refs(&yaml) {
-        return Err(PackError::InvalidManifest(
-            "capability.yaml contains YAML alias references (`*name`) — rejected to prevent billion-laughs amplification".into(),
-        ));
-    }
-    if !yaml_nesting_within_bound(&yaml) {
-        return Err(PackError::InvalidManifest(
-            "capability.yaml nesting/indentation is too deep — rejected to prevent parse-time resource exhaustion (serde_yml deep-nesting DoS)".into(),
-        ));
-    }
-
-    let manifest: ResourceCapabilityManifest = serde_yml::from_str(&yaml)
-        .map_err(|e| PackError::InvalidManifest(format!("capability.yaml parse: {e}")))?;
-
-    validate_resource_capability_manifest(&manifest)?;
-    Ok(manifest)
-}
-
-/// Enforce the ADR Decision-3 constraint surface on a parsed `capability.yaml`.
-fn validate_resource_capability_manifest(m: &ResourceCapabilityManifest) -> Result<(), PackError> {
-    // (1) id — required, non-empty, bounded, ASCII, no control bytes (matches the
-    //     manifest.rs name-validation / registry.rs key-validation posture).
-    if m.id.is_empty() {
-        return Err(PackError::ConstraintViolation {
-            reason: "capability.yaml `id` must be non-empty".into(),
-        });
-    }
-    if m.id.len() > MAX_CAPABILITY_ID_LEN {
-        return Err(PackError::ConstraintViolation {
-            reason: format!(
-                "capability.yaml `id` exceeds max {MAX_CAPABILITY_ID_LEN} bytes ({} bytes)",
-                m.id.len()
-            ),
-        });
-    }
-    if m.id.chars().any(|c| !c.is_ascii() || c.is_ascii_control()) {
-        return Err(PackError::ConstraintViolation {
-            reason: "capability.yaml `id` must be ASCII without control bytes".into(),
-        });
-    }
-
-    // (2) canonical_surfaces — non-empty, each in the ADR taxonomy, bounded count.
-    if m.canonical_surfaces.is_empty() {
-        return Err(PackError::ConstraintViolation {
-            reason: "capability.yaml `canonical_surfaces` must declare at least one surface".into(),
-        });
-    }
-    if m.canonical_surfaces.len() > MAX_CANONICAL_SURFACES {
-        return Err(PackError::ConstraintViolation {
-            reason: format!(
-                "capability.yaml `canonical_surfaces` count {} exceeds max {MAX_CANONICAL_SURFACES}",
-                m.canonical_surfaces.len()
-            ),
-        });
-    }
-    for s in &m.canonical_surfaces {
-        if !CANONICAL_SURFACE_KINDS.contains(&s.as_str()) {
-            return Err(PackError::ConstraintViolation {
-                reason: format!(
-                    "capability.yaml `canonical_surfaces` has unknown surface {s:?} (allowed: {CANONICAL_SURFACE_KINDS:?})"
-                ),
-            });
-        }
-    }
-
-    // (3) tools — bounded count; each name non-empty + bounded. `read_only` is typed.
-    if m.tools.len() > MAX_CAPABILITY_TOOLS {
-        return Err(PackError::ConstraintViolation {
-            reason: format!(
-                "capability.yaml `tools` count {} exceeds max {MAX_CAPABILITY_TOOLS}",
-                m.tools.len()
-            ),
-        });
-    }
-    for t in &m.tools {
-        if t.name.is_empty() || t.name.len() > MAX_TOOL_NAME_LEN {
-            return Err(PackError::ConstraintViolation {
-                reason: format!(
-                    "capability.yaml tool name must be non-empty and <= {MAX_TOOL_NAME_LEN} bytes (got {:?}, read_only={})",
-                    t.name, t.read_only
-                ),
-            });
-        }
-    }
-
-    // (4) widgets — bounded count; each non-empty.
-    if m.widgets.len() > MAX_CAPABILITY_WIDGETS {
-        return Err(PackError::ConstraintViolation {
-            reason: format!(
-                "capability.yaml `widgets` count {} exceeds max {MAX_CAPABILITY_WIDGETS}",
-                m.widgets.len()
-            ),
-        });
-    }
-    for w in &m.widgets {
-        if w.is_empty() {
-            return Err(PackError::ConstraintViolation {
-                reason: "capability.yaml `widgets` entries must be non-empty".into(),
-            });
-        }
-    }
-
-    // (5) supports.* + description + store — bounded (defense-in-depth; also keeps
-    //     these forward-compat fields consumed).
-    for (label, list) in [
-        ("resource_types", &m.supports.resource_types),
-        ("mime_types", &m.supports.mime_types),
-        ("ref_schemes", &m.supports.ref_schemes),
-        ("projection_schemas", &m.supports.projection_schemas),
-    ] {
-        if list.len() > MAX_SUPPORTS_LIST {
-            return Err(PackError::ConstraintViolation {
-                reason: format!(
-                    "capability.yaml `supports.{label}` count {} exceeds max {MAX_SUPPORTS_LIST}",
-                    list.len()
-                ),
-            });
-        }
-    }
-    if let Some(d) = &m.description {
-        if d.len() > MAX_RESOURCE_CAPABILITY_YAML_BYTES as usize {
-            return Err(PackError::ConstraintViolation {
-                reason: "capability.yaml `description` is implausibly large".into(),
-            });
-        }
-    }
-    if let Some(store) = &m.store {
-        for (label, v) in [
-            ("default_backend", &store.default_backend),
-            ("ownership", &store.ownership),
-            ("projection_format", &store.projection_format),
-        ] {
-            if let Some(val) = v {
-                if val.len() > MAX_CAPABILITY_ID_LEN {
-                    return Err(PackError::ConstraintViolation {
-                        reason: format!(
-                            "capability.yaml `store.{label}` exceeds max {MAX_CAPABILITY_ID_LEN} bytes"
-                        ),
-                    });
-                }
-            }
-        }
-    }
-    // `mcp` toggles carry no additional constraint at the pack-manager tier — the
-    // exposure they gate is the deferred M017 leg — but read them so the shape is
-    // fully validated / consumed.
-    if let Some(mcp) = &m.mcp {
-        let _ = (mcp.expose_tools, mcp.expose_resources);
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::PackManifest;
 
     #[test]
     fn trigger_empty_helper() {
@@ -908,180 +604,17 @@ mod tests {
         assert!(!is_trigger_empty(&serde_yml::Value::String("x".into())));
     }
 
-    // ── MODULE-018-T92 (AC-17): parse_resource_capability_manifest ──────────
+    // ── Shared YAML nesting guard + bounded reader ──────────────────────────────────
     //
-    // Calls the parser DIRECTLY (it is pub(crate); integration tests in
-    // tests/resource_capabilities.rs cannot reach it). The symlink case is
-    // witnessed here because at install the source-side copy_dir_no_symlinks
-    // would reject a symlink first (plan-eval R1 Info-4).
+    // Every pack-shipped YAML document passes `yaml_nesting_within_bound` before serde_yml,
+    // and rescan reads every installed `pack.yaml` through `open_text_nofollow_bounded`.
+    // These pin the bypasses each one closes, driven through `pack.yaml`.
 
-    fn cap_dir_with(yaml: &str) -> tempfile::TempDir {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("capability.yaml"), yaml.as_bytes()).unwrap();
-        dir
+    fn pack_yaml_with(tail: &str) -> String {
+        format!("name: x\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\n{tail}")
     }
 
-    const VALID_CAPABILITY_YAML: &str = r#"
-id: advance.structured-data
-description: Structured data resource capability.
-supports:
-  resource_types: [project, collection]
-  mime_types: [text/markdown]
-  ref_schemes: [data]
-  projection_schemas: [advance.entity-table.v1]
-canonical_surfaces:
-  - projection-native
-store:
-  default_backend: sqlite
-  ownership: workspace-owned
-  projection_format: ndjson
-tools:
-  - name: advance.data.query
-    read_only: true
-  - name: advance.data.upsert
-    read_only: false
-mcp:
-  expose_tools: true
-  expose_resources: true
-widgets:
-  - entity.table
-  - entity.form
-"#;
-
-    #[test]
-    fn t92_valid_adr_shape_parses_and_yields_id() {
-        let dir = cap_dir_with(VALID_CAPABILITY_YAML);
-        let m = parse_resource_capability_manifest(dir.path()).unwrap();
-        assert_eq!(m.id, "advance.structured-data");
-        assert_eq!(m.canonical_surfaces, vec!["projection-native".to_string()]);
-        assert_eq!(m.tools.len(), 2);
-        assert!(m.tools[0].read_only);
-        assert!(!m.tools[1].read_only);
-        assert_eq!(m.widgets.len(), 2);
-    }
-
-    #[test]
-    fn t92_unknown_fields_accepted_and_ignored() {
-        // Forward-compat: extra top-level keys don't fail the parse.
-        let yaml = "id: advance.x\ncanonical_surfaces: [projection-native]\nfuture_field: whatever\nreconcilers: [a, b]\n";
-        let m = parse_resource_capability_manifest(cap_dir_with(yaml).path()).unwrap();
-        assert_eq!(m.id, "advance.x");
-    }
-
-    #[test]
-    fn t92_empty_id_rejected() {
-        let yaml = "id: \"\"\ncanonical_surfaces: [projection-native]\n";
-        match parse_resource_capability_manifest(cap_dir_with(yaml).path()) {
-            Err(PackError::ConstraintViolation { reason }) => assert!(reason.contains("`id`")),
-            other => panic!("expected ConstraintViolation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t92_missing_id_rejected() {
-        // serde: `id` is required (no default) → parse error surfaces as InvalidManifest.
-        let yaml = "canonical_surfaces: [projection-native]\n";
-        match parse_resource_capability_manifest(cap_dir_with(yaml).path()) {
-            Err(PackError::InvalidManifest(msg)) => assert!(msg.contains("parse")),
-            other => panic!("expected InvalidManifest (parse), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t92_non_ascii_id_rejected() {
-        let yaml = "id: advance.dａta\ncanonical_surfaces: [projection-native]\n";
-        match parse_resource_capability_manifest(cap_dir_with(yaml).path()) {
-            Err(PackError::ConstraintViolation { reason }) => assert!(reason.contains("ASCII")),
-            other => panic!("expected ConstraintViolation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t92_empty_canonical_surfaces_rejected() {
-        let yaml = "id: advance.x\ncanonical_surfaces: []\n";
-        match parse_resource_capability_manifest(cap_dir_with(yaml).path()) {
-            Err(PackError::ConstraintViolation { reason }) => {
-                assert!(reason.contains("canonical_surfaces"))
-            }
-            other => panic!("expected ConstraintViolation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t92_unknown_canonical_surface_rejected() {
-        let yaml = "id: advance.x\ncanonical_surfaces: [not-a-real-surface]\n";
-        match parse_resource_capability_manifest(cap_dir_with(yaml).path()) {
-            Err(PackError::ConstraintViolation { reason }) => {
-                assert!(reason.contains("unknown surface"))
-            }
-            other => panic!("expected ConstraintViolation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t92_over_count_tools_rejected() {
-        let mut yaml =
-            String::from("id: advance.x\ncanonical_surfaces: [projection-native]\ntools:\n");
-        for i in 0..(MAX_CAPABILITY_TOOLS + 1) {
-            yaml.push_str(&format!("  - name: t{i}\n    read_only: true\n"));
-        }
-        match parse_resource_capability_manifest(cap_dir_with(&yaml).path()) {
-            Err(PackError::ConstraintViolation { reason }) => assert!(reason.contains("`tools`")),
-            other => panic!("expected ConstraintViolation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t92_empty_tool_name_rejected() {
-        let yaml = "id: advance.x\ncanonical_surfaces: [projection-native]\ntools:\n  - name: \"\"\n    read_only: true\n";
-        match parse_resource_capability_manifest(cap_dir_with(yaml).path()) {
-            Err(PackError::ConstraintViolation { reason }) => assert!(reason.contains("tool name")),
-            other => panic!("expected ConstraintViolation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t92_alias_bomb_rejected() {
-        // YAML alias reference → billion-laughs guard (InvalidManifest, pre-parse).
-        let yaml = "id: &a advance.x\ncanonical_surfaces: [*a]\n";
-        match parse_resource_capability_manifest(cap_dir_with(yaml).path()) {
-            Err(PackError::InvalidManifest(msg)) => assert!(msg.contains("alias")),
-            other => panic!("expected InvalidManifest (alias), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t92_oversize_rejected() {
-        let mut yaml = String::from("id: advance.x\ncanonical_surfaces: [projection-native]\n# ");
-        yaml.push_str(&"A".repeat(MAX_RESOURCE_CAPABILITY_YAML_BYTES as usize + 16));
-        match parse_resource_capability_manifest(cap_dir_with(&yaml).path()) {
-            Err(PackError::InvalidManifest(msg)) => assert!(msg.contains("exceeds max size")),
-            other => panic!("expected InvalidManifest (oversize), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t92_missing_capability_yaml_rejected() {
-        let dir = tempfile::TempDir::new().unwrap();
-        match parse_resource_capability_manifest(dir.path()) {
-            Err(PackError::InvalidManifest(msg)) => assert!(msg.contains("missing")),
-            other => panic!("expected InvalidManifest (missing), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t92_deep_nesting_rejected_fast() {
-        // Adversarial round 12: a <1 MiB but deeply flow-nested capability.yaml drives
-        // serde_yml into ~O(n²) (200 KB `[`-nesting measured at ~36s). The pre-parse
-        // nesting guard must reject it BEFORE serde_yml runs — assert it rejects in well
-        // under a second (the guard fires, not the parser).
-        let mut yaml = String::from("id: advance.x\ncanonical_surfaces: [projection-native]\nx: ");
-        yaml.push_str(&"[".repeat(50_000));
-        yaml.push_str(&"]".repeat(50_000));
-        yaml.push('\n');
-        let start = std::time::Instant::now();
-        let r = parse_resource_capability_manifest(cap_dir_with(&yaml).path());
-        let elapsed = start.elapsed();
+    fn expect_nesting_rejection(r: Result<PackManifest, PackError>) {
         match r {
             Err(PackError::InvalidManifest(msg)) => {
                 assert!(
@@ -1089,57 +622,36 @@ widgets:
                     "got: {msg}"
                 )
             }
-            other => panic!("expected InvalidManifest (deep nesting), got {other:?}"),
+            other => panic!("expected InvalidManifest (nesting), got {other:?}"),
         }
-        assert!(
-            elapsed.as_secs() < 2,
-            "nesting guard should reject FAST (before serde_yml's O(n^2) scan); took {elapsed:?}"
-        );
     }
 
     #[test]
-    fn t92_deep_block_indent_rejected() {
-        // Block-indentation depth proxy: a manifest whose deepest line carries a huge
-        // leading indent is rejected by the same guard.
-        let mut yaml = String::from("id: advance.x\ncanonical_surfaces: [projection-native]\n");
+    fn nesting_guard_rejects_deep_block_indent() {
+        // Block-indentation depth proxy: one line with a huge leading indent is rejected.
+        let mut yaml = pack_yaml_with("");
         yaml.push_str(&" ".repeat(2_000));
         yaml.push_str("deep: 1\n");
-        match parse_resource_capability_manifest(cap_dir_with(&yaml).path()) {
-            Err(PackError::InvalidManifest(msg)) => {
-                assert!(
-                    msg.contains("nesting") || msg.contains("deep"),
-                    "got: {msg}"
-                )
-            }
-            other => panic!("expected InvalidManifest (deep indent), got {other:?}"),
-        }
+        assert!(!yaml_nesting_within_bound(&yaml));
+        expect_nesting_rejection(PackManifest::from_yaml(&yaml));
     }
 
     #[test]
-    fn t92_quoted_fake_close_nesting_bypass_rejected() {
-        // Adversarial round 14 (dual-model): the round-12 NET-depth guard decremented on
-        // `]` bytes inside quoted scalars, so `["]",["]",…` oscillated its counter near
-        // zero while real nesting grew (900 KB measured at ~66 s). The total-opens guard
-        // (no decrement, quote-blind) rejects it — each `["]` is a real `[` open; 2000 >
-        // MAX_YAML_FLOW_OPENS — and rejects FAST (the OLD guard let this through to
-        // serde_yml's O(n²) scan; this timing bound is the anti-regression discriminator).
-        let mut yaml = String::from("id: advance.x\ncanonical_surfaces: [projection-native]\nx: ");
+    fn nesting_guard_rejects_quoted_fake_close_bypass() {
+        // A net-depth counter that decremented on `]` inside quoted scalars let `["]",["]",…`
+        // oscillate near zero while the real nesting grew (900 KB measured at ~66 s). The
+        // guard counts every `[`/`{` and never decrements (quote-blind): 2000 opens exceed
+        // MAX_YAML_FLOW_OPENS. The timing bound tells the guard apart from serde_yml's scan.
+        let mut yaml = pack_yaml_with("x: ");
         yaml.push_str(&"[\"]\",".repeat(2_000));
         yaml.push_str("null");
         yaml.push_str(&"]".repeat(2_000));
         yaml.push('\n');
+        assert!(!yaml_nesting_within_bound(&yaml));
         let start = std::time::Instant::now();
-        let r = parse_resource_capability_manifest(cap_dir_with(&yaml).path());
+        let r = PackManifest::from_yaml(&yaml);
         let elapsed = start.elapsed();
-        match r {
-            Err(PackError::InvalidManifest(msg)) => {
-                assert!(
-                    msg.contains("nesting") || msg.contains("deep"),
-                    "got: {msg}"
-                )
-            }
-            other => panic!("expected InvalidManifest (quoted-fake-close bypass), got {other:?}"),
-        }
+        expect_nesting_rejection(r);
         assert!(
             elapsed.as_secs() < 2,
             "guard must reject the quoted-fake-close bypass FAST; took {elapsed:?}"
@@ -1147,48 +659,39 @@ widgets:
     }
 
     #[test]
-    fn t92_comment_fake_close_nesting_bypass_rejected() {
-        // Comment `# ]]]` closes must not fool the guard either (quote/comment-blind).
-        let mut yaml = String::from("id: advance.x\ncanonical_surfaces: [projection-native]\nx: ");
+    fn nesting_guard_rejects_comment_fake_close_bypass() {
+        // Comment `# ]` closes must not fool the guard either (comment-blind).
+        let mut yaml = pack_yaml_with("x: ");
         yaml.push_str(&"[ # ]\n".repeat(2_000));
-        match parse_resource_capability_manifest(cap_dir_with(&yaml).path()) {
-            Err(PackError::InvalidManifest(msg)) => {
-                assert!(
-                    msg.contains("nesting") || msg.contains("deep"),
-                    "got: {msg}"
-                )
-            }
-            other => panic!("expected InvalidManifest (comment-fake-close bypass), got {other:?}"),
-        }
+        assert!(!yaml_nesting_within_bound(&yaml));
+        expect_nesting_rejection(PackManifest::from_yaml(&yaml));
     }
 
     #[test]
-    fn t92_deep_wide_hybrid_rejected_fast() {
-        // Adversarial round 18 Finding 2: a deep(1000)+wide(~450k scalars) flow document keeps
-        // total-opens at 1000 (the depth-only cap PASSED it) but costs O(depth×width) — ~1.1 s
-        // parse on <1 MiB. The work bound (opens × len ≤ 2e8) rejects it FAST: at ~0.9 MiB the
-        // per-input open cap tightens to ~220, so the scan bails after ~220 `[`.
-        let mut yaml = String::from("x: ");
+    fn nesting_guard_rejects_deep_wide_hybrid_fast() {
+        // A deep (1000) + wide (~450k scalars) flow document has exactly as many opens as the
+        // depth cap allows, so only the work bound (opens × len ≤ 2e8) can reject it; parsed,
+        // it costs O(depth × width), ~1.1 s on <1 MiB. At ~0.9 MiB the per-input open cap
+        // tightens to ~220, so the scan bails after ~220 `[`.
+        let mut yaml = pack_yaml_with("x: ");
         yaml.push_str(&"[".repeat(1_000));
-        yaml.push_str(&"9,".repeat(450_000)); // ~0.9 MiB of scalars at depth 1000
+        yaml.push_str(&"9,".repeat(450_000));
         yaml.push_str(&"]".repeat(1_000));
         yaml.push('\n');
         assert!(
-            (yaml.len() as u64) < MAX_RESOURCE_CAPABILITY_YAML_BYTES,
-            "must stay under the size cap"
+            (yaml.len() as u64) < MAX_COMPONENT_YAML_BYTES,
+            "must stay under the 1 MiB size cap of the guarded documents"
         );
+        assert_eq!(
+            yaml.bytes().filter(|b| matches!(b, b'[' | b'{')).count(),
+            MAX_YAML_FLOW_OPENS,
+            "the depth cap alone accepts this document"
+        );
+        assert!(!yaml_nesting_within_bound(&yaml));
         let start = std::time::Instant::now();
-        let r = parse_resource_capability_manifest(cap_dir_with(&yaml).path());
+        let r = PackManifest::from_yaml(&yaml);
         let elapsed = start.elapsed();
-        match r {
-            Err(PackError::InvalidManifest(msg)) => {
-                assert!(
-                    msg.contains("nesting") || msg.contains("deep"),
-                    "got: {msg}"
-                )
-            }
-            other => panic!("expected InvalidManifest (deep+wide), got {other:?}"),
-        }
+        expect_nesting_rejection(r);
         assert!(
             elapsed.as_secs() < 2,
             "work bound must reject the deep+wide hybrid FAST; took {elapsed:?}"
@@ -1196,21 +699,39 @@ widgets:
     }
 
     #[test]
-    fn t92_wide_flow_manifest_within_bound_accepts() {
-        // A WIDE-but-shallow legit-shaped manifest (many sibling flow tools, depth ~2)
-        // stays under the opens cap and parses fast — proves the guard is not a blanket
-        // reject of flow style. 256 tools = ~256 `{` opens (< MAX_YAML_FLOW_OPENS).
-        let mut tools = String::from("tools: [");
-        for i in 0..256 {
-            if i > 0 {
-                tools.push_str(", ");
+    fn nesting_guard_accepts_wide_shallow_flow() {
+        // A wide-but-shallow realistic document stays under both caps and parses: the guard
+        // is no blanket reject of flow style. 256 dependency mappings = 256 `{` + 1 `[` opens.
+        let deps: Vec<String> = (0..256)
+            .map(|i| format!("{{name: dep{i}, version: \"^1.0.0\"}}"))
+            .collect();
+        let yaml = pack_yaml_with(&format!(
+            "dependencies: [{}]\nchecksums:\n  algo: sha256\n  files: {{}}\n",
+            deps.join(", ")
+        ));
+        assert!(yaml_nesting_within_bound(&yaml));
+        let m = PackManifest::from_yaml(&yaml).unwrap();
+        assert_eq!(m.dependencies.len(), 256);
+    }
+
+    #[test]
+    fn bounded_reader_rejects_oversize() {
+        // The size bound of the reader rescan uses for every installed pack.yaml and the
+        // component parser for component.yaml: one byte over is refused, the bound reads.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("component.yaml");
+        let max = MAX_COMPONENT_YAML_BYTES as usize;
+        std::fs::write(&path, vec![b'a'; max + 1]).unwrap();
+        match open_text_nofollow_bounded(&path, MAX_COMPONENT_YAML_BYTES, "component.yaml") {
+            Err(PackError::InvalidManifest(msg)) => {
+                assert!(msg.contains("exceeds max size"), "got: {msg}")
             }
-            tools.push_str(&format!("{{name: t{i}, read_only: true}}"));
+            other => panic!("expected InvalidManifest (oversize), got {other:?}"),
         }
-        tools.push_str("]\n");
-        let yaml = format!("id: advance.x\ncanonical_surfaces: [projection-native]\n{tools}");
-        let m = parse_resource_capability_manifest(cap_dir_with(&yaml).path()).unwrap();
-        assert_eq!(m.tools.len(), 256);
+        std::fs::write(&path, vec![b'a'; max]).unwrap();
+        let text = open_text_nofollow_bounded(&path, MAX_COMPONENT_YAML_BYTES, "component.yaml")
+            .expect("a file at the bound reads");
+        assert_eq!(text.len(), max);
     }
 
     #[test]
@@ -1231,20 +752,6 @@ widgets:
                 assert!(m.contains("nesting") || m.contains("deep"), "got: {m}")
             }
             other => panic!("expected InvalidManifest (deep nesting), got {other:?}"),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn t92_capability_yaml_symlink_rejected() {
-        // The parser's OWN leaf-symlink gate (not the install-time copy guard).
-        let dir = tempfile::TempDir::new().unwrap();
-        let real = dir.path().join("real.yaml");
-        std::fs::write(&real, VALID_CAPABILITY_YAML).unwrap();
-        std::os::unix::fs::symlink(&real, dir.path().join("capability.yaml")).unwrap();
-        match parse_resource_capability_manifest(dir.path()) {
-            Err(PackError::InvalidManifest(msg)) => assert!(msg.contains("symlink")),
-            other => panic!("expected InvalidManifest (symlink), got {other:?}"),
         }
     }
 }

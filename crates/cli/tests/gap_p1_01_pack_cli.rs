@@ -181,3 +181,85 @@ fn pc_06_packs_dir_defaults_to_workspace_env() {
         .success();
     assert!(ws.join(".advance/packs/foo@1.0.0/pack.yaml").is_file());
 }
+
+// `provides: resource-capabilities` is a retired content kind: `advance pack install` refuses a
+// manifest that declares it, and a pack that an older runtime installed with it still lists and
+// uninstalls (rescan ignores the key instead of failing every pack command).
+#[test]
+fn pc_07_retired_resource_capabilities_key() {
+    let tmp = TempDir::new().unwrap();
+    let packs = tmp.path().join("packs");
+    let src = write_pack(tmp.path(), "foo", &[]);
+    let manifest = src.join("pack.yaml");
+    let plain = std::fs::read_to_string(&manifest).unwrap();
+    let with_key = plain.replacen("provides:\n", "provides:\n  resource-capabilities: []\n", 1);
+    assert_ne!(with_key, plain);
+
+    std::fs::write(&manifest, &with_key).unwrap();
+    advance()
+        .args(["pack", "install"])
+        .arg(&src)
+        .args(["--no-input", "--packs-dir"])
+        .arg(&packs)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "foo@1.0.0 declares `provides: resource-capabilities`",
+        ));
+    assert!(!packs.join("foo@1.0.0").exists());
+
+    std::fs::write(&manifest, &plain).unwrap();
+    advance()
+        .args(["pack", "install"])
+        .arg(&src)
+        .args(["--no-input", "--packs-dir"])
+        .arg(&packs)
+        .assert()
+        .success();
+    std::fs::write(packs.join("foo@1.0.0/pack.yaml"), &with_key).unwrap();
+    advance()
+        .args(["pack", "list", "--packs-dir"])
+        .arg(&packs)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("foo@1.0.0"));
+    advance()
+        .args(["pack", "uninstall", "foo@1.0.0", "--packs-dir"])
+        .arg(&packs)
+        .assert()
+        .success();
+    assert!(!packs.join("foo@1.0.0").exists());
+}
+
+// The catalog `required-capabilities` are checked against is exactly the runtime's capability
+// names (no installed pack widens it), and the install note never names the retired kind.
+#[test]
+fn pc_08_capability_catalog_is_exactly_the_known_capabilities() {
+    use advance_pack_manager::{ComponentKind, PackProvideEntry};
+    let mut known = advance_cli::agent_config::KNOWN_CAPABILITIES.to_vec();
+    known.sort_unstable();
+    known.dedup();
+    let catalog = advance_cli::commands::pack::capability_catalog();
+    assert_eq!(catalog.names().collect::<Vec<_>>(), known);
+
+    let every_kind: Vec<PackProvideEntry> = [
+        ComponentKind::Binary,
+        ComponentKind::AgentTemplate,
+        ComponentKind::Skill,
+        ComponentKind::RunnableComponent,
+        ComponentKind::ChannelAdapter,
+        ComponentKind::McpServer,
+        ComponentKind::Preset,
+        ComponentKind::Workflow,
+        ComponentKind::MemorySeed,
+        ComponentKind::MetaSchemaExtension,
+    ]
+    .into_iter()
+    .map(|kind| PackProvideEntry {
+        kind,
+        name: "x".into(),
+    })
+    .collect();
+    let inert = advance_cli::pack_runtime::inert_kinds(&every_kind);
+    assert!(!inert.contains(&"resource-capabilities"), "{inert:?}");
+}

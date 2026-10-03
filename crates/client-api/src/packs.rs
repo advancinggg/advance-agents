@@ -36,7 +36,7 @@ pub const MAX_SOURCE_LEN: usize = 2048;
 pub const MAX_PACK_NAME_LEN: usize = 128;
 /// Bound on a pack version string (semver).
 pub const MAX_PACK_VERSION_LEN: usize = 64;
-/// Bound on one accepted capability id (`fs`, `llm`, `advance.structured-data`, …).
+/// Bound on one accepted capability id (`fs`, `llm`, `tools`, …).
 pub const MAX_CAPABILITY_ID_LEN: usize = 64;
 /// Bound on the number of accepted capabilities in one install request.
 pub const MAX_ACCEPTED_CAPABILITIES: usize = 64;
@@ -64,7 +64,7 @@ pub struct ClientPackSummary {
 pub struct ClientPackProvide {
     /// The provide category directory name (`behavior-binaries`, `agent-templates`, `skills`,
     /// `components`, `channel-adapters`, `mcp-servers`, `presets`, `workflows`, `memory-seeds`,
-    /// `meta-schema-extensions`, `resource-capabilities`).
+    /// `meta-schema-extensions`).
     pub kind: String,
     pub name: String,
 }
@@ -181,7 +181,9 @@ pub fn parse_pack_id(pack_id: &str) -> Result<(String, String), ClientError> {
     Ok((name.to_string(), version.to_string()))
 }
 
-/// `^[A-Za-z0-9_.:-]{1,64}$` — runtime capability ids and pack resource-capability ids.
+/// `^[A-Za-z0-9_.:-]{1,64}$` — one accepted capability id. The charset is wider than the
+/// runtime's capability names on purpose: an accepted id the runtime does not know approves
+/// nothing (a pack's `required-capabilities` must each be accepted AND known to the runtime).
 pub fn validate_capability_id(id: &str) -> Result<(), ClientError> {
     if id.is_empty()
         || id.len() > MAX_CAPABILITY_ID_LEN
@@ -351,7 +353,7 @@ mod tests {
     fn install_request_bounds() {
         let ok = ClientPackInstallRequest {
             source: "/tmp/pack".into(),
-            accepted_capabilities: vec!["fs".into(), "advance.structured-data".into()],
+            accepted_capabilities: vec!["fs".into(), "vendor.custom-cap".into()],
         };
         assert!(validate_install_request(&ok).is_ok());
         let empty = ClientPackInstallRequest {

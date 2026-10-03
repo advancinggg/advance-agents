@@ -15,11 +15,7 @@
 //!   atomic read-build-swap. Slice B adds `find_installed_satisfying` helper
 //!   for recursive-dep dedup.
 //! - [`MaterializeAction`] trait + [`DefaultMaterializer`] concrete impl. Slice C
-//!   shipped all 10 §19.3 materializer methods; the AC-17 slice (m018-rescap) adds
-//!   the 11th, [`register_resource_capability`](MaterializeAction::register_resource_capability)
-//!   — the register-not-copy REGISTRATION surface for the `resource-capabilities`
-//!   category (validate `capability.yaml`, return a content-derived
-//!   [`ResourceCapabilityId`]; nothing copied to workspaces).
+//!   shipped all 10 §19.3 materializer methods, one per content kind.
 //! - [`InteractiveApproval`] stdin-driven [`ApprovalStrategy`] for the admin
 //!   approval prompt (Slice B AC-07). Short-circuits on empty
 //!   `required-capabilities`.
@@ -54,9 +50,8 @@
 //!   compensation (`WorkflowExecutor::{terminate_child, withdraw_component}` +
 //!   `PackError::WorkflowStepFailed`); the `mcp-servers/{name}.yaml` schema
 //!   ([`mcp_server_manifest`]); the STRUCTURED meta-schema extension merge
-//!   ([`meta_schema_merge`]); `materialize_channel_adapter` explicitly
-//!   unsupported; and [`resource_capability_tool_names`] for the cli's
-//!   pack-tool exposure reconciliation. The pack → subsystem bridges themselves
+//!   ([`meta_schema_merge`]); and `materialize_channel_adapter` explicitly
+//!   unsupported. The pack → subsystem bridges themselves
 //!   (skills / presets / mcp / meta-schema / memory-seeds) and the production
 //!   `WorkflowExecutor` / `SecretStore` / `DependencyResolver` implementations
 //!   live in the cli composition root (`pack_bridges`, `pack_production`).
@@ -86,7 +81,6 @@ pub mod workflow;
 pub use admin::InteractiveApproval;
 pub use bundle::{bundle_pack, BundleReport};
 pub use catalog::{CapabilityCatalog, CatalogCheckedApproval, StaticCapabilityCatalog};
-pub use component_manifest::{resource_capability_id, resource_capability_tool_names};
 pub use deps::DependencyResolver;
 pub use error::PackError;
 pub use fetch::FetchContext;
@@ -99,9 +93,7 @@ pub use install::{
 pub use manifest::{
     ChecksumAlgo, PackChecksums, PackDependency, PackManifest, PackProvides, TrustLevel,
 };
-pub use materialize::{
-    GrantId, MaterializeAction, McpServerId, ResourceCapabilityId, WorkflowContext, WorkflowReport,
-};
+pub use materialize::{GrantId, MaterializeAction, McpServerId, WorkflowContext, WorkflowReport};
 pub use materialize_impl::DefaultMaterializer;
 pub use mcp_server_manifest::{
     parse_mcp_server_manifest, parse_mcp_server_manifest_str, McpServerManifest, McpTransportDecl,

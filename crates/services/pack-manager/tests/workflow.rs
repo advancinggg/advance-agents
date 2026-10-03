@@ -171,8 +171,8 @@ steps:
 async fn workflow_deep_flow_nesting_rejected_fast() {
     // Adversarial round 18: a pack-shipped `workflows/{name}.yaml` is untrusted; a
     // deep-flow-nested one drives serde_yml super-linear (measured 320 KB → ~83 s; ~15 min
-    // at the 1 MiB cap). The crate-wide `yaml_nesting_within_bound` guard — the 5th entry
-    // point — rejects it FAST, before serde_yml's O(n²) scan.
+    // at the 1 MiB cap). The crate-wide `yaml_nesting_within_bound` guard rejects it FAST,
+    // before serde_yml's O(n²) scan.
     let mut yaml = String::from("name: wf\nsteps: []\nx: ");
     yaml.push_str(&"[".repeat(5_000));
     let executor = MockExecutor::default();

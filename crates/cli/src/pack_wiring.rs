@@ -14,7 +14,7 @@
 //! - the [`PackEvaluatorResolver`] — auto-loop evaluator FQ refs
 //!   (`{pack}@{ver}/components/{name}`), installed on the production auto-loop
 //!   driver by `auto_wiring::install_auto_loop_integration_with_evaluator`.
-//! - a [`DefaultMaterializer`] over the registry (the 11 CONTRACT-171
+//! - a [`DefaultMaterializer`] over the registry (the 10 CONTRACT-171
 //!   materializer methods). Pack lane P2: its
 //!   `WorkflowExecutor` / `SecretStore` seams are the one-shot
 //!   [`LateBoundWorkflowExecutor`] / [`LateBoundSecretStore`] slots — the

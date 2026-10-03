@@ -3,10 +3,10 @@
 //! Strict top-level allow-list per PRD §19.3 / MODULE-018 §2.5: `pack.yaml`
 //! MUST exist, optional `.meta.yaml` and `pack.sig` (Pack lane P3:
 //! the ed25519 signature over `pack.yaml`), top-level entries restricted to the
-//! 11 canonical subdirectory names (the 10 §19.3 kinds + the AC-17
-//! `resource-capabilities` category; sparse subset OK — pack ships only the
-//! subdirs it populates). Unknown top-level entries (`README.md`, `LICENSE`,
-//! `extra/`, `.DS_Store`, etc.) → `InvalidManifest`.
+//! 10 canonical subdirectory names of the §19.3 kinds (sparse subset OK — pack
+//! ships only the subdirs it populates). Unknown top-level entries (`README.md`,
+//! `LICENSE`, `extra/`, `.DS_Store`, `resource-capabilities/` of the retired
+//! content kind, etc.) → `InvalidManifest`.
 //!
 //! Insertion site: called inline inside `Installer::install_with_context`'s
 //! step ⑥ window, AFTER `copy_dir_no_symlinks` and BEFORE
@@ -36,7 +36,6 @@ const CANONICAL_TOP_LEVEL: &[&str] = &[
     "workflows",
     "memory-seeds",
     "meta-schema-extensions",
-    "resource-capabilities",
 ];
 
 /// Validate the top-level shape of a pack install directory per AC-03.
@@ -74,7 +73,7 @@ pub(crate) fn validate_pack_layout(install_path: &Path) -> Result<(), PackError>
     // Top-level entry scan — strict allow-list + file-type enforcement.
     // Slice C adversarial round 11 Info 1 fix: don't just allow-list by
     // name — verify each entry has the canonical TYPE for its name.
-    // `pack.yaml`, `.meta.yaml` and `pack.sig` must be regular files; the 11
+    // `pack.yaml`, `.meta.yaml` and `pack.sig` must be regular files; the 10
     // subdirs must be directories. Symlinks are rejected outright at the top
     // level (defense-in-depth on top of `copy_dir_no_symlinks`).
     let read_dir = std::fs::read_dir(install_path).map_err(|e| PackError::Io {
@@ -121,7 +120,6 @@ pub(crate) fn validate_pack_layout(install_path: &Path) -> Result<(), PackError>
                 | "workflows"
                 | "memory-seeds"
                 | "meta-schema-extensions"
-                | "resource-capabilities"
         );
         if expected_dir && !md.is_dir() {
             return Err(PackError::InvalidManifest(format!(
@@ -231,21 +229,17 @@ mod tests {
         }
     }
 
-    // ── MODULE-018-T91 (AC-17): resource-capabilities/ layout parity ──
-
     #[test]
-    fn t91_pack_layout_accepts_resource_capabilities_dir() {
-        // AC-17: the top-level allow-list widened by exactly `resource-capabilities/`.
+    fn pack_layout_rejects_resource_capabilities_dir() {
+        // The directory of the retired `resource-capabilities` content kind is not part of
+        // the layout.
         let dir = make_pack_dir(&[("resource-capabilities", true)]);
-        validate_pack_layout(dir.path()).unwrap();
-    }
-
-    #[test]
-    fn t91_pack_layout_still_rejects_unknown_dir_alongside_resource_capabilities() {
-        // Widening is EXACTLY `resource-capabilities/` — an unknown sibling still fails.
-        let dir = make_pack_dir(&[("resource-capabilities", true), ("extra", true)]);
         match validate_pack_layout(dir.path()) {
-            Err(PackError::InvalidManifest(msg)) => assert!(msg.contains("extra")),
+            Err(PackError::InvalidManifest(msg)) => assert!(
+                msg.contains("unknown top-level entry")
+                    && msg.contains("\"resource-capabilities\""),
+                "{msg}"
+            ),
             other => panic!("expected InvalidManifest, got {other:?}"),
         }
     }
@@ -259,18 +253,6 @@ mod tests {
         let dir = make_pack_dir(&[("pack.sig", true)]);
         match validate_pack_layout(dir.path()) {
             Err(PackError::InvalidManifest(msg)) => assert!(msg.contains("pack.sig")),
-            other => panic!("expected InvalidManifest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn t91_pack_layout_rejects_resource_capabilities_as_file() {
-        // Directory-backed kind: a regular file named `resource-capabilities` is rejected.
-        let dir = make_pack_dir(&[("resource-capabilities", false)]);
-        match validate_pack_layout(dir.path()) {
-            Err(PackError::InvalidManifest(msg)) => {
-                assert!(msg.contains("resource-capabilities"))
-            }
             other => panic!("expected InvalidManifest, got {other:?}"),
         }
     }

@@ -304,15 +304,6 @@ async fn t32_materialize_action_trait_has_10_methods() {
         fn merge_meta_schema_extension(&self, _: &str, _: &Path) -> Result<(), PackError> {
             Ok(())
         }
-        // AC-17 (m018-rescap): the 11th method — added so the stub compiles against
-        // the widened trait. This test's assertions below stay AC-02 scope (the 10
-        // §19.3 methods); the 11th method's behaviour is covered by the AC-17 suite.
-        fn register_resource_capability(
-            &self,
-            _: &str,
-        ) -> Result<advance_pack_manager::ResourceCapabilityId, PackError> {
-            Ok(advance_pack_manager::ResourceCapabilityId("x".into()))
-        }
     }
     let m: Box<dyn MaterializeAction> = Box::new(StubMaterializer);
     // Confirm dynamic dispatch routes to all 10 methods at runtime (compile-time

@@ -7,9 +7,10 @@
 //! <registry>/index/<name>.json                { "name", "versions": { "<v>": { tarball, sha256, size } } }
 //! ```
 //!
-//! `bundle_pack` archives a validated pack directory (the install-layout allow-list; `pack.sig`
-//! rides along when present), records its sha256 + size, and merges the version into the
-//! index (other versions are kept). The tarball is reproducible: entries sorted by path,
+//! `bundle_pack` archives a validated pack directory (a manifest install would accept, retired
+//! `provides:` keys refused; the install-layout allow-list; `pack.sig` rides along when
+//! present), records its sha256 + size, and merges the version into the index (other versions
+//! are kept). The tarball is reproducible: entries sorted by path,
 //! mtime 0, uid/gid 0, modes 0644, ustar headers only (the installer refuses GNU long-name
 //! extension entries), gzip header without a timestamp — the same source tree bundles to the
 //! same bytes on any machine, so a CI rebuild can compare digests.
@@ -152,6 +153,7 @@ pub fn bundle_pack(
     let manifest_text =
         std::fs::read_to_string(&manifest_path).map_err(|e| io(&manifest_path, e))?;
     let manifest = PackManifest::from_yaml(&manifest_text)?;
+    manifest.refuse_retired_provides()?;
     crate::layout::validate_pack_layout(pack_dir)?;
     let files = collect_files(pack_dir)?;
     let archive = build_archive(&files)?;
@@ -290,5 +292,30 @@ mod tests {
         let long = "x".repeat(300);
         let files = vec![(long, dir.join("pack.yaml"))];
         assert!(build_archive(&files).is_err(), "no GNU long-name entries");
+    }
+
+    // A registry never serves what install refuses: a manifest declaring the retired
+    // `provides: resource-capabilities` key is not bundled, and nothing is written.
+    #[test]
+    fn a_retired_provides_key_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("p");
+        pack(&dir);
+        let manifest = dir.join("pack.yaml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        assert!(text.contains("provides:\n"));
+        std::fs::write(
+            &manifest,
+            text.replacen("provides:\n", "provides:\n  resource-capabilities: []\n", 1),
+        )
+        .unwrap();
+        let registry = tmp.path().join("registry");
+        match bundle_pack(&dir, &registry, None) {
+            Err(PackError::InvalidManifest(msg)) => {
+                assert!(msg.contains("`provides: resource-capabilities`"), "{msg}")
+            }
+            other => panic!("expected InvalidManifest, got {other:?}"),
+        }
+        assert!(!registry.exists(), "nothing is written");
     }
 }

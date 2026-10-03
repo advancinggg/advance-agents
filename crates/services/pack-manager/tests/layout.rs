@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use advance_pack_manager::{
-    AutoApprove, InMemoryPackRegistry, Installer, PackError, RecordingTraceSink,
+    AutoApprove, InMemoryPackRegistry, Installer, PackError, PackRegistry, RecordingTraceSink,
 };
 
 /// Build a pack source directory with the given top-level extras and a
@@ -119,6 +119,32 @@ async fn t40_extra_top_level_dir_is_rejected() {
         ),
         other => panic!("expected InvalidManifest, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn t40_resource_capabilities_dir_is_rejected() {
+    // `resource-capabilities/` belonged to a retired content kind and is no longer part of
+    // the layout: a pack shipping it (even without declaring the key) is refused, and nothing
+    // of it is left installed or indexed.
+    let dir = tempfile::TempDir::new().unwrap();
+    let extras: Vec<(&str, bool, &[u8])> = vec![(
+        "resource-capabilities/structured-data/capability.yaml",
+        false,
+        b"id: advance.structured-data\ncanonical_surfaces: [projection-native]\n" as &[u8],
+    )];
+    let pack_src = build_pack_source(dir.path(), "retired-kind-dir-pack", &extras);
+    let packs_dir = dir.path().join("packs");
+    match install_pack(&pack_src, &packs_dir).await {
+        Err(PackError::InvalidManifest(msg)) => assert!(
+            msg.contains("unknown top-level entry") && msg.contains("\"resource-capabilities\""),
+            "expected layout rejection, got: {msg}"
+        ),
+        other => panic!("expected InvalidManifest, got {other:?}"),
+    }
+    assert!(!packs_dir.join("retired-kind-dir-pack@1.0.0").exists());
+    let registry = InMemoryPackRegistry::new(packs_dir.clone());
+    registry.rescan().await.unwrap();
+    assert!(registry.list_installed().is_empty(), "nothing indexed");
 }
 
 #[tokio::test]

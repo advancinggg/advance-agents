@@ -24,8 +24,8 @@
 //!   pack with an empty `required-capabilities` without any decision (AC-07);
 //!   a pack that would need one is prompted for / rejected. The strategy is
 //!   wrapped in `CatalogCheckedApproval` over `agent_config::KNOWN_CAPABILITIES`
-//!   ∪ the ids of every installed pack's resource-capabilities, so an unknown
-//!   requirement is refused BEFORE any prompt.
+//!   ([`capability_catalog`]), so an unknown requirement is refused BEFORE any
+//!   prompt.
 //! - output: `installed {name}@{version} -> {path}` / one `name@version\ttrust\t
 //!   installed_at` line per pack / `uninstalled {name}@{version}`; failures go
 //!   to stderr with the error's Display and exit 1 (usage errors exit 2). Every
@@ -38,9 +38,9 @@ use std::time::Duration;
 
 use advance_pack_manager::meta::read_meta_index;
 use advance_pack_manager::{
-    resource_capability_id, ApprovalStrategy, AutoReject, CatalogCheckedApproval, ComponentKind,
-    InMemoryPackRegistry, Installer, InteractiveApproval, PackError, PackManifest, PackRegistry,
-    RejectUnlessTrivial, StaticCapabilityCatalog,
+    ApprovalStrategy, AutoReject, CatalogCheckedApproval, InMemoryPackRegistry, Installer,
+    InteractiveApproval, PackError, PackManifest, PackRegistry, RejectUnlessTrivial,
+    StaticCapabilityCatalog,
 };
 use advance_runtime::config::{load_config, PackApprovalPolicy, PackConfig};
 
@@ -93,8 +93,7 @@ fn resolve_settings(packs_dir: Option<PathBuf>) -> Result<PackCliSettings, Strin
 }
 
 /// A rescanned registry over `packs_dir` (disk truth BEFORE any decision: the
-/// installer's step-⑤ dependency dedup, the capability catalog and `list` all
-/// read the in-memory registry).
+/// installer's step-⑤ dependency dedup and `list` read the in-memory registry).
 async fn rescanned_registry(
     verb: &str,
     packs_dir: &Path,
@@ -111,28 +110,10 @@ async fn rescanned_registry(
     Ok(registry)
 }
 
-/// `KNOWN_CAPABILITIES` ∪ every installed pack's resource-capability ids (read
-/// through the registry's validated `resolve` + the bounded manifest parser).
-pub(crate) fn build_capability_catalog(
-    registry: &InMemoryPackRegistry,
-) -> Result<StaticCapabilityCatalog, PackError> {
-    let mut names: Vec<String> = KNOWN_CAPABILITIES.iter().map(|s| s.to_string()).collect();
-    for pack in registry.list_installed() {
-        let Some(provides) = registry.provides(&pack.name, &pack.version) else {
-            continue;
-        };
-        for entry in provides
-            .iter()
-            .filter(|p| p.kind == ComponentKind::ResourceCapability)
-        {
-            let resolution = registry.resolve(&format!(
-                "{}@{}/resource-capabilities/{}",
-                pack.name, pack.version, entry.name
-            ))?;
-            names.push(resource_capability_id(&resolution.local_path)?);
-        }
-    }
-    Ok(StaticCapabilityCatalog::new(names))
+/// The catalog a pack's `required-capabilities` are checked against at install (CLI and
+/// Client API alike): exactly the runtime's capability names. A pack never adds one.
+pub fn capability_catalog() -> StaticCapabilityCatalog {
+    StaticCapabilityCatalog::new(KNOWN_CAPABILITIES.iter().copied())
 }
 
 /// Operator-facing rendering of a `PackError` (`PackNotFound` reads
@@ -178,16 +159,6 @@ async fn run_install_async(source: String, packs_dir: Option<PathBuf>, no_input:
         Ok(r) => r,
         Err(code) => return code,
     };
-    let catalog = match build_capability_catalog(&registry) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "advance pack install: cannot build the capability catalog: {}",
-                safe_msg(&e.to_string())
-            );
-            return ExitCode::from(1);
-        }
-    };
     // `--no-input` / `pack.approval: auto-reject` ⇒ a pack that needs an admin
     // decision is refused; otherwise the operator answers on stdin. Both approve
     // a pack with an empty `required-capabilities` without any decision (AC-07).
@@ -196,7 +167,10 @@ async fn run_install_async(source: String, packs_dir: Option<PathBuf>, no_input:
     } else {
         Arc::new(InteractiveApproval::new_stdin())
     };
-    let approval = Arc::new(CatalogCheckedApproval::new(inner, Arc::new(catalog)));
+    let approval = Arc::new(CatalogCheckedApproval::new(
+        inner,
+        Arc::new(capability_catalog()),
+    ));
     let mut installer = Installer::new(
         settings.packs_dir.clone(),
         Arc::clone(&registry),
@@ -382,7 +356,6 @@ const PACK_LAYOUT_DIRS: &[&str] = &[
     "workflows",
     "memory-seeds",
     "meta-schema-extensions",
-    "resource-capabilities",
 ];
 
 impl PackBuildManifest {

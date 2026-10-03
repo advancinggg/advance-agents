@@ -25,8 +25,8 @@
 //!   in the same id namespace as the WASM tools, listed and invoked through
 //!   the same [`ToolRegistry`] surface with the same fail-closed gates
 //!   (`MethodNotFound`, per-method schemas, invoke timeout, `max_result_bytes`).
-//!   Store-backed pack resource-capability tools are host code by necessity
-//!   (tool WASMs link WASI only).
+//!   A tool that needs host state (a store, a database handle) is host code by
+//!   necessity (tool WASMs link WASI only).
 //!
 //! ## Slice B scope clarifier
 //!

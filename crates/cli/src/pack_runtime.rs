@@ -20,6 +20,9 @@
 //!   here blocks boot or fails an install; each distinct warning is logged once.
 //! - **One version per pack.** When several versions of a pack are installed (mid-upgrade),
 //!   only the highest applies.
+//! - **Retired keys are ignored.** A pack installed by an older runtime may declare
+//!   `provides: resource-capabilities`; the pack applies as usual and the key is reported as
+//!   ignored (one warning per pack).
 //! - **Existing records follow.** A change of the effective schema re-projects the
 //!   workspace's Markdown files into the entity index, so records gain (or lose) the pack's
 //!   aspects without being rewritten.
@@ -115,14 +118,11 @@ pub fn compose_schema(base: &str, packs: &[PackSchemaExtensions]) -> ComposedSch
 /// The content kinds among `provides` that no part of the runtime consumes: they install
 /// and list, and nothing activates them.
 pub fn inert_kinds(provides: &[advance_pack_manager::PackProvideEntry]) -> Vec<&'static str> {
-    [
-        (ComponentKind::McpServer, "mcp-servers"),
-        (ComponentKind::ResourceCapability, "resource-capabilities"),
-    ]
-    .into_iter()
-    .filter(|(kind, _)| provides.iter().any(|p| p.kind == *kind))
-    .map(|(_, label)| label)
-    .collect()
+    [(ComponentKind::McpServer, "mcp-servers")]
+        .into_iter()
+        .filter(|(kind, _)| provides.iter().any(|p| p.kind == *kind))
+        .map(|(_, label)| label)
+        .collect()
 }
 
 fn label(pack: &PackMetadata) -> String {
@@ -347,6 +347,18 @@ impl PackRuntime {
         let mut report = PackApplyReport::default();
         let packs = effective_packs(self.registry.list_installed(), &mut report.warnings);
         report.packs = packs.iter().map(label).collect();
+        for pack in &packs {
+            if self
+                .registry
+                .declares_retired_resource_capabilities(&pack.name, &pack.version)
+            {
+                report.warnings.push(format!(
+                    "pack {}: `provides: resource-capabilities` is ignored: this runtime no \
+                     longer supports pack resource capabilities (remove the key from pack.yaml)",
+                    label(pack)
+                ));
+            }
+        }
 
         if let Some(target) = self.schema.get() {
             let (base, warning) = read_base_schema(&target.base_path);

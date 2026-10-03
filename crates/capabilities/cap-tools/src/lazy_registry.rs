@@ -37,7 +37,7 @@
 //! ## Pack lane P2 — host-native tools
 //!
 //! Tool WASMs only link WASI p2, so a tool that needs host state (a store,
-//! a database handle, a pack resource-capability) must be HOST code. A
+//! a database handle) must be HOST code. A
 //! [`HostTool`] is registered under the same id namespace as the WASM
 //! tools ([`LazyToolRegistry::register_host`]; duplicate id → error),
 //! appears in `list()` with its `describe()` output, and is invoked by
@@ -481,17 +481,6 @@ impl LazyToolRegistry {
         }
         inner.host.insert(id, entry);
         Ok(())
-    }
-
-    /// Pack lane P2: the ids of every registered host-native
-    /// tool, sorted. The composition root's pack-tool exposure reconciliation
-    /// matches installed resource-capability `tools[].name` against THIS set
-    /// (a store-backed capability tool can only be host code).
-    pub async fn host_tool_ids(&self) -> Vec<String> {
-        let inner = self.inner.lock().await;
-        let mut ids: Vec<String> = inner.host.keys().cloned().collect();
-        ids.sort();
-        ids
     }
 
     async fn host_entry(&self, tool_id: &str) -> Option<Arc<HostToolEntry>> {

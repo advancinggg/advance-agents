@@ -387,9 +387,9 @@ pub async fn register_data_tool(
     store: Arc<DataStore>,
     grant: Arc<dyn GrantCheck>,
 ) -> Result<(), ToolError> {
-    // Same posture as `reconcile_pack_tool_exposure`: a declared operation whose bound skill
-    // tool is not registered is reported once at boot (WARN, never blocks); `describe` shows
-    // it as unavailable and `apply` answers `op_unavailable` until the pack's tool is present.
+    // A declared operation whose bound skill tool is not registered is reported once at boot
+    // (WARN, never blocks); `describe` shows it as unavailable and `apply` answers
+    // `op_unavailable` until the pack's tool is present.
     for aspect in store.describe("boot").await.aspects {
         for op in aspect.operations.iter().filter(|o| !o.available) {
             eprintln!(
