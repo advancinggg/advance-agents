@@ -9,7 +9,9 @@ use std::time::Duration;
 use advance_cli::commands::pack::{bundle_pack, sign_pack};
 use advance_cli::pack_registry_client::HttpsRegistryClient;
 use advance_pack_manager::signature::verify_pack_signature;
-use advance_pack_manager::{AutoApprove, InMemoryPackRegistry, Installer, PackRegistry};
+use advance_pack_manager::{
+    AutoApprove, InMemoryPackRegistry, Installer, PackManifest, PackRegistry,
+};
 use sha2::{Digest, Sha256};
 
 /// Serve `root` as a plain static file tree on loopback — what a registry host (a Pages
@@ -37,14 +39,23 @@ async fn serve_dir(root: PathBuf) -> std::net::SocketAddr {
     addr
 }
 
-fn agenda_copy(tmp: &Path) -> PathBuf {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+fn agenda_src() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../packs/agenda")
         .canonicalize()
-        .unwrap();
+        .unwrap()
+}
+
+fn agenda_copy(tmp: &Path) -> PathBuf {
     let dst = tmp.join("agenda");
-    copy_tree(&src, &dst);
+    copy_tree(&agenda_src(), &dst);
     dst
+}
+
+/// The version of the shipped agenda pack, read from its manifest.
+fn agenda_version() -> String {
+    let text = std::fs::read_to_string(agenda_src().join("pack.yaml")).unwrap();
+    PackManifest::from_yaml(&text).unwrap().version
 }
 
 fn copy_tree(src: &Path, dst: &Path) {
@@ -98,9 +109,11 @@ async fn e4_bundle_produces_an_installable_tarball_and_merges_the_index() {
     let dir = agenda_copy(tmp.path());
     sign_pack(&dir, &SECRET).unwrap();
     let out = tmp.path().join("registry");
+    let version = agenda_version();
+    let tarball = format!("agenda-{version}.tar.gz");
 
     let report = bundle_pack(&dir, &out).expect("bundle");
-    assert_eq!(report.tarball, out.join("agenda-0.1.1.tar.gz"));
+    assert_eq!(report.tarball, out.join(&tarball));
     let bytes = std::fs::read(&report.tarball).unwrap();
     assert_eq!(report.size, bytes.len() as u64);
     assert_eq!(report.sha256, format!("{:x}", Sha256::digest(&bytes)));
@@ -109,14 +122,11 @@ async fn e4_bundle_produces_an_installable_tarball_and_merges_the_index() {
         serde_json::from_str(&std::fs::read_to_string(out.join("index/agenda.json")).unwrap())
             .unwrap();
     assert_eq!(index["name"], "agenda");
-    let v = &index["versions"]["0.1.1"];
+    let v = &index["versions"][version.as_str()];
     assert_eq!(v["sha256"], serde_json::json!(report.sha256));
     assert_eq!(v["size"], serde_json::json!(report.size));
     assert!(
-        v["tarball"]
-            .as_str()
-            .unwrap()
-            .ends_with("agenda-0.1.1.tar.gz"),
+        v["tarball"].as_str().unwrap().ends_with(&tarball),
         "{index}"
     );
 
@@ -140,18 +150,18 @@ async fn e4_bundle_produces_an_installable_tarball_and_merges_the_index() {
     let bumped = tmp.path().join("agenda-0.2.0");
     copy_tree(&dir, &bumped);
     let manifest = std::fs::read_to_string(bumped.join("pack.yaml")).unwrap();
-    std::fs::write(
-        bumped.join("pack.yaml"),
-        manifest.replace("version: 0.1.1", "version: 0.2.0"),
-    )
-    .unwrap();
+    let rewritten = manifest.replace(&format!("version: {version}\n"), "version: 0.2.0\n");
+    assert_ne!(rewritten, manifest, "the copy now declares 0.2.0");
+    std::fs::write(bumped.join("pack.yaml"), rewritten).unwrap();
     let _ = std::fs::remove_file(bumped.join("pack.sig"));
     sign_pack(&bumped, &SECRET).unwrap();
     bundle_pack(&bumped, &out).expect("bundle 0.2.0");
     let index: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("index/agenda.json")).unwrap())
             .unwrap();
-    assert!(index["versions"]["0.1.1"].is_object() && index["versions"]["0.2.0"].is_object());
+    assert!(
+        index["versions"][version.as_str()].is_object() && index["versions"]["0.2.0"].is_object()
+    );
 }
 
 #[tokio::test]
@@ -163,12 +173,13 @@ async fn e4_bundled_registry_tree_installs_through_the_production_registry_clien
     let dir = agenda_copy(tmp.path());
     sign_pack(&dir, &SECRET).unwrap();
     let registry_dir = tmp.path().join("registry");
+    let version = agenda_version();
     let report = bundle_pack(&dir, &registry_dir).expect("bundle");
     let index: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&report.index).unwrap()).unwrap();
     assert_eq!(
-        index["versions"]["0.1.1"]["tarball"],
-        serde_json::json!("agenda-0.1.1.tar.gz"),
+        index["versions"][version.as_str()]["tarball"],
+        serde_json::json!(format!("agenda-{version}.tar.gz")),
         "no --base-url → bare file name"
     );
 
@@ -185,14 +196,14 @@ async fn e4_bundled_registry_tree_installs_through_the_production_registry_clien
     )
     .with_registry_client(Arc::new(client));
     let installed = installer
-        .install("registry:agenda@0.1.1")
+        .install(&format!("registry:agenda@{version}"))
         .await
         .expect("install through the registry client");
     assert_eq!(
         (installed.name.as_str(), installed.version.as_str()),
-        ("agenda", "0.1.1")
+        ("agenda", version.as_str())
     );
-    assert!(registry.has("agenda", "0.1.1"));
+    assert!(registry.has("agenda", &version));
     assert!(installed.install_path.join("pack.sig").is_file());
 
     // A version the index does not list is refused, not guessed.

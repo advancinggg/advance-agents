@@ -783,6 +783,35 @@ mod tests {
         assert!(schema.aspects["agenda"].fields.contains_key("due"));
     }
 
+    // An aspect has one owner, presentation included: a later pack that redeclares agenda with
+    // one tone changed is skipped, and agenda's presentation stands.
+    #[test]
+    fn a_pack_redeclaring_agenda_with_other_presentation_is_skipped() {
+        let original = "todo:      { tone: neutral, label: To do }";
+        assert!(AGENDA.contains(original));
+        let rival = AGENDA.replace(original, "todo:      { tone: warning, label: To do }");
+        let composed = compose_schema(
+            DEFAULT_META_SCHEMA_YAML,
+            &[
+                pack("agenda@0.1.0", &[("agenda", AGENDA)]),
+                pack("rival@1.0.0", &[("agenda", rival.as_str())]),
+            ],
+        );
+        assert_eq!(composed.merged, vec!["agenda@0.1.0"]);
+        assert_eq!(composed.warnings.len(), 1, "{:?}", composed.warnings);
+        assert!(
+            composed.warnings[0].starts_with("pack rival@1.0.0: meta-schema extensions skipped"),
+            "{:?}",
+            composed.warnings
+        );
+        let schema = parse(&composed.yaml);
+        let status = &schema.aspects["agenda"].display.fields["status"];
+        assert_eq!(
+            status.values["todo"].tone,
+            Some(cap_fs::meta_schema::Tone::Neutral)
+        );
+    }
+
     #[test]
     fn identical_redeclaration_is_idempotent() {
         let composed = compose_schema(

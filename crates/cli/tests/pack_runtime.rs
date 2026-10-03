@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use advance_cli::pack_runtime::PackRuntime;
-use advance_pack_manager::{AutoApprove, InMemoryPackRegistry, Installer};
+use advance_pack_manager::{AutoApprove, InMemoryPackRegistry, Installer, PackManifest};
 use advance_shared_types::entity::{EntityId, EntityIndex, EntityQuery};
 use cap_data::test_support::MemoryEntityIndex;
 use cap_fs::meta_schema::{MetaSchema, MetaSchemaLoader};
@@ -32,6 +32,17 @@ fn copy_tree(src: &Path, dst: &Path) {
             std::fs::copy(entry.path(), to).unwrap();
         }
     }
+}
+
+/// The version of the shipped agenda pack, read from its manifest.
+fn agenda_version() -> String {
+    let text = std::fs::read_to_string(repo().join("packs/agenda/pack.yaml")).unwrap();
+    PackManifest::from_yaml(&text).unwrap().version
+}
+
+/// `agenda@<version>` of the shipped pack.
+fn agenda_id() -> String {
+    format!("agenda@{}", agenda_version())
 }
 
 /// `packs/agenda` plus a `tool.wasm` for its skill. The stand-in is the cap-tools clock
@@ -145,8 +156,8 @@ async fn install_applies_and_uninstall_withdraws() {
     let report = rig.runtime.apply().await;
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     assert!(report.schema_changed);
-    assert_eq!(report.packs, vec!["agenda@0.1.1"]);
-    assert_eq!(report.schema_packs, vec!["agenda@0.1.1"]);
+    assert_eq!(report.packs, vec![agenda_id()]);
+    assert_eq!(report.schema_packs, vec![agenda_id()]);
     assert_eq!(report.aspects, vec!["agenda"]);
     assert_eq!(report.presets, vec!["agenda-editor"]);
     assert_eq!(report.tools, vec!["skill::agenda"]);
@@ -164,7 +175,7 @@ async fn install_applies_and_uninstall_withdraws() {
     assert!(!again.schema_changed);
 
     rig.installer()
-        .uninstall("agenda", "0.1.1")
+        .uninstall("agenda", &agenda_version())
         .await
         .expect("uninstall");
     let gone = rig.runtime.apply().await;
@@ -189,10 +200,10 @@ async fn a_conflicting_pack_is_skipped_with_a_warning() {
         .await
         .unwrap();
     let report = rig.runtime.apply().await;
-    assert_eq!(report.packs, vec!["agenda@0.1.1", "rival@1.0.0"]);
+    assert_eq!(report.packs, vec![agenda_id(), "rival@1.0.0".to_string()]);
     assert_eq!(
         report.schema_packs,
-        vec!["agenda@0.1.1"],
+        vec![agenda_id()],
         "pack-name order: agenda first"
     );
     assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
@@ -226,7 +237,10 @@ async fn a_workspace_skill_of_the_same_name_wins() {
         "{:?}",
         report.warnings
     );
-    rig.installer().uninstall("agenda", "0.1.1").await.unwrap();
+    rig.installer()
+        .uninstall("agenda", &agenda_version())
+        .await
+        .unwrap();
     rig.runtime.apply().await;
     assert!(
         rig.tools.is_registered("skill::agenda").await,
@@ -272,7 +286,10 @@ async fn existing_records_gain_and_lose_the_aspect() {
         .unwrap();
     assert_eq!(row.aspects, vec!["agenda"]);
 
-    rig.installer().uninstall("agenda", "0.1.1").await.unwrap();
+    rig.installer()
+        .uninstall("agenda", &agenda_version())
+        .await
+        .unwrap();
     rig.runtime.apply().await;
     assert_eq!(agenda_rows(&index).await, 0);
 }
@@ -305,7 +322,7 @@ async fn the_watcher_applies_an_install_made_by_another_process() {
     assert!(rig.presets.contains("agenda-editor"));
     assert!(rig.tools.is_registered("skill::agenda").await);
 
-    other.uninstall("agenda", "0.1.1").await.unwrap();
+    other.uninstall("agenda", &agenda_version()).await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while rig.loader.current().aspects.contains_key("agenda") {
         assert!(
@@ -358,7 +375,10 @@ async fn notes_name_what_did_not_take_effect() {
         .await
         .unwrap();
     let report = rig.runtime.apply().await;
-    assert!(rig.runtime.notes_for("agenda", "0.1.1", &report).is_empty());
+    assert!(rig
+        .runtime
+        .notes_for("agenda", &agenda_version(), &report)
+        .is_empty());
     let notes = rig.runtime.notes_for("rival", "1.0.0", &report);
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(
@@ -373,7 +393,7 @@ async fn notes_name_what_did_not_take_effect() {
         rig.packs_dir.clone(),
     ));
     let report = bare.apply().await;
-    let notes = bare.notes_for("agenda", "0.1.1", &report);
+    let notes = bare.notes_for("agenda", &agenda_version(), &report);
     assert_eq!(notes.len(), 3, "{notes:?}");
     assert!(notes.iter().any(|n| n.contains("`fs`")));
     assert!(notes.iter().any(|n| n.contains("`grant`")));
@@ -397,7 +417,10 @@ async fn pack_skill_docs_are_listed_for_the_prompt() {
     assert_eq!(skills[0].name, "agenda");
     assert!(!skills[0].summary.is_empty());
 
-    rig.installer().uninstall("agenda", "0.1.1").await.unwrap();
+    rig.installer()
+        .uninstall("agenda", &agenda_version())
+        .await
+        .unwrap();
     assert!(reader.list_skill_summaries("anyone").await.is_empty());
 }
 
@@ -422,7 +445,10 @@ async fn a_pack_status_field_does_not_collide_with_the_core_lifecycle_field() {
     assert!(live.record_field("lifecycle").is_some(), "base field kept");
     assert!(live.aspects["agenda"].fields.contains_key("status"));
 
-    rig.installer().uninstall("agenda", "0.1.1").await.unwrap();
+    rig.installer()
+        .uninstall("agenda", &agenda_version())
+        .await
+        .unwrap();
     rig.runtime.apply().await;
     assert!(rig.loader.current().record_field("status").is_none());
 }

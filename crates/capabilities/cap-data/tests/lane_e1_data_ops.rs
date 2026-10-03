@@ -4,9 +4,10 @@
 //! clock, a recording event sink and a scripted reducer are the doubles the crate ships under
 //! `test-support`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use advance_shared_types::entity::EntityQuery;
+use advance_shared_types::entity::{EntityQuery, OrderKey};
 use cap_data::test_support::{
     agenda_schema, AllowAll, DenyAll, DirWorkspaceFs, FixedClock, FsScoped, MemoryEntityIndex,
     RecordingEvents, ScriptedReducer, SequentialIds,
@@ -15,6 +16,7 @@ use cap_data::{
     DataError, DataStore, DataTool, IdempotencyKey, PatchOp, QueryRequest, Record, Target, Tier,
     MAX_EFFECTS_PER_APPLY, MAX_ITEMS_PER_FILE,
 };
+use cap_fs::meta_schema::MetaSchemaLoader;
 use cap_tools::{HostTool, ToolError};
 use serde_json::{json, Value};
 
@@ -632,7 +634,11 @@ async fn e1_describe_reports_aspects_and_operation_availability() {
     let a = &d.aspects[0];
     assert_eq!(a.name, "agenda");
     assert_eq!(a.key, vec!["status".to_string(), "starts".to_string()]);
-    assert_eq!(a.fields.len(), 11);
+    assert_eq!(
+        a.fields.len(),
+        12,
+        "11 declared fields and the presented `title` column"
+    );
     let names: Vec<_> = a.queries.iter().map(|q| q.name.as_str()).collect();
     assert_eq!(names, vec!["day", "open", "overdue", "upcoming"]);
     assert_eq!(a.views.len(), 4);
@@ -650,6 +656,219 @@ async fn e1_describe_reports_aspects_and_operation_availability() {
         .operations
         .iter()
         .all(|o| o.available && o.tool == "skill::agenda"));
+}
+
+fn order_key(field: &str, ascending: bool) -> OrderKey {
+    OrderKey {
+        field: field.into(),
+        ascending,
+    }
+}
+
+// The agenda pack's views and presentation, as `describe` hands them to clients and agents.
+#[tokio::test]
+async fn e1_describe_projects_view_presentation() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let (s, _) = store(&ws);
+    let d = s.describe("alice").await;
+    let a = &d.aspects[0];
+    assert_eq!(a.label.as_deref(), Some("Agenda"));
+    assert_eq!(a.icon.as_deref(), Some("calendar-check"));
+    assert_eq!(a.default_view.as_deref(), Some("list"));
+    assert_eq!(a.view_order, ["list", "board", "calendar"]);
+
+    let query = |name: &str| a.queries.iter().find(|q| q.name == name).unwrap();
+    assert_eq!(
+        query("open").order,
+        [order_key("due", true), order_key("priority", false)]
+    );
+    assert_eq!(
+        query("upcoming").order,
+        [order_key("starts", true), order_key("due", true)]
+    );
+
+    let view = |name: &str| a.views.iter().find(|v| v.name == name).unwrap();
+    let board = view("board");
+    assert_eq!(board.group_by.as_deref(), Some("status"));
+    assert_eq!(
+        board.order,
+        [order_key("priority", false), order_key("due", true)]
+    );
+    assert_eq!(board.columns, ["title", "due", "assignee", "priority"]);
+    assert_eq!(
+        (board.label.as_deref(), board.icon.as_deref()),
+        (Some("Board"), Some("kanban"))
+    );
+    let calendar = view("calendar");
+    assert!(
+        calendar.order.is_empty(),
+        "the calendar presents its query's own order"
+    );
+    assert_eq!(calendar.query.as_deref(), Some("upcoming"));
+    assert_eq!(
+        view("list").columns,
+        ["title", "status", "due", "priority", "assignee"]
+    );
+    assert_eq!(view("form").label.as_deref(), Some("Details"));
+
+    let field = |name: &str| a.fields.iter().find(|f| f.name == name).unwrap();
+    let status = field("status")
+        .display
+        .as_ref()
+        .expect("status is presented");
+    assert_eq!(status.format.as_deref(), Some("badge"));
+    assert_eq!(status.label.as_deref(), Some("Status"));
+    let tones: Vec<(&str, Option<&str>)> = status
+        .values
+        .iter()
+        .map(|v| (v.value.as_str(), v.tone.as_deref()))
+        .collect();
+    assert_eq!(
+        tones,
+        [
+            ("todo", Some("neutral")),
+            ("doing", Some("info")),
+            ("done", Some("success")),
+            ("cancelled", Some("muted")),
+        ],
+        "values come in the enum's declared order"
+    );
+    assert_eq!(status.values[2].icon.as_deref(), Some("check"));
+    let due = field("due").display.as_ref().unwrap();
+    assert_eq!(
+        (due.format.as_deref(), due.icon.as_deref()),
+        (Some("date"), Some("calendar"))
+    );
+    assert!(
+        field("due").display.as_ref().unwrap().values.is_empty(),
+        "values are for enum fields"
+    );
+    // A promoted column the aspect presents is listed under its fixed type; the others are not.
+    let title = field("title");
+    assert_eq!(title.r#type, "string");
+    assert!(!title.derived && !title.inherit && title.r#enum.is_none());
+    assert_eq!(
+        title.display.as_ref().unwrap().label.as_deref(),
+        Some("Title")
+    );
+    assert!(a
+        .fields
+        .iter()
+        .all(|f| f.name != "type" && f.name != "updated_at"));
+    let names: Vec<&str> = a.fields.iter().map(|f| f.name.as_str()).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "fields are sorted by name");
+
+    // An agent's `data.describe` carries the same presentation, with empty keys left out.
+    let tool = DataTool::new(Arc::new(s), Arc::new(AllowAll));
+    let out: Value = serde_json::from_slice(
+        &tool
+            .execute_as("alice", "describe", b"{}")
+            .await
+            .expect("describe"),
+    )
+    .unwrap();
+    let agenda = &out["aspects"][0];
+    assert_eq!(agenda["default_view"], "list");
+    assert_eq!(agenda["view_order"], json!(["list", "board", "calendar"]));
+    let named = |list: &str, name: &str| -> Value {
+        agenda[list]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(
+        named("fields", "status")["display"]["values"][3],
+        json!({ "value": "cancelled", "tone": "muted", "label": "Cancelled" })
+    );
+    assert_eq!(
+        named("views", "board")["order"],
+        json!([
+            { "field": "priority", "ascending": false },
+            { "field": "due", "ascending": true }
+        ])
+    );
+    let calendar = named("views", "calendar");
+    assert!(
+        calendar.get("order").is_none(),
+        "an empty order is left out: {calendar}"
+    );
+}
+
+// An aspect that presents nothing describes as before: no presentation key is serialized, and
+// a field or enum value whose presentation is empty is left out.
+#[tokio::test]
+async fn e1_describe_leaves_out_presentation_that_is_not_declared() {
+    const PLAIN: &str = "\
+aspect: tasks
+key: [state]
+fields:
+  state:
+    type: [open, shut]
+  note:
+    type: string
+  due:
+    type: datetime
+queries:
+  all: {}
+views:
+  rows: { kind: list, query: all }
+display:
+  fields:
+    state:
+      values:
+        open: { tone: info }
+        shut: {}
+    note: {}
+";
+    let ws = tempfile::TempDir::new().unwrap();
+    let schema = MetaSchemaLoader::from_yaml(PathBuf::from("/nonexistent/meta-schema.yaml"), PLAIN)
+        .expect("parses");
+    let s = DataStore::new(
+        Arc::new(DirWorkspaceFs::new(ws.path().to_path_buf())),
+        Arc::new(MemoryEntityIndex::default()),
+        Arc::new(schema),
+        Arc::new(SequentialIds::default()),
+        Arc::new(FixedClock::at(NOW)),
+    );
+    let d = s.describe("alice").await;
+    let tasks = &d.aspects[0];
+    assert_eq!(
+        tasks
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
+        ["due", "note", "state"],
+        "no promoted column is presented, so none is listed"
+    );
+
+    let out = serde_json::to_value(&d).unwrap();
+    let tasks = &out["aspects"][0];
+    for key in ["label", "icon", "default_view", "view_order"] {
+        assert!(tasks.get(key).is_none(), "{key}: {tasks}");
+    }
+    assert!(tasks["queries"][0].get("order").is_none(), "{tasks}");
+    let rows = &tasks["views"][0];
+    for key in ["order", "label", "icon"] {
+        assert!(rows.get(key).is_none(), "{key}: {rows}");
+    }
+    let fields = tasks["fields"].as_array().unwrap();
+    assert!(fields[0].get("display").is_none(), "due: {}", fields[0]);
+    assert!(
+        fields[1].get("display").is_none(),
+        "note (empty): {}",
+        fields[1]
+    );
+    assert_eq!(
+        fields[2]["display"],
+        json!({ "values": [{ "value": "open", "tone": "info" }] }),
+        "an empty value is left out"
+    );
 }
 
 // ── the `data` host tool ─────────────────────────────────────────────────────────────────────

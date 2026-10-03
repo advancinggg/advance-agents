@@ -63,21 +63,45 @@ pub struct ClientSchema {
 }
 
 /// One aspect: a named bundle of fields, queries, views and operations a record gains when
-/// any of its `key` fields is present.
+/// any of its `key` fields is present, and how clients present it. Every presentation key
+/// (labels, icons, formats, tones, the default view, the view order, a view's order) is
+/// optional, and a client renders without it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientAspect {
     pub name: String,
     pub key: Vec<String>,
+    /// The declared fields, plus each promoted column the aspect presents; sorted by name.
     pub fields: Vec<ClientAspectField>,
     pub queries: Vec<ClientAspectQuery>,
     pub views: Vec<ClientAspectView>,
     pub operations: Vec<ClientAspectOperation>,
+    /// The aspect's name for people, as plain text (render it as text, never as markup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// A name in the client's icon set (`[a-z0-9]+(-[a-z0-9]+)*`); a name the client does not
+    /// know renders without an icon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// The view a client opens first, never a `form`. Absent = the client chooses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_view: Option<String>,
+    /// The views a client lists (as tabs, say), in this order. A view left out is still
+    /// declared and reachable by name, typically a form that opens on a record. Empty = the
+    /// client chooses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub view_order: Vec<String>,
 }
 
-/// A declared field: its type (`string`, `integer`, `boolean`, `datetime`, `duration`, `enum`,
-/// `list<string>`, `list<datetime>`), enum values, default, declared transitions
-/// (`from → [to…]`), whether inline items inherit it from their file, and whether the host
-/// derives it (a derived field is never written by a client).
+/// A field of the aspect: its type (`string`, `integer`, `boolean`, `datetime`, `duration`,
+/// `enum`, `list<string>`, `list<datetime>`), enum values, default, declared transitions
+/// (`from → [to…]`), whether inline items inherit it from their file, whether the host derives
+/// it (a derived field is never written by a client), and how clients present it.
+///
+/// Besides its declared fields, an aspect lists each promoted column it presents: `title` and
+/// `type` (strings) and `updated_at` (a datetime the host maintains, so `derived`). Views and
+/// queries may name these three columns whether the aspect presents them or not. A promoted
+/// column's value is the row's own `title`, `type` or `updated_at`, not an entry of the row's
+/// `fields`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientAspectField {
     pub name: String,
@@ -92,27 +116,116 @@ pub struct ClientAspectField {
     pub inherit: bool,
     #[serde(default)]
     pub derived: bool,
+    /// How clients present the field; absent when the aspect declares nothing for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<ClientAspectFieldDisplay>,
 }
 
-/// A named query and the argument names / types it takes.
+/// How clients present a field. Every key is optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientAspectFieldDisplay {
+    /// One of `text`, `number`, `priority` (a higher value is more urgent), `checkbox`, `badge`
+    /// (an enum value takes its tone), `tags`, `person`, `date`, `datetime`, `relative` (a
+    /// moment relative to now), `duration`, `recurrence` (an RFC 5545 rule) and `timezone` (an
+    /// IANA zone name). An unknown value renders as `text`. When absent, infer the format from
+    /// the type: string → `text`, integer → `number`, boolean → `checkbox`, datetime and
+    /// list<datetime> → `datetime`, duration → `duration`, enum → `badge`, list<string> →
+    /// `tags`. Under `date` and `datetime`, a value written without a time of day is that
+    /// calendar day, shown as written; an instant renders in the zone named by the record's
+    /// field formatted `timezone`, if it has one, else in the viewer's zone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// The field's name for people (a column header, a form label), as plain text (render it
+    /// as text, never as markup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// A name in the client's icon set (`[a-z0-9]+(-[a-z0-9]+)*`); a name the client does not
+    /// know renders without an icon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Enum fields: the presentation of each value the aspect presents, in the enum's declared
+    /// order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<ClientAspectValueDisplay>,
+}
+
+/// How clients present one enum value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientAspectValueDisplay {
+    pub value: String,
+    /// One of `neutral`, `info`, `success`, `warning`, `error` and `muted`: a semantic name a
+    /// client maps onto its own palette, never a color. An unknown value renders as `neutral`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone: Option<String>,
+    /// The value's name for people (a badge, a board lane title), as plain text (render it as
+    /// text, never as markup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// A name in the client's icon set (`[a-z0-9]+(-[a-z0-9]+)*`); a name the client does not
+    /// know renders without an icon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+/// One ordering key of a declared query or view: an aspect field or a promoted column, and
+/// its direction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientAspectOrderKey {
+    pub field: String,
+    pub ascending: bool,
+}
+
+/// A named query, the argument names / types it takes, and the order its rows come in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientAspectQuery {
     pub name: String,
     pub args: BTreeMap<String, String>,
+    /// The order the host returns the rows in. The host puts missing values last in both
+    /// directions and compares text by code point (so an enum orders by its text, not by its
+    /// declared order), integers numerically and datetimes chronologically. Empty = newest
+    /// first (`updated_at` descending).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<ClientAspectOrderKey>,
 }
 
 /// A declared view: `kind` ∈ `list | table | board | calendar | form` (the GenUI catalog maps
-/// each kind to one component), the query it renders, the board column field, the columns.
+/// each kind to one component) and the query whose rows it renders (every kind but a form has
+/// one).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientAspectView {
     pub name: String,
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
+    /// A board's lanes (GenUI `Board.columns`): the values of this enum field in declared
+    /// order, each with the label and tone the field's `display` gives it. On a list or table
+    /// it makes sections. A calendar or form has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_by: Option<String>,
+    /// The fields the view shows, in order: a list or table row's cells (the first is the
+    /// primary line), a board card's fields (the first is the card title), a calendar event's
+    /// details, a form's inputs (a `derived` field renders read-only). Each is an aspect field
+    /// or a promoted column (`title`, `type`, `updated_at`); a form shows neither `type` nor
+    /// `updated_at`. Empty = the client chooses.
     #[serde(default)]
     pub columns: Vec<String>,
+    /// The order a client presents the rows in, within each lane or section when grouped.
+    /// Empty = the query's own `order`. It reorders only the rows the query returned and never
+    /// changes which rows come back, so a page cut at the query's limit is not the top rows by
+    /// this order. Every client compares the same way: missing values last in both directions;
+    /// an enum by its declared position; datetimes chronologically, a date without a time of
+    /// day counting as 00:00 UTC; integers numerically; `false` before `true`; text by Unicode
+    /// code point; rows that compare equal keep the order the query returned them in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<ClientAspectOrderKey>,
+    /// The view's name for people (a tab title, say), as plain text (render it as text, never
+    /// as markup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// A name in the client's icon set (`[a-z0-9]+(-[a-z0-9]+)*`); a name the client does not
+    /// know renders without an icon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 /// A declared logic operation bound to a pack skill tool; `available` says whether the tool

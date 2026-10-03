@@ -16,9 +16,12 @@ use cap_fs::frontmatter::{
     MAX_ITEMS_PER_FILE,
 };
 use cap_fs::meta_schema::{
-    FieldSpec, FieldType, MetaSchema, MetaSchemaLoader, QuerySpec, ValueExpr, WhereClause,
+    AspectSpec, FieldDisplay, FieldType, MetaSchema, MetaSchemaLoader, QuerySpec, ValueExpr,
+    WhereClause,
 };
-use cap_fs::schema_v2::{eval_expr, format_datetime, parse_datetime, yaml_to_json};
+use cap_fs::schema_v2::{
+    eval_expr, format_datetime, parse_datetime, promoted_column_type, yaml_to_json,
+};
 use cap_tools::DeterministicCtx;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -273,6 +276,9 @@ pub struct ApplyResult {
 
 // ── describe ────────────────────────────────────────────────────────────────────────────────
 
+/// One field of an aspect: a declared field, or a promoted column (`title`, `type`,
+/// `updated_at`) the aspect presents, under its fixed type. Presentation keys are left out
+/// when the aspect declares none.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldDescription {
     pub name: String,
@@ -287,12 +293,45 @@ pub struct FieldDescription {
     pub inherit: bool,
     #[serde(default)]
     pub derived: bool,
+    /// How clients present the field (`display.fields.<name>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<FieldDisplayDescription>,
+}
+
+/// How clients present one field: a format from the closed vocabulary, a label, an icon and,
+/// for an enum, the presentation of each value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldDisplayDescription {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// The values the aspect presents, in the enum's declared order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<ValueDisplayDescription>,
+}
+
+/// How clients present one enum value: a tone from the closed vocabulary, a label, an icon.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValueDisplayDescription {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryDescription {
     pub name: String,
     pub args: BTreeMap<String, String>,
+    /// The order the query returns its rows in; empty = newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<OrderKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -305,6 +344,13 @@ pub struct ViewDescription {
     pub group_by: Option<String>,
     #[serde(default)]
     pub columns: Vec<String>,
+    /// The order a client presents the query's rows in; empty = the query's own order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<OrderKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -321,10 +367,21 @@ pub struct OperationDescription {
 pub struct AspectDescription {
     pub name: String,
     pub key: Vec<String>,
+    /// Declared fields and presented promoted columns, sorted by name.
     pub fields: Vec<FieldDescription>,
     pub queries: Vec<QueryDescription>,
     pub views: Vec<ViewDescription>,
     pub operations: Vec<OperationDescription>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// The view a client opens first (never a form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_view: Option<String>,
+    /// The order a client lists the views in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub view_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -599,7 +656,7 @@ impl DataStore {
             .map(|(name, a)| AspectDescription {
                 name: name.clone(),
                 key: a.key.clone(),
-                fields: a.fields.iter().map(|(n, f)| describe_field(n, f)).collect(),
+                fields: describe_fields(a),
                 queries: a
                     .queries
                     .iter()
@@ -610,17 +667,24 @@ impl DataStore {
                             .iter()
                             .map(|(k, t)| (k.clone(), type_name(t)))
                             .collect(),
+                        order: q.order.clone(),
                     })
                     .collect(),
                 views: a
                     .views
                     .iter()
-                    .map(|(n, v)| ViewDescription {
-                        name: n.clone(),
-                        kind: v.kind.as_str().to_string(),
-                        query: v.query.clone(),
-                        group_by: v.group_by.clone(),
-                        columns: v.columns.clone(),
+                    .map(|(n, v)| {
+                        let shown = a.display.views.get(n);
+                        ViewDescription {
+                            name: n.clone(),
+                            kind: v.kind.as_str().to_string(),
+                            query: v.query.clone(),
+                            group_by: v.group_by.clone(),
+                            columns: v.columns.clone(),
+                            order: v.order.clone(),
+                            label: shown.and_then(|s| s.label.clone()),
+                            icon: shown.and_then(|s| s.icon.clone()),
+                        }
                     })
                     .collect(),
                 operations: a
@@ -636,6 +700,10 @@ impl DataStore {
                         }
                     })
                     .collect(),
+                label: a.display.label.clone(),
+                icon: a.display.icon.clone(),
+                default_view: a.display.default_view.clone(),
+                view_order: a.display.view_order.clone(),
             })
             .collect();
         SchemaDescription {
@@ -1603,19 +1671,82 @@ fn type_name(t: &FieldType) -> String {
     }
 }
 
-fn describe_field(name: &str, f: &FieldSpec) -> FieldDescription {
-    FieldDescription {
-        name: name.to_string(),
-        r#type: type_name(&f.field_type),
-        r#enum: match &f.field_type {
-            FieldType::EnumString(v) => Some(v.clone()),
-            _ => None,
-        },
-        default: f.default.as_ref().map(yaml_to_json),
-        transitions: f.transitions.clone(),
-        inherit: f.inherit,
-        derived: f.derive.is_some(),
+/// An aspect's declared fields, plus each promoted column its `display` presents (under the
+/// column's fixed type; `updated_at` is maintained by the host, so it is derived), sorted by
+/// name.
+fn describe_fields(a: &AspectSpec) -> Vec<FieldDescription> {
+    let mut out: BTreeMap<&str, FieldDescription> = a
+        .fields
+        .iter()
+        .map(|(n, f)| {
+            let shown = a.display.fields.get(n);
+            let described = FieldDescription {
+                name: n.clone(),
+                r#type: type_name(&f.field_type),
+                r#enum: match &f.field_type {
+                    FieldType::EnumString(v) => Some(v.clone()),
+                    _ => None,
+                },
+                default: f.default.as_ref().map(yaml_to_json),
+                transitions: f.transitions.clone(),
+                inherit: f.inherit,
+                derived: f.derive.is_some(),
+                display: shown.and_then(|s| describe_display(s, &f.field_type)),
+            };
+            (n.as_str(), described)
+        })
+        .collect();
+    for (n, shown) in &a.display.fields {
+        if a.fields.contains_key(n) {
+            continue;
+        }
+        let Some(column_type) = promoted_column_type(n) else {
+            continue;
+        };
+        let described = FieldDescription {
+            name: n.clone(),
+            r#type: type_name(&column_type),
+            r#enum: None,
+            default: None,
+            transitions: None,
+            inherit: false,
+            derived: n == "updated_at",
+            display: describe_display(shown, &column_type),
+        };
+        out.insert(n.as_str(), described);
     }
+    out.into_values().collect()
+}
+
+/// A field's presentation, with an enum's values in declared order. `None` when it declares
+/// nothing; a value that declares nothing is left out.
+fn describe_display(shown: &FieldDisplay, t: &FieldType) -> Option<FieldDisplayDescription> {
+    let values = match t {
+        FieldType::EnumString(variants) => variants
+            .iter()
+            .filter_map(|v| {
+                let d = shown.values.get(v)?;
+                let described = ValueDisplayDescription {
+                    value: v.clone(),
+                    tone: d.tone.map(|tone| tone.as_str().to_string()),
+                    label: d.label.clone(),
+                    icon: d.icon.clone(),
+                };
+                let empty = described.tone.is_none()
+                    && described.label.is_none()
+                    && described.icon.is_none();
+                (!empty).then_some(described)
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let described = FieldDisplayDescription {
+        format: shown.format.map(|f| f.as_str().to_string()),
+        label: shown.label.clone(),
+        icon: shown.icon.clone(),
+        values,
+    };
+    (described != FieldDisplayDescription::default()).then_some(described)
 }
 
 /// A `where` clause with its expressions evaluated (post-filter form).

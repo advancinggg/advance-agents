@@ -306,6 +306,18 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
                 schema_value::<crate::entities::ClientAspectField>(),
             ),
             (
+                "ClientAspectFieldDisplay",
+                schema_value::<crate::entities::ClientAspectFieldDisplay>(),
+            ),
+            (
+                "ClientAspectValueDisplay",
+                schema_value::<crate::entities::ClientAspectValueDisplay>(),
+            ),
+            (
+                "ClientAspectOrderKey",
+                schema_value::<crate::entities::ClientAspectOrderKey>(),
+            ),
+            (
                 "ClientAspectQuery",
                 schema_value::<crate::entities::ClientAspectQuery>(),
             ),

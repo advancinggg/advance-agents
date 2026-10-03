@@ -32,9 +32,9 @@ pub use effects::{
 };
 pub use store::{
     ApplyResult, AspectDescription, Clock, DataError, DataStore, EntityIds, FieldDescription,
-    FileVersion, IdempotencyKey, OperationDescription, PatchOp, PureReducer, QueryDescription,
-    QueryRequest, ReceiptKind, Record, RecordVersion, SchemaDescription, SystemClock, Target, Tier,
-    UlidEntityIds, ViewDescription, WorkspaceFs, WriteReceipt, IDS_PER_APPLY,
-    MAX_IDEMPOTENCY_ENTRIES,
+    FieldDisplayDescription, FileVersion, IdempotencyKey, OperationDescription, PatchOp,
+    PureReducer, QueryDescription, QueryRequest, ReceiptKind, Record, RecordVersion,
+    SchemaDescription, SystemClock, Target, Tier, UlidEntityIds, ValueDisplayDescription,
+    ViewDescription, WorkspaceFs, WriteReceipt, IDS_PER_APPLY, MAX_IDEMPOTENCY_ENTRIES,
 };
 pub use tool::DataTool;

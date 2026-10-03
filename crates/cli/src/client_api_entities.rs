@@ -19,7 +19,8 @@
 use std::sync::Arc;
 
 use advance_client_api::entities::{
-    ClientAspect, ClientAspectField, ClientAspectOperation, ClientAspectQuery, ClientAspectView,
+    ClientAspect, ClientAspectField, ClientAspectFieldDisplay, ClientAspectOperation,
+    ClientAspectOrderKey, ClientAspectQuery, ClientAspectValueDisplay, ClientAspectView,
     ClientEntityApplyRequest, ClientEntityCreateRequest, ClientEntityPage,
     ClientEntityPatchRequest, ClientEntityQueryRequest, ClientEntityRow, ClientEntityTarget,
     ClientPatchOp, ClientSchema,
@@ -28,7 +29,9 @@ use advance_client_api::{EntityProvider, ProviderError};
 use advance_shared_types::entity::{
     EntityId, EntityKind, EntityQuery, EntityRow, OrderKey, DEFAULT_ENTITY_QUERY_LIMIT,
 };
-use cap_data::{DataError, DataStore, PatchOp, QueryRequest, Record, Target, Tier};
+use cap_data::{
+    DataError, DataStore, FieldDisplayDescription, PatchOp, QueryRequest, Record, Target, Tier,
+};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 
@@ -156,6 +159,34 @@ fn map_err(e: DataError) -> ProviderError {
     }
 }
 
+fn order_dto(order: Vec<OrderKey>) -> Vec<ClientAspectOrderKey> {
+    order
+        .into_iter()
+        .map(|k| ClientAspectOrderKey {
+            field: k.field,
+            ascending: k.ascending,
+        })
+        .collect()
+}
+
+fn field_display_dto(d: FieldDisplayDescription) -> ClientAspectFieldDisplay {
+    ClientAspectFieldDisplay {
+        format: d.format,
+        label: d.label,
+        icon: d.icon,
+        values: d
+            .values
+            .into_iter()
+            .map(|v| ClientAspectValueDisplay {
+                value: v.value,
+                tone: v.tone,
+                label: v.label,
+                icon: v.icon,
+            })
+            .collect(),
+    }
+}
+
 fn object_or_empty(v: &Value) -> Value {
     if v.is_object() {
         v.clone()
@@ -199,6 +230,7 @@ impl EntityProvider for WiredEntityProvider {
                             transitions: f.transitions,
                             inherit: f.inherit,
                             derived: f.derived,
+                            display: f.display.map(field_display_dto),
                         })
                         .collect(),
                     queries: a
@@ -207,6 +239,7 @@ impl EntityProvider for WiredEntityProvider {
                         .map(|q| ClientAspectQuery {
                             name: q.name,
                             args: q.args,
+                            order: order_dto(q.order),
                         })
                         .collect(),
                     views: a
@@ -218,6 +251,9 @@ impl EntityProvider for WiredEntityProvider {
                             query: v.query,
                             group_by: v.group_by,
                             columns: v.columns,
+                            order: order_dto(v.order),
+                            label: v.label,
+                            icon: v.icon,
                         })
                         .collect(),
                     operations: a
@@ -230,6 +266,10 @@ impl EntityProvider for WiredEntityProvider {
                             available: o.available,
                         })
                         .collect(),
+                    label: a.label,
+                    icon: a.icon,
+                    default_view: a.default_view,
+                    view_order: a.view_order,
                 })
                 .collect(),
         })

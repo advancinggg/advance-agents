@@ -5,6 +5,7 @@
 //! reserve/replay, handler-side validation, provider-error projection). The production adapter
 //! over `DataStore` is `crates/cli/src/client_api_entities.rs`.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -14,9 +15,10 @@ use advance_client_api::audit::RecordingSink;
 use advance_client_api::clock::{Clock, TestClock};
 use advance_client_api::compat::RESPONSE_COMPONENTS;
 use advance_client_api::entities::{
-    ClientAspect, ClientEntityApplyRequest, ClientEntityCreateRequest, ClientEntityPage,
-    ClientEntityPatchRequest, ClientEntityQueryRequest, ClientEntityRow, ClientEntityTarget,
-    ClientSchema,
+    ClientAspect, ClientAspectField, ClientAspectFieldDisplay, ClientAspectOrderKey,
+    ClientAspectQuery, ClientAspectValueDisplay, ClientAspectView, ClientEntityApplyRequest,
+    ClientEntityCreateRequest, ClientEntityPage, ClientEntityPatchRequest,
+    ClientEntityQueryRequest, ClientEntityRow, ClientEntityTarget, ClientSchema,
 };
 use advance_client_api::projection::{accepted_event_literals, leaf_names};
 use advance_client_api::routes::{self, family_of};
@@ -42,6 +44,72 @@ struct MemoryEntities {
     calls: Calls,
     last_patch: Mutex<Option<(String, ClientEntityPatchRequest)>>,
     fail: Option<ProviderError>,
+}
+
+/// An aspect with every presentation key set, as a pack's `display` block yields it.
+fn presented_aspect() -> ClientAspect {
+    let key = |field: &str, ascending: bool| ClientAspectOrderKey {
+        field: field.into(),
+        ascending,
+    };
+    let value = |value: &str, tone: &str, label: Option<&str>, icon: Option<&str>| {
+        ClientAspectValueDisplay {
+            value: value.into(),
+            tone: Some(tone.into()),
+            label: label.map(Into::into),
+            icon: icon.map(Into::into),
+        }
+    };
+    ClientAspect {
+        name: "agenda".into(),
+        key: vec!["status".into(), "starts".into()],
+        fields: vec![
+            ClientAspectField {
+                name: "status".into(),
+                r#type: "enum".into(),
+                r#enum: Some(vec!["todo".into(), "done".into()]),
+                display: Some(ClientAspectFieldDisplay {
+                    format: Some("badge".into()),
+                    label: Some("Status".into()),
+                    icon: None,
+                    values: vec![
+                        value("todo", "neutral", Some("To do"), None),
+                        value("done", "success", None, Some("check")),
+                    ],
+                }),
+                ..Default::default()
+            },
+            ClientAspectField {
+                name: "title".into(),
+                r#type: "string".into(),
+                display: Some(ClientAspectFieldDisplay {
+                    label: Some("Title".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ],
+        queries: vec![ClientAspectQuery {
+            name: "open".into(),
+            args: BTreeMap::new(),
+            order: vec![key("due", true)],
+        }],
+        views: vec![ClientAspectView {
+            name: "board".into(),
+            kind: "board".into(),
+            query: Some("open".into()),
+            group_by: Some("status".into()),
+            columns: vec!["title".into()],
+            order: vec![key("priority", false)],
+            label: Some("Board".into()),
+            icon: Some("kanban".into()),
+        }],
+        operations: vec![],
+        label: Some("Agenda".into()),
+        icon: Some("calendar-check".into()),
+        default_view: Some("board".into()),
+        view_order: vec!["board".into()],
+    }
 }
 
 fn row(id: &str, status: &str) -> ClientEntityRow {
@@ -88,14 +156,7 @@ impl EntityProvider for MemoryEntities {
         self.gate()?;
         Ok(ClientSchema {
             hash: "ab".repeat(32),
-            aspects: vec![ClientAspect {
-                name: "agenda".into(),
-                key: vec!["status".into(), "starts".into()],
-                fields: vec![],
-                queries: vec![],
-                views: vec![],
-                operations: vec![],
-            }],
+            aspects: vec![presented_aspect()],
         })
     }
     fn query(&self, req: &ClientEntityQueryRequest) -> Result<ClientEntityPage, ProviderError> {
@@ -452,10 +513,130 @@ fn en06_dtos_are_in_the_schema_inventory() {
         "ClientEntityRow",
         "ClientEntityPage",
         "ClientEntityTarget",
+        "ClientAspectFieldDisplay",
+        "ClientAspectValueDisplay",
+        "ClientAspectOrderKey",
     ] {
         assert!(
             RESPONSE_COMPONENTS.contains(&name),
             "{name} needs a compat baseline"
         );
     }
+
+    // The presentation components are schema components of their own, and every presentation
+    // property is optional, so a payload without them stays valid.
+    let schema: Value = serde_json::from_str(&artifact).expect("the artifact is JSON");
+    let components = &schema["components"];
+    for (component, properties) in [
+        (
+            "ClientAspect",
+            &["label", "icon", "default_view", "view_order"][..],
+        ),
+        ("ClientAspectField", &["display"]),
+        ("ClientAspectQuery", &["order"]),
+        ("ClientAspectView", &["order", "label", "icon"]),
+        (
+            "ClientAspectFieldDisplay",
+            &["format", "label", "icon", "values"],
+        ),
+        ("ClientAspectValueDisplay", &["tone", "label", "icon"]),
+    ] {
+        let node = &components[component];
+        let required = node["required"].as_array().cloned().unwrap_or_default();
+        for property in properties {
+            assert!(
+                node["properties"].get(*property).is_some(),
+                "{component}.{property} is in the schema"
+            );
+            assert!(
+                !required.contains(&json!(property)),
+                "{component}.{property} is optional"
+            );
+        }
+    }
+    let order_key = &components["ClientAspectOrderKey"];
+    let mut required: Vec<&str> = order_key["required"]
+        .as_array()
+        .expect("required keys")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    required.sort_unstable();
+    assert_eq!(required, ["ascending", "field"]);
+    assert!(
+        order_key.get("additionalProperties").is_none(),
+        "a response component accepts later additive fields"
+    );
+}
+
+// ── EN-07: presentation is additive: an older payload still reads, a full one round-trips ────
+#[test]
+fn en07_presentation_is_additive_and_round_trips() {
+    // A payload from before presentation existed reads, and serializes back unchanged: no
+    // presentation key appears when the aspect declares none.
+    let old = json!({
+        "hash": "ab".repeat(32),
+        "aspects": [{
+            "name": "agenda",
+            "key": ["status"],
+            "fields": [{
+                "name": "status",
+                "type": "enum",
+                "enum": ["todo", "done"],
+                "inherit": false,
+                "derived": false
+            }],
+            "queries": [{ "name": "open", "args": {} }],
+            "views": [{ "name": "list", "kind": "list", "query": "open", "columns": [] }],
+            "operations": []
+        }]
+    });
+    let parsed: ClientSchema = serde_json::from_value(old.clone()).expect("an older payload reads");
+    let aspect = &parsed.aspects[0];
+    assert!(aspect.label.is_none() && aspect.default_view.is_none());
+    assert!(aspect.view_order.is_empty() && aspect.queries[0].order.is_empty());
+    assert!(aspect.views[0].order.is_empty() && aspect.fields[0].display.is_none());
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), old);
+
+    // Through the route, every presentation key reaches the client and reads back equal.
+    let (api, _sink) = api_with(MemoryEntities::new());
+    operator(&api);
+    let env = api.handle(get(routes::PATH_SCHEMA));
+    let raw = env.data.clone().expect("schema payload");
+    let schema: ClientSchema = data(&env);
+    assert_eq!(schema.aspects, vec![presented_aspect()]);
+    let aspect = &raw["aspects"][0];
+    assert_eq!(aspect["label"], "Agenda");
+    assert_eq!(aspect["icon"], "calendar-check");
+    assert_eq!(aspect["default_view"], "board");
+    assert_eq!(aspect["view_order"], json!(["board"]));
+    assert_eq!(
+        aspect["queries"][0]["order"],
+        json!([{ "field": "due", "ascending": true }])
+    );
+    assert_eq!(
+        aspect["views"][0],
+        json!({
+            "name": "board",
+            "kind": "board",
+            "query": "open",
+            "group_by": "status",
+            "columns": ["title"],
+            "order": [{ "field": "priority", "ascending": false }],
+            "label": "Board",
+            "icon": "kanban"
+        })
+    );
+    assert_eq!(
+        aspect["fields"][0]["display"],
+        json!({
+            "format": "badge",
+            "label": "Status",
+            "values": [
+                { "value": "todo", "tone": "neutral", "label": "To do" },
+                { "value": "done", "tone": "success", "icon": "check" }
+            ]
+        })
+    );
+    assert_eq!(aspect["fields"][1]["display"], json!({ "label": "Title" }));
 }

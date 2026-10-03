@@ -8,7 +8,8 @@
 //!   `:uninstall` takes the pack's contributions away again (no restart);
 //! - an install made by ANOTHER process into the packs dir reaches the running daemon;
 //! - the `data` host tool is reachable through the production tool registry with the
-//!   caller's identity, and serves an agent that holds an `fs` grant (no grant of its own).
+//!   caller's identity, and serves an agent that holds an `fs` grant (no grant of its own);
+//! - the pack's views and presentation reach `/client/schema` and the agent's `describe`.
 //!
 //! Fixture discipline: env-var master key (never read), no network, the agenda skill's
 //! `tool.wasm` is the cap-tools clock fixture (any component exporting `tool-exports` passes
@@ -19,11 +20,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use advance_cli::wiring::{wire_capabilities, WiringHandles};
-use advance_client_api::entities::{ClientEntityPage, ClientSchema};
+use advance_client_api::entities::{ClientAspectOrderKey, ClientEntityPage, ClientSchema};
 use advance_client_api::{
     ClientApi, ClientEnvelope, ClientRequest, ClientSession, Platform, Principal, Scope,
 };
-use advance_pack_manager::{AutoApprove, InMemoryPackRegistry, Installer};
+use advance_pack_manager::{AutoApprove, InMemoryPackRegistry, Installer, PackManifest};
 use advance_runtime::bootstrap::RuntimeHostBuilder;
 use cap_grant::data::{
     CapParam, Grant, GrantId, GrantIssuer, GrantProvenance, GrantStatus, GrantTtl,
@@ -78,6 +79,12 @@ fn copy_tree(src: &Path, dst: &Path) {
             std::fs::copy(entry.path(), to).unwrap();
         }
     }
+}
+
+/// The version of the shipped agenda pack, read from its manifest.
+fn agenda_version() -> String {
+    let text = std::fs::read_to_string(repo().join("packs/agenda/pack.yaml")).unwrap();
+    PackManifest::from_yaml(&text).unwrap().version
 }
 
 struct Ws {
@@ -236,6 +243,101 @@ async fn a_pack_installed_before_boot_is_live_at_boot() {
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 }
 
+// The agenda pack's views and presentation travel from its schema file, through the live
+// merge and the data store, to `GET /client/schema` and to an agent's `data.describe`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agenda_views_reach_clients_with_their_presentation() {
+    let ws = workspace();
+    shell_installer(&ws)
+        .install(ws.agenda_src.to_str().unwrap())
+        .await
+        .expect("install before boot");
+    let (_host, handles) = boot(&ws).await;
+    let api = operator_api(&handles);
+
+    let live = schema(&api);
+    assert_agenda_live(&live);
+    let agenda = &live.aspects[0];
+    assert_eq!(agenda.label.as_deref(), Some("Agenda"));
+    assert_eq!(agenda.icon.as_deref(), Some("calendar-check"));
+    assert_eq!(agenda.default_view.as_deref(), Some("list"));
+    assert_eq!(agenda.view_order, ["list", "board", "calendar"]);
+
+    let key = |field: &str, ascending: bool| ClientAspectOrderKey {
+        field: field.into(),
+        ascending,
+    };
+    let view = |name: &str| agenda.views.iter().find(|v| v.name == name).unwrap();
+    let board = view("board");
+    assert_eq!(board.group_by.as_deref(), Some("status"));
+    assert_eq!(board.order, [key("priority", false), key("due", true)]);
+    assert_eq!(board.label.as_deref(), Some("Board"));
+    assert_eq!(
+        view("list").columns,
+        ["title", "status", "due", "priority", "assignee"]
+    );
+    assert!(
+        view("list").order.is_empty(),
+        "the list keeps its query's order"
+    );
+    let open = agenda.queries.iter().find(|q| q.name == "open").unwrap();
+    assert_eq!(open.order, [key("due", true), key("priority", false)]);
+
+    let field = |name: &str| agenda.fields.iter().find(|f| f.name == name).unwrap();
+    let status = field("status")
+        .display
+        .clone()
+        .expect("status is presented");
+    assert_eq!(status.format.as_deref(), Some("badge"));
+    let tones: Vec<(&str, Option<&str>)> = status
+        .values
+        .iter()
+        .map(|v| (v.value.as_str(), v.tone.as_deref()))
+        .collect();
+    assert_eq!(
+        tones,
+        [
+            ("todo", Some("neutral")),
+            ("doing", Some("info")),
+            ("done", Some("success")),
+            ("cancelled", Some("muted")),
+        ]
+    );
+    assert_eq!(
+        field("due").display.clone().unwrap().format.as_deref(),
+        Some("date")
+    );
+    let title = field("title");
+    assert_eq!(title.r#type, "string");
+    assert_eq!(
+        title.display.clone().unwrap().label.as_deref(),
+        Some("Title")
+    );
+
+    // The agent-facing describe carries the same presentation.
+    let tools = handles.tool_registry.clone().expect("tools declared");
+    let described: Value = serde_json::from_slice(
+        &tools
+            .invoke_as(&handles.root_agent_id, "data", "describe", b"{}")
+            .await
+            .expect("describe with the root's fs grant"),
+    )
+    .unwrap();
+    let aspect = &described["aspects"][0];
+    assert_eq!(aspect["default_view"], "list");
+    assert_eq!(aspect["view_order"], json!(["list", "board", "calendar"]));
+    let described_status = aspect["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == "status")
+        .unwrap();
+    assert_eq!(
+        described_status["display"],
+        serde_json::to_value(&status).unwrap()
+    );
+}
+
 // A pack that an older runtime installed with the retired `provides: resource-capabilities` key
 // (and the `resource-capabilities/` directory it required) does not stop the daemon: it boots,
 // the rest of the pack is live, and the key is reported as ignored, once for the pack. A new
@@ -345,7 +447,7 @@ async fn client_api_install_is_hot_and_uninstall_withdraws() {
 
     let env = post(
         &api,
-        "/client/packs/agenda@0.1.1:uninstall",
+        &format!("/client/packs/agenda@{}:uninstall", agenda_version()),
         json!({}),
         "uninstall-1",
     );

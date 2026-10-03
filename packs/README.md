@@ -87,10 +87,10 @@ loads; the runtime ignores the key and logs a warning for that pack. A pack's
 5. A skill's `tool.wasm` is pure computation: no clock, no randomness, no I/O. `data.apply`
    invokes it with a fixed clock and seed, so equal inputs must give equal outputs.
 6. Structured data lives in frontmatter. A pack declares vocabulary (fields, invariants,
-   queries, views, operation bindings) in `meta-schema-extensions/`; it never ships code that
-   touches storage. The runtime enforces the declared invariants on every write of a Markdown
-   file, through the `data` host tool and through `fs.write` alike, and both keep the entity
-   index and the change event in step.
+   queries, views, operation bindings, and in `display` how clients present them) in
+   `meta-schema-extensions/`; it never ships code that touches storage. The runtime enforces
+   the declared invariants on every write of a Markdown file, through the `data` host tool and
+   through `fs.write` alike, and both keep the entity index and the change event in step.
 
 The `agenda` pack declares the first aspect and is the reference for the entity model
 (frontmatter records, inline items, the `data` host tool).
@@ -132,7 +132,7 @@ pack:
 ```
 
 Once GitHub Pages serves the `gh-pages` branch, `https://advancinggg.github.io/advance-agents/packs`
-serves the same tree. Then `advance pack install registry:agenda@0.1.1` installs the built
+serves the same tree. Then `advance pack install registry:agenda@0.1.2` installs the built
 agenda pack, `tool.wasm` included.
 
 Trust: operators list maintainers' public keys in `runtime-config.yaml` `pack.trust-roots`;

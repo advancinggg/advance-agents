@@ -55,11 +55,57 @@ queries:
     order: [starts asc, due asc]
 
 views:
-  list:     { kind: list,     query: open }
-  board:    { kind: board,    query: open, group_by: status }
-  calendar: { kind: calendar, query: upcoming }
-  form:     { kind: form }
+  list:
+    kind: list
+    query: open                      # no order of its own: the query's [due asc, priority desc]
+    columns: [title, status, due, priority, assignee]
+  board:
+    kind: board
+    query: open
+    group_by: status                 # lanes: todo, doing, done, cancelled (declared order)
+    order: [priority desc, due asc]  # within each lane
+    columns: [title, due, assignee, priority]
+  calendar:
+    kind: calendar
+    query: upcoming
+    columns: [title, status, assignee]
+  form:
+    kind: form
+    columns: [title, status, due, priority, assignee, starts, ends, all_day, repeat, exdates, tz, completed_at]
 
 operations:
   detach_occurrence: { tool: agenda, method: detach-occurrence }
   shift_series:      { tool: agenda, method: shift-series }
+
+# Presentation only: labels, icons, formats and tones for clients. Validation, storage and
+# queries never read it.
+display:
+  label: Agenda
+  icon: calendar-check
+  default_view: list
+  view_order: [list, board, calendar]
+  views:
+    list:     { label: Open,     icon: list-todo }
+    board:    { label: Board,    icon: kanban }
+    calendar: { label: Calendar, icon: calendar }
+    form:     { label: Details,  icon: pencil }
+  fields:
+    title:        { label: Title }
+    status:
+      format: badge
+      label: Status
+      values:
+        todo:      { tone: neutral, label: To do }
+        doing:     { tone: info,    label: In progress }
+        done:      { tone: success, label: Done, icon: check }
+        cancelled: { tone: muted,   label: Cancelled }
+    due:          { format: date,       label: Due,      icon: calendar }
+    priority:     { format: priority,   label: Priority }
+    assignee:     { format: person,     label: Assignee, icon: user }
+    completed_at: { format: relative,   label: Completed }
+    starts:       { format: datetime,   label: Starts }
+    ends:         { format: datetime,   label: Ends }
+    all_day:      { format: checkbox,   label: All day }
+    repeat:       { format: recurrence, label: Repeats,  icon: repeat }
+    exdates:      { format: date,       label: Skipped }
+    tz:           { format: timezone,   label: Time zone }

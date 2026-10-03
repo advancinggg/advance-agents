@@ -73,7 +73,8 @@ pub use deltas::{
     LLM_DELTA_ABSENT_NOTE,
 };
 pub use entities::{
-    ClientAspect, ClientAspectField, ClientAspectOperation, ClientAspectQuery, ClientAspectView,
+    ClientAspect, ClientAspectField, ClientAspectFieldDisplay, ClientAspectOperation,
+    ClientAspectOrderKey, ClientAspectQuery, ClientAspectValueDisplay, ClientAspectView,
     ClientEntityAgentRequest, ClientEntityApplyRequest, ClientEntityCreateRequest,
     ClientEntityFilter, ClientEntityPage, ClientEntityPatchRequest, ClientEntityQueryRequest,
     ClientEntityRow, ClientEntityTarget, ClientEntityWindow, ClientNamedQuery, ClientOrderKey,

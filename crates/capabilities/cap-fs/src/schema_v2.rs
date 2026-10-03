@@ -1386,9 +1386,10 @@ fn is_promoted_column(name: &str) -> bool {
     promoted_column_type(name).is_some()
 }
 
-/// The fixed type of a promoted column: `title` and `type` are strings, `updated_at` is the
-/// row's modification time.
-fn promoted_column_type(name: &str) -> Option<FieldType> {
+/// The fixed type of a promoted column, a record column that every query and view may name
+/// without an aspect declaring it: `title` and `type` are strings, `updated_at` is the row's
+/// modification time. `None` for any other name.
+pub fn promoted_column_type(name: &str) -> Option<FieldType> {
     match name {
         "title" | "type" => Some(FieldType::String),
         "updated_at" => Some(FieldType::DateTime),
