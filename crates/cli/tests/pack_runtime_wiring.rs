@@ -370,3 +370,72 @@ async fn an_agent_holding_fs_and_tools_reaches_the_data_tool_through_the_product
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["id"], "e-launch");
 }
+
+// A pack workflow runs through the daemon-composed Client API: `:apply` spawns the child the
+// workflow describes, from the pack's own template. The workspace declares `lifecycle` too,
+// which is what binds the production workflow executor.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_api_apply_runs_a_pack_workflow() {
+    let ws = workspace();
+    std::fs::write(
+        ws.root.join(".agent/config.yaml"),
+        "capabilities:\n  fs: true\n  tools: true\n  grant: true\n  lifecycle: true\n",
+    )
+    .unwrap();
+    let src = ws.root.parent().unwrap().join("src/p");
+    let t = src.join("agent-templates/researcher");
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(
+        t.join("template.yaml"),
+        "name: researcher\nversion: 1.0.0\ndescription: Research template\nbehavior:\n  type: embedded\n  binary: behavior.wasm\n",
+    )
+    .unwrap();
+    std::fs::write(t.join("AGENTS.md"), "# researcher\n").unwrap();
+    std::fs::write(t.join("behavior.wasm"), b"\0asm\x01\0\0\0").unwrap();
+    std::fs::create_dir_all(src.join("workflows")).unwrap();
+    std::fs::write(
+        src.join("workflows/team.yaml"),
+        "name: team\nsteps:\n  - type: spawn-child\n    template: p@1.0.0/agent-templates/researcher\n    target-path: /research-assistant\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("pack.yaml"),
+        "name: p\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\ntrust-level: untrusted\nprovides:\n  agent-templates:\n    - researcher\n  workflows:\n    - team\nchecksums:\n  algo: sha256\n  files: {}\n",
+    )
+    .unwrap();
+    // `lifecycle` wires the secret store too, which needs the configured master key.
+    std::env::set_var("ADV_PACK_RUNTIME_MK_UNUSED", "11".repeat(32));
+    let (_host, handles) = boot(&ws).await;
+    let api = operator_api(&handles);
+
+    let env = post(
+        &api,
+        "/client/packs:install",
+        json!({ "source": src.to_str().unwrap(), "accepted_capabilities": [] }),
+        "install-p",
+    );
+    assert!(env.is_ok(), "{:?}", env.error);
+
+    let env = post(
+        &api,
+        "/client/packs/p@1.0.0:apply",
+        json!({ "workflow": "team" }),
+        "apply-team",
+    );
+    assert!(env.is_ok(), "{:?}", env.error);
+    let result = env.data.expect("apply result");
+    assert_eq!(result["steps_executed"], json!(["spawn-child"]));
+    let child = ws.root.join("research-assistant");
+    assert!(
+        child.join(".agent/AGENTS.md").is_file(),
+        "child materialized from the pack template"
+    );
+
+    let env = post(
+        &api,
+        "/client/packs/p@1.0.0:apply",
+        json!({ "workflow": "nope" }),
+        "apply-nope",
+    );
+    assert!(!env.is_ok(), "an unknown workflow is refused");
+}

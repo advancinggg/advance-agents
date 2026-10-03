@@ -18,13 +18,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use advance_client_api::packs::{
-    ClientPackDetail, ClientPackInstallRequest, ClientPackInstallResult, ClientPackProvide,
-    ClientPackSummary, ClientPackUninstallResult,
+    ClientPackApplyResult, ClientPackDetail, ClientPackInstallRequest, ClientPackInstallResult,
+    ClientPackProvide, ClientPackSummary, ClientPackUninstallResult,
 };
 use advance_client_api::{PackAdminProvider, ProviderError};
 use advance_pack_manager::{
-    ApprovalStrategy, CatalogCheckedApproval, ComponentKind, InMemoryPackRegistry, Installer,
-    PackError, PackManifest, PackRegistry, TrustLevel,
+    ApprovalStrategy, CatalogCheckedApproval, ComponentKind, DefaultMaterializer,
+    InMemoryPackRegistry, Installer, MaterializeAction, PackError, PackManifest, PackRegistry,
+    TrustLevel, WorkflowContext,
 };
 use advance_runtime::config::PackConfig;
 use async_trait::async_trait;
@@ -63,6 +64,8 @@ pub struct WiredPackAdminProvider {
     /// Applies the installed pack set to the running runtime after a successful install /
     /// uninstall (schema extensions, presets, skill tools), before the response returns.
     pack_runtime: Option<Arc<crate::pack_runtime::PackRuntime>>,
+    /// Runs pack workflows (`:apply`) with the operator's identity over the workspace.
+    workflows: Option<(Arc<DefaultMaterializer>, WorkflowContext)>,
 }
 
 impl WiredPackAdminProvider {
@@ -78,7 +81,28 @@ impl WiredPackAdminProvider {
             config,
             runtime_version: runtime_version.into(),
             pack_runtime: None,
+            workflows: None,
         }
+    }
+
+    /// Let `POST /client/packs/{pack_id}:apply` run a pack's workflows through `materializer`
+    /// (its executor and secret store are bound by the composition root) as `admin_id`. A
+    /// workflow's `target-path` is a workspace-virtual path (`/team/x` = under the workspace
+    /// root), which the executor maps into the workspace; the applier's containment root is
+    /// therefore `/`, the operator-driven form.
+    pub fn with_workflows(
+        mut self,
+        materializer: Arc<DefaultMaterializer>,
+        admin_id: impl Into<String>,
+    ) -> Self {
+        self.workflows = Some((
+            materializer,
+            WorkflowContext {
+                admin_id: admin_id.into(),
+                target_workspace: PathBuf::from("/"),
+            },
+        ));
+        self
     }
 
     /// Apply every install / uninstall to the running runtime (hot, no restart).
@@ -224,7 +248,9 @@ pub fn map_pack_error(error: PackError) -> ProviderError {
         | PackError::DependencyCycle { .. }
         | PackError::DependencyDepthExceeded { .. }
         | PackError::ConstraintViolation { .. }
-        | PackError::SignatureInvalid { .. } => ProviderError::InvalidRequest(error.to_string()),
+        | PackError::SignatureInvalid { .. }
+        | PackError::InvalidWorkflow(_) => ProviderError::InvalidRequest(error.to_string()),
+        PackError::WorkflowStepFailed { .. } => ProviderError::InvalidState(error.to_string()),
         other => ProviderError::Unavailable(other.to_string()),
     }
 }
@@ -291,6 +317,32 @@ impl PackAdminProvider for WiredPackAdminProvider {
             version: report.version,
             install_path,
             warnings,
+        })
+    }
+
+    fn apply_pack_workflow(
+        &self,
+        name: &str,
+        version: &str,
+        workflow: &str,
+    ) -> Result<ClientPackApplyResult, ProviderError> {
+        let Some((materializer, context)) = &self.workflows else {
+            return Err(ProviderError::Unavailable(
+                "pack workflows are not wired in this runtime".into(),
+            ));
+        };
+        if !self.registry.has(name, version) {
+            return Err(ProviderError::NotFound(format!("{name}@{version}")));
+        }
+        let pack_ref = format!("{name}@{version}/workflows/{workflow}");
+        let report = materializer
+            .apply_workflow(&pack_ref, context.clone())
+            .map_err(map_pack_error)?;
+        Ok(ClientPackApplyResult {
+            name: name.into(),
+            version: version.into(),
+            workflow: workflow.into(),
+            steps_executed: report.steps_executed,
         })
     }
 

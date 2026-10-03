@@ -87,8 +87,9 @@ pub use events::{
 };
 pub use messages::{ClientMessageAck, ClientMessageStatus, ClientSendMessageRequest};
 pub use packs::{
-    ClientPackDetail, ClientPackInstallRequest, ClientPackInstallResult, ClientPackList,
-    ClientPackProvide, ClientPackSummary, ClientPackUninstallResult,
+    ClientPackApplyRequest, ClientPackApplyResult, ClientPackDetail, ClientPackInstallRequest,
+    ClientPackInstallResult, ClientPackList, ClientPackProvide, ClientPackSummary,
+    ClientPackUninstallResult,
 };
 pub use pagination::{Cursor, Page};
 pub use provider::{

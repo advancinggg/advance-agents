@@ -6,6 +6,7 @@
 //! - `GET  /client/packs/{pack_id}`                one pack + its declared provides
 //! - `POST /client/packs:install`                  install from a source (`Scope::ApproveGrants`)
 //! - `POST /client/packs/{pack_id}:uninstall`      uninstall (`Scope::ApproveGrants`)
+//! - `POST /client/packs/{pack_id}:apply`          run a pack workflow (`Scope::ApproveGrants`)
 //!
 //! `pack_id` is the registry key `{name}@{version}` (refs are always versioned, MODULE-018).
 //!
@@ -108,6 +109,21 @@ pub struct ClientPackInstallResult {
     /// live.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+/// `POST /client/packs/{pack_id}:apply` body: which of the pack's workflows to run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientPackApplyRequest {
+    pub workflow: String,
+}
+
+/// `POST /client/packs/{pack_id}:apply` result: the steps that ran, in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientPackApplyResult {
+    pub name: String,
+    pub version: String,
+    pub workflow: String,
+    pub steps_executed: Vec<String>,
 }
 
 /// `POST /client/packs/{pack_id}:uninstall` result.
@@ -263,6 +279,25 @@ pub(crate) fn register(api: &mut ClientApi, slot: PackProviderSlot) {
                 .install_pack(&req)
                 .map_err(ProviderError::into_client_error)?;
             Ok(serde_json::to_value(result).expect("ClientPackInstallResult serializes"))
+        })
+        .with_scopes(vec![Scope::ApproveGrants]),
+    );
+
+    // POST /client/packs/{pack_id}:apply — mutation: run one of the pack's workflows.
+    let s = slot.clone();
+    api.register_templated(
+        Method::Post,
+        routes::TPL_PACK_APPLY,
+        HandlerSpec::mutation(true, move |ctx| {
+            let (name, version) = parse_pack_id(&ctx.path_param("pack_id")?)?;
+            let req: ClientPackApplyRequest = parse_body(&ctx.body)?;
+            validate_pack_name(&req.workflow).map_err(|_| invalid("invalid workflow name"))?;
+            let provider = provider_or_unavailable(&s)?;
+            mark_provider_entry(ctx)?;
+            let result = provider
+                .apply_pack_workflow(&name, &version, &req.workflow)
+                .map_err(ProviderError::into_client_error)?;
+            Ok(serde_json::to_value(result).expect("ClientPackApplyResult serializes"))
         })
         .with_scopes(vec![Scope::ApproveGrants]),
     );

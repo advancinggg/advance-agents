@@ -2956,7 +2956,8 @@ async fn wire_capabilities_inner(
                     runtime_config.pack.clone(),
                     env!("CARGO_PKG_VERSION"),
                 )
-                .with_pack_runtime(Arc::clone(&pack_runtime)),
+                .with_pack_runtime(Arc::clone(&pack_runtime))
+                .with_workflows(Arc::clone(&pack_wiring.materializer), root_uid.as_str()),
             );
             // Secrets family: the home's secrets
             // mode over the same runtime-config.yaml write chain the selected-provider

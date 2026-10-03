@@ -96,16 +96,6 @@ fn build_pack_with_all_10_provides(root: &Path, name: &str, version: &str) -> Pa
         b"id: daily-summary",
     )
     .unwrap();
-    std::fs::create_dir_all(pack_dir.join("channel-adapters").join("telegram-adapter")).unwrap();
-    std::fs::write(
-        pack_dir
-            .join("channel-adapters")
-            .join("telegram-adapter")
-            .join("adapter.yaml"),
-        b"name: telegram",
-    )
-    .unwrap();
-
     let pack_yaml = format!(
         r#"name: {name}
 version: {version}
@@ -116,7 +106,6 @@ provides:
   agent-templates: [researcher]
   skills: [web-search]
   components: [daily-summary]
-  channel-adapters: [telegram-adapter]
   mcp-servers: [brave]
   presets: [research-auto]
   workflows: [auto-research]
@@ -595,30 +584,29 @@ async fn t60_materialize_channel_adapter_is_explicitly_unsupported() {
     // is now an explicit `NotImplemented`; the ref is still resolved first (a
     // wrong kind → MaterializeMissingProvide, see the kind-mismatch test) and
     // NOTHING is written to the target.
-    let (_dir, registry) = install_fixture_pack("bigpackT60", "1.0.0").await;
-    let registry_dyn: Arc<dyn PackRegistry> = registry.clone();
-    let executor: Arc<dyn WorkflowExecutor> = Arc::new(MockExecutor::default());
-    let secret_store: Arc<dyn SecretStore> = Arc::new(MockSecretStore);
-    let mat = DefaultMaterializer::new(registry_dyn, executor, secret_store);
-
-    let target_root = tempfile::TempDir::new().unwrap();
-    let target = target_root.path().join("dest-adapter");
-    let err = mat
-        .materialize_channel_adapter(
-            "bigpackT60@1.0.0/channel-adapters/telegram-adapter",
-            &target,
-        )
-        .expect_err("channel adapters are not materializable");
-    assert!(matches!(err, PackError::NotImplemented(_)), "got {err:?}");
-    assert!(
-        !target.exists(),
-        "nothing is written for an unsupported kind"
-    );
-    // An uninstalled pack still surfaces as PackNotFound (resolution first).
-    assert!(matches!(
-        mat.materialize_channel_adapter("ghost@1.0.0/channel-adapters/x", &target),
-        Err(PackError::PackNotFound(..))
-    ));
+    // A pack that declares channel adapters is refused at install: nothing is copied.
+    let dir = tempfile::TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("channel-adapters/telegram-adapter")).unwrap();
+    std::fs::write(
+        src.join("channel-adapters/telegram-adapter/adapter.wasm"),
+        b"\0asm\x01\0\0\0",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("pack.yaml"),
+        "name: adapters\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides:\n  channel-adapters: [telegram-adapter]\nchecksums:\n  algo: sha256\n  files: {}\n",
+    )
+    .unwrap();
+    let packs_dir = dir.path().join("packs");
+    let registry = Arc::new(InMemoryPackRegistry::new(packs_dir.clone()));
+    let installer = Installer::new(packs_dir.clone(), registry, "0.5.0", Arc::new(AutoApprove));
+    let err = installer
+        .install(src.to_str().unwrap())
+        .await
+        .expect_err("channel adapters are refused");
+    assert!(matches!(err, PackError::InvalidManifest(_)), "got {err:?}");
+    assert!(!packs_dir.join("adapters@1.0.0").exists());
 }
 
 #[tokio::test]

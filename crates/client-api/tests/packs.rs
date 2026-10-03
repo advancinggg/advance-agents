@@ -16,8 +16,8 @@ use advance_client_api::audit::RecordingSink;
 use advance_client_api::clock::{Clock, TestClock};
 use advance_client_api::compat::{EXCLUDED_COMPONENTS, RESPONSE_COMPONENTS};
 use advance_client_api::packs::{
-    ClientPackDetail, ClientPackInstallRequest, ClientPackInstallResult, ClientPackList,
-    ClientPackProvide, ClientPackSummary, ClientPackUninstallResult,
+    ClientPackApplyResult, ClientPackDetail, ClientPackInstallRequest, ClientPackInstallResult,
+    ClientPackList, ClientPackProvide, ClientPackSummary, ClientPackUninstallResult,
 };
 use advance_client_api::routes;
 use advance_client_api::schema::generate_schema_artifact;
@@ -124,6 +124,21 @@ impl PackAdminProvider for MemoryPacks {
             warnings: Vec::new(),
         })
     }
+    fn apply_pack_workflow(
+        &self,
+        name: &str,
+        version: &str,
+        workflow: &str,
+    ) -> Result<ClientPackApplyResult, ProviderError> {
+        self.gate()?;
+        Ok(ClientPackApplyResult {
+            name: name.into(),
+            version: version.into(),
+            workflow: workflow.into(),
+            steps_executed: vec!["spawn-child".into()],
+        })
+    }
+
     fn uninstall_pack(
         &self,
         name: &str,

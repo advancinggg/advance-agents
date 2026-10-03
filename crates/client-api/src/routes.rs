@@ -95,6 +95,8 @@ pub const TPL_AGENT_DELETE: &str = "/client/agents/{agent_id}:delete";
 /// Packs family templated routes: one installed pack (`{name}@{version}`), uninstall it.
 pub const TPL_PACK_GET: &str = "/client/packs/{pack_id}";
 pub const TPL_PACK_UNINSTALL: &str = "/client/packs/{pack_id}:uninstall";
+/// Run one of an installed pack's workflows (body: `{ "workflow": "<name>" }`).
+pub const TPL_PACK_APPLY: &str = "/client/packs/{pack_id}:apply";
 /// Costs family templated routes: one agent's / one provider's report.
 pub const TPL_COSTS_AGENT_GET: &str = "/client/costs/agents/{agent_id}";
 pub const TPL_COSTS_PROVIDER_GET: &str = "/client/costs/providers/{provider_id}";

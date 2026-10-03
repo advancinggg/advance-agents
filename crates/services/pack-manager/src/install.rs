@@ -675,6 +675,17 @@ impl Installer {
         let install_path = install_path.to_path_buf();
         copy_dir_no_symlinks(source, &install_path)?;
 
+        // Channel adapters cannot be loaded from a pack (cap-channel has no path-loaded adapter
+        // surface, decided in the gap-closure lane); refusing the declaration is more honest
+        // than installing content nothing will ever use.
+        if !manifest.provides.channel_adapters.is_empty() {
+            return Err(PackError::InvalidManifest(format!(
+                "pack {}@{} declares channel-adapters {:?}: this runtime does not load channel \
+                 adapters from packs",
+                manifest.name, manifest.version, manifest.provides.channel_adapters
+            )));
+        }
+
         // Slice C: AC-03 layout discipline. Inline inside the step ⑥ window
         // (no new InstallStep enum variant, no new trace event — preserves
         // verbatim 8-step PRD §19.5 order). A non-conformant layout fails

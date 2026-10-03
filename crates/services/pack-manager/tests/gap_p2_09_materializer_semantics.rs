@@ -59,17 +59,11 @@ fn materializer(registry: Arc<InMemoryPackRegistry>) -> DefaultMaterializer {
 
 fn write_pack(root: &Path, name: &str, schema_ext: &str) -> PathBuf {
     let dir = root.join(format!("{name}-src"));
-    std::fs::create_dir_all(dir.join("channel-adapters/slack")).unwrap();
     std::fs::create_dir_all(dir.join("meta-schema-extensions")).unwrap();
-    std::fs::write(
-        dir.join("channel-adapters/slack/adapter.wasm"),
-        b"\0asm\x01\0\0\0",
-    )
-    .unwrap();
     std::fs::write(dir.join("meta-schema-extensions/fields.yaml"), schema_ext).unwrap();
     std::fs::write(
         dir.join("pack.yaml"),
-        format!("name: {name}\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\nprovides:\n  channel-adapters:\n    - slack\n  meta-schema-extensions:\n    - fields\nchecksums:\n  algo: sha256\n  files: {{}}\n"),
+        format!("name: {name}\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\nprovides:\n  meta-schema-extensions:\n    - fields\nchecksums:\n  algo: sha256\n  files: {{}}\n"),
     )
     .unwrap();
     dir
@@ -89,20 +83,28 @@ const EXT_STR: &str = "optional:\n  priority:\n    type: string\n";
 const EXT_OTHER: &str = "optional:\n  published:\n    type: boolean\n    default: false\n";
 
 #[tokio::test]
-async fn g09_channel_adapter_materialization_is_explicitly_unsupported() {
+async fn g09_channel_adapter_packs_are_refused_at_install() {
     let work = tempfile::TempDir::new().unwrap();
     let packs = tempfile::TempDir::new().unwrap();
-    let registry = install_all(packs.path(), &[write_pack(work.path(), "a", EXT_INT)]).await;
-    let m = materializer(registry);
-    let target = work.path().join("adapter-out");
-    let err = m
-        .materialize_channel_adapter("a@1.0.0/channel-adapters/slack", &target)
-        .expect_err("must not silently copy");
-    assert!(matches!(err, PackError::NotImplemented(_)), "got {err:?}");
-    assert!(
-        !target.exists(),
-        "nothing is written for an unsupported kind"
-    );
+    let dir = work.path().join("adapters-src");
+    std::fs::create_dir_all(dir.join("channel-adapters/slack")).unwrap();
+    std::fs::write(
+        dir.join("channel-adapters/slack/adapter.wasm"),
+        b"\0asm\x01\0\0\0",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("pack.yaml"),
+        "name: adapters\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\nprovides:\n  channel-adapters:\n    - slack\nchecksums:\n  algo: sha256\n  files: {}\n",
+    )
+    .unwrap();
+    let registry = Arc::new(InMemoryPackRegistry::new(packs.path().to_path_buf()));
+    let inst = Installer::new(packs.path(), registry, "0.1.0", Arc::new(AutoApprove));
+    let err = inst
+        .install(dir.to_str().unwrap())
+        .await
+        .expect_err("channel adapters are refused at install");
+    assert!(matches!(err, PackError::InvalidManifest(_)), "got {err:?}");
 }
 
 #[tokio::test]

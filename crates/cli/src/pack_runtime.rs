@@ -116,10 +116,7 @@ pub fn compose_schema(base: &str, packs: &[PackSchemaExtensions]) -> ComposedSch
 /// and list, and nothing activates them.
 pub fn inert_kinds(provides: &[advance_pack_manager::PackProvideEntry]) -> Vec<&'static str> {
     [
-        (ComponentKind::RunnableComponent, "components"),
-        (ComponentKind::ChannelAdapter, "channel-adapters"),
         (ComponentKind::McpServer, "mcp-servers"),
-        (ComponentKind::Workflow, "workflows"),
         (ComponentKind::ResourceCapability, "resource-capabilities"),
     ]
     .into_iter()

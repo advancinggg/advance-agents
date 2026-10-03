@@ -280,6 +280,14 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
                 "ClientPackUninstallResult",
                 schema_value::<crate::packs::ClientPackUninstallResult>(),
             ),
+            (
+                "ClientPackApplyRequest",
+                schema_value::<crate::packs::ClientPackApplyRequest>(),
+            ),
+            (
+                "ClientPackApplyResult",
+                schema_value::<crate::packs::ClientPackApplyResult>(),
+            ),
         ] {
             m.insert(name.to_string(), schema);
         }

@@ -61,9 +61,13 @@ spawned from one), `presets`, `meta-schema-extensions` and `skills` (the `tool.w
 tool, the `SKILL.md` under the agent's available skills when it can reach tools). A template
 brings two more kinds with it: `behavior: { type: pack-ref, ref: <pack>@<version>/behavior-binaries/<name> }`
 gives the spawned agent that behavior binary, and `memory-seed: <name>` starts it with the
-pack's `memory-seeds/<name>.jsonl` as its knowledge file. The others (`components`,
-`channel-adapters`, `mcp-servers`, `workflows`, `resource-capabilities`) install and list,
-and nothing consumes them yet; install says so. A pack's `dependencies:` are installed from the
+pack's `memory-seeds/<name>.jsonl` as its knowledge file. `workflows` run on the operator's
+request, `POST /client/packs/{name}@{version}:apply` with `{ "workflow": "<name>" }`: a
+workflow spawns child agents from the pack's templates, submits the pack's `components` to
+the scheduler and registers its `mcp-servers`; a failed step is compensated. `mcp-servers`
+entries are recorded but the runtime has no MCP client yet, and `resource-capabilities` are
+validated only; install says so. `channel-adapters` are refused at install: the runtime does
+not load channel adapters from packs. A pack's `dependencies:` are installed from the
 configured registry when they are not present already.
 
 ## Contribution rules

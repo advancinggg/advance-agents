@@ -36,8 +36,8 @@ use crate::envelope::{ClientError, ClientErrorCode};
 use crate::events::ClientEventProvider;
 use crate::messages::{ClientMessageAck, ClientMessageStatus};
 use crate::packs::{
-    ClientPackDetail, ClientPackInstallRequest, ClientPackInstallResult, ClientPackSummary,
-    ClientPackUninstallResult,
+    ClientPackApplyResult, ClientPackDetail, ClientPackInstallRequest, ClientPackInstallResult,
+    ClientPackSummary, ClientPackUninstallResult,
 };
 use crate::provider_admin::{
     ClientCreateProviderRequest, ClientProviderDeleteResult, ClientProviderKeyResult,
@@ -250,6 +250,14 @@ pub trait PackAdminProvider: Send + Sync {
         name: &str,
         version: &str,
     ) -> Result<ClientPackUninstallResult, ProviderError>;
+    /// Run one of an installed pack's workflows (spawn agents, submit components, register
+    /// MCP servers) as the operator; a failed step is compensated by the applier.
+    fn apply_pack_workflow(
+        &self,
+        name: &str,
+        version: &str,
+        workflow: &str,
+    ) -> Result<ClientPackApplyResult, ProviderError>;
 }
 
 /// Entity data provider (entity-data lane E3) behind the `schema` + `entities` families. The
