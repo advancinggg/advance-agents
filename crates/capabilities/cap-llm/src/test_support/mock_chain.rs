@@ -2,7 +2,7 @@
 
 #![cfg(test)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,6 +34,23 @@ pub(crate) struct MockHttpSecurityChain {
     /// 1-based call index at which `execute_delay` starts applying. `None`
     /// means every call (existing behavior).
     pub execute_delay_from_call: Mutex<Option<usize>>,
+    /// Scripted answers of `execute_streaming` with an explicit head status, keyed by
+    /// path suffix and consumed in push order. They take precedence over `stream_results`
+    /// and over the buffered-response-derived synthesis, so a test can script a refused
+    /// (non-200) head together with the body that follows it, and several streamed
+    /// attempts on one path.
+    pub stream_scripts: Mutex<HashMap<String, VecDeque<ScriptedStream>>>,
+    /// The URL of every `execute_streaming` call, in order. `call_log` records the requests
+    /// of both entry points; this tells which of them were streamed.
+    pub streamed_urls: Mutex<Vec<String>>,
+}
+
+/// One scripted answer of `execute_streaming` (see `MockHttpSecurityChain::stream_scripts`).
+pub(crate) struct ScriptedStream {
+    status: u16,
+    results: Vec<Result<Vec<u8>, HttpError>>,
+    /// After the scripted pulls the body never yields again, instead of ending.
+    stall: bool,
 }
 
 impl MockHttpSecurityChain {
@@ -59,6 +76,60 @@ impl MockHttpSecurityChain {
             .lock()
             .unwrap()
             .insert(path_suffix.to_string(), results);
+    }
+
+    /// Script one `execute_streaming` answer for `path_suffix`: a head with `status`
+    /// followed by a body yielding `results` pull by pull, then ending. Several pushes
+    /// answer successive calls in order.
+    pub fn push_stream(
+        &self,
+        path_suffix: &str,
+        status: u16,
+        results: Vec<Result<Vec<u8>, HttpError>>,
+    ) {
+        self.push_scripted_stream(path_suffix, status, results, false);
+    }
+
+    /// Like [`Self::push_stream`], but after `results` the body never yields again: the
+    /// pull stays pending until the consumer gives up.
+    pub fn push_stalled_stream(
+        &self,
+        path_suffix: &str,
+        status: u16,
+        results: Vec<Result<Vec<u8>, HttpError>>,
+    ) {
+        self.push_scripted_stream(path_suffix, status, results, true);
+    }
+
+    fn push_scripted_stream(
+        &self,
+        path_suffix: &str,
+        status: u16,
+        results: Vec<Result<Vec<u8>, HttpError>>,
+        stall: bool,
+    ) {
+        self.stream_scripts
+            .lock()
+            .unwrap()
+            .entry(path_suffix.to_string())
+            .or_default()
+            .push_back(ScriptedStream {
+                status,
+                results,
+                stall,
+            });
+    }
+
+    /// Pop the next status-carrying stream script for `url` (longest matching key wins,
+    /// as for the other scripts).
+    fn take_stream_script_for(&self, url: &str) -> Option<ScriptedStream> {
+        let mut scripts = self.stream_scripts.lock().unwrap();
+        let best = scripts
+            .iter()
+            .filter(|(key, queue)| url.contains(key.as_str()) && !queue.is_empty())
+            .map(|(key, _)| key.clone())
+            .max_by_key(|key| key.len())?;
+        scripts.get_mut(&best)?.pop_front()
     }
 
     fn lookup_response(&self, url: &str) -> Result<HttpResponse, HttpError> {
@@ -160,6 +231,9 @@ pub(crate) struct SimpleStream {
     /// post-error contract so a consumer that keeps pulling past an error
     /// cannot observe resurrected chunks.
     done: bool,
+    /// When the script is exhausted the pull stays pending forever instead of ending
+    /// the stream (a body that stops making progress).
+    stall: bool,
 }
 
 impl SimpleStream {
@@ -182,6 +256,7 @@ impl SimpleStream {
         Self {
             chunks: frames.into_iter(),
             done: false,
+            stall: false,
         }
     }
 
@@ -192,6 +267,16 @@ impl SimpleStream {
         Self {
             chunks: results.into_iter(),
             done: false,
+            stall: false,
+        }
+    }
+
+    /// A script whose body never ends: after `results` every pull stays pending.
+    fn stalling_after(results: Vec<Result<Vec<u8>, HttpError>>) -> Self {
+        Self {
+            chunks: results.into_iter(),
+            done: false,
+            stall: true,
         }
     }
 }
@@ -208,6 +293,7 @@ impl HttpBodyStream for SimpleStream {
                 self.done = true;
                 Some(Err(e))
             }
+            None if self.stall => std::future::pending().await,
             None => {
                 self.done = true;
                 None
@@ -370,6 +456,54 @@ mod delta_pins {
         ));
         assert!(body.next_chunk().await.is_none());
     }
+
+    /// `push_stream` answers `execute_streaming` with the scripted head status and the
+    /// scripted body, one script per call in push order and ahead of a raw
+    /// `set_stream_results` script; a stalled script never ends its body. Every streamed
+    /// call is recorded in `streamed_urls`.
+    #[tokio::test(start_paused = true)]
+    async fn status_carrying_stream_scripts_serve_head_and_body_in_order() {
+        use advance_shared_types::security_validator::{Allowlist, HttpMethod};
+        let chain = MockHttpSecurityChain::default();
+        chain.set_stream_results("/v1/responses", vec![Ok(b"raw".to_vec())]);
+        chain.push_stream("/v1/responses", 429, vec![Ok(b"{\"error\":{}}".to_vec())]);
+        chain.push_stalled_stream("/v1/responses", 200, vec![Ok(b"data: a\n\n".to_vec())]);
+        let req = || HttpRequest {
+            method: HttpMethod::Post,
+            url: "https://api.openai.com/v1/responses".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        let cap = HttpCapability {
+            allowlist: Allowlist {
+                patterns: vec!["api.openai.com".into()],
+            },
+            credentials: vec![],
+            component_id: "scripts".into(),
+        };
+
+        let (head, mut body) = chain.execute_streaming("a", req(), &cap).await.unwrap();
+        assert_eq!(head.status, 429);
+        assert!(matches!(body.next_chunk().await, Some(Ok(c)) if c == b"{\"error\":{}}"));
+        assert!(body.next_chunk().await.is_none());
+
+        let (head, mut body) = chain.execute_streaming("a", req(), &cap).await.unwrap();
+        assert_eq!(head.status, 200);
+        assert!(matches!(body.next_chunk().await, Some(Ok(c)) if c == b"data: a\n\n"));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3600), body.next_chunk())
+                .await
+                .is_err(),
+            "a stalled body must stay pending"
+        );
+
+        // The status-carrying scripts are spent: the raw script answers, with a 200 head.
+        let (head, mut body) = chain.execute_streaming("a", req(), &cap).await.unwrap();
+        assert_eq!(head.status, 200);
+        assert!(matches!(body.next_chunk().await, Some(Ok(c)) if c == b"raw"));
+        assert_eq!(chain.streamed_urls.lock().unwrap().len(), 3);
+        assert_eq!(chain.call_log.lock().unwrap().len(), 3);
+    }
 }
 
 #[async_trait]
@@ -381,6 +515,26 @@ impl HttpStreamingChain for MockHttpSecurityChain {
         _cap: &HttpCapability,
     ) -> Result<(HttpResponseHead, Box<dyn HttpBodyStream>), HttpError> {
         self.call_log.lock().unwrap().push(req.clone());
+        self.streamed_urls.lock().unwrap().push(req.url.clone());
+        // A status-carrying script answers first: it is the only way to script a
+        // refused head with the body that follows it.
+        if let Some(script) = self.take_stream_script_for(&req.url) {
+            let content_type = if script.status == 200 {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            let head = HttpResponseHead {
+                status: script.status,
+                headers: vec![("content-type".into(), content_type.into())],
+            };
+            let body: Box<dyn HttpBodyStream> = Box::new(if script.stall {
+                SimpleStream::stalling_after(script.results)
+            } else {
+                SimpleStream::from_results(script.results)
+            });
+            return Ok((head, body));
+        }
         // grok-repass Item 2e: a raw stream-results script takes precedence —
         // it is the only way to script a mid-stream/terminal HttpError.
         let raw_script = {

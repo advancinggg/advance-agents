@@ -24,6 +24,11 @@ use crate::ports::{GeneratePathPreflight, PreflightPort};
 use crate::scaffold::MINIMAL_STARTER;
 use crate::secret_bytes::SecretBytes;
 
+/// `store_and_preflight` on an `auth-source: chatgpt-oauth` entry: it takes no typed key.
+pub const REASON_AUTH_SOURCE_MISMATCH: &str = "auth-source-mismatch";
+
+/// `Present` when the first entry's secret exists. For an `auth-source: chatgpt-oauth` entry
+/// that is its access token: the entry counts as configured once signed in.
 pub fn provider_status(home: &Path) -> ProviderStatus {
     let cfg_path = home.join(".advance").join("runtime-config.yaml");
     let Ok(cfg) = load_config(&cfg_path) else {
@@ -63,6 +68,13 @@ pub fn store_and_preflight(
         reason: "unknown-provider".into(),
     })?;
     let named = find_or_starter_provider(&cfg, provider_id)?;
+    if named.uses_chatgpt_sign_in() {
+        // The value under a sign-in entry's secret is the session's access token, written by
+        // the running daemon's sign-in; an operator-entered key never replaces it.
+        return Err(PreflightFail::ProviderRejected {
+            reason: REASON_AUTH_SOURCE_MISMATCH.into(),
+        });
+    }
     port.preflight(home, &named, &key, cancel)?;
     commit_secret_and_select(home, &cfg, &named, key.expose())?;
     Ok(PreflightPass {
@@ -84,6 +96,12 @@ pub fn confirm_existing_provider(
             let cfg_path = home.join(".advance").join("runtime-config.yaml");
             let cfg = load_config(&cfg_path).map_err(|_| PreflightFail::MissingProvider)?;
             let named = find_or_starter_provider(&cfg, &provider_id)?;
+            if named.uses_chatgpt_sign_in() {
+                // Configured = its access token exists (checked by `provider_status`). The
+                // token is short-lived and only the running daemon renews and verifies it; a
+                // chat preflight with the stored value is never run.
+                return Ok(PreflightPass { provider_id });
+            }
             let store = open_file_store(home, &cfg).map_err(|_| PreflightFail::MissingProvider)?;
             let secret = store
                 .resolve(&named.api_key_secret)

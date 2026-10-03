@@ -38,6 +38,13 @@ pub struct OpenAiResponsesAdapter;
 /// a context-overflow type detector so the retry classifier can route
 /// `ContextTooLong` correctly, but the reason string is static.
 fn map_status_static(status: u16, body: &[u8]) -> LlmError {
+    // A plan-usage code selects its fixed reason before the status is looked at: a usage
+    // limit arrives as a 429 and must not become a retried `RateLimited`. The code only
+    // selects from a closed table; a body without one (such as `{"detail": ..}`) falls
+    // through to the status arms.
+    if let Some(reason) = crate::plan_usage::reason_for_error_body(body) {
+        return crate::plan_usage::plan_error(reason);
+    }
     match status {
         400 => {
             if let Ok(v) = serde_json::from_slice::<Value>(body) {
@@ -96,6 +103,20 @@ fn map_status_static(status: u16, body: &[u8]) -> LlmError {
     }
 }
 
+/// The finish reason of a `response.completed` terminal; a `response.incomplete` terminal
+/// carries one of [`map_incomplete_reason`]'s values instead, never this one.
+const COMPLETED_FINISH_REASON: &str = "stop";
+
+/// The static failure of a stream whose terminal event reports the response incomplete, on a
+/// route where only a completed response is an answer (a ChatGPT sign-in entry).
+pub(crate) const RESPONSE_INCOMPLETE: &str = "upstream response incomplete";
+
+/// Whether `ev` (parsed by this dialect's `parse_sse_frame`) is a `response.incomplete`
+/// terminal rather than a `response.completed` one.
+pub(crate) fn is_incomplete_terminal(ev: &SseEvent) -> bool {
+    ev.terminal && ev.finish_reason.as_deref() != Some(COMPLETED_FINISH_REASON)
+}
+
 /// Map the Responses `incomplete_details.reason` onto the CLOSED
 /// finish_reason passthrough set. `max_output_tokens` aligns with the chat
 /// convention's `"length"`; anything unrecognized collapses to the static
@@ -121,6 +142,16 @@ fn probe_error_shapes(value: &Value) -> Result<(), LlmError> {
         return Err(LlmError::ProviderError("in-band error frame".into()));
     }
     Ok(())
+}
+
+/// The error for an in-band error or failed-response stream event: the plan-usage reason its
+/// code selects when it carries one, else the static `fallback`. Either way nothing the
+/// upstream sent is echoed.
+fn in_band_error(data: &str, fallback: &'static str) -> LlmError {
+    match crate::plan_usage::reason_for_event_data(data) {
+        Some(reason) => crate::plan_usage::plan_error(reason),
+        None => LlmError::ProviderError(fallback.into()),
+    }
 }
 
 impl OpenAiResponsesAdapter {
@@ -159,11 +190,17 @@ impl OpenAiResponsesAdapter {
         if !instructions.is_empty() {
             body["instructions"] = Value::String(instructions.join("\n\n"));
         }
-        if let Some(t) = params.temperature {
-            body["temperature"] = json!(t);
-        }
-        if let Some(m) = params.max_tokens {
-            body["max_output_tokens"] = json!(m);
+        // The plan route of a ChatGPT sign-in entry rejects a request that carries
+        // `temperature` or `max_output_tokens`, so a caller-supplied value is dropped there
+        // (the live path and the preflight always set `max_tokens`; failing closed would
+        // make the entry unusable). Every other entry sends them as before.
+        if !provider.uses_chatgpt_sign_in() {
+            if let Some(t) = params.temperature {
+                body["temperature"] = json!(t);
+            }
+            if let Some(m) = params.max_tokens {
+                body["max_output_tokens"] = json!(m);
+            }
         }
         Ok(body)
     }
@@ -200,6 +237,14 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
         messages: &[ChatMessage],
         params: &ChatParams,
     ) -> Result<HttpRequest, LlmError> {
+        // The plan route of a ChatGPT sign-in entry only accepts `stream: true`. Refusing
+        // here means a buffered call site without a streamed arm can never send an
+        // unstreamed request with that entry's token.
+        if provider.uses_chatgpt_sign_in() {
+            return Err(crate::plan_usage::plan_error(
+                crate::plan_usage::STREAMED_TRANSPORT_REQUIRED,
+            ));
+        }
         let body = self.chat_body(provider, messages, params)?;
         self.request_from_body(provider, &body, false)
     }
@@ -294,7 +339,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
         // the JSON decode errored. So we resolve the event name from the
         // reliable `event:` line before touching `data:`.
         if frame.event.as_deref() == Some("error") {
-            return Err(LlmError::ProviderError("in-band error frame".into()));
+            return Err(in_band_error(&frame.data, "in-band error frame"));
         }
         // Fail-closed terminal-family gate keyed on the `event:` name alone,
         // BEFORE parsing data. `response.failed` → error; an unknown
@@ -308,9 +353,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
             if let Some(rest) = ev.strip_prefix("response.") {
                 let single_segment = !rest.contains('.');
                 match rest {
-                    "failed" => {
-                        return Err(LlmError::ProviderError("upstream response failed".into()))
-                    }
+                    "failed" => return Err(in_band_error(&frame.data, "upstream response failed")),
                     "completed" | "incomplete" | "created" | "in_progress" | "queued" => {}
                     _ if single_segment => {
                         return Err(LlmError::ProviderError(
@@ -348,7 +391,9 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                 };
             }
         };
-        probe_error_shapes(&value)?;
+        if probe_error_shapes(&value).is_err() {
+            return Err(in_band_error(&frame.data, "in-band error frame"));
+        }
         let name = frame
             .event
             .clone()
@@ -359,7 +404,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
         match name.as_str() {
             // Data-shape error without an `event: error` line (Claude diff
             // round-1 parity gap vs the Anthropic adapter).
-            "error" => Err(LlmError::ProviderError("in-band error frame".into())),
+            "error" => Err(in_band_error(&frame.data, "in-band error frame")),
             "response.output_text.delta" => {
                 let delta = value["delta"].as_str().unwrap_or("");
                 if delta.is_empty() {
@@ -385,7 +430,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                     )
                     .to_string()
                 } else {
-                    "stop".to_string()
+                    COMPLETED_FINISH_REASON.to_string()
                 };
                 Ok(SseEvent {
                     delta: None,
@@ -397,7 +442,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
             }
             "response.failed" => {
                 // Static reason only (CONTRACT-111 Invariant 7).
-                Err(LlmError::ProviderError("upstream response failed".into()))
+                Err(in_band_error(&frame.data, "upstream response failed"))
             }
             other => {
                 // CLOSED terminal-family rule: a single-segment
@@ -428,6 +473,13 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
         // Embeddings are protocol-orthogonal to the chat backend: the
         // OpenAI platform serves them at /v1/embeddings for both chat and
         // responses deployments. Delegate to the OpenAI-compatible impl.
+        // A ChatGPT sign-in token is only ever sent to the Responses route; the gateway
+        // never selects such an entry for embeddings, and this refuses it regardless.
+        if provider.uses_chatgpt_sign_in() {
+            return Err(crate::plan_usage::plan_error(
+                crate::plan_usage::ROUTE_NOT_SUPPORTED,
+            ));
+        }
         OpenAiAdapter.build_embed_request(provider, text)
     }
 
@@ -629,6 +681,7 @@ mod tests {
             auth_scheme: None,
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
             embedding_model: None,
+            auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
         }
     }
 
@@ -689,6 +742,156 @@ mod tests {
             }
             other => panic!("expected static ProviderError, got {other:?}"),
         }
+    }
+
+    /// The same entry as [`provider`], with a Sign in with ChatGPT session as its credential.
+    fn sign_in_provider() -> ResolvedProvider {
+        ResolvedProvider {
+            id: "openai-plan".into(),
+            api_key_secret: "openai-plan-token".into(),
+            auth_source: advance_runtime::config::ProviderAuthSource::ChatGptOAuth,
+            ..provider()
+        }
+    }
+
+    fn shaping_messages() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage {
+                role: ChatRole::System,
+                content: "be brief".into(),
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: "hi".into(),
+            },
+        ]
+    }
+
+    fn shaping_params() -> ChatParams {
+        ChatParams {
+            temperature: Some(0.5),
+            max_tokens: Some(64),
+            ..ChatParams::default()
+        }
+    }
+
+    /// MODULE-009-T116 (request leg) — an API-key entry's requests are pinned byte for byte:
+    /// the unstreamed and the streamed body both carry the caller's `temperature` and
+    /// `max_output_tokens`, and only the streamed one carries `stream` and `Accept`.
+    #[test]
+    fn t116_api_key_entry_requests_are_byte_identical() {
+        let adapter = OpenAiResponsesAdapter;
+        let chat = adapter
+            .build_chat_request(&provider(), &shaping_messages(), &shaping_params())
+            .unwrap();
+        assert_eq!(chat.url, "https://api.openai.com/v1/responses");
+        assert_eq!(
+            String::from_utf8(chat.body).unwrap(),
+            r#"{"include":["reasoning.encrypted_content"],"input":[{"content":"hi","role":"user"}],"instructions":"be brief","max_output_tokens":64,"model":"gpt-5.2","store":false,"temperature":0.5}"#
+        );
+        assert_eq!(
+            chat.headers,
+            vec![
+                (
+                    "Authorization".to_string(),
+                    "Bearer {openai-api-key}".to_string()
+                ),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ]
+        );
+
+        let stream = adapter
+            .build_stream_request(&provider(), &shaping_messages(), &shaping_params())
+            .unwrap();
+        assert_eq!(stream.url, "https://api.openai.com/v1/responses");
+        assert_eq!(
+            String::from_utf8(stream.body).unwrap(),
+            r#"{"include":["reasoning.encrypted_content"],"input":[{"content":"hi","role":"user"}],"instructions":"be brief","max_output_tokens":64,"model":"gpt-5.2","store":false,"stream":true,"temperature":0.5}"#
+        );
+        assert_eq!(
+            stream.headers,
+            vec![
+                (
+                    "Authorization".to_string(),
+                    "Bearer {openai-api-key}".to_string()
+                ),
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Accept".to_string(), "text/event-stream".to_string()),
+            ]
+        );
+    }
+
+    /// MODULE-009-T116 (request leg) — a ChatGPT sign-in entry always sends `store: false`
+    /// and `stream: true`, keeps `include`, and never sends `temperature` or
+    /// `max_output_tokens`: a caller-supplied value is dropped, not refused.
+    #[test]
+    fn t116_chatgpt_sign_in_stream_request_drops_unsupported_fields() {
+        let adapter = OpenAiResponsesAdapter;
+        for params in [shaping_params(), ChatParams::default()] {
+            let req = adapter
+                .build_stream_request(&sign_in_provider(), &shaping_messages(), &params)
+                .unwrap();
+            assert_eq!(req.url, "https://api.openai.com/v1/responses");
+            assert_eq!(
+                String::from_utf8(req.body.clone()).unwrap(),
+                r#"{"include":["reasoning.encrypted_content"],"input":[{"content":"hi","role":"user"}],"instructions":"be brief","model":"gpt-5.2","store":false,"stream":true}"#
+            );
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(body["store"], json!(false));
+            assert_eq!(body["stream"], json!(true));
+            assert!(body.get("temperature").is_none());
+            assert!(body.get("max_output_tokens").is_none());
+            assert!(body.get("previous_response_id").is_none());
+            assert_eq!(
+                req.headers,
+                vec![
+                    (
+                        "Authorization".to_string(),
+                        "Bearer {openai-plan-token}".to_string()
+                    ),
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    ("Accept".to_string(), "text/event-stream".to_string()),
+                ]
+            );
+        }
+        // stop-sequences keep failing closed on such an entry too.
+        let params = ChatParams {
+            stop_sequences: Some(vec!["END".into()]),
+            ..ChatParams::default()
+        };
+        assert_eq!(
+            adapter
+                .build_stream_request(&sign_in_provider(), &shaping_messages(), &params)
+                .unwrap_err(),
+            LlmError::ProviderError(
+                "stop-sequences unsupported for openai-responses backend".into()
+            )
+        );
+    }
+
+    /// MODULE-009-T116 (request leg) — the unstreamed builder refuses a ChatGPT sign-in
+    /// entry with a fixed reason, whatever the parameters, and so does the embeddings
+    /// builder: that entry's token is only ever sent on a streamed `/v1/responses` request.
+    #[test]
+    fn t116_chatgpt_sign_in_unstreamed_and_embed_builders_refuse() {
+        let adapter = OpenAiResponsesAdapter;
+        for params in [shaping_params(), ChatParams::default()] {
+            assert_eq!(
+                adapter
+                    .build_chat_request(&sign_in_provider(), &shaping_messages(), &params)
+                    .unwrap_err(),
+                LlmError::ProviderError("chatgpt-plan: streamed transport required".into())
+            );
+        }
+        assert_eq!(
+            adapter
+                .build_embed_request(&sign_in_provider(), "text")
+                .unwrap_err(),
+            LlmError::ProviderError("chatgpt-plan: route not supported".into())
+        );
+        // An API-key entry still builds its embeddings request.
+        let embed = adapter.build_embed_request(&provider(), "text").unwrap();
+        assert_eq!(embed.url, "https://api.openai.com/v1/embeddings");
     }
 
     /// Cache billing — `input_tokens_details.cached_tokens` is a SUBSET of
@@ -963,6 +1166,184 @@ mod tests {
                     assert!(!msg.contains("LEAK"));
                 }
                 other => panic!("expected static in-band error, got {other:?}"),
+            }
+        }
+    }
+
+    /// MODULE-009-T118 — a plan-usage `error.code` selects its fixed reason BEFORE the
+    /// status is classified (a 429 usage limit is not `RateLimited`); the reason never
+    /// carries upstream bytes, and anything outside the closed table keeps today's mapping.
+    #[test]
+    fn t118_plan_usage_codes_select_fixed_reasons_before_status() {
+        let adapter = OpenAiResponsesAdapter;
+        for (status, code, reason) in [
+            (
+                429,
+                "subscription_sharing_usage_limit_exceeded",
+                "chatgpt-plan: usage limit reached",
+            ),
+            (
+                403,
+                "subscription_sharing_user_not_eligible",
+                "chatgpt-plan: account not eligible",
+            ),
+            (
+                400,
+                "subscription_sharing_unsupported_capability",
+                "chatgpt-plan: unsupported capability",
+            ),
+            (
+                403,
+                "subscription_sharing_route_not_supported",
+                "chatgpt-plan: route not supported",
+            ),
+            (
+                401,
+                "subscription_sharing_invalid_user",
+                "chatgpt-plan: sign-in rejected",
+            ),
+            (
+                403,
+                "chatpass_v2_scope_not_authorized",
+                "chatgpt-plan: plan usage not authorized",
+            ),
+            (
+                403,
+                "chatpass_v2_invalid_authorization_context",
+                "chatgpt-plan: plan usage not authorized",
+            ),
+        ] {
+            let body = format!(
+                r#"{{"error":{{"code":"{code}","message":"LEAK https://k?key=sk-1","param":"LEAK"}}}}"#
+            );
+            match adapter.parse_chat_response(status, body.as_bytes()) {
+                Err(LlmError::ProviderError(msg)) => {
+                    assert_eq!(msg, reason, "{code}");
+                    assert!(!msg.contains("LEAK") && !msg.contains(code));
+                    assert!(!crate::retry::classify_retryable(&LlmError::ProviderError(
+                        msg
+                    )));
+                }
+                other => panic!("expected the fixed reason for {code}, got {other:?}"),
+            }
+        }
+
+        // Temporary unavailability stays an ordinary, retried upstream failure.
+        for code in [
+            "subscription_sharing_usage_unavailable",
+            "subscription_sharing_user_unavailable",
+        ] {
+            let body = format!(r#"{{"error":{{"code":"{code}","message":"LEAK"}}}}"#);
+            let err = adapter
+                .parse_chat_response(503, body.as_bytes())
+                .unwrap_err();
+            assert_eq!(err, LlmError::ProviderError("upstream 503".into()));
+            assert!(crate::retry::classify_retryable(&err));
+        }
+
+        // No code, an unknown code, or a body that is not the error object: unchanged.
+        assert_eq!(
+            adapter
+                .parse_chat_response(429, br#"{"error":{"code":"rate_limit_exceeded"}}"#)
+                .unwrap_err(),
+            LlmError::RateLimited("rate limited".into())
+        );
+        assert_eq!(
+            adapter.parse_chat_response(429, b"").unwrap_err(),
+            LlmError::RateLimited("rate limited".into())
+        );
+        for (status, body) in [
+            (
+                401u16,
+                &br#"{"detail":"LEAK subscription_sharing_invalid_user"}"#[..],
+            ),
+            (403, br#"{"detail":"LEAK region"}"#),
+            (403, br#"{"error":{"code":"LEAK_unknown_code"}}"#),
+        ] {
+            assert_eq!(
+                adapter.parse_chat_response(status, body).unwrap_err(),
+                LlmError::ProviderError("auth failed".into())
+            );
+        }
+    }
+
+    /// MODULE-009-T118 — `error` and `response.failed` stream events select a plan-usage
+    /// reason from their code when they carry one, on every position the code can take;
+    /// without a known code they keep their static reasons. No upstream bytes either way.
+    #[test]
+    fn t118_plan_usage_codes_in_stream_events_select_fixed_reasons() {
+        let adapter = OpenAiResponsesAdapter;
+        for (event, data, reason) in [
+            (
+                Some("response.failed"),
+                r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"subscription_sharing_usage_limit_exceeded","message":"LEAK"}}}"#,
+                "chatgpt-plan: usage limit reached",
+            ),
+            (
+                None,
+                r#"{"type":"response.failed","response":{"error":{"code":"subscription_sharing_invalid_user","message":"LEAK"}}}"#,
+                "chatgpt-plan: sign-in rejected",
+            ),
+            (
+                Some("error"),
+                r#"{"type":"error","code":"subscription_sharing_user_not_eligible","message":"LEAK"}"#,
+                "chatgpt-plan: account not eligible",
+            ),
+            (
+                None,
+                r#"{"type":"error","code":"chatpass_v2_scope_not_authorized","message":"LEAK"}"#,
+                "chatgpt-plan: plan usage not authorized",
+            ),
+            (
+                None,
+                r#"{"error":{"code":"subscription_sharing_route_not_supported","message":"LEAK"}}"#,
+                "chatgpt-plan: route not supported",
+            ),
+            (
+                None,
+                r#"{"code":"subscription_sharing_unsupported_capability","error":"LEAK"}"#,
+                "chatgpt-plan: unsupported capability",
+            ),
+        ] {
+            match adapter.parse_sse_frame(&frame(event, data)) {
+                Err(LlmError::ProviderError(msg)) => {
+                    assert_eq!(msg, reason, "{data}");
+                    assert!(!msg.contains("LEAK"));
+                }
+                other => panic!("expected the fixed reason for {data}, got {other:?}"),
+            }
+        }
+        for (event, data, reason) in [
+            (
+                Some("response.failed"),
+                r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"LEAK"}}}"#,
+                "upstream response failed",
+            ),
+            (
+                Some("response.failed"),
+                r#"{"response":{"error":{"code":"subscription_sharing_usage_unavailable"}}}"#,
+                "upstream response failed",
+            ),
+            (
+                Some("response.failed"),
+                "LEAK subscription_sharing_usage_limit_exceeded",
+                "upstream response failed",
+            ),
+            (
+                None,
+                r#"{"type":"response.failed","response":{"error":{"code":"LEAK_unknown"}}}"#,
+                "upstream response failed",
+            ),
+            (
+                Some("error"),
+                r#"{"type":"error","code":"LEAK_unknown","message":"LEAK"}"#,
+                "in-band error frame",
+            ),
+            (Some("error"), "LEAK not json", "in-band error frame"),
+        ] {
+            match adapter.parse_sse_frame(&frame(event, data)) {
+                Err(LlmError::ProviderError(msg)) => assert_eq!(msg, reason, "{data}"),
+                other => panic!("expected the static reason for {data}, got {other:?}"),
             }
         }
     }

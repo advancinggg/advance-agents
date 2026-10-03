@@ -41,8 +41,9 @@ use crate::packs::{
 };
 use crate::provider_admin::{
     ClientCreateProviderRequest, ClientProviderDeleteResult, ClientProviderKeyResult,
-    ClientProviderPreflightResult, ClientProviderSummary, ClientProviderUsage,
-    ClientUpdateProviderRequest, ProviderAdminOutcome,
+    ClientProviderPreflightResult, ClientProviderSignIn, ClientProviderSignInStart,
+    ClientProviderSignOut, ClientProviderSummary, ClientProviderUsage, ClientUpdateProviderRequest,
+    ProviderAdminOutcome,
 };
 use crate::providers::grants::BoundGrantApprovalPort;
 use crate::providers::history::BoundHistoryReadPort;
@@ -53,6 +54,11 @@ use crate::tools::ClientToolInventory;
 /// The `ClientError.details` token carried by an `invalid_request` whose cause is an agent
 /// `llm.provider` that names no configured `llm-providers[].id` (lane agent-llm-policy).
 pub const UNKNOWN_PROVIDER_DETAIL: &str = "unknown_provider";
+
+/// The `ClientError.details` token carried by an `invalid_state` whose cause is an operation
+/// that does not apply to the provider entry's credential source: a sign-in route on an
+/// API-key entry, or a key route on a `chatgpt-oauth` entry.
+pub const AUTH_SOURCE_MISMATCH_DETAIL: &str = "auth_source_mismatch";
 
 /// A client-safe provider error. Adapters map raw `RunError`/`MsgError`/`SkillError` to a
 /// `ProviderError` VARIANT (operation-scoped; the only inner-string match is
@@ -87,6 +93,11 @@ pub enum ProviderError {
     /// secrets mode on a non-Apple host). → `invalid_request` with details
     /// `["platform_unsupported"]` so a client can distinguish it from a malformed request.
     PlatformUnsupported(String),
+    /// The operation does not apply to the provider entry's credential source (a sign-in route
+    /// on an API-key entry, a key route on a `chatgpt-oauth` entry). → `invalid_state` with
+    /// details `["auth_source_mismatch"]` so a client can tell it from a state that will change
+    /// by itself (the inner string is log-only).
+    AuthSourceMismatch(String),
 }
 
 impl ProviderError {
@@ -124,6 +135,13 @@ impl ProviderError {
             ProviderError::UnknownProvider(_) => {
                 return ClientError::new(ClientErrorCode::InvalidRequest, "invalid request")
                     .with_details(vec![UNKNOWN_PROVIDER_DETAIL.to_string()]);
+            }
+            ProviderError::AuthSourceMismatch(_) => {
+                return ClientError::new(
+                    ClientErrorCode::InvalidState,
+                    "operation not valid for the resource's current state",
+                )
+                .with_details(vec![AUTH_SOURCE_MISMATCH_DETAIL.to_string()]);
             }
         };
         ClientError::new(code, message)
@@ -309,11 +327,15 @@ pub trait EntityProvider: Send + Sync {
 /// first-open preflight port. Every id / request it receives has already passed handler-side
 /// validation in [`crate::provider_admin`]. Summaries never carry key material.
 ///
-/// Error projection: unknown id → `NotFound`; duplicate id → `AlreadyExists`; the runtime's
+/// Error projection: unknown id → `NotFound`; duplicate id, or a `chatgpt-oauth` create naming
+/// a secret that already holds a value → `AlreadyExists`; the runtime's
 /// `load_config` rejecting the rewritten document → `InvalidRequest`; deleting the last entry
 /// or an entry an agent's `llm.provider` pins → `InvalidState`; a config / secret-store read or
-/// write failure → `Unavailable`. A FAILED preflight is not an error: `set_key` answers
-/// `stored: false` with the verdict and leaves the old key untouched.
+/// write failure → `Unavailable`; a sign-in route on an entry that does not sign in, or a key
+/// route on an entry that does → `AuthSourceMismatch`. A FAILED preflight is not an error:
+/// `set_key` answers `stored: false` with the verdict and leaves the old key untouched. The
+/// outcome of a sign-in is not an error either: it is read as the `state` / `reason` of
+/// [`ClientProviderSignIn`].
 pub trait ProviderAdminProvider: Send + Sync {
     /// Every entry in YAML order (index 0 is `selected`).
     fn list_providers(&self) -> Result<Vec<ClientProviderSummary>, ProviderError>;
@@ -356,6 +378,32 @@ pub trait ProviderAdminProvider: Send + Sync {
         &self,
         provider_id: &str,
     ) -> Result<ProviderAdminOutcome<ClientProviderSummary>, ProviderError>;
+    /// `chatgpt-oauth`: begin a browser sign-in and return the URL the user opens plus the
+    /// attempt's deadline. Returns promptly; the attempt completes in the background and is
+    /// read through [`sign_in_status`](ProviderAdminProvider::sign_in_status). A new start
+    /// replaces a pending attempt. A secret holding another installation's sign-in is refused
+    /// with `Unavailable` (its state reads `signed-out` / `unavailable`). The default answers
+    /// `Unavailable` for adapters without a sign-in.
+    fn sign_in_start(&self, provider_id: &str) -> Result<ClientProviderSignInStart, ProviderError> {
+        let _ = provider_id;
+        Err(ProviderError::Unavailable("sign-in".into()))
+    }
+    /// `chatgpt-oauth`: the entry's sign-in state. Never a token.
+    fn sign_in_status(&self, provider_id: &str) -> Result<ClientProviderSignIn, ProviderError> {
+        let _ = provider_id;
+        Err(ProviderError::Unavailable("sign-in".into()))
+    }
+    /// `chatgpt-oauth`: abandon a pending attempt (a no-op without one) and return the state
+    /// that results.
+    fn sign_in_cancel(&self, provider_id: &str) -> Result<ClientProviderSignIn, ProviderError> {
+        let _ = provider_id;
+        Err(ProviderError::Unavailable("sign-in".into()))
+    }
+    /// `chatgpt-oauth`: revoke and drop the stored session. The entry itself is kept.
+    fn sign_out(&self, provider_id: &str) -> Result<ClientProviderSignOut, ProviderError> {
+        let _ = provider_id;
+        Err(ProviderError::Unavailable("sign-in".into()))
+    }
 }
 
 /// Secrets-mode administration provider behind the

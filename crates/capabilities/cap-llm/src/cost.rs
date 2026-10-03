@@ -169,6 +169,7 @@ mod tests {
             auth_scheme: None,
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
             embedding_model: None,
+            auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
         }
     }
 

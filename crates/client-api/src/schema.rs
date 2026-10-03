@@ -446,6 +446,22 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
                 "ClientProviderDeleteResult",
                 schema_value::<crate::provider_admin::ClientProviderDeleteResult>(),
             ),
+            (
+                "ClientProviderSignInStart",
+                schema_value::<crate::provider_admin::ClientProviderSignInStart>(),
+            ),
+            (
+                "ClientProviderSignInModel",
+                schema_value::<crate::provider_admin::ClientProviderSignInModel>(),
+            ),
+            (
+                "ClientProviderSignIn",
+                schema_value::<crate::provider_admin::ClientProviderSignIn>(),
+            ),
+            (
+                "ClientProviderSignOut",
+                schema_value::<crate::provider_admin::ClientProviderSignOut>(),
+            ),
         ] {
             m.insert(name.to_string(), schema);
         }

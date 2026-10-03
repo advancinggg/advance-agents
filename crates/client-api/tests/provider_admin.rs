@@ -1,12 +1,12 @@
 //! CONTRACT-190 providers family — `/client/providers` list / create / get / update / delete /
-//! set-key / clear-key / preflight / select over the REAL `ClientApi::handle()` pipeline
+//! set-key / clear-key / preflight / select / sign-in over the REAL `ClientApi::handle()` pipeline
 //! (admission, version, session, scope gate, idempotency reserve/replay, handler-side
 //! validation, provider-error projection, warning attachment) against a recording in-memory
 //! `ProviderAdminProvider`. The production adapter over the workspace's `runtime-config.yaml`
 //! and the daemon's live secret store is `crates/cli/src/client_api_providers.rs`.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
@@ -20,17 +20,35 @@ use advance_client_api::envelope::{
 use advance_client_api::provider_admin::{
     ClientCreateProviderRequest, ClientProviderCost, ClientProviderDeleteResult, ClientProviderKey,
     ClientProviderKeyResult, ClientProviderList, ClientProviderPreflightResult,
-    ClientProviderRateLimit, ClientProviderSummary, ClientProviderUsage, ClientProviderUsageWindow,
-    ClientUpdateProviderRequest, ProviderAdminOutcome, ProviderAdminWarning, MAX_KEY_BYTES,
+    ClientProviderRateLimit, ClientProviderSignIn, ClientProviderSignInModel,
+    ClientProviderSignInStart, ClientProviderSignOut, ClientProviderSummary, ClientProviderUsage,
+    ClientProviderUsageWindow, ClientUpdateProviderRequest, ProviderAdminOutcome,
+    ProviderAdminWarning, AUTH_SOURCES, CHATGPT_OAUTH_AUTH_SOURCE, MAX_KEY_BYTES, SIGN_IN_STATES,
 };
 use advance_client_api::routes;
 use advance_client_api::schema::generate_schema_artifact;
 use advance_client_api::{
     ClientApi, ClientApiConfig, ClientEnvelope, ClientErrorCode, ClientRequest, ClientSession,
-    Platform, Principal, ProviderAdminProvider, ProviderError, Scope,
+    Platform, Principal, ProviderAdminProvider, ProviderError, Scope, AUTH_SOURCE_MISMATCH_DETAIL,
 };
 
 const SECRET_KEY: &str = "sk-live-ULTRA-SECRET-0123456789";
+
+/// What a sign-in hands the provider: the verifier it minted for the attempt, the code the
+/// browser came back with, and the session the exchange returned. None of them may reach a
+/// client.
+const SIGN_IN_VERIFIER: &str = "pkce-verifier-ULTRA-SECRET-0123456789";
+const SIGN_IN_AUTH_CODE: &str = "ac_ULTRA-SECRET-code-0123456789";
+const SIGN_IN_ACCESS_TOKEN: &str = "eyJhbGciOiJSUzI1NiJ9.access-ULTRA-SECRET.c2ln";
+const SIGN_IN_REFRESH_TOKEN: &str = "rt_ULTRA-SECRET-refresh-0123456789";
+const SIGN_IN_CUSTODY: [&str; 4] = [
+    SIGN_IN_VERIFIER,
+    SIGN_IN_AUTH_CODE,
+    SIGN_IN_ACCESS_TOKEN,
+    SIGN_IN_REFRESH_TOKEN,
+];
+/// The entry [`MemoryProviders::with_sign_in_entry`] seeds.
+const PLAN: &str = "openai-plan";
 
 // ── Recording in-memory provider ─────────────────────────────────────────────────────────────
 
@@ -45,6 +63,24 @@ struct Calls {
     clear_key: AtomicUsize,
     preflight: AtomicUsize,
     select: AtomicUsize,
+    sign_in_start: AtomicUsize,
+    sign_in_status: AtomicUsize,
+    sign_in_cancel: AtomicUsize,
+    sign_out: AtomicUsize,
+}
+
+/// Where one `chatgpt-oauth` entry's sign-in stands (absent = signed out).
+enum SignInSlot {
+    Pending {
+        attempt: u64,
+        verifier: String,
+    },
+    SignedIn {
+        code: String,
+        access_token: String,
+        refresh_token: String,
+    },
+    Failed(&'static str),
 }
 
 struct MemoryProviders {
@@ -53,7 +89,16 @@ struct MemoryProviders {
     keys: Mutex<BTreeMap<String, String>>,
     /// The verdict `set_key` / `preflight` report (`None` = pass).
     preflight_reason: Mutex<Option<String>>,
+    /// Provider id → sign-in slot. Holds token material; only `sign_in_of` projects it.
+    sign_ins: Mutex<BTreeMap<String, SignInSlot>>,
+    /// `sign_out` reports an unconfirmed revocation while set.
+    revocation_offline: AtomicBool,
     fail: Option<ProviderError>,
+}
+
+/// The deadline the double gives attempt number `attempt`.
+fn sign_in_deadline(attempt: u64) -> u64 {
+    1_700_000_600_000 + attempt
 }
 
 fn summary(id: &str, selected: bool) -> ClientProviderSummary {
@@ -67,6 +112,7 @@ fn summary(id: &str, selected: bool) -> ClientProviderSummary {
             .collect(),
         embedding_model: None,
         auth_scheme: None,
+        auth_source: None,
         cost: ClientProviderCost {
             input_per_mtoken: 1.0,
             output_per_mtoken: 2.0,
@@ -88,6 +134,21 @@ fn summary(id: &str, selected: bool) -> ClientProviderSummary {
         selected,
         last_preflight: None,
         last_usage: None,
+        sign_in: None,
+    }
+}
+
+/// A `chatgpt-oauth` entry as the provider projects it before any sign-in.
+fn sign_in_summary(id: &str) -> ClientProviderSummary {
+    ClientProviderSummary {
+        backend: Some("openai-responses".into()),
+        endpoint: "https://api.openai.com".into(),
+        auth_source: Some(CHATGPT_OAUTH_AUTH_SOURCE.into()),
+        key: ClientProviderKey {
+            secret_name: format!("{id}-chatgpt-0a1b2c3d"),
+            present: false,
+        },
+        ..summary(id, false)
     }
 }
 
@@ -98,8 +159,16 @@ impl MemoryProviders {
             entries: Mutex::new(vec![summary("openai", true), summary("anthropic", false)]),
             keys: Mutex::new(BTreeMap::new()),
             preflight_reason: Mutex::new(None),
+            sign_ins: Mutex::new(BTreeMap::new()),
+            revocation_offline: AtomicBool::new(false),
             fail: None,
         })
+    }
+    /// `new()` plus one `chatgpt-oauth` entry ([`PLAN`]), signed out.
+    fn with_sign_in_entry() -> Arc<Self> {
+        let provider = Self::new();
+        provider.entries.lock().unwrap().push(sign_in_summary(PLAN));
+        provider
     }
     fn failing(err: ProviderError) -> Arc<Self> {
         Arc::new(Self {
@@ -107,6 +176,8 @@ impl MemoryProviders {
             entries: Mutex::new(vec![]),
             keys: Mutex::new(BTreeMap::new()),
             preflight_reason: Mutex::new(None),
+            sign_ins: Mutex::new(BTreeMap::new()),
+            revocation_offline: AtomicBool::new(false),
             fail: Some(err),
         })
     }
@@ -122,6 +193,95 @@ impl MemoryProviders {
         for (idx, e) in entries.iter_mut().enumerate() {
             e.selected = idx == 0;
             e.key.present = keys.contains_key(&e.key.secret_name);
+            if e.auth_source.is_some() {
+                e.sign_in = Some(self.sign_in_of(&e.provider_id));
+            }
+        }
+    }
+    /// The client-safe projection of one entry's sign-in slot: state, reason, account label,
+    /// deadline and models — never the slot's token material.
+    fn sign_in_of(&self, id: &str) -> ClientProviderSignIn {
+        let checked_at_ms = 1_700_000_000_005;
+        match self.sign_ins.lock().unwrap().get(id) {
+            None => ClientProviderSignIn {
+                state: "signed-out".into(),
+                checked_at_ms,
+                ..ClientProviderSignIn::default()
+            },
+            Some(SignInSlot::Pending { attempt, .. }) => ClientProviderSignIn {
+                state: "pending".into(),
+                checked_at_ms,
+                expires_at_ms: Some(sign_in_deadline(*attempt)),
+                ..ClientProviderSignIn::default()
+            },
+            Some(SignInSlot::SignedIn { .. }) => ClientProviderSignIn {
+                state: "signed-in".into(),
+                checked_at_ms,
+                reason: None,
+                account: Some("me@example.com".into()),
+                plan_usage: Some(true),
+                expires_at_ms: Some(1_700_003_600_000),
+                models: vec![
+                    ClientProviderSignInModel {
+                        id: "gpt-5.2".into(),
+                        display_name: Some("GPT-5.2".into()),
+                    },
+                    ClientProviderSignInModel {
+                        id: "gpt-5.2-mini".into(),
+                        display_name: None,
+                    },
+                ],
+            },
+            Some(SignInSlot::Failed(reason)) => ClientProviderSignIn {
+                state: "failed".into(),
+                checked_at_ms,
+                reason: Some((*reason).into()),
+                ..ClientProviderSignIn::default()
+            },
+        }
+    }
+    /// The entry behind a sign-in route, or the typed refusal for an entry that does not sign in.
+    fn sign_in_entry(&self, id: &str) -> Result<ClientProviderSummary, ProviderError> {
+        let entry = self.find(id)?;
+        if entry.auth_source.as_deref() != Some(CHATGPT_OAUTH_AUTH_SOURCE) {
+            return Err(ProviderError::AuthSourceMismatch(
+                "sign-in-on-a-keyed-entry".into(),
+            ));
+        }
+        Ok(entry)
+    }
+    /// What the browser coming back does to a pending attempt: the provider is handed the
+    /// code and the session, keeps both, and stores the access token under the entry's secret
+    /// name (the name the egress chain resolves).
+    fn complete_sign_in(&self, id: &str, code: &str, access_token: &str, refresh_token: &str) {
+        let entry = self.find(id).expect("entry exists");
+        let previous = self.sign_ins.lock().unwrap().insert(
+            id.to_string(),
+            SignInSlot::SignedIn {
+                code: code.to_string(),
+                access_token: access_token.to_string(),
+                refresh_token: refresh_token.to_string(),
+            },
+        );
+        assert!(
+            matches!(previous, Some(SignInSlot::Pending { .. })),
+            "a sign-in completes a pending attempt"
+        );
+        self.keys
+            .lock()
+            .unwrap()
+            .insert(entry.key.secret_name, access_token.to_string());
+    }
+    /// Every token-like value the double currently holds for `id`.
+    fn held_material(&self, id: &str) -> Vec<String> {
+        match self.sign_ins.lock().unwrap().get(id) {
+            Some(SignInSlot::Pending { verifier, .. }) => vec![verifier.clone()],
+            Some(SignInSlot::SignedIn {
+                code,
+                access_token,
+                refresh_token,
+            }) => vec![code.clone(), access_token.clone(), refresh_token.clone()],
+            _ => vec![],
         }
     }
     fn find(&self, id: &str) -> Result<ClientProviderSummary, ProviderError> {
@@ -165,6 +325,15 @@ impl ProviderAdminProvider for MemoryProviders {
         s.endpoint = request.endpoint.clone().unwrap_or_default();
         s.model_aliases = request.model_aliases.clone();
         s.sidecar_present = request.sidecar.is_some();
+        if request.auth_source.as_deref() == Some(CHATGPT_OAUTH_AUTH_SOURCE) {
+            s.auth_source = request.auth_source.clone();
+            s.backend = Some("openai-responses".into());
+            s.key.secret_name = format!("{}-chatgpt-0a1b2c3d", request.provider_id);
+            s.sign_in = Some(self.sign_in_of(&request.provider_id));
+        }
+        if let Some(name) = &request.api_key_secret {
+            s.key.secret_name = name.clone();
+        }
         self.entries.lock().unwrap().push(s.clone());
         let mut outcome = ProviderAdminOutcome::new(s.clone());
         if s.sidecar_present {
@@ -217,6 +386,11 @@ impl ProviderAdminProvider for MemoryProviders {
         self.calls.set_key.fetch_add(1, Ordering::SeqCst);
         self.gate()?;
         let entry = self.find(provider_id)?;
+        if entry.auth_source.is_some() {
+            return Err(ProviderError::AuthSourceMismatch(
+                "key-on-a-sign-in-entry".into(),
+            ));
+        }
         if entry.backend_class != "cloud-http" {
             self.keys
                 .lock()
@@ -252,6 +426,11 @@ impl ProviderAdminProvider for MemoryProviders {
         self.calls.clear_key.fetch_add(1, Ordering::SeqCst);
         self.gate()?;
         let entry = self.find(provider_id)?;
+        if entry.auth_source.is_some() {
+            return Err(ProviderError::AuthSourceMismatch(
+                "key-on-a-sign-in-entry".into(),
+            ));
+        }
         self.keys.lock().unwrap().remove(&entry.key.secret_name);
         self.find(provider_id)
     }
@@ -321,6 +500,109 @@ impl ProviderAdminProvider for MemoryProviders {
         drop(entries);
         Ok(ProviderAdminOutcome::new(self.find(provider_id)?))
     }
+    fn sign_in_start(&self, provider_id: &str) -> Result<ClientProviderSignInStart, ProviderError> {
+        let attempt = self.calls.sign_in_start.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+        self.gate()?;
+        self.sign_in_entry(provider_id)?;
+        // A new start replaces whatever attempt was pending. The verifier stays here; the URL
+        // carries only what a browser address bar may show.
+        self.sign_ins.lock().unwrap().insert(
+            provider_id.to_string(),
+            SignInSlot::Pending {
+                attempt,
+                verifier: SIGN_IN_VERIFIER.to_string(),
+            },
+        );
+        Ok(ClientProviderSignInStart {
+            authorize_url: format!(
+                "https://auth.openai.com/api/accounts/authorize?response_type=code\
+                 &client_id=dynamic_agent_client&state=state-{attempt}\
+                 &code_challenge=challenge-{attempt}&code_challenge_method=S256"
+            ),
+            expires_at_ms: sign_in_deadline(attempt),
+        })
+    }
+    fn sign_in_status(&self, provider_id: &str) -> Result<ClientProviderSignIn, ProviderError> {
+        self.calls.sign_in_status.fetch_add(1, Ordering::SeqCst);
+        self.gate()?;
+        self.sign_in_entry(provider_id)?;
+        Ok(self.sign_in_of(provider_id))
+    }
+    fn sign_in_cancel(&self, provider_id: &str) -> Result<ClientProviderSignIn, ProviderError> {
+        self.calls.sign_in_cancel.fetch_add(1, Ordering::SeqCst);
+        self.gate()?;
+        self.sign_in_entry(provider_id)?;
+        {
+            // Only a pending attempt is abandoned; a session is not touched.
+            let mut slots = self.sign_ins.lock().unwrap();
+            if matches!(slots.get(provider_id), Some(SignInSlot::Pending { .. })) {
+                slots.insert(provider_id.to_string(), SignInSlot::Failed("cancelled"));
+            }
+        }
+        Ok(self.sign_in_of(provider_id))
+    }
+    fn sign_out(&self, provider_id: &str) -> Result<ClientProviderSignOut, ProviderError> {
+        self.calls.sign_out.fetch_add(1, Ordering::SeqCst);
+        self.gate()?;
+        let entry = self.sign_in_entry(provider_id)?;
+        self.sign_ins.lock().unwrap().remove(provider_id);
+        self.keys.lock().unwrap().remove(&entry.key.secret_name);
+        Ok(ClientProviderSignOut {
+            signed_out: true,
+            revocation_confirmed: !self.revocation_offline.load(Ordering::SeqCst),
+        })
+    }
+}
+
+/// An adapter written before the sign-in routes existed: it implements only the required
+/// methods and inherits the default sign-in bodies.
+struct PredatesSignIn(Arc<MemoryProviders>);
+
+impl ProviderAdminProvider for PredatesSignIn {
+    fn list_providers(&self) -> Result<Vec<ClientProviderSummary>, ProviderError> {
+        self.0.list_providers()
+    }
+    fn get_provider(&self, provider_id: &str) -> Result<ClientProviderSummary, ProviderError> {
+        self.0.get_provider(provider_id)
+    }
+    fn create_provider(
+        &self,
+        request: &ClientCreateProviderRequest,
+    ) -> Result<ProviderAdminOutcome<ClientProviderSummary>, ProviderError> {
+        self.0.create_provider(request)
+    }
+    fn update_provider(
+        &self,
+        provider_id: &str,
+        request: &ClientUpdateProviderRequest,
+    ) -> Result<ProviderAdminOutcome<ClientProviderSummary>, ProviderError> {
+        self.0.update_provider(provider_id, request)
+    }
+    fn delete_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<ProviderAdminOutcome<ClientProviderDeleteResult>, ProviderError> {
+        self.0.delete_provider(provider_id)
+    }
+    fn set_key(
+        &self,
+        provider_id: &str,
+        key: &str,
+    ) -> Result<ProviderAdminOutcome<ClientProviderKeyResult>, ProviderError> {
+        self.0.set_key(provider_id, key)
+    }
+    fn clear_key(&self, provider_id: &str) -> Result<ClientProviderSummary, ProviderError> {
+        self.0.clear_key(provider_id)
+    }
+    fn preflight(&self, provider_id: &str) -> Result<ClientProviderPreflightResult, ProviderError> {
+        self.0.preflight(provider_id)
+    }
+    fn select_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<ProviderAdminOutcome<ClientProviderSummary>, ProviderError> {
+        self.0.select_provider(provider_id)
+    }
 }
 
 // ── Harness ──────────────────────────────────────────────────────────────────────────────────
@@ -386,6 +668,63 @@ fn has_warning(env: &ClientEnvelope<Value>, code: &str) -> bool {
     env.warnings.iter().any(|w| w.code == code)
 }
 
+/// The `details` tokens of an error envelope (empty for a success or a detail-free error).
+fn details(env: &ClientEnvelope<Value>) -> Vec<String> {
+    env.error
+        .as_ref()
+        .map(|e| e.details.clone())
+        .unwrap_or_default()
+}
+
+/// The four sign-in routes for `id`: the three mutations carry `key`-prefixed idempotency keys.
+fn sign_in_requests(id: &str, key: &str) -> [(&'static str, ClientRequest); 4] {
+    [
+        (
+            "start",
+            post(
+                &format!("/client/providers/{id}:sign-in"),
+                Value::Null,
+                &format!("{key}-start"),
+            ),
+        ),
+        ("status", get(&format!("/client/providers/{id}/sign-in"))),
+        (
+            "cancel",
+            post(
+                &format!("/client/providers/{id}:sign-in-cancel"),
+                Value::Null,
+                &format!("{key}-cancel"),
+            ),
+        ),
+        (
+            "sign-out",
+            post(
+                &format!("/client/providers/{id}:sign-out"),
+                Value::Null,
+                &format!("{key}-out"),
+            ),
+        ),
+    ]
+}
+
+/// How often each sign-in method of the double was entered: start, status, cancel, sign-out.
+fn sign_in_calls(provider: &MemoryProviders) -> [usize; 4] {
+    [
+        provider.calls.sign_in_start.load(Ordering::SeqCst),
+        provider.calls.sign_in_status.load(Ordering::SeqCst),
+        provider.calls.sign_in_cancel.load(Ordering::SeqCst),
+        provider.calls.sign_out.load(Ordering::SeqCst),
+    ]
+}
+
+/// A create body for a `chatgpt-oauth` entry with nothing but the required fields.
+fn sign_in_create_body(id: &str) -> Value {
+    let mut body = create_body(id);
+    body["endpoint"] = json!("https://api.openai.com");
+    body["auth_source"] = json!("chatgpt-oauth");
+    body
+}
+
 fn create_body(id: &str) -> Value {
     json!({
         "provider_id": id,
@@ -420,6 +759,10 @@ fn pa01_absent_provider_is_module_unavailable_not_unknown_route() {
         post("/client/providers/openai:preflight", Value::Null, "k6"),
         post("/client/providers/openai:select", Value::Null, "k7"),
         get("/client/providers/openai/usage"),
+        post("/client/providers/openai:sign-in", Value::Null, "k8"),
+        get("/client/providers/openai/sign-in"),
+        post("/client/providers/openai:sign-in-cancel", Value::Null, "k9"),
+        post("/client/providers/openai:sign-out", Value::Null, "k10"),
     ] {
         let env = api.handle(req);
         assert_eq!(
@@ -813,6 +1156,9 @@ fn pa07_scope_gate() {
         post("/client/providers/openai:clear-key", Value::Null, "k5"),
         post("/client/providers/openai:preflight", Value::Null, "k6"),
         post("/client/providers/openai:select", Value::Null, "k7"),
+        post("/client/providers/openai:sign-in", Value::Null, "k8"),
+        post("/client/providers/openai:sign-in-cancel", Value::Null, "k9"),
+        post("/client/providers/openai:sign-out", Value::Null, "k10"),
     ] {
         let env = api.handle(req);
         assert_eq!(code(&env), Some(ClientErrorCode::Forbidden), "{env:?}");
@@ -894,6 +1240,10 @@ fn pa09_schema_components_inventoried() {
         "ClientProviderList",
         "ClientProviderKeyResult",
         "ClientProviderDeleteResult",
+        "ClientProviderSignInStart",
+        "ClientProviderSignInModel",
+        "ClientProviderSignIn",
+        "ClientProviderSignOut",
     ] {
         assert!(components.contains_key(r), "{r} in schema");
         assert!(RESPONSE_COMPONENTS.contains(&r), "{r} inventoried");
@@ -911,6 +1261,27 @@ fn pa09_schema_components_inventoried() {
     let excluded: std::collections::BTreeSet<&str> = EXCLUDED_COMPONENTS.iter().copied().collect();
     assert!(response.is_disjoint(&excluded));
     assert_eq!(response.len() + excluded.len(), components.len());
+
+    // The sign-in vocabularies are plain strings checked against tables: a component that
+    // enumerated them would turn every later spelling into a closed-enum change.
+    for (component, field) in [
+        ("ClientProviderSignIn", "state"),
+        ("ClientProviderSignIn", "reason"),
+        ("ClientProviderSummary", "auth_source"),
+        ("ClientCreateProviderRequest", "auth_source"),
+    ] {
+        let schema = &components[component]["properties"][field];
+        assert!(schema.is_object(), "{component}.{field} in schema");
+        let text = serde_json::to_string(schema).unwrap();
+        assert!(
+            !text.contains("\"enum\"") && !text.contains("\"const\""),
+            "{component}.{field} must stay a free string: {text}"
+        );
+    }
+    assert!(
+        components["ClientUpdateProviderRequest"]["properties"]["auth_source"].is_null(),
+        "the credential source is fixed at creation"
+    );
 }
 
 // ── PA-11: GET …/usage — the vendor CLI's own allowance is a read; other classes answer a
@@ -952,4 +1323,714 @@ fn pa11_usage_read() {
     );
     let bad = api.handle(get("/client/providers/a.b/usage"));
     assert_eq!(code(&bad), Some(ClientErrorCode::InvalidRequest), "{bad:?}");
+}
+
+// ── PA-12: sign-in scope gate — the state is a ReadInventory read, start / cancel / sign-out
+//    are ApproveGrants mutations; a session with neither reaches none of them ──────────────────
+#[test]
+fn pa12_sign_in_scope_gate() {
+    let provider = MemoryProviders::with_sign_in_entry();
+    let (api, _sink) = api_with(provider.clone());
+
+    // ReadInventory alone: the state is readable, nothing can be changed.
+    mint(&api, "tok", vec![Scope::ReadInventory]);
+    for (what, req) in sign_in_requests(PLAN, "ro") {
+        let env = api.handle(req);
+        if what == "status" {
+            let status: ClientProviderSignIn = data(&env);
+            assert_eq!(status.state, "signed-out");
+        } else {
+            assert_eq!(
+                code(&env),
+                Some(ClientErrorCode::Forbidden),
+                "{what}: {env:?}"
+            );
+        }
+    }
+    assert_eq!(sign_in_calls(&provider), [0, 1, 0, 0]);
+
+    // ApproveGrants alone: the three mutations pass, the read does not.
+    mint(&api, "admin", vec![Scope::ApproveGrants]);
+    for (what, req) in sign_in_requests(PLAN, "admin") {
+        let env = api.handle(req.with_session("admin"));
+        if what == "status" {
+            assert_eq!(code(&env), Some(ClientErrorCode::Forbidden), "{env:?}");
+        } else {
+            assert!(env.is_ok(), "{what}: {env:?}");
+        }
+    }
+    assert_eq!(sign_in_calls(&provider), [1, 1, 1, 1]);
+
+    // Neither scope: all four are refused before the provider.
+    mint(&api, "runs", vec![Scope::ReadRuns, Scope::ControlRuns]);
+    for (what, req) in sign_in_requests(PLAN, "runs") {
+        let env = api.handle(req.with_session("runs"));
+        assert_eq!(
+            code(&env),
+            Some(ClientErrorCode::Forbidden),
+            "{what}: {env:?}"
+        );
+    }
+    // No session at all.
+    for (what, req) in [
+        (
+            "start",
+            ClientRequest::post(format!("/client/providers/{PLAN}:sign-in"), Value::Null)
+                .with_idempotency_key("anon-start"),
+        ),
+        (
+            "status",
+            ClientRequest::get(format!("/client/providers/{PLAN}/sign-in")),
+        ),
+        (
+            "cancel",
+            ClientRequest::post(
+                format!("/client/providers/{PLAN}:sign-in-cancel"),
+                Value::Null,
+            )
+            .with_idempotency_key("anon-cancel"),
+        ),
+        (
+            "sign-out",
+            ClientRequest::post(format!("/client/providers/{PLAN}:sign-out"), Value::Null)
+                .with_idempotency_key("anon-out"),
+        ),
+    ] {
+        let env = api.handle(req);
+        assert_eq!(
+            code(&env),
+            Some(ClientErrorCode::Unauthenticated),
+            "{what}: {env:?}"
+        );
+    }
+    assert_eq!(sign_in_calls(&provider), [1, 1, 1, 1]);
+}
+
+// ── PA-13: the provider id is validated before the provider is consulted on every sign-in
+//    route; an unknown id is the provider's not_found; the method is part of the route ────────
+#[test]
+fn pa13_sign_in_ids_validated_before_the_provider() {
+    let provider = MemoryProviders::with_sign_in_entry();
+    let (api, _sink) = api_with(provider.clone());
+    operator(&api);
+
+    let long = "x".repeat(65);
+    for (i, bad) in ["bad%20id", "a.b", "a b", "é", long.as_str()]
+        .into_iter()
+        .enumerate()
+    {
+        for (what, req) in sign_in_requests(bad, &format!("bad{i}")) {
+            let env = api.handle(req);
+            assert_eq!(
+                code(&env),
+                Some(ClientErrorCode::InvalidRequest),
+                "{what} {bad}: {env:?}"
+            );
+        }
+    }
+    assert_eq!(sign_in_calls(&provider), [0, 0, 0, 0]);
+
+    // A refused id leaves its idempotency key free: nothing was committed under it.
+    let env = api.handle(post("/client/providers/a.b:sign-in", Value::Null, "reuse"));
+    assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest));
+    let env = api.handle(post("/client/providers/a.b:sign-in", Value::Null, "reuse"));
+    assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest));
+    assert!(!has_warning(&env, "idempotent_replay"));
+
+    // A well-formed id the provider does not know.
+    for (what, req) in sign_in_requests("ghost", "ghost") {
+        let env = api.handle(req);
+        assert_eq!(
+            code(&env),
+            Some(ClientErrorCode::NotFound),
+            "{what}: {env:?}"
+        );
+    }
+    assert_eq!(sign_in_calls(&provider), [1, 1, 1, 1]);
+
+    // The verbs are POST-only and the state is GET-only: the other method never reaches a
+    // sign-in handler.
+    for verb in ["sign-in", "sign-in-cancel", "sign-out"] {
+        let env = api.handle(get(&format!("/client/providers/{PLAN}:{verb}")));
+        assert_eq!(
+            code(&env),
+            Some(ClientErrorCode::InvalidRequest),
+            "GET :{verb} is the entry read with an invalid id: {env:?}"
+        );
+    }
+    let env = api.handle(post(
+        &format!("/client/providers/{PLAN}/sign-in"),
+        Value::Null,
+        "post-status",
+    ));
+    assert_eq!(code(&env), Some(ClientErrorCode::UnknownRoute), "{env:?}");
+    assert_eq!(sign_in_calls(&provider), [1, 1, 1, 1]);
+
+    // The mutations require an idempotency key like every other mutation of the family.
+    for verb in ["sign-in", "sign-in-cancel", "sign-out"] {
+        let env = api.handle(
+            ClientRequest::post(format!("/client/providers/{PLAN}:{verb}"), Value::Null)
+                .with_session("tok"),
+        );
+        assert_eq!(
+            code(&env),
+            Some(ClientErrorCode::IdempotencyRequired),
+            ":{verb}: {env:?}"
+        );
+    }
+    assert_eq!(sign_in_calls(&provider), [1, 1, 1, 1]);
+}
+
+// ── PA-14: start answers the URL and the deadline and replays under the same key without
+//    starting another attempt; the state is polled; cancel and sign-out answer data ───────────
+#[test]
+fn pa14_sign_in_start_replays_and_the_state_is_polled() {
+    let provider = MemoryProviders::with_sign_in_entry();
+    let (api, _sink) = api_with(provider.clone());
+    operator(&api);
+    let start = format!("/client/providers/{PLAN}:sign-in");
+    let status = format!("/client/providers/{PLAN}/sign-in");
+    let cancel = format!("/client/providers/{PLAN}:sign-in-cancel");
+    let sign_out = format!("/client/providers/{PLAN}:sign-out");
+
+    let first_env = api.handle(post(&start, Value::Null, "si1"));
+    let first: ClientProviderSignInStart = data(&first_env);
+    assert!(
+        first
+            .authorize_url
+            .starts_with("https://auth.openai.com/api/accounts/authorize?"),
+        "{first:?}"
+    );
+    assert_eq!(first.expires_at_ms, sign_in_deadline(1));
+    let mut fields: Vec<&str> = first_env
+        .data
+        .as_ref()
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        ["authorize_url", "expires_at_ms"],
+        "the start response is the URL and the deadline, nothing else"
+    );
+
+    // Same key → the recorded pair, the provider is not re-entered, no second attempt.
+    let replay_env = api.handle(post(&start, Value::Null, "si1"));
+    let replay: ClientProviderSignInStart = data(&replay_env);
+    assert_eq!(replay, first);
+    assert!(has_warning(&replay_env, "idempotent_replay"));
+    assert_eq!(replay_env.request_id, first_env.request_id);
+    assert_eq!(provider.calls.sign_in_start.load(Ordering::SeqCst), 1);
+
+    // The state a client polls while the browser is open.
+    let pending: ClientProviderSignIn = data(&api.handle(get(&status)));
+    assert_eq!(pending.state, "pending");
+    assert_eq!(pending.expires_at_ms, Some(first.expires_at_ms));
+    assert_eq!(pending.account, None);
+    assert_eq!(pending.plan_usage, None);
+    assert!(pending.models.is_empty());
+
+    // A fresh key is a new attempt with its own URL and deadline; the old key keeps
+    // answering the old (now superseded) pair.
+    let second: ClientProviderSignInStart = data(&api.handle(post(&start, Value::Null, "si2")));
+    assert_ne!(second.authorize_url, first.authorize_url);
+    assert_eq!(second.expires_at_ms, sign_in_deadline(2));
+    assert_eq!(provider.calls.sign_in_start.load(Ordering::SeqCst), 2);
+    let stale: ClientProviderSignInStart = data(&api.handle(post(&start, Value::Null, "si1")));
+    assert_eq!(stale, first);
+    assert_eq!(provider.calls.sign_in_start.load(Ordering::SeqCst), 2);
+    let pending: ClientProviderSignIn = data(&api.handle(get(&status)));
+    assert_eq!(pending.expires_at_ms, Some(second.expires_at_ms));
+
+    // The browser comes back: the state turns signed-in and the entry's summary carries it.
+    provider.complete_sign_in(
+        PLAN,
+        SIGN_IN_AUTH_CODE,
+        SIGN_IN_ACCESS_TOKEN,
+        SIGN_IN_REFRESH_TOKEN,
+    );
+    let signed_in: ClientProviderSignIn = data(&api.handle(get(&status)));
+    assert_eq!(signed_in.state, "signed-in");
+    assert_eq!(signed_in.reason, None);
+    assert_eq!(signed_in.account.as_deref(), Some("me@example.com"));
+    assert_eq!(signed_in.plan_usage, Some(true));
+    assert_eq!(signed_in.expires_at_ms, Some(1_700_003_600_000));
+    assert_eq!(signed_in.models.len(), 2);
+    assert_eq!(signed_in.models[0].id, "gpt-5.2");
+    assert_eq!(signed_in.models[0].display_name.as_deref(), Some("GPT-5.2"));
+    assert_eq!(signed_in.models[1].display_name, None);
+    let one: ClientProviderSummary = data(&api.handle(get(&format!("/client/providers/{PLAN}"))));
+    assert_eq!(one.auth_source.as_deref(), Some("chatgpt-oauth"));
+    assert_eq!(one.sign_in.as_ref(), Some(&signed_in));
+    assert!(one.key.present, "the session's credential is stored");
+
+    // Cancel without a pending attempt changes nothing and answers the state.
+    let env = api.handle(post(&cancel, Value::Null, "c1"));
+    let after_cancel: ClientProviderSignIn = data(&env);
+    assert_eq!(after_cancel, signed_in);
+
+    // Sign-out answers data and replays without a second revocation.
+    let env = api.handle(post(&sign_out, Value::Null, "so1"));
+    let out: ClientProviderSignOut = data(&env);
+    assert_eq!(
+        out,
+        ClientProviderSignOut {
+            signed_out: true,
+            revocation_confirmed: true
+        }
+    );
+    let replay = api.handle(post(&sign_out, Value::Null, "so1"));
+    assert_eq!(data::<ClientProviderSignOut>(&replay), out);
+    assert!(has_warning(&replay, "idempotent_replay"));
+    assert_eq!(provider.calls.sign_out.load(Ordering::SeqCst), 1);
+    let signed_out: ClientProviderSignIn = data(&api.handle(get(&status)));
+    assert_eq!(signed_out.state, "signed-out");
+    let one: ClientProviderSummary = data(&api.handle(get(&format!("/client/providers/{PLAN}"))));
+    assert!(!one.key.present);
+    assert_eq!(one.sign_in.as_ref(), Some(&signed_out));
+
+    // Cancelling a pending attempt ends it with a fixed reason, as data.
+    let third: ClientProviderSignInStart = data(&api.handle(post(&start, Value::Null, "si3")));
+    assert_eq!(third.expires_at_ms, sign_in_deadline(3));
+    let cancelled: ClientProviderSignIn = data(&api.handle(post(&cancel, Value::Null, "c2")));
+    assert_eq!(cancelled.state, "failed");
+    assert_eq!(cancelled.reason.as_deref(), Some("cancelled"));
+    assert_eq!(cancelled.expires_at_ms, None);
+
+    // An unconfirmed revocation is a field of the result, not an error.
+    provider.revocation_offline.store(true, Ordering::SeqCst);
+    let out: ClientProviderSignOut = data(&api.handle(post(&sign_out, Value::Null, "so2")));
+    assert!(out.signed_out);
+    assert!(!out.revocation_confirmed);
+
+    // Every state the double reported is one of the documented spellings.
+    for state in [
+        &pending.state,
+        &signed_in.state,
+        &signed_out.state,
+        &cancelled.state,
+    ] {
+        assert!(SIGN_IN_STATES.contains(&state.as_str()), "{state}");
+    }
+    assert_eq!(SIGN_IN_STATES.len(), 4);
+}
+
+// ── PA-15: a route that does not apply to the entry's credential source is invalid_state with
+//    the `auth_source_mismatch` detail token; an adapter without a sign-in is unavailable ──────
+#[test]
+fn pa15_wrong_source_is_invalid_state_with_the_detail_token() {
+    let provider = MemoryProviders::with_sign_in_entry();
+    let (api, _sink) = api_with(provider.clone());
+    operator(&api);
+    assert_eq!(AUTH_SOURCE_MISMATCH_DETAIL, "auth_source_mismatch");
+
+    // Sign-in routes on an API-key entry.
+    for (what, req) in sign_in_requests("anthropic", "keyed") {
+        let env = api.handle(req);
+        assert_eq!(
+            code(&env),
+            Some(ClientErrorCode::InvalidState),
+            "{what}: {env:?}"
+        );
+        assert_eq!(details(&env), [AUTH_SOURCE_MISMATCH_DETAIL], "{what}");
+        let text = serde_json::to_string(&env).unwrap();
+        assert!(!text.contains("sign-in-on-a-keyed-entry"), "{what}: {text}");
+    }
+    assert_eq!(sign_in_calls(&provider), [1, 1, 1, 1]);
+    assert!(provider.sign_ins.lock().unwrap().is_empty());
+
+    // Key routes on a sign-in entry.
+    let env = api.handle(post(
+        &format!("/client/providers/{PLAN}:set-key"),
+        json!({ "key": SECRET_KEY }),
+        "sk-plan",
+    ));
+    assert_eq!(code(&env), Some(ClientErrorCode::InvalidState), "{env:?}");
+    assert_eq!(details(&env), [AUTH_SOURCE_MISMATCH_DETAIL]);
+    let text = serde_json::to_string(&env).unwrap();
+    assert!(!text.contains(SECRET_KEY) && !text.contains("key-on-a-sign-in-entry"));
+    assert!(provider.keys.lock().unwrap().is_empty());
+    let env = api.handle(post(
+        &format!("/client/providers/{PLAN}:clear-key"),
+        Value::Null,
+        "ck-plan",
+    ));
+    assert_eq!(code(&env), Some(ClientErrorCode::InvalidState), "{env:?}");
+    assert_eq!(details(&env), [AUTH_SOURCE_MISMATCH_DETAIL]);
+
+    // The refusal is a committed outcome: the same key replays it without re-entering.
+    let replay = api.handle(post(
+        "/client/providers/anthropic:sign-in",
+        Value::Null,
+        "keyed-start",
+    ));
+    assert_eq!(code(&replay), Some(ClientErrorCode::InvalidState));
+    assert_eq!(details(&replay), [AUTH_SOURCE_MISMATCH_DETAIL]);
+    assert!(has_warning(&replay, "idempotent_replay"));
+    assert_eq!(provider.calls.sign_in_start.load(Ordering::SeqCst), 1);
+
+    // The token is what tells this refusal from an ordinary state refusal.
+    let plain = ProviderError::InvalidState("last-provider".into()).into_client_error();
+    assert_eq!(plain.code, ClientErrorCode::InvalidState);
+    assert!(plain.details.is_empty());
+    let typed = ProviderError::AuthSourceMismatch("inner".into()).into_client_error();
+    assert_eq!(typed.code, plain.code);
+    assert_eq!(typed.message, plain.message);
+    assert_eq!(typed.details, [AUTH_SOURCE_MISMATCH_DETAIL]);
+
+    // Every route projects the variant the same way.
+    let (api, _sink) = api_with(MemoryProviders::failing(ProviderError::AuthSourceMismatch(
+        "inner-reason".into(),
+    )));
+    operator(&api);
+    for (what, req) in sign_in_requests(PLAN, "failing") {
+        let env = api.handle(req);
+        assert_eq!(
+            code(&env),
+            Some(ClientErrorCode::InvalidState),
+            "{what}: {env:?}"
+        );
+        assert_eq!(details(&env), [AUTH_SOURCE_MISMATCH_DETAIL], "{what}");
+        assert!(!serde_json::to_string(&env)
+            .unwrap()
+            .contains("inner-reason"));
+    }
+
+    // An adapter that predates the routes inherits the default bodies: unavailable, and the
+    // rest of the family keeps working.
+    let inner = MemoryProviders::with_sign_in_entry();
+    let (api, _sink) = api_with(Arc::new(PredatesSignIn(inner.clone())));
+    operator(&api);
+    for (what, req) in sign_in_requests(PLAN, "legacy") {
+        let env = api.handle(req);
+        assert_eq!(
+            code(&env),
+            Some(ClientErrorCode::ModuleUnavailable),
+            "{what}: {env:?}"
+        );
+        assert!(details(&env).is_empty(), "{what}");
+    }
+    assert_eq!(sign_in_calls(&inner), [0, 0, 0, 0]);
+    assert!(api.handle(get(routes::PATH_PROVIDERS)).is_ok());
+}
+
+// ── PA-16: `auth_source` on create — the closed spellings, and what a `chatgpt-oauth` entry
+//    may and may not name; the field does not exist on update ─────────────────────────────────
+#[test]
+fn pa16_create_auth_source_rules() {
+    let provider = MemoryProviders::new();
+    let (api, _sink) = api_with(provider.clone());
+    operator(&api);
+    assert_eq!(AUTH_SOURCES, ["api-key", "chatgpt-oauth"]);
+
+    // Accepted.
+    let mut explicit_default = create_body("keyed");
+    explicit_default["auth_source"] = json!("api-key");
+    let mut spelled = sign_in_create_body("plan-spelled");
+    spelled["backend_class"] = json!("cloud-http");
+    spelled["backend"] = json!("openai-responses");
+    spelled["auth_scheme"] = json!("bearer");
+    let mut named = sign_in_create_body("plan-named");
+    named["api_key_secret"] = json!("plan-named.session");
+    for (body, why) in [
+        (explicit_default, "explicit api-key"),
+        (
+            sign_in_create_body("plan-bare"),
+            "chatgpt-oauth, nothing else named",
+        ),
+        (spelled, "chatgpt-oauth, every dependent field spelled"),
+        (named, "chatgpt-oauth with its own secret name"),
+    ] {
+        let env = api.handle(post(routes::PATH_PROVIDERS, body, &format!("ok-{why}")));
+        assert!(env.is_ok(), "{why}: {env:?}");
+    }
+    assert_eq!(provider.calls.create.load(Ordering::SeqCst), 4);
+
+    // The summary names a non-default source and carries the sign-in state; an API-key entry
+    // serializes neither field.
+    let env = api.handle(get("/client/providers/plan-bare"));
+    let plan: ClientProviderSummary = data(&env);
+    assert_eq!(plan.auth_source.as_deref(), Some("chatgpt-oauth"));
+    assert_eq!(plan.backend.as_deref(), Some("openai-responses"));
+    assert_eq!(plan.sign_in.as_ref().unwrap().state, "signed-out");
+    assert!(!plan.key.present);
+    let named: ClientProviderSummary = data(&api.handle(get("/client/providers/plan-named")));
+    assert_eq!(named.key.secret_name, "plan-named.session");
+    let env = api.handle(get("/client/providers/keyed"));
+    let keyed = env.data.as_ref().unwrap().as_object().unwrap();
+    assert!(!keyed.contains_key("auth_source"), "{keyed:?}");
+    assert!(!keyed.contains_key("sign_in"), "{keyed:?}");
+
+    // Refused before the provider.
+    let creates = provider.calls.create.load(Ordering::SeqCst);
+    let with = |id: &str, field: &str, value: Value| {
+        let mut body = sign_in_create_body(id);
+        body[field] = value;
+        body
+    };
+    let mut unknown = create_body("r0");
+    unknown["auth_source"] = json!("oauth");
+    let mut empty = create_body("r1");
+    empty["auth_source"] = json!("");
+    let mut cased = create_body("r2");
+    cased["auth_source"] = json!("ChatGPT-OAuth");
+    let mut not_a_string = create_body("r3");
+    not_a_string["auth_source"] = json!({ "kind": "chatgpt-oauth" });
+    let mut agent_cli = with("r6", "backend_class", json!("agent-cli"));
+    agent_cli["agent_cli"] = json!({ "vendor": "codex", "command": "/opt/homebrew/bin/codex" });
+    agent_cli.as_object_mut().unwrap().remove("endpoint");
+    for (bad, why) in [
+        (unknown, "unknown source"),
+        (empty, "empty source"),
+        (cased, "source spelling is exact"),
+        (not_a_string, "source is a string"),
+        (with("r4", "backend_class", json!("local")), "local class"),
+        (
+            with("r5", "backend_class", json!("mesh-remote")),
+            "mesh-remote class",
+        ),
+        (agent_cli, "agent-cli class"),
+        (
+            with("r7", "backend", json!("openai-chat")),
+            "chat-completions dialect",
+        ),
+        (
+            with("r8", "backend", json!("anthropic-messages")),
+            "anthropic dialect",
+        ),
+        (
+            with("r9", "auth_scheme", json!("x-api-key")),
+            "x-api-key scheme",
+        ),
+        (
+            with("r10", "auth_scheme", json!("api-key")),
+            "api-key scheme",
+        ),
+    ] {
+        let env = api.handle(post(routes::PATH_PROVIDERS, bad, &format!("no-{why}")));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{why}");
+    }
+    assert_eq!(provider.calls.create.load(Ordering::SeqCst), creates);
+
+    // The dialect and scheme a sign-in entry may not name stay legal on an API-key entry.
+    let mut other = create_body("keyed-chat");
+    other["backend"] = json!("openai-chat");
+    other["auth_scheme"] = json!("x-api-key");
+    assert!(api
+        .handle(post(routes::PATH_PROVIDERS, other, "ok-keyed-chat"))
+        .is_ok());
+
+    // The source of an entry is fixed at creation: update has no such field.
+    let updates = provider.calls.update.load(Ordering::SeqCst);
+    for (id, value) in [("keyed", "chatgpt-oauth"), ("plan-bare", "api-key")] {
+        let env = api.handle(post(
+            &format!("/client/providers/{id}:update"),
+            json!({ "auth_source": value }),
+            &format!("upd-{id}"),
+        ));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{id}");
+    }
+    assert_eq!(provider.calls.update.load(Ordering::SeqCst), updates);
+}
+
+// ── PA-17: a secret name reserved for a sign-in record is never accepted as an entry's
+//    credential name, on create or on update, for either source ────────────────────────────────
+#[test]
+fn pa17_reserved_secret_name_refused() {
+    let provider = MemoryProviders::with_sign_in_entry();
+    let (api, _sink) = api_with(provider.clone());
+    operator(&api);
+
+    let mut keyed = create_body("k1");
+    keyed["api_key_secret"] = json!("openai-api-key.chatgpt-oauth");
+    let mut plan = sign_in_create_body("k2");
+    plan["api_key_secret"] = json!("k2-chatgpt-0a1b2c3d.chatgpt-oauth");
+    let mut bare = create_body("k3");
+    bare["api_key_secret"] = json!(".chatgpt-oauth");
+    for (bad, why) in [
+        (keyed, "api-key entry"),
+        (plan, "sign-in entry"),
+        (bare, "suffix alone"),
+    ] {
+        let env = api.handle(post(routes::PATH_PROVIDERS, bad, &format!("rs-{why}")));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{why}");
+    }
+    assert_eq!(provider.calls.create.load(Ordering::SeqCst), 0);
+
+    for id in ["openai", PLAN] {
+        let env = api.handle(post(
+            &format!("/client/providers/{id}:update"),
+            json!({ "api_key_secret": "openai-api-key.chatgpt-oauth" }),
+            &format!("rs-upd-{id}"),
+        ));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{id}");
+    }
+    assert_eq!(provider.calls.update.load(Ordering::SeqCst), 0);
+
+    // Only the suffix position is reserved: the same words elsewhere in a name are fine.
+    let mut inside = create_body("k4");
+    inside["api_key_secret"] = json!("team.chatgpt-oauth.backup");
+    let env = api.handle(post(routes::PATH_PROVIDERS, inside, "rs-inside"));
+    let created: ClientProviderSummary = data(&env);
+    assert_eq!(created.key.secret_name, "team.chatgpt-oauth.backup");
+}
+
+// ── PA-18: custody — the provider holds the verifier, the code and the session; no envelope
+//    of the family, no replay and no audit record carries any of them ──────────────────────────
+#[test]
+fn pa18_sign_in_envelopes_carry_no_token() {
+    let provider = MemoryProviders::with_sign_in_entry();
+    let (api, sink) = api_with(provider.clone());
+    operator(&api);
+    let start = format!("/client/providers/{PLAN}:sign-in");
+    let status = format!("/client/providers/{PLAN}/sign-in");
+    let cancel = format!("/client/providers/{PLAN}:sign-in-cancel");
+    let sign_out = format!("/client/providers/{PLAN}:sign-out");
+    let entry = format!("/client/providers/{PLAN}");
+
+    let mut seen: Vec<(String, ClientEnvelope<Value>)> = Vec::new();
+    let mut send = |what: &str, req: ClientRequest| {
+        let env = api.handle(req);
+        seen.push((what.to_string(), env.clone()));
+        env
+    };
+
+    // Pending: the provider holds the verifier.
+    assert!(send("start", post(&start, Value::Null, "c-si1")).is_ok());
+    assert_eq!(provider.held_material(PLAN), [SIGN_IN_VERIFIER]);
+    assert!(send("start replay", post(&start, Value::Null, "c-si1")).is_ok());
+    assert!(send("status pending", get(&status)).is_ok());
+    assert!(send("entry pending", get(&entry)).is_ok());
+
+    // Signed in: the provider holds the code and the session, and the access token sits under
+    // the entry's secret name.
+    provider.complete_sign_in(
+        PLAN,
+        SIGN_IN_AUTH_CODE,
+        SIGN_IN_ACCESS_TOKEN,
+        SIGN_IN_REFRESH_TOKEN,
+    );
+    assert_eq!(
+        provider.held_material(PLAN),
+        [
+            SIGN_IN_AUTH_CODE,
+            SIGN_IN_ACCESS_TOKEN,
+            SIGN_IN_REFRESH_TOKEN
+        ]
+    );
+    assert!(provider
+        .keys
+        .lock()
+        .unwrap()
+        .values()
+        .any(|v| v == SIGN_IN_ACCESS_TOKEN));
+    let env = send("status signed-in", get(&status));
+    assert_eq!(data::<ClientProviderSignIn>(&env).state, "signed-in");
+    let env = send("entry signed-in", get(&entry));
+    assert!(data::<ClientProviderSummary>(&env).key.present);
+    assert!(send("list signed-in", get(routes::PATH_PROVIDERS)).is_ok());
+    assert!(send("cancel signed-in", post(&cancel, Value::Null, "c-c1")).is_ok());
+    assert!(send(
+        "preflight signed-in",
+        post(&format!("{entry}:preflight"), Value::Null, "c-pf")
+    )
+    .is_ok());
+    assert!(send(
+        "select signed-in",
+        post(&format!("{entry}:select"), Value::Null, "c-sel")
+    )
+    .is_ok());
+    assert!(send(
+        "update signed-in",
+        post(
+            &format!("{entry}:update"),
+            json!({ "endpoint": "https://api.openai.com/" }),
+            "c-upd"
+        )
+    )
+    .is_ok());
+    // Refusals while the session is held.
+    assert!(send(
+        "set-key refused",
+        post(
+            &format!("{entry}:set-key"),
+            json!({ "key": SECRET_KEY }),
+            "c-sk"
+        )
+    )
+    .is_err());
+    assert!(send(
+        "clear-key refused",
+        post(&format!("{entry}:clear-key"), Value::Null, "c-ck")
+    )
+    .is_err());
+    for (what, req) in sign_in_requests("anthropic", "c-keyed") {
+        assert!(send(&format!("wrong source {what}"), req).is_err());
+    }
+    assert!(send("sign-out", post(&sign_out, Value::Null, "c-so1")).is_ok());
+    assert!(send("sign-out replay", post(&sign_out, Value::Null, "c-so1")).is_ok());
+    assert!(send("status signed-out", get(&status)).is_ok());
+    assert!(send("start again", post(&start, Value::Null, "c-si2")).is_ok());
+    assert!(send("cancel pending", post(&cancel, Value::Null, "c-c2")).is_ok());
+
+    // An adapter failure whose internal reason quotes token material: the projection drops
+    // the reason on every sign-in route.
+    for err in [
+        ProviderError::Unavailable(format!("exchange of {SIGN_IN_AUTH_CODE} failed")),
+        ProviderError::InvalidState(format!("verifier {SIGN_IN_VERIFIER} rejected")),
+        ProviderError::AuthSourceMismatch(format!("bearer {SIGN_IN_ACCESS_TOKEN}")),
+        ProviderError::NotFound(format!("no session for {SIGN_IN_REFRESH_TOKEN}")),
+    ] {
+        let (failing_api, failing_sink) = api_with(MemoryProviders::failing(err));
+        operator(&failing_api);
+        for (what, req) in sign_in_requests(PLAN, "c-fail") {
+            let env = failing_api.handle(req);
+            assert!(env.is_err(), "{what}: {env:?}");
+            seen.push((format!("failing {what}"), env));
+        }
+        let audit = format!("{:?}", failing_sink.events());
+        for secret in SIGN_IN_CUSTODY {
+            assert!(!audit.contains(secret), "audit carries {secret}");
+        }
+    }
+
+    // The check is not vacuous: the envelopes do carry what a client is meant to see.
+    assert_eq!(seen.len(), 38);
+    let all = seen
+        .iter()
+        .map(|(_, env)| serde_json::to_string(env).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for expected in [
+        "https://auth.openai.com/api/accounts/authorize?",
+        "code_challenge=challenge-1",
+        "me@example.com",
+        "gpt-5.2-mini",
+        "auth_source_mismatch",
+        "\"signed-in\"",
+    ] {
+        assert!(
+            all.contains(expected),
+            "expected {expected} in the envelopes"
+        );
+    }
+
+    for (what, env) in &seen {
+        let wire = serde_json::to_string(env).unwrap();
+        let debug = format!("{env:?}");
+        for secret in SIGN_IN_CUSTODY {
+            assert!(!wire.contains(secret), "{what}: wire carries {secret}");
+            assert!(!debug.contains(secret), "{what}: Debug carries {secret}");
+        }
+        assert!(!wire.contains(SECRET_KEY), "{what}: wire carries the key");
+    }
+    let audit = format!("{:?}", sink.events());
+    for secret in SIGN_IN_CUSTODY {
+        assert!(!audit.contains(secret), "audit carries {secret}");
+    }
+    assert!(!audit.contains(SECRET_KEY));
 }

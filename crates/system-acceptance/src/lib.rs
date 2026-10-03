@@ -2596,6 +2596,7 @@ impl SystemUnderTestBuilder {
                     self.agent_id.clone(),
                     delta,
                     None,
+                    None,
                 );
                 cap_llm::register_agent_llm(&*registry, gw.clone());
                 match launch {

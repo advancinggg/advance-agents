@@ -37,11 +37,13 @@ pub mod backend_mesh;
 pub mod capability;
 pub mod catalog;
 pub mod cost;
+pub mod credential;
 pub mod error;
 pub mod events;
 pub mod gateway;
 pub mod host_fn;
 pub mod placement;
+pub mod plan_usage;
 pub mod policy;
 pub mod preflight;
 pub mod provider;
@@ -73,6 +75,9 @@ mod mesh_remote_tests;
 mod placement_tests;
 
 #[cfg(test)]
+mod plan_usage_tests;
+
+#[cfg(test)]
 mod policy_tests;
 
 #[cfg(test)]
@@ -89,6 +94,7 @@ pub use backend_local::{
 pub use backend_mesh::MeshRemoteAdapter;
 pub use catalog::ModelProfileCatalog;
 pub use cost::compute_cost;
+pub use credential::{CredentialFailure, ProviderCredentialSource};
 pub use error::LlmError;
 pub use events::{LLM_ERROR, LLM_REQUEST, LLM_RESPONSE, LLM_RETRY};
 pub use gateway::{
@@ -100,6 +106,7 @@ pub use host_fn::{
     AgentLlmPollStreamHandler, AgentLlmStreamHandler, AgentStreamReaper, ReapBatch,
 };
 pub use placement::{PlacementRecord, PlacementTelemetry, UserHardConstraint};
+pub use plan_usage::{is_plan_usage_error, PLAN_USAGE_PREFIX};
 pub use policy::{
     constraint_to_string, is_valid_device_id, parse_constraint, AgentLlmPolicy,
     AgentLlmPolicySource, ConstraintParseError, LlmPolicySource, NotWiredAgentLlmPolicy,

@@ -2113,3 +2113,237 @@ fn agent_cli_requires_its_block_and_refuses_sidecar_device_and_dialect() {
         "{text}"
     );
 }
+
+// ── `auth-source: chatgpt-oauth` on a cloud-http entry ───────────────────────────────────────
+
+/// One `openai-plan` entry on `https://api.openai.com`; `block` is spliced in before
+/// `model-aliases`, `tail` after the entry (for further entries).
+fn chatgpt_oauth_yaml(block: &str, tail: &str) -> String {
+    format!(
+        "{}\n",
+        minimal_yaml().trim_end_matches('\n').replace(
+            "llm-providers: []",
+            &format!(
+                "llm-providers:\n  - id: openai-plan\n    endpoint: https://api.openai.com\n    api-key-secret: openai-plan-token\n{block}    model-aliases:\n      gpt: gpt-5\n    cost-per-mtoken-in: 0.001\n    cost-per-mtoken-out: 0.001\n    rate-limit:\n      requests-per-minute: 6\n      tokens-per-minute: 60000{tail}"
+            )
+        )
+    )
+}
+
+#[test]
+fn chatgpt_oauth_entry_parses_and_defaults_its_dialect() {
+    use advance_runtime::config::{InferenceBackendClass, ProviderAuthSource, ProviderBackend};
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("runtime-config.yaml");
+
+    // Explicit dialect, explicit class, explicit bearer scheme.
+    write_config(
+        &config_path,
+        &chatgpt_oauth_yaml(
+            "    backend-class: cloud-http\n    backend: openai-responses\n    auth-scheme: bearer\n    auth-source: chatgpt-oauth\n",
+            "",
+        ),
+    );
+    let cfg = load_config(&config_path).expect("chatgpt-oauth entry must load");
+    let p = &cfg.llm_providers[0];
+    assert_eq!(p.auth_source, ProviderAuthSource::ChatGptOAuth);
+    assert!(p.uses_chatgpt_sign_in());
+    assert_eq!(p.backend_class, InferenceBackendClass::CloudHttp);
+    assert_eq!(p.backend, Some(ProviderBackend::OpenAiResponses));
+    assert!(format!("{p:?}").contains("auth_source: ChatGptOAuth"));
+
+    // An absent `backend` defaults to the only dialect the source allows; one trailing slash
+    // on the endpoint is tolerated.
+    write_config(
+        &config_path,
+        &chatgpt_oauth_yaml("    auth-source: chatgpt-oauth\n", "").replace(
+            "endpoint: https://api.openai.com\n",
+            "endpoint: https://api.openai.com/\n",
+        ),
+    );
+    let cfg = load_config(&config_path).expect("chatgpt-oauth entry without backend must load");
+    let p = &cfg.llm_providers[0];
+    assert!(p.uses_chatgpt_sign_in());
+    assert_eq!(p.backend, Some(ProviderBackend::OpenAiResponses));
+    assert_eq!(p.auth_scheme, None);
+
+    // No key, and the explicit default spelling, both mean an operator-entered API key and
+    // leave the dialect to the resolver.
+    for block in ["", "    auth-source: api-key\n"] {
+        write_config(&config_path, &chatgpt_oauth_yaml(block, ""));
+        let cfg = load_config(&config_path).expect("api-key entry must load");
+        let p = &cfg.llm_providers[0];
+        assert_eq!(p.auth_source, ProviderAuthSource::ApiKey, "block {block:?}");
+        assert!(!p.uses_chatgpt_sign_in());
+        assert_eq!(p.backend, None, "block {block:?}");
+    }
+
+    assert_eq!(ProviderAuthSource::default(), ProviderAuthSource::ApiKey);
+    for source in [ProviderAuthSource::ApiKey, ProviderAuthSource::ChatGptOAuth] {
+        assert_eq!(ProviderAuthSource::parse(source.as_str()), Some(source));
+    }
+    assert_eq!(ProviderAuthSource::ChatGptOAuth.as_str(), "chatgpt-oauth");
+    assert_eq!(ProviderAuthSource::parse("oauth"), None);
+}
+
+#[test]
+fn chatgpt_oauth_refuses_other_classes_dialects_schemes_endpoints_and_shared_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("runtime-config.yaml");
+    fn chain(err: &dyn std::error::Error) -> String {
+        let mut out = err.to_string();
+        let mut cur = err.source();
+        while let Some(e) = cur {
+            out.push_str(" / ");
+            out.push_str(&e.to_string());
+            cur = e.source();
+        }
+        out
+    }
+    const SOURCE: &str = "    auth-source: chatgpt-oauth\n";
+    let second_entry = |secret: &str| {
+        format!(
+            "\n  - id: other\n    endpoint: https://api.example.com\n    api-key-secret: {secret}\n    model-aliases:\n      m: m\n    cost-per-mtoken-in: 0.001\n    cost-per-mtoken-out: 0.001\n    rate-limit:\n      requests-per-minute: 6\n      tokens-per-minute: 60000"
+        )
+    };
+    // (yaml, needle, whether the text must be visible in `Display` itself)
+    let cases: Vec<(String, &str, bool)> = vec![
+        // Entry-shape rules: reported through the parse error's source chain.
+        (
+            chatgpt_oauth_yaml(
+                &format!("{SOURCE}    backend-class: agent-cli\n    agent-cli:\n      vendor: codex\n      command: /opt/homebrew/bin/codex\n"),
+                "",
+            ),
+            "auth-source: chatgpt-oauth is only valid on backend-class: cloud-http",
+            false,
+        ),
+        (
+            chatgpt_oauth_yaml(&format!("{SOURCE}    backend-class: local\n"), ""),
+            "auth-source: chatgpt-oauth is only valid on backend-class: cloud-http",
+            false,
+        ),
+        (
+            chatgpt_oauth_yaml(
+                &format!("{SOURCE}    backend-class: mesh-remote\n    device-id: peer\n"),
+                "",
+            ),
+            "auth-source: chatgpt-oauth is only valid on backend-class: cloud-http",
+            false,
+        ),
+        (
+            chatgpt_oauth_yaml(&format!("{SOURCE}    backend: local\n"), ""),
+            "auth-source: chatgpt-oauth is only valid on backend-class: cloud-http",
+            false,
+        ),
+        (
+            chatgpt_oauth_yaml(&format!("{SOURCE}    backend: openai-chat\n"), ""),
+            "auth-source: chatgpt-oauth requires backend: openai-responses",
+            false,
+        ),
+        (
+            chatgpt_oauth_yaml(&format!("{SOURCE}    backend: anthropic-messages\n"), ""),
+            "auth-source: chatgpt-oauth requires backend: openai-responses",
+            false,
+        ),
+        (
+            chatgpt_oauth_yaml(&format!("{SOURCE}    auth-scheme: x-api-key\n"), ""),
+            "auth-source: chatgpt-oauth sends a bearer token (omit auth-scheme)",
+            false,
+        ),
+        (
+            chatgpt_oauth_yaml(&format!("{SOURCE}    auth-scheme: api-key\n"), ""),
+            "auth-source: chatgpt-oauth sends a bearer token (omit auth-scheme)",
+            false,
+        ),
+        (
+            chatgpt_oauth_yaml(
+                &format!("{SOURCE}    embedding-model: text-embedding-3-small\n"),
+                "",
+            ),
+            "embedding-model is invalid with auth-source: chatgpt-oauth",
+            false,
+        ),
+        (
+            chatgpt_oauth_yaml("    auth-source: chatgpt\n", ""),
+            "unknown variant",
+            false,
+        ),
+        // Value rules: the message is the error's own text.
+        (
+            chatgpt_oauth_yaml(SOURCE, "").replace(
+                "endpoint: https://api.openai.com\n",
+                "endpoint: https://api.example.com\n",
+            ),
+            "llm-providers[openai-plan]: auth-source: chatgpt-oauth requires endpoint https://api.openai.com",
+            true,
+        ),
+        (
+            chatgpt_oauth_yaml(SOURCE, "").replace(
+                "endpoint: https://api.openai.com\n",
+                "endpoint: https://api.openai.com/v1\n",
+            ),
+            "auth-source: chatgpt-oauth requires endpoint https://api.openai.com",
+            true,
+        ),
+        (
+            chatgpt_oauth_yaml(SOURCE, "").replace(
+                "endpoint: https://api.openai.com\n",
+                "endpoint: https://api.openai.com//\n",
+            ),
+            "auth-source: chatgpt-oauth requires endpoint https://api.openai.com",
+            true,
+        ),
+        (
+            chatgpt_oauth_yaml(SOURCE, "").replace(
+                "endpoint: https://api.openai.com\n",
+                "endpoint: http://localhost:8080\n",
+            ),
+            "auth-source: chatgpt-oauth requires endpoint https://api.openai.com",
+            true,
+        ),
+        (
+            chatgpt_oauth_yaml(SOURCE, &second_entry("openai-plan-token")),
+            "llm-providers[openai-plan]: auth-source: chatgpt-oauth needs an api-key-secret no other entry uses",
+            true,
+        ),
+        // The reserved record name is refused on every entry, whatever its source.
+        (
+            chatgpt_oauth_yaml(SOURCE, "").replace(
+                "api-key-secret: openai-plan-token\n",
+                "api-key-secret: openai-plan-token.chatgpt-oauth\n",
+            ),
+            "llm-providers[openai-plan].api-key-secret must not end with the reserved suffix .chatgpt-oauth",
+            true,
+        ),
+        (
+            chatgpt_oauth_yaml("", &second_entry("openai-plan-token.chatgpt-oauth")),
+            "llm-providers[other].api-key-secret must not end with the reserved suffix .chatgpt-oauth",
+            true,
+        ),
+    ];
+    for (yaml, needle, in_display) in cases {
+        write_config(&config_path, &yaml);
+        let err = load_config(&config_path).expect_err(needle);
+        let text = chain(&err);
+        assert!(text.contains(needle), "needle {needle:?}: {text}");
+        if in_display {
+            assert!(
+                err.to_string().contains(needle),
+                "needle {needle:?} must be visible in Display: {err}"
+            );
+        }
+    }
+
+    // Two API-key entries may still share one secret name, and a second entry with its own
+    // name beside a chatgpt-oauth entry loads.
+    write_config(
+        &config_path,
+        &chatgpt_oauth_yaml("", &second_entry("openai-plan-token")),
+    );
+    load_config(&config_path).expect("api-key entries may share a secret name");
+    write_config(
+        &config_path,
+        &chatgpt_oauth_yaml(SOURCE, &second_entry("other-api-key")),
+    );
+    load_config(&config_path).expect("a distinct secret name beside a chatgpt-oauth entry loads");
+}

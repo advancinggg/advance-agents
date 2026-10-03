@@ -28,12 +28,22 @@ libc = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 secrecy = { workspace = true }
+# Sign in with ChatGPT (`chatgpt_sign_in`): the credential-source port, the record, PKCE,
+# the authorization URL / form bodies, constant-time comparisons, the host id, RS256.
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+url = { workspace = true }
+subtle = { workspace = true }
+uuid = { workspace = true }
+rsa = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 
 [lints]
 workspace = true

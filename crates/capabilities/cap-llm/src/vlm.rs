@@ -130,6 +130,13 @@ impl VlmExtractor for LlmGatewayVlm {
                 "unsupported capability: image".into(),
             ));
         }
+        // The walker already skips a ChatGPT sign-in entry (its descriptor reports no image
+        // input); refuse it here too, so its token can never reach `/v1/chat/completions`.
+        if resolved.uses_chatgpt_sign_in() {
+            return Err(LlmError::ProviderError(
+                "unsupported capability: image".into(),
+            ));
+        }
         let http_cap = build_http_cap(&resolved, &provider_cfg)?;
 
         // Adversarial-R1 C2 fix — fragile string-equality `id == "anthropic"`
@@ -592,6 +599,7 @@ mod tests {
             profile_id: None,
             device_id: None,
             agent_cli: None,
+            auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
         };
         let mut cfg = fixture_runtime_config();
         cfg.llm_providers.insert(0, local);
@@ -642,6 +650,7 @@ mod tests {
             profile_id: None,
             device_id: None,
             agent_cli: None,
+            auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
         };
         let mut cfg = fixture_runtime_config();
         cfg.llm_providers = vec![local];
@@ -660,6 +669,96 @@ mod tests {
             .await
             .expect_err("local-only has no image");
         assert!(format!("{err}").contains("unsupported capability"), "{err}");
+        assert!(chain.call_log.lock().unwrap().is_empty());
+    }
+
+    /// A ChatGPT sign-in entry is never used for image extraction: listed first, it is
+    /// skipped in favour of the next image-capable entry; alone, the extraction is refused
+    /// before any request is built. Its token never reaches `/v1/chat/completions`.
+    #[tokio::test]
+    async fn vlm_skips_a_chatgpt_sign_in_entry() {
+        use std::collections::HashMap;
+
+        use advance_runtime::config::{
+            InferenceBackendClass, LlmProviderConfig, ProviderAuthSource, ProviderBackend,
+        };
+
+        let mut aliases = HashMap::new();
+        aliases.insert("gpt".into(), "gpt-5".into());
+        let plan = LlmProviderConfig {
+            id: "openai-plan".into(),
+            endpoint: "https://api.openai.com".into(),
+            api_key_secret: "openai-plan-token".into(),
+            model_aliases: aliases,
+            cost_per_mtoken_in: 0.001,
+            cost_per_mtoken_out: 0.001,
+            cost_per_mtoken_cache_read: None,
+            cost_per_mtoken_cache_write: None,
+            cost_per_mtoken_cache_write_1h: None,
+            rate_limit: None,
+            retry_default: None,
+            backend: Some(ProviderBackend::OpenAiResponses),
+            auth_scheme: None,
+            backend_class: InferenceBackendClass::CloudHttp,
+            embedding_model: None,
+            sidecar: None,
+            profile_id: None,
+            device_id: None,
+            agent_cli: None,
+            auth_source: ProviderAuthSource::ChatGptOAuth,
+        };
+        let png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+        let mut cfg = fixture_runtime_config();
+        cfg.llm_providers.insert(0, plan.clone());
+        let chain = vlm_chain_with_scripted_text("cloud-vision");
+        let vlm = LlmGatewayVlm::new(
+            Arc::new(MockRuntimeConfigProvider::new(cfg)),
+            chain.clone(),
+            Arc::new(MockEventBusEmit::default()),
+            "test-agent".into(),
+        );
+        let res = vlm
+            .extract_description(&FileContent::Image {
+                bytes: png.clone(),
+                mime: "image/png".into(),
+            })
+            .await
+            .expect("the walker must skip the sign-in entry and use the next one");
+        assert_eq!(res, "cloud-vision");
+        {
+            let log = chain.call_log.lock().unwrap();
+            assert_eq!(log.len(), 1);
+            assert!(log[0]
+                .headers
+                .iter()
+                .any(|(n, v)| n == "Authorization" && v == "Bearer {openai-api-key}"));
+            assert!(!log[0]
+                .headers
+                .iter()
+                .any(|(_, v)| v.contains("openai-plan-token")));
+        }
+
+        let mut cfg = fixture_runtime_config();
+        cfg.llm_providers = vec![plan];
+        let chain = vlm_chain_with_scripted_text("must not be reached");
+        let vlm = LlmGatewayVlm::new(
+            Arc::new(MockRuntimeConfigProvider::new(cfg)),
+            chain.clone(),
+            Arc::new(MockEventBusEmit::default()),
+            "test-agent".into(),
+        );
+        let err = vlm
+            .extract_description(&FileContent::Image {
+                bytes: png,
+                mime: "image/png".into(),
+            })
+            .await
+            .expect_err("a sign-in entry alone has no image extraction");
+        assert_eq!(
+            err,
+            LlmError::ProviderError("unsupported capability: image".into())
+        );
         assert!(chain.call_log.lock().unwrap().is_empty());
     }
 

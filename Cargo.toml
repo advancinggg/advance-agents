@@ -292,6 +292,11 @@ hkdf = "=0.12.4"
 sha2 = "=0.10.8"
 # AES-256-GCM AEAD (confidentiality + authenticity for stored secrets).
 aes-gcm = "=0.10.3"
+# rsa — RS256 verification of the Sign in with ChatGPT ID token against the issuer's published
+# keys (advance-home `chatgpt_sign_in`). Pure-Rust RustCrypto (MIT OR Apache-2.0), never `ring`.
+# Verification only: no private-key operation ships (RUSTSEC-2023-0071 concerns decryption
+# timing). `sha2` = the `Sha256` OID binding over the pinned sha2; no `pem`.
+rsa = { version = "=0.9.10", default-features = false, features = ["std", "u64_digit", "sha2"] }
 # Wave-25A CONTRACT-218 role roots use XChaCha20-Poly1305 so every active
 # allocation has a distinct 192-bit nonce.
 chacha20poly1305 = "=0.10.1"

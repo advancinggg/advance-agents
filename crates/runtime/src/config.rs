@@ -624,6 +624,23 @@ pub struct SidecarSpec {
     pub args: Vec<String>,
 }
 
+/// Suffix of the internal secret name that holds the sign-in record of an
+/// `auth-source: chatgpt-oauth` entry: the record lives under
+/// `<api-key-secret><suffix>`, beside the access token stored under `<api-key-secret>`.
+/// No provider entry may use a name with this suffix as its `api-key-secret`, and name-addressed
+/// secret lookups offered to packs and guests refuse it.
+pub const CHATGPT_OAUTH_RECORD_SUFFIX: &str = ".chatgpt-oauth";
+
+/// Whether `name` is reserved for an internal sign-in record (see
+/// [`CHATGPT_OAUTH_RECORD_SUFFIX`]).
+pub fn is_reserved_secret_name(name: &str) -> bool {
+    name.ends_with(CHATGPT_OAUTH_RECORD_SUFFIX)
+}
+
+/// The only endpoint an `auth-source: chatgpt-oauth` entry may name (one trailing `/` is
+/// tolerated).
+const CHATGPT_OAUTH_ENDPOINT: &str = "https://api.openai.com";
+
 /// Credential-position scheme, orthogonal to `ProviderBackend` (ADR 2026-07-22
 /// fork f). Absent → the backend's default applies (`OpenAiChat`/
 /// `OpenAiResponses` → `Bearer`; `AnthropicMessages` → `XApiKey`).
@@ -637,6 +654,39 @@ pub enum AuthScheme {
     XApiKey,
     #[serde(rename = "api-key")]
     ApiKey,
+}
+
+/// Where the credential of a provider entry comes from, orthogonal to [`AuthScheme`] (which
+/// header carries it). Absent → `ApiKey`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub enum ProviderAuthSource {
+    /// An API key the operator entered, stored under `api-key-secret`.
+    #[default]
+    #[serde(rename = "api-key")]
+    ApiKey,
+    /// A Sign in with ChatGPT session the daemon keeps fresh: the current access token is
+    /// stored under `api-key-secret` and sent as a bearer token. Only valid on a `cloud-http`
+    /// entry speaking `openai-responses` to `https://api.openai.com`.
+    #[serde(rename = "chatgpt-oauth")]
+    ChatGptOAuth,
+}
+
+impl ProviderAuthSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api-key",
+            Self::ChatGptOAuth => "chatgpt-oauth",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "api-key" => Some(Self::ApiKey),
+            "chatgpt-oauth" => Some(Self::ChatGptOAuth),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, PartialEq)]
@@ -679,6 +729,16 @@ pub struct LlmProviderConfig {
     pub device_id: Option<String>,
     /// `agent-cli` backend class only: the vendor CLI recipe target.
     pub agent_cli: Option<AgentCliSpec>,
+    /// Where the entry's credential comes from. Absent → an operator-entered API key.
+    pub auth_source: ProviderAuthSource,
+}
+
+impl LlmProviderConfig {
+    /// Whether the entry's credential is a Sign in with ChatGPT session
+    /// (`auth-source: chatgpt-oauth`) rather than an API key.
+    pub fn uses_chatgpt_sign_in(&self) -> bool {
+        self.auth_source == ProviderAuthSource::ChatGptOAuth
+    }
 }
 
 #[derive(Deserialize)]
@@ -721,6 +781,8 @@ struct LlmProviderConfigRaw {
     device_id: Option<String>,
     #[serde(rename = "agent-cli", default)]
     agent_cli: Option<AgentCliSpec>,
+    #[serde(rename = "auth-source", default)]
+    auth_source: Option<ProviderAuthSource>,
 }
 
 impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
@@ -820,6 +882,31 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
         } else if raw.agent_cli.is_some() {
             return Err("agent-cli block is only valid on backend-class: agent-cli".into());
         }
+        let auth_source = raw.auth_source.unwrap_or_default();
+        if auth_source == ProviderAuthSource::ChatGptOAuth {
+            if backend_class != InferenceBackendClass::CloudHttp {
+                return Err(
+                    "auth-source: chatgpt-oauth is only valid on backend-class: cloud-http".into(),
+                );
+            }
+            match backend {
+                None => backend = Some(ProviderBackend::OpenAiResponses),
+                Some(ProviderBackend::OpenAiResponses) => {}
+                Some(_) => {
+                    return Err(
+                        "auth-source: chatgpt-oauth requires backend: openai-responses".into(),
+                    );
+                }
+            }
+            if matches!(raw.auth_scheme, Some(scheme) if scheme != AuthScheme::Bearer) {
+                return Err(
+                    "auth-source: chatgpt-oauth sends a bearer token (omit auth-scheme)".into(),
+                );
+            }
+            if raw.embedding_model.is_some() {
+                return Err("embedding-model is invalid with auth-source: chatgpt-oauth".into());
+            }
+        }
         Ok(Self {
             id: raw.id,
             endpoint: raw.endpoint,
@@ -840,6 +927,7 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
             profile_id: raw.profile_id,
             device_id: raw.device_id,
             agent_cli: raw.agent_cli,
+            auth_source,
         })
     }
 }
@@ -875,6 +963,7 @@ impl fmt::Debug for LlmProviderConfig {
             .field("profile_id", &self.profile_id)
             .field("device_id", &self.device_id)
             .field("agent_cli", &self.agent_cli)
+            .field("auth_source", &self.auth_source)
             .finish()
     }
 }
@@ -2180,6 +2269,39 @@ fn validate_config(path: &Path, cfg: &RuntimeConfig) -> Result<(), ConfigError> 
         check_nonempty("llm-providers[].api-key-secret", &p.api_key_secret)?;
         if !seen_ids.insert(&p.id) {
             return invalid("duplicate llm-providers[].id (provider-shadowing attack surface)");
+        }
+        // The suffixed name is where a sign-in record lives; an entry that named it as its
+        // credential would have that record injected as a header value.
+        if is_reserved_secret_name(&p.api_key_secret) {
+            return invalid(&format!(
+                "llm-providers[{}].api-key-secret must not end with the reserved suffix {CHATGPT_OAUTH_RECORD_SUFFIX}",
+                p.id
+            ));
+        }
+        if p.uses_chatgpt_sign_in() {
+            // The access token is only ever valid for the vendor's public API origin; any
+            // other endpoint would hand the token to a third party.
+            let endpoint = p.endpoint.strip_suffix('/').unwrap_or(&p.endpoint);
+            if endpoint != CHATGPT_OAUTH_ENDPOINT {
+                return invalid(&format!(
+                    "llm-providers[{}]: auth-source: chatgpt-oauth requires endpoint {CHATGPT_OAUTH_ENDPOINT}",
+                    p.id
+                ));
+            }
+            // The daemon rewrites the value under this name on every renewal and removes it
+            // on sign-out; a second entry sharing the name would send or lose that token.
+            let shared = cfg
+                .llm_providers
+                .iter()
+                .filter(|other| other.api_key_secret == p.api_key_secret)
+                .count()
+                > 1;
+            if shared {
+                return invalid(&format!(
+                    "llm-providers[{}]: auth-source: chatgpt-oauth needs an api-key-secret no other entry uses",
+                    p.id
+                ));
+            }
         }
         // Endpoint must be https:// except for localhost/127.0.0.1 (dev proxies).
         // Local-class entries do not use endpoint as the connect target (C238

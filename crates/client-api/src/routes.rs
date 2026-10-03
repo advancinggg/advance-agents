@@ -111,6 +111,12 @@ pub const TPL_PROVIDER_CLEAR_KEY: &str = "/client/providers/{provider_id}:clear-
 pub const TPL_PROVIDER_PREFLIGHT: &str = "/client/providers/{provider_id}:preflight";
 pub const TPL_PROVIDER_SELECT: &str = "/client/providers/{provider_id}:select";
 pub const TPL_PROVIDER_USAGE: &str = "/client/providers/{provider_id}/usage";
+/// Providers family sign-in routes (an `auth_source: chatgpt-oauth` entry): start a browser
+/// sign-in, read the sign-in state, cancel a pending attempt, sign out.
+pub const TPL_PROVIDER_SIGN_IN: &str = "/client/providers/{provider_id}:sign-in";
+pub const TPL_PROVIDER_SIGN_IN_STATUS: &str = "/client/providers/{provider_id}/sign-in";
+pub const TPL_PROVIDER_SIGN_IN_CANCEL: &str = "/client/providers/{provider_id}:sign-in-cancel";
+pub const TPL_PROVIDER_SIGN_OUT: &str = "/client/providers/{provider_id}:sign-out";
 /// Secrets family: the home's secrets mode (GET)
 /// and the mode switch (POST). Its own family (`secrets`); no templated routes.
 pub const PATH_SECRETS_MODE: &str = "/client/secrets/mode";

@@ -564,6 +564,10 @@ struct SettlementInner {
     /// to these before summing (plan §4).
     input_estimate: u64,
     output_estimate: u64,
+    /// The ceiling on the output the provider REPORTS: `output_estimate`, unless the stream's
+    /// upstream was sent no output ceiling (see
+    /// [`Settlement::bill_reported_output_beyond_estimate`]).
+    reported_output_ceiling: u64,
     /// ALL decoded output bytes — counted at DECODE time, before release,
     /// suppression, or hold, so capped/held/abandoned output is never free.
     decoded_output_bytes: u64,
@@ -632,6 +636,7 @@ impl Settlement {
                 run_id,
                 input_estimate: input_est,
                 output_estimate: output_est,
+                reported_output_ceiling: output_est,
                 decoded_output_bytes: 0,
                 decoded_at_last_output_usage: 0,
                 folded_input: None,
@@ -653,6 +658,16 @@ impl Settlement {
             tee: std::sync::Mutex::new(None),
             ceiling_breached: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Bill the output the provider reports even where it exceeds the output reservation (up
+    /// to `MAX_TOKENS_PER_ATTEMPT`, the per-attempt clamp of the buffered path). For a stream
+    /// whose upstream is sent no output ceiling (a ChatGPT sign-in entry) the reservation does
+    /// not bound what the provider generates, so clamping a report to it would under-count the
+    /// run's tokens and cost. Output decoded without a report stays clamped to the reservation.
+    pub(crate) fn bill_reported_output_beyond_estimate(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.reported_output_ceiling = crate::host_fn::MAX_TOKENS_PER_ATTEMPT.max(g.output_estimate);
     }
 
     /// Bind the CONTRACT-234 tee for this stream (tee slice T1). Separate from
@@ -824,7 +839,9 @@ impl Settlement {
     /// reservation ceiling before the checked sum. Round 16 added the addend after an
     /// attack billed 2 tokens for 4000 delivered bytes; round 17 made this the single
     /// source of truth after finding a second, stale copy of the formula in the
-    /// gateway's terminal-phase construction.
+    /// gateway's terminal-phase construction. Reported output is clamped to
+    /// `reported_output_ceiling`, which is the output reservation unless the upstream was
+    /// sent no output ceiling.
     fn compute_bill(g: &SettlementInner) -> (u64, u64) {
         let bin = g
             .folded_input
@@ -835,7 +852,9 @@ impl Settlement {
                 let uncovered = g
                     .decoded_output_bytes
                     .saturating_sub(g.decoded_at_last_output_usage);
-                reported.saturating_add(uncovered).min(g.output_estimate)
+                reported
+                    .saturating_add(uncovered)
+                    .min(g.reported_output_ceiling)
             }
             None => g.decoded_output_bytes.min(g.output_estimate),
         };

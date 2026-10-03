@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use advance_home::{
-    write_recognizable_home, CancelToken, HostWorkspaceHome, PreflightFail, PreflightPort,
-    ProviderStatus, SecretBytes, WorkspaceHomeFirstOpen,
+    select_provider, upsert_provider_entry, write_recognizable_home, CancelToken,
+    HostWorkspaceHome, PreflightFail, PreflightPort, ProviderStatus, SecretBytes, UpsertMode,
+    WorkspaceHomeFirstOpen,
 };
 use advance_runtime::config::LlmProviderConfig;
 use cap_secrets::{
@@ -193,15 +194,107 @@ fn t108_provider_status_and_select() {
     );
 }
 
-fn committed_secret(home: &Path) -> String {
+/// Counts chat preflights.
+struct CountingPreflight(Arc<AtomicUsize>);
+
+impl PreflightPort for CountingPreflight {
+    fn preflight(
+        &self,
+        _home: &Path,
+        _provider: &LlmProviderConfig,
+        _key: &SecretBytes,
+        _cancel: &CancelToken,
+    ) -> Result<(), PreflightFail> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// A sign-in entry (`auth-source: chatgpt-oauth`) counts as configured once its access token
+/// exists; the first-open flow never runs the chat preflight for it and never stores a typed
+/// key under the token's name.
+#[test]
+fn t108b_sign_in_entry_is_configured_by_its_token_and_never_preflighted() {
+    const TOKEN_SECRET: &str = "openai-plan-chatgpt-0a1b2c3d";
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("h");
+    write_recognizable_home(&path).unwrap();
+    let entry: serde_yml::Value = serde_yml::from_str(&format!(
+        "id: openai-plan
+backend: openai-responses
+auth-source: chatgpt-oauth
+endpoint: https://api.openai.com
+api-key-secret: {TOKEN_SECRET}
+model-aliases:
+  gpt: gpt-5
+cost-per-mtoken-in: 0.01
+cost-per-mtoken-out: 0.01
+rate-limit:
+  requests-per-minute: 60
+  tokens-per-minute: 100000
+"
+    ))
+    .unwrap();
+    upsert_provider_entry(&path, entry, UpsertMode::Create).unwrap();
+    select_provider(&path, "openai-plan").unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let h = home_with_ports_custom(CountingPreflight(Arc::clone(&calls)));
+    let handle = h.open(&path).unwrap();
+
+    // Not signed in yet: not configured.
+    assert_eq!(h.provider_status(&handle), ProviderStatus::Absent);
+    assert_eq!(
+        h.confirm_existing_provider(&handle, &CancelToken::new())
+            .unwrap_err(),
+        PreflightFail::MissingProvider
+    );
+
+    // A typed key is refused before any preflight and never lands under the token's name.
+    let refused = h
+        .store_and_preflight(
+            &handle,
+            "openai-plan",
+            SecretBytes::new("sk-test-typed-by-hand"),
+            &CancelToken::new(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        PreflightFail::ProviderRejected {
+            reason: advance_home::provider::REASON_AUTH_SOURCE_MISMATCH.into()
+        }
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(!file_store(&path).exists(TOKEN_SECRET).unwrap());
+
+    // Signed in (the daemon wrote the access token): configured, confirmed without a preflight.
+    file_store(&path)
+        .store(TOKEN_SECRET, "access-token-value")
+        .unwrap();
+    match h.provider_status(&handle) {
+        ProviderStatus::Present { provider_id } => assert_eq!(provider_id, "openai-plan"),
+        other => panic!("{other:?}"),
+    }
+    let pass = h
+        .confirm_existing_provider(&handle, &CancelToken::new())
+        .unwrap();
+    assert_eq!(pass.provider_id, "openai-plan");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+fn file_store(home: &Path) -> SecretStore {
     let mk = MasterKeyConfig::EnvVar("SECRETS_MASTER_KEY".into());
     let master = ensure_master_key(home, &mk, &DefaultEntryProvider).unwrap();
-    let store = SecretStore::new(
+    SecretStore::new(
         master,
         Arc::new(FileSecretStorage::open(home.join(".advance").join("secrets.json")).unwrap()),
-    );
+    )
+}
+
+fn committed_secret(home: &Path) -> String {
     use secrecy::ExposeSecret;
-    store
+    file_store(home)
         .resolve("anthropic-api-key")
         .unwrap()
         .expose_secret()

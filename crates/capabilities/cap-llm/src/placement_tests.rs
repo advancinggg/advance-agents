@@ -68,6 +68,7 @@ fn provider(
         profile_id: profile_id.map(str::to_string),
         device_id: None,
         agent_cli: None,
+        auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
     }
 }
 

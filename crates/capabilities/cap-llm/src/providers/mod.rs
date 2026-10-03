@@ -164,6 +164,7 @@ mod cred_tests {
             auth_scheme: auth,
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
             embedding_model: None,
+            auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
         }
     }
 

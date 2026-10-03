@@ -37,6 +37,7 @@ fn local_cfg() -> LlmProviderConfig {
         profile_id: None,
         device_id: None,
         agent_cli: None,
+        auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
     }
 }
 

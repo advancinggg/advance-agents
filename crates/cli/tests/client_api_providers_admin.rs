@@ -12,7 +12,8 @@
 //!
 //! Preflight is the ONE injected seam: a recording `PreflightPort` stands in for the network
 //! generate path (the production adapter uses `GeneratePathPreflight`), mounted onto the booted
-//! daemon's API with `install_provider_admin`.
+//! daemon's API with `install_provider_admin`. A `chatgpt-oauth` entry adds a second seam, a
+//! scripted `ChatGptSignInPort` standing in for the browser sign-in (PV-06).
 //!
 //! Fixture discipline: `master-key-source: env-var` with a test-unique env var name set ONCE
 //! (`needs_key = true` because `llm` is declared), mirroring `s4_live_streaming_composition.rs`.
@@ -30,7 +31,8 @@ use advance_client_api::envelope::{
 };
 use advance_client_api::provider_admin::{
     ClientProviderDeleteResult, ClientProviderKeyResult, ClientProviderList,
-    ClientProviderPreflightResult, ClientProviderSummary,
+    ClientProviderPreflightResult, ClientProviderSignIn, ClientProviderSignInStart,
+    ClientProviderSignOut, ClientProviderSummary,
 };
 use advance_client_api::{
     ClientApi, ClientEnvelope, ClientErrorCode, ClientRequest, ClientSession, Platform, Principal,
@@ -913,4 +915,346 @@ async fn pv05_agent_cli_entry_over_production_wiring() {
         ),
         "placeholder secret removed with the entry"
     );
+}
+
+// ── Sign in with ChatGPT: a `chatgpt-oauth` entry over the daemon-composed API ──────────────
+
+const SIGN_IN_HOST_ID: &str = "urn:uuid:0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+const SIGN_IN_SECRET: &str = "openai-plan-chatgpt-0a1b2c3d";
+
+/// A sign-in port the test drives: `start` makes the name pending, `complete` signs it in.
+/// Records every call with the secret name it was asked about. Never holds a token.
+#[derive(Default)]
+struct ScriptedSignIn {
+    calls: Mutex<Vec<(&'static str, String)>>,
+    pending: std::sync::atomic::AtomicBool,
+    signed_in: std::sync::atomic::AtomicBool,
+}
+
+impl ScriptedSignIn {
+    fn record(&self, call: &'static str, secret_name: &str) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((call, secret_name.to_string()));
+    }
+
+    fn calls_of(&self, call: &str) -> Vec<String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _)| *c == call)
+            .map(|(_, name)| name.clone())
+            .collect()
+    }
+
+    /// The browser came back: the attempt ends with a session.
+    fn complete(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.pending.store(false, SeqCst);
+        self.signed_in.store(true, SeqCst);
+    }
+
+    fn state(&self, reason: Option<&'static str>) -> advance_home::SignInStatus {
+        use advance_home::chatgpt_sign_in::{STATE_PENDING, STATE_SIGNED_IN, STATE_SIGNED_OUT};
+        use std::sync::atomic::Ordering::SeqCst;
+        let base = advance_home::SignInStatus {
+            state: STATE_SIGNED_OUT,
+            reason,
+            account: None,
+            plan_usage: None,
+            expires_at_ms: None,
+            models: Vec::new(),
+        };
+        if self.pending.load(SeqCst) {
+            advance_home::SignInStatus {
+                state: STATE_PENDING,
+                expires_at_ms: Some(4_102_444_800_000),
+                ..base
+            }
+        } else if self.signed_in.load(SeqCst) {
+            advance_home::SignInStatus {
+                state: STATE_SIGNED_IN,
+                account: Some("me@example.com".into()),
+                plan_usage: Some(true),
+                expires_at_ms: Some(4_102_444_800_000),
+                models: vec![advance_home::SignInModel {
+                    id: "gpt-5".into(),
+                    display_name: Some("GPT-5".into()),
+                }],
+                ..base
+            }
+        } else {
+            base
+        }
+    }
+}
+
+impl advance_home::ChatGptSignInPort for ScriptedSignIn {
+    fn host_id(&self) -> Result<String, advance_home::SignInRefusal> {
+        self.record("host_id", "");
+        Ok(SIGN_IN_HOST_ID.to_string())
+    }
+    fn start(
+        &self,
+        secret_name: &str,
+    ) -> Result<advance_home::SignInStarted, advance_home::SignInRefusal> {
+        self.record("start", secret_name);
+        self.pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(advance_home::SignInStarted {
+            authorize_url: "https://auth.example.test/api/accounts/authorize?state=scripted".into(),
+            expires_at_ms: 4_102_444_800_000,
+        })
+    }
+    fn status(&self, secret_name: &str) -> advance_home::SignInStatus {
+        self.record("status", secret_name);
+        self.state(None)
+    }
+    fn cancel(&self, secret_name: &str) -> advance_home::SignInStatus {
+        self.record("cancel", secret_name);
+        let was_pending = self
+            .pending
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        self.state(was_pending.then_some("cancelled"))
+    }
+    fn sign_out(&self, secret_name: &str) -> advance_home::SignOutOutcome {
+        self.record("sign_out", secret_name);
+        self.signed_in
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        advance_home::SignOutOutcome {
+            signed_out: true,
+            revocation_confirmed: true,
+        }
+    }
+    fn verify(&self, secret_name: &str) -> advance_home::VerifyOutcome {
+        self.record("verify", secret_name);
+        let ok = self.signed_in.load(std::sync::atomic::Ordering::SeqCst);
+        advance_home::VerifyOutcome {
+            ok,
+            reason: (!ok).then_some("not-signed-in"),
+            models: Vec::new(),
+        }
+    }
+    fn forget(&self, secret_name: &str) {
+        self.record("forget", secret_name);
+    }
+}
+
+fn error_details(env: &ClientEnvelope<Value>) -> Vec<String> {
+    env.error
+        .as_ref()
+        .map(|e| e.details.clone())
+        .unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pv06_chatgpt_oauth_entry_over_production_wiring() {
+    let (_g, ws, cfg) = fresh_workspace();
+    let (host, handles) = boot(&ws, &cfg).await;
+
+    // The daemon shares ONE sign-in object between the gateway and the provider admin: both
+    // hold the very object the composition root built (pointer identity, not just presence).
+    let sign_in = handles
+        .chatgpt_sign_in
+        .clone()
+        .expect("llm declared ⇒ one sign-in object");
+    let gateway = handles
+        .llm_gateway
+        .as_ref()
+        .expect("llm declared ⇒ gateway");
+    assert!(
+        gateway.has_credential_source(),
+        "the production gateway must hold the sign-in as its credential source"
+    );
+    assert!(
+        gateway.credential_source_is(
+            &(Arc::clone(&sign_in) as Arc<dyn cap_llm::ProviderCredentialSource>)
+        ),
+        "the gateway's credential source is the composed sign-in"
+    );
+    let admin = handles
+        .provider_admin
+        .as_ref()
+        .expect("provider admin composed");
+    assert!(
+        admin.has_chatgpt_sign_in(),
+        "the production provider admin must serve sign-in entries"
+    );
+    assert!(
+        admin.chatgpt_sign_in_is(
+            &(Arc::clone(&sign_in) as Arc<dyn advance_home::ChatGptSignInPort>)
+        ),
+        "the provider admin drives the same sign-in object"
+    );
+    let api = handles
+        .client_api_server
+        .as_ref()
+        .expect("EventBus up ⇒ Client API bound")
+        .api();
+    mint(&api, "tok", Scope::operator_default());
+    // Through the daemon-composed adapter: a sign-in route on the API-key entry is a source
+    // mismatch (an adapter without a sign-in would answer module_unavailable instead).
+    let env = get(&api, "/client/providers/openai/sign-in");
+    assert_eq!(
+        env.error_code(),
+        Some(ClientErrorCode::InvalidState),
+        "{env:?}"
+    );
+    assert_eq!(
+        error_details(&env),
+        vec!["auth_source_mismatch".to_string()]
+    );
+
+    // Mount an adapter whose only differences are the scripted sign-in and preflight seams.
+    let port = Arc::new(ScriptedSignIn::default());
+    let preflight = ScriptedPreflight::passing();
+    let adapter = Arc::new(
+        WiredProviderAdmin::new(
+            ws.clone(),
+            host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
+            handles.secret_store.clone(),
+            preflight.clone(),
+            Arc::new(NoReferences),
+        )
+        .with_chatgpt_sign_in(port.clone()),
+    );
+    install_provider_admin(&api, adapter);
+
+    // Create: no key, no backend, no secret name in the request.
+    let body = json!({
+        "provider_id": "openai-plan",
+        "endpoint": "https://api.openai.com",
+        "auth_source": "chatgpt-oauth",
+        "model_aliases": { "gpt": "gpt-5" },
+        "cost": { "input_per_mtoken": 0.01, "output_per_mtoken": 0.01 },
+        "rate_limit": { "requests_per_minute": 60, "tokens_per_minute": 100000 }
+    });
+    let env = post(&api, "/client/providers", body, "k-plan-create");
+    let created: ClientProviderSummary = data(&env);
+    assert_eq!(created.auth_source.as_deref(), Some("chatgpt-oauth"));
+    assert_eq!(created.backend.as_deref(), Some("openai-responses"));
+    assert_eq!(created.key.secret_name, SIGN_IN_SECRET);
+    assert!(!created.key.present);
+    assert_eq!(
+        created.sign_in.as_ref().map(|s| s.state.as_str()),
+        Some("signed-out")
+    );
+    assert_eq!(port.calls_of("host_id").len(), 1);
+    // The rewritten document re-parses under the strict runtime loader.
+    let on_disk = entries(&ws);
+    let entry = on_disk
+        .iter()
+        .find(|p| p.id == "openai-plan")
+        .expect("on disk");
+    assert!(entry.uses_chatgpt_sign_in());
+    assert_eq!(
+        entry.backend,
+        Some(advance_runtime::config::ProviderBackend::OpenAiResponses)
+    );
+    assert_eq!(entry.api_key_secret, SIGN_IN_SECRET);
+    let store = handles.secret_store.clone().expect("live store");
+    assert!(
+        !store.exists(SIGN_IN_SECRET).unwrap(),
+        "a sign-in entry is created keyless"
+    );
+
+    // Start → poll (pending) → cancel.
+    let env = post(
+        &api,
+        "/client/providers/openai-plan:sign-in",
+        Value::Null,
+        "k-plan-start-1",
+    );
+    let started: ClientProviderSignInStart = data(&env);
+    assert!(started
+        .authorize_url
+        .starts_with("https://auth.example.test/"));
+    assert_eq!(started.expires_at_ms, 4_102_444_800_000);
+    let polled: ClientProviderSignIn = data(&get(&api, "/client/providers/openai-plan/sign-in"));
+    assert_eq!(polled.state, "pending");
+    assert!(polled.checked_at_ms > 0);
+    let cancelled: ClientProviderSignIn = data(&post(
+        &api,
+        "/client/providers/openai-plan:sign-in-cancel",
+        Value::Null,
+        "k-plan-cancel",
+    ));
+    assert_eq!(cancelled.state, "signed-out");
+    assert_eq!(cancelled.reason.as_deref(), Some("cancelled"));
+
+    // A second attempt completes: the summary carries the signed-in state.
+    let _: ClientProviderSignInStart = data(&post(
+        &api,
+        "/client/providers/openai-plan:sign-in",
+        Value::Null,
+        "k-plan-start-2",
+    ));
+    port.complete();
+    let one: ClientProviderSummary = data(&get(&api, "/client/providers/openai-plan"));
+    let sign_in = one.sign_in.as_ref().expect("sign-in state on the summary");
+    assert_eq!(sign_in.state, "signed-in");
+    assert_eq!(sign_in.account.as_deref(), Some("me@example.com"));
+    assert_eq!(sign_in.models.len(), 1);
+
+    // `:preflight` is the sign-in's verify (never the chat preflight); `usage` has no API.
+    let verdict: ClientProviderPreflightResult = data(&post(
+        &api,
+        "/client/providers/openai-plan:preflight",
+        Value::Null,
+        "k-plan-pf",
+    ));
+    assert!(verdict.ok, "{verdict:?}");
+    assert_eq!(port.calls_of("verify"), vec![SIGN_IN_SECRET.to_string()]);
+    assert!(preflight.calls.lock().unwrap().is_empty());
+    let usage: advance_client_api::provider_admin::ClientProviderUsage =
+        data(&get(&api, "/client/providers/openai-plan/usage"));
+    assert!(!usage.ok);
+    assert_eq!(usage.reason.as_deref(), Some("not-provided"));
+
+    // Key routes on the sign-in entry are a source mismatch, and write nothing.
+    let env = post(
+        &api,
+        "/client/providers/openai-plan:set-key",
+        json!({ "key": SECRET_KEY }),
+        "k-plan-set-key",
+    );
+    assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidState));
+    assert_eq!(
+        error_details(&env),
+        vec!["auth_source_mismatch".to_string()]
+    );
+    assert!(!store.exists(SIGN_IN_SECRET).unwrap());
+
+    // Sign out → signed out.
+    let out: ClientProviderSignOut = data(&post(
+        &api,
+        "/client/providers/openai-plan:sign-out",
+        Value::Null,
+        "k-plan-sign-out",
+    ));
+    assert!(out.signed_out && out.revocation_confirmed);
+    let after: ClientProviderSignIn = data(&get(&api, "/client/providers/openai-plan/sign-in"));
+    assert_eq!(after.state, "signed-out");
+    for call in ["start", "status", "cancel", "sign_out"] {
+        let names = port.calls_of(call);
+        assert!(!names.is_empty(), "{call}");
+        assert!(
+            names.iter().all(|n| n == SIGN_IN_SECRET),
+            "{call}: {names:?}"
+        );
+    }
+
+    // Delete: the entry leaves the document and the sign-in forgets its session.
+    let env = post(
+        &api,
+        "/client/providers/openai-plan:delete",
+        Value::Null,
+        "k-plan-delete",
+    );
+    let gone: ClientProviderDeleteResult = data(&env);
+    assert_eq!(gone.provider_id, "openai-plan");
+    assert_eq!(ids(&ws), vec!["openai"]);
+    assert_eq!(port.calls_of("forget"), vec![SIGN_IN_SECRET.to_string()]);
 }

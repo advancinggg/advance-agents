@@ -226,6 +226,45 @@ struct DispatchError {
     tokens_released: bool,
 }
 
+/// A failed upstream attempt of a buffered cloud call, with the usage the upstream reported
+/// before the failure: an answer that ended incomplete still consumed (and reported) tokens,
+/// which the site owes like any other attempt's usage.
+#[derive(Debug)]
+struct AttemptFailure {
+    err: LlmError,
+    spent: Option<SpentUsage>,
+}
+
+impl From<LlmError> for AttemptFailure {
+    fn from(err: LlmError) -> Self {
+        Self { err, spent: None }
+    }
+}
+
+/// The usage a failed attempt reported (each counter absent from the report is 0).
+#[derive(Debug, Clone, Copy)]
+struct SpentUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache: CacheUsage,
+}
+
+impl SpentUsage {
+    /// The tokens and cost the site commits for it: each counter clamped to the per-attempt
+    /// ceiling, as for a successful attempt.
+    fn committed(&self, resolved: &ResolvedProvider) -> (u64, f64) {
+        let input = self.input_tokens.min(MAX_TOKENS_PER_ATTEMPT);
+        let output = self.output_tokens.min(MAX_TOKENS_PER_ATTEMPT);
+        let cost = compute_cost(
+            resolved,
+            input,
+            output,
+            self.cache.clamp_each(MAX_TOKENS_PER_ATTEMPT),
+        );
+        (input.saturating_add(output), cost)
+    }
+}
+
 /// cap-llm-gaps (2026-06-04) — finalized buffered-stream payload produced by
 /// `LlmGateway::stream_begin` and consumed at the done poll by `stream_finish`.
 ///
@@ -303,6 +342,84 @@ pub struct LlmGateway {
     /// Lane agent-llm-policy: the per-agent policy source consulted before placement on every
     /// generate / stream request. `None` = not wired (byte-identical to the pre-lane gateway).
     agent_policy: Option<Arc<dyn crate::policy::AgentLlmPolicySource>>,
+    /// Keeps the credential of entries whose `auth-source` is not `api-key` usable: consulted
+    /// before every cloud dispatch of such an entry and told when the upstream rejects the
+    /// credential. `None` = not wired; such an entry then fails closed with a fixed reason,
+    /// and every API-key entry is unaffected.
+    credential_source: Option<Arc<dyn crate::credential::ProviderCredentialSource>>,
+}
+
+/// What it takes to tell the credential source that the upstream rejected an entry's
+/// credential, detached from the gateway so the live-stream owner task can carry it.
+#[derive(Clone)]
+struct CredentialWatch {
+    source: Arc<dyn crate::credential::ProviderCredentialSource>,
+    provider_id: String,
+    secret_name: String,
+}
+
+impl CredentialWatch {
+    /// Tell the source its credential was rejected. One call per rejected request; the
+    /// request itself is never retried.
+    async fn rejected(&self) {
+        self.source
+            .credential_rejected(&self.provider_id, &self.secret_name)
+            .await;
+    }
+}
+
+/// On an entry whose credential is a ChatGPT sign-in (`plan_entry`), an authentication (401)
+/// or permission (403) refusal that selected no plan-usage reason through its error code is
+/// still a plan-usage outcome. `err` is the ordinary classification of the answer; every
+/// other entry and every other status keeps it unchanged.
+pub(crate) fn plan_usage_status_error(plan_entry: bool, status: u16, err: LlmError) -> LlmError {
+    if !plan_entry {
+        return err;
+    }
+    if matches!(&err, LlmError::ProviderError(msg) if crate::plan_usage::is_plan_usage_error(msg)) {
+        return err;
+    }
+    match crate::plan_usage::reason_for_refused_status(status) {
+        Some(reason) => crate::plan_usage::plan_error(reason),
+        None => err,
+    }
+}
+
+/// Consecutive no-progress frames tolerated while a streamed answer is consumed (mirrors
+/// the chain's bound). Shared by the live owner task and the streamed arm of a buffered call.
+const MAX_IGNORE_STREAK: u32 = 1024;
+
+/// How much of a refused streamed answer's body is read to look for an error code.
+const REFUSED_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// How long that read may take. The refusal is already decided by its status; the body only
+/// refines the reason, so a slow or endless body must not hold the caller.
+const REFUSED_BODY_READ_BOUND: Duration = Duration::from_secs(5);
+
+/// Read the leading part of the body of a refused (non-200) streamed answer, so its error
+/// code can select a fixed reason. Best effort: at most [`REFUSED_BODY_MAX_BYTES`], for at
+/// most [`REFUSED_BODY_READ_BOUND`] and never past `not_after`; a transport error, the end of
+/// the body or either bound ends the read with whatever arrived. The bytes are only ever
+/// looked up in a closed table — nothing of them reaches an error, an event or a log.
+async fn read_refused_body(
+    body: &mut dyn advance_shared_types::security_validator::HttpBodyStream,
+    not_after: Option<tokio::time::Instant>,
+) -> Vec<u8> {
+    let mut until = tokio::time::Instant::now() + REFUSED_BODY_READ_BOUND;
+    if let Some(not_after) = not_after {
+        until = until.min(not_after);
+    }
+    let mut read = Vec::new();
+    while read.len() < REFUSED_BODY_MAX_BYTES {
+        match tokio::time::timeout_at(until, body.next_chunk()).await {
+            Ok(Some(Ok(chunk))) => {
+                let room = REFUSED_BODY_MAX_BYTES - read.len();
+                read.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            _ => break,
+        }
+    }
+    read
 }
 
 impl LlmGateway {
@@ -334,6 +451,7 @@ impl LlmGateway {
             placement_telemetry: crate::placement::default_telemetry(),
             generate_timeout: None,
             agent_policy: None,
+            credential_source: None,
         }
     }
 
@@ -367,6 +485,93 @@ impl LlmGateway {
     /// Composition witness: is a per-agent policy source installed?
     pub fn has_agent_policy(&self) -> bool {
         self.agent_policy.is_some()
+    }
+
+    /// Install the credential source for entries whose `auth-source` is not `api-key` (see
+    /// [`crate::credential`]). Consulted before every cloud dispatch of such an entry.
+    /// Non-trait inherent builder; every plain `new` caller stays byte-identical.
+    pub fn with_credential_source(
+        mut self,
+        source: Arc<dyn crate::credential::ProviderCredentialSource>,
+    ) -> Self {
+        self.credential_source = Some(source);
+        self
+    }
+
+    /// Composition witness: is a credential source installed?
+    pub fn has_credential_source(&self) -> bool {
+        self.credential_source.is_some()
+    }
+
+    /// Composition witness: is the installed credential source the SAME object as `other`
+    /// (pointer identity, so a composition root can pin that one object serves every holder)?
+    pub fn credential_source_is(
+        &self,
+        other: &Arc<dyn crate::credential::ProviderCredentialSource>,
+    ) -> bool {
+        self.credential_source
+            .as_ref()
+            .is_some_and(|source| Arc::ptr_eq(source, other))
+    }
+
+    /// Make sure the credential of a ChatGPT sign-in entry is usable for the request about
+    /// to be dispatched; a no-op for every other entry. Must run before `llm.request` is
+    /// emitted and before any budget is reserved, so a failure leaves nothing to settle.
+    /// `deadline`, when given, bounds the wait.
+    async fn ensure_credential_fresh(
+        &self,
+        resolved: &ResolvedProvider,
+        deadline: Option<Instant>,
+    ) -> Result<(), LlmError> {
+        if !resolved.uses_chatgpt_sign_in() {
+            return Ok(());
+        }
+        let Some(source) = self.credential_source.as_ref() else {
+            return Err(crate::plan_usage::plan_error(
+                crate::plan_usage::SOURCE_NOT_WIRED,
+            ));
+        };
+        let fresh = source.ensure_fresh(&resolved.id, &resolved.api_key_secret);
+        let checked = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(remaining, fresh).await {
+                    Ok(checked) => checked,
+                    Err(_) => return Err(LlmError::ProviderError("deadline-exceeded".into())),
+                }
+            }
+            None => fresh.await,
+        };
+        checked.map_err(|failure| {
+            crate::plan_usage::plan_error(crate::plan_usage::reason_for_credential_failure(failure))
+        })
+    }
+
+    /// The handle for reporting a rejected credential of `resolved`, when it is a ChatGPT
+    /// sign-in entry and a source is installed.
+    fn credential_watch(&self, resolved: &ResolvedProvider) -> Option<CredentialWatch> {
+        if !resolved.uses_chatgpt_sign_in() {
+            return None;
+        }
+        self.credential_source
+            .as_ref()
+            .map(|source| CredentialWatch {
+                source: Arc::clone(source),
+                provider_id: resolved.id.clone(),
+                secret_name: resolved.api_key_secret.clone(),
+            })
+    }
+
+    /// Report a "sign-in rejected" outcome of a request on `resolved` to the credential
+    /// source, so its next freshness check renews regardless of the recorded expiry. Any
+    /// other error, and any other entry, reports nothing.
+    async fn note_credential_rejected(&self, resolved: &ResolvedProvider, err: &LlmError) {
+        if !crate::plan_usage::is_sign_in_rejected(err) {
+            return;
+        }
+        if let Some(watch) = self.credential_watch(resolved) {
+            watch.rejected().await;
+        }
     }
 
     /// Apply the caller agent's `llm:` policy to `ctx` and return the provider list placement
@@ -1161,7 +1366,11 @@ impl LlmGateway {
 
         // Stream path: absent max-tokens resolves to DEFAULT_STREAM_OUTPUT_TOKENS and
         // the RESOLVED value is serialized upstream — the reserved output ceiling is
-        // upstream-enforced, not merely local (plan §2.2).
+        // upstream-enforced, not merely local. A ChatGPT sign-in entry is the
+        // exception: its upstream refuses an output ceiling, so the consume loop ends its
+        // answer locally once the decoded output reaches the reservation (finish reason
+        // `length`), and the settlement bills the output the upstream reports even where it
+        // exceeds the reservation.
         let mut params = ctx.params.clone();
         let out_est_u32 = params.max_tokens.unwrap_or(DEFAULT_STREAM_OUTPUT_TOKENS);
         params.max_tokens = Some(out_est_u32);
@@ -1195,6 +1404,11 @@ impl LlmGateway {
             (input_est, LiveUpstream::Local { port, req: inf_req })
         } else {
             let http_cap = build_http_cap(&resolved, &provider_cfg)?;
+            // Credential freshness belongs to this pre-reservation section: nothing may be
+            // awaited between the budget check below and the owner spawn, and a failure
+            // here leaves no reservation and no `llm.request`.
+            self.ensure_credential_fresh(&resolved, Some(live_deadline))
+                .await?;
             let adapter = select_adapter(resolved.backend);
             let req = adapter.build_stream_request(&resolved, &ctx.messages, &params)?;
             let input_est = req.body.len() as u64;
@@ -1237,6 +1451,10 @@ impl LlmGateway {
             agent_id.clone(),
         );
         settlement.set_provider_id(&resolved.id);
+        if resolved.uses_chatgpt_sign_in() {
+            // No output ceiling reaches this upstream: what it reports is what it generated.
+            settlement.bill_reported_output_beyond_estimate();
+        }
 
         // CONTRACT-234 tee (ADR 2026-07-22 D6, tee slice T1). `stream_key` is an
         // OPAQUE per-stream id, deliberately NOT the guest's `u64` handle: the handle
@@ -1260,6 +1478,10 @@ impl LlmGateway {
         let agent_owner = agent_id.clone();
         let model_owner = resolved.model.clone();
         let schema_owner = ctx.output_schema.clone();
+        // Carried into the owner so it can type a refused head of a ChatGPT sign-in entry
+        // and report a rejected sign-in after the gateway borrow has ended.
+        let plan_entry = resolved.uses_chatgpt_sign_in();
+        let credential_watch = self.credential_watch(&resolved);
 
         let owner_task = tokio::spawn(async move {
             // ONE deadline anchor for the entire stream: dispatch, every pull,
@@ -1354,7 +1576,7 @@ impl LlmGateway {
                         chain.execute_streaming(&agent_owner, req, &http_cap),
                     )
                     .await;
-                    let (head, body) = match dispatched {
+                    let (head, mut body) = match dispatched {
                         Err(_) => {
                             fail_begin!(crate::LlmError::ProviderError("stream deadline".into()))
                         }
@@ -1366,20 +1588,56 @@ impl LlmGateway {
                         Ok(Ok(hb)) => hb,
                     };
                     if head.status != 200 {
-                        let err = match head.status {
-                            401 | 403 => {
-                                crate::LlmError::ProviderError("stream auth rejected".into())
-                            }
-                            404 => crate::LlmError::ModelNotAvailable(
-                                "stream model not available".into(),
-                            ),
-                            429 => crate::LlmError::RateLimited("stream rate limited".into()),
-                            500..=599 => {
-                                crate::LlmError::ProviderError("stream provider error".into())
-                            }
-                            _ => crate::LlmError::ProviderError("stream unexpected status".into()),
+                        // A refused head of a ChatGPT sign-in entry may name a plan-usage
+                        // code (a usage limit arrives as a 429), so a bounded part of its
+                        // body is read before it is dropped. Every other entry drops the
+                        // body unread and is classified by status alone.
+                        let coded = if plan_entry {
+                            let refused = read_refused_body(body.as_mut(), Some(dl)).await;
+                            crate::plan_usage::reason_for_error_body(&refused)
+                        } else {
+                            None
                         };
                         drop(body);
+                        let err = match coded {
+                            Some(reason) => crate::plan_usage::plan_error(reason),
+                            None => {
+                                let err = match head.status {
+                                    401 | 403 => crate::LlmError::ProviderError(
+                                        "stream auth rejected".into(),
+                                    ),
+                                    404 => crate::LlmError::ModelNotAvailable(
+                                        "stream model not available".into(),
+                                    ),
+                                    429 => {
+                                        crate::LlmError::RateLimited("stream rate limited".into())
+                                    }
+                                    500..=599 => crate::LlmError::ProviderError(
+                                        "stream provider error".into(),
+                                    ),
+                                    _ => crate::LlmError::ProviderError(
+                                        "stream unexpected status".into(),
+                                    ),
+                                };
+                                plan_usage_status_error(plan_entry, head.status, err)
+                            }
+                        };
+                        if let Some(watch) = credential_watch
+                            .as_ref()
+                            .filter(|_| crate::plan_usage::is_sign_in_rejected(&err))
+                        {
+                            // Settle first (a refused head bills zero), then tell the
+                            // credential source, then answer the caller: the caller's next
+                            // request already sees the rejection.
+                            settlement_owner.finalize(
+                                crate::stream::SettleOutcome::FailedBegin,
+                                crate::stream::LivePhase::Failed(err.clone()),
+                            );
+                            registry_owner.remove_live(handle);
+                            let _ = tokio::time::timeout_at(dl, watch.rejected()).await;
+                            let _ = result_tx.send(Err(err));
+                            return;
+                        }
                         fail_begin!(err);
                     }
                     DispatchedLive::Http { body, backend }
@@ -1437,8 +1695,6 @@ impl LlmGateway {
             let mut finish_reason: Option<String> = None;
             let mut ignore_streak: u32 = 0;
             let mut failed: Option<crate::LlmError> = None;
-            /// Consecutive no-progress frames tolerated (mirrors the chain's bound).
-            const MAX_IGNORE_STREAK: u32 = 1024;
             /// Mid-stream byte-fallback slack: the guard cuts when decoded bytes
             /// exceed 16× the output token ceiling. The serialized max_tokens
             /// already enforces the exact ceiling at a CONFORMING provider; this
@@ -1446,6 +1702,10 @@ impl LlmGateway {
             /// for byte-heavy encodings (CJK ≈ up to ~9 bytes/token). A stream
             /// overshooting 16× its reservation is cut fail-closed.
             const GUARD_BYTES_PER_TOKEN: u64 = 16;
+            /// The local output ceiling of an upstream that is sent none (a ChatGPT
+            /// sign-in entry): about four bytes of text per token, so the answer ends near
+            /// the reserved token count, well before the fail-closed byte guard above.
+            const LOCAL_CEILING_BYTES_PER_TOKEN: u64 = 4;
 
             match dispatched_live {
                 DispatchedLive::Local { mut stream } => {
@@ -1612,6 +1872,16 @@ impl LlmGateway {
                             if ev.terminal {
                                 saw_terminal = true;
                                 progressed = true;
+                                if plan_entry
+                                    && crate::providers::responses::is_incomplete_terminal(&ev)
+                                {
+                                    // Only a completed response is an answer on this route
+                                    // (its usage, folded above, is still billed).
+                                    failed = Some(crate::LlmError::ProviderError(
+                                        crate::providers::responses::RESPONSE_INCOMPLETE.into(),
+                                    ));
+                                    break 'consume;
+                                }
                             }
                             if let Some(fr) = &ev.finish_reason {
                                 finish_reason = Some(fr.clone());
@@ -1671,6 +1941,18 @@ impl LlmGateway {
                                         if !released.is_empty() {
                                             append_released(&state_arc, &notify_arc, &released);
                                         }
+                                    }
+
+                                    // An upstream that is sent no output ceiling is held to
+                                    // the reservation here: the answer ends as a capped one
+                                    // (as an answer the upstream stops at `max_tokens`) and
+                                    // the rest of the body is dropped unread.
+                                    if plan_entry
+                                        && settlement_owner.decoded_output_bytes()
+                                            >= out_est.saturating_mul(LOCAL_CEILING_BYTES_PER_TOKEN)
+                                    {
+                                        finish_reason = Some("length".to_string());
+                                        break 'consume;
                                     }
                                 }
                             }
@@ -1750,6 +2032,12 @@ impl LlmGateway {
                 }
             }
 
+            // An in-band "sign-in rejected" is reported to the credential source once the
+            // stream is settled (below), never before.
+            let sign_in_rejected = failed
+                .as_ref()
+                .is_some_and(crate::plan_usage::is_sign_in_rejected);
+
             if let Some(err) = failed.take() {
                 let released = state_arc.lock().map(|st| st.visible.len()).unwrap_or(0);
                 failed = Some(wrap_stream_partial(err, released));
@@ -1794,6 +2082,11 @@ impl LlmGateway {
                 }
             };
             settlement_owner.finalize(crate::stream::SettleOutcome::Terminal, terminal_phase);
+            if sign_in_rejected {
+                if let Some(watch) = &credential_watch {
+                    let _ = tokio::time::timeout_at(dl, watch.rejected()).await;
+                }
+            }
         });
 
         // Hand the owner its JoinHandle (synchronous send — still no await since check()).
@@ -1944,15 +2237,21 @@ impl LlmGateway {
             self.dispatch_port(ctx, resolved, deadline, tee, tee_armed)
                 .await
         } else {
-            self.dispatch_cloud_http(
-                ctx,
-                resolved.clone(),
-                provider_cfg.clone(),
-                tee,
-                tee_armed,
-                deadline,
-            )
-            .await
+            let result = self
+                .dispatch_cloud_http(
+                    ctx,
+                    resolved.clone(),
+                    provider_cfg.clone(),
+                    tee,
+                    tee_armed,
+                    deadline,
+                )
+                .await;
+            // One report per rejected request, whichever attempt step produced it.
+            if let Err(de) = &result {
+                self.note_credential_rejected(resolved, &de.err).await;
+            }
+            result
         };
         ctx.messages = messages_snapshot;
         result
@@ -2106,6 +2405,247 @@ impl LlmGateway {
         }
     }
 
+    /// One upstream attempt of a buffered cloud call: build the request, send it, parse the
+    /// answer. Both buffered sites (`dispatch_cloud_http`, `stream_begin`) feed the single
+    /// result into their retry classifier; no build error is retryable, so a site may treat
+    /// every error of an attempt alike. A failure may carry usage the upstream reported
+    /// before it ([`AttemptFailure::spent`]), which the site commits to the run budget.
+    ///
+    /// `deadline`, where the site has one, bounds the send, and its expiry is the site's
+    /// `deadline-exceeded`.
+    ///
+    /// The plan route of a ChatGPT sign-in entry only accepts streamed requests, so such an
+    /// entry is served by [`Self::streamed_attempt`] instead of the three unstreamed steps.
+    /// That attempt is never unbounded: a site without a deadline gets the buffered
+    /// executor's default total timeout.
+    async fn cloud_attempt(
+        &self,
+        adapter: &dyn crate::providers::ProviderAdapter,
+        resolved: &ResolvedProvider,
+        ctx: &LlmRequestContext,
+        http_cap: &HttpCapability,
+        deadline: Option<Instant>,
+    ) -> Result<ExecutionOutcome, AttemptFailure> {
+        let deadline_exceeded =
+            || AttemptFailure::from(LlmError::ProviderError("deadline-exceeded".into()));
+
+        if resolved.uses_chatgpt_sign_in() {
+            let deadline = deadline.unwrap_or_else(|| Instant::now() + cap_http::DEFAULT_TIMEOUT);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(deadline_exceeded());
+            }
+            // Dropping the attempt at the deadline drops its body stream, which ends the
+            // upstream read.
+            return match tokio::time::timeout(
+                remaining,
+                self.streamed_attempt(adapter, resolved, ctx, http_cap),
+            )
+            .await
+            {
+                Ok(attempt) => attempt,
+                Err(_) => Err(deadline_exceeded()),
+            };
+        }
+
+        let req = adapter.build_chat_request(resolved, &ctx.messages, &ctx.params)?;
+        let sent = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(deadline_exceeded());
+                }
+                match tokio::time::timeout(
+                    remaining,
+                    self.chain.execute(&ctx.agent_id, req, http_cap),
+                )
+                .await
+                {
+                    Ok(sent) => sent,
+                    Err(_) => return Err(deadline_exceeded()),
+                }
+            }
+            None => self.chain.execute(&ctx.agent_id, req, http_cap).await,
+        };
+        let response = sent.map_err(map_http_err_to_llm)?;
+        adapter
+            .parse_chat_response(response.status, &response.body)
+            .map_err(AttemptFailure::from)
+    }
+
+    /// A buffered call served by a streamed upstream request: the answer is consumed to its
+    /// terminal event and handed back whole, shaped like the unstreamed parser's result.
+    ///
+    /// - Needs the streaming chain and the decoded-layer detector; without them it fails
+    ///   closed with the same fixed reason as the live path.
+    /// - A refused head is classified from a bounded read of its body, like an unstreamed
+    ///   non-200 answer, so the transport retry whitelist keeps working.
+    /// - Every text fragment passes the decoded-layer scan of the live path before it is
+    ///   kept: the streaming chain scans wire chunks only, and the whole-body inbound scan
+    ///   of the buffered chain does not run here.
+    /// - Both usage counters and some text are required, as in the unstreamed parser.
+    /// - A stream that ends before the dialect's terminal event is a failure, and so is a
+    ///   terminal event that reports the response incomplete: only a completed response
+    ///   is an answer. The usage an incomplete response reported comes back with the
+    ///   failure, for the site to commit.
+    /// - No-progress frames are bounded as on the live path, and the wire bytes by the
+    ///   buffered executor's response cap. The caller bounds the attempt in time.
+    async fn streamed_attempt(
+        &self,
+        adapter: &dyn crate::providers::ProviderAdapter,
+        resolved: &ResolvedProvider,
+        ctx: &LlmRequestContext,
+        http_cap: &HttpCapability,
+    ) -> Result<ExecutionOutcome, AttemptFailure> {
+        let (Some(chain), Some(detector)) = (
+            self.streaming_chain.as_ref(),
+            self.decoded_detector.as_ref(),
+        ) else {
+            return Err(
+                LlmError::ProviderError("streaming transport not wired".to_string()).into(),
+            );
+        };
+
+        let req = adapter.build_stream_request(resolved, &ctx.messages, &ctx.params)?;
+        let (head, mut body) = chain
+            .execute_streaming(&ctx.agent_id, req, http_cap)
+            .await
+            .map_err(map_http_err_to_llm)?;
+
+        if head.status != 200 {
+            let refused = read_refused_body(body.as_mut(), None).await;
+            drop(body);
+            // The unstreamed parser's non-200 mapping: an error code selects its fixed
+            // reason first, then the status decides (5xx stays a retried upstream failure).
+            let err = match adapter.parse_chat_response(head.status, &refused) {
+                Err(err) => err,
+                Ok(_) => LlmError::ProviderError("stream unexpected status".into()),
+            };
+            return Err(
+                plan_usage_status_error(resolved.uses_chatgpt_sign_in(), head.status, err).into(),
+            );
+        }
+
+        let mut splitter = crate::providers::sse::FrameSplitter::new();
+        let mut fold = SseUsageFold::default();
+        let mut pipeline = crate::stream::DecodedPipeline::new();
+        let mut text = String::new();
+        let mut saw_text = false;
+        let mut finish_reason: Option<String> = None;
+        let mut wire_bytes: usize = 0;
+        let mut ignore_streak: u32 = 0;
+        let ignore_flood =
+            || AttemptFailure::from(LlmError::ProviderError("stream ignore flood".into()));
+
+        'consume: loop {
+            let chunk = match body.next_chunk().await {
+                // The end of the stream before the terminal event (also a truncated final
+                // frame) is not a completed answer.
+                None => {
+                    return Err(LlmError::ProviderError("stream eof before terminal".into()).into())
+                }
+                // A broken body read is the transport failure it would be unstreamed.
+                Some(Err(http_err)) => return Err(map_http_err_to_llm(http_err).into()),
+                Some(Ok(chunk)) => chunk,
+            };
+            wire_bytes = wire_bytes.saturating_add(chunk.len());
+            if wire_bytes > cap_http::DEFAULT_MAX_RESPONSE_BYTES {
+                return Err(
+                    LlmError::ProviderError("stream response exceeds size limit".into()).into(),
+                );
+            }
+            let frames = splitter
+                .push(&chunk)
+                .map_err(|_| LlmError::ProviderError("stream frame error".into()))?;
+            if frames.is_empty() {
+                ignore_streak += 1;
+                if ignore_streak > MAX_IGNORE_STREAK {
+                    return Err(ignore_flood());
+                }
+                continue 'consume;
+            }
+            for frame in frames {
+                // In-band error frames (typed by their code where it is a plan-usage one),
+                // malformed terminals and unknown terminal families fail closed.
+                let ev = adapter.parse_sse_frame(&frame)?;
+                let mut progressed = ev.usage.is_some() || ev.terminal;
+                fold.apply(&ev);
+                if let Some(reason) = &ev.finish_reason {
+                    finish_reason = Some(reason.clone());
+                    progressed = true;
+                }
+                if let Some(delta) = ev.delta.as_deref().filter(|delta| !delta.is_empty()) {
+                    progressed = true;
+                    saw_text = true;
+                    let (released, verdict) = pipeline.push(detector.as_ref(), delta.as_bytes());
+                    if let crate::stream::DecodedVerdict::Fail(reason) = verdict {
+                        return Err(LlmError::ProviderError(reason.to_string()).into());
+                    }
+                    text.push_str(&released);
+                }
+                if ev.terminal {
+                    // Only a completed response is an answer: an incomplete one (a server-side
+                    // limit, a content filter) is a failure on a ChatGPT sign-in entry, and the
+                    // usage it reported is still owed.
+                    if resolved.uses_chatgpt_sign_in()
+                        && crate::providers::responses::is_incomplete_terminal(&ev)
+                    {
+                        let spent = (fold.input_tokens.is_some() || fold.output_tokens.is_some())
+                            .then(|| {
+                                let input_tokens = fold.input_tokens.unwrap_or(0);
+                                SpentUsage {
+                                    input_tokens,
+                                    output_tokens: fold.output_tokens.unwrap_or(0),
+                                    cache: fold.cache().clamped_to(input_tokens),
+                                }
+                            });
+                        return Err(AttemptFailure {
+                            err: LlmError::ProviderError(
+                                crate::providers::responses::RESPONSE_INCOMPLETE.into(),
+                            ),
+                            spent,
+                        });
+                    }
+                    // Frames after the terminal one are not processed: the upstream must
+                    // not be able to void or re-decide a completed answer.
+                    break 'consume;
+                }
+                if progressed {
+                    ignore_streak = 0;
+                } else {
+                    ignore_streak += 1;
+                    if ignore_streak > MAX_IGNORE_STREAK {
+                        return Err(ignore_flood());
+                    }
+                }
+            }
+        }
+        drop(body);
+
+        // Terminal scan: what the hold still retains is released or fails closed.
+        let (released, verdict) = pipeline.finish(detector.as_ref());
+        if let crate::stream::DecodedVerdict::Fail(reason) = verdict {
+            return Err(LlmError::ProviderError(reason.to_string()).into());
+        }
+        text.push_str(&released);
+
+        // Usage must not coerce to 0, and an answer without any text part is a shape error.
+        let invalid_shape = || LlmError::ProviderError("invalid response shape".into());
+        if !saw_text {
+            return Err(invalid_shape().into());
+        }
+        let input_tokens = fold.input_tokens.ok_or_else(invalid_shape)?;
+        let output_tokens = fold.output_tokens.ok_or_else(invalid_shape)?;
+        Ok(ExecutionOutcome {
+            text,
+            model: resolved.model.clone(),
+            input_tokens,
+            output_tokens,
+            cache: fold.cache().clamped_to(input_tokens),
+            finish_reason: finish_reason.unwrap_or_else(|| "stop".to_string()),
+        })
+    }
+
     #[allow(unused_assignments)]
     async fn dispatch_cloud_http(
         &self,
@@ -2128,6 +2668,15 @@ impl LlmGateway {
             request_emitted: false,
             tokens_released: false,
         })?;
+        // Credential freshness comes before the tee is armed and before `llm.request`: a
+        // signed-out or unrenewable entry must leave no orphan request event.
+        self.ensure_credential_fresh(&resolved, Some(deadline))
+            .await
+            .map_err(|err| DispatchError {
+                err,
+                request_emitted: false,
+                tokens_released: false,
+            })?;
         self.arm_generate_tee(ctx, tee, tee_armed);
 
         // Emit llm.request.
@@ -2234,89 +2783,30 @@ impl LlmGateway {
             }
             total_attempts += 1;
 
-            // Build request via adapter.
+            // One upstream attempt: build the request, call the chain, parse the answer.
             // Round-AUDIT-2 W2 (orphan llm.request) fix: emit_llm_request has
             // already fired before the loop; a build-time failure here would
-            // leave an orphan llm.request without a paired llm.error. Emit
-            // explicitly before propagating.
-            let req = match adapter.build_chat_request(&resolved, &ctx.messages, &ctx.params) {
-                Ok(r) => r,
-                Err(e) => {
-                    return Err(self.cloud_dispatch_err(
-                        ctx,
-                        tee,
-                        e,
-                        cumulative_tokens,
-                        cumulative_cost,
-                        true,
-                        hop_had_completion,
-                    ));
-                }
-            };
-
-            // Call chain. Remaining hop budget bounds execute so AC-06 cannot
-            // run a full DEFAULT_TIMEOUT past generate's absolute deadline.
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(self.cloud_dispatch_err(
-                    ctx,
-                    tee,
-                    LlmError::ProviderError("deadline-exceeded".into()),
-                    cumulative_tokens,
-                    cumulative_cost,
-                    true,
-                    hop_had_completion,
-                ));
-            }
-            let response = match tokio::time::timeout(
-                remaining,
-                self.chain.execute(&ctx.agent_id, req, &http_cap),
-            )
-            .await
+            // leave an orphan llm.request without a paired llm.error, so every
+            // error of the attempt — build, transport or parse — leaves through
+            // `cloud_dispatch_err`. The remaining hop budget bounds the attempt so
+            // AC-06 cannot run a full DEFAULT_TIMEOUT past generate's absolute
+            // deadline; its expiry is `deadline-exceeded`, which is not retried.
+            let outcome = match self
+                .cloud_attempt(adapter.as_ref(), &resolved, ctx, &http_cap, Some(deadline))
+                .await
             {
-                Err(_) => {
-                    return Err(self.cloud_dispatch_err(
-                        ctx,
-                        tee,
-                        LlmError::ProviderError("deadline-exceeded".into()),
-                        cumulative_tokens,
-                        cumulative_cost,
-                        true,
-                        hop_had_completion,
-                    ));
-                }
-                Ok(Ok(r)) => r,
-                Ok(Err(http_err)) => {
-                    let mapped = map_http_err_to_llm(http_err);
-                    if classify_retryable(&mapped)
-                        && total_attempts
-                            < retry_cfg
-                                .max_retries
-                                .saturating_add(1)
-                                .min(MAX_TOTAL_ATTEMPTS)
-                    {
-                        last_err = Some(mapped);
-                        continue;
-                    }
-                    return Err(self.cloud_dispatch_err(
-                        ctx,
-                        tee,
-                        mapped,
-                        cumulative_tokens,
-                        cumulative_cost,
-                        true,
-                        hop_had_completion,
-                    ));
-                }
-            };
-
-            // Parse response.
-            let outcome = match adapter.parse_chat_response(response.status, &response.body) {
                 Ok(o) => {
                     hop_had_completion = true;
                     o
                 }
-                Err(e) => {
+                Err(AttemptFailure { err: e, spent }) => {
+                    if let Some(spent) = spent {
+                        // Usage the upstream reported for the failed answer is owed like a
+                        // failed schema attempt's.
+                        let (tokens, cost) = spent.committed(&resolved);
+                        cumulative_tokens = cumulative_tokens.saturating_add(tokens);
+                        cumulative_cost += cost;
+                    }
                     if classify_retryable(&e)
                         && total_attempts
                             < retry_cfg
@@ -3169,9 +3659,19 @@ impl LlmGateway {
         // build_http_cap BEFORE emit_llm_request (no orphan llm.request — same
         // round-AUDIT-2 W2 ordering as generate()).
         let http_cap = build_http_cap(&resolved, &provider_cfg)?;
+        // Credential freshness before `llm.request`: a failure here emits nothing.
+        self.ensure_credential_fresh(&resolved, Some(start + cap_http::DEFAULT_TIMEOUT))
+            .await?;
         emit_llm_request(self.event_bus.as_ref(), &ctx, &resolved.model);
 
         let adapter = select_adapter(resolved.backend);
+        // The unstreamed request of every other entry is bounded by the chain's own total
+        // timeout, as before. The streamed request that serves a ChatGPT sign-in entry has
+        // no such bound in the chain, so the whole dispatch — the freshness check above and
+        // every attempt — shares the one budget a buffered `generate` hop has.
+        let attempt_deadline = resolved
+            .uses_chatgpt_sign_in()
+            .then(|| start + cap_http::DEFAULT_TIMEOUT);
 
         // Transport-ONLY retry loop (cap=6). DELIBERATE focused copy of
         // `generate()`'s transport branch (see `generate()` above) — kept
@@ -3223,54 +3723,28 @@ impl LlmGateway {
             }
             total_attempts += 1;
 
-            let req = match adapter.build_chat_request(&resolved, &ctx.messages, &ctx.params) {
-                Ok(r) => r,
-                Err(e) => {
-                    emit_llm_error(
-                        self.event_bus.as_ref(),
-                        &ctx,
-                        &resolved.model,
-                        e.variant_name(),
-                        total_attempts.saturating_sub(1),
-                        None,
-                        None,
-                        None,
-                    );
-                    return Err(e);
-                }
-            };
-
-            let response = match self.chain.execute(&ctx.agent_id, req, &http_cap).await {
-                Ok(r) => r,
-                Err(http_err) => {
-                    let mapped = map_http_err_to_llm(http_err);
-                    if classify_retryable(&mapped)
-                        && total_attempts
-                            < retry_cfg
-                                .max_retries
-                                .saturating_add(1)
-                                .min(MAX_TOTAL_ATTEMPTS)
-                    {
-                        last_err = Some(mapped);
-                        continue;
-                    }
-                    emit_llm_error(
-                        self.event_bus.as_ref(),
-                        &ctx,
-                        &resolved.model,
-                        mapped.variant_name(),
-                        total_attempts.saturating_sub(1),
-                        None,
-                        None,
-                        None,
-                    );
-                    return Err(mapped);
-                }
-            };
-
-            match adapter.parse_chat_response(response.status, &response.body) {
+            // One upstream attempt: build, send, parse. Every terminal error of the
+            // attempt emits its `llm.error` below (no orphan `llm.request`).
+            match self
+                .cloud_attempt(
+                    adapter.as_ref(),
+                    &resolved,
+                    &ctx,
+                    &http_cap,
+                    attempt_deadline,
+                )
+                .await
+            {
                 Ok(o) => break o,
-                Err(e) => {
+                Err(AttemptFailure { err: e, spent }) => {
+                    // Usage the upstream reported for the failed answer is owed: committed
+                    // now, before any retry and before a refused sign-in is reported.
+                    if let (Some(spent), Some(rid)) = (spent, &ctx.run_id) {
+                        let (tokens, cost) = spent.committed(&resolved);
+                        if tokens > 0 {
+                            self.run_budget.commit(rid, tokens, cost);
+                        }
+                    }
                     if classify_retryable(&e)
                         && total_attempts
                             < retry_cfg
@@ -3281,6 +3755,7 @@ impl LlmGateway {
                         last_err = Some(e);
                         continue;
                     }
+                    self.note_credential_rejected(&resolved, &e).await;
                     emit_llm_error(
                         self.event_bus.as_ref(),
                         &ctx,
@@ -3524,12 +3999,16 @@ pub(crate) fn compute_output_hash(text: &str) -> OutputHash {
 /// per declaration order and resolve to a `ResolvedProvider` mirroring the
 /// canonical resolver at `provider.rs:98-115` (lex-smallest alias key, return
 /// the alias VALUE).
-fn is_embedding_capable(p: &LlmProviderConfig) -> bool {
+pub(crate) fn is_embedding_capable(p: &LlmProviderConfig) -> bool {
     if crate::provider::backend_of(p) == advance_runtime::config::ProviderBackend::AnthropicMessages
     {
         return false;
     }
     if p.backend_class.uses_inference_port() && p.embedding_model.is_none() {
+        return false;
+    }
+    // The token of a ChatGPT sign-in entry is never sent to `/v1/embeddings`.
+    if p.uses_chatgpt_sign_in() {
         return false;
     }
     true
@@ -3559,6 +4038,10 @@ pub(crate) fn select_embedding_provider(
             continue;
         }
         if p.backend_class.uses_inference_port() && p.embedding_model.is_none() {
+            continue;
+        }
+        // Same rule as `is_embedding_capable`: a ChatGPT sign-in entry never embeds.
+        if p.uses_chatgpt_sign_in() {
             continue;
         }
         let target_model = if p.model_aliases.is_empty() {
@@ -4989,6 +5472,7 @@ mod tests {
             auth_scheme: None,
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
             embedding_model: None,
+            auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
         };
         let cfg1 = LlmProviderConfig {
             id: "openai".into(),
@@ -5010,6 +5494,7 @@ mod tests {
             profile_id: None,
             device_id: None,
             agent_cli: None,
+            auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
         };
         let cap1 = build_http_cap(&p1, &cfg1).unwrap();
         assert_eq!(
@@ -5034,6 +5519,7 @@ mod tests {
             auth_scheme: None,
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
             embedding_model: None,
+            auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
         };
         let cfg2 = LlmProviderConfig {
             id: "local-llm".into(),
@@ -5055,6 +5541,7 @@ mod tests {
             profile_id: None,
             device_id: None,
             agent_cli: None,
+            auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
         };
         let cap2 = build_http_cap(&p2, &cfg2).unwrap();
         assert_eq!(
@@ -5089,6 +5576,7 @@ mod tests {
                     auth_scheme: None,
                     backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
                     embedding_model: None,
+                    auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
                 },
                 LlmProviderConfig {
                     id: "openai".into(),
@@ -5110,6 +5598,7 @@ mod tests {
                     profile_id: None,
                     device_id: None,
                     agent_cli: None,
+                    auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
                 },
             )
         };

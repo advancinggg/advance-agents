@@ -52,6 +52,7 @@ fn agent_cli_cfg() -> LlmProviderConfig {
             command: "/nonexistent/claude".into(),
             args: vec![],
         }),
+        auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
     }
 }
 

@@ -18,7 +18,7 @@
 use std::fmt;
 
 use advance_runtime::config::{
-    AuthScheme, InferenceBackendClass, LlmProviderConfig, ProviderBackend,
+    AuthScheme, InferenceBackendClass, LlmProviderConfig, ProviderAuthSource, ProviderBackend,
 };
 
 use crate::catalog::CacheCost;
@@ -51,6 +51,16 @@ pub struct ResolvedProvider {
     pub auth_scheme: Option<AuthScheme>,
     pub backend_class: InferenceBackendClass,
     pub embedding_model: Option<String>,
+    /// Where the entry's credential comes from. For anything but an API key the gateway asks
+    /// the installed credential source to keep the secret fresh before each cloud dispatch.
+    pub auth_source: ProviderAuthSource,
+}
+
+impl ResolvedProvider {
+    /// Whether the entry's credential is a Sign in with ChatGPT session rather than an API key.
+    pub fn uses_chatgpt_sign_in(&self) -> bool {
+        self.auth_source == ProviderAuthSource::ChatGptOAuth
+    }
 }
 
 impl fmt::Debug for ResolvedProvider {
@@ -67,6 +77,7 @@ impl fmt::Debug for ResolvedProvider {
             .field("auth_scheme", &self.auth_scheme)
             .field("backend_class", &self.backend_class)
             .field("embedding_model", &self.embedding_model)
+            .field("auth_source", &self.auth_source)
             .finish()
     }
 }
@@ -182,6 +193,7 @@ pub(crate) fn make_resolved(p: &LlmProviderConfig, model: String) -> ResolvedPro
         auth_scheme: p.auth_scheme,
         backend_class: p.backend_class,
         embedding_model: p.embedding_model.clone(),
+        auth_source: p.auth_source,
     }
 }
 
@@ -215,6 +227,7 @@ mod tests {
             profile_id: None,
             device_id: None,
             agent_cli: None,
+            auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
         }
     }
 

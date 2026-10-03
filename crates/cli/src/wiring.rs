@@ -152,6 +152,9 @@ pub fn install_live_streaming(
     gateway.with_live_streaming(streaming_chain, decoded_detector)
 }
 
+/// The name the user sees when this daemon first registers with Sign in with ChatGPT.
+const CHATGPT_SIGN_IN_APP_NAME: &str = "Advance Agents";
+
 /// THE production LLM-gateway constructor (S4, 2026-07-29). The composition root
 /// has no other path to a gateway, so a test that calls this with stub
 /// collaborators witnesses the real wiring: deleting `install_live_streaming` here
@@ -170,6 +173,10 @@ pub fn build_llm_gateway(
     // Lane agent-llm-policy: the per-agent `llm:` policy source. `None` = not wired (every
     // request on the default path; `LlmGateway::has_agent_policy()` answers false).
     agent_policy: Option<Arc<dyn cap_llm::AgentLlmPolicySource>>,
+    // The credential source of `auth-source: chatgpt-oauth` entries (the daemon's ONE sign-in
+    // object). `None` = not wired: such an entry fails before dispatch and
+    // `LlmGateway::has_credential_source()` answers false.
+    credential_source: Option<Arc<dyn cap_llm::ProviderCredentialSource>>,
 ) -> Arc<LlmGateway> {
     let catalog = cap_llm::ModelProfileCatalog::new();
     let mut holds: Vec<Arc<cap_llm::SupervisedChild>> = Vec::new();
@@ -261,6 +268,9 @@ pub fn build_llm_gateway(
     .with_catalog(catalog);
     if let Some(policy) = agent_policy {
         gateway = gateway.with_agent_policy(policy);
+    }
+    if let Some(source) = credential_source {
+        gateway = gateway.with_credential_source(source);
     }
     Arc::new(install_live_streaming(
         gateway,
@@ -715,6 +725,10 @@ pub struct WiringHandles {
     /// composed; it falls back to opening the file when no live store exists).
     pub secret_store: Option<Arc<SecretStore>>,
     pub provider_admin: Option<Arc<crate::client_api_providers::WiredProviderAdmin>>,
+    /// Sign in with ChatGPT: the ONE sign-in object the gateway (as the credential source of
+    /// `auth-source: chatgpt-oauth` entries) and the provider admin (the sign-in routes) share.
+    /// `Some` iff `llm` is declared.
+    pub chatgpt_sign_in: Option<Arc<advance_home::ChatGptSignIn>>,
     /// Wave-12 Lane C: the `DefaultDecompositionStore` (wrapping the SAME shared
     /// `AgentTreeStore`) the decomposition host-fns record into. `start.rs` wraps it
     /// in a `CapDecompositionReader` (with the agent's bare/colon alias set) and
@@ -2405,11 +2419,43 @@ async fn wire_capabilities_inner(
     // extractor, built alongside the gateway (shares its chain + config). `None` when
     // llm is not declared → no Step-3 description indexing.
     let mut vlm_extractor: Option<Arc<dyn VlmExtractor>> = None;
+    // Sign in with ChatGPT: ONE sign-in object, shared by the gateway (the credential source of
+    // `auth-source: chatgpt-oauth` entries) and the provider admin (the sign-in routes), so a
+    // completed sign-in, a renewal and a sign-out are serialized against each other. `None`
+    // when llm is not declared (no live store, no gateway).
+    let mut chatgpt_sign_in: Option<Arc<advance_home::ChatGptSignIn>> = None;
     if declares_llm {
         let store = secret_store
             .as_ref()
             .expect("needs_key ⇒ Some when llm declared")
             .clone();
+        // Its egress chain is its own, never the LLM chain below: the same live store and
+        // the same kinds of SSRF guard, rate limiter and executor (tunables sourced live off
+        // the config provider), and no content scan of the credential traffic it carries.
+        let sign_in = {
+            let (_, sign_in_ssrf, sign_in_rate) = crate::channels_boot::live_security_components(
+                Some(builder.config_watcher() as Arc<dyn RuntimeConfigProvider>),
+            );
+            let sign_in_executor = crate::channels_boot::live_executor(Some(
+                builder.config_watcher() as Arc<dyn RuntimeConfigProvider>,
+            ));
+            let sign_in_chain = advance_home::sign_in_egress::sign_in_egress_chain(
+                store.clone(),
+                sign_in_ssrf,
+                sign_in_rate,
+                sign_in_executor,
+            )
+            // Host-only redacted http.*/security.*/secret.injected events, as on the LLM chain.
+            .with_event_bus(event_bus_dyn.clone());
+            Arc::new(advance_home::ChatGptSignIn::new(
+                workspace.to_path_buf(),
+                store.clone(),
+                Arc::new(sign_in_chain),
+                CHATGPT_SIGN_IN_APP_NAME,
+                advance_home::ChatGptSignInConfig::default(),
+            ))
+        };
+        chatgpt_sign_in = Some(Arc::clone(&sign_in));
         // Wave-16 Lane-4 (MODULE-012 AC-17): build the leak/SSRF/rate components
         // with their `security.*` tunables sourced LIVE off the config provider, so
         // a hot-reload takes effect on this LLM-egress chain without restart.
@@ -2530,6 +2576,8 @@ async fn wire_capabilities_inner(
                     event_bus_dyn.clone(),
                 )) as Arc<dyn cap_llm::AgentLlmPolicySource>,
             ),
+            // The SAME sign-in object the provider admin drives below.
+            Some(sign_in as Arc<dyn cap_llm::ProviderCredentialSource>),
         );
         // Hold an Arc clone for the composition root before registration
         // moves one into the host-fn handlers (all clones share the one gateway,
@@ -2896,8 +2944,10 @@ async fn wire_capabilities_inner(
     // A delete is refused while any agent pins the provider through its `llm.provider`
     // The reference check walks the SAME tree + root the gateway's
     // policy source reads, so the two can never disagree about who pins what.
-    let provider_admin: Arc<crate::client_api_providers::WiredProviderAdmin> =
-        Arc::new(crate::client_api_providers::WiredProviderAdmin::new(
+    // `auth-source: chatgpt-oauth` entries are served through the gateway's own sign-in object
+    // (when llm is declared); without it such an entry cannot be created here.
+    let provider_admin: Arc<crate::client_api_providers::WiredProviderAdmin> = {
+        let admin = crate::client_api_providers::WiredProviderAdmin::new(
             workspace.to_path_buf(),
             host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
             secret_store.clone(),
@@ -2908,7 +2958,14 @@ async fn wire_capabilities_inner(
                 workspace.to_path_buf(),
                 event_bus_dyn.clone(),
             )),
-        ));
+        );
+        Arc::new(match chatgpt_sign_in.as_ref() {
+            Some(sign_in) => admin.with_chatgpt_sign_in(
+                Arc::clone(sign_in) as Arc<dyn advance_home::ChatGptSignInPort>
+            ),
+            None => admin,
+        })
+    };
     let provider_admin_for_api = provider_admin.clone();
     let client_api_server = match observability_read_api.as_ref() {
         Some(read) => {
@@ -3096,6 +3153,7 @@ async fn wire_capabilities_inner(
             agent_admin,
             secret_store: secret_store.clone(),
             provider_admin: Some(provider_admin),
+            chatgpt_sign_in,
             decomposition_store,
             memory_root,
             skills_root,

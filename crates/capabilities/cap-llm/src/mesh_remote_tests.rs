@@ -50,6 +50,7 @@ fn mesh_cfg() -> LlmProviderConfig {
         profile_id: None,
         device_id: Some("peer-b".into()),
         agent_cli: None,
+        auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
     }
 }
 
@@ -318,6 +319,7 @@ async fn t135_gateway_resolve_returns_local_prefix() {
         profile_id: None,
         device_id: None,
         agent_cli: None,
+        auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
     };
     let mut cfg = fixture_runtime_config();
     cfg.llm_providers = vec![local];

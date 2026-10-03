@@ -104,15 +104,31 @@ pub fn descriptor_for(
                     .into(),
             ));
         }
-        return Ok(p.capabilities.clone());
+        return Ok(responses_route_only(cfg, p.capabilities.clone()));
     }
     Ok(match cfg.backend_class {
         InferenceBackendClass::Local | InferenceBackendClass::MeshRemote => {
             CapabilityDescriptor::unbound_local(cfg.embedding_model.is_some())
         }
         InferenceBackendClass::AgentCli => CapabilityDescriptor::agent_cli(),
-        InferenceBackendClass::CloudHttp => CapabilityDescriptor::unbound_cloud_http(),
+        InferenceBackendClass::CloudHttp => {
+            responses_route_only(cfg, CapabilityDescriptor::unbound_cloud_http())
+        }
     })
+}
+
+/// The token of a ChatGPT sign-in entry is only ever sent on a streamed Responses request,
+/// so whatever a profile claims such an entry serves neither embeddings (`/v1/embeddings`)
+/// nor the image extractor (`/v1/chat/completions`). Every other entry keeps `desc`.
+fn responses_route_only(
+    cfg: &LlmProviderConfig,
+    mut desc: CapabilityDescriptor,
+) -> CapabilityDescriptor {
+    if cfg.uses_chatgpt_sign_in() {
+        desc.embeddings = false;
+        desc.image = false;
+    }
+    desc
 }
 
 pub fn missing_capability(
@@ -224,6 +240,7 @@ mod tests {
             profile_id: None,
             device_id: None,
             agent_cli: None,
+            auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
         }
     }
 
@@ -369,5 +386,82 @@ mod tests {
             ..Default::default()
         };
         assert!(CapabilityNeed::from_chat(&params, false).tools);
+    }
+
+    /// A ChatGPT sign-in entry advertises neither image input nor embeddings — unbound or
+    /// bound to a profile that claims them — so the image walker moves past it.
+    #[test]
+    fn chatgpt_sign_in_entry_reports_no_image_and_no_embeddings() {
+        let mut plan = cfg(
+            "openai-plan",
+            InferenceBackendClass::CloudHttp,
+            &[("gpt", "gpt-5")],
+        );
+        plan.auth_source = advance_runtime::config::ProviderAuthSource::ChatGptOAuth;
+        let key = cfg(
+            "openai",
+            InferenceBackendClass::CloudHttp,
+            &[("gpt4o", "gpt-4o")],
+        );
+        let mut cat = ModelProfileCatalog::new();
+        cat.insert(
+            "vision".into(),
+            crate::catalog::ModelProfile {
+                key: crate::catalog::ProfileKey {
+                    model_version: "v1".into(),
+                    quantization: "none".into(),
+                    backend: "cloud-http".into(),
+                    chat_template: "t".into(),
+                    tool_parser: "p".into(),
+                },
+                tier: crate::catalog::CatalogTier::Evaluation,
+                licence: "Apache-2.0".into(),
+                benchmark_provenance: None,
+                quirks: crate::catalog::ProfileQuirks::default(),
+                capabilities: CapabilityDescriptor::unbound_cloud_http(),
+            },
+        )
+        .unwrap();
+
+        let desc = descriptor_for(&plan, &cat).unwrap();
+        assert!(!desc.image && !desc.embeddings);
+        assert!(desc.structured_output);
+        let mut bound = plan.clone();
+        bound.profile_id = Some("vision".into());
+        let desc = descriptor_for(&bound, &cat).unwrap();
+        assert!(!desc.image && !desc.embeddings);
+        // An API-key cloud entry keeps both, unbound and bound.
+        assert_eq!(
+            descriptor_for(&key, &cat).unwrap(),
+            CapabilityDescriptor::unbound_cloud_http()
+        );
+        let mut bound_key = key.clone();
+        bound_key.profile_id = Some("vision".into());
+        assert!(descriptor_for(&bound_key, &cat).unwrap().image);
+
+        let need = CapabilityNeed {
+            tools: false,
+            output_schema: false,
+            image: true,
+            prompt_tokens_est: None,
+            max_tokens: None,
+        };
+        let resolved = walk_eligible(&[plan.clone(), bound.clone(), key], None, &cat, &need)
+            .expect("the walker must move past the sign-in entry");
+        assert_eq!(resolved.id, "openai");
+        let err = walk_eligible(&[plan.clone(), bound], None, &cat, &need).unwrap_err();
+        assert_eq!(
+            err,
+            LlmError::ProviderError("unsupported capability: image".into())
+        );
+        // Text needs are unaffected.
+        let text = CapabilityNeed {
+            image: false,
+            ..need
+        };
+        assert_eq!(
+            walk_eligible(&[plan], None, &cat, &text).unwrap().id,
+            "openai-plan"
+        );
     }
 }

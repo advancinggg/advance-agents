@@ -6,6 +6,9 @@
 #![deny(unsafe_code)]
 
 pub mod cancel;
+pub mod chatgpt_sign_in;
+#[cfg(test)]
+mod chatgpt_sign_in_tests;
 pub mod connect;
 pub mod contract;
 pub mod create;
@@ -20,8 +23,13 @@ pub mod runtime_state;
 pub mod scaffold;
 pub mod secret_bytes;
 pub mod secrets_mode;
+pub mod sign_in_egress;
 
 pub use cancel::CancelToken;
+pub use chatgpt_sign_in::{
+    ChatGptSignIn, ChatGptSignInConfig, ChatGptSignInPort, SignInClock, SignInModel, SignInRefusal,
+    SignInStarted, SignInStatus, SignOutOutcome, SystemSignInClock, VerifyOutcome,
+};
 pub use connect::ProcessLauncher;
 pub use contract::{
     AdoptError, ConnectError, ConnectedRuntime, CreateError, DisplayNameError, PreflightFail,

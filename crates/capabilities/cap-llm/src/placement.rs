@@ -159,6 +159,12 @@ pub fn is_pre_token_failover(err: &LlmError) -> bool {
             || cli.starts_with("daemon identity unknown")
             || cli.starts_with("egress scan not wired");
     }
+    // A Sign in with ChatGPT entry that is signed out, out of plan usage or refused by the
+    // upstream has spent no tokens either: same policy as the agent-cli sign-in and quota
+    // reasons, for every reason of that closed vocabulary.
+    if crate::plan_usage::is_plan_usage_error(rest) {
+        return true;
+    }
     rest == "not wired" || rest == "unavailable" || crate::retry::is_transport_provider_error(rest)
 }
 
@@ -621,6 +627,45 @@ mod t133_helpers {
         assert!(!is_pre_token_failover(&LlmError::RateLimited("x".into())));
     }
 
+    /// Every reason of the ChatGPT plan vocabulary is a pre-token failover trigger and is
+    /// never retried on the same endpoint; neighbours of the prefix are not affected.
+    #[test]
+    fn chatgpt_plan_errors_fail_over_before_tokens_and_never_retry() {
+        for msg in [
+            "chatgpt-plan: not signed in",
+            "chatgpt-plan: plan usage not authorized",
+            "chatgpt-plan: credential refresh unavailable",
+            "chatgpt-plan: credential source not wired",
+            "chatgpt-plan: sign-in rejected",
+            "chatgpt-plan: request not permitted",
+            "chatgpt-plan: usage limit reached",
+            "chatgpt-plan: account not eligible",
+            "chatgpt-plan: unsupported capability",
+            "chatgpt-plan: route not supported",
+            "chatgpt-plan: streamed transport required",
+        ] {
+            let err = LlmError::ProviderError(msg.into());
+            assert!(is_pre_token_failover(&err), "{msg}");
+            assert!(!crate::retry::classify_retryable(&err), "{msg}");
+            assert!(cascade_trigger(&err).is_none(), "{msg}");
+        }
+        // The ordinary credential failures of an API-key entry keep their terminal policy,
+        // and a plan reason on another variant is not a trigger.
+        for msg in ["auth failed", "stream auth rejected", "http 403"] {
+            assert!(
+                !is_pre_token_failover(&LlmError::ProviderError(msg.into())),
+                "{msg}"
+            );
+        }
+        assert!(!is_pre_token_failover(&LlmError::RateLimited(
+            "chatgpt-plan: usage limit reached".into()
+        )));
+        // A reason reached after bytes were released is no longer this vocabulary.
+        assert!(!is_pre_token_failover(&LlmError::ProviderError(
+            "stream-partial: chatgpt-plan: usage limit reached".into()
+        )));
+    }
+
     #[allow(dead_code)]
     fn _desc() -> CapabilityDescriptor {
         CapabilityDescriptor {
@@ -657,6 +702,7 @@ mod t133_helpers {
             profile_id: None,
             device_id: None,
             agent_cli: None,
+            auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
         }
     }
 }

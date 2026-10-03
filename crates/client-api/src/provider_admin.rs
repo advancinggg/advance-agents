@@ -13,6 +13,11 @@
 //! - `GET  /client/providers/{provider_id}/usage`          `agent-cli`: the vendor CLI's own
 //!                                                         subscription allowance (no key, no turn)
 //! - `POST /client/providers/{provider_id}:select`         move to index 0
+//! - `POST /client/providers/{provider_id}:sign-in`        `chatgpt-oauth`: start a browser sign-in;
+//!                                                         answers the URL to open and a deadline
+//! - `GET  /client/providers/{provider_id}/sign-in`        `chatgpt-oauth`: the sign-in state
+//! - `POST /client/providers/{provider_id}:sign-in-cancel` `chatgpt-oauth`: abandon a pending attempt
+//! - `POST /client/providers/{provider_id}:sign-out`       `chatgpt-oauth`: revoke and drop the session
 //!
 //! The family reuses the packs-family scopes on purpose: `Scope` is a closed enum inventoried by
 //! the AC-14 compat gate, so minting `ReadProviders` / `ManageProviders` is an
@@ -29,6 +34,19 @@
 //! record (audit carries route + family only) or a response (`ClientProviderKeyResult` reports
 //! `stored` and the preflight verdict), and the idempotency layer fingerprints the body with
 //! SHA-256 instead of retaining it.
+//!
+//! Sign-in (an entry created with `auth_source: chatgpt-oauth`): the daemon runs the browser
+//! sign-in and keeps the session; no token, authorization code or verifier ever crosses this
+//! crate. `:sign-in` returns promptly with the URL the user opens and the attempt's deadline, and
+//! a client then polls `GET …/sign-in` until `state` leaves `pending`. Like every mutation the
+//! start response is replayed for the idempotency TTL under the same key, so a client uses a
+//! fresh key per attempt and treats a replayed `expires_at_ms` in the past as stale. The four
+//! routes answer `invalid_state` with details `["auth_source_mismatch"]` on an entry that does
+//! not sign in; `:set-key` / `:clear-key` answer the same on an entry that does. `:sign-in`
+//! answers `module_unavailable` for an entry whose secret holds another installation's sign-in,
+//! and for every entry while this installation's host id cannot be read (either way the state
+//! reads `signed-out` with reason `unavailable`), and creating a `chatgpt-oauth`
+//! entry under a named secret that already holds a value answers `already_exists`.
 
 use std::collections::BTreeMap;
 
@@ -81,6 +99,21 @@ pub const BACKENDS: &[&str] = &["openai-chat", "openai-responses", "anthropic-me
 pub const AUTH_SCHEMES: &[&str] = &["bearer", "x-api-key", "api-key"];
 /// The `backend_class` a create defaults to.
 pub const DEFAULT_BACKEND_CLASS: &str = "cloud-http";
+/// Closed spellings of `auth_source` (`ProviderAuthSource`).
+pub const AUTH_SOURCES: &[&str] = &["api-key", "chatgpt-oauth"];
+/// The `auth_source` a create defaults to: a key the operator enters through `:set-key`.
+pub const DEFAULT_AUTH_SOURCE: &str = "api-key";
+/// The `auth_source` of an entry whose credential is a Sign in with ChatGPT session.
+pub const CHATGPT_OAUTH_AUTH_SOURCE: &str = "chatgpt-oauth";
+/// The only `backend` a `chatgpt-oauth` entry may name (also what an absent `backend` means).
+pub const CHATGPT_OAUTH_BACKEND: &str = "openai-responses";
+/// The only `auth_scheme` a `chatgpt-oauth` entry may name (also what an absent one means).
+pub const CHATGPT_OAUTH_AUTH_SCHEME: &str = "bearer";
+/// Closed spellings of [`ClientProviderSignIn::state`].
+pub const SIGN_IN_STATES: &[&str] = &["signed-out", "pending", "signed-in", "failed"];
+/// Suffix of the internal secret that holds a sign-in record (the runtime loader's
+/// `CHATGPT_OAUTH_RECORD_SUFFIX`): no entry may name a secret ending with it.
+pub const RESERVED_SECRET_SUFFIX: &str = ".chatgpt-oauth";
 
 const RELOAD_PENDING_MESSAGE: &str =
     "runtime-config.yaml was written but the daemon has not observed the reload yet; it applies at the next watcher tick";
@@ -156,7 +189,12 @@ pub struct ClientProviderKey {
 /// `LlmError` variant name (`model-not-available`, `provider-error`, …), `timeout`, `cancelled`,
 /// `missing-key`, `missing-provider`, or `unsupported-backend-class`. For an `agent-cli` entry
 /// the check is the vendor CLI's own sign-in status: ok = signed in; else `not-signed-in`,
-/// `cli-not-found`, `cli-failed`, `daemon-identity-unknown`, `timeout`, `cancelled`.
+/// `cli-not-found`, `cli-failed`, `daemon-identity-unknown`, `timeout`, `cancelled`. For a
+/// `chatgpt-oauth` entry the check renews the sign-in when needed and lists the account's models
+/// with it: ok = usable; else `not-signed-in` (no sign-in of this daemon), `session-ended` (sign
+/// in again), `plan-usage-not-granted` (the account did not grant use of its plan; sign in again
+/// to consent), `refresh-unavailable` (the credential expired and could not be renewed right
+/// now), `unavailable` (the sign-in or the model list could not be reached), `timeout`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientProviderPreflightResult {
     pub ok: bool,
@@ -192,7 +230,9 @@ pub struct ClientProviderUsageWindow {
 /// account surface (ADR 2026-09-28 §usage): Claude Code's `/usage`, Codex's app-server
 /// `account/rateLimits/read`, Grok Build's `x.ai/billing`. Never a model turn, never a token
 /// read. `reason` (when not ok) is the sign-in probe's vocabulary plus `unparsed` (the CLI
-/// answered something this version does not read) and `unsupported-backend-class`.
+/// answered something this version does not read) and `unsupported-backend-class`. A
+/// `chatgpt-oauth` entry always answers `ok: false` with `not-provided`: its plan allowance has
+/// no API (a client links to the vendor's own usage page instead).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientProviderUsage {
     pub ok: bool,
@@ -208,6 +248,70 @@ pub struct ClientProviderUsage {
     pub account: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub windows: Vec<ClientProviderUsageWindow>,
+}
+
+/// The result of `:sign-in`: where the user signs in, and until when. It carries no secret.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientProviderSignInStart {
+    /// The URL to open in a browser on the machine the daemon runs on (the sign-in returns to
+    /// a loopback address of that machine).
+    pub authorize_url: String,
+    /// Unix milliseconds after which the attempt is abandoned. A value in the past means the
+    /// response is stale (a replay): start a new attempt under a fresh idempotency key.
+    pub expires_at_ms: u64,
+}
+
+/// One model the signed-in account may use, as the provider lists it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientProviderSignInModel {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// The sign-in state of a `chatgpt-oauth` entry (`GET /client/providers/{id}/sign-in`, the
+/// result of `:sign-in-cancel`, and `sign_in` on the entry's summary). Never a token.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientProviderSignIn {
+    /// `signed-out` | `pending` (an attempt is waiting for the browser) | `signed-in` |
+    /// `failed` (the last attempt ended without a session; see `reason`).
+    pub state: String,
+    /// Unix milliseconds of the read.
+    pub checked_at_ms: u64,
+    /// A fixed token saying why the state is what it is, when there is something to say:
+    /// `timeout`, `cancelled`, `access-denied`, `authorization-failed`, `state-mismatch`,
+    /// `registration-incomplete`, `client-mismatch`, `account-mismatch`, `exchange-failed`,
+    /// `id-token-invalid`, `plan-usage-not-granted`, `session-ended`, `refresh-unavailable`,
+    /// `store-failed`, `unavailable`, `not-signed-in`. `signed-out` with `unavailable` means
+    /// this daemon cannot sign the entry in, and `:sign-in` is refused (`module_unavailable`):
+    /// either the entry's secret holds another installation's sign-in (an entry created under
+    /// another secret name signs in here), or this installation's host id cannot be read (no
+    /// entry signs in until it is repaired).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The signed-in account's own label (an email) — shown back to the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Once signed in: whether the account granted use of its plan for model requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_usage: Option<bool>,
+    /// Unix milliseconds. `pending`: when the attempt is abandoned. `signed-in`: when the
+    /// current credential lapses (the daemon renews it before then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+    /// The models the account may use, when the provider listed them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ClientProviderSignInModel>,
+}
+
+/// The result of `:sign-out`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientProviderSignOut {
+    /// The session is gone from this daemon (true also when there was none).
+    pub signed_out: bool,
+    /// The provider confirmed the revocation. False when it could not be reached: the local
+    /// session is dropped all the same.
+    pub revocation_confirmed: bool,
 }
 
 /// One provider entry (`GET /client/providers` rows, `GET /client/providers/{id}`, and the
@@ -229,6 +333,11 @@ pub struct ClientProviderSummary {
     /// `bearer | x-api-key | api-key`; absent = the backend's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_scheme: Option<String>,
+    /// Where the entry's credential comes from, when it is not an operator-entered key:
+    /// `chatgpt-oauth` (a Sign in with ChatGPT session the daemon keeps fresh). Absent = an
+    /// API key (`key` says whether one is stored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_source: Option<String>,
     pub cost: ClientProviderCost,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<ClientProviderRateLimit>,
@@ -250,6 +359,9 @@ pub struct ClientProviderSummary {
     /// `agent-cli` entries: the last allowance read this daemon made (in-memory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_usage: Option<ClientProviderUsage>,
+    /// `chatgpt-oauth` entries only: the sign-in state at the time of the read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<ClientProviderSignIn>,
 }
 
 /// `GET /client/providers`.
@@ -279,9 +391,18 @@ pub struct ClientCreateProviderRequest {
     pub embedding_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_scheme: Option<String>,
-    /// Secret reference name; defaults to `<provider_id>-api-key`.
+    /// Secret reference name; defaults to `<provider_id>-api-key`, or for a `chatgpt-oauth`
+    /// entry to `<provider_id>-chatgpt-<first 8 hex digits of the daemon's host id>`. A
+    /// `chatgpt-oauth` entry that names a secret already holding a value (or already holding a
+    /// sign-in record) is refused with `already_exists`: the sign-in writes its access token
+    /// under that name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_secret: Option<String>,
+    /// `api-key` (default) | `chatgpt-oauth`. Fixed at creation. `chatgpt-oauth` is only valid
+    /// on `cloud-http` with `backend` absent or `openai-responses` and `auth_scheme` absent or
+    /// `bearer`; such an entry takes no key (`:set-key` is refused) and signs in instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_source: Option<String>,
     pub cost: ClientProviderCost,
     /// Required (the runtime refuses an entry without a rate limit).
     pub rate_limit: ClientProviderRateLimit,
@@ -455,7 +576,8 @@ pub fn validate_provider_id(id: &str) -> Result<(), ClientError> {
     Ok(())
 }
 
-/// `^[A-Za-z0-9_.-]{1,128}$` — a secret reference name.
+/// `^[A-Za-z0-9_.-]{1,128}$` — a secret reference name. A name the runtime reserves for a
+/// sign-in record is refused: no entry may point its credential at one.
 pub fn validate_secret_name(name: &str) -> Result<(), ClientError> {
     if name.is_empty()
         || name.len() > MAX_SECRET_NAME_LEN
@@ -464,6 +586,9 @@ pub fn validate_secret_name(name: &str) -> Result<(), ClientError> {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
     {
         return Err(invalid("invalid api_key_secret name"));
+    }
+    if name.ends_with(RESERVED_SECRET_SUFFIX) {
+        return Err(invalid("api_key_secret names a reserved secret"));
     }
     Ok(())
 }
@@ -633,6 +758,26 @@ pub fn validate_create_request(req: &ClientCreateProviderRequest) -> Result<(), 
     }
     if let Some(name) = &req.api_key_secret {
         validate_secret_name(name)?;
+    }
+    let source = req.auth_source.as_deref().unwrap_or(DEFAULT_AUTH_SOURCE);
+    validate_enum(source, AUTH_SOURCES, "invalid auth_source")?;
+    if source == CHATGPT_OAUTH_AUTH_SOURCE {
+        // The loader's own rules for the source, so the refusal names the field.
+        if class != DEFAULT_BACKEND_CLASS {
+            return Err(invalid(
+                "auth_source chatgpt-oauth is only valid for cloud-http providers",
+            ));
+        }
+        if matches!(req.backend.as_deref(), Some(b) if b != CHATGPT_OAUTH_BACKEND) {
+            return Err(invalid(
+                "auth_source chatgpt-oauth requires backend openai-responses (or omit backend)",
+            ));
+        }
+        if matches!(req.auth_scheme.as_deref(), Some(s) if s != CHATGPT_OAUTH_AUTH_SCHEME) {
+            return Err(invalid(
+                "auth_source chatgpt-oauth sends a bearer token (omit auth_scheme)",
+            ));
+        }
     }
     validate_cost(&req.cost)?;
     validate_rate_limit(&req.rate_limit)?;
@@ -939,7 +1084,7 @@ pub(crate) fn register(api: &mut ClientApi, slot: ProviderAdminSlot) {
     );
 
     // POST /client/providers/{provider_id}:select — move to index 0.
-    let s = slot;
+    let s = slot.clone();
     api.register_templated(
         Method::Post,
         routes::TPL_PROVIDER_SELECT,
@@ -952,6 +1097,79 @@ pub(crate) fn register(api: &mut ClientApi, slot: ProviderAdminSlot) {
                 .select_provider(&id)
                 .map_err(ProviderError::into_client_error)?;
             Ok(outcome_response(outcome))
+        })
+        .with_scopes(vec![Scope::ApproveGrants]),
+    );
+
+    // POST /client/providers/{provider_id}:sign-in — start a browser sign-in. The response is
+    // the URL to open and the attempt's deadline; a replay under the same key returns the same
+    // (possibly lapsed) pair without starting another attempt.
+    let s = slot.clone();
+    api.register_templated(
+        Method::Post,
+        routes::TPL_PROVIDER_SIGN_IN,
+        HandlerSpec::mutation(true, move |ctx| {
+            let id = ctx.path_param("provider_id")?;
+            validate_provider_id(&id)?;
+            let provider = provider_or_unavailable(&s)?;
+            mark_provider_entry(ctx)?;
+            let started = provider
+                .sign_in_start(&id)
+                .map_err(ProviderError::into_client_error)?;
+            Ok(serde_json::to_value(started).expect("ClientProviderSignInStart serializes"))
+        })
+        .with_scopes(vec![Scope::ApproveGrants]),
+    );
+
+    // GET /client/providers/{provider_id}/sign-in — the sign-in state (what a client polls).
+    let s = slot.clone();
+    api.register_templated(
+        Method::Get,
+        routes::TPL_PROVIDER_SIGN_IN_STATUS,
+        HandlerSpec::read(true, move |ctx| {
+            let id = ctx.path_param("provider_id")?;
+            validate_provider_id(&id)?;
+            let provider = provider_or_unavailable(&s)?;
+            let status = provider
+                .sign_in_status(&id)
+                .map_err(ProviderError::into_client_error)?;
+            Ok(serde_json::to_value(status).expect("ClientProviderSignIn serializes"))
+        })
+        .with_scopes(vec![Scope::ReadInventory]),
+    );
+
+    // POST /client/providers/{provider_id}:sign-in-cancel — abandon a pending attempt.
+    let s = slot.clone();
+    api.register_templated(
+        Method::Post,
+        routes::TPL_PROVIDER_SIGN_IN_CANCEL,
+        HandlerSpec::mutation(true, move |ctx| {
+            let id = ctx.path_param("provider_id")?;
+            validate_provider_id(&id)?;
+            let provider = provider_or_unavailable(&s)?;
+            mark_provider_entry(ctx)?;
+            let status = provider
+                .sign_in_cancel(&id)
+                .map_err(ProviderError::into_client_error)?;
+            Ok(serde_json::to_value(status).expect("ClientProviderSignIn serializes"))
+        })
+        .with_scopes(vec![Scope::ApproveGrants]),
+    );
+
+    // POST /client/providers/{provider_id}:sign-out — revoke and drop the session.
+    let s = slot;
+    api.register_templated(
+        Method::Post,
+        routes::TPL_PROVIDER_SIGN_OUT,
+        HandlerSpec::mutation(true, move |ctx| {
+            let id = ctx.path_param("provider_id")?;
+            validate_provider_id(&id)?;
+            let provider = provider_or_unavailable(&s)?;
+            mark_provider_entry(ctx)?;
+            let outcome = provider
+                .sign_out(&id)
+                .map_err(ProviderError::into_client_error)?;
+            Ok(serde_json::to_value(outcome).expect("ClientProviderSignOut serializes"))
         })
         .with_scopes(vec![Scope::ApproveGrants]),
     );
@@ -1120,6 +1338,77 @@ mod tests {
         let mut r = create_req();
         r.api_key_secret = Some("bad name".into());
         assert!(validate_create_request(&r).is_err());
+    }
+
+    #[test]
+    fn auth_source_create_request_rules() {
+        fn sign_in_req() -> ClientCreateProviderRequest {
+            let mut req = create_req();
+            req.provider_id = "openai-plan".into();
+            req.endpoint = Some("https://api.openai.com".into());
+            req.auth_source = Some("chatgpt-oauth".into());
+            req
+        }
+        // Absent and the explicit default are the same entry kind.
+        assert!(validate_create_request(&create_req()).is_ok());
+        let mut explicit = create_req();
+        explicit.auth_source = Some("api-key".into());
+        assert!(validate_create_request(&explicit).is_ok());
+        let mut unknown = create_req();
+        unknown.auth_source = Some("oauth".into());
+        assert!(validate_create_request(&unknown).is_err());
+
+        // A sign-in entry: every dependent field may be absent or spell the one legal value.
+        assert!(validate_create_request(&sign_in_req()).is_ok());
+        let mut spelled = sign_in_req();
+        spelled.backend_class = Some("cloud-http".into());
+        spelled.backend = Some("openai-responses".into());
+        spelled.auth_scheme = Some("bearer".into());
+        assert!(validate_create_request(&spelled).is_ok());
+
+        for class in ["local", "mesh-remote", "agent-cli"] {
+            let mut r = sign_in_req();
+            r.backend_class = Some(class.into());
+            assert!(validate_create_request(&r).is_err(), "{class}");
+        }
+        for backend in ["openai-chat", "anthropic-messages"] {
+            let mut r = sign_in_req();
+            r.backend = Some(backend.into());
+            assert!(validate_create_request(&r).is_err(), "{backend}");
+        }
+        for scheme in ["x-api-key", "api-key"] {
+            let mut r = sign_in_req();
+            r.auth_scheme = Some(scheme.into());
+            assert!(validate_create_request(&r).is_err(), "{scheme}");
+        }
+        // The same dialect and scheme stay legal on an API-key entry.
+        let mut keyed = create_req();
+        keyed.backend = Some("openai-chat".into());
+        keyed.auth_scheme = Some("x-api-key".into());
+        assert!(validate_create_request(&keyed).is_ok());
+
+        // The tables agree with the constants the rules use.
+        assert!(AUTH_SOURCES.contains(&DEFAULT_AUTH_SOURCE));
+        assert!(AUTH_SOURCES.contains(&CHATGPT_OAUTH_AUTH_SOURCE));
+        assert!(BACKENDS.contains(&CHATGPT_OAUTH_BACKEND));
+        assert!(AUTH_SCHEMES.contains(&CHATGPT_OAUTH_AUTH_SCHEME));
+    }
+
+    #[test]
+    fn reserved_secret_names_are_refused() {
+        let reserved = format!("openai-plan{RESERVED_SECRET_SUFFIX}");
+        assert!(validate_secret_name("openai-plan").is_ok());
+        assert!(validate_secret_name(&reserved).is_err());
+        // The suffix is reserved only at the end of a name.
+        assert!(validate_secret_name(&format!("{reserved}.v2")).is_ok());
+        let mut create = create_req();
+        create.api_key_secret = Some(reserved.clone());
+        assert!(validate_create_request(&create).is_err());
+        let update = ClientUpdateProviderRequest {
+            api_key_secret: Some(reserved),
+            ..Default::default()
+        };
+        assert!(validate_update_request(&update).is_err());
     }
 
     #[test]

@@ -65,6 +65,8 @@ impl SecretStore for ClosureSecretStore {
 /// `SecretStore` over the daemon's cap-secrets store: `get(key)` resolves and
 /// decrypts `key`; any failure (absent, undecryptable, storage error) is `None`
 /// — the pack layer then reports `MissingSecret` for the key, never the cause.
+/// A name reserved for a provider's internal sign-in record answers `None`
+/// whether or not it is stored: no pack may read one.
 pub struct CapSecretsSecretStore {
     store: Arc<cap_secrets::SecretStore>,
 }
@@ -77,6 +79,9 @@ impl CapSecretsSecretStore {
 
 impl SecretStore for CapSecretsSecretStore {
     fn get(&self, key: &str) -> Option<SecretValue> {
+        if advance_runtime::config::is_reserved_secret_name(key) {
+            return None;
+        }
         self.store
             .resolve(key)
             .ok()
@@ -699,5 +704,31 @@ mod tests {
             secrets.bind(Arc::new(ClosureSecretStore::new(|_| None))),
             Err(AlreadyBound)
         );
+    }
+
+    #[test]
+    fn cap_secrets_store_never_hands_a_sign_in_record_to_a_pack() {
+        let store = Arc::new(cap_secrets::SecretStore::new(
+            zeroize::Zeroizing::new([0xab; 32]),
+            Arc::new(cap_secrets::InMemorySecretStorage::new()),
+        ));
+        let record = format!(
+            "openai-plan{}",
+            advance_runtime::config::CHATGPT_OAUTH_RECORD_SUFFIX
+        );
+        store.store("openai-plan", "access-value").unwrap();
+        store.store(&record, "{\"v\":1}").unwrap();
+        let secrets = CapSecretsSecretStore::new(store);
+        assert_eq!(
+            secrets
+                .get("openai-plan")
+                .map(|v| v.expose_secret().to_string()),
+            Some("access-value".into())
+        );
+        assert!(
+            secrets.get(&record).is_none(),
+            "a stored record still answers absent"
+        );
+        assert!(secrets.get("missing").is_none());
     }
 }

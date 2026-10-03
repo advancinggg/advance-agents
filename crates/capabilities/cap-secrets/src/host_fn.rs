@@ -19,11 +19,16 @@
 //!   `secrets.dependencies` config map (keyed on the bare
 //!   `HostCallContext.agent_id`) and registers this handler via
 //!   `register_agent_secrets_with_policy` whenever that map is non-empty.
+//!
+//! Both answer `false` for a name reserved for a provider's internal sign-in
+//! record (`advance_runtime::config::is_reserved_secret_name`) without asking
+//! the store: a guest can neither read nor detect one.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use advance_runtime::config::is_reserved_secret_name;
 use advance_runtime::host_registry::{
     HostCallContext, HostCallError, HostFunctionHandler, HostFunctionSpec, HostRegistry,
 };
@@ -63,9 +68,7 @@ impl HostFunctionHandler for SecretExistsHandler {
         let store = Arc::clone(&self.store);
         Box::pin(async move {
             let name = parse_secret_exists_params(&params, results_len)?;
-            let exists = store
-                .exists(&name)
-                .map_err(|e| HostCallError::HandlerError(format!("{e}")))?;
+            let exists = exists_unless_reserved(&store, &name)?;
             Ok(vec![Val::Result(Ok(Some(Box::new(Val::Bool(exists)))))])
         })
     }
@@ -123,12 +126,21 @@ impl HostFunctionHandler for GatedSecretExistsHandler {
                 )))))]);
             }
 
-            let exists = store
-                .exists(&name)
-                .map_err(|e| HostCallError::HandlerError(format!("{e}")))?;
+            let exists = exists_unless_reserved(&store, &name)?;
             Ok(vec![Val::Result(Ok(Some(Box::new(Val::Bool(exists)))))])
         })
     }
+}
+
+/// The storage probe both handlers share: a reserved sign-in record name is
+/// `false` and never reaches the store.
+fn exists_unless_reserved(store: &SecretStore, name: &str) -> Result<bool, HostCallError> {
+    if is_reserved_secret_name(name) {
+        return Ok(false);
+    }
+    store
+        .exists(name)
+        .map_err(|e| HostCallError::HandlerError(format!("{e}")))
 }
 
 /// Register the `agent-secrets::secret-exists` host function into the
@@ -258,6 +270,60 @@ mod tests {
                 other => panic!("expected Val::Bool, got {other:?}"),
             },
             other => panic!("expected Val::Result(Ok(Some(_))), got {other:?}"),
+        }
+    }
+
+    fn answer(out: &[Val]) -> bool {
+        match out {
+            [Val::Result(Ok(Some(inner)))] => match inner.as_ref() {
+                Val::Bool(b) => *b,
+                other => panic!("expected Val::Bool, got {other:?}"),
+            },
+            other => panic!("expected Val::Result(Ok(Some(_))), got {other:?}"),
+        }
+    }
+
+    struct PermitAll;
+
+    impl CallerDependencyPolicy for PermitAll {
+        fn permits(&self, _ctx: &HostCallContext, _name: &str) -> bool {
+            true
+        }
+    }
+
+    // A provider's sign-in record is never detectable by a guest, even when stored and
+    // declared: both handlers answer `false` for the reserved name.
+    #[tokio::test]
+    async fn reserved_sign_in_record_names_answer_false() {
+        let store = make_store();
+        let record = format!(
+            "existing_key{}",
+            advance_runtime::config::CHATGPT_OAUTH_RECORD_SUFFIX
+        );
+        store.store(&record, "{\"v\":1}").unwrap();
+        assert!(store.exists(&record).unwrap(), "the record is stored");
+
+        let permissive = SecretExistsHandler {
+            store: Arc::clone(&store),
+        };
+        let gated = GatedSecretExistsHandler::new(Arc::clone(&store), Arc::new(PermitAll));
+        for handler in [
+            &permissive as &dyn HostFunctionHandler,
+            &gated as &dyn HostFunctionHandler,
+        ] {
+            let reserved = handler
+                .call(test_ctx(), vec![Val::String(record.clone())], 1)
+                .await
+                .expect("handler call should succeed");
+            assert!(!answer(&reserved), "reserved name → Bool(false)");
+            let ordinary = handler
+                .call(test_ctx(), vec![Val::String("existing_key".into())], 1)
+                .await
+                .expect("handler call should succeed");
+            assert!(
+                answer(&ordinary),
+                "an ordinary stored name still → Bool(true)"
+            );
         }
     }
 
