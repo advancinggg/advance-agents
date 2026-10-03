@@ -719,6 +719,7 @@ fn map_executor_err(e: ExecutorError) -> HttpError {
             HttpError::RedirectRejected { reason, target }
         }
         ExecutorError::Transport => HttpError::Transport(TransportErrorKind::Other),
+        ExecutorError::Connect(kind) => HttpError::Transport(kind),
         ExecutorError::Timeout => HttpError::Transport(TransportErrorKind::Timeout),
     }
 }
@@ -1337,6 +1338,10 @@ impl HttpStreamingChain for DefaultHttpSecurityChain {
             Err(ExecutorError::Transport) => {
                 ensure_stream_stage_deadline(Some(deadline))?;
                 return Err(HttpError::Transport(TransportErrorKind::Other));
+            }
+            Err(ExecutorError::Connect(kind)) => {
+                ensure_stream_stage_deadline(Some(deadline))?;
+                return Err(HttpError::Transport(kind));
             }
             Err(ExecutorError::Timeout) => {
                 return Err(HttpError::Transport(TransportErrorKind::Timeout));

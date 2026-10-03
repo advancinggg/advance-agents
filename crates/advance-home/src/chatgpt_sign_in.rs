@@ -2013,12 +2013,16 @@ impl Inner {
     }
 }
 
-/// Failures after which the request certainly never reached the network.
+/// Failures after which the request certainly never reached the server: the connection was
+/// never established (DNS, TCP connect, or the TLS handshake — HTTP writes nothing before the
+/// handshake completes), or the local rate limiter held it back. A one-time authorization
+/// code or a rotating refresh token is still unspent after any of these.
 fn never_left(e: &HttpError) -> bool {
     matches!(
         e,
         HttpError::Transport(TransportErrorKind::Dns)
             | HttpError::Transport(TransportErrorKind::ConnectionRefused)
+            | HttpError::Transport(TransportErrorKind::Tls)
             | HttpError::RateLimited { .. }
     )
 }

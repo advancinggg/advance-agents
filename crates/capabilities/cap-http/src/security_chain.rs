@@ -506,6 +506,9 @@ impl HttpSecurityChain for DefaultHttpSecurityChain {
             Err(ExecutorError::Transport) => {
                 return Err(HttpError::Transport(TransportErrorKind::Other));
             }
+            Err(ExecutorError::Connect(kind)) => {
+                return Err(HttpError::Transport(kind));
+            }
             Err(ExecutorError::Timeout) => {
                 return Err(HttpError::Transport(TransportErrorKind::Timeout));
             }

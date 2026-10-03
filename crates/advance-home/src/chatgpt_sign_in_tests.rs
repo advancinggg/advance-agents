@@ -4073,3 +4073,54 @@ fn production_defaults_are_the_documented_endpoints_and_bounds() {
     assert_eq!(c.dispatch_margin, Duration::from_secs(30));
     assert_eq!(c.revocation_timeout, Duration::from_secs(10));
 }
+
+#[test]
+fn a_tls_handshake_failure_on_the_code_exchange_is_retried_and_signs_in() {
+    // A flaky proxy resets the TLS handshake: no byte of the exchange reached the server, so
+    // the one-time code is still unspent and the exchange is sent again.
+    let h = harness();
+    h.chain.fail_next(
+        &token_endpoint(),
+        HttpError::Transport(TransportErrorKind::Tls),
+    );
+    let started = h.sign_in.start(NAME).expect("start");
+    let (status, _) = approve(&h, &started, Some(ISSUED));
+    assert_eq!(status, 200);
+    assert_eq!(h.sign_in.status(NAME).state, STATE_SIGNED_IN);
+    assert_eq!(h.chain.attempts_to(&token_endpoint()), 2);
+    assert_eq!(
+        h.idp.token_forms("authorization_code").len(),
+        1,
+        "the identity provider saw the code exactly once"
+    );
+}
+
+#[test]
+fn a_failure_after_the_exchange_left_is_not_repeated() {
+    // The request may have reached the server: repeating it could present a spent code.
+    let h = harness();
+    h.chain.fail_next(
+        &token_endpoint(),
+        HttpError::Transport(TransportErrorKind::Other),
+    );
+    let started = h.sign_in.start(NAME).expect("start");
+    let (status, _) = approve(&h, &started, Some(ISSUED));
+    assert_eq!(status, 200);
+    let st = h.sign_in.status(NAME);
+    assert_eq!(st.state, STATE_FAILED);
+    assert_eq!(st.reason, Some(REASON_EXCHANGE_FAILED));
+    assert_eq!(h.chain.attempts_to(&token_endpoint()), 1);
+}
+
+#[tokio::test]
+async fn a_tls_handshake_failure_on_renewal_is_retried() {
+    let h = harness();
+    h.seed_session(T0_MS + 60_000, FULL_SCOPE);
+    h.chain.fail_next(
+        &token_endpoint(),
+        HttpError::Transport(TransportErrorKind::Tls),
+    );
+    assert_eq!(h.ensure().await, Ok(()));
+    assert_eq!(h.chain.attempts_to(&token_endpoint()), 2);
+    assert_eq!(h.idp.token_forms("refresh_token").len(), 1);
+}

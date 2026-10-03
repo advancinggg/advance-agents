@@ -951,3 +951,104 @@ async fn s3_reqwest_stream_redirect_zero_carry_on_wire() {
         "redirect hop must not carry the original request body"
     );
 }
+
+// ─── Connect-phase failures are told apart from failures after the request left ──────────
+// (ADR 2026-10-03 follow-up: a TLS handshake reset through a flaky proxy failed a one-time
+// ChatGPT sign-in exchange that was safe to repeat.)
+
+fn connect_executor_for(host: &str, addr: SocketAddr) -> ReqwestHttpExecutor {
+    ReqwestHttpExecutor::from_config(ReqwestExecutorConfig {
+        timeout: Duration::from_secs(5),
+        dns_overrides: vec![(host.to_string(), addr)],
+        max_redirects: 0,
+        max_response_bytes: 1024,
+    })
+}
+
+#[tokio::test]
+async fn a_refused_connection_is_a_connect_failure() {
+    // Bind then drop: nothing listens on the port any more.
+    let addr = {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        l.local_addr().unwrap()
+    };
+    let exec = connect_executor_for("api.refused.test", addr);
+    let req = HttpRequest {
+        method: HttpMethod::Post,
+        url: format!("http://api.refused.test:{}/token", addr.port()),
+        headers: vec![],
+        body: b"code=one-time".to_vec(),
+    };
+    let err = exec
+        .execute(&req, Arc::new(AllowAllRedirect))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ExecutorError::Connect(TransportErrorKind::ConnectionRefused)
+        ),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_tls_handshake_the_peer_resets_is_a_connect_failure() {
+    // The peer accepts TCP and closes before any TLS bytes: the handshake never completes,
+    // so the request body was never written.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for _ in 0..4 {
+            if let Ok((sock, _)) = listener.accept().await {
+                drop(sock);
+            }
+        }
+    });
+    let exec = connect_executor_for("auth.tls.test", addr);
+    let req = HttpRequest {
+        method: HttpMethod::Post,
+        url: format!("https://auth.tls.test:{}/token", addr.port()),
+        headers: vec![],
+        body: b"code=one-time".to_vec(),
+    };
+    let err = exec
+        .execute(&req, Arc::new(AllowAllRedirect))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ExecutorError::Connect(TransportErrorKind::Tls)),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failure_after_the_connection_stays_a_plain_transport_failure() {
+    // The server completes the HTTP exchange badly (garbage instead of a status line): the
+    // request was written, so it is not a connect failure.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(b"NOT HTTP\r\n\r\n").await;
+        }
+    });
+    let exec = connect_executor_for("api.garbage.test", addr);
+    let req = HttpRequest {
+        method: HttpMethod::Post,
+        url: format!("http://api.garbage.test:{}/token", addr.port()),
+        headers: vec![],
+        body: b"code=one-time".to_vec(),
+    };
+    let err = exec
+        .execute(&req, Arc::new(AllowAllRedirect))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ExecutorError::Transport), "got {err:?}");
+}

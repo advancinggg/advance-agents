@@ -15,7 +15,7 @@ use crate::ssrf::{build_forbidden_table, normalize_ip};
 use advance_shared_types::security_validator::Allowlist;
 use advance_shared_types::security_validator::{
     CidrClass, HttpMethod, HttpRequest, HttpResponse, HttpResponseHead, LeakDetector,
-    RedirectCheck, RedirectRejectReason, ScanContext, SsrfGuard,
+    RedirectCheck, RedirectRejectReason, ScanContext, SsrfGuard, TransportErrorKind,
 };
 use async_trait::async_trait;
 use ipnet::IpNet;
@@ -32,8 +32,13 @@ pub enum ExecutorError {
         reason: RedirectRejectReason,
         target: String,
     },
-    /// Underlying transport failure (DNS, TLS, connect, etc.).
+    /// Underlying transport failure after the connection may have carried the request.
     Transport,
+    /// The connection was never established (DNS, TCP connect or TLS handshake), so no byte
+    /// of the request reached the server. The kind says which phase failed; a caller whose
+    /// request is not repeatable (a one-time code, a rotating refresh token) may still retry
+    /// this one.
+    Connect(TransportErrorKind),
     /// Request timeout.
     Timeout,
 }
@@ -1296,8 +1301,50 @@ fn literal_host_forbidden(url: &str, forbidden: &[(IpNet, CidrClass)]) -> bool {
 fn map_reqwest_err(e: reqwest::Error) -> ExecutorError {
     if e.is_timeout() {
         ExecutorError::Timeout
+    } else if e.is_connect() {
+        // reqwest reports DNS, TCP connect and TLS handshake failures as connect errors:
+        // the connector never produced a connection, so nothing was written.
+        ExecutorError::Connect(connect_failure_kind(&e))
     } else {
         ExecutorError::Transport
+    }
+}
+
+/// Which connect phase failed, read off the error's source chain. A failure that names
+/// none of the phases is reported as a refused connection (it never connected either way).
+pub(crate) fn connect_failure_kind(e: &(dyn std::error::Error + 'static)) -> TransportErrorKind {
+    let mut text = String::new();
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if io.kind() == std::io::ErrorKind::ConnectionRefused {
+                return TransportErrorKind::ConnectionRefused;
+            }
+        }
+        text.push_str(&err.to_string().to_ascii_lowercase());
+        text.push(' ');
+        cur = err.source();
+    }
+    if text.contains("dns error")
+        || text.contains("failed to lookup address")
+        || text.contains("nodename nor servname")
+    {
+        TransportErrorKind::Dns
+    } else if [
+        "tls",
+        "ssl",
+        "certificate",
+        "handshake",
+        "close_notify",
+        "peer closed connection",
+        "unexpected eof",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+    {
+        TransportErrorKind::Tls
+    } else {
+        TransportErrorKind::ConnectionRefused
     }
 }
 
@@ -1521,6 +1568,75 @@ mod ac17_tests {
         assert!(
             result.is_err(),
             "a late connect-time DNS tunable must gate lookup_host"
+        );
+    }
+}
+
+#[cfg(test)]
+mod connect_kind_tests {
+    use super::connect_failure_kind;
+    use advance_shared_types::security_validator::TransportErrorKind;
+    use std::fmt;
+
+    #[derive(Debug)]
+    struct Wrap(
+        &'static str,
+        Option<Box<dyn std::error::Error + Send + Sync>>,
+    );
+    impl fmt::Display for Wrap {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Wrap {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1
+                .as_deref()
+                .map(|e| e as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn the_failed_phase_is_read_off_the_source_chain() {
+        let refused = Wrap(
+            "error trying to connect",
+            Some(Box::new(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused,
+            ))),
+        );
+        assert_eq!(
+            connect_failure_kind(&refused),
+            TransportErrorKind::ConnectionRefused
+        );
+        let dns = Wrap(
+            "error trying to connect",
+            Some(Box::new(Wrap(
+                "dns error: failed to lookup address information",
+                None,
+            ))),
+        );
+        assert_eq!(connect_failure_kind(&dns), TransportErrorKind::Dns);
+        let tls = Wrap(
+            "error trying to connect",
+            Some(Box::new(Wrap("tls handshake eof", None))),
+        );
+        assert_eq!(connect_failure_kind(&tls), TransportErrorKind::Tls);
+        let reset = Wrap(
+            "error trying to connect",
+            Some(Box::new(Wrap(
+                "peer closed connection without sending TLS close_notify",
+                None,
+            ))),
+        );
+        assert_eq!(connect_failure_kind(&reset), TransportErrorKind::Tls);
+        let unnamed = Wrap(
+            "error trying to connect",
+            Some(Box::new(Wrap("network is unreachable", None))),
+        );
+        assert_eq!(
+            connect_failure_kind(&unnamed),
+            TransportErrorKind::ConnectionRefused,
+            "it never connected: reported as a refused connection"
         );
     }
 }
