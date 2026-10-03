@@ -18,13 +18,18 @@ path = "src/lib.rs"
 
 [features]
 default = []
-test-support = []
+# Forwards to the composition library, which owns the test-only seams and the
+# test-only CONTRACT-218 platform root.
+test-support = ["advance-runtime-compose/test-support"]
 
 [[bin]]
 name = "advance"
 path = "src/main.rs"
 
 [dependencies]
+# The composition behind `advance start` (`commands::start` forwards to
+# `advance_runtime_compose::run_daemon`); `lib.rs` re-exports its modules.
+advance-runtime-compose = { path = "../runtime-compose" }
 advance-runtime = { path = "../runtime" }
 advance-home = { path = "../advance-home" }
 # MODULE-001-AC-20 (024): core->component encode for the deploy-component loader.

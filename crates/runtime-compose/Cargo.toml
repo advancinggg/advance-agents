@@ -1,0 +1,97 @@
+[package]
+name = "advance-runtime-compose"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The runtime composition behind `advance start`: capability wiring, agent loop, bootstraps, channel boot, Client API adapters, pack runtime and the daemon entry."
+
+# Pathless internal dependencies are accepted by cargo-deny only for private crates.
+publish = false
+
+[lib]
+name = "advance_runtime_compose"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Test-only seams (fixture-only monotonic-record backends, failpoints, `*_for_test`
+# constructors, `daemon::{TestServeLoop, spawn_test_agent_loop}`) and the test-only
+# CONTRACT-218 platform root under the temp dir. `advance-cli`'s `test-support`
+# forwards here.
+test-support = []
+
+[dependencies]
+advance-runtime = { path = "../runtime" }
+advance-home = { path = "../advance-home" }
+# Core -> component encode for the deploy-component loader.
+build-agent = { path = "../build-agent" }
+# Same feature set as `advance-cli` declared before the move, so the `advance`
+# binary's unified tokio feature set is unchanged.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }
+tokio-util = { workspace = true }
+axum = { workspace = true }
+advance-scheduler = { path = "../scheduler" }
+advance-scheduler-auto-loop = { path = "../scheduler/auto-loop" }
+advance-pack-manager = { path = "../services/pack-manager" }
+advance-messaging = { path = "../messaging" }
+advance-git = { path = "../git" }
+wasmtime = { workspace = true }
+advance-database = { path = "../database" }
+advance-event-bus = { path = "../event-bus" }
+advance-client-api = { path = "../client-api" }
+advance-run-manager = { path = "../run-manager" }
+advance-shared-types = { path = "../shared-types" }
+advance-reply-tracker = { path = "../messaging/reply-tracker" }
+advance-context-engine = { path = "../context-engine" }
+cap-grant = { path = "../capabilities/cap-grant" }
+cap-secrets = { path = "../capabilities/cap-secrets" }
+cap-skills = { path = "../capabilities/cap-skills" }
+cap-llm = { path = "../capabilities/cap-llm" }
+cap-fs = { path = "../capabilities/cap-fs" }
+cap-tools = { path = "../capabilities/cap-tools" }
+cap-data = { path = "../capabilities/cap-data" }
+walkdir = { workspace = true }
+cap-memory = { path = "../capabilities/cap-memory" }
+cap-http = { path = "../capabilities/cap-http" }
+cap-lifecycle = { path = "../capabilities/cap-lifecycle" }
+cap-channel = { path = "../capabilities/cap-channel" }
+cap-mcp = { path = "../capabilities/cap-mcp" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+zeroize = { workspace = true }
+chacha20poly1305 = { workspace = true }
+fd-lock = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+reqwest = { workspace = true }
+semver = { workspace = true }
+secrecy = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+# Self dev-dep: the crate's own `#[cfg(test)]` units build with `test-support`
+# on (as they did inside `advance-cli`), without shipping the feature in
+# production builds.
+advance-runtime-compose = { path = ".", features = ["test-support"] }
+tempfile = { workspace = true }
+# The fake `LlmGatewayInternal::stream()` in the unit tests names `futures_core::Stream`.
+futures-core = { workspace = true }
+git2 = { workspace = true }
+wit-component = { workspace = true }
+
+[lints]
+workspace = true

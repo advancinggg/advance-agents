@@ -208,7 +208,7 @@ fn late_install_skips_symlinked_skills_root() {
 
 #[test]
 fn run_async_source_calls_install_tools_if_real() {
-    let start = include_str!("../src/commands/start.rs");
+    let start = include_str!("../../runtime-compose/src/daemon/mod.rs");
     assert!(
         start.contains("install_tools_if_real"),
         "production run_async must late-install tools via install_tools_if_real"

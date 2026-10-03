@@ -75,10 +75,10 @@ fn t53_identity_is_runtime_resolved_not_hardcoded() {
         fs::read_to_string(crates.join("capabilities/cap-lifecycle/src/identity.rs")).unwrap();
     assert!(identity.contains("pub const ID_KEY: &str = \"id\""));
     assert!(identity.contains("pub const ROOT_HANDLE: &str = \"root\""));
-    let start = fs::read_to_string(crates.join("cli/src/commands/start.rs")).unwrap();
+    let start = fs::read_to_string(crates.join("runtime-compose/src/daemon/mod.rs")).unwrap();
     assert!(!start.contains("let cap_agent_id = \"root\""));
     assert!(start.contains("let cap_agent_id = root_agent_id;"));
-    let wiring = fs::read_to_string(crates.join("cli/src/wiring.rs")).unwrap();
+    let wiring = fs::read_to_string(crates.join("runtime-compose/src/wiring.rs")).unwrap();
     assert!(!wiring.contains("const DEFAULT_AGENT_ID"));
     assert!(wiring.contains("resolve_root_identity(workspace)"));
 }

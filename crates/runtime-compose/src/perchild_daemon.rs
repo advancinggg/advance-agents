@@ -497,7 +497,7 @@ impl SpawnObserver for PerChildLoopManager {
             eprintln!("perchild: runtime/injector not bound; child {child_bare} not served");
             return;
         };
-        let bytes = match crate::commands::start::resolve_driver_component_bytes(workspace) {
+        let bytes = match crate::daemon::resolve_driver_component_bytes(workspace) {
             Ok(Some((_, bytes))) => bytes,
             Ok(None) => {
                 eprintln!("perchild: child {child_bare} has no driver; not served");

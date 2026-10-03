@@ -2,7 +2,7 @@
 
 #[test]
 fn production_agent_loop_uses_client_ingress_store() {
-    let src = include_str!("../src/commands/start.rs");
+    let src = include_str!("../../runtime-compose/src/daemon/mod.rs");
     assert!(
         src.contains("client_ingress_store.clone()"),
         "run_async must pass client_ingress_store into try_spawn_agent_loop"

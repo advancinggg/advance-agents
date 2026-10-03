@@ -30,7 +30,7 @@ use advance_pack_manager::{
 use advance_runtime::config::PackConfig;
 use async_trait::async_trait;
 
-use crate::commands::pack::capability_catalog;
+use crate::capability_catalog::capability_catalog;
 use crate::pack_registry_client::HttpsRegistryClient;
 
 /// Approves a manifest iff every `required-capabilities` entry was accepted by the request.

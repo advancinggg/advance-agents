@@ -40,13 +40,14 @@ use advance_pack_manager::meta::read_meta_index;
 use advance_pack_manager::{
     ApprovalStrategy, AutoReject, CatalogCheckedApproval, InMemoryPackRegistry, Installer,
     InteractiveApproval, PackError, PackManifest, PackRegistry, RejectUnlessTrivial,
-    StaticCapabilityCatalog,
 };
 use advance_runtime::config::{load_config, PackApprovalPolicy, PackConfig};
 
 use super::skill::{safe_msg, safe_path};
-use crate::agent_config::KNOWN_CAPABILITIES;
 use crate::pack_registry_client::HttpsRegistryClient;
+// The catalog lives in the composition library, which the Client API packs family checks
+// against too; re-exported here under its former path.
+pub use advance_runtime_compose::capability_catalog::capability_catalog;
 
 /// Runtime version the installer checks `runtime-version:` ranges against.
 const CURRENT_RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -108,12 +109,6 @@ async fn rescanned_registry(
         return Err(ExitCode::from(1));
     }
     Ok(registry)
-}
-
-/// The catalog a pack's `required-capabilities` are checked against at install (CLI and
-/// Client API alike): exactly the runtime's capability names. A pack never adds one.
-pub fn capability_catalog() -> StaticCapabilityCatalog {
-    StaticCapabilityCatalog::new(KNOWN_CAPABILITIES.iter().copied())
 }
 
 /// Operator-facing rendering of a `PackError` (`PackNotFound` reads

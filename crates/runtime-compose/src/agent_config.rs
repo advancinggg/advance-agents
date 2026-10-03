@@ -2,7 +2,7 @@
 //!
 //! Single source of truth for "is capability X active for this agent". Used by
 //! both [`crate::wiring::wire_capabilities`] (which host fns to register at L0)
-//! and [`crate::commands::start`]'s agent-loop wiring (which `CapRequest`s to
+//! and [`crate::daemon`]'s agent-loop wiring (which `CapRequest`s to
 //! inject into the guest's linker). Factored out of `wiring.rs` so the two
 //! paths cannot drift — a capability the daemon registers at L0 is exactly the
 //! one the loop requests for the guest.
