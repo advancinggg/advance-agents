@@ -1,0 +1,10 @@
+# MODULE-001-T111 (1) `advance start` on H1 (capabilities: fs, llm; deployed driver; no git repository) with stdout's read end closed right after spawn (EPIPE on the readiness line)
+exit=101
+--- stderr ---
+advance: Client API and Web Console listening at http://127.0.0.1:<PORT>
+
+thread 'main' (<TID>) panicked at <PANIC_LOCATION>:
+failed printing to stdout: Broken pipe (os error 32)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--- .runtime after exit ---
+runtime.lock=absent client-api=present selected-provider=present

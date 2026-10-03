@@ -1,0 +1,7 @@
+# MODULE-001-T111 (1) `advance start` on a workspace without .advance/runtime-config.yaml
+exit=1
+--- stdout ---
+--- stderr ---
+advance start: runtime-config.yaml not found at "<ROOT>/ws/.advance/runtime-config.yaml"; run `advance init <workspace>` first
+--- .runtime after exit ---
+runtime.lock=absent client-api=absent selected-provider=absent

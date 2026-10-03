@@ -1,0 +1,2 @@
+# MODULE-001-T111 (1) `advance start` stderr on H2 (capabilities: every KNOWN_CAPABILITIES entry = secrets, fs, skills, memory, grant, llm, tools, messaging, lifecycle, genui; genui.enabled: true; deployed driver; git repository) — normalised, spawn to EOF after SIGTERM
+advance: Client API and Web Console listening at http://127.0.0.1:<PORT>

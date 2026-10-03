@@ -1,0 +1,6 @@
+# MODULE-001-T111 (1) runtime files of `advance start` on H1 (capabilities: fs, llm; deployed driver; no git repository) while running
+# bytes = the exact file content as a Rust string literal (no trailing newline unless shown)
+.runtime/runtime.lock mode=0600 bytes="pid: <PID>\nplatform_uid: \"<OS>:<PID>:<PS_LSTART>\"\nstarted_at: \"<RFC3339_UTC>\"\nheartbeat_at: \"<RFC3339_UTC>\"\nworkspace_root: \"<ROOT>/ws\"\nversion: \"0.1.0\""
+.runtime/client-api mode=0600 bytes="pid: <PID>\nclient_api_base: \"http://127.0.0.1:<PORT>\"\n"
+.runtime/selected-provider mode=0600 bytes="pid: <PID>\nprovider_id: \"openai\"\n"
+after exit: runtime.lock=absent client-api=present selected-provider=present

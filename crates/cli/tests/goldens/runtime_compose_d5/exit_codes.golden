@@ -1,0 +1,5 @@
+# MODULE-001-T111 (1) exit status of `advance start` (`= NAME` rows are pinned by that constant in this file)
+missing_runtime_config: exit=1
+readiness_write_failure: = READINESS_WRITE_FAILURE
+sigterm_after_readiness h1_fs_llm: exit=0
+sigterm_after_readiness h2_all_capabilities: = H2_SIGTERM_AFTER_READINESS
