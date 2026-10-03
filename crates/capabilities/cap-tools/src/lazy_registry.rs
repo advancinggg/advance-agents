@@ -179,8 +179,8 @@ impl From<&ToolsConfig> for LazyRegistryConfig {
 /// Pack lane P2 — a host-native tool: same agent-facing
 /// contract as a tool WASM (`describe()` → methods; `execute(method, params)`
 /// → bytes), implemented in host code so it can hold state the WASI-only
-/// linker cannot give a guest (stores, database handles, pack resource
-/// capabilities). Registered through [`LazyToolRegistry::register_host`].
+/// linker cannot give a guest (stores, database handles). Registered through
+/// [`LazyToolRegistry::register_host`].
 ///
 /// Implementations MUST validate `method` themselves only for the methods
 /// they declared — the registry already refuses undeclared methods with

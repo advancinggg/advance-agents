@@ -685,6 +685,74 @@ checksums:
         }
     }
 
+    /// A minimal manifest whose only `provides:` list is `skills: [<entries>]`; `entries` is
+    /// spliced in verbatim as flow-sequence content.
+    fn manifest_with_skills(entries: &str) -> String {
+        format!(
+            "name: x\nversion: 1.0.0\nruntime-version: \">=0.0.1\"\nprovides:\n  skills: \
+             [{entries}]\nchecksums:\n  algo: sha256\n  files: {{}}"
+        )
+    }
+
+    /// The manifest is refused by the provides-name check itself (not by the YAML parser).
+    fn assert_skills_entry_rejected(entries: &str) {
+        match PackManifest::from_yaml(&manifest_with_skills(entries)) {
+            Err(PackError::InvalidManifest(msg)) => assert!(
+                msg.contains("provides.skills entry rejected"),
+                "{entries}: {msg}"
+            ),
+            other => panic!("expected InvalidManifest for {entries}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provides_entry_rejects_nul_byte() {
+        // YAML's `\0` escape requires a double-quoted string.
+        assert_skills_entry_rejected(r#""foo\0bar""#);
+    }
+
+    #[test]
+    fn provides_entry_rejects_whitespace() {
+        assert_skills_entry_rejected(r#""has space""#);
+        assert_skills_entry_rejected(r#""has\ttab""#);
+    }
+
+    #[test]
+    fn provides_entry_rejects_control_bytes() {
+        // A provide name becomes a directory component and is interpolated into install and
+        // rescan error strings: newline, CR and ESC are a terminal-/log-injection surface.
+        for bad in [r#""cap\ncap""#, r#""cap\rcap""#, r#""cap\x1bcap""#] {
+            assert_skills_entry_rejected(bad);
+        }
+    }
+
+    #[test]
+    fn provides_entry_rejects_non_ascii() {
+        // A zero-width space renders invisibly next to an ASCII look-alike name.
+        assert_skills_entry_rejected("\"cap\u{200b}x\"");
+    }
+
+    #[test]
+    fn provides_length_cap_enforced() {
+        // At most 256 entries per kind: 256 parse, 257 are refused.
+        let names = |n: usize| {
+            (0..n)
+                .map(|i| format!("s{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let m = PackManifest::from_yaml(&manifest_with_skills(&names(256)))
+            .expect("256 entries are within the cap");
+        assert_eq!(m.provides.skills.len(), 256);
+        match PackManifest::from_yaml(&manifest_with_skills(&names(257))) {
+            Err(PackError::InvalidManifest(msg)) => assert!(
+                msg.contains("provides.skills length 257 exceeds max 256"),
+                "{msg}"
+            ),
+            other => panic!("expected InvalidManifest (length cap), got {other:?}"),
+        }
+    }
+
     // `provides: resource-capabilities` is a retired content kind. It parses whatever its
     // value (`null` included), so a pack installed by an older runtime keeps loading; nothing
     // validates the value, and install / bundle refuse the declaration by name.

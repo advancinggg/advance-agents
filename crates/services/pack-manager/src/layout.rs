@@ -230,6 +230,33 @@ mod tests {
     }
 
     #[test]
+    fn pack_layout_rejects_canonical_dir_as_file() {
+        // Every content-kind name is directory-backed: a regular file under that name is
+        // refused by its type, although the name is on the allow-list.
+        for name in [
+            "behavior-binaries",
+            "agent-templates",
+            "skills",
+            "components",
+            "channel-adapters",
+            "mcp-servers",
+            "presets",
+            "workflows",
+            "memory-seeds",
+            "meta-schema-extensions",
+        ] {
+            let dir = make_pack_dir(&[(name, false)]);
+            match validate_pack_layout(dir.path()) {
+                Err(PackError::InvalidManifest(msg)) => assert!(
+                    msg.contains(&format!("top-level {name:?} must be a directory")),
+                    "{name}: {msg}"
+                ),
+                other => panic!("expected InvalidManifest for a file named {name}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn pack_layout_rejects_resource_capabilities_dir() {
         // The directory of the retired `resource-capabilities` content kind is not part of
         // the layout.

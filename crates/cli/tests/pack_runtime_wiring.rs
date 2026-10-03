@@ -237,8 +237,9 @@ async fn a_pack_installed_before_boot_is_live_at_boot() {
 }
 
 // A pack that an older runtime installed with the retired `provides: resource-capabilities` key
-// does not stop the daemon: it boots, the rest of the pack is live, and the key is reported as
-// ignored, once for the pack. A new install declaring the key is refused.
+// (and the `resource-capabilities/` directory it required) does not stop the daemon: it boots,
+// the rest of the pack is live, and the key is reported as ignored, once for the pack. A new
+// install declaring the key is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pack_declaring_the_retired_resource_capabilities_key_still_boots() {
     let ws = workspace();
@@ -255,6 +256,17 @@ async fn a_pack_declaring_the_retired_resource_capabilities_key_still_boots() {
     );
     assert_ne!(with_key, text);
     std::fs::write(&manifest, &with_key).unwrap();
+    // An older runtime required `resource-capabilities/<name>/capability.yaml` for each listed
+    // name, at install and at every rescan, so such a pack carries the directory too.
+    let legacy = installed
+        .install_path
+        .join("resource-capabilities/structured-data");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(
+        legacy.join("capability.yaml"),
+        "id: advance.structured-data\ncanonical_surfaces: [projection-native]\n",
+    )
+    .unwrap();
 
     let (_host, handles) = boot(&ws).await;
     let api = operator_api(&handles);

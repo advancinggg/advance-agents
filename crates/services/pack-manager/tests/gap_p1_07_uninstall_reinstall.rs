@@ -280,8 +280,9 @@ async fn a_damaged_pack_can_still_be_uninstalled() {
 
 // `provides: resource-capabilities` is a retired content kind. Install refuses a manifest that
 // declares it, right after the manifest parse (before approval, nothing left behind). A pack
-// that an older runtime installed with the key keeps loading, the key ignored, so neither boot
-// nor `pack list` breaks, and it uninstalls normally.
+// that an older runtime installed with the key (and the `resource-capabilities/` directory it
+// required) keeps loading, both ignored, so neither boot nor `pack list` breaks, and it
+// uninstalls normally.
 #[tokio::test]
 async fn the_retired_resource_capabilities_key_is_refused_at_install_and_ignored_at_rescan() {
     let work = tempfile::TempDir::new().unwrap();
@@ -315,12 +316,23 @@ async fn the_retired_resource_capabilities_key_is_refused_at_install_and_ignored
     assert!(!packs.path().join("a@1.0.0").exists());
     assert!(inst.registry.list_installed().is_empty());
 
-    // What a runtime that still accepted the key left installed.
+    // What a runtime that still accepted the key left installed: the key, and for each listed
+    // name the `resource-capabilities/<name>/capability.yaml` it required at install and at
+    // every rescan.
     std::fs::write(&manifest, &plain).unwrap();
     inst.install(src.to_str().unwrap())
         .await
         .expect("install without the key");
     std::fs::write(packs.path().join("a@1.0.0/pack.yaml"), &with_key).unwrap();
+    let legacy = packs
+        .path()
+        .join("a@1.0.0/resource-capabilities/structured-data");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(
+        legacy.join("capability.yaml"),
+        "id: advance.structured-data\ncanonical_surfaces: [projection-native]\n",
+    )
+    .unwrap();
     inst.registry
         .rescan()
         .await
