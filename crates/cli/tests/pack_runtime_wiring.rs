@@ -271,7 +271,10 @@ async fn the_agenda_views_reach_clients_with_their_presentation() {
     let board = view("board");
     assert_eq!(board.group_by.as_deref(), Some("status"));
     assert_eq!(board.order, [key("priority", false), key("due", true)]);
-    assert_eq!(board.label.as_deref(), Some("Board"));
+    assert_eq!(
+        (board.label.as_deref(), board.icon.as_deref()),
+        (Some("Board"), Some("kanban"))
+    );
     assert_eq!(
         view("list").columns,
         ["title", "status", "due", "priority", "assignee"]
@@ -303,9 +306,10 @@ async fn the_agenda_views_reach_clients_with_their_presentation() {
             ("cancelled", Some("muted")),
         ]
     );
+    let due = field("due").display.clone().expect("due is presented");
     assert_eq!(
-        field("due").display.clone().unwrap().format.as_deref(),
-        Some("date")
+        (due.format.as_deref(), due.icon.as_deref()),
+        (Some("date"), Some("calendar"))
     );
     let title = field("title");
     assert_eq!(title.r#type, "string");

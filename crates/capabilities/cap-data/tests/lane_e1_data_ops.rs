@@ -799,6 +799,19 @@ async fn e1_describe_projects_view_presentation() {
     );
 }
 
+/// A store over an empty workspace whose whole schema is `yaml`.
+fn store_over(ws: &tempfile::TempDir, yaml: &str) -> DataStore {
+    let schema = MetaSchemaLoader::from_yaml(PathBuf::from("/nonexistent/meta-schema.yaml"), yaml)
+        .expect("parses");
+    DataStore::new(
+        Arc::new(DirWorkspaceFs::new(ws.path().to_path_buf())),
+        Arc::new(MemoryEntityIndex::default()),
+        Arc::new(schema),
+        Arc::new(SequentialIds::default()),
+        Arc::new(FixedClock::at(NOW)),
+    )
+}
+
 // An aspect that presents nothing describes as before: no presentation key is serialized, and
 // a field or enum value whose presentation is empty is left out.
 #[tokio::test]
@@ -826,16 +839,7 @@ display:
     note: {}
 ";
     let ws = tempfile::TempDir::new().unwrap();
-    let schema = MetaSchemaLoader::from_yaml(PathBuf::from("/nonexistent/meta-schema.yaml"), PLAIN)
-        .expect("parses");
-    let s = DataStore::new(
-        Arc::new(DirWorkspaceFs::new(ws.path().to_path_buf())),
-        Arc::new(MemoryEntityIndex::default()),
-        Arc::new(schema),
-        Arc::new(SequentialIds::default()),
-        Arc::new(FixedClock::at(NOW)),
-    );
-    let d = s.describe("alice").await;
+    let d = store_over(&ws, PLAIN).describe("alice").await;
     let tasks = &d.aspects[0];
     assert_eq!(
         tasks
@@ -869,6 +873,69 @@ display:
         json!({ "values": [{ "value": "open", "tone": "info" }] }),
         "an empty value is left out"
     );
+}
+
+// Each promoted column an aspect presents is listed among its fields under the column's fixed
+// type, sorted in with the declared ones: `type` is a string, `updated_at` a datetime the host
+// maintains, so it is derived.
+#[tokio::test]
+async fn e1_describe_lists_presented_promoted_columns_under_their_fixed_types() {
+    const COLUMNS: &str = "\
+aspect: tasks
+key: [state]
+fields:
+  state:
+    type: [open, shut]
+  zone:
+    type: string
+queries:
+  all: {}
+views:
+  rows: { kind: list, query: all }
+display:
+  fields:
+    updated_at: { format: relative }
+    type: { label: Kind }
+";
+    let ws = tempfile::TempDir::new().unwrap();
+    let d = store_over(&ws, COLUMNS).describe("alice").await;
+    let tasks = &d.aspects[0];
+    assert_eq!(
+        tasks
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
+        ["state", "type", "updated_at", "zone"],
+        "the presented columns sort in among the declared fields; `title` is not presented"
+    );
+    let field = |name: &str| tasks.fields.iter().find(|f| f.name == name).unwrap();
+
+    let updated_at = field("updated_at");
+    assert_eq!(updated_at.r#type, "datetime");
+    assert!(updated_at.derived, "the host maintains `updated_at`");
+    assert_eq!(
+        updated_at.display.as_ref().unwrap().format.as_deref(),
+        Some("relative")
+    );
+
+    let kind = field("type");
+    assert_eq!(kind.r#type, "string");
+    assert!(!kind.derived);
+    assert_eq!(
+        kind.display.as_ref().unwrap().label.as_deref(),
+        Some("Kind")
+    );
+
+    for column in [updated_at, kind] {
+        assert!(
+            !column.inherit
+                && column.r#enum.is_none()
+                && column.default.is_none()
+                && column.transitions.is_none(),
+            "a promoted column has no field spec: {column:?}"
+        );
+    }
 }
 
 // ── the `data` host tool ─────────────────────────────────────────────────────────────────────

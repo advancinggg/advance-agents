@@ -7,9 +7,13 @@ pub const VIEW_KINDS: &[&str] = &["list", "table", "board", "calendar", "form"];
 
 /// The catalog component that renders a schema view kind; `None` for an unknown kind.
 ///
-/// `list` and `table` share `DataTable` (a list is a one-column table); `board` → `Board`
-/// (columns from the `group_by` field's enum), `calendar` → `Calendar` (occurrences of the
-/// view's query), `form` → `EntityForm` (one record, fields from the aspect).
+/// `list` and `table` share `DataTable`, whose columns are the view's `columns` in order, the
+/// first being a row's primary line. `board` → `Board`: its lanes (`Board.columns`) are the
+/// `group_by` field's enum values in declared order, and a card shows the view's `columns`, the
+/// first as its title. `calendar` → `Calendar`: the occurrences of the view's query, each with
+/// the view's `columns` as its details. `form` → `EntityForm`: one record, whose inputs are the
+/// view's `columns`, a `derived` field rendering read-only. When a view names no `columns`, the
+/// client chooses.
 pub fn component_for_view_kind(kind: &str) -> Option<&'static str> {
     match kind {
         "list" | "table" => Some("DataTable"),
