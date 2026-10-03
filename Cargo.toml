@@ -6,9 +6,9 @@ resolver = "2"
 [workspace.package]
 # Single source of truth for every member crate version (pre-genesis unification,
 # OPEN-CORE-PUBLISH-RUNBOOK §Pre-genesis #1). Members inherit via
-# `version.workspace = true`. Consumers pin releases by git tag (v0.1.24), so this
+# `version.workspace = true`. Consumers pin releases by git tag (v0.1.25), so this
 # version and the release tag must move together.
-version = "0.1.24"
+version = "0.1.25"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 # The public OSS remote (final name adjudicated 2026-08-07: the ORIGINAL URL is kept
@@ -327,7 +327,7 @@ regex = "=1.11.1"
 # (U+FE50..U+FE6F) + other NFKC-decomposable ASCII-equivalents bypass the ASCII-literal
 # regexes in INJECTION_PATTERNS / LEAK_PATTERNS unless normalized at scan time. Pure-Rust,
 # no_std-capable, ~200 KB. Pinned per Slice A' supply-chain discipline.
-unicode-normalization = "=0.1.24"
+unicode-normalization = "=0.1.25"
 # Slice m012-C (2026-04-27): cap-http HttpSecurityChain + SsrfGuard deps.
 # url — RFC 3986 URL parsing for SSRF host extraction + percent-encoding for
 # QueryParam credential injection. Pinned =2.5.8 (matches Cargo.lock-resolved
