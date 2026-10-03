@@ -49,8 +49,7 @@ pub const MAX_IDENTIFIER_LEN: usize = 64;
 pub const MAX_PATCH_OPS: usize = 64;
 /// Bound on the number of `status` values in an ad-hoc filter.
 pub const MAX_FILTER_STATUSES: usize = 32;
-/// Bound on the number of `order` keys in an ad-hoc filter.
-pub const MAX_ORDER_KEYS: usize = 4;
+pub use advance_shared_types::entity::MAX_ORDER_KEYS;
 
 // ── Schema DTOs (CONTRACT-192 schema components) ─────────────────────────────────────────────
 

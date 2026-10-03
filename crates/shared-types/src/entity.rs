@@ -27,6 +27,9 @@ pub const MAX_ENTITY_QUERY_LIMIT: usize = 1000;
 /// Default `EntityQuery::limit`.
 pub const DEFAULT_ENTITY_QUERY_LIMIT: usize = 100;
 
+/// Bound on the number of `order` keys a client's ad-hoc filter or a declared view may carry.
+pub const MAX_ORDER_KEYS: usize = 4;
+
 /// Prefix of every host-assigned entity id (`"e-"` + 26-char Crockford-base32 ULID).
 pub const ENTITY_ID_PREFIX: &str = "e-";
 

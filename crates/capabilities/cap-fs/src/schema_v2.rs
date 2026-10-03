@@ -1,21 +1,27 @@
 //! Meta-schema grammar v2: aspects, field
 //! invariants (`transitions` / `derive` / `ensure` / `inherit`), named queries, views and
 //! operation bindings, plus the closed expression language (`$now`, `$args.x`, `$self.x`,
-//! literals, `± <duration>`).
+//! literals, `± <duration>`) and each aspect's presentation (`display`).
 //!
 //! Two document shapes parse through [`parse_document`]:
 //! - the workspace schema (`required` / `optional` / `aspects: {name: {…}}`), and
 //! - a pack extension declaring ONE aspect at the top level (`aspect: name`, `key`, `fields`,
-//!   `queries`, `views`, `operations`), optionally with a v1 `optional:` block.
+//!   `queries`, `views`, `operations`, `display`), optionally with a v1 `optional:` block.
 //!
 //! Aspect fields are namespaced under their aspect and validated for frontmatter records;
 //! `optional` fields remain the `.meta.yaml` entry vocabulary. A field name shared by two
-//! aspects must carry an identical spec (fields are a global vocabulary across aspects).
-//! Unknown keys anywhere are rejected.
+//! aspects must carry an identical spec (fields are a global vocabulary across aspects). A
+//! query or operation name belongs to exactly one aspect, because requests name them without
+//! their aspect.
+//!
+//! `display` holds presentation only: labels, icons, per-field formats, per-enum-value tones,
+//! the default view and the view order. Validation, storage and queries never consult it, so
+//! two aspects may present a shared field differently. Its vocabularies (formats, tones) are
+//! closed. Unknown keys anywhere are rejected.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use advance_shared_types::entity::OrderKey;
+use advance_shared_types::entity::{OrderKey, MAX_ORDER_KEYS};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_yml::Value;
@@ -160,9 +166,19 @@ impl ViewKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewSpec {
     pub kind: ViewKind,
+    /// The query that feeds the view (declared by the same aspect); `None` only on a form.
     pub query: Option<String>,
+    /// A board's lanes (an enum field, required on a board) or a list / table's sections (a
+    /// non-list field). A calendar or form takes none.
     pub group_by: Option<String>,
+    /// The fields the view shows, in order: aspect fields or the promoted columns `title` /
+    /// `type` / `updated_at` (a form shows neither `type` nor `updated_at`). Empty = the client
+    /// chooses.
     pub columns: Vec<String>,
+    /// The order a client presents the query's rows in (within each group when grouped). Empty
+    /// = the query's own order. It never changes which rows the query returns. A calendar or
+    /// form takes none.
+    pub order: Vec<OrderKey>,
 }
 
 /// An operation binding: the skill tool (`skill::<tool>`) and method that compute the
@@ -171,6 +187,196 @@ pub struct ViewSpec {
 pub struct OperationBinding {
     pub tool: String,
     pub method: String,
+}
+
+/// How a client presents a field's value (`display.fields.<f>.format`). The vocabulary is
+/// closed, and each format suits only some field types ([`DisplayFormat::allows`]). Without a
+/// declared format a client infers one from the field type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayFormat {
+    /// Plain text.
+    Text,
+    /// A number.
+    Number,
+    /// A priority: a higher value is more urgent.
+    Priority,
+    /// A checkbox.
+    Checkbox,
+    /// A badge; an enum value takes its declared tone.
+    Badge,
+    /// A list of tags.
+    Tags,
+    /// A person, or a list of people.
+    Person,
+    /// A calendar date.
+    Date,
+    /// A date with a time of day.
+    DateTime,
+    /// A moment relative to now ("in 3 days", "2 hours ago").
+    Relative,
+    /// A length of time.
+    Duration,
+    /// An RFC 5545 recurrence rule.
+    Recurrence,
+    /// An IANA time zone name.
+    Timezone,
+}
+
+impl DisplayFormat {
+    /// Every format, in declaration order.
+    pub const ALL: [Self; 13] = [
+        Self::Text,
+        Self::Number,
+        Self::Priority,
+        Self::Checkbox,
+        Self::Badge,
+        Self::Tags,
+        Self::Person,
+        Self::Date,
+        Self::DateTime,
+        Self::Relative,
+        Self::Duration,
+        Self::Recurrence,
+        Self::Timezone,
+    ];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.as_str() == s)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Number => "number",
+            Self::Priority => "priority",
+            Self::Checkbox => "checkbox",
+            Self::Badge => "badge",
+            Self::Tags => "tags",
+            Self::Person => "person",
+            Self::Date => "date",
+            Self::DateTime => "datetime",
+            Self::Relative => "relative",
+            Self::Duration => "duration",
+            Self::Recurrence => "recurrence",
+            Self::Timezone => "timezone",
+        }
+    }
+
+    /// Whether the format may present a field of type `t`.
+    pub fn allows(self, t: &FieldType) -> bool {
+        use FieldType as T;
+        match self {
+            Self::Text => matches!(
+                t,
+                T::String | T::Integer | T::Boolean | T::DateTime | T::Duration | T::EnumString(_)
+            ),
+            Self::Number => matches!(t, T::Integer),
+            Self::Priority => matches!(t, T::Integer | T::EnumString(_)),
+            Self::Checkbox => matches!(t, T::Boolean),
+            Self::Badge => matches!(t, T::String | T::EnumString(_)),
+            Self::Tags => matches!(t, T::ListString),
+            Self::Person => matches!(t, T::String | T::ListString),
+            Self::Date | Self::DateTime => matches!(t, T::DateTime | T::ListDateTime),
+            Self::Relative => matches!(t, T::DateTime),
+            Self::Duration => matches!(t, T::Duration),
+            Self::Recurrence | Self::Timezone => matches!(t, T::String),
+        }
+    }
+}
+
+/// The semantic tone of an enum value (`display.fields.<f>.values.<v>.tone`): a name a client
+/// maps onto its own palette, never a color. The vocabulary is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Neutral,
+    Info,
+    Success,
+    Warning,
+    Error,
+    Muted,
+}
+
+impl Tone {
+    /// Every tone, in declaration order.
+    pub const ALL: [Self; 6] = [
+        Self::Neutral,
+        Self::Info,
+        Self::Success,
+        Self::Warning,
+        Self::Error,
+        Self::Muted,
+    ];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.as_str() == s)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Neutral => "neutral",
+            Self::Info => "info",
+            Self::Success => "success",
+            Self::Warning => "warning",
+            Self::Error => "error",
+            Self::Muted => "muted",
+        }
+    }
+}
+
+/// Bound on the number of `columns` of one view.
+pub const MAX_VIEW_COLUMNS: usize = 64;
+/// Bound on the length of a label, in characters.
+pub const MAX_LABEL_CHARS: usize = 64;
+/// Bound on the length of an icon name, in bytes.
+pub const MAX_ICON_BYTES: usize = 48;
+
+/// How clients present one aspect (`display:`). Presentation only: validation, storage and
+/// queries never consult it.
+///
+/// A label is plain single-line text of 1..=[`MAX_LABEL_CHARS`] characters, without control
+/// characters, line or paragraph separators, bidi controls, `<` or `>`. An icon is a name in
+/// the client's icon set (`[a-z0-9]+(-[a-z0-9]+)*`, at most [`MAX_ICON_BYTES`] bytes); a name
+/// the client does not know renders without an icon.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AspectDisplay {
+    pub label: Option<String>,
+    pub icon: Option<String>,
+    /// The view a client opens first; never a form. `None` = the client chooses.
+    pub default_view: Option<String>,
+    /// The order a client lists the views in: declared views, each at most once. Empty = the
+    /// client chooses.
+    pub view_order: Vec<String>,
+    /// Label and icon per view, keyed by view name.
+    pub views: BTreeMap<String, ViewDisplay>,
+    /// Presentation per field, keyed by aspect field or promoted column (`title` / `type` /
+    /// `updated_at`, typed string, string and datetime).
+    pub fields: BTreeMap<String, FieldDisplay>,
+}
+
+/// Label and icon of one view (`display.views.<v>`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ViewDisplay {
+    pub label: Option<String>,
+    pub icon: Option<String>,
+}
+
+/// Presentation of one field (`display.fields.<f>`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FieldDisplay {
+    /// A format that suits the field's type.
+    pub format: Option<DisplayFormat>,
+    pub label: Option<String>,
+    pub icon: Option<String>,
+    /// Enum fields only: presentation per variant, keyed by variant (any subset of them).
+    pub values: BTreeMap<String, ValueDisplay>,
+}
+
+/// Presentation of one enum value (`display.fields.<f>.values.<v>`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ValueDisplay {
+    pub tone: Option<Tone>,
+    pub label: Option<String>,
+    pub icon: Option<String>,
 }
 
 /// One aspect: the unit of ownership a pack declares.
@@ -182,6 +388,8 @@ pub struct AspectSpec {
     pub queries: BTreeMap<String, QuerySpec>,
     pub views: BTreeMap<String, ViewSpec>,
     pub operations: BTreeMap<String, OperationBinding>,
+    /// How clients present the aspect.
+    pub display: AspectDisplay,
 }
 
 // ── YAML shapes ─────────────────────────────────────────────────────────────────────────────
@@ -208,6 +416,8 @@ struct YamlDoc {
     views: BTreeMap<String, YamlView>,
     #[serde(default)]
     operations: BTreeMap<String, YamlOperation>,
+    #[serde(default)]
+    display: Option<YamlDisplay>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +432,8 @@ struct YamlAspect {
     views: BTreeMap<String, YamlView>,
     #[serde(default)]
     operations: BTreeMap<String, YamlOperation>,
+    #[serde(default)]
+    display: Option<YamlDisplay>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,6 +491,8 @@ struct YamlView {
     group_by: Option<String>,
     #[serde(default)]
     columns: Vec<String>,
+    #[serde(default)]
+    order: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,6 +500,56 @@ struct YamlView {
 struct YamlOperation {
     tool: String,
     method: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YamlDisplay {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    icon: Option<String>,
+    #[serde(default)]
+    default_view: Option<String>,
+    #[serde(default)]
+    view_order: Vec<String>,
+    #[serde(default)]
+    views: BTreeMap<String, YamlLabelIcon>,
+    #[serde(default)]
+    fields: BTreeMap<String, YamlFieldDisplay>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YamlLabelIcon {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    icon: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YamlFieldDisplay {
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    icon: Option<String>,
+    #[serde(default)]
+    values: BTreeMap<String, YamlValueDisplay>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YamlValueDisplay {
+    #[serde(default)]
+    tone: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    icon: Option<String>,
 }
 
 // ── parsing ─────────────────────────────────────────────────────────────────────────────────
@@ -362,7 +626,8 @@ pub fn parse_document(yaml: &str) -> Result<MetaSchema, MetaSchemaError> {
         || !doc.fields.is_empty()
         || !doc.queries.is_empty()
         || !doc.views.is_empty()
-        || !doc.operations.is_empty();
+        || !doc.operations.is_empty()
+        || doc.display.is_some();
     match doc.aspect {
         Some(name) => {
             check_aspect_name(&name)?;
@@ -380,13 +645,15 @@ pub fn parse_document(yaml: &str) -> Result<MetaSchema, MetaSchemaError> {
                     queries: doc.queries,
                     views: doc.views,
                     operations: doc.operations,
+                    display: doc.display,
                 },
             )?;
             aspects.insert(name, spec);
         }
         None if has_single_parts => {
             return Err(err(
-                "`key` / `fields` / `queries` / `views` / `operations` need a top-level `aspect:`",
+                "`key` / `fields` / `queries` / `views` / `operations` / `display` need a \
+                 top-level `aspect:`",
             ));
         }
         None => {}
@@ -404,6 +671,27 @@ pub fn parse_document(yaml: &str) -> Result<MetaSchema, MetaSchemaError> {
                 }
             } else {
                 seen.insert(fname, (aname, fspec));
+            }
+        }
+    }
+
+    // Cross-aspect: a request names a query or an operation without its aspect, so each name
+    // belongs to exactly one aspect.
+    let mut query_owner: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut operation_owner: BTreeMap<&str, &str> = BTreeMap::new();
+    for (aname, aspect) in &aspects {
+        for qname in aspect.queries.keys() {
+            if let Some(other) = query_owner.insert(qname, aname) {
+                return Err(err(format!(
+                    "query {qname} is declared by aspects {other} and {aname}"
+                )));
+            }
+        }
+        for oname in aspect.operations.keys() {
+            if let Some(other) = operation_owner.insert(oname, aname) {
+                return Err(err(format!(
+                    "operation {oname} is declared by aspects {other} and {aname}"
+                )));
             }
         }
     }
@@ -641,32 +929,7 @@ fn parse_aspect(name: &str, ya: YamlAspect) -> Result<AspectSpec, MetaSchemaErro
         let due_between = window(&yq.due_between, "due_between")?;
         let occurs_between = window(&yq.occurs_between, "occurs_between")?;
         let any_between = window(&yq.any_between, "any_between")?;
-        let mut order = Vec::new();
-        for o in &yq.order {
-            let mut parts = o.split_whitespace();
-            let field = parts.next().unwrap_or_default().to_string();
-            let dir = parts.next().unwrap_or("asc");
-            if parts.next().is_some() {
-                return Err(err(format!(
-                    "aspect {name}: query {qname}: bad order entry {o:?}"
-                )));
-            }
-            if !fields.contains_key(&field) && !is_promoted_column(&field) {
-                return Err(err(format!(
-                    "aspect {name}: query {qname}: order references undeclared field {field:?}"
-                )));
-            }
-            let ascending = match dir {
-                "asc" => true,
-                "desc" => false,
-                _ => {
-                    return Err(err(format!(
-                        "aspect {name}: query {qname}: order direction must be asc / desc"
-                    )))
-                }
-            };
-            order.push(OrderKey { field, ascending });
-        }
+        let order = parse_order(&format!("aspect {name}: query {qname}"), &yq.order, &fields)?;
         queries.insert(
             qname,
             QuerySpec {
@@ -687,36 +950,103 @@ fn parse_aspect(name: &str, ya: YamlAspect) -> Result<AspectSpec, MetaSchemaErro
                 "aspect {name}: view name {vname:?} must be a bare identifier"
             )));
         }
+        let scope = format!("aspect {name}: view {vname}");
         let kind = ViewKind::parse(&yv.kind).ok_or_else(|| {
             err(format!(
-                "aspect {name}: view {vname}: kind must be list / table / board / calendar / form"
+                "{scope}: kind must be list / table / board / calendar / form"
             ))
         })?;
         if let Some(q) = &yv.query {
             if !queries.contains_key(q) {
-                return Err(err(format!(
-                    "aspect {name}: view {vname}: query {q:?} is not declared"
-                )));
+                return Err(err(format!("{scope}: query {q:?} is not declared")));
             }
         } else if kind != ViewKind::Form {
-            return Err(err(format!(
-                "aspect {name}: view {vname}: `query` is required"
-            )));
+            return Err(err(format!("{scope}: `query` is required")));
         }
-        if let Some(g) = &yv.group_by {
-            if !fields.contains_key(g) {
+        match &yv.group_by {
+            Some(g) => {
+                let Some(spec) = fields.get(g) else {
+                    return Err(err(format!(
+                        "{scope}: group_by references undeclared field {g:?}"
+                    )));
+                };
+                match kind {
+                    ViewKind::Board => {
+                        if !matches!(spec.field_type, FieldType::EnumString(_)) {
+                            return Err(err(format!(
+                                "{scope}: a board groups by an enum field; {g} is not one"
+                            )));
+                        }
+                    }
+                    ViewKind::List | ViewKind::Table => {
+                        if matches!(
+                            spec.field_type,
+                            FieldType::ListString | FieldType::ListDateTime
+                        ) {
+                            return Err(err(format!(
+                                "{scope}: cannot group by the list field {g}"
+                            )));
+                        }
+                    }
+                    ViewKind::Calendar | ViewKind::Form => {
+                        return Err(err(format!(
+                            "{scope}: a {} takes no group_by",
+                            kind.as_str()
+                        )));
+                    }
+                }
+            }
+            None if kind == ViewKind::Board => {
                 return Err(err(format!(
-                    "aspect {name}: view {vname}: group_by references undeclared field {g:?}"
+                    "{scope}: a board needs `group_by` (an enum field)"
                 )));
             }
+            None => {}
         }
+        if yv.columns.len() > MAX_VIEW_COLUMNS {
+            return Err(err(format!(
+                "{scope}: at most {MAX_VIEW_COLUMNS} columns, got {}",
+                yv.columns.len()
+            )));
+        }
+        let mut shown: BTreeSet<&str> = BTreeSet::new();
         for c in &yv.columns {
             if !fields.contains_key(c) && !is_promoted_column(c) {
                 return Err(err(format!(
-                    "aspect {name}: view {vname}: column references undeclared field {c:?}"
+                    "{scope}: column references undeclared field {c:?}"
                 )));
             }
+            if !shown.insert(c.as_str()) {
+                return Err(err(format!("{scope}: column {c} is listed twice")));
+            }
+            if kind == ViewKind::Form && matches!(c.as_str(), "type" | "updated_at") {
+                return Err(err(format!("{scope}: a form cannot edit {c}")));
+            }
         }
+        let order = if yv.order.is_empty() {
+            Vec::new()
+        } else {
+            if matches!(kind, ViewKind::Calendar | ViewKind::Form) {
+                return Err(err(format!("{scope}: a {} takes no order", kind.as_str())));
+            }
+            if yv.order.len() > MAX_ORDER_KEYS {
+                return Err(err(format!(
+                    "{scope}: at most {MAX_ORDER_KEYS} order keys, got {}",
+                    yv.order.len()
+                )));
+            }
+            let order = parse_order(&scope, &yv.order, &fields)?;
+            let mut ordered: BTreeSet<&str> = BTreeSet::new();
+            for k in &order {
+                if !ordered.insert(k.field.as_str()) {
+                    return Err(err(format!(
+                        "{scope}: order lists the field {} twice",
+                        k.field
+                    )));
+                }
+            }
+            order
+        };
         views.insert(
             vname,
             ViewSpec {
@@ -724,6 +1054,7 @@ fn parse_aspect(name: &str, ya: YamlAspect) -> Result<AspectSpec, MetaSchemaErro
                 query: yv.query,
                 group_by: yv.group_by,
                 columns: yv.columns,
+                order,
             },
         );
     }
@@ -744,13 +1075,255 @@ fn parse_aspect(name: &str, ya: YamlAspect) -> Result<AspectSpec, MetaSchemaErro
         );
     }
 
+    let display = match ya.display {
+        None => AspectDisplay::default(),
+        Some(yd) => parse_display(name, yd, &fields, &views)?,
+    };
+
     Ok(AspectSpec {
         key: ya.key,
         fields,
         queries,
         views,
         operations,
+        display,
     })
+}
+
+/// Parse `order` entries (`"<field>[ asc|desc]"`, ascending by default); each field is an
+/// aspect field or a promoted column.
+fn parse_order(
+    scope: &str,
+    entries: &[String],
+    fields: &BTreeMap<String, FieldSpec>,
+) -> Result<Vec<OrderKey>, MetaSchemaError> {
+    let mut order = Vec::with_capacity(entries.len());
+    for o in entries {
+        let mut parts = o.split_whitespace();
+        let field = parts.next().unwrap_or_default().to_string();
+        let dir = parts.next().unwrap_or("asc");
+        if parts.next().is_some() {
+            return Err(err(format!("{scope}: bad order entry {o:?}")));
+        }
+        if !fields.contains_key(&field) && !is_promoted_column(&field) {
+            return Err(err(format!(
+                "{scope}: order references undeclared field {field:?}"
+            )));
+        }
+        let ascending = match dir {
+            "asc" => true,
+            "desc" => false,
+            _ => return Err(err(format!("{scope}: order direction must be asc / desc"))),
+        };
+        order.push(OrderKey { field, ascending });
+    }
+    Ok(order)
+}
+
+/// Parse an aspect's `display` block against the aspect's own fields and views.
+fn parse_display(
+    aspect: &str,
+    yd: YamlDisplay,
+    fields: &BTreeMap<String, FieldSpec>,
+    views: &BTreeMap<String, ViewSpec>,
+) -> Result<AspectDisplay, MetaSchemaError> {
+    let scope = format!("aspect {aspect}: display");
+    let label = check_label(&scope, yd.label)?;
+    let icon = check_icon(&scope, yd.icon)?;
+    if let Some(v) = &yd.default_view {
+        match views.get(v) {
+            None => {
+                return Err(err(format!(
+                    "{scope}: default_view {v:?} is not a declared view"
+                )))
+            }
+            Some(spec) if spec.kind == ViewKind::Form => {
+                return Err(err(format!(
+                    "{scope}: default_view {v} is a form; a client opens a list, table, board \
+                     or calendar first"
+                )))
+            }
+            Some(_) => {}
+        }
+    }
+    let mut listed: BTreeSet<&str> = BTreeSet::new();
+    for v in &yd.view_order {
+        if !views.contains_key(v) {
+            return Err(err(format!(
+                "{scope}: view_order names {v:?}, which is not a declared view"
+            )));
+        }
+        if !listed.insert(v.as_str()) {
+            return Err(err(format!("{scope}: view_order lists {v} twice")));
+        }
+    }
+
+    let mut view_displays: BTreeMap<String, ViewDisplay> = BTreeMap::new();
+    for (vname, yv) in yd.views {
+        if !views.contains_key(&vname) {
+            return Err(err(format!(
+                "{scope}: views.{vname} is not a declared view"
+            )));
+        }
+        let vscope = format!("{scope}: views.{vname}");
+        let shown = ViewDisplay {
+            label: check_label(&vscope, yv.label)?,
+            icon: check_icon(&vscope, yv.icon)?,
+        };
+        view_displays.insert(vname, shown);
+    }
+
+    let mut field_displays: BTreeMap<String, FieldDisplay> = BTreeMap::new();
+    for (fname, yf) in yd.fields {
+        let field_type = match fields.get(&fname) {
+            Some(spec) => spec.field_type.clone(),
+            None => promoted_column_type(&fname).ok_or_else(|| {
+                err(format!(
+                    "{scope}: fields.{fname} is not a field of the aspect (nor title / type / \
+                     updated_at)"
+                ))
+            })?,
+        };
+        let fscope = format!("{scope}: fields.{fname}");
+        let YamlFieldDisplay {
+            format,
+            label,
+            icon,
+            values,
+        } = yf;
+        let format = match format {
+            None => None,
+            Some(f) => {
+                let parsed = DisplayFormat::parse(&f).ok_or_else(|| {
+                    err(format!(
+                        "{fscope}: unknown format {f:?} (one of {})",
+                        DisplayFormat::ALL.map(DisplayFormat::as_str).join(" / ")
+                    ))
+                })?;
+                if !parsed.allows(&field_type) {
+                    return Err(err(format!(
+                        "{fscope}: format {f} does not suit a {} field",
+                        field_type_name(&field_type)
+                    )));
+                }
+                Some(parsed)
+            }
+        };
+        let mut value_displays: BTreeMap<String, ValueDisplay> = BTreeMap::new();
+        if !values.is_empty() {
+            let FieldType::EnumString(variants) = &field_type else {
+                return Err(err(format!(
+                    "{fscope}: values are only for enum fields; {fname} is a {} field",
+                    field_type_name(&field_type)
+                )));
+            };
+            for (value, yv) in values {
+                if !variants.contains(&value) {
+                    return Err(err(format!(
+                        "{fscope}: {value:?} is not a variant of {fname}"
+                    )));
+                }
+                let vscope = format!("{fscope}: values.{value}");
+                let tone = match yv.tone {
+                    None => None,
+                    Some(t) => Some(Tone::parse(&t).ok_or_else(|| {
+                        err(format!(
+                            "{vscope}: unknown tone {t:?} (one of {})",
+                            Tone::ALL.map(Tone::as_str).join(" / ")
+                        ))
+                    })?),
+                };
+                let shown = ValueDisplay {
+                    tone,
+                    label: check_label(&vscope, yv.label)?,
+                    icon: check_icon(&vscope, yv.icon)?,
+                };
+                value_displays.insert(value, shown);
+            }
+        }
+        let shown = FieldDisplay {
+            format,
+            label: check_label(&fscope, label)?,
+            icon: check_icon(&fscope, icon)?,
+            values: value_displays,
+        };
+        field_displays.insert(fname, shown);
+    }
+
+    Ok(AspectDisplay {
+        label,
+        icon,
+        default_view: yd.default_view,
+        view_order: yd.view_order,
+        views: view_displays,
+        fields: field_displays,
+    })
+}
+
+/// A label is plain single-line text of 1..=[`MAX_LABEL_CHARS`] characters. Control
+/// characters, line and paragraph separators, bidi controls and `<` / `>` are refused, so a
+/// label can neither break a line, reorder the text around it nor read as markup.
+fn check_label(scope: &str, label: Option<String>) -> Result<Option<String>, MetaSchemaError> {
+    let Some(l) = label else {
+        return Ok(None);
+    };
+    if l.trim().is_empty() {
+        return Err(err(format!("{scope}: label must not be blank")));
+    }
+    if l.chars().count() > MAX_LABEL_CHARS {
+        return Err(err(format!(
+            "{scope}: label is longer than {MAX_LABEL_CHARS} characters"
+        )));
+    }
+    if let Some(c) = l.chars().find(|c| is_refused_label_char(*c)) {
+        return Err(err(format!(
+            "{scope}: label contains the refused character U+{:04X}",
+            u32::from(c)
+        )));
+    }
+    Ok(Some(l))
+}
+
+fn is_refused_label_char(c: char) -> bool {
+    // `is_control` covers C0, DEL and C1.
+    c.is_control()
+        || matches!(
+            c,
+            '<' | '>'
+                // line separator, paragraph separator
+                | '\u{2028}'
+                | '\u{2029}'
+                // arabic letter mark, left-to-right mark, right-to-left mark
+                | '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                // embeddings, pop and overrides (LRE, RLE, PDF, LRO, RLO)
+                | '\u{202A}'..='\u{202E}'
+                // isolates (LRI, RLI, FSI, PDI)
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// An icon is a name in the client's icon set: lowercase letters and digits in `-`-separated
+/// words, at most [`MAX_ICON_BYTES`] bytes.
+fn check_icon(scope: &str, icon: Option<String>) -> Result<Option<String>, MetaSchemaError> {
+    let Some(i) = icon else {
+        return Ok(None);
+    };
+    let well_formed = i.len() <= MAX_ICON_BYTES
+        && i.split('-').all(|word| {
+            !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        });
+    if !well_formed {
+        return Err(err(format!(
+            "{scope}: icon {i:?} must be lowercase letters and digits in `-`-separated words \
+             (at most {MAX_ICON_BYTES} bytes)"
+        )));
+    }
+    Ok(Some(i))
 }
 
 /// `derive` / `ensure` references must point at fields declared in the same map.
@@ -793,9 +1366,33 @@ fn check_cross_refs(
     Ok(())
 }
 
-/// Record columns every query may reference even though no aspect declares them.
+/// Record columns every query and view may reference even though no aspect declares them.
 fn is_promoted_column(name: &str) -> bool {
-    matches!(name, "title" | "type" | "updated_at")
+    promoted_column_type(name).is_some()
+}
+
+/// The fixed type of a promoted column: `title` and `type` are strings, `updated_at` is the
+/// row's modification time.
+fn promoted_column_type(name: &str) -> Option<FieldType> {
+    match name {
+        "title" | "type" => Some(FieldType::String),
+        "updated_at" => Some(FieldType::DateTime),
+        _ => None,
+    }
+}
+
+/// The grammar's name of a field type (`enum` for any enum).
+fn field_type_name(t: &FieldType) -> &'static str {
+    match t {
+        FieldType::String => "string",
+        FieldType::Integer => "integer",
+        FieldType::Boolean => "boolean",
+        FieldType::DateTime => "datetime",
+        FieldType::Duration => "duration",
+        FieldType::ListString => "list<string>",
+        FieldType::ListDateTime => "list<datetime>",
+        FieldType::EnumString(_) => "enum",
+    }
 }
 
 /// Parse one expression value. `args` scopes `$args.<name>`; `allow_self` admits `$self.<f>`.
@@ -997,14 +1594,8 @@ fn expr_json(e: &ValueExpr) -> serde_json::Value {
 
 pub(crate) fn field_type_json(t: &FieldType) -> serde_json::Value {
     match t {
-        FieldType::String => serde_json::json!("string"),
-        FieldType::Integer => serde_json::json!("integer"),
-        FieldType::Boolean => serde_json::json!("boolean"),
-        FieldType::DateTime => serde_json::json!("datetime"),
-        FieldType::Duration => serde_json::json!("duration"),
-        FieldType::ListString => serde_json::json!("list<string>"),
-        FieldType::ListDateTime => serde_json::json!("list<datetime>"),
         FieldType::EnumString(v) => serde_json::json!(v),
+        other => serde_json::json!(field_type_name(other)),
     }
 }
 
@@ -1073,12 +1664,70 @@ fn query_json(q: &QuerySpec) -> serde_json::Value {
         "due_between": win(&q.due_between),
         "occurs_between": win(&q.occurs_between),
         "any_between": win(&q.any_between),
-        "order": q.order.iter().map(|o| serde_json::json!({ "field": o.field, "ascending": o.ascending })).collect::<Vec<_>>(),
+        "order": order_json(&q.order),
+    })
+}
+
+fn order_json(order: &[OrderKey]) -> serde_json::Value {
+    order
+        .iter()
+        .map(|o| serde_json::json!({ "field": o.field, "ascending": o.ascending }))
+        .collect()
+}
+
+fn display_json(d: &AspectDisplay) -> serde_json::Value {
+    let views: serde_json::Map<String, serde_json::Value> = d
+        .views
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                serde_json::json!({ "label": v.label, "icon": v.icon }),
+            )
+        })
+        .collect();
+    let fields: serde_json::Map<String, serde_json::Value> = d
+        .fields
+        .iter()
+        .map(|(k, f)| {
+            let values: serde_json::Map<String, serde_json::Value> = f
+                .values
+                .iter()
+                .map(|(v, vd)| {
+                    (
+                        v.clone(),
+                        serde_json::json!({
+                            "tone": vd.tone.map(Tone::as_str),
+                            "label": vd.label,
+                            "icon": vd.icon,
+                        }),
+                    )
+                })
+                .collect();
+            (
+                k.clone(),
+                serde_json::json!({
+                    "format": f.format.map(DisplayFormat::as_str),
+                    "label": f.label,
+                    "icon": f.icon,
+                    "values": values,
+                }),
+            )
+        })
+        .collect();
+    serde_json::json!({
+        "label": d.label,
+        "icon": d.icon,
+        "default_view": d.default_view,
+        "view_order": d.view_order,
+        "views": views,
+        "fields": fields,
     })
 }
 
 /// Canonical JSON of the whole schema (deterministic key order via `BTreeMap` + serde_json's
-/// preserve-order-off maps).
+/// preserve-order-off maps). It covers presentation too (views' `order`, each aspect's
+/// `display`), so a presentation change changes the hash.
 pub fn schema_canonical_json(schema: &MetaSchema) -> serde_json::Value {
     let fields = |m: &BTreeMap<String, FieldSpec>| -> serde_json::Value {
         serde_json::Value::Object(
@@ -1098,9 +1747,11 @@ pub fn schema_canonical_json(schema: &MetaSchema) -> serde_json::Value {
                     "fields": fields(&a.fields),
                     "queries": serde_json::Value::Object(a.queries.iter().map(|(k, q)| (k.clone(), query_json(q))).collect()),
                     "views": serde_json::Value::Object(a.views.iter().map(|(k, v)| (k.clone(), serde_json::json!({
-                        "kind": v.kind.as_str(), "query": v.query, "group_by": v.group_by, "columns": v.columns
+                        "kind": v.kind.as_str(), "query": v.query, "group_by": v.group_by, "columns": v.columns,
+                        "order": order_json(&v.order),
                     }))).collect()),
                     "operations": serde_json::Value::Object(a.operations.iter().map(|(k, o)| (k.clone(), serde_json::json!({ "tool": o.tool, "method": o.method }))).collect()),
+                    "display": display_json(&a.display),
                 }),
             )
         })
@@ -1211,5 +1862,159 @@ mod tests {
             parse_expr(&Value::String("todo".into()), &args, false).unwrap(),
             ValueExpr::Literal(Value::String("todo".into()))
         );
+    }
+
+    #[test]
+    fn display_formats_suit_exactly_their_field_types() {
+        use DisplayFormat as F;
+        assert_eq!(
+            F::ALL.map(F::as_str),
+            [
+                "text",
+                "number",
+                "priority",
+                "checkbox",
+                "badge",
+                "tags",
+                "person",
+                "date",
+                "datetime",
+                "relative",
+                "duration",
+                "recurrence",
+                "timezone"
+            ]
+        );
+        let types = [
+            FieldType::String,
+            FieldType::Integer,
+            FieldType::Boolean,
+            FieldType::DateTime,
+            FieldType::Duration,
+            FieldType::EnumString(vec!["a".into(), "b".into()]),
+            FieldType::ListString,
+            FieldType::ListDateTime,
+        ];
+        // One row per format. The columns follow `types`: string, integer, boolean, datetime,
+        // duration, enum, list<string>, list<datetime>; `x` = the format suits the type.
+        let matrix = [
+            (F::Text, "xxxxxx.."),
+            (F::Number, ".x......"),
+            (F::Priority, ".x...x.."),
+            (F::Checkbox, "..x....."),
+            (F::Badge, "x....x.."),
+            (F::Tags, "......x."),
+            (F::Person, "x.....x."),
+            (F::Date, "...x...x"),
+            (F::DateTime, "...x...x"),
+            (F::Relative, "...x...."),
+            (F::Duration, "....x..."),
+            (F::Recurrence, "x......."),
+            (F::Timezone, "x......."),
+        ];
+        assert_eq!(
+            matrix.map(|(f, _)| f),
+            F::ALL,
+            "one row per format, in order"
+        );
+        for (format, row) in matrix {
+            assert_eq!(row.len(), types.len());
+            for (t, cell) in types.iter().zip(row.chars()) {
+                assert_eq!(
+                    format.allows(t),
+                    cell == 'x',
+                    "{} on a {} field",
+                    format.as_str(),
+                    field_type_name(t)
+                );
+            }
+            assert_eq!(F::parse(format.as_str()), Some(format));
+        }
+        for unknown in ["currency", "url", "markdown", "Text", ""] {
+            assert_eq!(F::parse(unknown), None, "{unknown:?}");
+        }
+    }
+
+    #[test]
+    fn tones_are_six_semantic_names() {
+        assert_eq!(
+            Tone::ALL.map(Tone::as_str),
+            ["neutral", "info", "success", "warning", "error", "muted"]
+        );
+        for tone in Tone::ALL {
+            assert_eq!(Tone::parse(tone.as_str()), Some(tone));
+        }
+        for unknown in ["danger", "red", "#00ff00", "Info", ""] {
+            assert_eq!(Tone::parse(unknown), None, "{unknown:?}");
+        }
+    }
+
+    #[test]
+    fn labels_are_plain_single_line_text() {
+        let check = |l: &str| check_label("scope", Some(l.to_string()));
+        assert_eq!(
+            check("In progress").unwrap().as_deref(),
+            Some("In progress")
+        );
+        assert!(check("Échéance · 截止 ✓").is_ok());
+        assert!(check(&"x".repeat(MAX_LABEL_CHARS)).is_ok());
+        assert!(
+            check(&"é".repeat(MAX_LABEL_CHARS)).is_ok(),
+            "the bound counts characters, not bytes"
+        );
+        assert_eq!(check_label("scope", None).unwrap(), None);
+        let too_long = "x".repeat(MAX_LABEL_CHARS + 1);
+        for bad in [
+            "",
+            "   ",
+            too_long.as_str(),
+            "a\nb",
+            "a\tb",
+            "a\u{7f}b",
+            "a\u{85}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{202E}b",
+            "a\u{202A}b",
+            "a\u{2066}b",
+            "a\u{2069}b",
+            "a\u{200E}b",
+            "a\u{200F}b",
+            "a\u{061C}b",
+            "<b>bold</b>",
+            "a > b",
+        ] {
+            assert!(check(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn icons_are_lowercase_dashed_names() {
+        let check = |i: &str| check_icon("scope", Some(i.to_string()));
+        let longest = "a".repeat(MAX_ICON_BYTES);
+        for good in [
+            "calendar",
+            "list-todo",
+            "calendar-check",
+            "h1",
+            "x",
+            longest.as_str(),
+        ] {
+            assert!(check(good).is_ok(), "{good:?}");
+        }
+        let too_long = "a".repeat(MAX_ICON_BYTES + 1);
+        for bad in [
+            "",
+            "Calendar",
+            "cal endar",
+            "-x",
+            "x-",
+            "a--b",
+            "a_b",
+            "ä",
+            too_long.as_str(),
+        ] {
+            assert!(check(bad).is_err(), "{bad:?} must be refused");
+        }
     }
 }

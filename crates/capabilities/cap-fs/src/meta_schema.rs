@@ -125,7 +125,8 @@ pub struct MetaSchema {
 }
 
 pub use crate::schema_v2::{
-    AspectSpec, Cmp, DeriveElse, DeriveRule, EnsureRule, OperationBinding, QuerySpec, ValueExpr,
+    AspectDisplay, AspectSpec, Cmp, DeriveElse, DeriveRule, DisplayFormat, EnsureRule,
+    FieldDisplay, OperationBinding, QuerySpec, Tone, ValueDisplay, ValueExpr, ViewDisplay,
     ViewKind, ViewSpec, WhereClause,
 };
 

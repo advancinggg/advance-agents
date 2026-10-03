@@ -196,11 +196,14 @@ pub fn merge_meta_schema_extension_file_with(
 /// `{optional: …}` document).
 ///
 /// Grammar v2 (entity-data lane E1): an extension may additionally declare ONE aspect
-/// (`aspect` / `key` / `fields` / `queries` / `views` / `operations`); the block lands under
-/// the target's `aspects.<name>`. An aspect has exactly one owner (a second declaration with
-/// different content is a conflict; an identical one is idempotent), and a field name shared
-/// by two aspects must carry an identical spec. Field specs may omit `default` and may carry
-/// the v2 attributes (`transitions` / `derive` / `ensure` / `inherit`).
+/// (`aspect` / `key` / `fields` / `queries` / `views` / `operations` / `display`); the block
+/// lands under the target's `aspects.<name>`. An aspect has exactly one owner (a second
+/// declaration with different content, presentation included, is a conflict; an identical one
+/// is idempotent), and a field name shared by two aspects must carry an identical spec. Field
+/// specs may omit `default` and may carry the v2 attributes (`transitions` / `derive` /
+/// `ensure` / `inherit`). `queries`, `views` and the presentation block `display` are copied
+/// verbatim; their inner grammar is cap-fs's to check. Presentation lives outside the field
+/// specs, so two aspects may present a shared field differently.
 pub fn merge_documents(
     target_yaml: Option<&str>,
     extension_yaml: &str,
@@ -378,11 +381,11 @@ pub fn merge_documents(
 /// A parsed extension: v1 `optional` fields plus, in v2, at most one aspect block.
 struct ParsedExtension {
     optional: Vec<(String, Value)>,
-    /// `(aspect name, {key, fields, queries, views, operations})`.
+    /// `(aspect name, {key, fields, queries, views, operations, display})`.
     aspect: Option<(String, Mapping)>,
 }
 
-const ASPECT_BLOCK_KEYS: &[&str] = &["key", "fields", "queries", "views", "operations"];
+const ASPECT_BLOCK_KEYS: &[&str] = &["key", "fields", "queries", "views", "operations", "display"];
 
 /// Parse + structurally validate an extension document (per-field grammar is applied by
 /// [`merge_documents`] for NEW fields; redeclarations are judged against the existing spec).
@@ -406,7 +409,7 @@ fn parse_extension(yaml: &str) -> Result<ParsedExtension, MetaSchemaMergeError> 
             Some(other) => {
                 return Err(MetaSchemaMergeError::InvalidExtension(format!(
                     "unknown top-level key `{other}` (only `optional`, `aspect`, `key`, `fields`, \
-                     `queries`, `views`, `operations` are accepted)"
+                     `queries`, `views`, `operations`, `display` are accepted)"
                 )))
             }
             None => {
@@ -517,7 +520,7 @@ fn parse_extension(yaml: &str) -> Result<ParsedExtension, MetaSchemaMergeError> 
             let mut block = Mapping::new();
             block.insert(Value::from("key"), key);
             block.insert(Value::from("fields"), Value::Mapping(fields));
-            for section in ["queries", "views", "operations"] {
+            for section in ["queries", "views", "operations", "display"] {
                 match root.get(Value::from(section)) {
                     None | Some(Value::Null) => {}
                     Some(Value::Mapping(m)) => {
@@ -848,6 +851,28 @@ mod tests {
         // Meta-schema v2: `default` is optional.
         assert!(merge_documents(None, "optional:\n  x:\n    type: string\n").is_ok());
         assert!(merge_documents(None, "a: &x 1\noptional: *x\n").is_err());
+    }
+
+    #[test]
+    fn unknown_top_level_key_message_lists_every_accepted_key() {
+        match merge_documents(None, "displays: {}\n") {
+            Err(MetaSchemaMergeError::InvalidExtension(m)) => {
+                assert!(m.contains("unknown top-level key `displays`"), "{m}");
+                for key in [
+                    "optional",
+                    "aspect",
+                    "key",
+                    "fields",
+                    "queries",
+                    "views",
+                    "operations",
+                    "display",
+                ] {
+                    assert!(m.contains(&format!("`{key}`")), "{key} missing from: {m}");
+                }
+            }
+            other => panic!("expected InvalidExtension, got {other:?}"),
+        }
     }
 
     #[test]
