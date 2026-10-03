@@ -849,6 +849,57 @@ impl ClientApi {
         None
     }
 
+    /// A read-only snapshot of every registered route: the exact-path routes and the templated
+    /// routes (with their template text), each with the session / mutation / scope gates it was
+    /// registered with. Sorted by path, then method (GET before POST), then exact before
+    /// templated, so the result is deterministic.
+    ///
+    /// Not listed: the session operations (`POST /client/session/{login,refresh,logout}`), which
+    /// `handle` dispatches before route lookup, and the transport-only routes (the WebSocket
+    /// upgrades of the two stream paths and the Web Console assets), which live in
+    /// [`client_api_router`](crate::transport::client_api_router).
+    pub fn route_table(&self) -> Vec<routes::RouteTableEntry> {
+        fn entry(
+            method: Method,
+            path: String,
+            templated: bool,
+            spec: &HandlerSpec,
+        ) -> routes::RouteTableEntry {
+            routes::RouteTableEntry {
+                method,
+                path,
+                templated,
+                requires_session: spec.requires_session,
+                is_mutation: spec.is_mutation,
+                required_scopes: spec.required_scopes.clone(),
+            }
+        }
+        let mut table: Vec<routes::RouteTableEntry> = self
+            .handlers
+            .iter()
+            .map(|((method, path), spec)| entry(*method, path.clone(), false, spec))
+            .chain(
+                self.routes
+                    .iter()
+                    .map(|(method, pattern, spec)| entry(*method, pattern.template(), true, spec)),
+            )
+            .collect();
+        let method_rank = |method: Method| match method {
+            Method::Get => 0u8,
+            Method::Post => 1u8,
+        };
+        // Stable sort: two templated routes with the same template and method (a shadowed
+        // registration) keep their registration (= match) order.
+        table.sort_by(|a, b| {
+            (a.path.as_str(), method_rank(a.method), a.templated).cmp(&(
+                b.path.as_str(),
+                method_rank(b.method),
+                b.templated,
+            ))
+        });
+        table
+    }
+
     pub fn auth(&self) -> &ClientSessionAuth {
         &self.auth
     }

@@ -116,6 +116,7 @@ pub use providers::history::{
     BoundHistoryPage, BoundHistoryReadPort, ClientHistoryEntry, ClientHistoryResponse,
 };
 pub use request::{ClientRequest, Method};
+pub use routes::RouteTableEntry;
 pub use runs::{ClientAgentTreeNode, ClientRunMutation, ClientRunSummary};
 pub use secrets_admin::{ClientSecretsMode, ClientSetSecretsModeRequest};
 pub use session::{ClientSession, Platform, Principal, Scope};

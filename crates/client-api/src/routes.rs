@@ -6,6 +6,7 @@
 //! with no provider call.
 
 use crate::request::Method;
+use crate::session::Scope;
 
 pub const PATH_LOGIN: &str = "/client/session/login";
 pub const PATH_REFRESH: &str = "/client/session/refresh";
@@ -186,6 +187,21 @@ impl RoutePattern {
         RoutePattern { segs }
     }
 
+    /// The template text this pattern was parsed from. [`parse`](RoutePattern::parse) is lossless
+    /// (every segment keeps its literal text, its parameter name and its suffix), so this renders
+    /// the original template back, e.g. `/client/runs/{run_id}:pause`.
+    pub fn template(&self) -> String {
+        self.segs
+            .iter()
+            .map(|seg| match seg {
+                Seg::Literal(text) => text.clone(),
+                Seg::Param(name) => format!("{{{name}}}"),
+                Seg::ParamSuffix { name, suffix } => format!("{{{name}}}{suffix}"),
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
     /// Match a concrete path, returning the bound `(name, value)` params (in template order) on
     /// success. The FULL path is split (no leading-slash trimming — see [`parse`](RoutePattern::parse)),
     /// so only the canonical `/client/...` form matches. Segment count must match exactly; every
@@ -220,4 +236,22 @@ impl RoutePattern {
         }
         Some(params)
     }
+}
+
+/// One registered route, as reported by [`ClientApi::route_table`](crate::ClientApi::route_table).
+///
+/// Read-only Rust introspection of the gate flags a route was registered with. It is not a wire
+/// DTO: it is not part of the CONTRACT-192 schema and is never serialized by the API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteTableEntry {
+    pub method: Method,
+    /// The exact path, or the template text of a templated route (e.g.
+    /// `/client/runs/{run_id}:pause`).
+    pub path: String,
+    /// `true` for a templated route (matched only after an exact-path miss).
+    pub templated: bool,
+    pub requires_session: bool,
+    pub is_mutation: bool,
+    /// Scopes the session must carry, in registration order (empty = no scope requirement).
+    pub required_scopes: Vec<Scope>,
 }
