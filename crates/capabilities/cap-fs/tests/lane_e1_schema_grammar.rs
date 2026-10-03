@@ -100,10 +100,16 @@ fields:
     type: datetime
   tags:
     type: list<string>
+  skips:
+    type: list<datetime>
   owner:
     type: string
   rank:
     type: integer
+  urgent:
+    type: boolean
+  effort:
+    type: duration
 queries:
   open:
     where: { status: [todo, doing] }
@@ -439,13 +445,19 @@ fn e1_views_carry_order_columns_and_presentation() {
 #[test]
 fn e1_view_presentation_is_rejected_when_malformed() {
     load(&with_views_and_display(VIEWS, "  label: T\n")).expect("the base document parses");
+    load(&with_views_and_display(
+        "  l: { kind: list, query: open, order: [status, due desc, rank, urgent] }\n  \
+         t: { kind: table, query: open, order: [owner, title desc, type, updated_at] }\n",
+        "",
+    ))
+    .expect("a view orders by enum, datetime, integer, boolean, string and promoted fields");
 
     let many_columns = format!(
         "  l: {{ kind: list, query: open, columns: [{}] }}\n",
         vec!["owner"; 65].join(", ")
     );
     let long_label = format!("  label: {}\n", "x".repeat(65));
-    let cases: [(&str, &str, &str, &str); 48] = [
+    let cases: [(&str, &str, &str, &str); 51] = [
         // Views.
         (
             "a board without group_by",
@@ -524,6 +536,24 @@ fn e1_view_presentation_is_rejected_when_malformed() {
             "  l: { kind: list, query: open, order: [due up] }\n",
             "",
             "order direction must be asc / desc",
+        ),
+        (
+            "a list ordered by a list<string> field",
+            "  l: { kind: list, query: open, order: [due, tags asc] }\n",
+            "",
+            "cannot order by the list field tags",
+        ),
+        (
+            "a table ordered by a list<datetime> field",
+            "  t: { kind: table, query: open, order: [skips] }\n",
+            "",
+            "cannot order by the list field skips",
+        ),
+        (
+            "a board ordered by a duration field",
+            "  b: { kind: board, query: open, group_by: status, order: [effort desc] }\n",
+            "",
+            "cannot order by the duration field effort",
         ),
         (
             "a column listed twice",

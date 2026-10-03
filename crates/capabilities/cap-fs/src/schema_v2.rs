@@ -176,8 +176,9 @@ pub struct ViewSpec {
     /// chooses.
     pub columns: Vec<String>,
     /// The order a client presents the query's rows in (within each group when grouped). Empty
-    /// = the query's own order. It never changes which rows the query returns. A calendar or
-    /// form takes none.
+    /// = the query's own order. It never changes which rows the query returns. Each key is an
+    /// enum, datetime, integer, boolean or string field, or a promoted column; a client has no
+    /// comparison for list or duration values. A calendar or form takes none.
     pub order: Vec<OrderKey>,
 }
 
@@ -1041,6 +1042,20 @@ fn parse_aspect(name: &str, ya: YamlAspect) -> Result<AspectSpec, MetaSchemaErro
                 if !ordered.insert(k.field.as_str()) {
                     return Err(err(format!(
                         "{scope}: order lists the field {} twice",
+                        k.field
+                    )));
+                }
+                // A client sorts the rows itself and compares enum, datetime, integer, boolean
+                // and string values only. The promoted columns are strings and a datetime.
+                let refused = match fields.get(k.field.as_str()).map(|spec| &spec.field_type) {
+                    Some(FieldType::ListString | FieldType::ListDateTime) => Some("list"),
+                    Some(FieldType::Duration) => Some("duration"),
+                    _ => None,
+                };
+                if let Some(what) = refused {
+                    return Err(err(format!(
+                        "{scope}: cannot order by the {what} field {}; a view orders by enum, \
+                         datetime, integer, boolean or string fields only",
                         k.field
                     )));
                 }
