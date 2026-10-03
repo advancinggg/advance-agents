@@ -450,7 +450,10 @@ async fn sys_ac_315_connect_time_localhost_rebinding_blocked() {
     let err = chat(&gw, None, "ssrf")
         .await
         .expect_err("ssrf dns resolver");
-    assert_eq!(err_msg(&err), "transport error");
+    // The executor's guarding resolver refuses the loopback answer while connecting, so the
+    // failure names that phase (`dns failed`, since `ExecutorError::Connect`); still blocked,
+    // still nothing reaches the sidecar.
+    assert_eq!(err_msg(&err), "dns failed");
     assert_eq!(sut.llm_chat_request_count(), 0);
 }
 
