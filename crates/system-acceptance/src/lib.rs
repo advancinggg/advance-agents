@@ -439,6 +439,8 @@ impl LeakDetector for NoOpLeakDetector {
 // enforcement (SYS-AC-046/048).
 
 /// In-process scripted MCP transport — returns canned bytes for any tool call.
+/// The client treats an injected transport as an initialized connection, so it
+/// never sees the `initialize` exchange.
 struct ScriptedMcpTransport {
     server_id: String,
     reply: Vec<u8>,
@@ -452,6 +454,13 @@ impl McpTransport for ScriptedMcpTransport {
         _params: serde_json::Value,
     ) -> Result<Vec<u8>, cap_mcp::McpError> {
         Ok(self.reply.clone())
+    }
+    async fn notify(
+        &self,
+        _method: &str,
+        _params: Option<serde_json::Value>,
+    ) -> Result<(), cap_mcp::McpError> {
+        Ok(())
     }
     fn server_id(&self) -> &str {
         &self.server_id

@@ -1,18 +1,23 @@
-//! Slice D AC-17 — stdio transport (SD-01..SD-10d).
+//! MODULE-017 AC-17 — stdio transport (SD-01..SD-10d), plus the stdio server
+//! lifecycle through `McpClient` (initialize, eviction, backoff, runtime).
 //!
 //! Strategy: use shell-pipeline fixtures so each test scripts the subprocess
 //! response inline. `bash -c "..."` snippets read stdin lines and emit
 //! pre-formatted JSON-RPC responses on stdout. Each test scopes its transport
 //! in an inner block so Drop fires before the test function returns; the
-//! Drop impl aborts spawned tasks + start_kill's the child.
+//! Drop impl aborts spawned tasks + kills the child's process group.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use advance_shared_types::security_validator::{Finding, LeakDetector, ScanContext, ScanResult};
-use cap_mcp::{McpErrorKind, StdioMcpTransport};
+use cap_mcp::{
+    McpClient, McpClientLimits, McpErrorKind, McpServerEntry, McpServersConfig, McpTransportSpec,
+    StdioMcpTransport, StdioOptions, SUPPORTED_PROTOCOL_VERSIONS,
+};
 
 // ─────────────────────────────────────────────────────────────────────────
 // LeakDetector fixtures
@@ -427,4 +432,564 @@ printf '{"jsonrpc":"2.0","id":1,"result":42}'
     // Accept either "mid-line" (deterministic protocol violation) or any other
     // subprocess-exited message that races with the writer task.
     assert!(err.message.contains("subprocess"), "msg={}", err.message);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Server-to-client traffic, notifications and the bounded reader
+// ─────────────────────────────────────────────────────────────────────────
+
+const PATH_VALUE: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+fn path_env() -> BTreeMap<String, String> {
+    BTreeMap::from([("PATH".to_string(), PATH_VALUE.to_string())])
+}
+
+fn lines(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// `kill -0 <pid>` — exit 0 iff the process exists.
+fn pid_alive(pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Poll `condition` every 20 ms until it holds or `limit` passes.
+async fn wait_until(mut condition: impl FnMut() -> bool, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    condition()
+}
+
+fn json_of(bytes: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(bytes).expect("result is json")
+}
+
+// A server `ping` carrying the id of the pending call is answered with an
+// empty result and never resolves that call; a server notification is dropped.
+#[tokio::test]
+async fn a_server_ping_with_a_colliding_id_is_answered_and_never_answers_the_call() {
+    let script = r#"
+read -r req
+printf '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"hi"}}\n'
+printf '{"jsonrpc":"2.0","id":1,"method":"ping"}\n'
+read -r pong
+ok=false
+case "$pong" in *'"id":1'*) case "$pong" in *'"result":{}'*) case "$pong" in *'"method"'*) ;; *) ok=true ;; esac ;; esac ;; esac
+printf '{"jsonrpc":"2.0","id":1,"result":{"pong_ok":%s}}\n' "$ok"
+sleep 1
+"#;
+    let (cmd, args) = bash(script);
+    let transport = StdioMcpTransport::spawn_with_wall_clock(
+        "srv",
+        &cmd,
+        &args,
+        &empty_env(),
+        Arc::new(NoOpDetector),
+        Duration::from_secs(5),
+    )
+    .expect("spawn");
+    let out = transport
+        .invoke("x", serde_json::json!({}))
+        .await
+        .expect("the call gets its own answer");
+    assert_eq!(json_of(&out), serde_json::json!({"pong_ok": true}));
+}
+
+// Any other server request gets JSON-RPC error -32601 (method not found), so
+// a server waiting for an answer is not left hanging.
+#[tokio::test]
+async fn an_unknown_server_request_gets_method_not_found() {
+    let script = r#"
+read -r req
+printf '{"jsonrpc":"2.0","id":"s-1","method":"sampling/createMessage","params":{}}\n'
+read -r reply
+ok=false
+case "$reply" in *'"code":-32601'*) case "$reply" in *'"id":"s-1"'*) ok=true ;; esac ;; esac
+printf '{"jsonrpc":"2.0","id":1,"result":{"refused":%s}}\n' "$ok"
+sleep 1
+"#;
+    let (cmd, args) = bash(script);
+    let transport = StdioMcpTransport::spawn_with_wall_clock(
+        "srv",
+        &cmd,
+        &args,
+        &empty_env(),
+        Arc::new(NoOpDetector),
+        Duration::from_secs(5),
+    )
+    .expect("spawn");
+    let out = transport
+        .invoke("x", serde_json::json!({}))
+        .await
+        .expect("the server answers after reading the refusal");
+    assert_eq!(json_of(&out), serde_json::json!({"refused": true}));
+}
+
+// A notification is one line without an id.
+#[tokio::test]
+async fn notify_writes_one_line_without_an_id() {
+    let script = r#"
+read -r note
+read -r req
+ok=false
+case "$note" in *'"method":"notifications/initialized"'*) case "$note" in *'"id"'*) ;; *) ok=true ;; esac ;; esac
+printf '{"jsonrpc":"2.0","id":1,"result":{"note_ok":%s}}\n' "$ok"
+sleep 1
+"#;
+    let (cmd, args) = bash(script);
+    let transport = StdioMcpTransport::spawn_with_wall_clock(
+        "srv",
+        &cmd,
+        &args,
+        &empty_env(),
+        Arc::new(NoOpDetector),
+        Duration::from_secs(5),
+    )
+    .expect("spawn");
+    transport
+        .notify("notifications/initialized", None)
+        .await
+        .expect("written");
+    let out = transport
+        .invoke("x", serde_json::json!({}))
+        .await
+        .expect("answered");
+    assert_eq!(json_of(&out), serde_json::json!({"note_ok": true}));
+}
+
+// The line cap holds while reading: a stdout line that never ends closes the
+// transport at the cap instead of being buffered until the call times out,
+// and the closed transport fails later calls at once with the same reason.
+#[tokio::test]
+async fn an_endless_stdout_line_closes_the_transport_at_the_line_cap() {
+    let script = r#"
+read -r req
+while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done
+"#;
+    let (cmd, args) = bash(script);
+    let transport = StdioMcpTransport::spawn_with_options(
+        "srv",
+        &cmd,
+        &args,
+        &empty_env(),
+        Arc::new(NoOpDetector),
+        StdioOptions {
+            request_timeout: Duration::from_secs(20),
+            max_line_bytes: 64 * 1024,
+            runtime: None,
+        },
+    )
+    .expect("spawn");
+    let started = Instant::now();
+    let err = transport
+        .invoke("x", serde_json::json!({}))
+        .await
+        .expect_err("the line overflows the cap");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert!(
+        err.message.contains("exceeds 65536 bytes"),
+        "msg={}",
+        err.message
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(transport.is_closed());
+    let again = transport
+        .invoke("y", serde_json::json!({}))
+        .await
+        .expect_err("a closed transport fails at once");
+    assert!(again.message.contains("exceeds"), "msg={}", again.message);
+}
+
+// A server that exits closes the transport; a later call fails at once rather
+// than waiting out its budget.
+#[tokio::test]
+async fn a_server_that_exits_closes_the_transport() {
+    let (cmd, args) = bash("exit 0");
+    let transport = StdioMcpTransport::spawn_with_wall_clock(
+        "srv",
+        &cmd,
+        &args,
+        &empty_env(),
+        Arc::new(NoOpDetector),
+        Duration::from_secs(20),
+    )
+    .expect("spawn");
+    assert!(wait_until(|| transport.is_closed(), Duration::from_secs(5)).await);
+    let started = Instant::now();
+    let err = transport
+        .invoke("x", serde_json::json!({}))
+        .await
+        .expect_err("closed");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert!(err.message.contains("subprocess"), "msg={}", err.message);
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+// The server leads its own process group: dropping the transport also stops
+// the processes it started (as `npx` / `uvx` wrappers do).
+#[tokio::test]
+async fn dropping_the_transport_stops_the_processes_the_server_started() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("grandchild");
+    let script = format!("sleep 300 & echo $! > '{}'; read -r x", marker.display());
+    let transport = StdioMcpTransport::spawn(
+        "srv",
+        "bash",
+        &["-c".to_string(), script],
+        &path_env(),
+        Arc::new(NoOpDetector),
+    )
+    .expect("spawn");
+    assert!(wait_until(|| !lines(&marker).is_empty(), Duration::from_secs(5)).await);
+    let pid = lines(&marker)[0].clone();
+    assert!(pid_alive(&pid), "the server's child {pid} runs");
+
+    drop(transport);
+
+    let stopped = wait_until(|| !pid_alive(&pid), Duration::from_secs(5)).await;
+    if !stopped {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid])
+            .status();
+    }
+    assert!(stopped, "the server's child {pid} outlived the transport");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The stdio server lifecycle through McpClient
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Records the server's pid, one line per start.
+const LOG_START: &str = r#"
+echo $$ >> '@DIR@/starts'
+"#;
+
+/// Answers `initialize` (id 1) with protocol version `@VERSION@`, then requires
+/// `notifications/initialized` (without an id) as the next line. A message out
+/// of order makes the server exit, which fails the caller's call.
+const HANDSHAKE: &str = r#"
+read -r init
+case "$init" in *'"method":"initialize"'*'"id":1'*) ;; *) exit 3 ;; esac
+case "$init" in *'"protocolVersion":"2025-06-18"'*) ;; *) exit 4 ;; esac
+case "$init" in *'"clientInfo":{"name":"advance"'*) ;; *) exit 4 ;; esac
+printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"@VERSION@","capabilities":{"tools":{}},"serverInfo":{"name":"t","version":"1"}}}\n'
+read -r note
+case "$note" in *'"method":"notifications/initialized"'*) ;; *) exit 5 ;; esac
+case "$note" in *'"id"'*) exit 6 ;; esac
+"#;
+
+/// Answers every further request with `{"pid": <server pid>}`, echoing its id.
+const SERVE: &str = r#"
+while read -r line; do
+  id=${line##*\"id\":}; id=${id%%[!0-9]*}
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"pid":%s}}\n' "$id" "$$"
+done
+"#;
+
+fn server_script(parts: &[&str], dir: &Path, version: &str) -> String {
+    parts
+        .concat()
+        .replace("@DIR@", &dir.display().to_string())
+        .replace("@VERSION@", version)
+}
+
+/// A client with one stdio server `srv` running `bash -c <script>`.
+fn stdio_client(script: String, limits: McpClientLimits) -> McpClient {
+    let config = McpServersConfig::builder()
+        .add_server(McpServerEntry {
+            server_id: "srv".into(),
+            description: "stdio".into(),
+            transport: McpTransportSpec::Stdio {
+                command: "bash".into(),
+                args: vec!["-c".into(), script],
+                env: path_env(),
+            },
+            tool_patterns: None,
+            tool_schemas: BTreeMap::new(),
+        })
+        .expect("add server")
+        .build();
+    McpClient::new(Arc::new(config), Arc::new(NoOpDetector), None).with_limits(limits)
+}
+
+// The first call initializes the server (`initialize`, then
+// `notifications/initialized`) before the tool call, for every protocol version
+// the client accepts.
+#[tokio::test]
+async fn the_client_initializes_a_stdio_server_before_its_first_call() {
+    for version in SUPPORTED_PROTOCOL_VERSIONS {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client = stdio_client(
+            server_script(&[HANDSHAKE, SERVE], dir.path(), version),
+            McpClientLimits::default(),
+        );
+        let out = client
+            .invoke_tool("srv", "echo", br#"{"x":1}"#)
+            .await
+            .expect("initialized, then called");
+        assert!(json_of(&out)["pid"].is_u64());
+        assert_eq!(client.protocol_version("srv").as_deref(), Some(*version));
+    }
+}
+
+// A server that chooses a protocol version the client does not speak is
+// stopped before it receives anything else.
+#[tokio::test]
+async fn the_client_refuses_a_server_that_chooses_an_unsupported_protocol_version() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = r#"
+read -r init
+printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1999-01-01","capabilities":{}}}\n'
+while read -r more; do echo "$more" >> '@DIR@/after'; done
+"#;
+    let client = stdio_client(
+        server_script(&[LOG_START, script], dir.path(), ""),
+        McpClientLimits::default(),
+    );
+    let err = client
+        .invoke_tool("srv", "echo", b"{}")
+        .await
+        .expect_err("unsupported protocol version");
+    assert_eq!(err.kind, McpErrorKind::InvalidResponse);
+    assert!(
+        err.message.contains("protocol version"),
+        "msg={}",
+        err.message
+    );
+    assert_eq!(client.protocol_version("srv"), None);
+    let pid = lines(&dir.path().join("starts"))[0].clone();
+    assert!(
+        wait_until(|| !pid_alive(&pid), Duration::from_secs(5)).await,
+        "the refused server is stopped"
+    );
+    assert!(lines(&dir.path().join("after")).is_empty());
+}
+
+// `initialize` is bounded by the startup timeout, and a server that misses it
+// is stopped.
+#[tokio::test]
+async fn the_client_bounds_initialize_by_the_startup_timeout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = r#"
+read -r init
+sleep 30
+"#;
+    let client = stdio_client(
+        server_script(&[LOG_START, script], dir.path(), ""),
+        McpClientLimits {
+            startup_timeout: Duration::from_millis(300),
+            ..McpClientLimits::default()
+        },
+    );
+    let started = Instant::now();
+    let err = client
+        .invoke_tool("srv", "echo", b"{}")
+        .await
+        .expect_err("initialize never answered");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert!(err.message.contains("initialize"), "msg={}", err.message);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let pid = lines(&dir.path().join("starts"))[0].clone();
+    assert!(
+        wait_until(|| !pid_alive(&pid), Duration::from_secs(5)).await,
+        "the silent server is stopped"
+    );
+}
+
+// Concurrent first calls share one connection attempt: one server starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_calls_start_one_server() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = Arc::new(stdio_client(
+        server_script(&[LOG_START, HANDSHAKE, SERVE], dir.path(), "2025-06-18"),
+        McpClientLimits::default(),
+    ));
+    let calls: Vec<_> = (0..8)
+        .map(|_| {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.invoke_tool("srv", "echo", b"{}").await })
+        })
+        .collect();
+    for call in calls {
+        call.await.expect("join").expect("call");
+    }
+    assert_eq!(lines(&dir.path().join("starts")).len(), 1);
+}
+
+// A server that dies is evicted; reconnecting waits out the backoff (calls in
+// the window fail fast without starting a server), then a new server starts.
+#[tokio::test]
+async fn a_server_that_dies_is_restarted_after_the_backoff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // The first server dies on its first tool call; later ones serve.
+    let crash_once = r#"
+if [ ! -e '@DIR@/crashed' ]; then read -r call; : > '@DIR@/crashed'; exit 1; fi
+"#;
+    let client = stdio_client(
+        server_script(
+            &[LOG_START, HANDSHAKE, crash_once, SERVE],
+            dir.path(),
+            "2025-06-18",
+        ),
+        McpClientLimits {
+            restart_backoff_initial: Duration::from_millis(500),
+            restart_backoff_max: Duration::from_secs(30),
+            ..McpClientLimits::default()
+        },
+    );
+    let starts = dir.path().join("starts");
+
+    let died = client
+        .invoke_tool("srv", "echo", b"{}")
+        .await
+        .expect_err("the server dies during the call");
+    assert_eq!(died.kind, McpErrorKind::TransportError);
+
+    let waiting = client
+        .invoke_tool("srv", "echo", b"{}")
+        .await
+        .expect_err("inside the backoff window");
+    assert_eq!(waiting.kind, McpErrorKind::TransportError);
+    assert!(
+        waiting.message.contains("retry in"),
+        "msg={}",
+        waiting.message
+    );
+    assert_eq!(
+        lines(&starts).len(),
+        1,
+        "no server starts inside the window"
+    );
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let out = client
+        .invoke_tool("srv", "echo", b"{}")
+        .await
+        .expect("a new server after the backoff");
+    assert_eq!(lines(&starts).len(), 2);
+    assert_eq!(
+        json_of(&out)["pid"].to_string(),
+        lines(&starts)[1],
+        "the call is answered by the new server"
+    );
+}
+
+// A connection attempt that completes after `disconnect` retired its slot
+// publishes nothing: its caller gets an error, its server is stopped, and the
+// next call starts a new server.
+#[tokio::test]
+async fn a_connection_completing_after_disconnect_publishes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let slow_start = r#"
+sleep 1
+"#;
+    let client = Arc::new(stdio_client(
+        server_script(
+            &[LOG_START, slow_start, HANDSHAKE, SERVE],
+            dir.path(),
+            "2025-06-18",
+        ),
+        McpClientLimits::default(),
+    ));
+    let starts = dir.path().join("starts");
+    let first = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.invoke_tool("srv", "echo", b"{}").await })
+    };
+    assert!(wait_until(|| lines(&starts).len() == 1, Duration::from_secs(5)).await);
+
+    client.disconnect("srv");
+
+    let err = first
+        .await
+        .expect("join")
+        .expect_err("the attempt's slot was retired");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert!(err.message.contains("disconnected"), "msg={}", err.message);
+    let first_pid = lines(&starts)[0].clone();
+    assert!(
+        wait_until(|| !pid_alive(&first_pid), Duration::from_secs(5)).await,
+        "the retired attempt's server is stopped"
+    );
+
+    let out = client
+        .invoke_tool("srv", "echo", b"{}")
+        .await
+        .expect("a fresh connection");
+    assert_eq!(lines(&starts).len(), 2);
+    assert_eq!(json_of(&out)["pid"].to_string(), lines(&starts)[1]);
+}
+
+// Transport tasks run on the client's runtime, not on the runtime of the call
+// that connected the server: after that runtime is gone, the same server keeps
+// answering.
+#[test]
+fn stdio_transports_outlive_the_runtime_of_the_call_that_started_them() {
+    let daemon = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("daemon runtime");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = Arc::new(
+        stdio_client(
+            server_script(&[LOG_START, HANDSHAKE, SERVE], dir.path(), "2025-06-18"),
+            McpClientLimits::default(),
+        )
+        .with_runtime(daemon.handle().clone()),
+    );
+
+    let first = {
+        let client = Arc::clone(&client);
+        std::thread::spawn(move || {
+            let call_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("call runtime");
+            call_runtime.block_on(client.invoke_tool("srv", "echo", b"{}"))
+        })
+        .join()
+        .expect("call thread")
+        .expect("first call")
+    };
+    // The call runtime has shut down; the server must still be reachable.
+    let second = daemon
+        .block_on(client.invoke_tool("srv", "echo", b"{}"))
+        .expect("second call");
+    assert_eq!(json_of(&first)["pid"], json_of(&second)["pid"]);
+    assert_eq!(lines(&dir.path().join("starts")).len(), 1);
+}
+
+// A client built outside any runtime and given none never borrows the runtime
+// of the call that would connect a stdio server: it refuses to start one.
+#[test]
+fn a_client_built_outside_a_runtime_starts_no_stdio_server_without_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = stdio_client(
+        server_script(&[LOG_START, HANDSHAKE, SERVE], dir.path(), "2025-06-18"),
+        McpClientLimits::default(),
+    );
+    let call_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("call runtime");
+    let err = call_runtime
+        .block_on(client.invoke_tool("srv", "echo", b"{}"))
+        .expect_err("no runtime for stdio servers");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert!(err.message.contains("with_runtime"), "msg={}", err.message);
+    assert!(lines(&dir.path().join("starts")).is_empty());
 }

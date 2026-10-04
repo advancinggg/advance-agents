@@ -9,8 +9,8 @@ use advance_shared_types::security_validator::{
     Allowlist, HttpCapability, LeakDetector, ScanContext, ScanResult,
 };
 use cap_mcp::{
-    register_mcp_client, McpClient, McpError, McpErrorKind, McpServerEntry, McpServersConfig,
-    McpTransportSpec, ToolPattern,
+    is_valid_server_id, register_mcp_client, McpClient, McpError, McpErrorKind, McpServerEntry,
+    McpServersConfig, McpTransportSpec, ToolPattern,
 };
 
 struct NoOpDetector;
@@ -299,6 +299,86 @@ fn sd_15c_split_capability_registration() {
             spec.name
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Server ids: the builder admits only the pack manifest's grammar
+// ─────────────────────────────────────────────────────────────────────────
+#[test]
+fn builder_admits_only_server_ids_from_the_charset() {
+    let longest = "a".repeat(128);
+    for id in ["a", "srv-1", "alpha.beta_gamma", "A9", longest.as_str()] {
+        assert!(is_valid_server_id(id), "{id:?}");
+        McpServersConfig::builder()
+            .add_server(http_entry(id, None))
+            .unwrap_or_else(|e| panic!("{id:?} refused: {e}"));
+    }
+    let too_long = "a".repeat(129);
+    for id in [
+        "",
+        "a b",
+        "a/b",
+        "srv:1",
+        "ü",
+        "a\u{200B}b",
+        "a\nb",
+        too_long.as_str(),
+    ] {
+        assert!(!is_valid_server_id(id), "{id:?}");
+        let err = McpServersConfig::builder()
+            .add_server(http_entry(id, None))
+            .expect_err("invalid server id");
+        assert_eq!(err.kind, McpErrorKind::InvalidResponse);
+        assert!(
+            err.message.contains("[A-Za-z0-9._-]"),
+            "msg={}",
+            err.message
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Debug never prints a resolved secret
+// ─────────────────────────────────────────────────────────────────────────
+#[test]
+fn debug_output_hides_env_values_args_and_endpoint_queries() {
+    let stdio = McpServerEntry {
+        server_id: "local".to_string(),
+        description: "stdio".to_string(),
+        transport: McpTransportSpec::Stdio {
+            command: "/usr/local/bin/server".to_string(),
+            args: vec!["--token=arg-secret-123".to_string()],
+            env: BTreeMap::from([("API_TOKEN".to_string(), "env-secret-456".to_string())]),
+        },
+        tool_patterns: None,
+        tool_schemas: BTreeMap::new(),
+    };
+    let text = format!("{stdio:?}");
+    assert!(text.contains("API_TOKEN"), "{text}");
+    assert!(text.contains("/usr/local/bin/server"), "{text}");
+    assert!(!text.contains("env-secret-456"), "{text}");
+    assert!(!text.contains("arg-secret-123"), "{text}");
+
+    let http = McpTransportSpec::Http {
+        endpoint_url: "https://mcp.example.com/mcp?key=query-secret-789#frag".to_string(),
+        capability: HttpCapability {
+            allowlist: Allowlist {
+                patterns: vec!["mcp.example.com".to_string()],
+            },
+            credentials: vec![],
+            component_id: "remote".into(),
+        },
+    };
+    let text = format!("{http:?}");
+    assert!(text.contains("https://mcp.example.com/mcp"), "{text}");
+    assert!(!text.contains("query-secret-789"), "{text}");
+    assert!(!text.contains("frag"), "{text}");
+
+    let config = McpServersConfig::builder()
+        .add_server(stdio)
+        .unwrap()
+        .build();
+    assert!(!format!("{config:?}").contains("env-secret-456"));
 }
 
 fn _unused_mcp_error_type(_e: &McpError) {

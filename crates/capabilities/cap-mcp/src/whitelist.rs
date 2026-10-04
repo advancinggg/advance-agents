@@ -41,6 +41,20 @@ pub const MAX_PATTERNS_PER_SERVER: usize = 64;
 /// per-client transport pool size.
 pub const MAX_SERVERS: usize = 128;
 
+/// Longest server id, in bytes.
+pub const MAX_SERVER_ID_BYTES: usize = 128;
+
+/// Whether `server_id` is 1..=[`MAX_SERVER_ID_BYTES`] characters from
+/// `[A-Za-z0-9._-]`, the server-id grammar of a pack's `mcp-servers/*.yaml`.
+/// Such an id is safe in file names, log lines and display names.
+pub fn is_valid_server_id(server_id: &str) -> bool {
+    !server_id.is_empty()
+        && server_id.len() <= MAX_SERVER_ID_BYTES
+        && server_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// Tool name pattern — literal or single-trailing-`*` prefix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolPattern {
@@ -103,7 +117,11 @@ pub struct ToolSchemas {
 }
 
 /// Per-server transport specification.
-#[derive(Clone, Debug)]
+///
+/// `Debug` never prints what may hold a secret: a stdio `env` shows its keys
+/// only (its values are resolved secrets), `args` show only their count, and an
+/// http endpoint shows no query or fragment.
+#[derive(Clone)]
 pub enum McpTransportSpec {
     /// HTTP/SSE transport — reuses MODULE-012 HttpSecurityChain.
     Http {
@@ -116,6 +134,60 @@ pub enum McpTransportSpec {
         args: Vec<String>,
         env: BTreeMap<String, String>,
     },
+}
+
+impl std::fmt::Debug for McpTransportSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            McpTransportSpec::Http {
+                endpoint_url,
+                capability,
+            } => f
+                .debug_struct("Http")
+                .field("endpoint_url", &RedactedUrl(endpoint_url))
+                .field("capability", capability)
+                .finish(),
+            McpTransportSpec::Stdio { command, args, env } => f
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", &format_args!("<{} redacted>", args.len()))
+                .field("env", &RedactedEnv(env))
+                .finish(),
+        }
+    }
+}
+
+/// An endpoint URL without its query and fragment, which may carry tokens.
+struct RedactedUrl<'a>(&'a str);
+
+impl std::fmt::Debug for RedactedUrl<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keep the separator (`?` or `#`, one byte) so the shape stays visible.
+        match self.0.find(['?', '#']) {
+            Some(end) => write!(f, "{:?}", format!("{}<redacted>", &self.0[..=end])),
+            None => write!(f, "{:?}", self.0),
+        }
+    }
+}
+
+/// An environment map with every value hidden.
+struct RedactedEnv<'a>(&'a BTreeMap<String, String>);
+
+impl std::fmt::Debug for RedactedEnv<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|key| (key, Hidden)))
+            .finish()
+    }
+}
+
+/// Debug-prints as `<redacted>`.
+struct Hidden;
+
+impl std::fmt::Debug for Hidden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 /// Single server entry in the whitelist.
@@ -192,9 +264,16 @@ pub struct McpServersConfigBuilder {
 }
 
 impl McpServersConfigBuilder {
-    /// Add a server entry. Returns an error if the id collides with an existing
-    /// entry, or if the total would exceed `MAX_SERVERS`.
+    /// Add a server entry. Returns an error if the id is not a valid server id
+    /// (see [`is_valid_server_id`]), collides with an existing entry, or if the
+    /// total would exceed `MAX_SERVERS`.
     pub fn add_server(mut self, entry: McpServerEntry) -> Result<Self, McpError> {
+        if !is_valid_server_id(&entry.server_id) {
+            return Err(McpError::invalid_response(format!(
+                "server_id {:?} must be 1..={MAX_SERVER_ID_BYTES} characters from [A-Za-z0-9._-]",
+                entry.server_id
+            )));
+        }
         if self.servers.contains_key(&entry.server_id) {
             return Err(McpError::invalid_response(format!(
                 "duplicate server_id '{}'",

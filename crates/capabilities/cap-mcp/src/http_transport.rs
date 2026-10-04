@@ -2,8 +2,7 @@
 //!
 //! Routes JSON-RPC 2.0 over an `Arc<dyn HttpSecurityChain>` (CONTRACT-111),
 //! parsing both `application/json` single-response and `text/event-stream`
-//! streaming responses. Stdio transport is **out of scope** this slice
-//! (deferred to Slice C per MODULE-017 §3.7).
+//! streaming responses. The stdio transport lives in `stdio_transport.rs`.
 //!
 //! ## Bounds (Slice B foundation)
 //!
@@ -42,7 +41,7 @@ use async_trait::async_trait;
 
 use crate::client::McpTransport;
 use crate::error::{McpError, McpErrorKind};
-use crate::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
+use crate::jsonrpc::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 
 /// Maximum JSON-RPC request body bytes; rejects oversize requests at the
 /// boundary before submitting to HttpSecurityChain. Matches `MAX_SSE_TOTAL_BYTES`
@@ -115,6 +114,35 @@ impl HttpMcpTransport {
         let req = JsonRpcRequest::new(id, method, params);
         let body = serde_json::to_vec(&req)
             .map_err(|e| McpError::invalid_response(format!("serialize request: {e}")))?;
+        let response = self.post(body).await?;
+        self.decode_response(response, id)
+    }
+
+    /// Send a JSON-RPC notification (no id; the server sends no JSON-RPC
+    /// answer). Any 2xx status, `202 Accepted` included, means the server took
+    /// it; the response body is ignored.
+    pub async fn notify(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<(), McpError> {
+        let notification = JsonRpcNotification::new(method, params);
+        let body = serde_json::to_vec(&notification)
+            .map_err(|e| McpError::invalid_response(format!("serialize request: {e}")))?;
+        let response = self.post(body).await?;
+        if (200..300).contains(&response.status) {
+            Ok(())
+        } else {
+            Err(McpError::server_error(format!(
+                "http {} from mcp server",
+                response.status
+            )))
+        }
+    }
+
+    /// POST one JSON-RPC message through the security chain, under the size cap
+    /// and the wall-clock budget.
+    async fn post(&self, body: Vec<u8>) -> Result<HttpResponse, McpError> {
         if body.len() > MAX_JSONRPC_REQ_BYTES {
             return Err(McpError::new(
                 McpErrorKind::TransportError,
@@ -133,15 +161,14 @@ impl HttpMcpTransport {
             ],
             body,
         };
-        let response = tokio::time::timeout(
+        tokio::time::timeout(
             MAX_SSE_WALL_CLOCK,
             self.chain
                 .execute(&self.server_id, http_req, &self.capability),
         )
         .await
         .map_err(|_| McpError::transport("wall-clock timeout"))?
-        .map_err(map_http_error)?;
-        self.decode_response(response, id)
+        .map_err(map_http_error)
     }
 
     fn decode_response(
@@ -309,6 +336,14 @@ fn map_http_error(err: HttpError) -> McpError {
 impl McpTransport for HttpMcpTransport {
     async fn invoke(&self, method: &str, params: serde_json::Value) -> Result<Vec<u8>, McpError> {
         HttpMcpTransport::invoke(self, method, params).await
+    }
+
+    async fn notify(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<(), McpError> {
+        HttpMcpTransport::notify(self, method, params).await
     }
 
     fn server_id(&self) -> &str {

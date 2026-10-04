@@ -65,6 +65,16 @@ impl McpTransport for CountingMockTransport {
         q.remove(0)
     }
 
+    // An injected transport is already initialized, so the client sends it no
+    // handshake notification; any other notification is accepted and dropped.
+    async fn notify(
+        &self,
+        _method: &str,
+        _params: Option<serde_json::Value>,
+    ) -> Result<(), McpError> {
+        Ok(())
+    }
+
     fn server_id(&self) -> &str {
         &self.server_id
     }

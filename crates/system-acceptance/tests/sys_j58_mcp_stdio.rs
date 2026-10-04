@@ -35,6 +35,15 @@ fn shell_env() -> BTreeMap<String, String> {
     e
 }
 
+/// A bash MCP server script. It answers `initialize` (JSON-RPC id 1) with a supported protocol
+/// version, reads `notifications/initialized`, reads the tool call (id 2), then runs `on_call`,
+/// which answers it.
+fn mcp_server(on_call: &str) -> String {
+    format!(
+        r#"read -r init; printf '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-06-18","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"srv","version":"1"}}}}}}\n'; read -r initialized; read -r call; {on_call}"#
+    )
+}
+
 /// A real `McpClient` with one stdio server `"srv"` running `bash -c <script>`.
 fn stdio_client(script: &str) -> McpClient {
     let config = McpServersConfig::builder()
@@ -56,10 +65,10 @@ fn stdio_client(script: &str) -> McpClient {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sys_ac_180_stdio_subprocess_json_rpc_round_trip() {
-    // First invoke on a fresh transport allocates JSON-RPC id 1; the subprocess reads the
-    // request line and replies with a matching-id result.
-    let script = r#"read line; printf '{"jsonrpc":"2.0","id":1,"result":{"echoed":true}}\n'"#;
-    let client = stdio_client(script);
+    // The client initializes the fresh server first (`initialize` takes JSON-RPC id 1), so the
+    // tool call is id 2; the subprocess replies to it with a matching-id result.
+    let script = mcp_server(r#"printf '{"jsonrpc":"2.0","id":2,"result":{"echoed":true}}\n'"#);
+    let client = stdio_client(&script);
     let out = client
         .invoke_tool("srv", "echo", br#"{"x":1}"#)
         .await
@@ -72,8 +81,10 @@ async fn sys_ac_180_stdio_subprocess_json_rpc_round_trip() {
 async fn sys_ac_181_stdio_inbound_credential_blocked_by_leak_detector() {
     // The subprocess returns a result carrying a Block-class credential; the inbound
     // LeakDetector blocks the line → the credential bytes never reach the caller.
-    let script = r#"read line; printf '{"jsonrpc":"2.0","id":1,"result":{"data":"sk-proj-AAAAAAAAAAAAAAAAAAAAAAAA"}}\n'"#;
-    let client = stdio_client(script);
+    let script = mcp_server(
+        r#"printf '{"jsonrpc":"2.0","id":2,"result":{"data":"sk-proj-AAAAAAAAAAAAAAAAAAAAAAAA"}}\n'"#,
+    );
+    let client = stdio_client(&script);
     let err = client
         .invoke_tool("srv", "echo", br#"{}"#)
         .await
@@ -108,7 +119,7 @@ async fn sys_ac_182_subprocess_terminated_on_transport_drop() {
         "subprocess is alive before the transport is dropped"
     );
 
-    drop(transport); // Drop → start_kill() (SIGKILL) + kill_on_drop.
+    drop(transport); // Drop → SIGKILL to the subprocess's process group + start_kill().
 
     // The subprocess exits (observable: the PID is no longer alive).
     let mut gone = false;
@@ -128,10 +139,11 @@ async fn sys_ac_182_subprocess_terminated_on_transport_drop() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sys_ac_255_oversize_stdio_line_aborted_with_transport_error() {
-    // The subprocess emits a single response line exceeding MAX_STDIO_LINE_BYTES (4 MiB) →
-    // the reader aborts with a transport error rather than buffering unboundedly.
-    let script = r#"head -c 5000000 /dev/zero | tr '\0' x; echo"#;
-    let client = stdio_client(script);
+    // The subprocess answers the tool call with a single line exceeding MAX_STDIO_LINE_BYTES
+    // (4 MiB) → the reader stops at the cap and aborts with a transport error rather than
+    // buffering unboundedly.
+    let script = mcp_server(r#"head -c 5000000 /dev/zero | tr '\0' x; echo"#);
+    let client = stdio_client(&script);
     let err = client
         .invoke_tool("srv", "echo", br#"{}"#)
         .await

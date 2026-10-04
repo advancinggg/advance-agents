@@ -221,3 +221,46 @@ async fn sb_17b_sse_multiline_data_folding() {
     let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(parsed["value"], 42);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// A notification is POSTed through the chain without an id; any 2xx (202
+// Accepted included) means the server took it, anything else is an error.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn notify_posts_a_message_without_an_id_through_the_chain() {
+    let chain = Arc::new(MockChain::default());
+    chain.push(Ok(HttpResponse {
+        status: 202,
+        headers: vec![],
+        body: vec![],
+    }));
+    chain.push(Ok(HttpResponse {
+        status: 400,
+        headers: vec![("content-type".into(), "text/plain".into())],
+        body: b"rejected".to_vec(),
+    }));
+
+    let transport = HttpMcpTransport::new(
+        chain.clone(),
+        "srv",
+        "https://api.example.com/mcp",
+        dummy_cap(),
+    );
+    transport
+        .notify("notifications/initialized", None)
+        .await
+        .expect("202 accepted");
+    let sent: serde_json::Value = serde_json::from_slice(&chain.captured()[0].body).unwrap();
+    assert_eq!(
+        sent,
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    );
+
+    let err = transport
+        .notify("notifications/initialized", None)
+        .await
+        .expect_err("400 refused");
+    assert_eq!(err.kind, McpErrorKind::ServerError);
+    assert!(!err.message.contains("rejected"), "msg={}", err.message);
+    assert_eq!(chain.captured().len(), 2);
+}

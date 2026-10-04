@@ -1288,6 +1288,7 @@ dependencies = [
  "async-trait",
  "cap-http",
  "jsonschema",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

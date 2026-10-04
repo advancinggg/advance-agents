@@ -17,6 +17,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "process", "io-util", "macros"] }
+# Signals a stdio server's whole process group (`kill(-pgid, SIGKILL)`).
+libc = { workspace = true }
 cap-http = { path = "../cap-http" }
 advance-shared-types = { path = "../../shared-types" }
 # Slice D — host_fn registration + Val encoding for the 7 mcp-client methods

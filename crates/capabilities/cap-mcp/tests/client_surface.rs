@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use advance_shared_types::security_validator::{LeakDetector, ScanContext, ScanResult};
 use cap_mcp::{
-    McpClient, McpServerEntry, McpServersConfig, McpTransport, McpTransportSpec, ToolPattern,
+    McpClient, McpClientLimits, McpErrorKind, McpServerEntry, McpServersConfig, McpTransport,
+    McpTransportSpec, ToolPattern,
 };
 
 mod support;
@@ -206,4 +207,30 @@ async fn sd_36_read_resource() {
     let captured = mock.captured();
     assert_eq!(captured[0].0, "resources/read");
     assert_eq!(captured[0].1["uri"], serde_json::json!("file:///x.txt"));
+}
+
+// A result larger than `max_result_bytes` fails the call; one within it passes.
+#[tokio::test]
+async fn a_result_over_the_cap_fails_the_call() {
+    let mock = Arc::new(CountingMockTransport::new("srv"));
+    mock.push_ok(serde_json::json!({"text": "x".repeat(64)}));
+    mock.push_ok(serde_json::json!({"ok": true}));
+    let client = build_client_with_mock("srv", mock, None).with_limits(McpClientLimits {
+        max_result_bytes: 32,
+        ..McpClientLimits::default()
+    });
+    let err = client
+        .invoke_tool("srv", "search", b"{}")
+        .await
+        .expect_err("the result is over the cap");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert!(
+        err.message.contains("exceeds 32 bytes"),
+        "msg={}",
+        err.message
+    );
+    client
+        .invoke_tool("srv", "search", b"{}")
+        .await
+        .expect("a small result passes");
 }
