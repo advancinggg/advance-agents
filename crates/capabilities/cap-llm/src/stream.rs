@@ -3289,6 +3289,72 @@ mod tests {
         });
     }
 
+    /// MODULE-001-AC-30: `AgentStreamReaper::stop` ends the TTL loop between sweeps and
+    /// never abandons one. While the loop's sweep is parked inside `RunBudget::commit` on
+    /// the blocking pool, `stop` does not return; once the sweep has settled, it does. An
+    /// abort of the loop would return at once and leave the sweep settling detached.
+    #[test]
+    fn module_001_ac30_reaper_stop_waits_for_the_sweep_in_flight() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let enter = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let exit = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let budget = RecBudget::blocking(enter.clone(), exit.clone());
+        let bus = Arc::new(RecBus::default());
+        let reg = Arc::new(StreamRegistry::new());
+        let reaper = Arc::new(crate::host_fn::AgentStreamReaper::new(Arc::clone(&reg)));
+        rt.block_on(async {
+            let mut live = mk_live(mk_settlement(budget.clone(), bus.clone(), 1, 1));
+            live.created_at = Instant::now()
+                .checked_sub(crate::host_fn::STREAM_HANDLE_TTL + Duration::from_secs(1))
+                .expect("machine uptime > TTL");
+            assert!(reg.insert_live(live).is_ok());
+            reaper.spawn_loop(Duration::from_millis(5));
+        });
+
+        // The loop's first sweep settles the expired stream and parks inside commit. The
+        // barrier is met on a helper thread so a sweep that never comes fails the test
+        // instead of hanging it.
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let meet = enter.clone();
+        std::thread::spawn(move || {
+            meet.wait();
+            let _ = entered_tx.send(());
+        });
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the loop's sweep reached RunBudget::commit");
+
+        let (stopped_tx, stopped) = std::sync::mpsc::channel();
+        let stopper = Arc::clone(&reaper);
+        rt.spawn(async move {
+            stopper.stop().await;
+            let _ = stopped_tx.send(());
+        });
+        let returned_early = stopped.recv_timeout(Duration::from_millis(300)).is_ok();
+        let commits_while_parked = budget.commits.load(AOrd::SeqCst);
+        // Release the sweep before asserting: a parked blocking-pool thread would make the
+        // runtime's drop hang a failing test.
+        exit.wait();
+        assert!(
+            !returned_early,
+            "stop returned while the sweep it started was still settling"
+        );
+        assert_eq!(commits_while_parked, 0);
+        stopped
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stop returns once the sweep has settled");
+        assert_eq!(
+            budget.commits.load(AOrd::SeqCst),
+            1,
+            "the sweep finished its settlement before stop returned"
+        );
+        assert_eq!(bus.errors.load(AOrd::SeqCst), 1, "and its terminal record");
+    }
+
     /// Round 25 (adversarial I8): the WINS-not-victims return is discriminated —
     /// two snapshots of the same victim, settled in sequence, report 1 then 0.
     /// A `victims.len()` return (the round-23 form) reports 1 then 1.

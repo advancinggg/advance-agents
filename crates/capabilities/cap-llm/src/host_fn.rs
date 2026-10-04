@@ -663,12 +663,43 @@ pub fn register_agent_llm(registry: &dyn HostRegistry, gateway: Arc<LlmGateway>)
 pub struct AgentStreamReaper {
     registry: Arc<StreamRegistry>,
     /// The TTL reaper loop spawned at registration (when a runtime was present);
-    /// [`AgentStreamReaper::stop`] aborts and joins it. Dropped un-taken, the loop stays
+    /// [`AgentStreamReaper::stop`] stops and joins it. Never stopped, the loop stays
     /// detached and ends once its registry is unreachable, as before.
-    loop_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    loop_task: tokio::sync::Mutex<Option<ReaperLoop>>,
+}
+
+/// The running TTL reaper loop and the signal that ends it between sweeps.
+struct ReaperLoop {
+    stop: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl AgentStreamReaper {
+    /// A reaper over `registry`, with no loop yet ([`Self::spawn_loop`]).
+    pub(crate) fn new(registry: Arc<StreamRegistry>) -> Self {
+        Self {
+            registry,
+            loop_task: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Spawn the TTL reaper loop over this reaper's registry, ticking every `period`, and
+    /// keep it for [`Self::stop`]. The loop holds only a `Weak` of the registry. Must run
+    /// inside a tokio runtime.
+    pub(crate) fn spawn_loop(&self, period: std::time::Duration) {
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(reaper_loop(
+            Arc::downgrade(&self.registry),
+            period,
+            Arc::clone(&stop),
+        ));
+        // Uncontended: the slot is filled once, right after construction, before any
+        // `stop` can run.
+        if let Ok(mut slot) = self.loop_task.try_lock() {
+            *slot = Some(ReaperLoop { stop, task });
+        }
+    }
+
     /// Settle every live stream owned by `agent_id` (the BARE cap-id — the caller is
     /// responsible for holding the authoritative id; there is no resolution here).
     /// Returns the number of settlements this call WON — a zero can mean nothing
@@ -706,17 +737,19 @@ impl AgentStreamReaper {
             .settle_and_evict(self.registry.select_all_victims())
     }
 
-    /// Abort the TTL reaper loop and wait until it has ended. Idempotent; a no-op when no
-    /// loop was spawned (registration without a runtime).
+    /// Stop the TTL reaper loop and wait until it has ended. The loop is stopped between
+    /// sweeps, never aborted: a sweep in flight (it settles expired streams on the blocking
+    /// pool, `RunBudget::commit` and the `llm.*` emits included) is awaited first, so when
+    /// this returns nothing the loop started is still running. Idempotent and cancel-safe
+    /// (the loop's handle stays in its slot until it has resolved, so a call dropped part-way
+    /// leaves the join to the next call); a no-op when no loop was spawned (registration
+    /// without a runtime).
     pub async fn stop(&self) {
-        let task = self
-            .loop_task
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(task) = task {
-            task.abort();
-            let _ = task.await;
+        let mut slot = self.loop_task.lock().await;
+        if let Some(running) = slot.as_mut() {
+            running.stop.notify_one();
+            let _ = (&mut running.task).await;
+            *slot = None;
         }
     }
 }
@@ -761,8 +794,14 @@ impl std::fmt::Debug for AgentStreamReaper {
 /// The TTL reaper's loop, shared by the production spawn and its witness so the two cannot
 /// drift. Taking a `Weak` is load-bearing and type-enforced: a strong handle would pin the
 /// registry (and every entry reachable through it) alive for the process's lifetime and the
-/// task would never exit. Returns as soon as the registry is unreachable (audit round 7).
-async fn reaper_loop(reaper: std::sync::Weak<StreamRegistry>, period: std::time::Duration) {
+/// task would never exit. Returns as soon as the registry is unreachable (audit round 7), or
+/// once `stop` is notified — checked only while waiting for the next tick, so a sweep in
+/// flight always finishes before the loop returns.
+async fn reaper_loop(
+    reaper: std::sync::Weak<StreamRegistry>,
+    period: std::time::Duration,
+    stop: Arc<tokio::sync::Notify>,
+) {
     let mut ticker = tokio::time::interval(period);
     // Round 25: `Delay`, not the default `Burst` — with the sweep now AWAITED, an
     // overrunning sweep under the default was followed by N zero-delay catch-up
@@ -770,7 +809,11 @@ async fn reaper_loop(reaper: std::sync::Weak<StreamRegistry>, period: std::time:
     // already congested.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            biased;
+            () = stop.notified() => break,
+            _ = ticker.tick() => {}
+        }
         match reaper.upgrade() {
             // ADVERSARIAL §5.2: CONTAIN the sweep. `settle_expired_batch` reaches
             // `Settlement::finalize`, which still `unwrap()`s several mutexes; an
@@ -865,10 +908,7 @@ pub(crate) fn build_agent_llm_parts(
             gateway,
             registry: Arc::clone(&stream_registry),
         }),
-        reaper: Arc::new(AgentStreamReaper {
-            registry: stream_registry,
-            loop_task: std::sync::Mutex::new(None),
-        }),
+        reaper: Arc::new(AgentStreamReaper::new(stream_registry)),
     }
 }
 
@@ -908,15 +948,7 @@ pub(crate) fn register_agent_llm_parts(
     // The loop's handle is kept by the returned reaper so an owner can stop and join it
     // (`AgentStreamReaper::stop`); the loop itself still holds only the `Weak`.
     if tokio::runtime::Handle::try_current().is_ok() {
-        let task = tokio::spawn(reaper_loop(
-            Arc::downgrade(&parts.reaper.registry),
-            std::time::Duration::from_secs(30),
-        ));
-        *parts
-            .reaper
-            .loop_task
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(task);
+        parts.reaper.spawn_loop(std::time::Duration::from_secs(30));
     }
     registry.register(HostFunctionSpec {
         capability: CAPABILITY.to_string(),
@@ -980,27 +1012,30 @@ mod tests {
     }
 
     /// MODULE-001-AC-30: the TTL reaper loop spawned at registration is owned by the
-    /// returned reaper, which stops and joins it (idempotently).
+    /// returned reaper, which stops and joins it (idempotently): the loop task has ended
+    /// by the time `stop` returns, not merely been let go. (That a sweep in flight is
+    /// awaited first is `stream::tests::module_001_ac30_reaper_stop_waits_for_the_sweep_in_flight`.)
     #[tokio::test]
     async fn module_001_ac30_stream_reaper_loop_is_stopped_and_joined() {
         let registry = InMemoryHostRegistry::new();
         let reaper =
             register_agent_llm_parts(&registry, build_agent_llm_parts(test_gateway(), None));
-        let running = reaper
+        let probe = reaper
             .loop_task
             .lock()
-            .unwrap()
+            .await
             .as_ref()
-            .map(|t| !t.is_finished());
-        assert_eq!(
-            running,
-            Some(true),
-            "registration under a runtime spawns the loop"
-        );
+            .map(|running| running.task.abort_handle())
+            .expect("registration under a runtime spawns the loop");
+        assert!(!probe.is_finished(), "the loop runs until it is stopped");
         tokio::time::timeout(std::time::Duration::from_secs(2), reaper.stop())
             .await
             .expect("stop joined the loop");
-        assert!(reaper.loop_task.lock().unwrap().is_none());
+        assert!(
+            probe.is_finished(),
+            "the loop task had ended when stop returned"
+        );
+        assert!(reaper.loop_task.lock().await.is_none());
         reaper.stop().await;
         assert_eq!(reaper.reap_all(), 0, "nothing live");
     }
@@ -3762,7 +3797,8 @@ mod live_gated_tests {
         let flag = Arc::clone(&stopped);
         let weak = Arc::downgrade(&reg);
         let task = tokio::spawn(async move {
-            super::reaper_loop(weak, Duration::from_millis(2)).await;
+            let never = Arc::new(tokio::sync::Notify::new());
+            super::reaper_loop(weak, Duration::from_millis(2), never).await;
             flag.store(true, AOrd::SeqCst);
         });
         // While the registry is alive the loop keeps sweeping and must NOT return.
@@ -3789,10 +3825,7 @@ mod live_gated_tests {
             .stream_begin_live(ctx(), &r.registry)
             .await
             .unwrap();
-        let reaper = super::AgentStreamReaper {
-            registry: Arc::clone(&r.registry),
-            loop_task: Mutex::new(None),
-        };
+        let reaper = super::AgentStreamReaper::new(Arc::clone(&r.registry));
         assert_eq!(reaper.reap_all(), 1, "the live stream is settled");
         assert_eq!(r.budget.commits.load(AOrd::SeqCst), 1, "settled once");
         assert_eq!(reaper.reap_all(), 0, "evicted: nothing left to reap");
