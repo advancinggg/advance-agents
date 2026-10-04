@@ -1,5 +1,5 @@
 # MODULE-001-T111 (1) `advance start` on H1 (capabilities: fs, llm; deployed driver; no git repository) with stdout's read end closed right after spawn (EPIPE on the readiness line): stderr up to the readiness write
-# captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
+# captured on the pre-lane OSS tree (main 84a82451, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
 # the outcome and what follows the Client API line: READINESS_WRITE_FAILURE, exit.readiness_write_failure.after_write.golden
 --- stderr through the Client API line ---
 advance: Client API and Web Console listening at http://127.0.0.1:<PORT>

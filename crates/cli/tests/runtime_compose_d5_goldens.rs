@@ -1,8 +1,8 @@
 //! MODULE-001-T111 (1)–(2) / MODULE-001-AC-30 — the no-regression goldens of ADR 2026-10-03 D5
-//! for the real `advance start` binary, captured on the pre-lane OSS tree (v0.1.26 + the sign-in
-//! retry fix + the 0.1.27 version bump), before the runtime-compose move. The route-table goldens
-//! live in `runtime_compose_d5_route_table.rs` (their own test binary); both binaries share
-//! `runtime_compose_d5_common` (homes, golden files, sha256 pins, pending decisions).
+//! for the real `advance start` binary, captured on the pre-lane OSS tree (main 84a82451), before
+//! the runtime-compose move. The route-table goldens live in `runtime_compose_d5_route_table.rs`
+//! (their own test binary); both binaries share `runtime_compose_d5_common` (homes, golden files,
+//! sha256 pins, pending decisions).
 //!
 //! What each golden pins (files under `tests/goldens/runtime_compose_d5/`):
 //! - `start.<home>.stdout.golden` / `start.<home>.stderr.golden` (H1..H6): every byte of each

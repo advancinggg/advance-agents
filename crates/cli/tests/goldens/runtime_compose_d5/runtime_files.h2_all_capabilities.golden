@@ -1,5 +1,5 @@
 # MODULE-001-T111 (1) runtime files of `advance start` on H2 (capabilities: every KNOWN_CAPABILITIES entry = secrets, fs, skills, memory, grant, llm, tools, messaging, lifecycle, genui; genui.enabled: true; deployed driver; git repository) while running (after exit: pinned by H2_SIGTERM_AFTER_READINESS in start.h2_all_capabilities.after_shutdown.golden)
-# captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
+# captured on the pre-lane OSS tree (main 84a82451, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
 # bytes = the exact file content as a Rust string literal (no trailing newline unless shown)
 .runtime/runtime.lock mode=0600 bytes="pid: <PID>\nplatform_uid: \"<OS>:<PID>:<PS_LSTART>\"\nstarted_at: \"<RFC3339_UTC>\"\nheartbeat_at: \"<RFC3339_UTC>\"\nworkspace_root: \"<ROOT>/ws\"\nversion: \"0.1.0\""
 .runtime/client-api mode=0600 bytes="pid: <PID>\nclient_api_base: \"http://127.0.0.1:<PORT>\"\n"

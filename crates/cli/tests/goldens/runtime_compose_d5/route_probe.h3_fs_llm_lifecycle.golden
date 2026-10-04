@@ -1,5 +1,5 @@
 # MODULE-001-T111 (2) route probes through `advance start` on H3 (capabilities: fs, llm, lifecycle; deployed driver; no git repository)
-# captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
+# captured on the pre-lane OSS tree (main 84a82451, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
 # native client: loopback, no Origin, x-advance-api-version: 2026-09-17, bearer session;
 # GET with no query; POST with body {} (+ idempotency-key for mutations); path params = "golden-probe-id"
 # <KEY> -> <status> data <canonical JSON of data, keys sorted> [warnings=[<code> "<message>", …]] | <status> error <code> "<message>" [details=…]

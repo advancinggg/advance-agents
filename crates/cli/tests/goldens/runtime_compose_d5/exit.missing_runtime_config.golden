@@ -1,5 +1,5 @@
 # MODULE-001-T111 (1) `advance start` on a workspace without .advance/runtime-config.yaml
-# captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
+# captured on the pre-lane OSS tree (main 84a82451, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
 exit=1
 --- stdout ---
 --- stderr ---

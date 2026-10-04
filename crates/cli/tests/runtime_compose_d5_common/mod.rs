@@ -35,9 +35,9 @@ pub const UPDATE_ENV: &str = "ADVANCE_UPDATE_D5_GOLDENS";
 pub const MASTER_KEY_ENV: &str = "ADVANCE_D5_GOLDEN_MASTER_KEY";
 pub const MASTER_KEY_HEX: &str = "d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5";
 
-/// Where the goldens were captured. Every golden header carries it. (The version the bump went
-/// to is named by its commit, not spelled out: no golden may contain the package version.)
-pub const CAPTURED_ON: &str = "captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move";
+/// Where the goldens were captured. Every golden header carries it. (The base is named by its
+/// commit, not by its version: no golden may contain the package version.)
+pub const CAPTURED_ON: &str = "captured on the pre-lane OSS tree (main 84a82451, plus the read-only ClientApi::route_table accessor), before the runtime-compose move";
 
 /// The package version of this tree. No golden may contain it (the lane bumps the version): a
 /// version value must be masked, and every golden is checked for it before it is compared or
@@ -138,7 +138,7 @@ pub const READINESS_WRITE_FAILURE: PendingExpectation = PendingExpectation {
         ExitOutcome::Code(101),
         &[(
             READINESS_AFTER_WRITE_GOLDEN,
-            "772b51026db0db9f08c60b8f51a79de240dbda4a82b4fb58056ae942faa69161",
+            "5f983305de98cf724c689f8baf5d09418dca70a4db89dcbd6201ec170ed257f3",
         )],
     )],
 };
@@ -160,7 +160,7 @@ pub const H2_SIGTERM_AFTER_READINESS: PendingExpectation = PendingExpectation {
         ExitOutcome::NoExitAfterSigterm,
         &[(
             H2_AFTER_SHUTDOWN_GOLDEN,
-            "e20f4b427ebb2e10bef68956ca26a339d3bd927b4740aded3c1a5a167c2936c2",
+            "fad1479dbef4727cf33072ffd37761a4217a4f0398f700763bd7980f6a215fcd",
         )],
     )],
 };
@@ -181,111 +181,111 @@ pub const PENDING_EXPECTATIONS: &[(&str, &PendingExpectation)] = &[
 pub const BASELINE_GOLDEN_SHA256: &[(&str, &str)] = &[
     (
         "exit.malformed_runtime_config.golden",
-        "61b8a1349ee4af073c29fb8ba85ddc520098e2779d29737d6ac977c378222834",
+        "763b1c097b949f8ed67df26679c1817d01272b62c305e61feeec7a2371b4e819",
     ),
     (
         "exit.missing_runtime_config.golden",
-        "75561a44f8a477838b201b41d158d76f1ba9135d48d2ce546fca9cb525fbdb9d",
+        "15ecc6142aec7d7b489456508b0ca1db7817f9a97af6487d5f07ea0d1be5bcd3",
     ),
     (
         READINESS_BEFORE_WRITE_GOLDEN,
-        "33ddd0fd84ec671190bdf42270e3c46cfe847d2c166602cb8d965ebb95522841",
+        "e052028dd26c1a38191e04aef60bc984a605ed2ec403e67d9d411109eb6ce717",
     ),
     (
         "exit.runtime_lock_held.golden",
-        "91b27e4385ec0694faa06a84d9c7f83a2bf40791180be3a202119283268a5b4b",
+        "f73a1780cab54ca7516607288c839c98787c2396059448274c4ee93e7f563b28",
     ),
     (
         "exit_codes.golden",
-        "4bc43af463468de8da775648d496996b82f986de3271006f16dfadb215249ed9",
+        "edb61af2e2aa0673d7ea95efcbd97f6abbdcf1bb09735be7a3300642ecc355aa",
     ),
     (
         "route_probe.h1_fs_llm.golden",
-        "ed82460dfe188cc7a120b83f9c8d92a6943afdc8ea0f6097b5516bd6a9f7da26",
+        "831cb55772ee6a2e2f42ee9672d98b5bbac50caea2fb1a9dc661729934d8a29c",
     ),
     (
         "route_probe.h2_all_capabilities.golden",
-        "37d51e6e98499faacd5659903777d56e9d44620b9a2011c509cd3bb2f89f6be4",
+        "a7867005f8ab098fcd9e5fd456f250a11c3765b96a0de7824e40361ef14c3ea5",
     ),
     (
         "route_probe.h3_fs_llm_lifecycle.golden",
-        "c7c518c09e72a67b5a5763fa076cbc435b78b5d4732782601fa76e1c7629ef69",
+        "98b4bd9738c7299fef2b88a469f061fc1fe2d42e263dfe063609a38f7a65a7e1",
     ),
     (
         "route_probe.h4_fs_llm_grant.golden",
-        "da8516c5f5f0b7f641b451c6f75b990dd1a83bca0c0427c40b609894d7599251",
+        "6c03a0c9bd793db9013c4c2193a809e329a1a924579c244d93d2c44c53ef2e6e",
     ),
     (
         "route_probe.h5_fs_llm_tools_no_driver.golden",
-        "410672f64fa41d1549f652c518d348462457e6c23bb9918aae0575e5c4afa338",
+        "bf7be8af05a70c378bac5a2f6d0d49f7ab8866f1112fb829d7257b21a86ecb0c",
     ),
     (
         "route_table.h1_fs_llm.golden",
-        "bc4e050f3f091459bc71bccb2abc0320e7ab092dd530ca1197f3f35dd4bd67fe",
+        "b09dd0ccf9a4604c400701df9d9ae477171ed3db2e1e3381bac8bce0bd545527",
     ),
     (
         "route_table.h2_all_capabilities.golden",
-        "52d08d66643ac2cb6fdbfc42827ded867c384c8834ab82aa4ca1ed2555925343",
+        "4331c411de5d7efc5448140d0ae59ab92fe19e73b06b9a731fcb84e54ef6be2e",
     ),
     (
         "runtime_files.h1_fs_llm.golden",
-        "85fdb5db5e9569be29b39bd32db2feb2350a6c85de4d564d932c7abea31dbec6",
+        "dc87407125376ac2fbba6f92c36a7850c07d8eba4c435dea1e84443d5bbd5c51",
     ),
     (
         "runtime_files.h2_all_capabilities.golden",
-        "768fdfcb50d436fdb3e2af8eef26b73cdcfce9bd3b21f09dd3cb7f0e1a1eb7a4",
+        "a9c7f78b0d31346c7400aa712b798a59954bbd627c1e8a8d8a76a01fe18cd5f4",
     ),
     (
         "start.h1_fs_llm.merged.golden",
-        "62bff0c17a4c4a8c1ed48c51bd2ae6cc576ce3a15b25ddf127f2b98df8b07641",
+        "7388bdeb144392afa2258feed36c55aa47dee7977cc5c301f4ebf58bdbda50e4",
     ),
     (
         "start.h1_fs_llm.stderr.golden",
-        "84b477c1f8976d8b03b4815fdf803c6c1ffef5f3e94951c655526b569ebebe05",
+        "4856ac3784caa2af51e5713e719476551f81c5c5ae52dc010e734023da55016d",
     ),
     (
         "start.h1_fs_llm.stdout.golden",
-        "9e1d0ba7c2961614ee206dacb5cdabc2d6494ffc4a6d94558b540a13859d8ec7",
+        "9e5442316f51dcb1fdb10ffedb33e0eb93a819f2b80585863273e044137a340f",
     ),
     (
         "start.h2_all_capabilities.stderr.golden",
-        "c2bf81b5e2e7ebf22bf5efc0ccebc86630f5f63b1d729b94d01374880c2727e4",
+        "36ebf25496e5b5d5b3253c42a5009958337d8b7088115753e377958a04f86606",
     ),
     (
         "start.h2_all_capabilities.stdout.golden",
-        "8e980afcf200483a3b9f919bdacffd1671d35cc9d56a97810a7bc27e50bc58d0",
+        "b6732b8a6687b1de180524c6de7dba4b81b761c8e4f41bf8e384df9e155e3afc",
     ),
     (
         "start.h3_fs_llm_lifecycle.stderr.golden",
-        "9c0de9d7bef006a75c2e323a6b6d83a8d888cac5af9ed62f9ff563fb30a376e1",
+        "9322d7f2de4c61a757b990cd9db892f462afa857e786bcdbcfbf19e5cb6b376a",
     ),
     (
         "start.h3_fs_llm_lifecycle.stdout.golden",
-        "798f8fbab02b9d35d3dcee0671e3aede8443879badd33725185fd9ce03141667",
+        "7e42acf63e2ee25e5b61aa99c127deaa9d2250ecc7791598186f80b04ee1a6fa",
     ),
     (
         "start.h4_fs_llm_grant.stderr.golden",
-        "41dcf8a32d0f8798c6bf1ae70ef7f40ed7e006d46a99d77c81e41d4c5facfc86",
+        "e1dc685f0de9ea9e7c443d548410ffeceac91b0d847782c2f4021578129b9ba2",
     ),
     (
         "start.h4_fs_llm_grant.stdout.golden",
-        "a34c1dcde5bdd4c81057084be022374712af998a198444f962ae714fee3e198b",
+        "6a639eb50088e1143c58bbce063a82f213385104526874eea8f72b7b905c01ef",
     ),
     (
         "start.h5_fs_llm_tools_no_driver.stderr.golden",
-        "f83e1d90655824af59157e47cae4e15c7927de09ea71bb929baf41956484e501",
+        "d9812d126f5451defdbe9eb83e4d3947de5a20870120ad5b2763e45c84508af8",
     ),
     (
         "start.h5_fs_llm_tools_no_driver.stdout.golden",
-        "fef5ca1acb6998bdb90b1181a76ee4c35305e64fc535b9517860dc9612d75e6a",
+        "ccf69ebfe218f0c3368d25084f36e70671e432e762f342a8e1c6e2cb3d3f24f5",
     ),
     (
         "start.h6_fs_llm_memory_no_git.stderr.golden",
-        "f38239b52cbe16d921f8efec1f7b981379d9e86c0fdc8135e8561a83f8d06243",
+        "59a48e475cc4e381f1805905decce6a6d09e0499b308da8206101bdcc2f91f1c",
     ),
     (
         "start.h6_fs_llm_memory_no_git.stdout.golden",
-        "1b23dc207d7338622619f72f90e4c899c3540a753e5579d18598cb906b7e8ff2",
+        "b883d6a2045c6d9838d35cf734b67c08bfa18514a8684403b446b50742b2292e",
     ),
 ];
 
