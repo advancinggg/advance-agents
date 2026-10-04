@@ -16,7 +16,7 @@
 //! MODULE-001 §3.6 Known Gaps.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use advance_database::{
     R2d2RecallImpl, R2d2SqliteIndexHandle, R2d2UnifiedSearchImpl, Recall, SqliteIndexHandle,
@@ -293,6 +293,9 @@ pub struct RuntimeHostBuilder {
     host_registry: Arc<dyn HostRegistry>,
     breaker: Arc<dyn CircuitBreakerBus>,
     workspace_root: PathBuf,
+    /// The WAL-mode reload observer task, until an owner takes it
+    /// ([`RuntimeHostBuilder::take_wal_observer`]); left here it stays detached.
+    wal_observer: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl RuntimeHostBuilder {
@@ -381,15 +384,17 @@ impl RuntimeHostBuilder {
         // log-spam when an operator chose `wal-mode: false` deliberately at
         // startup and triggers later reloads for unrelated fields.
         //
-        // Lifecycle: the spawned task is detached. When the last
-        // `Arc<RuntimeConfigWatcher>` is dropped, the watcher drops its
-        // `_watcher` (closing the OS file-watch channel), the bridge task
+        // Lifecycle: the spawned task is detached unless an owner takes its
+        // handle (`take_wal_observer`). When the last
+        // `Arc<RuntimeConfigWatcher>` is dropped, the watcher drops its OS
+        // watcher (closing the file-watch channel), the bridge task
         // exits, `WatcherInner` is dropped, the sender vec drops, and our
         // receiver sees EOF — the task exits cleanly. Same lifecycle posture
-        // as the existing watcher bridge task.
+        // as the existing watcher bridge task. `RuntimeConfigWatcher::stop`
+        // closes the subscriber channels directly, with the same effect.
         let mut wal_reload_rx = config_watcher.subscribe();
         let initial_wal_mode = config.database.wal_mode;
-        tokio::spawn(async move {
+        let wal_observer = tokio::spawn(async move {
             let mut prev_wal_mode = initial_wal_mode;
             while let Some(new_cfg) = wal_reload_rx.recv().await {
                 let new_wal_mode = new_cfg.database.wal_mode;
@@ -454,7 +459,19 @@ impl RuntimeHostBuilder {
             host_registry,
             breaker,
             workspace_root: workspace_root.to_path_buf(),
+            wal_observer: Mutex::new(Some(wal_observer)),
         })
+    }
+
+    /// Hand the WAL-mode reload observer task to an owner that awaits it at shutdown
+    /// (it ends once the config watcher's subscriber channels close). `None` after the
+    /// first call. A builder whose handle is never taken behaves as before: dropping
+    /// the handle leaves the task detached.
+    pub fn take_wal_observer(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.wal_observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// Finalize construction with the given `GrantCheck`. Runs steps 6–8

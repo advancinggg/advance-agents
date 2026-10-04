@@ -22,7 +22,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 
 /// Per-subscriber channel capacity. Bounded to prevent unbounded memory growth when
 /// a subscriber stalls or leaks. Drop-oldest semantics via try_send — a stalled
@@ -1700,12 +1700,19 @@ struct WatcherInner {
 /// The `notify::RecommendedWatcher` watches the parent directory to support
 /// atomic rename/create patterns (editors that write to a temp file then rename).
 ///
-/// Debug impl omits the watcher/abort internals (not useful for diagnostics).
+/// Debug impl omits the watcher/task internals (not useful for diagnostics).
+///
+/// [`RuntimeConfigWatcher::stop`] ends every part of it (OS watcher, poll task,
+/// bridge task, subscriber channels) while the owner still holds it; without
+/// `stop` they end once the last `Arc` drops, as before.
 pub struct RuntimeConfigWatcher {
     inner: Arc<WatcherInner>,
-    _watcher: RecommendedWatcher,
-    _bridge_abort: AbortHandle,
-    _poll_abort: AbortHandle,
+    /// The OS file watcher; `None` once [`RuntimeConfigWatcher::stop`] dropped it.
+    watcher: Mutex<Option<RecommendedWatcher>>,
+    /// The bridge task; taken and joined by [`RuntimeConfigWatcher::stop`].
+    bridge: Mutex<Option<JoinHandle<()>>>,
+    /// The fingerprint poll task; taken and joined by `stop`, aborted by `Drop`.
+    poll: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl fmt::Debug for RuntimeConfigWatcher {
@@ -1971,10 +1978,51 @@ impl RuntimeConfigWatcher {
 
         Ok(Self {
             inner,
-            _watcher: watcher,
-            _bridge_abort: bridge_handle.abort_handle(),
-            _poll_abort: poll_handle.abort_handle(),
+            watcher: Mutex::new(Some(watcher)),
+            bridge: Mutex::new(Some(bridge_handle)),
+            poll: Mutex::new(Some(poll_handle)),
         })
+    }
+
+    /// Stop watching, while the owner still holds the watcher:
+    ///
+    /// 1. no `runtime.config_reloaded` event is emitted any more;
+    /// 2. the OS file watcher is dropped on the blocking pool (on macOS its drop
+    ///    joins the FSEvents thread);
+    /// 3. the fingerprint poll task and the bridge task are aborted and awaited;
+    /// 4. every subscriber channel is closed: each `subscribe()` receiver then
+    ///    yields `None`, so the tasks reading them end.
+    ///
+    /// [`RuntimeConfigProvider::current`] keeps answering the last applied config.
+    /// A `subscribe()` after `stop` gets a receiver that never yields. Idempotent.
+    pub async fn stop(&self) {
+        self.inner.emitter_live.store(false, Ordering::Release);
+        let watcher = self
+            .watcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(watcher) = watcher {
+            let _ = tokio::task::spawn_blocking(move || drop(watcher)).await;
+        }
+        let poll = self.poll.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(poll) = poll {
+            poll.abort();
+            let _ = poll.await;
+        }
+        let bridge = self.bridge.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(bridge) = bridge {
+            bridge.abort();
+            let _ = bridge.await;
+        }
+        let subscribers = std::mem::take(
+            &mut *self
+                .inner
+                .subscribers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        drop(subscribers);
     }
 
     /// Install (or replace) the `runtime.config_reloaded` event sink
@@ -2020,10 +2068,17 @@ impl Drop for RuntimeConfigWatcher {
         // phantom `runtime.config_reloaded` events for a dead watcher.
         // Subscriber fan-out during the drain is deliberately UNCHANGED —
         // only the new emit is gated. Runs before the automatic field drops,
-        // so the gate closes before `_watcher` drops `event_tx` and the
+        // so the gate closes before `watcher` drops `event_tx` and the
         // drain begins.
         self.inner.emitter_live.store(false, Ordering::Release);
-        self._poll_abort.abort();
+        if let Some(poll) = self
+            .poll
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            poll.abort();
+        }
     }
 }
 

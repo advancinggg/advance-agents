@@ -17,7 +17,7 @@ use chrono::Utc;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 
 /// Default heartbeat interval per MODULE-001 §2.11 line 992: 30 seconds.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -167,10 +167,16 @@ impl From<std::io::Error> for LockError {
 /// Holds the `/.runtime/runtime.lock` file and a background heartbeat task.
 ///
 /// When dropped, aborts the heartbeat task and removes the lock file (best-effort).
+/// An owner that can await uses [`RuntimeLock::release`] instead, which joins the
+/// heartbeat before it removes the file.
 #[derive(Debug)]
 pub struct RuntimeLock {
     path: PathBuf,
-    _heartbeat_abort: AbortHandle,
+    /// `None` once [`RuntimeLock::release`] joined it.
+    heartbeat: Option<JoinHandle<()>>,
+    /// Set by [`RuntimeLock::release`]: the file is already removed, so `Drop` leaves
+    /// the path alone (a newer lock may own it by then).
+    released: bool,
 }
 
 impl RuntimeLock {
@@ -248,11 +254,11 @@ impl RuntimeLock {
         // Spawn heartbeat task
         let hb_path = path.clone();
         let task = tokio::spawn(heartbeat_loop(hb_path, heartbeat_interval));
-        let abort_handle = task.abort_handle();
 
         Ok(RuntimeLock {
             path,
-            _heartbeat_abort: abort_handle,
+            heartbeat: Some(task),
+            released: false,
         })
     }
 
@@ -260,12 +266,29 @@ impl RuntimeLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Release the lock: abort the heartbeat task and await it, THEN remove the lock
+    /// file. Joining first means no heartbeat rewrite can run after the unlink (on a
+    /// multi-thread runtime an aborted-but-running heartbeat could otherwise re-create
+    /// the file it reads and rewrites). The removal is best-effort, as in `Drop`.
+    pub async fn release(mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+            let _ = heartbeat.await;
+        }
+        let _ = std::fs::remove_file(&self.path);
+        self.released = true;
+    }
 }
 
 impl Drop for RuntimeLock {
     fn drop(&mut self) {
-        self._heartbeat_abort.abort();
-        let _ = std::fs::remove_file(&self.path);
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+        if !self.released {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
