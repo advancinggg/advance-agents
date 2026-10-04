@@ -74,6 +74,7 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 pub use crate::clock::{Clock, SystemClock};
 pub use crate::error::EventBusError;
@@ -468,7 +469,13 @@ struct AsyncState {
     /// cancel_token and are joined together after the flush barrier.
     sweeper_handle: TokioMutex<Option<JoinHandle<()>>>,
     join_handles: TokioMutex<Vec<JoinHandle<()>>>,
-    server_addr: SocketAddr,
+    /// `None` when the bus was built by [`EventBus::new_without_server`].
+    server_addr: Option<SocketAddr>,
+    /// Cancels every connected `/events` WebSocket client (a child of
+    /// `cancel_token`); see [`EventBus::shutdown_shared`].
+    ws_cancel: CancellationToken,
+    /// Tracks the upgraded `/events` client tasks, which axum spawns detached.
+    ws_tasks: TaskTracker,
     /// Slice m019-readapi (CONTRACT-185) — additive read-substrate handles for
     /// `EventBus::read_api`. Clones of the SAME pool / broadcaster the production
     /// `/query` + `/events` surfaces use, so the read API sees identical persisted
@@ -522,6 +529,20 @@ impl EventBus {
     /// `CancellationToken`); dropping the bus without `shutdown()` leaks the
     /// server task + bound listener until process exit.
     pub async fn new(cfg: EventBusConfig) -> Result<Self, EventBusError> {
+        Self::new_inner(cfg, true).await
+    }
+
+    /// Construct a production `EventBus` that binds no listener: no HTTP/WS server
+    /// task, so neither `/events` nor `/query` is served and
+    /// [`EventBus::server_addr`] is `None`. `cfg.websocket_addr` is ignored. Every
+    /// other part is as in [`EventBus::new`]: the 4 sink actors, the stats tick,
+    /// the retention sweeper, [`EventBus::read_api`] (live subscribe included) and
+    /// [`EventBus::cost_ledger`].
+    pub async fn new_without_server(cfg: EventBusConfig) -> Result<Self, EventBusError> {
+        Self::new_inner(cfg, false).await
+    }
+
+    async fn new_inner(cfg: EventBusConfig, serve: bool) -> Result<Self, EventBusError> {
         // 1. Build SQLite pool with schema migration.
         let pool = build_pool(&cfg.db_path)?;
 
@@ -569,6 +590,8 @@ impl EventBus {
         // live subscribe sees identical live events. Cloned BEFORE `ws_state` is
         // moved into `ws_route` below (order-sensitive — the only such step).
         let read_broadcaster = ws_state.broadcaster.clone();
+        let ws_cancel = ws_state.cancel.clone();
+        let ws_tasks = ws_state.tasks.clone();
 
         // 7. Spawn stats_aggregator actor.
         let (stats_aggregator_tx, stats_handle) = stats_aggregator::spawn(
@@ -579,61 +602,68 @@ impl EventBus {
         );
         // dropped_count for actor-side write failures already constructed above.
 
-        // 8. Build the merged axum router and spawn the HTTP server.
-        let query_state = query_api::QueryState { pool: pool.clone() };
-        let router = axum::Router::new()
-            .merge(ws_broadcaster::ws_route(ws_state))
-            .nest("/query", query_api::query_router(query_state));
+        // 8. Build the merged axum router and spawn the HTTP server (skipped by
+        //    `new_without_server`: no listener, no server task).
+        let (server_addr, server_handle) = if serve {
+            let query_state = query_api::QueryState { pool: pool.clone() };
+            let router = axum::Router::new()
+                .merge(ws_broadcaster::ws_route(ws_state))
+                .nest("/query", query_api::query_router(query_state));
 
-        // Adversarial Round-1 W2 fix: hard-fail on non-loopback bind unless the
-        // caller explicitly opts in (escape-hatch via env var
-        // `ADVANCE_EVENTBUS_ALLOW_NONLOOPBACK_BIND=1`). Per spec §1.6 / §2.9 the
-        // /query and /events surfaces are local-only by design — they leak event
-        // payloads (potentially containing PII / non-LeakDetector-caught secrets)
-        // and have no auth layer this slice. Reject misconfigured 0.0.0.0 / public
-        // IP binds at construction time rather than rely on caller discipline.
-        if !cfg.websocket_addr.ip().is_loopback()
-            && std::env::var("ADVANCE_EVENTBUS_ALLOW_NONLOOPBACK_BIND")
-                .ok()
-                .as_deref()
-                != Some("1")
-        {
-            return Err(EventBusError::BindFailed {
-                addr: cfg.websocket_addr.to_string(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "non-loopback bind rejected — set ADVANCE_EVENTBUS_ALLOW_NONLOOPBACK_BIND=1 to override (spec §1.6 / §2.9 local-only)",
-                ),
+            // Adversarial Round-1 W2 fix: hard-fail on non-loopback bind unless the
+            // caller explicitly opts in (escape-hatch via env var
+            // `ADVANCE_EVENTBUS_ALLOW_NONLOOPBACK_BIND=1`). Per spec §1.6 / §2.9 the
+            // /query and /events surfaces are local-only by design — they leak event
+            // payloads (potentially containing PII / non-LeakDetector-caught secrets)
+            // and have no auth layer this slice. Reject misconfigured 0.0.0.0 / public
+            // IP binds at construction time rather than rely on caller discipline.
+            if !cfg.websocket_addr.ip().is_loopback()
+                && std::env::var("ADVANCE_EVENTBUS_ALLOW_NONLOOPBACK_BIND")
+                    .ok()
+                    .as_deref()
+                    != Some("1")
+            {
+                return Err(EventBusError::BindFailed {
+                    addr: cfg.websocket_addr.to_string(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "non-loopback bind rejected — set ADVANCE_EVENTBUS_ALLOW_NONLOOPBACK_BIND=1 to override (spec §1.6 / §2.9 local-only)",
+                    ),
+                });
+            }
+            let listener = tokio::net::TcpListener::bind(cfg.websocket_addr)
+                .await
+                .map_err(|e| EventBusError::BindFailed {
+                    addr: cfg.websocket_addr.to_string(),
+                    source: e,
+                })?;
+            let server_addr = listener
+                .local_addr()
+                .map_err(|e| EventBusError::BindFailed {
+                    addr: cfg.websocket_addr.to_string(),
+                    source: e,
+                })?;
+            let server_cancel = cancel_token.clone();
+            // Round-2 AUDIT diff Critical 1 fix: tower_governor::GovernorLayer's
+            // PeerIpKeyExtractor reads ConnectInfo<SocketAddr> from request
+            // extensions. `axum::serve(listener, router.into_make_service())`
+            // does NOT inject ConnectInfo; without it, the rate-limit layer
+            // returns 500 "Unable To Extract Key!" on every request. Use
+            // `into_make_service_with_connect_info::<SocketAddr>()` so axum
+            // populates the extension on each connection.
+            let server_handle = tokio::spawn(async move {
+                let _ = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move { server_cancel.cancelled().await })
+                .await;
             });
-        }
-        let listener = tokio::net::TcpListener::bind(cfg.websocket_addr)
-            .await
-            .map_err(|e| EventBusError::BindFailed {
-                addr: cfg.websocket_addr.to_string(),
-                source: e,
-            })?;
-        let server_addr = listener
-            .local_addr()
-            .map_err(|e| EventBusError::BindFailed {
-                addr: cfg.websocket_addr.to_string(),
-                source: e,
-            })?;
-        let server_cancel = cancel_token.clone();
-        // Round-2 AUDIT diff Critical 1 fix: tower_governor::GovernorLayer's
-        // PeerIpKeyExtractor reads ConnectInfo<SocketAddr> from request
-        // extensions. `axum::serve(listener, router.into_make_service())`
-        // does NOT inject ConnectInfo; without it, the rate-limit layer
-        // returns 500 "Unable To Extract Key!" on every request. Use
-        // `into_make_service_with_connect_info::<SocketAddr>()` so axum
-        // populates the extension on each connection.
-        let server_handle = tokio::spawn(async move {
-            let _ = axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move { server_cancel.cancelled().await })
-            .await;
-        });
+            (Some(server_addr), Some(server_handle))
+        } else {
+            drop(ws_state);
+            (None, None)
+        };
 
         // Slice C — build the EmitPipeline that fans out events to the 4 actors.
         // Both `EventBus::emit` (Async branch) and the retention sweeper
@@ -690,13 +720,13 @@ impl EventBus {
         // Slice E: the other 5 actor handles share the main `cancel_token` and
         // are joined together AFTER the sweeper has fully drained. They live in
         // `join_handles` Vec; the sweeper lives in its own named field.
-        let join_handles = vec![
+        let mut join_handles = vec![
             file_writer_handle,
             db_indexer_handle,
             ws_handle,
             stats_handle,
-            server_handle,
         ];
+        join_handles.extend(server_handle);
 
         Ok(Self {
             mode: EventBusMode::Async(AsyncState {
@@ -707,6 +737,8 @@ impl EventBus {
                 sweeper_handle: TokioMutex::new(Some(sweeper_handle)),
                 join_handles: TokioMutex::new(join_handles),
                 server_addr,
+                ws_cancel,
+                ws_tasks,
                 // Slice m019-readapi (CONTRACT-185) — additive read substrate:
                 // a DEDICATED read pool (isolated from the writer pool), the SAME
                 // broadcaster, the bus clock, and the clamped retention window.
@@ -736,7 +768,7 @@ impl EventBus {
     /// Slice B: the actual bound socket address (useful for tests that bind to port 0).
     pub fn server_addr(&self) -> Option<SocketAddr> {
         match &self.mode {
-            EventBusMode::Async(state) => Some(state.server_addr),
+            EventBusMode::Async(state) => state.server_addr,
             EventBusMode::Sync { .. } => None,
         }
     }
@@ -795,12 +827,29 @@ impl EventBus {
     ///      `try_recv` drain (lib.rs spawn closures + stats_aggregator cancel
     ///      arm) processes any buffered events including the sweeper's late
     ///      warning.
+    ///   6. Cancel every connected `/events` WebSocket client (each gets a
+    ///      `Close` frame), then wait until no client task is left. axum's
+    ///      graceful server shutdown does not wait for upgraded connections.
+    ///
+    /// Equivalent to [`EventBus::shutdown_shared`] followed by dropping the bus.
     pub async fn shutdown(self) {
-        if let EventBusMode::Async(state) = self.mode {
+        self.shutdown_shared().await;
+    }
+
+    /// The [`EventBus::shutdown`] sequence on a shared bus (`&self`), so an owner
+    /// holding an `Arc<EventBus>` can stop it without `Arc::try_unwrap`.
+    ///
+    /// Idempotent: a later call finds no task left and returns once the first
+    /// call's joins are done. After it, `emit` still accepts events but the sinks
+    /// are gone, so they only count as dropped (`dropped_count`). No-op on the
+    /// synchronous test bus.
+    pub async fn shutdown_shared(&self) {
+        if let EventBusMode::Async(state) = &self.mode {
             // Step 1: cancel sweeper first.
             state.sweeper_cancel_token.cancel();
             // Step 2: await sweeper's join via named-field take().
-            if let Some(handle) = state.sweeper_handle.lock().await.take() {
+            let sweeper = state.sweeper_handle.lock().await.take();
+            if let Some(handle) = sweeper {
                 let _ = handle.await;
             }
             // Step 3: soft flush barrier — yield once to let durable-sink
@@ -808,11 +857,17 @@ impl EventBus {
             tokio::task::yield_now().await;
             // Step 4: cancel remaining actors.
             state.cancel_token.cancel();
-            // Step 5: join remaining 5 actor handles.
+            // Step 5: join remaining actor handles (the guard is held across the
+            // joins, so a concurrent second call waits for them).
             let mut handles = state.join_handles.lock().await;
             for h in handles.drain(..) {
                 let _ = h.await;
             }
+            drop(handles);
+            // Step 6: close and join the upgraded `/events` client tasks.
+            state.ws_cancel.cancel();
+            state.ws_tasks.close();
+            state.ws_tasks.wait().await;
         }
     }
 

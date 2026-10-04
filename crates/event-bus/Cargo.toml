@@ -24,7 +24,7 @@ async-trait.workspace = true
 # Slice m019-B: async runtime + bounded channels + cancellation tokens for
 # graceful shutdown of background writer / stats / server tasks.
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "fs", "time", "signal", "macros", "sync", "io-util", "net"] }
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 futures.workspace = true
 # Slice m019-B: HTTP + WebSocket server (single axum router on port 8081).
 axum = { workspace = true, features = ["ws", "macros"] }

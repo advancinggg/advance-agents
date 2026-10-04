@@ -13,6 +13,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use advance_shared_types::event::Event;
 use advance_shared_types::traits::LeakDetector;
@@ -23,11 +24,15 @@ use axum::Router;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::leak::{apply_scan_to_outbound, ScrubOutcome};
 
 const PER_CLIENT_BUFFER: usize = 1000;
 const DEFAULT_MAX_CONCURRENT_WS_CLIENTS: usize = 10;
+/// How long a client task waits to hand its `Close` frame to a client that stopped
+/// reading, once the bus shuts down.
+const CLOSE_FRAME_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(crate) struct WsState {
@@ -35,6 +40,12 @@ pub(crate) struct WsState {
     pub max_clients: usize,
     pub current_clients: Arc<AtomicUsize>,
     pub leak_detector: Option<Arc<dyn LeakDetector>>,
+    /// Cancelled by `EventBus::shutdown_shared`: every connected `/events` client
+    /// gets a `Close` frame and its task ends. A child of the bus token.
+    pub cancel: CancellationToken,
+    /// Tracks every upgraded `/events` client task (axum spawns them detached), so
+    /// the bus shutdown can wait until none is left.
+    pub tasks: TaskTracker,
 }
 
 /// Spawn the WebSocket broadcaster background task.
@@ -59,6 +70,8 @@ pub(crate) fn spawn(
         max_clients: max_clients.unwrap_or(DEFAULT_MAX_CONCURRENT_WS_CLIENTS),
         current_clients: Arc::new(AtomicUsize::new(0)),
         leak_detector,
+        cancel: cancel_token.child_token(),
+        tasks: TaskTracker::new(),
     };
 
     let bg_broadcaster = broadcaster.clone();
@@ -154,7 +167,13 @@ async fn ws_upgrade_handler(State(state): State<WsState>, ws: WebSocketUpgrade) 
     // are tiny JSON, so no legitimate inbound payload approaches this cap.
     let ws = ws.max_message_size(64 * 1024).max_frame_size(64 * 1024);
 
+    // Taken BEFORE `on_upgrade`, so the window between axum's spawn of the upgrade
+    // task and the callback is already tracked; the token drops with the closure.
+    let tracked = state.tasks.token();
+    let cancel = state.cancel.clone();
+
     ws.on_upgrade(move |socket| async move {
+        let _tracked = tracked;
         // Phase-2 admission: tentatively increment, then verify we didn't
         // exceed cap due to a concurrent upgrade race.
         let prev = counter.fetch_add(1, Ordering::SeqCst);
@@ -169,45 +188,57 @@ async fn ws_upgrade_handler(State(state): State<WsState>, ws: WebSocketUpgrade) 
 
         let (mut sender, mut receiver) = socket.split();
 
-        loop {
-            tokio::select! {
-                event = rx.recv() => {
-                    match event {
-                        Ok(event) => {
-                            let serialized = match serde_json::to_string(&*event) {
-                                Ok(s) => s,
-                                Err(_) => continue,
-                            };
-                            let outbound = match apply_scan_to_outbound(
-                                &serialized,
-                                leak_detector.as_deref(),
-                            ) {
-                                ScrubOutcome::Send(text) => text,
-                                ScrubOutcome::Drop => continue,
-                            };
-                            if sender.send(Message::Text(outbound.into())).await.is_err() {
+        let client = async {
+            loop {
+                tokio::select! {
+                    event = rx.recv() => {
+                        match event {
+                            Ok(event) => {
+                                let serialized = match serde_json::to_string(&*event) {
+                                    Ok(s) => s,
+                                    Err(_) => continue,
+                                };
+                                let outbound = match apply_scan_to_outbound(
+                                    &serialized,
+                                    leak_detector.as_deref(),
+                                ) {
+                                    ScrubOutcome::Send(text) => text,
+                                    ScrubOutcome::Drop => continue,
+                                };
+                                if sender.send(Message::Text(outbound.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                // Drop the slow client per per-client backpressure cap.
+                                let _ = sender.send(Message::Close(None)).await;
                                 break;
                             }
+                            Err(broadcast::error::RecvError::Closed) => break,
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            // Drop the slow client per per-client backpressure cap.
-                            let _ = sender.send(Message::Close(None)).await;
-                            break;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
                     }
-                }
-                msg = receiver.next() => {
-                    match msg {
-                        Some(Ok(Message::Close(_))) | None => break,
-                        Some(Err(_)) => break,
-                        // Subscribe-filter messages (Round-2 W4 future-work) are
-                        // accepted but ignored in MVP. Server-side filter wiring
-                        // ships in a follow-up audit fix round.
-                        Some(Ok(_)) => {}
+                    msg = receiver.next() => {
+                        match msg {
+                            Some(Ok(Message::Close(_))) | None => break,
+                            Some(Err(_)) => break,
+                            // Subscribe-filter messages (Round-2 W4 future-work) are
+                            // accepted but ignored in MVP. Server-side filter wiring
+                            // ships in a follow-up audit fix round.
+                            Some(Ok(_)) => {}
+                        }
                     }
                 }
             }
+        };
+        // The bus shutdown preempts the client loop wherever it waits, a send to a
+        // client that stopped reading included; the `Close` frame is then bounded.
+        let cancelled = tokio::select! {
+            () = client => false,
+            () = cancel.cancelled() => true,
+        };
+        if cancelled {
+            let _ =
+                tokio::time::timeout(CLOSE_FRAME_GRACE, sender.send(Message::Close(None))).await;
         }
 
         counter.fetch_sub(1, Ordering::SeqCst);
