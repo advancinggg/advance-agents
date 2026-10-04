@@ -10,6 +10,11 @@
       "sha256": "15190bd3df013370cdfe5f918f0e38b4472315362144f8f1d8f2a37254ccef17",
       "size": 50202,
       "tarball": "agenda-0.1.1.tar.gz"
+    },
+    "0.1.2": {
+      "sha256": "5339961029f96832167baa80cc06c892c582a2d164fcf180babdb56635fcc95b",
+      "size": 50905,
+      "tarball": "agenda-0.1.2.tar.gz"
     }
   }
 }
