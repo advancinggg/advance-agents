@@ -196,31 +196,45 @@ async fn module_001_ac30_git_close_and_join_releases_after_drain() {
     );
 }
 
+/// Two concurrent `close_and_join` calls both wait for the worker: while it is held
+/// (committed, not yet answered) neither call returns and the entry stays registered; once
+/// it has answered and exited, both return and the entry is gone. A second call that did not
+/// wait on the first call's join would return, and release the entry, while the worker still
+/// ran.
 #[tokio::test(flavor = "current_thread")]
 async fn module_001_ac30_git_concurrent_close_and_join_both_wait_for_the_worker() {
     let td = TempDir::new().unwrap();
     let workdir = td.path().to_path_buf();
     bootstrap_repo_at(&workdir).unwrap();
     let canonical = std::fs::canonicalize(&workdir).unwrap();
-    let queue = Arc::new(DefaultGitCommitQueue::spawn(workdir.clone()).unwrap());
-    std::fs::write(workdir.join("a.md"), b"a").unwrap();
-    let mut reply = queue.submit(CommitRequest::new(
-        "tester",
-        "a",
-        vec![PathBuf::from("a.md")],
-        CommitType::Turn,
-        "agent:tester",
-    ));
+    let (queue, mut reply, release) = held_queue(&workdir);
 
-    let (q1, q2) = (Arc::clone(&queue), Arc::clone(&queue));
-    let (r1, r2) = tokio::join!(
-        tokio::spawn(async move { q1.close_and_join().await }),
-        tokio::spawn(async move { q2.close_and_join().await }),
+    let spawn_call = || {
+        let queue = Arc::clone(&queue);
+        tokio::spawn(async move { queue.close_and_join().await })
+    };
+    let (first, second) = (spawn_call(), spawn_call());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !first.is_finished() && !second.is_finished(),
+        "no call returns while the worker still runs"
     );
-    r1.unwrap();
-    r2.unwrap();
-    // Whichever call returned, the worker had committed the queued request first.
-    assert!(matches!(reply.try_recv(), Ok(Ok(_))));
+    assert!(
+        registered(&canonical),
+        "the entry stays while the worker runs"
+    );
+    assert!(
+        matches!(reply.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "the held worker has not answered yet"
+    );
+
+    release.now();
+    first.await.unwrap();
+    second.await.unwrap();
+    assert!(
+        matches!(reply.try_recv(), Ok(Ok(_))),
+        "the worker answered before the calls returned"
+    );
     assert!(!registered(&canonical));
 }
 
