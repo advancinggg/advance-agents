@@ -135,8 +135,9 @@ pub trait GitCommitQueue: Send + Sync {
 pub struct DefaultGitCommitQueue {
     /// `None` once [`DefaultGitCommitQueue::close_and_join`] closed the channel.
     tx: Mutex<Option<mpsc::UnboundedSender<CommitRequest>>>,
-    /// Taken (and awaited) by [`DefaultGitCommitQueue::close_and_join`]; the async
-    /// lock makes a concurrent second call wait for the first call's join.
+    /// Awaited in place by [`DefaultGitCommitQueue::close_and_join`] and cleared only
+    /// once it has resolved; the async lock makes a concurrent second call wait for
+    /// the first call's join.
     worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     /// Set once the `ACTIVE_QUEUES` entry was released by `close_and_join`, so the
     /// later `Drop` never removes an entry a newer queue registered for this repo.
@@ -267,11 +268,15 @@ impl DefaultGitCommitQueue {
     ///    `Drop` of this queue leaves the registry alone.
     ///
     /// Idempotent; a concurrent second call returns after the first call's join.
+    /// Cancel-safe: the worker's handle stays in its slot until it has resolved, so a
+    /// call dropped while it waits (an owner's timeout) leaves the join, and with it
+    /// the release, to the next call.
     pub async fn close_and_join(&self) {
         drop(self.tx.lock().unwrap_or_else(|e| e.into_inner()).take());
         let mut worker = self.worker.lock().await;
-        if let Some(handle) = worker.take() {
+        if let Some(handle) = worker.as_mut() {
             let _ = handle.await;
+            *worker = None;
         }
         if !self.released.swap(true, Ordering::AcqRel) {
             let mut set = active_queues().lock().unwrap_or_else(|e| e.into_inner());
