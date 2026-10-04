@@ -44,9 +44,11 @@
 //! Update mode: `ADVANCE_UPDATE_D5_GOLDENS=1` writes every golden and then fails (update mode is
 //! never green). Every golden is pinned by sha256 (`BASELINE_GOLDEN_SHA256`, or the entry of the
 //! decided outcome in the pending constant that owns it), and the pin is checked before the
-//! comparison and before the D5 overlay is applied. Intended wire changes go through
-//! [`D5_CHANGE_MATRIX`] only, and the overlay is checked against the ADR D5 rows derived from
-//! each home's declarations, on the route-probe path itself.
+//! comparison and before the D5 overlay is applied. A pin is edited in place only by a whole-tree
+//! re-capture on a new base, for a golden whose only changed line is its `CAPTURED_ON` header
+//! (update mode labels every golden it writes; see `PendingExpectation`). Intended wire changes
+//! go through [`D5_CHANGE_MATRIX`] only, and the overlay is checked against the ADR D5 rows
+//! derived from each home's declarations, on the route-probe path itself.
 //!
 //! Runs that compose take one of a few boot slots (spawn until settled), and the harness reads
 //! `runtime.lock` only clear of its 30 s in-place heartbeat rewrite.
@@ -70,13 +72,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use advance_client_api::{Method, RouteTableEntry, API_VERSION, CLIENT_WS_PROTOCOL};
 use runtime_compose_d5_common::{
-    declares, describe, field, golden_path, make_home, method_name, output_locked, pending_owner,
-    probe_route_table, read_pinned_golden, replace_field, sha256_hex, spawn_lock, spawn_locked,
-    update_mode, ExitOutcome, Goldens, HomeSpec, Masks, PendingExpectation, TestHome,
-    BASELINE_GOLDEN_SHA256, CAPTURED_ON, GOLDEN_DIR, H1, H2, H2_AFTER_SHUTDOWN_GOLDEN,
-    H2_SIGTERM_AFTER_READINESS, H3, H4, H5, H6, PACKAGE_VERSION, PENDING_EXPECTATIONS, PROBE_HOMES,
-    READINESS_AFTER_WRITE_GOLDEN, READINESS_BEFORE_WRITE_GOLDEN, READINESS_WRITE_FAILURE,
-    SIGTERM_EXIT_BUDGET_SECS,
+    declares, describe, field, golden_path, make_home, method_name, only_captured_on_line_changed,
+    output_locked, pending_owner, probe_route_table, read_pinned_golden, replace_field, sha256_hex,
+    spawn_lock, spawn_locked, update_mode, ExitOutcome, Goldens, HomeSpec, Masks,
+    PendingExpectation, TestHome, BASELINE_GOLDEN_SHA256, CAPTURED_ON, GOLDEN_DIR, H1, H2,
+    H2_AFTER_SHUTDOWN_GOLDEN, H2_SIGTERM_AFTER_READINESS, H3, H4, H5, H6, PACKAGE_VERSION,
+    PENDING_EXPECTATIONS, PROBE_HOMES, READINESS_AFTER_WRITE_GOLDEN, READINESS_BEFORE_WRITE_GOLDEN,
+    READINESS_WRITE_FAILURE, SIGTERM_EXIT_BUDGET_SECS,
 };
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::protocol::Role;
@@ -2570,8 +2572,8 @@ fn module_001_t111_ac30_golden_pins_cover_every_golden() {
         for (outcome, _) in pending.pins_by_outcome {
             assert!(
                 !outcomes.contains(outcome),
-                "{owner}: outcome {outcome:?} has two pin entries (a pending golden is re-pinned \
-                 only with a new outcome)"
+                "{owner}: outcome {outcome:?} has two pin entries (a pending golden gets a new \
+                 entry only for a new outcome)"
             );
             outcomes.push(*outcome);
         }
@@ -2615,6 +2617,43 @@ fn module_001_t111_ac30_golden_pins_cover_every_golden() {
         read_pinned_golden(name);
         assert!(golden_path(name).is_file());
     }
+}
+
+#[test]
+fn module_001_t111_ac30_detects_a_captured_on_only_change() {
+    // Every golden header is `# {CAPTURED_ON}`; the header of an older base starts the same way.
+    assert!(CAPTURED_ON.starts_with("captured on "));
+    let header = format!("# {CAPTURED_ON}");
+    let older = "# captured on an older base";
+    let pinned = format!("# title\n{older}\nline 1\nline 2\n");
+    // Only the header changed: the in-place re-pin of a whole-tree re-capture.
+    assert!(only_captured_on_line_changed(
+        pinned.as_bytes(),
+        &format!("# title\n{header}\nline 1\nline 2\n")
+    ));
+    for recaptured in [
+        // The header and a data line changed.
+        format!("# title\n{header}\nline 1\nline X\n"),
+        // The header changed and a line was added.
+        format!("# title\n{header}\nline 1\nline 2\nline 3\n"),
+        // The new header in place of a data line, the old header kept.
+        format!("# title\n{older}\n{header}\nline 2\n"),
+        // No current header.
+        format!("# title\n{older}\nline 1\nline X\n"),
+    ] {
+        assert!(
+            !only_captured_on_line_changed(pinned.as_bytes(), &recaptured),
+            "not a header-only change: {recaptured:?}"
+        );
+    }
+    // Pinned under the current header already: nothing, or a data line, changed.
+    let current = format!("# title\n{header}\nline 1\n");
+    assert!(!only_captured_on_line_changed(current.as_bytes(), &current));
+    assert!(!only_captured_on_line_changed(
+        current.as_bytes(),
+        &format!("# title\n{header}\nline X\n")
+    ));
+    assert!(!only_captured_on_line_changed(&[0xff, 0xfe], &header));
 }
 
 #[test]

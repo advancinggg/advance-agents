@@ -76,14 +76,21 @@ impl ExitOutcome {
 /// Only the decision-dependent part of the scenario belongs to the constant: one golden holding
 /// the rendered outcome and what the run does from the decision point on. Everything before that
 /// point (boot lines, files while running, stderr before the failing write) is a separate golden
-/// pinned in [`BASELINE_GOLDEN_SHA256`], which never changes, so a re-pin made for the decision
-/// cannot absorb a regression of the decision-independent part.
+/// pinned in [`BASELINE_GOLDEN_SHA256`], which no decision re-pins, so a re-pin made for the
+/// decision cannot absorb a regression of the decision-independent part.
 ///
 /// The pins are keyed by outcome. The active pin is the entry of `outcome`; each outcome has
-/// exactly one entry (checked), and an entry is never edited once captured. Changing the decision
-/// is therefore the only sanctioned way to re-capture a pending golden: set `outcome` to the new
-/// decision, re-capture, and add a new `(outcome, pins)` entry. A re-capture under an unchanged
-/// outcome has no entry to go to.
+/// exactly one entry (checked), and an entry is never edited once captured, except by the
+/// whole-tree re-capture below. Changing the decision is therefore the only sanctioned way to
+/// change what a pending golden records: set `outcome` to the new decision, re-capture, and add a
+/// new `(outcome, pins)` entry. A re-capture under an unchanged outcome has no entry to go to.
+///
+/// Whole-tree re-capture, the one in-place re-pin: when the lane moves to a new base, every golden
+/// is re-captured on the new pre-move tree with [`CAPTURED_ON`] naming the new base commit, which
+/// changes the header line of every golden. A golden whose only changed line is that header
+/// (update mode labels it "only the CAPTURED_ON line changed") is re-pinned in place, in the
+/// active entry of its pending constant or in [`BASELINE_GOLDEN_SHA256`]. A golden with any other
+/// changed line is never re-pinned in place: the rules above apply to it.
 pub struct PendingExpectation {
     pub outcome: ExitOutcome,
     pub pins_by_outcome: &'static [(ExitOutcome, &'static [(&'static str, &'static str)])],
@@ -168,7 +175,9 @@ pub const PENDING_EXPECTATIONS: &[(&str, &PendingExpectation)] = &[
 /// before it is compared (and before the D5 overlay is applied): the baselines are immutable, and
 /// re-capturing one (update mode) cannot turn the test green without editing this table, which a
 /// review sees. Intended wire changes go through the D5 change matrix in
-/// `runtime_compose_d5_goldens.rs`; pending decisions through their constant above.
+/// `runtime_compose_d5_goldens.rs`; pending decisions through their constant above. The one
+/// sanctioned edit of an entry is the whole-tree re-capture on a new base ([`PendingExpectation`]),
+/// and only for a golden whose sole changed line is its [`CAPTURED_ON`] header.
 pub const BASELINE_GOLDEN_SHA256: &[(&str, &str)] = &[
     (
         "exit.malformed_runtime_config.golden",
@@ -768,9 +777,34 @@ pub fn read_pinned_golden(name: &str) -> String {
         actual, pin,
         "golden {name} does not match its sha256 pin in {owner}: the captured baselines are \
          immutable (intended wire changes go through D5_CHANGE_MATRIX; a pending golden is \
-         re-pinned only with a new decided outcome, in a new entry of its constant)"
+         re-pinned only with a new decided outcome, in a new entry of its constant; only a \
+         whole-tree re-capture on a new base re-pins in place, and only a golden whose sole \
+         changed line is its CAPTURED_ON header)"
     );
     String::from_utf8(bytes).unwrap_or_else(|e| panic!("golden {name} is not utf-8: {e}"))
+}
+
+/// Whether `recaptured` differs from the `pinned` bytes of its golden in exactly one line: its
+/// `# {CAPTURED_ON}` header, in place of an older `# captured on …` header. That is the one change
+/// a whole-tree re-capture on a new base re-pins in place (see [`PendingExpectation`]).
+pub fn only_captured_on_line_changed(pinned: &[u8], recaptured: &str) -> bool {
+    let Ok(pinned) = std::str::from_utf8(pinned) else {
+        return false;
+    };
+    let header = format!("# {CAPTURED_ON}");
+    let pinned: Vec<&str> = pinned.split('\n').collect();
+    let recaptured: Vec<&str> = recaptured.split('\n').collect();
+    let Some(at) = recaptured.iter().position(|line| *line == header) else {
+        return false;
+    };
+    pinned.len() == recaptured.len()
+        && pinned[at] != header
+        && pinned[at].starts_with("# captured on ")
+        && pinned
+            .iter()
+            .zip(&recaptured)
+            .enumerate()
+            .all(|(i, (old, new))| i == at || old == new)
 }
 
 /// The first difference between `expected` and `actual`, with its line, column and context.
@@ -814,7 +848,10 @@ pub fn assert_text_eq(name: &str, expected: &str, actual: &str) {
 /// golden still fails its sha256 pin until the pin table is edited. Otherwise each golden is read,
 /// checked against its pin, passed through `overlay` and compared with the actual text.
 pub struct Goldens {
-    written: Vec<(String, String)>,
+    /// Each golden written in update mode: its name, its new sha256, and whether its only changed
+    /// line is the `CAPTURED_ON` header (`None`: no pinned bytes to compare with, because the
+    /// golden was missing or no longer matched its pin before the write).
+    written: Vec<(String, String, Option<bool>)>,
     finished: bool,
 }
 
@@ -842,9 +879,19 @@ impl Goldens {
         );
         if update_mode() {
             std::fs::create_dir_all(GOLDEN_DIR).expect("create golden dir");
-            std::fs::write(golden_path(name), actual).expect("write golden");
-            self.written
-                .push((name.to_string(), sha256_hex(actual.as_bytes())));
+            let path = golden_path(name);
+            // Compared with the pinned bytes, read before the write and only while they still
+            // match the pin (a golden an earlier update run rewrote is not the pinned one).
+            let captured_on_only = std::fs::read(&path)
+                .ok()
+                .filter(|bytes| golden_pin(name).is_some_and(|(pin, _)| sha256_hex(bytes) == pin))
+                .map(|pinned| only_captured_on_line_changed(&pinned, actual));
+            std::fs::write(&path, actual).expect("write golden");
+            self.written.push((
+                name.to_string(),
+                sha256_hex(actual.as_bytes()),
+                captured_on_only,
+            ));
             return;
         }
         let golden = read_pinned_golden(name);
@@ -855,20 +902,28 @@ impl Goldens {
         self.finished = true;
         if update_mode() {
             let mut list = String::new();
-            for (name, sha) in &self.written {
-                let state = match (golden_pin(name), pending_owner(name)) {
-                    (Some((pin, _)), _) if pin == sha => "pin unchanged",
-                    (Some((_, "BASELINE_GOLDEN_SHA256")), _) => {
+            for (name, sha, captured_on_only) in &self.written {
+                let state = match (golden_pin(name), pending_owner(name), captured_on_only) {
+                    (Some((pin, _)), _, _) if pin == sha => "pin unchanged",
+                    (Some(_), _, Some(true)) => {
+                        "only the CAPTURED_ON line changed (a whole-tree re-capture on a new \
+                         base: re-pin this entry in place)"
+                    }
+                    (Some(_), _, None) => {
+                        "CHANGED, and the golden was missing or no longer matched its pin before \
+                         the write (restore the goldens from git, then re-capture)"
+                    }
+                    (Some((_, "BASELINE_GOLDEN_SHA256")), _, Some(false)) => {
                         "CHANGED (a baseline: never re-pin after the capture)"
                     }
-                    (Some(_), _) => {
+                    (Some(_), _, Some(false)) => {
                         "CHANGED under an unchanged outcome (refused: a pending golden is \
                          re-pinned only in a new entry for a new decided outcome)"
                     }
-                    (None, Some(_)) => {
+                    (None, Some(_), _) => {
                         "NEW outcome (add its `(outcome, pins)` entry to the pending constant)"
                     }
-                    (None, None) => "NEW (no pin yet)",
+                    (None, None, _) => "NEW (no pin yet)",
                 };
                 let _ = writeln!(list, "    (\"{name}\", \"{sha}\"), // {state}");
             }
