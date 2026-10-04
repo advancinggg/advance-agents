@@ -1,4 +1,4 @@
-# MODULE-001-T111 (2) route probes through `advance start` on H4 (capabilities: fs, llm, grant; deployed driver; no git repository)
+# MODULE-001-T111 (2) route probes through `advance start` on H5 (capabilities: fs, llm, tools; NO deployed driver; no git repository)
 # captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
 # native client: loopback, no Origin, x-advance-api-version: 2026-09-17, bearer session;
 # GET with no query; POST with body {} (+ idempotency-key for mutations); path params = "golden-probe-id"
@@ -30,10 +30,10 @@ GET /client/providers -> 200 data {"providers":[{"backend_class":"cloud-http","c
 GET /client/providers/{provider_id} -> 404 error not_found "resource not found"
 GET /client/providers/{provider_id}/sign-in -> 404 error not_found "resource not found"
 GET /client/providers/{provider_id}/usage -> 404 error not_found "resource not found"
-GET /client/runs -> 200 data {"runs":[{"controller_agent":"<ROOT_AGENT_ID>","cost_usd":0.0,"created_at":"<RUN_TIMESTAMP +00:00>","iteration":0,"run_id":"<ROOT_RUN_ID>","status":"active","task_id":"<ROOT_AGENT_ID>","token_used":0,"updated_at":"<RUN_TIMESTAMP +00:00>"}]}
+GET /client/runs -> 200 data {"runs":[]}
 GET /client/runs/tree -> 200 data {"nodes":[{"id":"<ROOT_AGENT_ID>","kind":"root","status":"active"}]}
 GET /client/runs/{run_id}/history -> 503 error module_unavailable "provider not wired"
-GET /client/schema -> 503 error module_unavailable "provider not wired"
+GET /client/schema -> 200 data {"aspects":[],"hash":"f71ee2ceddddd8aaea66d95975f5c27ec2fbe5c8ef2f60ba2352e5dea0360428"}
 GET /client/secrets/mode -> 200 data {"master_key_source":"env-var","mode":"file","namespace":"default","platform_supported":"<OS_KEYCHAIN_SUPPORTED>","synchronizable":"<OS_KEYCHAIN_SYNCHRONIZABLE>"}
 GET /client/tasks/{task_id}/history -> 503 error module_unavailable "provider not wired"
 GET /client/tools -> 503 error module_unavailable "provider not wired"
@@ -91,9 +91,7 @@ WS /client/llm/deltas/stream seed -> 101 protocol=advance.client.2026-09-17 data
 WS /client/llm/deltas/stream seed handshake headers -> connection: upgrade | upgrade: websocket | sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo= | sec-websocket-protocol: advance.client.2026-09-17
 WS /client/llm/deltas/stream subscribe -> error module_unavailable "delta cursor unavailable"
 == POST /msg listener (the address on stdout's `advance: msg listener on` line)
-POST /msg body {} -> 422 content-type=text/plain; charset=utf-8 body="Failed to deserialize the JSON body into the target type: missing field `payload` at line 1 column 2"
-POST /msg body {"agent_id":"agent:golden-probe-other","payload":"golden"} -> 404 content-type=application/octet-stream body=""
-GET /msg -> 405 content-type=<none> body=""
+POST /msg -> no msg listener (no `advance: msg listener on` line)
 == session (last)
 POST /client/session/refresh -> 200 data {"csrf_token":null,"expires_at":"<SESSION_EXPIRES_AT: now+480min>","platform":"mac","principal":{"id":"operator","os_user":"operator"},"scopes":["read_runs","control_runs","read_messages","send_messages","approve_grants","read_inventory","read_events","read_llm_deltas","write_entities"],"session_id":"<SESSION_ID>","token":"<SESSION_TOKEN>"}
 POST /client/session/logout -> 200 data {"revoked":true}

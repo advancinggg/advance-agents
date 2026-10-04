@@ -1,0 +1,10 @@
+# MODULE-001-T111 (1) a second `advance start` on H1 (capabilities: fs, llm; deployed driver; no git repository)'s workspace while the first one runs (runtime lock held)
+# captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
+# <HOLDER_PID> = the first run's pid (checked)
+exit=1
+--- stdout ---
+--- stderr ---
+advance start: failed to acquire runtime lock: another runtime active (pid=<HOLDER_PID>)
+--- .runtime after the second run exits (the first still running) ---
+runtime.lock=present client-api=present selected-provider=present
+runtime.lock still names the first run: true

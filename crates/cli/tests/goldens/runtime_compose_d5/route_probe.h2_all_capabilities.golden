@@ -1,37 +1,42 @@
 # MODULE-001-T111 (2) route probes through `advance start` on H2 (capabilities: every KNOWN_CAPABILITIES entry = secrets, fs, skills, memory, grant, llm, tools, messaging, lifecycle, genui; genui.enabled: true; deployed driver; git repository)
+# captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
 # native client: loopback, no Origin, x-advance-api-version: 2026-09-17, bearer session;
 # GET with no query; POST with body {} (+ idempotency-key for mutations); path params = "golden-probe-id"
-# <METHOD> <route> -> <status> data {sorted top-level keys of data: JSON type} | error <code> "<message>"
+# <KEY> -> <status> data <canonical JSON of data, keys sorted> [warnings=[<code> "<message>", …]] | <status> error <code> "<message>" [details=…]
+# masked values render as "<NAME>" (PROBE_MASKS in the test); <ROOT> = the temp root; 127.0.0.1:<PORT> = a loopback port
 == session
-POST /client/session/login -> 200 data {csrf_token: null, expires_at: number, platform: string, principal: object, scopes: array, session_id: string, token: string}
+POST /client/session/login -> 200 data {"csrf_token":null,"expires_at":"<SESSION_EXPIRES_AT: now+480min>","platform":"mac","principal":{"id":"operator","os_user":"operator"},"scopes":["read_runs","control_runs","read_messages","send_messages","approve_grants","read_inventory","read_events","read_llm_deltas","write_entities"],"session_id":"<SESSION_ID>","token":"<SESSION_TOKEN>"}
+POST /client/session/login (Origin: http://127.0.0.1:<PORT> = the bound console origin) -> 200 data {"csrf_token":"<CSRF_TOKEN>","expires_at":"<SESSION_EXPIRES_AT: now+480min>","platform":"mac","principal":{"id":"operator","os_user":"operator"},"scopes":["read_runs","control_runs","read_messages","send_messages","approve_grants","read_inventory","read_events","read_llm_deltas","write_entities"],"session_id":"<SESSION_ID>","token":"<SESSION_TOKEN>"}
+POST /client/session/login (Origin: http://evil.invalid) -> 403 error origin_not_allowed "origin not allowed"
+POST /client/agents (console Origin + its session + idempotency-key, no x-csrf-token) -> 403 error csrf_required "csrf"
 == GET routes
-GET /client/agent-templates -> 200 data {templates: array}
-GET /client/agents -> 200 data {agents: array}
+GET /client/agent-templates -> 200 data {"templates":[{"description":"Read-only exploration sub-agent (Slice B built-in template).","template_ref":"explorer"},{"description":"Inherits parent's full capabilities (Slice B built-in template).","template_ref":"general-purpose"},{"description":"Plan-decomposition sub-agent (Slice B built-in template).","template_ref":"planner"},{"description":"Critique-and-flag sub-agent (Slice B built-in template).","template_ref":"reviewer"}]}
+GET /client/agents -> 200 data {"agents":[{"agent_id":"root","id":"<ROOT_AGENT_ID>","kind":"root","status":"active","workspace_path":"."}]}
 GET /client/agents/{agent_id} -> 404 error not_found "resource not found"
-GET /client/costs/agents -> 200 data {agents: array, window: object}
-GET /client/costs/agents/{agent_id} -> 200 data {agent_id: string, by_provider: array, totals: object, window: object}
-GET /client/costs/providers -> 200 data {providers: array, window: object}
-GET /client/costs/providers/{provider_id} -> 200 data {by_agent: array, provider_id: string, totals: object, window: object}
+GET /client/costs/agents -> 200 data {"agents":[],"window":{}}
+GET /client/costs/agents/{agent_id} -> 200 data {"agent_id":"golden-probe-id","by_provider":[],"totals":{"cost_usd":0.0,"request_count":0,"tokens_in":0,"tokens_out":0},"window":{}}
+GET /client/costs/providers -> 200 data {"providers":[],"window":{}}
+GET /client/costs/providers/{provider_id} -> 200 data {"by_agent":[],"provider_id":"golden-probe-id","totals":{"cost_usd":0.0,"request_count":0,"tokens_in":0,"tokens_out":0},"window":{}}
 GET /client/entities/{agent_id}/{entity_id} -> 400 error invalid_request "invalid entity id"
-GET /client/events -> 200 data {dropped_count: number, events: array, raw_limit_reached: bool, redacted_count: number, rejected_count: number, response_limit_reached: bool}
-GET /client/events/stream -> 200 data {cursor: object, dropped_count: number, events: array, raw_limit_reached: bool, redacted_count: number, rejected_count: number, response_limit_reached: bool}
-GET /client/grants/pending -> 200 data {requests: array}
-GET /client/health -> 200 data {api_version: string, status: string}
-GET /client/llm/deltas/stream -> 200 data {subscribed: bool}
+GET /client/events -> 200 data {"dropped_count":0,"events":[{"agent_id":"<ROOT_AGENT_ID>","data":{},"event_id":"<EVENT_ID: c1.local-k1.…>","event_type":"run.created","priority":"normal","run_id":"<ROOT_RUN_ID>","timestamp":"<EVENT_TIMESTAMP Z>","trace_id":"<TRACE_ID>"}],"raw_limit_reached":false,"redacted_count":0,"rejected_count":10,"response_limit_reached":false}
+GET /client/events/stream -> 200 data {"cursor":{"last_event_id":"<EVENT_ID: c1.local-k1.…>","stream_id":"ces1.u6NCCap9GF2eI3P8a6a-U1FGyPjT8Nkg8vC6GjJQn6w"},"dropped_count":0,"events":[],"raw_limit_reached":false,"redacted_count":0,"rejected_count":0,"response_limit_reached":false}
+GET /client/grants/pending -> 200 data {"requests":[]}
+GET /client/health -> 200 data {"api_version":"2026-09-17","status":"ok"}
+GET /client/llm/deltas/stream -> 200 data {"subscribed":true}
 GET /client/messages/{message_id} -> 404 error not_found "resource not found"
-GET /client/packs -> 200 data {packs: array}
+GET /client/packs -> 200 data {"packs":[]}
 GET /client/packs/{pack_id} -> 400 error invalid_request "pack id must be name@version"
-GET /client/providers -> 200 data {providers: array}
+GET /client/providers -> 200 data {"providers":[{"backend_class":"cloud-http","cost":{"input_per_mtoken":2.5,"output_per_mtoken":10.0},"endpoint":"https://api.openai.com","key":{"present":false,"secret_name":"openai-api-key"},"model_aliases":{"gpt":"gpt-4o"},"provider_id":"openai","rate_limit":{"requests_per_minute":1000,"tokens_per_minute":400000},"selected":true,"sidecar_present":false}]}
 GET /client/providers/{provider_id} -> 404 error not_found "resource not found"
 GET /client/providers/{provider_id}/sign-in -> 404 error not_found "resource not found"
 GET /client/providers/{provider_id}/usage -> 404 error not_found "resource not found"
-GET /client/runs -> 200 data {runs: array}
-GET /client/runs/tree -> 200 data {nodes: array}
-GET /client/runs/{run_id}/history -> 200 data {entries: array}
-GET /client/schema -> 200 data {aspects: array, hash: string}
-GET /client/secrets/mode -> 200 data {master_key_source: string, mode: string, namespace: string, platform_supported: bool, synchronizable: bool}
-GET /client/tasks/{task_id}/history -> 200 data {entries: array}
-GET /client/tools -> 200 data {mcp: array, skills: array, wasm: array}
+GET /client/runs -> 200 data {"runs":[{"controller_agent":"<ROOT_AGENT_ID>","cost_usd":0.0,"created_at":"<RUN_TIMESTAMP +00:00>","iteration":0,"run_id":"<ROOT_RUN_ID>","status":"active","task_id":"<ROOT_AGENT_ID>","token_used":0,"updated_at":"<RUN_TIMESTAMP +00:00>"}]}
+GET /client/runs/tree -> 200 data {"nodes":[{"id":"<ROOT_AGENT_ID>","kind":"root","status":"active"}]}
+GET /client/runs/{run_id}/history -> 200 data {"entries":[]}
+GET /client/schema -> 200 data {"aspects":[],"hash":"f71ee2ceddddd8aaea66d95975f5c27ec2fbe5c8ef2f60ba2352e5dea0360428"}
+GET /client/secrets/mode -> 200 data {"master_key_source":"env-var","mode":"file","namespace":"default","platform_supported":"<OS_KEYCHAIN_SUPPORTED>","synchronizable":"<OS_KEYCHAIN_SYNCHRONIZABLE>"}
+GET /client/tasks/{task_id}/history -> 200 data {"entries":[]}
+GET /client/tools -> 200 data {"mcp":[],"skills":[],"wasm":[{"description":"Structured data over frontmatter: describe the schema, query the index, and create / patch / delete / promote / demote / apply operations on entities. Every write is validated against the schema and committed by the host.","name":"data"}]}
 == POST reads
 POST /client/entities:query -> 400 error invalid_request "invalid entity request body"
 == POST mutations
@@ -66,13 +71,29 @@ POST /client/runs/{run_id}:cancel -> 404 error not_found "resource not found"
 POST /client/runs/{run_id}:pause -> 404 error not_found "resource not found"
 POST /client/runs/{run_id}:resume -> 404 error not_found "resource not found"
 POST /client/secrets:set-mode -> 400 error invalid_request "invalid secrets request body"
-== transport-only routes (not in the route table)
-GET / -> 200 content-type=text/html; charset=utf-8
-GET /index.html -> 200 content-type=text/html; charset=utf-8
-GET /app.js -> 200 content-type=text/javascript; charset=utf-8
-GET /styles.css -> 200 content-type=text/css; charset=utf-8
-GET /client/events/stream (WebSocket upgrade) -> not probed: needs a WebSocket handshake; the plain GET of this path is probed above
-GET /client/llm/deltas/stream (WebSocket upgrade) -> not probed: needs a WebSocket handshake; the plain GET of this path is probed above
+== router (not in the route table)
+GET /client/golden-probe-unknown -> 404 error unknown_route "no route"
+POST /client/health -> 404 error unknown_route "no route"
+GET /golden-probe-unknown (Client API address) -> 404 content-type=<none> body=""
+POST /msg (Client API address) -> 404 content-type=<none> body=""
+== Web Console assets
+GET / -> 200 content-type=text/html; charset=utf-8 len=3269 sha256=c756acaa37d285b9d8cd38c95aa0a630dc454fe28251f307f8174bedd9340c8a
+GET /index.html -> 200 content-type=text/html; charset=utf-8 len=3269 sha256=c756acaa37d285b9d8cd38c95aa0a630dc454fe28251f307f8174bedd9340c8a
+GET /app.js -> 200 content-type=text/javascript; charset=utf-8 len=8577 sha256=111f069a8d476eed1acf14949220e3aaa29f692f9577e7eb1ee6426df442cde5
+GET /styles.css -> 200 content-type=text/css; charset=utf-8 len=3055 sha256=41a8bab16a74c7ffcbaf9d0e0e633691eb0e19c0299e84119613925d9befabc4
+== response headers (all but date, in wire order)
+GET /client/health headers -> content-type: application/json | content-length: 157 | connection: close
+GET /client/golden-probe-unknown headers -> content-type: application/json | content-length: 160 | connection: close
+GET / headers -> content-type: text/html; charset=utf-8 | x-content-type-options: nosniff | content-security-policy: default-src 'self'; connect-src 'self' ws: wss:; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none' | cache-control: no-cache | content-length: 3269 | connection: close
+== WebSocket (protocols: advance.client.2026-09-17, advance.bearer.<session token>; delta subscribe frame {"stream_key":"golden-probe","from_cursor":"golden-probe-cursor"})
+WS /client/events/stream seed -> 101 protocol=advance.client.2026-09-17 data {"cursor":{"last_event_id":"<EVENT_ID: c1.local-k1.…>","stream_id":"ces1.u6NCCap9GF2eI3P8a6a-U1FGyPjT8Nkg8vC6GjJQn6w"},"dropped_count":0,"events":[],"raw_limit_reached":false,"redacted_count":0,"rejected_count":0,"response_limit_reached":false}
+WS /client/llm/deltas/stream seed -> 101 protocol=advance.client.2026-09-17 data {"subscribed":true}
+WS /client/llm/deltas/stream seed handshake headers -> connection: upgrade | upgrade: websocket | sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo= | sec-websocket-protocol: advance.client.2026-09-17
+WS /client/llm/deltas/stream subscribe -> error not_found "event cursor not found"
+== POST /msg listener (the address on stdout's `advance: msg listener on` line)
+POST /msg body {} -> 422 content-type=text/plain; charset=utf-8 body="Failed to deserialize the JSON body into the target type: missing field `payload` at line 1 column 2"
+POST /msg body {"agent_id":"agent:golden-probe-other","payload":"golden"} -> 404 content-type=application/octet-stream body=""
+GET /msg -> 405 content-type=<none> body=""
 == session (last)
-POST /client/session/refresh -> 200 data {csrf_token: null, expires_at: number, platform: string, principal: object, scopes: array, session_id: string, token: string}
-POST /client/session/logout -> 200 data {revoked: bool}
+POST /client/session/refresh -> 200 data {"csrf_token":null,"expires_at":"<SESSION_EXPIRES_AT: now+480min>","platform":"mac","principal":{"id":"operator","os_user":"operator"},"scopes":["read_runs","control_runs","read_messages","send_messages","approve_grants","read_inventory","read_events","read_llm_deltas","write_entities"],"session_id":"<SESSION_ID>","token":"<SESSION_TOKEN>"}
+POST /client/session/logout -> 200 data {"revoked":true}

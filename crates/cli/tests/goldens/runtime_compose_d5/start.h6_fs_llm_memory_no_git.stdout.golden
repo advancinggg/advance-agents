@@ -1,8 +1,7 @@
-# MODULE-001-T111 (1) `advance start` stdout on H2 (capabilities: every KNOWN_CAPABILITIES entry = secrets, fs, skills, memory, grant, llm, tools, messaging, lifecycle, genui; genui.enabled: true; deployed driver; git repository) — normalised, spawn to EOF after SIGTERM
+# MODULE-001-T111 (1) `advance start` stdout on H6 (capabilities: fs, llm, memory; deployed driver; no git repository) — normalised, spawn to EOF after SIGTERM
 # captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
 advance: runtime ready (workspace="<ROOT>/ws")
 advance: agent loop wired (component loaded; serving inbound messages)
 advance: msg listener on http://127.0.0.1:<PORT>/msg
-advance: auto-mode scheduler tick loop running (interval=1s)
 advance: continuous component reconciliation wired (component-type breaker gate active)
 advance: shutting down

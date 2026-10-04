@@ -1,0 +1,8 @@
+# MODULE-001-T111 (1) `advance start` on H1 (capabilities: fs, llm; deployed driver; no git repository) with .advance/runtime-config.yaml = "wasm:\n  max_memory_pages: [1024\n" (malformed YAML)
+# captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
+exit=1
+--- stdout ---
+--- stderr ---
+advance start: bootstrap failed: config load failed: config parse failure at <ROOT>/ws/.advance/runtime-config.yaml (see error source() for detail)
+--- .runtime after exit ---
+runtime.lock=absent client-api=absent selected-provider=absent

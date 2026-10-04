@@ -1,4 +1,5 @@
 # MODULE-001-T111 (1) route table of the Client API composed in-process (RuntimeHostBuilder::new + wire_capabilities) on H1 (capabilities: fs, llm; deployed driver; no git repository)
+# captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
 # method path | exact/templated session mutation scopes
 GET /client/agent-templates | exact session=true mutation=false scopes=[read_runs]
 GET /client/agents | exact session=true mutation=false scopes=[read_runs]

@@ -1,5 +1,13 @@
-# MODULE-001-T111 (1) exit status of `advance start` (`= NAME` rows are pinned by that constant in this file)
+# MODULE-001-T111 (1) exit status of `advance start` (`= NAME` rows are pinned by that constant)
+# captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
 missing_runtime_config: exit=1
+malformed_runtime_config: exit=1
+runtime_lock_held: exit=1
 readiness_write_failure: = READINESS_WRITE_FAILURE
 sigterm_after_readiness h1_fs_llm: exit=0
 sigterm_after_readiness h2_all_capabilities: = H2_SIGTERM_AFTER_READINESS
+sigterm_after_readiness h3_fs_llm_lifecycle: exit=0
+sigterm_after_readiness h4_fs_llm_grant: exit=0
+sigterm_after_readiness h5_fs_llm_tools_no_driver: exit=0
+sigterm_after_readiness h6_fs_llm_memory_no_git: exit=0
+sigterm_after_readiness h1_fs_llm (stderr joined to stdout's pipe): exit=0

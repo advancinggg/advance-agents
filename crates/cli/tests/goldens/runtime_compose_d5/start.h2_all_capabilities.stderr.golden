@@ -1,2 +1,3 @@
 # MODULE-001-T111 (1) `advance start` stderr on H2 (capabilities: every KNOWN_CAPABILITIES entry = secrets, fs, skills, memory, grant, llm, tools, messaging, lifecycle, genui; genui.enabled: true; deployed driver; git repository) — normalised, spawn to EOF after SIGTERM
+# captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
 advance: Client API and Web Console listening at http://127.0.0.1:<PORT>

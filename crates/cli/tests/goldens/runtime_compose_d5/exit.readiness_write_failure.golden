@@ -1,4 +1,5 @@
 # MODULE-001-T111 (1) `advance start` on H1 (capabilities: fs, llm; deployed driver; no git repository) with stdout's read end closed right after spawn (EPIPE on the readiness line)
+# captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
 exit=101
 --- stderr ---
 advance: Client API and Web Console listening at http://127.0.0.1:<PORT>
