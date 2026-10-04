@@ -43,6 +43,9 @@ use cap_grant::preset::{Preset, PresetRegistry};
 use cap_tools::LazyToolRegistry;
 use sha2::{Digest, Sha256};
 
+use crate::api::log_keys;
+use crate::compose_log::LogHandle;
+
 /// How often the packs dir's `.meta.yaml` index is polled for installs made by another
 /// process (`advance pack install` while the daemon runs).
 pub const PACKS_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -283,6 +286,9 @@ pub struct PackRuntime {
     tools: OnceLock<Arc<LazyToolRegistry>>,
     reindex: OnceLock<EntityReindex>,
     state: tokio::sync::Mutex<Applied>,
+    /// Where new apply warnings and failed rescans are reported ([`Self::with_log`];
+    /// none by default).
+    log: LogHandle,
 }
 
 impl PackRuntime {
@@ -295,7 +301,14 @@ impl PackRuntime {
             tools: OnceLock::new(),
             reindex: OnceLock::new(),
             state: tokio::sync::Mutex::new(Applied::default()),
+            log: LogHandle::null(),
         }
+    }
+
+    /// Report each new apply warning, and a failed packs-dir rescan, to `log`.
+    pub fn with_log(mut self, log: LogHandle) -> Self {
+        self.log = log;
+        self
     }
 
     /// The live meta-schema loader (the one cap-fs, the `.meta.yaml` maintainer and the
@@ -417,7 +430,8 @@ impl PackRuntime {
 
         let current: BTreeSet<String> = report.warnings.iter().cloned().collect();
         for warning in current.difference(&state.warned) {
-            eprintln!("advance: WARN {warning}");
+            self.log
+                .err(log_keys::PACKS_WARN, format!("advance: WARN {warning}"));
         }
         state.warned = current;
         report
@@ -461,8 +475,11 @@ impl PackRuntime {
                     }
                     Err(e) => {
                         if failed_at != Some(now) {
-                            eprintln!(
-                                "advance: WARN the packs dir changed but its rescan failed (retrying): {e}"
+                            this.log.err(
+                                log_keys::PACKS_RESCAN_FAILED,
+                                format!(
+                                    "advance: WARN the packs dir changed but its rescan failed (retrying): {e}"
+                                ),
                             );
                             failed_at = Some(now);
                         }

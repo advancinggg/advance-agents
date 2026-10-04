@@ -54,6 +54,9 @@ use advance_scheduler::webhook_hmac::{
     verify_webhook, MIN_WEBHOOK_SECRET_BYTES, WEBHOOK_MAX_BODY_BYTES,
 };
 
+use crate::api::log_keys;
+use crate::compose_log::LogHandle;
+
 /// HTTP header carrying the hex HMAC-SHA256 signature of the request body.
 const SIGNATURE_HEADER: &str = "x-signature";
 
@@ -65,6 +68,9 @@ pub struct WebhookListener {
     /// `None` in production. Interior mutability because `WebhookSource::run`
     /// takes `&self` while `oneshot::Sender::send` consumes the sender by value.
     ready: Mutex<Option<oneshot::Sender<SocketAddr>>>,
+    /// Where a verified webhook that could not fire its trigger is reported
+    /// ([`Self::with_log`]; none by default).
+    log: LogHandle,
 }
 
 impl WebhookListener {
@@ -72,7 +78,14 @@ impl WebhookListener {
         Self {
             bind_addr,
             ready: Mutex::new(None),
+            log: LogHandle::null(),
         }
+    }
+
+    /// Report a verified webhook whose trigger send failed to `log`.
+    pub fn with_log(mut self, log: LogHandle) -> Self {
+        self.log = log;
+        self
     }
 
     /// Test-support builder: install a one-shot that `run` fires with the bound
@@ -89,6 +102,7 @@ impl WebhookListener {
 struct ListenerState {
     cfg: WebhookConfig,
     tx: mpsc::Sender<TriggerFireEvent>,
+    log: LogHandle,
 }
 
 /// Reject paths that would panic `axum::Router::route`. A literal webhook path is
@@ -139,7 +153,10 @@ async fn handle_webhook(
         Ok(()) => StatusCode::OK,
         Err(e) => {
             // Verified but the trigger pipeline is gone (channel closed) → 500.
-            eprintln!("advance: webhook verified but trigger send failed: {e}");
+            state.log.err(
+                log_keys::WEBHOOK_TRIGGER_SEND_FAILED,
+                format!("advance: webhook verified but trigger send failed: {e}"),
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
@@ -183,7 +200,11 @@ impl WebhookSource for WebhookListener {
         let app = Router::new()
             .route(&route, post(handle_webhook))
             .layer(DefaultBodyLimit::max(WEBHOOK_MAX_BODY_BYTES))
-            .with_state(ListenerState { cfg, tx });
+            .with_state(ListenerState {
+                cfg,
+                tx,
+                log: self.log.clone(),
+            });
 
         // (2) Bind. Bind/port-in-use → HookError::Failure (NEVER panic the walk).
         let listener = tokio::net::TcpListener::bind(self.bind_addr)

@@ -43,6 +43,9 @@ use cap_fs::{DefaultAtomicWriter, MetaMaintainer, MetaSchemaLoader};
 use cap_llm::{dispatch_for_indexing, LlmGatewayInternal, VlmExtractor};
 use cap_memory::{DescriptionIndexer, IndexedDescription};
 
+use crate::api::log_keys;
+use crate::compose_log::LogHandle;
+
 /// Upper bound on bytes read from a changed file before MIME routing. Kept ≤
 /// cap-llm's own dispatch caps (text 2 MiB / VLM 8 MiB) so an oversize input is
 /// rejected here rather than buffered then rejected downstream.
@@ -63,6 +66,9 @@ pub struct VlmDescriptionIndexer {
     vlm: Arc<dyn VlmExtractor>,
     meta: Arc<MetaMaintainer>,
     workspace_root: PathBuf,
+    /// Where a failed `.meta.yaml` writeback is reported ([`Self::with_log`]; none by
+    /// default).
+    log: LogHandle,
 }
 
 impl VlmDescriptionIndexer {
@@ -83,7 +89,14 @@ impl VlmDescriptionIndexer {
             vlm,
             meta,
             workspace_root,
+            log: LogHandle::null(),
         }
+    }
+
+    /// Report a failed `.meta.yaml` writeback to `log`.
+    pub fn with_log(mut self, log: LogHandle) -> Self {
+        self.log = log;
+        self
     }
 
     /// Reference to the adapter's `MetaMaintainer` (tests read back `.meta.yaml`).
@@ -109,7 +122,10 @@ impl VlmDescriptionIndexer {
         let meta_file = match self.meta.add_entry_for_write(meta_pre, file_name, bytes) {
             Ok((mf, _)) => mf,
             Err(e) => {
-                eprintln!("vlm-indexer: .meta.yaml ensure-entry failed ({e:?})");
+                self.log.err(
+                    log_keys::VLM_META_ENSURE_FAILED,
+                    format!("vlm-indexer: .meta.yaml ensure-entry failed ({e:?})"),
+                );
                 return;
             }
         };
@@ -128,12 +144,18 @@ impl VlmDescriptionIndexer {
         ) {
             Ok((mf, _)) => mf,
             Err(e) => {
-                eprintln!("vlm-indexer: .meta.yaml update failed ({e:?})");
+                self.log.err(
+                    log_keys::VLM_META_UPDATE_FAILED,
+                    format!("vlm-indexer: .meta.yaml update failed ({e:?})"),
+                );
                 return;
             }
         };
         if let Err(e) = self.meta.write(parent, &meta_file).await {
-            eprintln!("vlm-indexer: .meta.yaml write failed ({e:?})");
+            self.log.err(
+                log_keys::VLM_META_WRITE_FAILED,
+                format!("vlm-indexer: .meta.yaml write failed ({e:?})"),
+            );
         }
     }
 }

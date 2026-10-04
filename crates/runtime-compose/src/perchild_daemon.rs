@@ -40,6 +40,8 @@ use cap_lifecycle::{AgentTreeStore, SpawnObserver};
 use crate::agent_loop::{
     build_agent_loop, build_agent_loop_with_prebuilt_dispatcher, WasmMessageHandler,
 };
+use crate::api::log_keys;
+use crate::compose_log::LogHandle;
 
 /// Bare→colon key resolver (the crash-cascade pattern): the root is the special
 /// pair (`root`→`agent:root`), children are mechanical
@@ -131,6 +133,9 @@ pub struct PerChildLoopManager {
     /// its routing, and the await resolution are ALL production — this only selects
     /// which branch the fixture exercises (a real child replies from its own logic).
     child_config_data: Option<Vec<u8>>,
+    /// Where an unserved child and an undelegated grant are reported
+    /// ([`Self::with_log`]; none by default).
+    log: LogHandle,
 }
 
 impl PerChildLoopManager {
@@ -166,7 +171,15 @@ impl PerChildLoopManager {
             skip_routing: false,
             skip_crash: false,
             child_config_data: None,
+            log: LogHandle::null(),
         }
+    }
+
+    /// Report unserved children and undelegated grants to `log`; each child's
+    /// handler and turn-end reap report through it too.
+    pub fn with_log(mut self, log: LogHandle) -> Self {
+        self.log = log;
+        self
     }
 
     /// Witness-only: suppress the loop spawn (child-loop-absent discriminator) or
@@ -427,9 +440,12 @@ impl PerChildLoopManager {
             // `fs` path params are relative to the grantee's own territory, so they do not
             // carry over to a child; that case is reported instead of delegated.
             if cap_name == "fs" && !pg.params.is_empty() {
-                eprintln!(
-                    "advance: WARN child {child_bare} gets no `fs` grant: the parent's `fs` \
-                     grant is path-restricted and paths do not carry across territories"
+                self.log.err(
+                    log_keys::PERCHILD_NO_FS_GRANT,
+                    format!(
+                        "advance: WARN child {child_bare} gets no `fs` grant: the parent's `fs` \
+                         grant is path-restricted and paths do not carry across territories"
+                    ),
                 );
                 continue;
             }
@@ -445,7 +461,10 @@ impl PerChildLoopManager {
                 parent_bare,
                 &validator,
             ) {
-                eprintln!("advance: WARN child {child_bare} gets no `{cap_name}` grant: {e}");
+                self.log.err(
+                    log_keys::PERCHILD_NO_GRANT,
+                    format!("advance: WARN child {child_bare} gets no `{cap_name}` grant: {e}"),
+                );
             }
         }
     }
@@ -494,36 +513,51 @@ impl SpawnObserver for PerChildLoopManager {
         // guest stop — audit r8 W2), so a child is routable EXACTLY while its loop can
         // run. (`skip_loop` above is the sole intentional register-without-loop path.)
         let (Some(runtime), Some(injector)) = (self.runtime.get(), self.injector.get()) else {
-            eprintln!("perchild: runtime/injector not bound; child {child_bare} not served");
+            self.log.err(
+                log_keys::PERCHILD_UNBOUND,
+                format!("perchild: runtime/injector not bound; child {child_bare} not served"),
+            );
             return;
         };
         let bytes = match crate::daemon::resolve_driver_component_bytes(workspace) {
             Ok(Some((_, bytes))) => bytes,
             Ok(None) => {
-                eprintln!("perchild: child {child_bare} has no driver; not served");
+                self.log.err(
+                    log_keys::PERCHILD_NO_DRIVER,
+                    format!("perchild: child {child_bare} has no driver; not served"),
+                );
                 return;
             }
             Err(e) => {
-                eprintln!("perchild: child {child_bare} driver resolve failed: {e}");
+                self.log.err(
+                    log_keys::PERCHILD_DRIVER_RESOLVE_FAILED,
+                    format!("perchild: child {child_bare} driver resolve failed: {e}"),
+                );
                 return;
             }
         };
         let loaded = match runtime.load_component(&bytes) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("perchild: child {child_bare} load failed: {e:?}");
+                self.log.err(
+                    log_keys::PERCHILD_LOAD_FAILED,
+                    format!("perchild: child {child_bare} load failed: {e:?}"),
+                );
                 return;
             }
         };
         // BARE cap-id (the L1 grant grantee + `send` `from` body), COLON serve key.
-        let handler: Arc<dyn MessageHandler> = Arc::new(WasmMessageHandler::new(
-            runtime.clone(),
-            loaded,
-            injector.clone(),
-            caps,
-            child_bare.to_string(),
-            format!("trace-child-{child_bare}"),
-        ));
+        let handler: Arc<dyn MessageHandler> = Arc::new(
+            WasmMessageHandler::new(
+                runtime.clone(),
+                loaded,
+                injector.clone(),
+                caps,
+                child_bare.to_string(),
+                format!("trace-child-{child_bare}"),
+            )
+            .with_log(self.log.clone()),
+        );
         // Tee slice T3, observer path (ii): fan out to the recording observer AND
         // the turn-end reap. Recording runs first so existing MODULE-001-AC-22
         // witnesses observe the same counts they always did.
@@ -533,11 +567,14 @@ impl SpawnObserver for PerChildLoopManager {
                 // §5.2 item 5: the authoritative (serve-key, cap-id) pair is injected
                 // verbatim from the SAME locals this spawn serves under — never
                 // re-derived from the serve id by string surgery.
-                Arc::new(crate::reap::ReapTurnObserver::for_agent(
-                    reaper,
-                    child_colon.clone(),
-                    child_bare.to_string(),
-                )),
+                Arc::new(
+                    crate::reap::ReapTurnObserver::for_agent(
+                        reaper,
+                        child_colon.clone(),
+                        child_bare.to_string(),
+                    )
+                    .with_log(self.log.clone()),
+                ),
             ])),
             None => self.turn_observer.clone(),
         };
@@ -570,7 +607,10 @@ impl SpawnObserver for PerChildLoopManager {
         let component_id = match ComponentId::new(format!("agent-{child_bare}-inst")) {
             Ok(c) => c,
             Err(_) => {
-                eprintln!("perchild: child {child_bare} invalid component id");
+                self.log.err(
+                    log_keys::PERCHILD_INVALID_COMPONENT_ID,
+                    format!("perchild: child {child_bare} invalid component id"),
+                );
                 return;
             }
         };
@@ -603,9 +643,12 @@ impl SpawnObserver for PerChildLoopManager {
                 if bridged {
                     self.bridge.unregister(&child_colon, child_bare);
                 }
-                eprintln!(
-                    "perchild: child {child_bare} colon id {child_colon} collides with an \
-                     existing agent; not served (tree node recorded, unrouted)"
+                self.log.err(
+                    log_keys::PERCHILD_COLON_COLLISION,
+                    format!(
+                        "perchild: child {child_bare} colon id {child_colon} collides with an \
+                         existing agent; not served (tree node recorded, unrouted)"
+                    ),
                 );
                 return;
             }

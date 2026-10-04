@@ -89,7 +89,9 @@ use cap_lifecycle::{
     WorkspaceFileResidentPolicy,
 };
 
+use crate::api::log_keys;
 use crate::component_submit_bridge::{CapGrantSubmitSubsetGate, SchedulerSubmitBridge};
+use crate::compose_log::LogHandle;
 // Pack lane P1: the composition-root pack wiring (ONE rescanned pack
 // registry + the chained built-in ∪ pack template resolver + the evaluator resolver).
 use crate::pack_wiring::{build_pack_wiring, PackWiring};
@@ -854,7 +856,8 @@ pub fn run_config_from(cfg: &RunBudgetConfig) -> RunConfig {
 /// Lives at the composition root so cap-memory keeps zero `advance-git`
 /// compile-time edges (the same inversion posture as the scheduler's
 /// `WasmRunnableHook`). Public: the system-acceptance harness wires the SAME
-/// adapter over its own workspace repo.
+/// adapter over its own workspace repo. It does not report the git-side failure
+/// detail; the composition wires a twin that reports it to the composition log.
 pub struct GitMemoryRestore {
     pub inner: Arc<advance_git::DefaultWorkspaceRollback>,
 }
@@ -867,41 +870,82 @@ impl MemoryGitRestore for GitMemoryRestore {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Vec<String>, String>> + Send + 'static>,
     > {
-        let inner = Arc::clone(&self.inner);
-        Box::pin(async move {
-            // `agent:`-prefix duality at the seam boundary (the
-            // CapGrantSubsetAdapter precedent): the WIT HostCallContext
-            // carries the canonical `agent:<body>` id, but MODULE-003's
-            // rollback surface validates agent_id against Git ref-name
-            // grammar (colon-free, bare-id convention — `.agent/config.yaml`
-            // names the bare body, root falls back to the `root` sentinel).
-            let bare = agent_id.strip_prefix("agent:").unwrap_or(&agent_id);
-            inner
-                .rollback_memory_files_at(bare, &timestamp_rfc3339)
-                .await
-                .map(|paths| paths.into_iter().map(|p| p.display().to_string()).collect())
-                // Adversarial-round F5 fix (2026-06-13): map every git-side
-                // failure to a CLOSED set of invariant reason codes — no
-                // Debug stringification (RollbackError's Debug carries host
-                // absolute paths + unbounded internal detail, which must not
-                // cross into the guest-visible WIT storage-error; the
-                // ERROR_MESSAGE_ECHO_MAX / sanitize_audit_field discipline).
-                // Full detail is logged host-side only.
-                .map_err(|e| {
-                    eprintln!("advance: rollback-memory git half failed for {bare}: {e:?}");
-                    use advance_git::RollbackError as RE;
-                    match e {
-                        RE::NotFound { .. } => "git-restore:not-found",
-                        RE::PermissionDenied { .. } => "git-restore:permission-denied",
-                        RE::Libgit2 { .. } => "git-restore:libgit2",
-                        RE::Io(_) => "git-restore:io",
-                        RE::Checkpoint(_) => "git-restore:invalid-agent-id",
-                        RE::InvalidTarget { .. } => "git-restore:invalid-target",
-                    }
-                    .to_string()
-                })
-        })
+        restore_memory_files_at(
+            Arc::clone(&self.inner),
+            agent_id,
+            timestamp_rfc3339,
+            LogHandle::null(),
+        )
     }
+}
+
+/// [`GitMemoryRestore`] reporting each git-side failure's detail to `log`.
+struct LoggedGitMemoryRestore {
+    inner: Arc<advance_git::DefaultWorkspaceRollback>,
+    log: LogHandle,
+}
+
+impl MemoryGitRestore for LoggedGitMemoryRestore {
+    fn restore_at(
+        &self,
+        agent_id: String,
+        timestamp_rfc3339: String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<String>, String>> + Send + 'static>,
+    > {
+        restore_memory_files_at(
+            Arc::clone(&self.inner),
+            agent_id,
+            timestamp_rfc3339,
+            self.log.clone(),
+        )
+    }
+}
+
+fn restore_memory_files_at(
+    inner: Arc<advance_git::DefaultWorkspaceRollback>,
+    agent_id: String,
+    timestamp_rfc3339: String,
+    log: LogHandle,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<String>, String>> + Send + 'static>,
+> {
+    Box::pin(async move {
+        // `agent:`-prefix duality at the seam boundary (the
+        // CapGrantSubsetAdapter precedent): the WIT HostCallContext
+        // carries the canonical `agent:<body>` id, but MODULE-003's
+        // rollback surface validates agent_id against Git ref-name
+        // grammar (colon-free, bare-id convention — `.agent/config.yaml`
+        // names the bare body, root falls back to the `root` sentinel).
+        let bare = agent_id.strip_prefix("agent:").unwrap_or(&agent_id);
+        inner
+            .rollback_memory_files_at(bare, &timestamp_rfc3339)
+            .await
+            .map(|paths| paths.into_iter().map(|p| p.display().to_string()).collect())
+            // Adversarial-round F5 fix (2026-06-13): map every git-side
+            // failure to a CLOSED set of invariant reason codes — no
+            // Debug stringification (RollbackError's Debug carries host
+            // absolute paths + unbounded internal detail, which must not
+            // cross into the guest-visible WIT storage-error; the
+            // ERROR_MESSAGE_ECHO_MAX / sanitize_audit_field discipline).
+            // Full detail is logged host-side only.
+            .map_err(|e| {
+                log.err(
+                    log_keys::ROLLBACK_MEMORY_GIT_FAILED,
+                    format!("advance: rollback-memory git half failed for {bare}: {e:?}"),
+                );
+                use advance_git::RollbackError as RE;
+                match e {
+                    RE::NotFound { .. } => "git-restore:not-found",
+                    RE::PermissionDenied { .. } => "git-restore:permission-denied",
+                    RE::Libgit2 { .. } => "git-restore:libgit2",
+                    RE::Io(_) => "git-restore:io",
+                    RE::Checkpoint(_) => "git-restore:invalid-agent-id",
+                    RE::InvalidTarget { .. } => "git-restore:invalid-target",
+                }
+                .to_string()
+            })
+    })
 }
 
 /// Wave-17 Lane 3 (MODULE-005-AC-25): materialize the config-declared child-agent
@@ -1133,11 +1177,23 @@ fn adopt_existing_declared(
     Ok(())
 }
 
+/// Wire the production capability graph. Its diagnostics are not reported; the
+/// daemon composition uses `wire_capabilities_with_log`.
 pub async fn wire_capabilities(
     builder: RuntimeHostBuilder,
     workspace: &Path,
 ) -> Result<(RuntimeHost, WiringHandles), CliWiringError> {
-    wire_capabilities_inner(builder, workspace, None, None).await
+    wire_capabilities_inner(builder, workspace, None, None, LogHandle::null()).await
+}
+
+/// [`wire_capabilities`] reporting its diagnostics, and those of the objects it
+/// builds, to `log`.
+pub(crate) async fn wire_capabilities_with_log(
+    builder: RuntimeHostBuilder,
+    workspace: &Path,
+    log: LogHandle,
+) -> Result<(RuntimeHost, WiringHandles), CliWiringError> {
+    wire_capabilities_inner(builder, workspace, None, None, log).await
 }
 
 /// Test seam: inject a canonical HOME so progress-lifecycle bootstrap does not
@@ -1150,7 +1206,7 @@ pub async fn wire_capabilities_with_home_for_test(
     workspace: &Path,
     home: &Path,
 ) -> Result<(RuntimeHost, WiringHandles), CliWiringError> {
-    wire_capabilities_inner(builder, workspace, None, Some(home)).await
+    wire_capabilities_inner(builder, workspace, None, Some(home), LogHandle::null()).await
 }
 
 /// Production-composition witness entry point.  It preserves the complete
@@ -1171,6 +1227,7 @@ pub async fn wire_capabilities_with_channel_security_for_test(
             ssrf, executor,
         )),
         None,
+        LogHandle::null(),
     )
     .await
 }
@@ -1180,6 +1237,7 @@ async fn wire_capabilities_inner(
     workspace: &Path,
     channel_security_override: Option<crate::channels_boot::ChannelSecurityTestOverride>,
     home_override: Option<&Path>,
+    log: LogHandle,
 ) -> Result<(RuntimeHost, WiringHandles), CliWiringError> {
     // Step 1 — snapshot the agent config YAML ONCE.
     //
@@ -1235,10 +1293,13 @@ async fn wire_capabilities_inner(
     // live schema), presets and skill tools. The parts attach below as they are built; applied
     // at boot and again on every install / uninstall (Client API, or the packs-dir watcher for
     // installs made by another process).
-    let pack_runtime = Arc::new(crate::pack_runtime::PackRuntime::new(
-        pack_wiring.registry.clone(),
-        pack_wiring.packs_dir.clone(),
-    ));
+    let pack_runtime = Arc::new(
+        crate::pack_runtime::PackRuntime::new(
+            pack_wiring.registry.clone(),
+            pack_wiring.packs_dir.clone(),
+        )
+        .with_log(log.clone()),
+    );
     let evidence_ids = Arc::new(EvidenceIdStore::new());
     // await-leg B-2 (2026-06-22): gate the production messaging chain (await-replies
     // + heartbeat host-fns + the suspend sink). await-leg B-4a (2026-06-22) flipped
@@ -1273,10 +1334,13 @@ async fn wire_capabilities_inner(
             &DefaultEntryProvider,
             None,
         ) {
-            Ok(Some(report)) => eprintln!(
-                "advance: migrated {} secret(s) into the synchronized keychain ({} file(s) renamed)",
-                report.migrated.len(),
-                report.renamed.len()
+            Ok(Some(report)) => log.err(
+                log_keys::KEYCHAIN_MIGRATED,
+                format!(
+                    "advance: migrated {} secret(s) into the synchronized keychain ({} file(s) renamed)",
+                    report.migrated.len(),
+                    report.renamed.len()
+                ),
             ),
             Ok(None) => {}
             Err(e) => return Err(CliWiringError::MasterKey(e)),
@@ -1969,11 +2033,15 @@ async fn wire_capabilities_inner(
             // W24 seam (f): one shared crash-cascade sink built from the tree +
             // mailbox store + the SAME bare→colon resolver. It resolves the crashing
             // agent's parent DYNAMICALLY, so one instance serves root + all children.
-            let crash_sink =
-                crate::crash_cascade::build_crash_cascade_sink((**tree).clone(), store.clone(), {
+            let crash_sink = crate::crash_cascade::build_crash_cascade_sink_with_log(
+                (**tree).clone(),
+                store.clone(),
+                {
                     let keys_tree = (**tree).clone();
                     move |bare: &str| crate::agent_config::mailbox_key_for(&keys_tree, bare)
-                });
+                },
+                log.clone(),
+            );
             perchild_crash_sink = Some(crash_sink.clone());
             let mgr = Arc::new(
                 PerChildLoopManager::new(
@@ -1998,7 +2066,8 @@ async fn wire_capabilities_inner(
                         .execution_boundary
                         .clone(),
                 )
-                .with_crash_sink(crash_sink),
+                .with_crash_sink(crash_sink)
+                .with_log(log.clone()),
             );
             perchild_manager = Some(mgr.clone());
             let observer: Arc<dyn SpawnObserver> = mgr;
@@ -2330,19 +2399,26 @@ async fn wire_capabilities_inner(
                 // half IS the correct semantics (the
                 // `DefaultGitCommitQueue::spawn` open-probe precedent above).
                 Ok(rb) => match rb.verify_repo() {
-                    Ok(()) => Some(Arc::new(GitMemoryRestore {
+                    Ok(()) => Some(Arc::new(LoggedGitMemoryRestore {
                         inner: Arc::new(rb),
+                        log: log.clone(),
                     })),
                     Err(e) => {
-                        eprintln!(
-                            "advance: rollback-memory git half not wired (workspace is not a git repository): {e:?}"
+                        log.err(
+                            log_keys::ROLLBACK_MEMORY_NOT_REPO,
+                            format!(
+                                "advance: rollback-memory git half not wired (workspace is not a git repository): {e:?}"
+                            ),
                         );
                         None
                     }
                 },
                 Err(e) => {
-                    eprintln!(
-                        "advance: rollback-memory git half not wired (workspace rollback unavailable): {e:?}"
+                    log.err(
+                        log_keys::ROLLBACK_MEMORY_UNAVAILABLE,
+                        format!(
+                            "advance: rollback-memory git half not wired (workspace rollback unavailable): {e:?}"
+                        ),
                     );
                     None
                 }
@@ -2760,14 +2836,18 @@ async fn wire_capabilities_inner(
             );
             // Lane E3: the Client API's schema + entities families serve the SAME store.
             data_store_for_api = Some(Arc::clone(&store));
-            if let Err(e) = crate::data_wiring::register_data_tool(
+            if let Err(e) = crate::data_wiring::register_data_tool_with_log(
                 &tools_concrete,
                 store,
                 cap_grant.grant_check.clone(),
+                &log,
             )
             .await
             {
-                eprintln!("advance: WARN data tool not registered: {e}");
+                log.err(
+                    log_keys::DATA_TOOL_NOT_REGISTERED,
+                    format!("advance: WARN data tool not registered: {e}"),
+                );
             }
         }
         let host_slots = Arc::new(HostToolRegistry::new());
@@ -2975,7 +3055,10 @@ async fn wire_capabilities_inner(
                     match (history, events) {
                         (Ok(h), Ok(e)) => Some((h, e, Arc::clone(projector))),
                         (Err(error), _) | (_, Err(error)) => {
-                            eprintln!("advance: Client API history/events unavailable: {error}");
+                            log.err(
+                                log_keys::CLIENT_API_HISTORY_UNAVAILABLE,
+                                format!("advance: Client API history/events unavailable: {error}"),
+                            );
                             None
                         }
                     }
@@ -3099,9 +3182,12 @@ async fn wire_capabilities_inner(
             );
             match bound {
                 Ok(server) => {
-                    eprintln!(
-                        "advance: Client API and Web Console listening at http://{}",
-                        server.local_addr()
+                    log.err(
+                        log_keys::CLIENT_API_LISTENING,
+                        format!(
+                            "advance: Client API and Web Console listening at http://{}",
+                            server.local_addr()
+                        ),
                     );
                     let _ = advance_home::write_client_api_discovery(
                         workspace,
@@ -3111,7 +3197,10 @@ async fn wire_capabilities_inner(
                     Some(server)
                 }
                 Err(error) => {
-                    eprintln!("advance: Client API unavailable (loopback bind failed): {error}");
+                    log.err(
+                        log_keys::CLIENT_API_UNAVAILABLE,
+                        format!("advance: Client API unavailable (loopback bind failed): {error}"),
+                    );
                     None
                 }
             }

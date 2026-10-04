@@ -20,7 +20,6 @@
 //! in-process via the same `build_agent_loop` factory. Full agent-template
 //! materialization of a deployed binary into the workspace ships in MODULE-018/005.
 
-use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -46,7 +45,7 @@ use advance_scheduler::types::{ComponentConfig, ComponentId, WasmInstance};
 // Wave-13 Lane B (SYS-AC-228): drive the readiness-gated registry walk at boot,
 // installing the component-type breaker gate over the runtime's shared bus.
 use crate::runnable_hook_factory::WasmRunnableHookFactory;
-use crate::runnable_walk::start_continuous_readiness_gated_walk_with_breaker_gate;
+use crate::runnable_walk::start_continuous_readiness_gated_walk_with_breaker_gate_with_log;
 use advance_scheduler::hook::{
     FileWatchSource, HookError, RunnableHookFactory, RuntimeReadiness, WebhookSource,
 };
@@ -93,6 +92,9 @@ use crate::reply::ReplyRegistry;
 use crate::channel_egress::{ChannelEgress, DaemonOutboundSink};
 use crate::channels_boot;
 use crate::execution_turn_ingress::ExecutionTurnIngress;
+
+use crate::api::log_keys;
+use crate::compose_log::{LogHandle, StdioComposeLog};
 
 #[derive(Clone)]
 struct ProgressLoopWiring {
@@ -227,10 +229,13 @@ pub fn run_daemon(workspace: Option<PathBuf>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    rt.block_on(run_async(workspace))
+    rt.block_on(run_async(
+        workspace,
+        LogHandle::new(Arc::new(StdioComposeLog)),
+    ))
 }
 
-async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
+async fn run_async(workspace: Option<PathBuf>, log: LogHandle) -> ExitCode {
     // 1. Install signal listeners FIRST. Tokio's `signal(SignalKind::*)` is
     //    synchronous (installs the kernel handler eagerly), so subsequent
     //    SIGINT/SIGTERM during lock-acquire or bootstrap is captured and
@@ -333,13 +338,14 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
     // resolves by passing pre-snapshotted YAML bytes to cap-grant via the
     // Step-2 fix in `wiring.rs`. Surface any wiring failure with the
     // generic diagnostic.
-    let (host, wiring_handles) = match crate::wiring::wire_capabilities(builder, &workspace).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("advance start: wiring failed: {e}");
-            return ExitCode::from(1);
-        }
-    };
+    let (host, wiring_handles) =
+        match crate::wiring::wire_capabilities_with_log(builder, &workspace, log.clone()).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("advance start: wiring failed: {e}");
+                return ExitCode::from(1);
+            }
+        };
 
     {
         let pid = std::process::id();
@@ -364,11 +370,10 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
         });
     }
 
-    println!(
+    if let Err(e) = log.ready(format!(
         "advance: runtime ready (workspace={})",
         safe_path(&workspace)
-    );
-    if let Err(e) = std::io::stdout().flush() {
+    )) {
         eprintln!("advance start: failed to flush readiness signal: {e}");
         return ExitCode::from(1);
     }
@@ -455,6 +460,7 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
         wiring_handles.tools_grant_reader.clone(),
         wiring_handles.web_grant.clone(),
         Some(wiring_handles.pack_runtime.clone()),
+        &log,
     )
     .await
     {
@@ -498,7 +504,10 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
     //      a pending POST reply slot (no POST↔channel mis-correlation).
     let msg_listener = if let Some(spawned) = agent_loop.as_ref() {
         if spawned.channels_active {
-            println!("advance: channels configured — POST /msg shim disabled (replaced by /hooks)");
+            log.out(
+                log_keys::CHANNELS_POST_MSG_DISABLED,
+                "advance: channels configured — POST /msg shim disabled (replaced by /hooks)",
+            );
             None
         } else {
             match spawn_msg_listener(
@@ -508,6 +517,7 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
                 spawned.reply_registry.clone(),
                 spawned.done.clone(),
                 spawned.in_flight.clone(),
+                log.clone(),
             )
             .await
             {
@@ -543,7 +553,8 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
             wiring_handles.run_manager.clone(),
         ));
         let extension: Arc<dyn advance_scheduler::SchedulerExtension> = Arc::new(
-            crate::auto_tick_extension::AutoTickExtension::new(driver, coordinator),
+            crate::auto_tick_extension::AutoTickExtension::new(driver, coordinator)
+                .with_log(log.clone()),
         );
         let mut scheduler = advance_scheduler::Scheduler::new(Arc::new(
             advance_scheduler::TriggerBusDispatchImpl::new(),
@@ -552,6 +563,7 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
         let scheduler = Arc::new(scheduler);
         let cancel = tokio_util::sync::CancellationToken::new();
         let loop_cancel = cancel.clone();
+        let tick_log = log.clone();
         let handle = tokio::spawn(async move {
             if let Err(e) = advance_scheduler::run_scheduler_tick_loop(
                 scheduler,
@@ -560,11 +572,17 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
             )
             .await
             {
-                eprintln!("advance: auto tick loop did not start: {e}");
+                tick_log.err(
+                    log_keys::AUTO_TICK_FAILED,
+                    format!("advance: auto tick loop did not start: {e}"),
+                );
             }
         });
-        println!(
-            "advance: auto-mode scheduler tick loop running (interval={AUTO_TICK_INTERVAL:?})"
+        log.out(
+            log_keys::AUTO_TICK_RUNNING,
+            format!(
+                "advance: auto-mode scheduler tick loop running (interval={AUTO_TICK_INTERVAL:?})"
+            ),
         );
         Some((cancel, handle))
     } else {
@@ -641,7 +659,7 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
                 let file_source: Arc<dyn FileWatchSource> = Arc::new(BootNoopFileWatchSource);
                 let webhook_source: Arc<dyn WebhookSource> = Arc::new(BootNoopWebhookSource);
                 let breaker_bus = host.circuit_breaker_bus();
-                match start_continuous_readiness_gated_walk_with_breaker_gate(
+                match start_continuous_readiness_gated_walk_with_breaker_gate_with_log(
                     registry,
                     probe,
                     factory,
@@ -649,26 +667,39 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
                     file_source,
                     webhook_source,
                     breaker_bus,
+                    log.clone(),
                 )
                 .await
                 {
                     Ok(walk) => {
-                        println!("advance: continuous component reconciliation wired (component-type breaker gate active)");
+                        log.out(
+                            log_keys::RECONCILIATION_WIRED,
+                            "advance: continuous component reconciliation wired (component-type breaker gate active)",
+                        );
                         Some(walk)
                     }
                     Err(e) => {
-                        eprintln!("advance: readiness walk did not run: {e}");
+                        log.err(
+                            log_keys::READINESS_WALK_FAILED,
+                            format!("advance: readiness walk did not run: {e}"),
+                        );
                         None
                     }
                 }
             }
             Ok(Err(e)) => {
-                eprintln!("advance: skipping readiness walk — {e}");
+                log.err(
+                    log_keys::READINESS_WALK_SKIPPED,
+                    format!("advance: skipping readiness walk — {e}"),
+                );
                 None
             }
             Err(_elapsed) => {
-                eprintln!(
-                    "advance: skipping readiness walk — registry open timed out after {BOOT_REGISTRY_OPEN_TIMEOUT:?}"
+                log.err(
+                    log_keys::READINESS_WALK_TIMEOUT,
+                    format!(
+                        "advance: skipping readiness walk — registry open timed out after {BOOT_REGISTRY_OPEN_TIMEOUT:?}"
+                    ),
                 );
                 None
             }
@@ -714,7 +745,7 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
     if let Some(walk) = readiness_walk {
         walk.shutdown().await;
     }
-    println!("advance: shutting down");
+    log.out(log_keys::SHUTTING_DOWN, "advance: shutting down");
     // _host and _lock drop here, releasing resources.
     ExitCode::SUCCESS
 }
@@ -726,7 +757,7 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
 const _: () = {
     fn assert_send_static<F, Fut>(_: F)
     where
-        F: Fn(Option<PathBuf>) -> Fut,
+        F: Fn(Option<PathBuf>, LogHandle) -> Fut,
         Fut: std::future::Future<Output = ExitCode> + Send + 'static,
     {
     }
@@ -911,6 +942,7 @@ async fn try_spawn_agent_loop(
     tools_grant_reader: Option<Arc<dyn advance_shared_types::traits::ToolsGrantReader>>,
     web_grant: Option<Arc<dyn advance_shared_types::traits::GrantCheck>>,
     pack_runtime: Option<Arc<crate::pack_runtime::PackRuntime>>,
+    log: &LogHandle,
 ) -> Result<Option<SpawnedAgentLoop>, String> {
     // MODULE-001-AC-20 (024): resolve the canonical materialized name + (if a core
     // module) encode it to a Component on the fly. `None` → no driver deployed → park.
@@ -972,7 +1004,8 @@ async fn try_spawn_agent_loop(
         .with_run_session(RunSession {
             run_manager: run_manager.clone(),
             cell: session_cell.clone(),
-        }),
+        })
+        .with_log(log.clone()),
     );
     // Hold the shared store at this scope and clone the Arc into the loop: the
     // SAME store is returned to `run_async`, which hands it to the `POST /msg`
@@ -1031,11 +1064,14 @@ async fn try_spawn_agent_loop(
             // §5.2 item 5: the authoritative (serve-key, cap-id) pair is injected
             // verbatim from the SAME locals this function serves and grants with —
             // never re-derived from the serve id by string surgery.
-            Arc::new(crate::reap::ReapTurnObserver::for_agent(
-                reaper,
-                msg_agent_id.clone(),
-                cap_agent_id.clone(),
-            )),
+            Arc::new(
+                crate::reap::ReapTurnObserver::for_agent(
+                    reaper,
+                    msg_agent_id.clone(),
+                    cap_agent_id.clone(),
+                )
+                .with_log(log.clone()),
+            ),
         ])),
         None => watch_observer,
     };
@@ -1117,6 +1153,7 @@ async fn try_spawn_agent_loop(
         git_queue,
         vlm_extractor,
         agent_tree_snapshot.clone(),
+        log,
     ));
     // Backbone Step 2: when llm is wired, install the REAL ContextAssemblerImpl
     // (via the PublishingContextAssembler seam) so the assembled layered context
@@ -1259,7 +1296,10 @@ async fn try_spawn_agent_loop(
     let component_id = ComponentId::new("agent-default-inst".to_string())
         .map_err(|_| "internal: static component instance id is invalid".to_string())?;
     let instance = WasmInstance::new(component_id);
-    println!("advance: agent loop wired (component loaded; serving inbound messages)");
+    log.out(
+        log_keys::AGENT_LOOP_WIRED,
+        "advance: agent loop wired (component loaded; serving inbound messages)",
+    );
     // `done` watch: the serving-loop task sends `true` only when the loop
     // TERMINATES (shutdown `handle.abort()` or a panic-unwind, via the drop-guard).
     // Under the infinite `serve` loop it no longer fires on per-turn completion;
@@ -1288,7 +1328,13 @@ async fn try_spawn_agent_loop(
     // listener + spawn the host pump (poll_host_pump → Message → mailbox → serve).
     let mut channel_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if let Some(cr) = channel_rt {
-        match channels_boot::spawn_hooks_listener(cr.supervisor.clone(), cr.listen_addr).await {
+        match channels_boot::spawn_hooks_listener_with(
+            cr.supervisor.clone(),
+            cr.listen_addr,
+            log.clone(),
+        )
+        .await
+        {
             Ok(h) => channel_handles.push(h),
             Err(msg) => {
                 handle.abort();
@@ -1302,13 +1348,15 @@ async fn try_spawn_agent_loop(
                 cr.subs.clone(),
                 ingress.clone(),
                 msg_agent_id.clone(),
+                log.clone(),
             ),
-            None => channels_boot::spawn_host_pump(
+            None => channels_boot::spawn_host_pump_with_log(
                 cr.manager.clone(),
                 cr.identity.clone(),
                 cr.subs.clone(),
                 store.clone(),
                 msg_agent_id.clone(),
+                log.clone(),
             ),
         });
     }
@@ -1444,6 +1492,7 @@ pub async fn spawn_test_agent_loop(
         handles.tools_grant_reader.clone(),
         handles.web_grant.clone(),
         Some(handles.pack_runtime.clone()),
+        &LogHandle::null(),
     )
     .await
     .map(|spawned| spawned.map(|inner| TestServeLoop { inner }))
@@ -1541,6 +1590,7 @@ async fn spawn_msg_listener(
     reply_registry: Arc<ReplyRegistry>,
     done: watch::Receiver<bool>,
     in_flight: Arc<AtomicBool>,
+    log: LogHandle,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     let state = MsgListenerState {
         store,
@@ -1567,10 +1617,16 @@ async fn spawn_msg_listener(
     let addr = listener
         .local_addr()
         .map_err(|e| format!("failed to read POST /msg listener address: {e}"))?;
-    println!("advance: msg listener on http://{addr}/msg");
+    log.out(
+        log_keys::MSG_LISTENER,
+        format!("advance: msg listener on http://{addr}/msg"),
+    );
     Ok(tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
-            eprintln!("advance: msg listener stopped: {e}");
+            log.err(
+                log_keys::MSG_LISTENER_STOPPED,
+                format!("advance: msg listener stopped: {e}"),
+            );
         }
     }))
 }
@@ -1937,6 +1993,7 @@ fn build_live_post_processor(
     // threaded into the production L6 `StalenessProbe`'s MODULE-002 path resolver
     // (`build_l6_stale_resolver`). `None` ⇒ `EmptyAgentTree` fallback (conservative Stale).
     agent_tree: Option<Arc<dyn AgentTreeSnapshot>>,
+    log: &LogHandle,
 ) -> Arc<dyn PostProcessorHook> {
     let (Some(store), Some(gateway)) = (memory_store, llm_gateway) else {
         // Trace-only path (AC-44 synthetic-entry guard): an LLM-absent or
@@ -1978,8 +2035,11 @@ fn build_live_post_processor(
             components = components.with_sqlite_index(Arc::new(idx));
         }
         Err(e) => {
-            eprintln!(
-                "advance start: durable memory index open failed ({e}); using the in-memory index"
+            log.err(
+                log_keys::MEMORY_INDEX_FALLBACK,
+                format!(
+                    "advance start: durable memory index open failed ({e}); using the in-memory index"
+                ),
             );
         }
     }
@@ -1995,7 +2055,8 @@ fn build_live_post_processor(
         let gw_vlm_concrete = Arc::clone(gateway);
         let gw_vlm: Arc<dyn cap_llm::LlmGatewayInternal> = gw_vlm_concrete;
         components = components.with_description_indexer(Arc::new(
-            crate::vlm_indexer::VlmDescriptionIndexer::new(gw_vlm, vlm, workspace.to_path_buf()),
+            crate::vlm_indexer::VlmDescriptionIndexer::new(gw_vlm, vlm, workspace.to_path_buf())
+                .with_log(log.clone()),
         ));
     }
     // SAT-C (slice satC-l6): when a live git queue is present, attach the L6
@@ -2071,8 +2132,18 @@ mod satb_gate_tests {
         let ws = std::env::temp_dir(); // unused on the trace-only path
 
         // (memory present, llm absent) → trace-only, no writes.
-        let pp =
-            build_live_post_processor(Some(&store), None, &ws, bus(), "root", None, None, None);
+        let log = crate::compose_log::LogHandle::null();
+        let pp = build_live_post_processor(
+            Some(&store),
+            None,
+            &ws,
+            bus(),
+            "root",
+            None,
+            None,
+            None,
+            &log,
+        );
         pp.run("root", &fixture_msg(), &fixture_result())
             .await
             .expect("run Ok");
@@ -2082,7 +2153,7 @@ mod satb_gate_tests {
         );
 
         // (both absent) → trace-only, no writes.
-        let pp2 = build_live_post_processor(None, None, &ws, bus(), "root", None, None, None);
+        let pp2 = build_live_post_processor(None, None, &ws, bus(), "root", None, None, None, &log);
         pp2.run("root", &fixture_msg(), &fixture_result())
             .await
             .expect("run Ok");

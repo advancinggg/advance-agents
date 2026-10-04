@@ -23,6 +23,9 @@ use std::sync::Arc;
 
 use advance_scheduler::TurnObserver;
 
+use crate::api::log_keys;
+use crate::compose_log::LogHandle;
+
 /// Fan-out over several [`TurnObserver`]s, preserving declaration order.
 ///
 /// Order matters: the reap observer runs AFTER the wrapped observers, so a
@@ -80,6 +83,8 @@ pub struct ReapTurnObserver {
     /// I/O keeps the slot busy indefinitely (indistinguishable from running) and
     /// victims fall to the TTL sweep.
     settle_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Where a contained reap panic is reported ([`Self::with_log`]; none by default).
+    log: LogHandle,
 }
 
 impl ReapTurnObserver {
@@ -94,7 +99,14 @@ impl ReapTurnObserver {
             serve_id: serve_id.into(),
             cap_id: cap_id.into(),
             settle_task: std::sync::Mutex::new(None),
+            log: LogHandle::null(),
         }
+    }
+
+    /// Report a contained reap panic to `log`.
+    pub fn with_log(mut self, log: LogHandle) -> Self {
+        self.log = log;
+        self
     }
 
     /// Reap if `serve_id` matches the injected serve key exactly, returning how many
@@ -185,6 +197,7 @@ impl TurnObserver for ReapTurnObserver {
                         return;
                     }
                     let agent = agent_id.to_string();
+                    let log = self.log.clone();
                     // The spawn CALL itself can panic (worker-thread exhaustion);
                     // it is inside the outer catch_unwind and nothing is stored on
                     // that unwind, so the next boundary simply retries (round 25 —
@@ -195,9 +208,12 @@ impl TurnObserver for ReapTurnObserver {
                                 batch.settle()
                             }));
                         if settled.is_err() {
-                            eprintln!(
-                                "reap: deferred stream settlement panicked for {agent}; \
-                                 remaining streams settle at TTL"
+                            log.err(
+                                log_keys::REAP_DEFERRED_SETTLE_PANICKED,
+                                format!(
+                                    "reap: deferred stream settlement panicked for {agent}; \
+                                     remaining streams settle at TTL"
+                                ),
                             );
                         }
                     });
@@ -210,9 +226,12 @@ impl TurnObserver for ReapTurnObserver {
         }));
         if outcome.is_err() {
             // The panic is already reported by the default hook; keep the loop alive.
-            eprintln!(
-                "reap: turn-end stream reap panicked for {agent_id}; \
-                 serve loop continues, streams settle at TTL"
+            self.log.err(
+                log_keys::REAP_TURN_END_PANICKED,
+                format!(
+                    "reap: turn-end stream reap panicked for {agent_id}; \
+                     serve loop continues, streams settle at TTL"
+                ),
             );
         }
     }

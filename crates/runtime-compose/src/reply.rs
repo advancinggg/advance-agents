@@ -18,7 +18,6 @@
 //! outbound (notify-channel `send-raw`, SYS-AC-001) is Step-3.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::Write;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::oneshot;
@@ -26,6 +25,9 @@ use tokio::sync::oneshot;
 use advance_messaging::{AgentAction, OutboundActionSink};
 use advance_shared_types::mailbox::{DispatchError, Message};
 use advance_shared_types::outbound::DeliveryReport;
+
+use crate::api::log_keys;
+use crate::compose_log::LogHandle;
 
 /// Upper bound on the per-turn stdout reply preview. Untrusted model output can
 /// be up to `MAX_BATCH_SIZE` (128) actions × `MAX_PAYLOAD_BYTES` (1 MiB) = ~128
@@ -281,16 +283,27 @@ impl advance_shared_types::traits::LlmDeltaSink for StreamKeyAnnouncer {
     }
 }
 
-/// Production [`OutboundActionSink`] for the daemon: prints each reply to stdout
-/// (sanitized) and fulfils the [`ReplyRegistry`] oneshot so a waiting `POST /msg`
-/// caller gets the model's answer in the HTTP body.
+/// [`OutboundActionSink`] for the `POST /msg` path: fulfils the [`ReplyRegistry`]
+/// oneshot so a waiting `POST /msg` caller gets the model's answer in the HTTP
+/// body, and reports a sanitized preview of each reply as a stdout line to its log
+/// ([`Self::with_log`]; none by default).
 pub struct ReplyRouterSink {
     registry: Arc<ReplyRegistry>,
+    log: LogHandle,
 }
 
 impl ReplyRouterSink {
     pub fn new(registry: Arc<ReplyRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            log: LogHandle::null(),
+        }
+    }
+
+    /// Report each reply preview to `log`.
+    pub fn with_log(mut self, log: LogHandle) -> Self {
+        self.log = log;
+        self
     }
 }
 
@@ -320,8 +333,8 @@ impl OutboundActionSink for ReplyRouterSink {
         //     synchronous stdout write that stalls the current-thread runtime
         //     (the validator allows up to ~128 MiB per batch). Sanitized so the
         //     reply can't inject terminal escape sequences or bidi-spoof the
-        //     daemon TTY. `writeln!` (NOT `println!`) so a stdout write failure
-        //     (e.g. broken pipe) returns an error instead of unwinding `dispatch`.
+        //     daemon TTY. The log is infallible: a sink that cannot write drops the
+        //     line, so a stdout failure never unwinds `dispatch`.
         if let Some(first) = actions.first() {
             let truncated = first.payload.len() > STDOUT_PREVIEW_BYTES;
             let preview = if truncated {
@@ -339,8 +352,7 @@ impl OutboundActionSink for ReplyRouterSink {
             if actions.len() > 1 {
                 line.push_str(&format!(" … (+{} more actions)", actions.len() - 1));
             }
-            let mut stdout = std::io::stdout().lock();
-            let _ = writeln!(stdout, "{line}");
+            self.log.out(log_keys::REPLY_AGENT_REPLY, line);
         }
         Ok(DeliveryReport::empty())
     }

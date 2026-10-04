@@ -50,6 +50,9 @@ use advance_git::{
 };
 use advance_scheduler::WorkspaceRollbackSink;
 
+use crate::api::log_keys;
+use crate::compose_log::LogHandle;
+
 /// The per-agent checkpoint label the sink uses to mark the pre-turn HEAD. The checkpoint
 /// namespace is already per-agent (keyed on `agent_id`), so a single fixed label is safe
 /// across agents; `mark_pre_turn` delete-then-creates it so it tracks the latest HEAD.
@@ -90,14 +93,27 @@ fn dir_has_other_regular_files(dir: &Path) -> bool {
 /// repo). `repo_path` is the workspace repo root. The rollback + checkpoint helpers are
 /// constructed lazily per call (cheap path-canonicalize) and any construction error is
 /// swallowed — a workspace rollback is best-effort and must NEVER panic the serve loop.
+/// Swallowed failures are not reported; [`build_workspace_rollback_sink_with_log`]
+/// reports them.
 pub fn build_workspace_rollback_sink(
     queue: Arc<dyn GitCommitQueue>,
     repo_path: PathBuf,
+) -> Arc<dyn WorkspaceRollbackSink> {
+    build_workspace_rollback_sink_with_log(queue, repo_path, LogHandle::null())
+}
+
+/// [`build_workspace_rollback_sink`] reporting every swallowed failure and skipped
+/// rollback to `log`.
+pub fn build_workspace_rollback_sink_with_log(
+    queue: Arc<dyn GitCommitQueue>,
+    repo_path: PathBuf,
+    log: LogHandle,
 ) -> Arc<dyn WorkspaceRollbackSink> {
     Arc::new(WorkspaceRollbackSinkImpl {
         queue,
         repo_path,
         fresh: std::sync::Mutex::new(std::collections::HashSet::new()),
+        log,
     })
 }
 
@@ -111,6 +127,7 @@ struct WorkspaceRollbackSinkImpl {
     /// leaves the tag pointed at an OLDER commit) → the id is absent → no-op (the trapping turn's
     /// write persists = retention, never a silent rollback to — and loss of — a PRIOR turn's work).
     fresh: std::sync::Mutex<std::collections::HashSet<String>>,
+    log: LogHandle,
 }
 
 #[async_trait::async_trait]
@@ -155,18 +172,22 @@ impl WorkspaceRollbackSink for WorkspaceRollbackSinkImpl {
                 if let Ok(mut g) = self.fresh.lock() {
                     g.remove(&bare);
                 }
-                eprintln!(
-                    "build_workspace_rollback_sink: mark_pre_turn {msg} \
-                     (swallowed; rollback_on_crash no-ops for this turn)"
+                self.log.err(
+                    log_keys::ROLLBACK_MARK_PRE_TURN_FAILED,
+                    format!(
+                        "build_workspace_rollback_sink: mark_pre_turn {msg} \
+                         (swallowed; rollback_on_crash no-ops for this turn)"
+                    ),
                 );
             }
             Err(_panic) => {
                 if let Ok(mut g) = self.fresh.lock() {
                     g.remove(&bare);
                 }
-                eprintln!(
+                self.log.err(
+                    log_keys::ROLLBACK_MARK_PRE_TURN_PANICKED,
                     "build_workspace_rollback_sink: mark_pre_turn PANICKED (poisoned git coord mutex?) \
-                     — swallowed to honor the no-panic invariant; rollback_on_crash no-ops this turn"
+                     — swallowed to honor the no-panic invariant; rollback_on_crash no-ops this turn",
                 );
             }
         }
@@ -183,18 +204,24 @@ impl WorkspaceRollbackSink for WorkspaceRollbackSinkImpl {
             .map(|mut g| g.remove(bare))
             .unwrap_or(false);
         if !armed {
-            eprintln!(
-                "build_workspace_rollback_sink: rollback_on_crash({bare}) — no fresh pre-turn \
-                 marker armed this turn → no-op (fail-safe against over-rollback)"
+            self.log.err(
+                log_keys::ROLLBACK_NOT_ARMED,
+                format!(
+                    "build_workspace_rollback_sink: rollback_on_crash({bare}) — no fresh pre-turn \
+                     marker armed this turn → no-op (fail-safe against over-rollback)"
+                ),
             );
             return;
         }
         let rollback = match DefaultWorkspaceRollback::new(self.repo_path.clone()) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!(
-                    "build_workspace_rollback_sink: rollback_on_crash rollback ctor → {e:?} \
-                     (swallowed — best-effort, must not panic the serve loop)"
+                self.log.err(
+                    log_keys::ROLLBACK_CTOR_FAILED,
+                    format!(
+                        "build_workspace_rollback_sink: rollback_on_crash rollback ctor → {e:?} \
+                         (swallowed — best-effort, must not panic the serve loop)"
+                    ),
                 );
                 return;
             }
@@ -211,7 +238,10 @@ impl WorkspaceRollbackSink for WorkspaceRollbackSinkImpl {
         {
             Ok(paths) => paths,
             Err(e) => {
-                eprintln!("build_workspace_rollback_sink: rollback({bare}) → {e:?} (swallowed)");
+                self.log.err(
+                    log_keys::ROLLBACK_REVERT_FAILED,
+                    format!("build_workspace_rollback_sink: rollback({bare}) → {e:?} (swallowed)"),
+                );
                 return;
             }
         };
@@ -237,20 +267,26 @@ impl WorkspaceRollbackSink for WorkspaceRollbackSinkImpl {
                 continue;
             }
             if dir_has_other_regular_files(&dir) {
-                eprintln!(
-                    "build_workspace_rollback_sink: {} retains regular content after rollback — \
-                     leaving its .meta.yaml (a byte-exact restore of a pre-existing committed \
-                     sidecar needs the pre-turn blob; deferred to the Wave-19 daemon wiring; NO \
-                     data loss)",
-                    dir.display()
+                self.log.err(
+                    log_keys::ROLLBACK_SIDECAR_KEPT,
+                    format!(
+                        "build_workspace_rollback_sink: {} retains regular content after rollback — \
+                         leaving its .meta.yaml (a byte-exact restore of a pre-existing committed \
+                         sidecar needs the pre-turn blob; deferred to the Wave-19 daemon wiring; NO \
+                         data loss)",
+                        dir.display()
+                    ),
                 );
                 continue;
             }
             match std::fs::remove_file(&meta) {
                 Ok(()) => affected.push(meta),
-                Err(e) => eprintln!(
-                    "build_workspace_rollback_sink: remove sidecar {} → {e:?} (swallowed)",
-                    meta.display()
+                Err(e) => self.log.err(
+                    log_keys::ROLLBACK_SIDECAR_REMOVE_FAILED,
+                    format!(
+                        "build_workspace_rollback_sink: remove sidecar {} → {e:?} (swallowed)",
+                        meta.display()
+                    ),
                 ),
             }
         }
@@ -269,9 +305,12 @@ impl WorkspaceRollbackSink for WorkspaceRollbackSinkImpl {
         );
         match self.queue.submit(req).await {
             Ok(Ok(_oid)) => {}
-            other => eprintln!(
-                "build_workspace_rollback_sink: compensating commit for {bare} → {other:?} \
-                 (swallowed — best-effort)"
+            other => self.log.err(
+                log_keys::ROLLBACK_COMPENSATING_COMMIT_FAILED,
+                format!(
+                    "build_workspace_rollback_sink: compensating commit for {bare} → {other:?} \
+                     (swallowed — best-effort)"
+                ),
             ),
         }
     }

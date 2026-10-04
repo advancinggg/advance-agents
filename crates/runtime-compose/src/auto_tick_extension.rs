@@ -37,6 +37,8 @@ use advance_scheduler::{ComponentEvent, SchedulerExtension, SchedulerTick};
 use advance_scheduler_auto_loop::DefaultAutoLoopDriver;
 use async_trait::async_trait;
 
+use crate::api::log_keys;
+use crate::compose_log::LogHandle;
 use crate::crash_coordinator::{AutoTickCoordinator, TerminalSettle};
 
 /// A registered auto session: the agent id + its RunManager-minted `RunId`
@@ -63,6 +65,8 @@ pub struct AutoTickExtension {
     /// Pending operator cancels (agent_id, reason) drained per tick. Enqueued by
     /// the harvest's operator-cancel path via [`Self::request_cancel`].
     pending_cancels: Mutex<Vec<(String, String)>>,
+    /// Where the tick's failures are reported ([`Self::with_log`]; none by default).
+    log: LogHandle,
 }
 
 impl AutoTickExtension {
@@ -75,7 +79,14 @@ impl AutoTickExtension {
             coordinator,
             sessions: Mutex::new(Vec::new()),
             pending_cancels: Mutex::new(Vec::new()),
+            log: LogHandle::null(),
         }
+    }
+
+    /// Report cancel / settle failures and a full pending-cancel queue to `log`.
+    pub fn with_log(mut self, log: LogHandle) -> Self {
+        self.log = log;
+        self
     }
 
     /// Register an active auto session so the next tick settles it on a recorded
@@ -139,9 +150,12 @@ impl AutoTickExtension {
         if q.len() >= MAX_PENDING_CANCELS {
             let dropped = q.len() - MAX_PENDING_CANCELS + 1;
             q.drain(0..dropped);
-            eprintln!(
-                "advance: auto-tick pending-cancel queue at cap ({MAX_PENDING_CANCELS}); \
-                 dropped {dropped} oldest request(s)"
+            self.log.err(
+                log_keys::AUTO_TICK_PENDING_CANCEL_CAP,
+                format!(
+                    "advance: auto-tick pending-cancel queue at cap ({MAX_PENDING_CANCELS}); \
+                     dropped {dropped} oldest request(s)"
+                ),
             );
         }
         q.push((agent_id.into(), reason.into()));
@@ -189,8 +203,11 @@ impl AutoTickExtension {
         for (agent_id, reason) in cancels {
             match self.coordinator.cancel(&agent_id, &reason) {
                 Ok(()) => self.deregister_agent(&agent_id),
-                Err(e) => eprintln!(
-                    "advance: auto-tick cancel failed for {agent_id:?}: {e} (session left registered)"
+                Err(e) => self.log.err(
+                    log_keys::AUTO_TICK_CANCEL_FAILED,
+                    format!(
+                        "advance: auto-tick cancel failed for {agent_id:?}: {e} (session left registered)"
+                    ),
                 ),
             }
         }
@@ -215,9 +232,12 @@ impl AutoTickExtension {
                 Ok(TerminalSettle::Continued) => {}
                 // Fail-CLOSED loud: never silently swallow, never half-settle.
                 // Leave registered for a later retry / operator action.
-                Err(e) => eprintln!(
-                    "advance: auto-tick settle failed for {agent_id:?} (run {run_id:?}): {e} \
-                     (session left registered)"
+                Err(e) => self.log.err(
+                    log_keys::AUTO_TICK_SETTLE_FAILED,
+                    format!(
+                        "advance: auto-tick settle failed for {agent_id:?} (run {run_id:?}): {e} \
+                         (session left registered)"
+                    ),
                 ),
             }
         }

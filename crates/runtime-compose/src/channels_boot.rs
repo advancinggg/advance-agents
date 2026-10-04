@@ -50,6 +50,8 @@ use cap_http::{
 use cap_secrets::{InMemorySecretStorage, SecretStore};
 use zeroize::Zeroizing;
 
+use crate::api::log_keys;
+use crate::compose_log::LogHandle;
 use crate::execution_turn_ingress::ExecutionTurnIngress;
 
 /// Build the three HTTP-security-chain components with their `security.*` tunables
@@ -486,10 +488,20 @@ async fn handle_hook(
 }
 
 /// Bind the shared `/hooks/{route}` listener on `addr`. Returns the serve task
-/// handle (aborted on shutdown).
+/// handle (aborted on shutdown). Emits nothing; the composition uses
+/// `spawn_hooks_listener_with`.
 pub async fn spawn_hooks_listener(
     supervisor: Arc<TransportSupervisor>,
     addr: SocketAddr,
+) -> Result<tokio::task::JoinHandle<()>, String> {
+    spawn_hooks_listener_with(supervisor, addr, LogHandle::null()).await
+}
+
+/// [`spawn_hooks_listener`] reporting the bound address and a serve error to `log`.
+pub(crate) async fn spawn_hooks_listener_with(
+    supervisor: Arc<TransportSupervisor>,
+    addr: SocketAddr,
+    log: LogHandle,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     let app = Router::new()
         .route("/hooks/{route}", post(handle_hook))
@@ -501,10 +513,16 @@ pub async fn spawn_hooks_listener(
     let bound = listener
         .local_addr()
         .map_err(|e| format!("failed to read /hooks listener addr: {e}"))?;
-    println!("advance: channel /hooks listener on http://{bound}/hooks/{{route}}");
+    log.out(
+        log_keys::HOOKS_LISTENER,
+        format!("advance: channel /hooks listener on http://{bound}/hooks/{{route}}"),
+    );
     Ok(tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
-            eprintln!("advance: /hooks listener stopped: {e}");
+            log.err(
+                log_keys::HOOKS_LISTENER_STOPPED,
+                format!("advance: /hooks listener stopped: {e}"),
+            );
         }
     }))
 }
@@ -513,13 +531,33 @@ pub async fn spawn_hooks_listener(
 /// build a `Message` (with `MessageOrigin.channel_metadata` populated per the
 /// ADR keystone), and deliver it into the shared `MailboxStore` to wake the
 /// serving loop. A simple poll loop (no enqueue-notify primitive exists for
-/// `poll_host_pump`); 50 ms idle backoff.
+/// `poll_host_pump`); 50 ms idle backoff. Emits nothing; the composition uses
+/// `spawn_host_pump_with_log`.
 pub fn spawn_host_pump(
     manager: Arc<SubscriptionManager>,
     identity: Arc<IdentityResolver>,
     subs: Vec<ChannelSub>,
     store: Arc<MailboxStore>,
     msg_agent_id: String,
+) -> tokio::task::JoinHandle<()> {
+    spawn_host_pump_with_log(
+        manager,
+        identity,
+        subs,
+        store,
+        msg_agent_id,
+        LogHandle::null(),
+    )
+}
+
+/// [`spawn_host_pump`] reporting rejected and dropped events to `log`.
+pub(crate) fn spawn_host_pump_with_log(
+    manager: Arc<SubscriptionManager>,
+    identity: Arc<IdentityResolver>,
+    subs: Vec<ChannelSub>,
+    store: Arc<MailboxStore>,
+    msg_agent_id: String,
+    log: LogHandle,
 ) -> tokio::task::JoinHandle<()> {
     let publish: Arc<dyn Fn(Message) -> Result<(), MsgError> + Send + Sync> =
         Arc::new(move |message: Message| {
@@ -528,7 +566,7 @@ pub fn spawn_host_pump(
                 .get_or_create(&target)
                 .and_then(|mailbox| mailbox.deliver(message))
         });
-    spawn_host_pump_inner(manager, identity, subs, publish, msg_agent_id)
+    spawn_host_pump_inner(manager, identity, subs, publish, msg_agent_id, log)
 }
 
 /// Joint C215/C216 production pump. Unlike the legacy additive helper above,
@@ -540,10 +578,11 @@ pub(crate) fn spawn_protected_host_pump(
     subs: Vec<ChannelSub>,
     ingress: Arc<ExecutionTurnIngress>,
     msg_agent_id: String,
+    log: LogHandle,
 ) -> tokio::task::JoinHandle<()> {
     let publish: Arc<dyn Fn(Message) -> Result<(), MsgError> + Send + Sync> =
         Arc::new(move |message| ingress.publish(message));
-    spawn_host_pump_inner(manager, identity, subs, publish, msg_agent_id)
+    spawn_host_pump_inner(manager, identity, subs, publish, msg_agent_id, log)
 }
 
 fn spawn_host_pump_inner(
@@ -552,6 +591,7 @@ fn spawn_host_pump_inner(
     subs: Vec<ChannelSub>,
     publish: Arc<dyn Fn(Message) -> Result<(), MsgError> + Send + Sync>,
     msg_agent_id: String,
+    log: LogHandle,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let counter = AtomicU64::new(0);
@@ -569,8 +609,9 @@ fn spawn_host_pump_inner(
                 while let Ok(Some(raw)) = manager.poll_host_pump(&s.sub_id) {
                     let n = counter.fetch_add(1, Ordering::Relaxed);
                     let Some(msg) = build_inbound_message(&identity, raw, &msg_agent_id, n) else {
-                        eprintln!(
-                            "advance: channel pump rejected inbound event with invalid adapter identity"
+                        log.err(
+                            log_keys::PUMP_INVALID_IDENTITY,
+                            "advance: channel pump rejected inbound event with invalid adapter identity",
                         );
                         backpressured = true;
                         break 'pass;
@@ -580,10 +621,13 @@ fn spawn_host_pump_inner(
                         Err(e) => {
                             // The event was already popped → an at-most-once
                             // drop (logged, not silent).
-                            eprintln!(
-                                "advance: channel pump dropped an inbound event for {:?} \
-                                 (mailbox publish failed: {:?}) — backpressure, pausing all drains",
-                                msg_agent_id, e
+                            log.err(
+                                log_keys::PUMP_DROPPED,
+                                format!(
+                                    "advance: channel pump dropped an inbound event for {:?} \
+                                     (mailbox publish failed: {:?}) — backpressure, pausing all drains",
+                                    msg_agent_id, e
+                                ),
                             );
                             backpressured = true;
                             break 'pass;

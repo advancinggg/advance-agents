@@ -43,6 +43,9 @@ use cap_lifecycle::{
     RunCascade, TerminateController, WorkspaceCleanup,
 };
 
+use crate::api::log_keys;
+use crate::compose_log::LogHandle;
+
 /// Build the production crash-cascade sink.
 ///
 /// `tree` is the SAME `AgentTreeStore` the spawn/await wiring records nodes into
@@ -50,11 +53,22 @@ use cap_lifecycle::{
 /// over an interior `Arc`, so the clone shares state). `mailbox_store` is the shared
 /// Step-7 `MailboxStore` the served loops read. `key_resolver` maps a bare
 /// tree-parent id to the served mailbox key the parent polls (e.g. the symmetric
-/// `|b| format!("agent:{b}")` for spawned children).
+/// `|b| format!("agent:{b}")` for spawned children). A swallowed cascade failure
+/// is not reported; the composition uses [`build_crash_cascade_sink_with_log`].
 pub fn build_crash_cascade_sink(
     tree: AgentTreeStore,
     mailbox_store: Arc<MailboxStore>,
     key_resolver: impl Fn(&str) -> String + Send + Sync + 'static,
+) -> Arc<dyn CrashCascadeSink> {
+    build_crash_cascade_sink_with_log(tree, mailbox_store, key_resolver, LogHandle::null())
+}
+
+/// [`build_crash_cascade_sink`] reporting a swallowed cascade failure to `log`.
+pub fn build_crash_cascade_sink_with_log(
+    tree: AgentTreeStore,
+    mailbox_store: Arc<MailboxStore>,
+    key_resolver: impl Fn(&str) -> String + Send + Sync + 'static,
+    log: LogHandle,
 ) -> Arc<dyn CrashCascadeSink> {
     let mailbox: Arc<dyn MailboxCascade> = Arc::new(CliCrashMailboxCascade {
         store: mailbox_store,
@@ -71,6 +85,7 @@ pub fn build_crash_cascade_sink(
     Arc::new(CrashCascadeSinkImpl {
         controller,
         tree: keys_tree,
+        log,
     })
 }
 
@@ -82,6 +97,7 @@ struct CrashCascadeSinkImpl {
     controller: DefaultTerminateController,
     /// The same tree, for the served-key (`agent:<handle>`) → tree-id resolution.
     tree: AgentTreeStore,
+    log: LogHandle,
 }
 
 impl CrashCascadeSink for CrashCascadeSinkImpl {
@@ -89,9 +105,12 @@ impl CrashCascadeSink for CrashCascadeSinkImpl {
         let bare = crate::agent_config::tree_id_for(&self.tree, agent_id);
         let bare = bare.as_str();
         if let Err(e) = self.controller.handle_crash(bare, reason) {
-            eprintln!(
-                "build_crash_cascade_sink: handle_crash({bare}) → {e:?} (swallowed — \
-                 crash cascade is best-effort, must not panic the serve loop)"
+            self.log.err(
+                log_keys::CRASH_CASCADE_FAILED,
+                format!(
+                    "build_crash_cascade_sink: handle_crash({bare}) → {e:?} (swallowed — \
+                     crash cascade is best-effort, must not panic the serve loop)"
+                ),
             );
         }
     }

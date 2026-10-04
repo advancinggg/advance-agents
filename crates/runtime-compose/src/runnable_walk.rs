@@ -54,7 +54,9 @@ use advance_scheduler::trigger_bus::TriggerBusDispatchImpl;
 use advance_scheduler::types::ComponentId;
 use advance_shared_types::component::ComponentType;
 
+use crate::api::log_keys;
 use crate::breaker_gate::DefaultComponentTypeBreakerGate;
+use crate::compose_log::LogHandle;
 use advance_runtime::circuit_breaker::CircuitBreakerBus;
 
 /// Failure modes of [`run_readiness_gated_walk`] BEFORE any per-row work is
@@ -172,6 +174,8 @@ pub async fn run_readiness_gated_walk_with_breaker_gate(
 /// this discovers rows committed after boot, materializes each canonical component id exactly once
 /// per daemon lifetime, and retains the drivers until shutdown.  Durable rows are rediscovered on
 /// restart, so a process crash between admission and the next poll cannot strand a submission.
+/// A failed registry read is not reported; the composition uses
+/// [`start_continuous_readiness_gated_walk_with_breaker_gate_with_log`].
 #[allow(clippy::too_many_arguments)]
 pub async fn start_continuous_readiness_gated_walk_with_breaker_gate(
     registry: Arc<ComponentRegistry>,
@@ -181,6 +185,32 @@ pub async fn start_continuous_readiness_gated_walk_with_breaker_gate(
     file_source: Arc<dyn FileWatchSource>,
     webhook_source: Arc<dyn WebhookSource>,
     breaker_bus: Arc<dyn CircuitBreakerBus>,
+) -> Result<ContinuousReadinessWalk, WalkError> {
+    start_continuous_readiness_gated_walk_with_breaker_gate_with_log(
+        registry,
+        probe,
+        factory,
+        dispatcher,
+        file_source,
+        webhook_source,
+        breaker_bus,
+        LogHandle::null(),
+    )
+    .await
+}
+
+/// [`start_continuous_readiness_gated_walk_with_breaker_gate`] reporting each failed
+/// registry read to `log`.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_continuous_readiness_gated_walk_with_breaker_gate_with_log(
+    registry: Arc<ComponentRegistry>,
+    probe: Arc<dyn RuntimeReadiness>,
+    factory: Arc<dyn RunnableHookFactory>,
+    dispatcher: Arc<TriggerBusDispatchImpl>,
+    file_source: Arc<dyn FileWatchSource>,
+    webhook_source: Arc<dyn WebhookSource>,
+    breaker_bus: Arc<dyn CircuitBreakerBus>,
+    log: LogHandle,
 ) -> Result<ContinuousReadinessWalk, WalkError> {
     Scheduler::new(Arc::clone(&dispatcher))
         .start_with_readiness(probe)
@@ -222,9 +252,12 @@ pub async fn start_continuous_readiness_gated_walk_with_breaker_gate(
                             Arc::clone(&materializer),
                             supervisor_cancel.clone(),
                         ),
-                        Err(error) => eprintln!(
-                            "advance: component registry reconciliation read failed: {}",
-                            error.to_string().escape_debug()
+                        Err(error) => log.err(
+                            log_keys::WALK_REGISTRY_READ_FAILED,
+                            format!(
+                                "advance: component registry reconciliation read failed: {}",
+                                error.to_string().escape_debug()
+                            ),
                         ),
                     }
                 }

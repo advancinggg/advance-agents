@@ -9,6 +9,13 @@
 
 #![forbid(unsafe_code)]
 
+// The composition API (its output sink and keys), re-exported at the crate root.
+pub mod api;
+pub use api::*;
+
+// The handle every composition module emits its lines through.
+pub mod compose_log;
+
 pub mod agent_config;
 // Lane agent-llm-policy (2026-09-16) — the production `AgentLlmPolicySource`: resolves an
 // agent's `.agent/config.yaml` `llm:` block (provider pin / default model / constraint) for the

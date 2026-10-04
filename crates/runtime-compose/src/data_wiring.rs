@@ -28,6 +28,9 @@ use cap_fs::{
 };
 use cap_tools::{DeterministicCtx, LazyToolRegistry, ToolError, ToolRegistry};
 
+use crate::api::log_keys;
+use crate::compose_log::LogHandle;
+
 /// Bound on the files [`seed_entity_index`] projects at boot.
 pub const MAX_SEED_FILES: usize = 10_000;
 
@@ -381,21 +384,36 @@ impl cap_fs::RecordObserver for StoreRecordObserver {
     }
 }
 
-/// Register the `data` host tool. Call BEFORE the tool-inventory snapshot.
+/// Register the `data` host tool. Call BEFORE the tool-inventory snapshot. An
+/// operation bound to a missing tool is not reported; the composition uses
+/// [`register_data_tool_with_log`].
 pub async fn register_data_tool(
     registry: &LazyToolRegistry,
     store: Arc<DataStore>,
     grant: Arc<dyn GrantCheck>,
+) -> Result<(), ToolError> {
+    register_data_tool_with_log(registry, store, grant, &LogHandle::null()).await
+}
+
+/// [`register_data_tool`] reporting each operation bound to a missing tool to `log`.
+pub async fn register_data_tool_with_log(
+    registry: &LazyToolRegistry,
+    store: Arc<DataStore>,
+    grant: Arc<dyn GrantCheck>,
+    log: &LogHandle,
 ) -> Result<(), ToolError> {
     // A declared operation whose bound skill tool is not registered is reported once at boot
     // (WARN, never blocks); `describe` shows it as unavailable and `apply` answers
     // `op_unavailable` until the pack's tool is present.
     for aspect in store.describe("boot").await.aspects {
         for op in aspect.operations.iter().filter(|o| !o.available) {
-            eprintln!(
-                "advance: WARN data operation {}.{} is bound to tool {} ({}), which is not \
-                 registered — install the pack that provides it",
-                aspect.name, op.name, op.tool, op.method
+            log.err(
+                log_keys::DATA_OP_TOOL_MISSING,
+                format!(
+                    "advance: WARN data operation {}.{} is bound to tool {} ({}), which is not \
+                     registered — install the pack that provides it",
+                    aspect.name, op.name, op.tool, op.method
+                ),
             );
         }
     }

@@ -63,6 +63,9 @@ use cap_http::{DefaultActionValidator, DEFAULT_MAX_DUPLICATE_PAYLOADS};
 use cap_llm::LlmGateway;
 use cap_memory::PostProcessor;
 
+use crate::api::log_keys;
+use crate::compose_log::LogHandle;
+
 /// Production WASM-bridge `MessageHandler`. One handler drives one guest
 /// component; `init` instantiates a fresh per-turn instance (and runs the guest's
 /// `init` export), `handle_message` drives `handle-message` on that instance.
@@ -176,6 +179,8 @@ pub struct WasmMessageHandler {
     /// reacquire/reuse the Store even if task abort prevented async destruction.
     store_poisoned: AtomicBool,
     active_turn: StdMutex<Option<String>>,
+    /// Where a failed `complete_round` is reported ([`Self::with_log`]; none by default).
+    log: LogHandle,
 }
 
 impl WasmMessageHandler {
@@ -201,6 +206,7 @@ impl WasmMessageHandler {
             store_epoch: AtomicU64::new(0),
             store_poisoned: AtomicBool::new(false),
             active_turn: StdMutex::new(None),
+            log: LogHandle::null(),
         }
     }
 
@@ -210,6 +216,12 @@ impl WasmMessageHandler {
     /// `run_id == None` behaviour. Only `start.rs` chains this.
     pub fn with_run_session(mut self, run_session: RunSession) -> Self {
         self.run_session = Some(run_session);
+        self
+    }
+
+    /// Report a failed per-turn `complete_round` to `log`.
+    pub fn with_log(mut self, log: LogHandle) -> Self {
+        self.log = log;
         self
     }
 }
@@ -424,9 +436,12 @@ impl MessageHandler for WasmMessageHandler {
                     )
                     .await
                 {
-                    eprintln!(
-                        "advance: complete_round failed for run {}: {e:?}",
-                        rid.as_ref()
+                    self.log.err(
+                        log_keys::COMPLETE_ROUND_FAILED,
+                        format!(
+                            "advance: complete_round failed for run {}: {e:?}",
+                            rid.as_ref()
+                        ),
                     );
                 }
             }
