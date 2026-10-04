@@ -34,6 +34,115 @@ use crate::reply::ReplyRegistry;
 const HISTORY_LIMIT: usize = 100;
 const REDACTED: &str = "[REDACTED]";
 
+/// One adapter's worker thread and its job queue. The adapter submits through it; an
+/// owner shutting the composition down closes the queue (the thread then finishes the job
+/// in hand and exits) and joins the thread once it has finished, never blocking on it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "name and thread are read by the composition's ordered teardown"
+    )
+)]
+pub(crate) struct AdapterWorker<J> {
+    name: &'static str,
+    jobs: Mutex<Option<mpsc::Sender<J>>>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl<J: Send + 'static> AdapterWorker<J> {
+    /// Start the thread `name` running `body` over the job queue.
+    fn spawn(
+        name: &'static str,
+        body: impl FnOnce(mpsc::Receiver<J>) + Send + 'static,
+    ) -> std::io::Result<Arc<Self>> {
+        let (jobs, receiver) = mpsc::channel::<J>();
+        let thread = std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || body(receiver))?;
+        Ok(Arc::new(Self {
+            name,
+            jobs: Mutex::new(Some(jobs)),
+            thread: Mutex::new(Some(thread)),
+        }))
+    }
+
+    /// As [`Self::spawn`]; when no thread can be started, a worker that refuses every job
+    /// (each submit takes the adapter's existing send-failure answer).
+    fn spawn_or_closed(
+        name: &'static str,
+        body: impl FnOnce(mpsc::Receiver<J>) + Send + 'static,
+    ) -> Arc<Self> {
+        Self::spawn(name, body).unwrap_or_else(|_| {
+            Arc::new(Self {
+                name,
+                jobs: Mutex::new(None),
+                thread: Mutex::new(None),
+            })
+        })
+    }
+
+    /// Queue `job`; `Err(job)` once the queue is closed or the thread is gone.
+    fn submit(&self, job: J) -> Result<(), J> {
+        let sender = self.jobs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        match sender {
+            Some(sender) => sender.send(job).map_err(|mpsc::SendError(job)| job),
+            None => Err(job),
+        }
+    }
+}
+
+/// Shutdown control over an [`AdapterWorker`], independent of its job type.
+pub(crate) trait WorkerControl: Send + Sync {
+    /// The thread name.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the composition's ordered teardown")
+    )]
+    fn name(&self) -> &'static str;
+    /// Close the job queue: the thread finishes the job in hand and exits.
+    fn close(&self);
+    /// Join the thread iff it has finished (never blocks); `true` when it is joined now
+    /// or was never started / already joined.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the composition's ordered teardown")
+    )]
+    fn try_join(&self) -> bool;
+}
+
+impl<J: Send + 'static> WorkerControl for AdapterWorker<J> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn close(&self) {
+        drop(self.jobs.lock().unwrap_or_else(|e| e.into_inner()).take());
+    }
+
+    fn try_join(&self) -> bool {
+        let mut thread = self.thread.lock().unwrap_or_else(|e| e.into_inner());
+        match thread.as_ref() {
+            None => true,
+            Some(handle) if handle.is_finished() => {
+                if let Some(handle) = thread.take() {
+                    let _ = handle.join();
+                }
+                true
+            }
+            Some(_) => false,
+        }
+    }
+}
+
+/// Registers `worker` with an owner's tracked list.
+fn track<J: Send + 'static>(
+    worker: &Arc<AdapterWorker<J>>,
+    workers: &mut Vec<Arc<dyn WorkerControl>>,
+) {
+    workers.push(Arc::clone(worker) as Arc<dyn WorkerControl>);
+}
+
 enum EventReadRequest {
     Latest {
         reply: mpsc::Sender<Result<Option<String>, ProviderError>>,
@@ -55,16 +164,24 @@ enum EventReadRequest {
 /// This powers the public WebSocket dashboard; it never receives the raw
 /// execution event because EventBus stores/broadcasts only the projected copy.
 pub struct Contract185EventAdapter {
-    requests: mpsc::Sender<EventReadRequest>,
+    worker: Arc<AdapterWorker<EventReadRequest>>,
     retention_days: u32,
 }
 
 impl Contract185EventAdapter {
     pub fn new(read: Arc<dyn ObservabilityReadApi>, retention_days: u32) -> Result<Self, String> {
-        let (requests, receiver) = mpsc::channel::<EventReadRequest>();
-        std::thread::Builder::new()
-            .name("advance-client-events".to_owned())
-            .spawn(move || {
+        Self::new_tracked(read, retention_days, &mut Vec::new())
+    }
+
+    /// As [`Self::new`], also registering the worker thread with `workers`.
+    pub(crate) fn new_tracked(
+        read: Arc<dyn ObservabilityReadApi>,
+        retention_days: u32,
+        workers: &mut Vec<Arc<dyn WorkerControl>>,
+    ) -> Result<Self, String> {
+        let worker = AdapterWorker::spawn(
+            "advance-client-events",
+            move |receiver: mpsc::Receiver<EventReadRequest>| {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -117,12 +234,22 @@ impl Contract185EventAdapter {
                         }
                     }
                 }
-            })
-            .map_err(|error| format!("spawn client event bridge: {error}"))?;
+            },
+        )
+        .map_err(|error| format!("spawn client event bridge: {error}"))?;
+        track(&worker, workers);
         Ok(Self {
-            requests,
+            worker,
             retention_days,
         })
+    }
+}
+
+impl Drop for Contract185EventAdapter {
+    /// Only closes the queue (the thread then exits on its own): a last-`Arc` drop on a
+    /// runtime worker never blocks on a join.
+    fn drop(&mut self) {
+        self.worker.close();
     }
 }
 
@@ -133,8 +260,8 @@ impl ClientEventProvider for Contract185EventAdapter {
 
     fn latest_raw_event_id(&self) -> Result<Option<String>, ProviderError> {
         let (reply, response) = mpsc::channel();
-        self.requests
-            .send(EventReadRequest::Latest { reply })
+        self.worker
+            .submit(EventReadRequest::Latest { reply })
             .map_err(|_| ProviderError::Unavailable("event worker stopped".to_owned()))?;
         response
             .recv()
@@ -147,8 +274,8 @@ impl ClientEventProvider for Contract185EventAdapter {
         limit: usize,
     ) -> Result<Vec<RawEventRow>, ProviderError> {
         let (reply, response) = mpsc::channel();
-        self.requests
-            .send(EventReadRequest::Query {
+        self.worker
+            .submit(EventReadRequest::Query {
                 filter: normalized_filter(filter),
                 limit,
                 reply,
@@ -166,8 +293,8 @@ impl ClientEventProvider for Contract185EventAdapter {
         idle_ms: u64,
     ) -> Result<Vec<RawEventRow>, ProviderError> {
         let (reply, response) = mpsc::channel();
-        self.requests
-            .send(EventReadRequest::Drain {
+        self.worker
+            .submit(EventReadRequest::Drain {
                 after: after_raw_id.map(str::to_owned),
                 limit: scan_ceiling,
                 idle: std::time::Duration::from_millis(idle_ms),
@@ -218,7 +345,7 @@ struct HistoryQuery {
 /// Synchronous CONTRACT-190 adapter over CONTRACT-185's async read port. A
 /// dedicated runtime thread avoids nested-runtime blocking in Axum handlers.
 pub struct Contract219HistoryAdapter {
-    queries: mpsc::Sender<HistoryQuery>,
+    worker: Arc<AdapterWorker<HistoryQuery>>,
     projector: Arc<Contract219EventProjector>,
     carriers: Arc<ObservationCarrierStore>,
 }
@@ -229,10 +356,19 @@ impl Contract219HistoryAdapter {
         projector: Arc<Contract219EventProjector>,
         carriers: Arc<ObservationCarrierStore>,
     ) -> Result<Self, String> {
-        let (queries, receiver) = mpsc::channel::<HistoryQuery>();
-        std::thread::Builder::new()
-            .name("advance-client-history".to_owned())
-            .spawn(move || {
+        Self::new_tracked(read, projector, carriers, &mut Vec::new())
+    }
+
+    /// As [`Self::new`], also registering the worker thread with `workers`.
+    pub(crate) fn new_tracked(
+        read: Arc<dyn ObservabilityReadApi>,
+        projector: Arc<Contract219EventProjector>,
+        carriers: Arc<ObservationCarrierStore>,
+        workers: &mut Vec<Arc<dyn WorkerControl>>,
+    ) -> Result<Self, String> {
+        let worker = AdapterWorker::spawn(
+            "advance-client-history",
+            move |receiver: mpsc::Receiver<HistoryQuery>| {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -246,10 +382,12 @@ impl Contract219HistoryAdapter {
                         .map_err(|error| ProviderError::Unavailable(error.to_string()));
                     let _ = query.reply.send(result);
                 }
-            })
-            .map_err(|error| format!("spawn client history bridge: {error}"))?;
+            },
+        )
+        .map_err(|error| format!("spawn client history bridge: {error}"))?;
+        track(&worker, workers);
         Ok(Self {
-            queries,
+            worker,
             projector,
             carriers,
         })
@@ -262,8 +400,8 @@ impl Contract219HistoryAdapter {
         cursor: Option<&str>,
     ) -> Result<BoundHistoryPage, ProviderError> {
         let (reply, response) = mpsc::channel();
-        self.queries
-            .send(HistoryQuery {
+        self.worker
+            .submit(HistoryQuery {
                 filter: EventFilter {
                     run_id: run_id.map(str::to_owned),
                     ..EventFilter::default()
@@ -306,6 +444,13 @@ impl Contract219HistoryAdapter {
             return Err(ProviderError::NotFound("history cursor".to_owned()));
         }
         Ok(BoundHistoryPage::from_bound_documents(documents, None))
+    }
+}
+
+impl Drop for Contract219HistoryAdapter {
+    /// Only closes the queue (the thread then exits on its own): never blocks on a join.
+    fn drop(&mut self) {
+        self.worker.close();
     }
 }
 
@@ -839,16 +984,24 @@ enum RunControlJob {
 pub struct RunManagerRunControl {
     mgr: Arc<RunManager>,
     tree: Option<Arc<dyn AgentTreeSnapshot>>,
-    jobs: mpsc::Sender<RunControlJob>,
+    jobs: Arc<AdapterWorker<RunControlJob>>,
 }
 
 impl RunManagerRunControl {
     pub fn new(mgr: Arc<RunManager>, tree: Option<Arc<dyn AgentTreeSnapshot>>) -> Self {
-        let (jobs, receiver) = mpsc::channel();
+        Self::new_tracked(mgr, tree, &mut Vec::new())
+    }
+
+    /// As [`Self::new`], also registering the worker thread with `workers`.
+    pub(crate) fn new_tracked(
+        mgr: Arc<RunManager>,
+        tree: Option<Arc<dyn AgentTreeSnapshot>>,
+        workers: &mut Vec<Arc<dyn WorkerControl>>,
+    ) -> Self {
         let worker = Arc::clone(&mgr);
-        let _ = std::thread::Builder::new()
-            .name("advance-client-run-control".to_owned())
-            .spawn(move || {
+        let jobs = AdapterWorker::spawn_or_closed(
+            "advance-client-run-control",
+            move |receiver: mpsc::Receiver<RunControlJob>| {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -869,7 +1022,9 @@ impl RunManagerRunControl {
                         }
                     }
                 }
-            });
+            },
+        );
+        track(&jobs, workers);
         Self { mgr, tree, jobs }
     }
 
@@ -879,7 +1034,7 @@ impl RunManagerRunControl {
     ) -> Result<(), ProviderError> {
         let (reply, response) = mpsc::channel();
         self.jobs
-            .send(job(reply))
+            .submit(job(reply))
             .map_err(|_| ProviderError::Unavailable("run".to_owned()))?;
         response
             .recv()
@@ -910,6 +1065,13 @@ impl RunManagerRunControl {
                 ProviderError::Unavailable("run".to_owned())
             }
         }
+    }
+}
+
+impl Drop for RunManagerRunControl {
+    /// Only closes the queue (the thread then exits on its own): never blocks on a join.
+    fn drop(&mut self) {
+        self.jobs.close();
     }
 }
 
@@ -1036,6 +1198,99 @@ mod tests {
             "skill_id: echo-skill\nversion: 3\nprovenance: Imported\ntrust_level: Trusted\n"
         )
         .is_some());
+    }
+
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < until,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn module_001_ac30_adapter_worker_close_drains_then_try_join_reports_the_exit() {
+        let sum = Arc::new(AtomicU64::new(0));
+        let seen = Arc::clone(&sum);
+        let worker = AdapterWorker::<u64>::spawn("t111-adapter", move |rx| {
+            while let Ok(n) = rx.recv() {
+                seen.fetch_add(n, Ordering::SeqCst);
+            }
+        })
+        .expect("spawn");
+        assert_eq!(worker.name(), "t111-adapter");
+        for n in [1, 2, 3] {
+            assert!(worker.submit(n).is_ok());
+        }
+        assert!(!worker.try_join(), "the thread is still waiting for jobs");
+        worker.close();
+        wait_for("the worker thread to exit", || worker.try_join());
+        assert_eq!(
+            sum.load(Ordering::SeqCst),
+            6,
+            "queued jobs ran before the exit"
+        );
+        assert!(matches!(worker.submit(4), Err(4)), "closed: refused");
+        assert!(worker.try_join(), "joined stays joined");
+    }
+
+    #[test]
+    fn module_001_ac30_adapter_worker_try_join_never_blocks_on_a_busy_thread() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let worker = AdapterWorker::<()>::spawn("t111-busy", move |rx| {
+            while rx.recv().is_ok() {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            }
+        })
+        .expect("spawn");
+        assert!(worker.submit(()).is_ok());
+        entered_rx.recv().expect("job in hand");
+        worker.close();
+        let begun = std::time::Instant::now();
+        assert!(!worker.try_join(), "busy: not joined");
+        assert!(
+            begun.elapsed() < std::time::Duration::from_millis(50),
+            "try_join returned at once"
+        );
+        release_tx.send(()).unwrap();
+        wait_for("the busy thread to exit", || worker.try_join());
+    }
+
+    #[test]
+    fn module_001_ac30_spawn_or_closed_refuses_without_a_thread() {
+        let worker = AdapterWorker::<u8> {
+            name: "t111-none",
+            jobs: Mutex::new(None),
+            thread: Mutex::new(None),
+        };
+        assert!(matches!(worker.submit(7), Err(7)));
+        assert!(worker.try_join(), "no thread: nothing to wait for");
+    }
+
+    struct NoopBus;
+    impl advance_shared_types::traits::EventBusEmit for NoopBus {
+        fn emit(&self, _event: advance_shared_types::event::Event) {}
+    }
+
+    #[test]
+    fn module_001_ac30_run_control_adapter_drop_closes_its_tracked_worker() {
+        let mgr = RunManager::new_arc(Arc::new(NoopBus));
+        let mut workers: Vec<Arc<dyn WorkerControl>> = Vec::new();
+        let adapter = RunManagerRunControl::new_tracked(mgr, None, &mut workers);
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].name(), "advance-client-run-control");
+        assert!(!workers[0].try_join(), "the thread waits for jobs");
+        // The last adapter reference drops while the tracked list still holds the worker:
+        // the drop closes the queue and returns without joining.
+        let begun = std::time::Instant::now();
+        drop(adapter);
+        assert!(begun.elapsed() < std::time::Duration::from_millis(50));
+        wait_for("the run-control thread to exit", || workers[0].try_join());
     }
 
     #[test]

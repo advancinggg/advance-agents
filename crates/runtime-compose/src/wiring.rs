@@ -778,6 +778,10 @@ pub struct WiringHandles {
     /// Installed packs → the running runtime (schema extensions, presets, skill tools);
     /// re-applied on every install / uninstall. See [`crate::pack_runtime`].
     pub pack_runtime: Arc<crate::pack_runtime::PackRuntime>,
+    /// The Client API adapters' worker threads (events, history, run control), so an
+    /// owner shutting down can close their queues and join them without blocking.
+    #[expect(dead_code, reason = "read by the composition's ordered teardown")]
+    pub(crate) adapter_workers: Vec<Arc<dyn crate::client_api_adapters::WorkerControl>>,
 }
 
 #[cfg(feature = "test-support")]
@@ -2946,6 +2950,7 @@ async fn wire_capabilities_inner(
         })
     };
     let provider_admin_for_api = provider_admin.clone();
+    let mut adapter_workers: Vec<Arc<dyn crate::client_api_adapters::WorkerControl>> = Vec::new();
     let client_api_server = match observability_read_api.as_ref() {
         Some(read) => {
             let history_events = match (
@@ -2953,14 +2958,19 @@ async fn wire_capabilities_inner(
                 observation_carrier_store.as_ref(),
             ) {
                 (Some(projector), Some(carriers)) => {
-                    let history = crate::client_api_adapters::Contract219HistoryAdapter::new(
+                    use crate::client_api_adapters::{
+                        Contract185EventAdapter, Contract219HistoryAdapter,
+                    };
+                    let history = Contract219HistoryAdapter::new_tracked(
                         Arc::clone(read),
                         Arc::clone(projector),
                         Arc::clone(carriers),
+                        &mut adapter_workers,
                     );
-                    let events = crate::client_api_adapters::Contract185EventAdapter::new(
+                    let events = Contract185EventAdapter::new_tracked(
                         Arc::clone(read),
                         client_event_retention_days,
+                        &mut adapter_workers,
                     );
                     match (history, events) {
                         (Ok(h), Ok(e)) => Some((h, e, Arc::clone(projector))),
@@ -3010,15 +3020,25 @@ async fn wire_capabilities_inner(
                 });
             let tree_for_api = agent_tree_snapshot.clone();
             let root_colon_for_api = root_colon.clone();
-            match advance_client_api::ClientApiServer::bind_local_factory(0, move |address| {
+            // The factory runs inside the bind and moves its captures, so the run-control
+            // worker it starts is registered through a shared list read after the bind.
+            let run_control_workers: Arc<
+                std::sync::Mutex<Vec<Arc<dyn crate::client_api_adapters::WorkerControl>>>,
+            > = Arc::default();
+            let run_control_workers_for_api = Arc::clone(&run_control_workers);
+            let factory = move |address: std::net::SocketAddr| {
                 let mut config = advance_client_api::ClientApiConfig::default();
                 config.allowed_origins = vec![format!("http://{address}")];
                 let mut api = advance_client_api::ClientApi::new(config);
+                let mut workers = run_control_workers_for_api
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let mut parts = crate::client_api_adapters::FirstPartyClientCompose {
                     run: Some(Arc::new(
-                        crate::client_api_adapters::RunManagerRunControl::new(
+                        crate::client_api_adapters::RunManagerRunControl::new_tracked(
                             run_mgr_for_api.clone(),
                             tree_for_api.clone(),
+                            &mut workers,
                         ),
                     )),
                     mailbox: Some(ingress_for_api.clone()),
@@ -3067,11 +3087,17 @@ async fn wire_capabilities_inner(
                             as Arc<dyn advance_client_api::BoundGrantApprovalPort>
                     });
                 }
+                drop(workers);
                 api = crate::client_api_adapters::compose_first_party_client(api, parts);
                 Arc::new(api)
-            })
-            .await
-            {
+            };
+            let bound = advance_client_api::ClientApiServer::bind_local_factory(0, factory).await;
+            adapter_workers.append(
+                &mut run_control_workers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+            match bound {
                 Ok(server) => {
                     eprintln!(
                         "advance: Client API and Web Console listening at http://{}",
@@ -3148,6 +3174,7 @@ async fn wire_capabilities_inner(
             web_grant: web_grant_handle,
             pack: pack_wiring,
             pack_runtime,
+            adapter_workers,
         },
     ))
 }
