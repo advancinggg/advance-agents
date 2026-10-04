@@ -80,7 +80,7 @@ async fn sd_12_unknown_server_blocked() {
     );
     let client = McpClient::new(cfg, Arc::new(NoOpDetector), None);
     let err = client
-        .invoke_tool("gamma", "x", b"{}")
+        .invoke_tool(None, "gamma", "x", b"{}")
         .await
         .expect_err("not in whitelist");
     assert_eq!(err.kind, McpErrorKind::NotFound);
@@ -104,7 +104,7 @@ async fn sd_14_tool_pattern_blocks_invoke() {
     );
     let client = McpClient::new(cfg, Arc::new(NoOpDetector), None);
     let err = client
-        .invoke_tool("alpha", "delete-all", b"{}")
+        .invoke_tool(None, "alpha", "delete-all", b"{}")
         .await
         .expect_err("blocked by tool-patterns");
     assert_eq!(err.kind, McpErrorKind::ToolNotFound);

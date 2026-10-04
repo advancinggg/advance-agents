@@ -794,7 +794,7 @@ async fn the_client_initializes_a_stdio_server_before_its_first_call() {
             McpClientLimits::default(),
         );
         let out = client
-            .invoke_tool("srv", "echo", br#"{"x":1}"#)
+            .invoke_tool(None, "srv", "echo", br#"{"x":1}"#)
             .await
             .expect("initialized, then called");
         assert!(json_of(&out)["pid"].is_u64());
@@ -817,7 +817,7 @@ while read -r more; do echo "$more" >> '@DIR@/after'; done
         McpClientLimits::default(),
     );
     let err = client
-        .invoke_tool("srv", "echo", b"{}")
+        .invoke_tool(None, "srv", "echo", b"{}")
         .await
         .expect_err("unsupported protocol version");
     assert_eq!(err.kind, McpErrorKind::InvalidResponse);
@@ -853,7 +853,7 @@ sleep 30
     );
     let started = Instant::now();
     let err = client
-        .invoke_tool("srv", "echo", b"{}")
+        .invoke_tool(None, "srv", "echo", b"{}")
         .await
         .expect_err("initialize never answered");
     assert_eq!(err.kind, McpErrorKind::TransportError);
@@ -877,7 +877,7 @@ async fn concurrent_first_calls_start_one_server() {
     let calls: Vec<_> = (0..8)
         .map(|_| {
             let client = Arc::clone(&client);
-            tokio::spawn(async move { client.invoke_tool("srv", "echo", b"{}").await })
+            tokio::spawn(async move { client.invoke_tool(None, "srv", "echo", b"{}").await })
         })
         .collect();
     for call in calls {
@@ -910,13 +910,13 @@ if [ ! -e '@DIR@/crashed' ]; then read -r call; : > '@DIR@/crashed'; exit 1; fi
     let starts = dir.path().join("starts");
 
     let died = client
-        .invoke_tool("srv", "echo", b"{}")
+        .invoke_tool(None, "srv", "echo", b"{}")
         .await
         .expect_err("the server dies during the call");
     assert_eq!(died.kind, McpErrorKind::TransportError);
 
     let waiting = client
-        .invoke_tool("srv", "echo", b"{}")
+        .invoke_tool(None, "srv", "echo", b"{}")
         .await
         .expect_err("inside the backoff window");
     assert_eq!(waiting.kind, McpErrorKind::TransportError);
@@ -933,7 +933,7 @@ if [ ! -e '@DIR@/crashed' ]; then read -r call; : > '@DIR@/crashed'; exit 1; fi
 
     tokio::time::sleep(Duration::from_millis(700)).await;
     let out = client
-        .invoke_tool("srv", "echo", b"{}")
+        .invoke_tool(None, "srv", "echo", b"{}")
         .await
         .expect("a new server after the backoff");
     assert_eq!(lines(&starts).len(), 2);
@@ -965,14 +965,14 @@ async fn a_server_that_died_while_idle_is_reconnected_once_its_backoff_has_passe
     );
     let starts = dir.path().join("starts");
     client
-        .invoke_tool("srv", "echo", b"{}")
+        .invoke_tool(None, "srv", "echo", b"{}")
         .await
         .expect("the first server answers, then exits");
 
     // The server died young, so a wait follows its death; let it pass.
     tokio::time::sleep(Duration::from_millis(900)).await;
     let out = client
-        .invoke_tool("srv", "echo", b"{}")
+        .invoke_tool(None, "srv", "echo", b"{}")
         .await
         .expect("reconnected at once: the wait counted from the death is over");
     assert_eq!(lines(&starts).len(), 2);
@@ -999,7 +999,7 @@ sleep 1
     let starts = dir.path().join("starts");
     let first = {
         let client = Arc::clone(&client);
-        tokio::spawn(async move { client.invoke_tool("srv", "echo", b"{}").await })
+        tokio::spawn(async move { client.invoke_tool(None, "srv", "echo", b"{}").await })
     };
     assert!(wait_until(|| lines(&starts).len() == 1, Duration::from_secs(5)).await);
 
@@ -1018,7 +1018,7 @@ sleep 1
     );
 
     let out = client
-        .invoke_tool("srv", "echo", b"{}")
+        .invoke_tool(None, "srv", "echo", b"{}")
         .await
         .expect("a fresh connection");
     assert_eq!(lines(&starts).len(), 2);
@@ -1051,7 +1051,7 @@ fn stdio_transports_outlive_the_runtime_of_the_call_that_started_them() {
                 .enable_all()
                 .build()
                 .expect("call runtime");
-            call_runtime.block_on(client.invoke_tool("srv", "echo", b"{}"))
+            call_runtime.block_on(client.invoke_tool(None, "srv", "echo", b"{}"))
         })
         .join()
         .expect("call thread")
@@ -1059,7 +1059,7 @@ fn stdio_transports_outlive_the_runtime_of_the_call_that_started_them() {
     };
     // The call runtime has shut down; the server must still be reachable.
     let second = daemon
-        .block_on(client.invoke_tool("srv", "echo", b"{}"))
+        .block_on(client.invoke_tool(None, "srv", "echo", b"{}"))
         .expect("second call");
     assert_eq!(json_of(&first)["pid"], json_of(&second)["pid"]);
     assert_eq!(lines(&dir.path().join("starts")).len(), 1);
@@ -1082,7 +1082,7 @@ fn a_client_given_no_runtime_starts_no_stdio_server() {
         )
     });
     let err = call_runtime
-        .block_on(client.invoke_tool("srv", "echo", b"{}"))
+        .block_on(client.invoke_tool(None, "srv", "echo", b"{}"))
         .expect_err("no runtime for stdio servers");
     assert_eq!(err.kind, McpErrorKind::TransportError);
     assert!(err.message.contains("with_runtime"), "msg={}", err.message);

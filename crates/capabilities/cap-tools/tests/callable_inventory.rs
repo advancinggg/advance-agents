@@ -74,6 +74,7 @@ fn mcp_snapshot() -> Vec<McpToolEntry> {
         name: MCP_TOOL.into(),
         description: "Search the web".into(),
         server_id: "srv-1".into(),
+        input_schema: None,
     }])
 }
 
@@ -122,7 +123,8 @@ fn module_017_t32_two_methods_distinct_types_never_combined() {
 }
 
 /// T32 sub-(4): `params_schema` is the empty object for both halves (V1-b
-/// mapping); the Tier-2 line renders `- name() — desc` (no args).
+/// mapping; the MCP tool here was listed without an input schema); the Tier-2
+/// line renders `- name() — desc` (no args).
 #[test]
 fn module_017_t32_params_schema_is_empty_object() {
     let reader = production_reader();

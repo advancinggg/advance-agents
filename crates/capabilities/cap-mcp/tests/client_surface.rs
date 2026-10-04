@@ -1,4 +1,6 @@
-//! Slice D AC-15 — full 7-method client surface coverage (SD-30..SD-36).
+//! Slice D AC-15 — full 7-method client surface coverage (SD-30..SD-36), plus
+//! tool listings (pages, entry limits, the tool cache) and the caller each
+//! request is made for.
 //!
 //! Uses `CountingMockTransport` as the per-server backend so the test asserts
 //! the McpClient's dispatch path (method names, JSON-RPC param shapes,
@@ -8,11 +10,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use advance_runtime::host_registry::{HostCallContext, HostRegistry, InMemoryHostRegistry};
 use advance_shared_types::security_validator::{LeakDetector, ScanContext, ScanResult};
 use cap_mcp::{
-    McpClient, McpClientLimits, McpErrorKind, McpServerEntry, McpServersConfig, McpTransport,
-    McpTransportSpec, ToolPattern,
+    register_mcp_client, McpClient, McpClientLimits, McpErrorKind, McpServerEntry,
+    McpServersConfig, McpTransport, McpTransportSpec, ToolPattern, MAX_CACHED_TOOLS,
+    MAX_TOOLS_PER_SERVER, MAX_TOOL_DESCRIPTION_BYTES, MAX_TOOL_LIST_CURSOR_BYTES,
+    MAX_TOOL_LIST_PAGES, MAX_TOOL_NAME_BYTES, MAX_TOOL_SCHEMA_BYTES,
 };
+use serde_json::{json, Value};
+use wasmtime::component::Val;
 
 mod support;
 use support::mock_transport::CountingMockTransport;
@@ -85,7 +92,7 @@ async fn sd_31_list_tools_parses_array() {
         ]
     }));
     let client = build_client_with_mock("srv", mock.clone(), None);
-    let tools = client.list_tools("srv").await.expect("ok");
+    let tools = client.list_tools(None, "srv").await.expect("ok");
     let names: Vec<_> = tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(names, vec!["a", "b"]);
     assert_eq!(tools[0].server_id, "srv");
@@ -106,7 +113,7 @@ async fn sd_13_list_tools_filters_by_pattern() {
         ]
     }));
     let client = build_client_with_mock("srv", mock, Some(vec!["search.*"]));
-    let tools = client.list_tools("srv").await.expect("ok");
+    let tools = client.list_tools(None, "srv").await.expect("ok");
     let names: Vec<_> = tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(names, vec!["search.web", "search.code"]);
 }
@@ -119,7 +126,7 @@ async fn sd_32_invoke_tool_payload_shape() {
     let client = build_client_with_mock("srv", mock.clone(), None);
     let params = serde_json::to_vec(&serde_json::json!({"q": "weather"})).unwrap();
     let bytes = client
-        .invoke_tool("srv", "search", &params)
+        .invoke_tool(None, "srv", "search", &params)
         .await
         .expect("ok");
     let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -144,7 +151,7 @@ async fn sd_33_list_prompts() {
         ]
     }));
     let client = build_client_with_mock("srv", mock.clone(), None);
-    let prompts = client.list_prompts("srv").await.expect("ok");
+    let prompts = client.list_prompts(None, "srv").await.expect("ok");
     assert_eq!(prompts.len(), 1);
     assert_eq!(prompts[0].name, "greet");
     assert_eq!(prompts[0].server_id, "srv");
@@ -159,6 +166,7 @@ async fn sd_34_get_prompt() {
     let client = build_client_with_mock("srv", mock.clone(), None);
     let bytes = client
         .get_prompt(
+            None,
             "srv",
             "greet",
             vec![("name".to_string(), "alice".to_string())],
@@ -186,7 +194,7 @@ async fn sd_35_list_resources() {
         ]
     }));
     let client = build_client_with_mock("srv", mock.clone(), None);
-    let res = client.list_resources("srv").await.expect("ok");
+    let res = client.list_resources(None, "srv").await.expect("ok");
     assert_eq!(res.len(), 1);
     assert_eq!(res[0].uri, "file:///x.txt");
     assert_eq!(mock.captured()[0].0, "resources/list");
@@ -199,7 +207,7 @@ async fn sd_36_read_resource() {
     mock.push_ok(serde_json::json!({"contents": "the answer is 42"}));
     let client = build_client_with_mock("srv", mock.clone(), None);
     let bytes = client
-        .read_resource("srv", "file:///x.txt")
+        .read_resource(None, "srv", "file:///x.txt")
         .await
         .expect("ok");
     let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -220,7 +228,7 @@ async fn a_result_over_the_cap_fails_the_call() {
         ..McpClientLimits::default()
     });
     let err = client
-        .invoke_tool("srv", "search", b"{}")
+        .invoke_tool(None, "srv", "search", b"{}")
         .await
         .expect_err("the result is over the cap");
     assert_eq!(err.kind, McpErrorKind::TransportError);
@@ -230,7 +238,316 @@ async fn a_result_over_the_cap_fails_the_call() {
         err.message
     );
     client
-        .invoke_tool("srv", "search", b"{}")
+        .invoke_tool(None, "srv", "search", b"{}")
         .await
         .expect("a small result passes");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Tool listings
+// ─────────────────────────────────────────────────────────────────────────
+
+fn names(tools: &[cap_mcp::McpToolInfo]) -> Vec<String> {
+    tools.iter().map(|t| t.name.clone()).collect()
+}
+
+// A listing follows `nextCursor`, sending each cursor back, and reads at most
+// MAX_TOOL_LIST_PAGES pages.
+#[tokio::test]
+async fn a_listing_follows_next_cursor_up_to_the_page_cap() {
+    let mock = Arc::new(CountingMockTransport::new("srv"));
+    for page in 0..=MAX_TOOL_LIST_PAGES {
+        mock.push_ok(json!({
+            "tools": [{"name": format!("t{page}")}],
+            "nextCursor": format!("c{}", page + 1),
+        }));
+    }
+    let client = build_client_with_mock("srv", mock.clone(), None);
+    let tools = client.list_tools(None, "srv").await.expect("listed");
+    assert_eq!(tools.len(), MAX_TOOL_LIST_PAGES);
+    let captured = mock.captured();
+    assert_eq!(captured.len(), MAX_TOOL_LIST_PAGES);
+    assert_eq!(captured[0], ("tools/list".to_string(), json!({})));
+    for (page, call) in captured.iter().enumerate().skip(1) {
+        assert_eq!(
+            call,
+            &(
+                "tools/list".to_string(),
+                json!({"cursor": format!("c{page}")})
+            )
+        );
+    }
+}
+
+// A listing ends at a page whose cursor is missing, not a string, empty,
+// too long or the same as the one that asked for the page.
+#[tokio::test]
+async fn a_listing_ends_at_a_page_without_a_usable_cursor() {
+    let too_long = "x".repeat(MAX_TOOL_LIST_CURSOR_BYTES + 1);
+    for last in [
+        json!(null),
+        json!(42),
+        json!(""),
+        json!(too_long),
+        json!("c1"),
+    ] {
+        let mock = Arc::new(CountingMockTransport::new("srv"));
+        mock.push_ok(json!({"tools": [{"name": "a"}], "nextCursor": "c1"}));
+        mock.push_ok(json!({"tools": [{"name": "b"}], "nextCursor": last}));
+        mock.push_ok(json!({"tools": [{"name": "c"}]}));
+        let client = build_client_with_mock("srv", mock.clone(), None);
+        let tools = client.list_tools(None, "srv").await.expect("listed");
+        assert_eq!(names(&tools), ["a", "b"], "{last}");
+        assert_eq!(mock.call_count(), 2, "{last}");
+    }
+    let mock = Arc::new(CountingMockTransport::new("srv"));
+    let longest = "x".repeat(MAX_TOOL_LIST_CURSOR_BYTES);
+    mock.push_ok(json!({"tools": [{"name": "a"}], "nextCursor": longest}));
+    mock.push_ok(json!({"tools": [{"name": "b"}]}));
+    let client = build_client_with_mock("srv", mock.clone(), None);
+    let tools = client.list_tools(None, "srv").await.expect("listed");
+    assert_eq!(names(&tools), ["a", "b"]);
+}
+
+// A listed tool keeps its inputSchema when it is an object within the size
+// limit whose references stay inside it; otherwise the tool is listed
+// without one.
+#[tokio::test]
+async fn listed_tools_keep_an_input_schema_within_the_limits() {
+    let small = json!({"type": "object", "properties": {"q": {"type": "string"}}});
+    let external = json!({
+        "type": "object",
+        "properties": {"q": {"$ref": "https://schemas.example.com/q.json"}},
+    });
+    let big = json!({"type": "object", "description": "x".repeat(MAX_TOOL_SCHEMA_BYTES)});
+    let mock = Arc::new(CountingMockTransport::new("srv"));
+    mock.push_ok(json!({"tools": [
+        {"name": "small", "inputSchema": small},
+        {"name": "external", "inputSchema": external},
+        {"name": "big", "inputSchema": big},
+        {"name": "not-an-object", "inputSchema": "string"},
+        {"name": "none"},
+    ]}));
+    let client = build_client_with_mock("srv", mock, None);
+    let tools = client.list_tools(None, "srv").await.expect("listed");
+    assert_eq!(
+        names(&tools),
+        ["small", "external", "big", "not-an-object", "none"]
+    );
+    assert_eq!(tools[0].input_schema, Some(small));
+    for tool in &tools[1..] {
+        assert_eq!(tool.input_schema, None, "{}", tool.name);
+    }
+}
+
+// A listed name must fit a literal tool pattern and be a name a call can
+// carry, and is listed once; a long description is cut.
+#[tokio::test]
+async fn listed_names_and_descriptions_meet_the_entry_limits() {
+    let longest = "n".repeat(MAX_TOOL_NAME_BYTES);
+    let too_long = "n".repeat(MAX_TOOL_NAME_BYTES + 1);
+    let mock = Arc::new(CountingMockTransport::new("srv"));
+    mock.push_ok(json!({"tools": [
+        {"name": longest, "description": "d".repeat(MAX_TOOL_DESCRIPTION_BYTES + 100)},
+        {"name": too_long},
+        {"name": "has,comma"},
+        {"name": " padded"},
+        {"name": "ok", "description": "first"},
+        {"name": "ok", "description": "again"},
+    ]}));
+    let client = build_client_with_mock("srv", mock, None);
+    let tools = client.list_tools(None, "srv").await.expect("listed");
+    assert_eq!(names(&tools), [longest, "ok".to_string()]);
+    assert!(tools[0].description.len() <= MAX_TOOL_DESCRIPTION_BYTES);
+    assert!(tools[0].description.ends_with('…'));
+    assert_eq!(tools[1].description, "first");
+}
+
+// A listing keeps at most MAX_TOOLS_PER_SERVER tools and reads no page past
+// them.
+#[tokio::test]
+async fn a_listing_keeps_at_most_max_tools_per_server() {
+    let page: Vec<Value> = (0..MAX_TOOLS_PER_SERVER + 10)
+        .map(|i| json!({"name": format!("t{i}")}))
+        .collect();
+    let mock = Arc::new(CountingMockTransport::new("srv"));
+    mock.push_ok(json!({"tools": page, "nextCursor": "more"}));
+    mock.push_ok(json!({"tools": [{"name": "late"}]}));
+    let client = build_client_with_mock("srv", mock.clone(), None);
+    let tools = client.list_tools(None, "srv").await.expect("listed");
+    assert_eq!(tools.len(), MAX_TOOLS_PER_SERVER);
+    assert_eq!(mock.call_count(), 1);
+}
+
+fn full_page(count: usize) -> Value {
+    let tools: Vec<Value> = (0..count)
+        .map(|i| json!({"name": format!("t{i}")}))
+        .collect();
+    json!({ "tools": tools })
+}
+
+// The cache keeps each server's latest listing, within MAX_CACHED_TOOLS tools
+// across servers: a listing that does not fit is cached in part while its
+// caller gets all of it; a new listing frees the room of the one it replaces;
+// a failed listing changes nothing.
+#[tokio::test]
+async fn the_tool_cache_keeps_each_servers_latest_listing_within_the_total_cap() {
+    let fitting = MAX_CACHED_TOOLS / MAX_TOOLS_PER_SERVER;
+    let ids: Vec<String> = (0..=fitting).map(|i| format!("srv{i}")).collect();
+    let mocks: Vec<Arc<CountingMockTransport>> = ids
+        .iter()
+        .map(|id| Arc::new(CountingMockTransport::new(id.as_str())))
+        .collect();
+    let mut builder = McpServersConfig::builder();
+    let mut injected: HashMap<String, Arc<dyn McpTransport>> = HashMap::new();
+    for (id, mock) in ids.iter().zip(&mocks) {
+        builder = builder.add_server(entry_with_patterns(id, None)).unwrap();
+        injected.insert(id.clone(), mock.clone());
+    }
+    let client =
+        McpClient::new_with_transports(Arc::new(builder.build()), Arc::new(NoOpDetector), injected);
+    let cached_of = |client: &McpClient, id: &str| {
+        client
+            .cached_tools()
+            .iter()
+            .filter(|t| t.server_id == id)
+            .count()
+    };
+    assert!(client.cached_tools().is_empty());
+
+    for (id, mock) in ids.iter().zip(&mocks) {
+        mock.push_ok(full_page(MAX_TOOLS_PER_SERVER));
+        let tools = client.list_tools(None, id).await.expect("listed");
+        assert_eq!(tools.len(), MAX_TOOLS_PER_SERVER, "the caller gets it all");
+    }
+    let cached = client.cached_tools();
+    assert_eq!(cached.len(), MAX_CACHED_TOOLS);
+    let in_order: Vec<&str> = cached.iter().map(|t| t.server_id.as_str()).collect();
+    let mut sorted = in_order.clone();
+    sorted.sort();
+    assert_eq!(in_order, sorted, "server-id order");
+    let last = &ids[fitting];
+    assert_eq!(
+        cached_of(&client, last),
+        MAX_CACHED_TOOLS - fitting * MAX_TOOLS_PER_SERVER
+    );
+
+    // A shorter listing of the first server frees room for the last one.
+    mocks[0].push_ok(full_page(10));
+    client.list_tools(None, &ids[0]).await.expect("listed");
+    assert_eq!(cached_of(&client, &ids[0]), 10);
+    mocks[fitting].push_ok(full_page(MAX_TOOLS_PER_SERVER));
+    client.list_tools(None, last).await.expect("listed");
+    assert_eq!(client.cached_tools().len(), MAX_CACHED_TOOLS);
+    assert_eq!(
+        cached_of(&client, last),
+        MAX_CACHED_TOOLS - 10 - (fitting - 1) * MAX_TOOLS_PER_SERVER
+    );
+
+    // A failed listing (nothing scripted) leaves the cache as it was.
+    let before = client.cached_tools();
+    assert!(client.list_tools(None, &ids[1]).await.is_err());
+    assert_eq!(client.cached_tools(), before);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Callers
+// ─────────────────────────────────────────────────────────────────────────
+
+/// An answer every list method can read.
+fn any_listing() -> Value {
+    json!({"tools": [], "prompts": [], "resources": []})
+}
+
+// Every request reaches the transport with the caller it was made for.
+#[tokio::test]
+async fn requests_reach_the_transport_with_their_caller() {
+    let mock = Arc::new(CountingMockTransport::new("srv"));
+    for _ in 0..6 {
+        mock.push_ok(any_listing());
+    }
+    let client = build_client_with_mock("srv", mock.clone(), None);
+    client.list_tools(Some("agent-a"), "srv").await.unwrap();
+    client.list_prompts(Some("agent-b"), "srv").await.unwrap();
+    client
+        .get_prompt(Some("agent-c"), "srv", "p", vec![])
+        .await
+        .unwrap();
+    client.list_resources(None, "srv").await.unwrap();
+    client
+        .read_resource(Some("agent-d"), "srv", "file:///x")
+        .await
+        .unwrap();
+    client
+        .invoke_tool(Some("agent-e"), "srv", "t", b"{}")
+        .await
+        .unwrap();
+    let expected: Vec<Option<String>> = [
+        Some("agent-a"),
+        Some("agent-b"),
+        Some("agent-c"),
+        None,
+        Some("agent-d"),
+        Some("agent-e"),
+    ]
+    .iter()
+    .map(|c| c.map(str::to_string))
+    .collect();
+    assert_eq!(mock.callers(), expected);
+}
+
+// The mcp-client host functions make their requests for the calling agent.
+#[tokio::test]
+async fn the_host_functions_call_for_the_calling_agent() {
+    let mock = Arc::new(CountingMockTransport::new("srv"));
+    for _ in 0..6 {
+        mock.push_ok(any_listing());
+    }
+    let client = Arc::new(build_client_with_mock("srv", mock.clone(), None));
+    let registry = InMemoryHostRegistry::new();
+    register_mcp_client(&registry, client);
+    let specs: Vec<_> = ["mcp.servers", "mcp.tool-patterns"]
+        .into_iter()
+        .flat_map(|capability| registry.lookup(capability))
+        .collect();
+    let server = || Val::String("srv".into());
+    let calls: Vec<(&str, Vec<Val>)> = vec![
+        ("list-mcp-tools", vec![server()]),
+        ("list-mcp-prompts", vec![server()]),
+        (
+            "get-mcp-prompt",
+            vec![server(), Val::String("p".into()), Val::List(vec![])],
+        ),
+        ("list-mcp-resources", vec![server()]),
+        (
+            "read-mcp-resource",
+            vec![server(), Val::String("file:///x".into())],
+        ),
+        (
+            "invoke-mcp-tool",
+            vec![server(), Val::String("t".into()), Val::List(vec![])],
+        ),
+    ];
+    for (name, params) in calls {
+        let spec = specs
+            .iter()
+            .find(|spec| spec.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        let ctx = HostCallContext {
+            agent_id: "agent-x".into(),
+            trace_id: "trace".into(),
+            turn_id: None,
+            capability: spec.capability.clone(),
+            function: format!("{}::{name}", spec.namespace),
+            run_id: None,
+            iteration: None,
+        };
+        let out = spec.handler.call(ctx, params, 1).await.expect("handled");
+        assert!(
+            matches!(&out[0], Val::Result(Ok(_))),
+            "{name}: {:?}",
+            out[0]
+        );
+    }
+    assert_eq!(mock.callers(), vec![Some("agent-x".to_string()); 6]);
 }

@@ -22,6 +22,13 @@
 //! tool_name) is L1-V2 / future-slice scope mirroring MODULE-013 AC-21 §3.3
 //! T37.
 //!
+//! ## Caller
+//!
+//! Each handler that reaches a server makes its request for the calling agent
+//! (`HostCallContext::agent_id`): an http server's traffic is attributed to
+//! that agent in the security chain (rate limits, `http.*` events), not to the
+//! server.
+//!
 //! ## Idempotent flag
 //!
 //! Read-shaped methods (`list-*`, `get-*`, `read-*`) carry `idempotent: true`
@@ -426,12 +433,15 @@ impl HostFunctionHandler for ListMcpToolsHandler {
             }
             let server_id = decode_string(&params[0])?.to_string();
             let allow_web = web_family_allowed(web_grant.as_deref(), &agent_id, "list-mcp-tools");
-            let r = client.list_tools(&server_id).await.map(|infos| {
-                infos
-                    .into_iter()
-                    .filter(|info| !is_web_tool_id(&info.name) || allow_web)
-                    .collect::<Vec<_>>()
-            });
+            let r = client
+                .list_tools(Some(&agent_id), &server_id)
+                .await
+                .map(|infos| {
+                    infos
+                        .into_iter()
+                        .filter(|info| !is_web_tool_id(&info.name) || allow_web)
+                        .collect::<Vec<_>>()
+                });
             Ok(vec![encode_result_tool_list(r)])
         })
     }
@@ -443,11 +453,12 @@ pub struct ListMcpPromptsHandler {
 impl HostFunctionHandler for ListMcpPromptsHandler {
     fn call(
         &self,
-        _ctx: HostCallContext,
+        ctx: HostCallContext,
         params: Vec<Val>,
         _results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
         let client = Arc::clone(&self.client);
+        let agent_id = ctx.agent_id;
         Box::pin(async move {
             if params.len() < 1 {
                 return Err(HostCallError::HandlerError(
@@ -455,7 +466,7 @@ impl HostFunctionHandler for ListMcpPromptsHandler {
                 ));
             }
             let server_id = decode_string(&params[0])?.to_string();
-            let r = client.list_prompts(&server_id).await;
+            let r = client.list_prompts(Some(&agent_id), &server_id).await;
             Ok(vec![encode_result_prompt_list(r)])
         })
     }
@@ -467,11 +478,12 @@ pub struct GetMcpPromptHandler {
 impl HostFunctionHandler for GetMcpPromptHandler {
     fn call(
         &self,
-        _ctx: HostCallContext,
+        ctx: HostCallContext,
         params: Vec<Val>,
         _results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
         let client = Arc::clone(&self.client);
+        let agent_id = ctx.agent_id;
         Box::pin(async move {
             if params.len() < 3 {
                 return Err(HostCallError::HandlerError(
@@ -481,7 +493,9 @@ impl HostFunctionHandler for GetMcpPromptHandler {
             let server_id = decode_string(&params[0])?.to_string();
             let prompt_name = decode_string(&params[1])?.to_string();
             let args = decode_cap_param_list(&params[2])?;
-            let r = client.get_prompt(&server_id, &prompt_name, args).await;
+            let r = client
+                .get_prompt(Some(&agent_id), &server_id, &prompt_name, args)
+                .await;
             Ok(vec![encode_result_bytes(r)])
         })
     }
@@ -493,11 +507,12 @@ pub struct ListMcpResourcesHandler {
 impl HostFunctionHandler for ListMcpResourcesHandler {
     fn call(
         &self,
-        _ctx: HostCallContext,
+        ctx: HostCallContext,
         params: Vec<Val>,
         _results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
         let client = Arc::clone(&self.client);
+        let agent_id = ctx.agent_id;
         Box::pin(async move {
             if params.len() < 1 {
                 return Err(HostCallError::HandlerError(
@@ -505,7 +520,7 @@ impl HostFunctionHandler for ListMcpResourcesHandler {
                 ));
             }
             let server_id = decode_string(&params[0])?.to_string();
-            let r = client.list_resources(&server_id).await;
+            let r = client.list_resources(Some(&agent_id), &server_id).await;
             Ok(vec![encode_result_resource_list(r)])
         })
     }
@@ -517,11 +532,12 @@ pub struct ReadMcpResourceHandler {
 impl HostFunctionHandler for ReadMcpResourceHandler {
     fn call(
         &self,
-        _ctx: HostCallContext,
+        ctx: HostCallContext,
         params: Vec<Val>,
         _results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
         let client = Arc::clone(&self.client);
+        let agent_id = ctx.agent_id;
         Box::pin(async move {
             if params.len() < 2 {
                 return Err(HostCallError::HandlerError(
@@ -530,7 +546,9 @@ impl HostFunctionHandler for ReadMcpResourceHandler {
             }
             let server_id = decode_string(&params[0])?.to_string();
             let uri = decode_string(&params[1])?.to_string();
-            let r = client.read_resource(&server_id, &uri).await;
+            let r = client
+                .read_resource(Some(&agent_id), &server_id, &uri)
+                .await;
             Ok(vec![encode_result_bytes(r)])
         })
     }
@@ -570,7 +588,7 @@ impl HostFunctionHandler for InvokeMcpToolHandler {
                 }
             }
             let r = client
-                .invoke_tool(&server_id, &tool_name, &params_bytes)
+                .invoke_tool(Some(&agent_id), &server_id, &tool_name, &params_bytes)
                 .await;
             Ok(vec![encode_result_bytes(r)])
         })

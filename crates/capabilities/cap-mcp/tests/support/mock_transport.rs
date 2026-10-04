@@ -1,8 +1,8 @@
 //! `CountingMockTransport` — a test-only `McpTransport` that captures every
-//! invocation and returns scripted responses. Used by `tests/schema.rs` SD-20
-//! to assert "rejected before dispatch" (via `call_count() == 0`) and by
-//! `tests/client_surface.rs` to drive the 7-method surface without a real
-//! network or subprocess.
+//! invocation (and the caller it was made for) and returns scripted responses.
+//! Used by `tests/schema.rs` SD-20 to assert "rejected before dispatch" (via
+//! `call_count() == 0`) and by `tests/client_surface.rs` to drive the 7-method
+//! surface without a real network or subprocess.
 
 use std::sync::Mutex;
 
@@ -14,6 +14,7 @@ pub struct CountingMockTransport {
     pub server_id: String,
     scripted: Mutex<Vec<Result<Vec<u8>, McpError>>>,
     captured: Mutex<Vec<(String, serde_json::Value)>>,
+    callers: Mutex<Vec<Option<String>>>,
 }
 
 impl CountingMockTransport {
@@ -22,6 +23,7 @@ impl CountingMockTransport {
             server_id: server_id.into(),
             scripted: Mutex::new(Vec::new()),
             captured: Mutex::new(Vec::new()),
+            callers: Mutex::new(Vec::new()),
         }
     }
 
@@ -32,7 +34,7 @@ impl CountingMockTransport {
             .push(Ok(serde_json::to_vec(&body).unwrap()));
     }
 
-    // The three accessors below are shared test-support surface: each test binary
+    // The accessors below are shared test-support surface: each test binary
     // includes this module and consumes a different subset, so per-binary dead_code
     // would otherwise fire on whichever accessor that binary skips.
     #[allow(dead_code)]
@@ -49,15 +51,30 @@ impl CountingMockTransport {
     pub fn captured(&self) -> Vec<(String, serde_json::Value)> {
         self.captured.lock().unwrap().clone()
     }
+
+    /// The caller of each invocation, in order.
+    #[allow(dead_code)]
+    pub fn callers(&self) -> Vec<Option<String>> {
+        self.callers.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
 impl McpTransport for CountingMockTransport {
-    async fn invoke(&self, method: &str, params: serde_json::Value) -> Result<Vec<u8>, McpError> {
+    async fn invoke(
+        &self,
+        caller: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<Vec<u8>, McpError> {
         self.captured
             .lock()
             .unwrap()
             .push((method.to_string(), params));
+        self.callers
+            .lock()
+            .unwrap()
+            .push(caller.map(str::to_string));
         let mut q = self.scripted.lock().unwrap();
         if q.is_empty() {
             return Err(McpError::transport("mock transport: no scripted response"));

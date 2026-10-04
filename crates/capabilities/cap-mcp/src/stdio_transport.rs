@@ -571,9 +571,16 @@ impl Drop for PendingGuard<'_> {
     }
 }
 
+// A stdio server is a local process the host started: a call through it is
+// attributed to no one, so `caller` is not used.
 #[async_trait]
 impl McpTransport for StdioMcpTransport {
-    async fn invoke(&self, method: &str, params: Value) -> Result<Vec<u8>, McpError> {
+    async fn invoke(
+        &self,
+        _caller: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> Result<Vec<u8>, McpError> {
         StdioMcpTransport::invoke(self, method, params).await
     }
 
@@ -1000,14 +1007,14 @@ async fn stderr_task(inner: Arc<Inner>, stderr: ChildStderr) {
 
 /// Rate limit for one transport's host log lines: at most
 /// [`LOG_LINES_PER_WINDOW`] lines per [`LOG_WINDOW`].
-struct LogBudget {
+pub(crate) struct LogBudget {
     window_start: Instant,
     logged: u32,
     suppressed: u64,
 }
 
 impl LogBudget {
-    fn new(now: Instant) -> Self {
+    pub(crate) fn new(now: Instant) -> Self {
         Self {
             window_start: now,
             logged: 0,
@@ -1017,7 +1024,7 @@ impl LogBudget {
 
     /// Whether one more line may be logged at `now`, and, when a window that
     /// suppressed lines has just ended, how many it suppressed.
-    fn admit(&mut self, now: Instant) -> (bool, Option<u64>) {
+    pub(crate) fn admit(&mut self, now: Instant) -> (bool, Option<u64>) {
         let mut ended = None;
         if now.saturating_duration_since(self.window_start) >= LOG_WINDOW {
             ended = (self.suppressed > 0).then_some(self.suppressed);

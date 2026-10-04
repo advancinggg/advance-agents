@@ -17,7 +17,7 @@
 //! # or
 //! transport:
 //!   kind: http                      # https://… (any host) or http://<loopback>
-//!   endpoint-url: https://mcp.example.com/sse
+//!   endpoint-url: https://mcp.example.com/mcp   # the Streamable HTTP endpoint
 //! secret-refs:                      # stdio only: ENV_NAME → secret-store key
 //!   API_TOKEN: mcp-token
 //! ```
@@ -35,6 +35,11 @@
 //! - the file is read through `O_NOFOLLOW` + fstat, capped at
 //!   [`MAX_MCP_SERVER_YAML_BYTES`], alias-guarded and nesting-bounded like every
 //!   other pack-shipped YAML this crate parses.
+//!
+//! An `http` endpoint is the server's one Streamable HTTP endpoint. A server
+//! on the older HTTP+SSE transport (a GET stream such as `/sse` beside a
+//! separate message endpoint) parses here, but the MCP client refuses it when
+//! it connects.
 //!
 //! Trust (§3.2 rule 2) is NOT decided here — the manifest carries no trust; the
 //! bridge refuses `stdio` from a pack whose `.meta.yaml` trust is `untrusted`.

@@ -76,8 +76,10 @@ impl LeakDetector for NoOpDetector {
     }
 }
 
+/// An MCP server on the Streamable HTTP transport, reached through a mock
+/// security chain that records each message and the agent it was executed as.
 struct WebHttpMock {
-    captured: Mutex<Vec<serde_json::Value>>,
+    captured: Mutex<Vec<(String, serde_json::Value)>>,
 }
 
 impl WebHttpMock {
@@ -87,7 +89,12 @@ impl WebHttpMock {
         })
     }
     fn captured(&self) -> Vec<serde_json::Value> {
-        self.captured.lock().unwrap().clone()
+        self.captured
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, message)| message.clone())
+            .collect()
     }
     fn tools_call_names(&self) -> Vec<String> {
         self.captured()
@@ -96,21 +103,47 @@ impl WebHttpMock {
             .filter_map(|j| j["params"]["name"].as_str().map(str::to_string))
             .collect()
     }
+    /// The agents the requests for `method` were executed as.
+    fn agents_for(&self, method: &str) -> Vec<String> {
+        self.captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, message)| message["method"] == method)
+            .map(|(agent, _)| agent.clone())
+            .collect()
+    }
 }
 
 #[async_trait]
 impl HttpSecurityChain for WebHttpMock {
     async fn execute(
         &self,
-        _agent_id: &str,
+        agent_id: &str,
         req: HttpRequest,
         _cap: &HttpCapability,
     ) -> Result<HttpResponse, advance_shared_types::security_validator::HttpError> {
         let parsed: serde_json::Value = serde_json::from_slice(&req.body).expect("jsonrpc body");
-        self.captured.lock().unwrap().push(parsed.clone());
+        self.captured
+            .lock()
+            .unwrap()
+            .push((agent_id.to_string(), parsed.clone()));
+        // A notification (no id) is taken with 202 Accepted and no body.
+        if parsed.get("id").is_none() {
+            return Ok(HttpResponse {
+                status: 202,
+                headers: vec![],
+                body: vec![],
+            });
+        }
         let id = parsed["id"].clone();
         let method = parsed["method"].as_str().unwrap_or("");
         let result = match method {
+            "initialize" => serde_json::json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "web-http", "version": "1"}
+            }),
             "tools/list" => serde_json::json!({
                 "tools": [
                     {"name": WEB_SEARCH_TOOL_ID, "description": "search"},
@@ -497,6 +530,12 @@ async fn t48_grant_revoke_both_realizations() {
     assert!(calls.contains(&WEB_SEARCH_TOOL_ID.to_string()));
     assert!(calls.contains(&WEB_EXTRACT_TOOL_ID.to_string()));
     assert!(authz_web(&bus, "allowed", "invoke-mcp-tool"));
+    // The listing and the calls went out as the calling agent; the session
+    // handshake as the server.
+    assert_eq!(mock.agents_for("initialize"), [MCP_SERVER]);
+    assert_eq!(mock.agents_for("notifications/initialized"), [MCP_SERVER]);
+    assert_eq!(mock.agents_for("tools/list"), [AGENT]);
+    assert_eq!(mock.agents_for("tools/call"), [AGENT, AGENT]);
     let calls_after_allow = mock.tools_call_names().len();
 
     store.cascade_revoke(gid.as_str()).unwrap();

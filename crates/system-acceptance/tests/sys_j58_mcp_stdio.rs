@@ -71,7 +71,7 @@ async fn sys_ac_180_stdio_subprocess_json_rpc_round_trip() {
     let script = mcp_server(r#"printf '{"jsonrpc":"2.0","id":2,"result":{"echoed":true}}\n'"#);
     let client = stdio_client(&script);
     let out = client
-        .invoke_tool("srv", "echo", br#"{"x":1}"#)
+        .invoke_tool(None, "srv", "echo", br#"{"x":1}"#)
         .await
         .expect("stdio subprocess returns the tool result over line-framed JSON-RPC");
     let parsed: serde_json::Value = serde_json::from_slice(&out).expect("result json");
@@ -88,7 +88,7 @@ async fn sys_ac_181_stdio_inbound_credential_blocked_by_leak_detector() {
     );
     let client = stdio_client(&script);
     let err = client
-        .invoke_tool("srv", "echo", br#"{}"#)
+        .invoke_tool(None, "srv", "echo", br#"{}"#)
         .await
         .expect_err("inbound credential in the stdio response is blocked");
     assert_eq!(err.kind, McpErrorKind::InvalidResponse, "got {err:?}");
@@ -152,7 +152,7 @@ async fn sys_ac_255_oversize_stdio_line_aborted_with_transport_error() {
     let script = mcp_server(r#"head -c 5000000 /dev/zero | tr '\0' x; echo"#);
     let client = stdio_client(&script);
     let err = client
-        .invoke_tool("srv", "echo", br#"{}"#)
+        .invoke_tool(None, "srv", "echo", br#"{}"#)
         .await
         .expect_err("oversize stdio response line aborts with a transport error");
     assert_eq!(err.kind, McpErrorKind::TransportError, "got {err:?}");

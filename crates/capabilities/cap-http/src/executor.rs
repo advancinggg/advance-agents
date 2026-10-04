@@ -931,6 +931,20 @@ impl ReqwestHttpExecutor {
         Self::from_config_with_dns_source(ReqwestExecutorConfig::default(), Some(source))
     }
 
+    /// [`Self::from_config`] with the connect-time DNS timeout read live from
+    /// `source`, as [`Self::with_dns_timeout_source`] reads it. A chain whose
+    /// callers need a longer (or shorter) budget than [`DEFAULT_TIMEOUT`] builds
+    /// its executor here with `config.timeout`, keeping the live DNS timeout.
+    ///
+    /// # Panics
+    /// Panics only if the TLS backend fails to initialize (see [`Self::new`]).
+    pub fn from_config_with_dns_timeout_source(
+        config: ReqwestExecutorConfig,
+        source: crate::ssrf::DnsTunableSource,
+    ) -> Self {
+        Self::from_config_with_dns_source(config, Some(source))
+    }
+
     fn from_config_with_dns_source(
         config: ReqwestExecutorConfig,
         dns_timeout_source: Option<crate::ssrf::DnsTunableSource>,
@@ -1546,6 +1560,26 @@ mod ac17_tests {
             Duration::from_millis(2_000),
             "executor DNS timeout must reflect a hot-reloaded value"
         );
+    }
+
+    /// An executor built from a config together with a live DNS-timeout source
+    /// keeps the config's response timeout, redirect and size bounds.
+    #[test]
+    fn executor_from_config_with_a_live_dns_timeout_keeps_the_config_bounds() {
+        let exec = ReqwestHttpExecutor::from_config_with_dns_timeout_source(
+            ReqwestExecutorConfig {
+                timeout: Duration::from_secs(120),
+                max_redirects: 3,
+                max_response_bytes: 1024,
+                ..ReqwestExecutorConfig::default()
+            },
+            Arc::new(|| 5),
+        );
+        assert_eq!(exec.timeout, Duration::from_secs(120));
+        assert_eq!(exec.max_redirects, 3);
+        assert_eq!(exec.max_response_bytes, 1024);
+        let default = ReqwestHttpExecutor::with_dns_timeout_source(Arc::new(|| 5));
+        assert_eq!(default.timeout, DEFAULT_TIMEOUT);
     }
 
     /// MODULE-012-T29v — the connect-time resolver's synchronous live timeout

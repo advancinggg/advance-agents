@@ -14,12 +14,13 @@
 //! ## Connections
 //!
 //! Each server has a slot holding its live transport. The first call to a
-//! server connects it: a stdio server is spawned and initialized (`initialize`
-//! carrying [`MCP_PROTOCOL_VERSION`], a check that the server chose a version in
-//! [`SUPPORTED_PROTOCOL_VERSIONS`], then `notifications/initialized`) within
-//! [`McpClientLimits::startup_timeout`]; an http server's transport is built.
-//! Concurrent first calls share one connection attempt, and no std lock is held
-//! while it runs.
+//! server connects it within [`McpClientLimits::startup_timeout`]: a stdio
+//! server is spawned and initialized (`initialize` carrying
+//! [`MCP_PROTOCOL_VERSION`], a check that the server chose a version in
+//! [`SUPPORTED_PROTOCOL_VERSIONS`], then `notifications/initialized`); an http
+//! server's transport is built and goes through the same exchange, which also
+//! starts its session ([`HttpMcpTransport::initialize`]). Concurrent first calls
+//! share one connection attempt, and no std lock is held while it runs.
 //!
 //! A slot belongs to one generation. [`McpClient::disconnect`] retires it: a
 //! connection attempt that completes for a retired slot publishes nothing, and
@@ -39,6 +40,31 @@
 //! to [`McpClient::with_runtime`], and only that one: never the runtime current
 //! when the client was built, nor that of the call that connects them. A
 //! client given no runtime refuses to start stdio servers.
+//!
+//! ## Callers
+//!
+//! Each method that sends a request takes `caller`: the agent the request is
+//! made for, or `None` for one made on no agent's behalf (an operator's
+//! listing, the tool inventory). An http server's transport executes the
+//! request through the security chain as that agent, so rate limits and
+//! `http.*` events are the agent's; a request for no agent, and the
+//! handshake, are attributed to the server id.
+//!
+//! ## Tool listings
+//!
+//! [`McpClient::list_tools`] reads `tools/list` page by page, at most
+//! [`MAX_TOOL_LIST_PAGES`](crate::MAX_TOOL_LIST_PAGES) pages, and keeps a tool
+//! when it meets the entry limits: a name of at most
+//! [`MAX_TOOL_NAME_BYTES`](crate::MAX_TOOL_NAME_BYTES) that a call can carry,
+//! listed once; a description cut to
+//! [`MAX_TOOL_DESCRIPTION_BYTES`](crate::MAX_TOOL_DESCRIPTION_BYTES); an
+//! `inputSchema` kept when it is an object of at most
+//! [`MAX_TOOL_SCHEMA_BYTES`](crate::MAX_TOOL_SCHEMA_BYTES) whose references stay
+//! inside it. A listing keeps at most
+//! [`MAX_TOOLS_PER_SERVER`](crate::MAX_TOOLS_PER_SERVER) tools. Each server's
+//! latest listing is kept in a tool cache of at most
+//! [`MAX_CACHED_TOOLS`](crate::MAX_CACHED_TOOLS) tools across all servers,
+//! read without any I/O through [`McpClient::cached_tools`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -49,7 +75,8 @@ use async_trait::async_trait;
 use tokio::runtime::Handle;
 
 use crate::error::McpError;
-use crate::http_transport::HttpMcpTransport;
+use crate::http_transport::{HttpMcpTransport, HttpOptions};
+use crate::listing::{ToolCache, ToolListing, MAX_TOOL_LIST_PAGES};
 use crate::schema_validator::SchemaValidator;
 use crate::stdio_transport::{
     sanitize_log_text, StdioMcpTransport, StdioOptions, MAX_STDIO_LINE_BYTES, MAX_STDIO_WALL_CLOCK,
@@ -63,13 +90,26 @@ pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 /// newest first. A server that chooses any other version is disconnected.
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
+/// Default budget for connecting a server ([`McpClientLimits::startup_timeout`]).
+pub(crate) const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Trait shared by HTTP and stdio transports. `McpClient` dispatches through
 /// `Arc<dyn McpTransport>` so both transport classes can be cached behind the
 /// same per-server handle.
 #[async_trait]
 pub trait McpTransport: Send + Sync {
     /// Send a JSON-RPC request and return its `result` as JSON bytes.
-    async fn invoke(&self, method: &str, params: serde_json::Value) -> Result<Vec<u8>, McpError>;
+    ///
+    /// `caller` is the agent the request is made for, `None` when it is made on
+    /// no agent's behalf. A transport whose traffic passes the http security
+    /// chain attributes the request to that agent, and to the server id when
+    /// `None`; a stdio transport attributes it to no one.
+    async fn invoke(
+        &self,
+        caller: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<Vec<u8>, McpError>;
 
     /// Send a JSON-RPC notification: a message without an id, which the server
     /// never answers.
@@ -98,11 +138,15 @@ pub trait McpTransport: Send + Sync {
 /// Bounds on one client's connections and calls.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpClientLimits {
-    /// Budget for one call on a stdio server: sending it and receiving the
-    /// answer.
+    /// Budget for one call. On a stdio server it covers sending the request
+    /// and receiving the answer; on an http server, each POST through the
+    /// security chain, response included. The chain's executor bounds a POST
+    /// by its own timeout as well, so a budget longer than that executor's
+    /// takes effect only with an executor built to allow it.
     pub request_timeout: Duration,
-    /// Budget for connecting a stdio server: spawning it and completing the
-    /// `initialize` exchange.
+    /// Budget for connecting a server: spawning a stdio server, then
+    /// completing the `initialize` exchange; on an http server, also for
+    /// starting a session again after the server ended one.
     pub startup_timeout: Duration,
     /// Largest result, in bytes, that a call returns; a larger one fails the
     /// call.
@@ -122,7 +166,7 @@ impl Default for McpClientLimits {
     fn default() -> Self {
         Self {
             request_timeout: MAX_STDIO_WALL_CLOCK,
-            startup_timeout: Duration::from_secs(10),
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             max_result_bytes: 4 * 1024 * 1024,
             max_line_bytes: MAX_STDIO_LINE_BYTES,
             restart_backoff_initial: Duration::from_secs(1),
@@ -139,12 +183,16 @@ pub struct McpServerInfo {
     pub description: String,
 }
 
-/// Per-tool info surfaced by `list_tools`. Mirrors `mcp-tool-info`.
+/// Per-tool info surfaced by `list_tools`. Mirrors `mcp-tool-info`, plus the
+/// tool's input schema, which stays on the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpToolInfo {
     pub name: String,
     pub description: String,
     pub server_id: String,
+    /// The tool's `inputSchema`, when the server gave one within the listing
+    /// limits (see [`McpClient::list_tools`]).
+    pub input_schema: Option<serde_json::Value>,
 }
 
 /// Per-prompt info surfaced by `list_prompts`. Mirrors `mcp-prompt-info`.
@@ -275,11 +323,12 @@ fn backoff(failures: u32, limits: &McpClientLimits) -> Duration {
         .min(limits.restart_backoff_max)
 }
 
-/// High-level MCP client. Owns the `McpServersConfig` whitelist + the
-/// per-server connection slots.
+/// High-level MCP client. Owns the `McpServersConfig` whitelist, the
+/// per-server connection slots and the tool cache.
 pub struct McpClient {
     config: Arc<McpServersConfig>,
     slots: Mutex<HashMap<String, Arc<ServerSlot>>>,
+    tool_cache: Mutex<ToolCache>,
     leak_detector: Arc<dyn LeakDetector>,
     http_chain: Option<Arc<dyn HttpSecurityChain>>,
     limits: McpClientLimits,
@@ -310,6 +359,7 @@ impl McpClient {
         Self {
             config,
             slots: Mutex::new(HashMap::new()),
+            tool_cache: Mutex::new(ToolCache::default()),
             leak_detector,
             http_chain,
             limits: McpClientLimits::default(),
@@ -357,6 +407,7 @@ impl McpClient {
         Self {
             config,
             slots: Mutex::new(slots),
+            tool_cache: Mutex::new(ToolCache::default()),
             leak_detector,
             http_chain: None,
             limits: McpClientLimits::default(),
@@ -395,58 +446,74 @@ impl McpClient {
             .collect()
     }
 
-    /// List tools on a server. Dispatches `tools/list` over the server's
-    /// transport and applies the tool-patterns filter.
-    pub async fn list_tools(&self, server_id: &str) -> Result<Vec<McpToolInfo>, McpError> {
+    /// List the tools a server offers, for `caller` (see the module docs).
+    ///
+    /// Sends `tools/list`, then follows `nextCursor` with `tools/list
+    /// {cursor}` for at most [`MAX_TOOL_LIST_PAGES`](crate::MAX_TOOL_LIST_PAGES)
+    /// pages in all; the listing ends at a page without a usable cursor
+    /// (missing, not a string, empty, longer than
+    /// [`MAX_TOOL_LIST_CURSOR_BYTES`](crate::MAX_TOOL_LIST_CURSOR_BYTES) or the
+    /// same as the one that asked for the page) and once it holds
+    /// [`MAX_TOOLS_PER_SERVER`](crate::MAX_TOOLS_PER_SERVER) tools. A tool is
+    /// kept when the server's tool patterns allow it and it meets the entry
+    /// limits (see the module docs). The listing becomes the server's entry in
+    /// the tool cache ([`cached_tools`](Self::cached_tools)); a failed listing
+    /// leaves the cache as it was.
+    pub async fn list_tools(
+        &self,
+        caller: Option<&str>,
+        server_id: &str,
+    ) -> Result<Vec<McpToolInfo>, McpError> {
         let entry = self.config.get(server_id)?;
-        let bytes = self
-            .call(
-                entry,
-                "tools/list",
-                serde_json::Value::Object(Default::default()),
-            )
-            .await?;
-        let parsed: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| McpError::invalid_response(format!("parse tools/list result: {e}")))?;
-        let arr = parsed
-            .get("tools")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| McpError::invalid_response("tools/list missing 'tools' array"))?;
-        let mut out = Vec::new();
-        for v in arr {
-            let name = v
-                .get("name")
-                .and_then(|n| n.as_str())
-                .ok_or_else(|| McpError::invalid_response("tool entry missing 'name'"))?;
-            if !entry.tool_allowed(name) {
-                continue;
+        let mut listing = ToolListing::new(server_id);
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_TOOL_LIST_PAGES {
+            let params = match &cursor {
+                None => serde_json::json!({}),
+                Some(cursor) => serde_json::json!({ "cursor": cursor }),
+            };
+            let bytes = self.call(caller, entry, "tools/list", params).await?;
+            let page: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|_| McpError::invalid_response("tools/list result is not JSON"))?;
+            match listing.read_page(entry, page)? {
+                Some(next) if !listing.is_full() && cursor.as_deref() != Some(next.as_str()) => {
+                    cursor = Some(next);
+                }
+                _ => break,
             }
-            let description = v
-                .get("description")
-                .and_then(|d| d.as_str())
-                .unwrap_or_default()
-                .to_string();
-            out.push(McpToolInfo {
-                name: name.to_string(),
-                description,
-                server_id: server_id.to_string(),
-            });
         }
-        Ok(out)
+        let tools = listing.into_tools();
+        lock(&self.tool_cache).store(server_id, &tools);
+        Ok(tools)
     }
 
-    /// List prompts on a server (no filter).
-    pub async fn list_prompts(&self, server_id: &str) -> Result<Vec<McpPromptInfo>, McpError> {
+    /// The tools of each server's latest successful [`list_tools`](Self::list_tools),
+    /// in server-id order, read without contacting any server. The cache holds
+    /// at most [`MAX_CACHED_TOOLS`](crate::MAX_CACHED_TOOLS) tools across all
+    /// servers: a listing that does not fit beside the others is cached in
+    /// part, its first tools only.
+    pub fn cached_tools(&self) -> Vec<McpToolInfo> {
+        lock(&self.tool_cache).tools()
+    }
+
+    /// List prompts on a server (no filter), for `caller` (see the module
+    /// docs).
+    pub async fn list_prompts(
+        &self,
+        caller: Option<&str>,
+        server_id: &str,
+    ) -> Result<Vec<McpPromptInfo>, McpError> {
         let entry = self.config.get(server_id)?;
         let bytes = self
             .call(
+                caller,
                 entry,
                 "prompts/list",
                 serde_json::Value::Object(Default::default()),
             )
             .await?;
         let parsed: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| McpError::invalid_response(format!("parse prompts/list result: {e}")))?;
+            .map_err(|_| McpError::invalid_response("prompts/list result is not JSON"))?;
         let arr = parsed
             .get("prompts")
             .and_then(|v| v.as_array())
@@ -471,8 +538,10 @@ impl McpClient {
         Ok(out)
     }
 
+    /// Fetch a prompt, for `caller` (see the module docs).
     pub async fn get_prompt(
         &self,
+        caller: Option<&str>,
         server_id: &str,
         prompt_name: &str,
         args: Vec<(String, String)>,
@@ -483,20 +552,26 @@ impl McpClient {
             .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
         let params = serde_json::json!({"name": prompt_name, "arguments": args_obj});
-        self.call(entry, "prompts/get", params).await
+        self.call(caller, entry, "prompts/get", params).await
     }
 
-    pub async fn list_resources(&self, server_id: &str) -> Result<Vec<McpResourceInfo>, McpError> {
+    /// List resources on a server, for `caller` (see the module docs).
+    pub async fn list_resources(
+        &self,
+        caller: Option<&str>,
+        server_id: &str,
+    ) -> Result<Vec<McpResourceInfo>, McpError> {
         let entry = self.config.get(server_id)?;
         let bytes = self
             .call(
+                caller,
                 entry,
                 "resources/list",
                 serde_json::Value::Object(Default::default()),
             )
             .await?;
         let parsed: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| McpError::invalid_response(format!("parse resources/list result: {e}")))?;
+            .map_err(|_| McpError::invalid_response("resources/list result is not JSON"))?;
         let arr = parsed
             .get("resources")
             .and_then(|v| v.as_array())
@@ -523,13 +598,19 @@ impl McpClient {
         Ok(out)
     }
 
-    pub async fn read_resource(&self, server_id: &str, uri: &str) -> Result<Vec<u8>, McpError> {
+    /// Read a resource, for `caller` (see the module docs).
+    pub async fn read_resource(
+        &self,
+        caller: Option<&str>,
+        server_id: &str,
+        uri: &str,
+    ) -> Result<Vec<u8>, McpError> {
         let entry = self.config.get(server_id)?;
         let params = serde_json::json!({"uri": uri});
-        self.call(entry, "resources/read", params).await
+        self.call(caller, entry, "resources/read", params).await
     }
 
-    /// Invoke a tool. Order:
+    /// Invoke a tool, for `caller` (see the module docs). Order:
     /// 1. Whitelist gate (config.get) — `McpError::not_found` for unknown server.
     /// 2. Tool-pattern gate — `McpError::tool_not_found` if blocked.
     /// 3. Input schema validation (if schema present) — fails BEFORE dispatch.
@@ -537,6 +618,7 @@ impl McpClient {
     /// 5. Output schema validation (if schema present).
     pub async fn invoke_tool(
         &self,
+        caller: Option<&str>,
         server_id: &str,
         tool_name: &str,
         params_bytes: &[u8],
@@ -578,7 +660,7 @@ impl McpClient {
             "name": tool_name,
             "arguments": params_json,
         });
-        let bytes = self.call(entry, "tools/call", call_params).await?;
+        let bytes = self.call(caller, entry, "tools/call", call_params).await?;
 
         if let Some(s) = schemas {
             if let Some(output_schema) = &s.output {
@@ -592,16 +674,18 @@ impl McpClient {
         Ok(bytes)
     }
 
-    /// Send one request to the server. A failed call that found the transport
-    /// closed evicts it; a result over `max_result_bytes` fails the call.
+    /// Send one request to the server for `caller`. A failed call that found
+    /// the transport closed evicts it; a result over `max_result_bytes` fails
+    /// the call.
     async fn call(
         &self,
+        caller: Option<&str>,
         entry: &McpServerEntry,
         method: &str,
         params: serde_json::Value,
     ) -> Result<Vec<u8>, McpError> {
         let transport = self.transport_for(entry).await?;
-        let result = transport.invoke(method, params).await;
+        let result = transport.invoke(caller, method, params).await;
         if result.is_err() {
             self.evict_if_closed(&entry.server_id, &transport);
         }
@@ -726,9 +810,11 @@ impl McpClient {
         drop(evicted);
     }
 
-    /// Open a transport for `entry`. A stdio server is spawned on the client's
-    /// runtime and initialized within the startup timeout; a failed or late
-    /// initialization drops the transport, which stops the process.
+    /// Open a transport for `entry` and initialize it within the startup
+    /// timeout. A stdio server is spawned on the client's runtime; an http
+    /// transport posts through the client's security chain with the client's
+    /// request timeout. A failed or late initialization drops the transport,
+    /// which stops a stdio server's process.
     async fn connect(
         &self,
         entry: &McpServerEntry,
@@ -743,13 +829,19 @@ impl McpClient {
                         "http transport requested but McpClient has no http_chain configured",
                     )
                 })?;
-                let transport: Arc<dyn McpTransport> = Arc::new(HttpMcpTransport::new(
+                let transport = Arc::new(HttpMcpTransport::with_options(
                     Arc::clone(chain),
                     entry.server_id.clone(),
                     endpoint_url.clone(),
                     capability.clone(),
+                    HttpOptions {
+                        request_timeout: self.limits.request_timeout,
+                        startup_timeout: self.limits.startup_timeout,
+                    },
                 ));
-                Ok((transport, None))
+                let version = transport.initialize().await?;
+                let transport: Arc<dyn McpTransport> = transport;
+                Ok((transport, Some(version.to_string())))
             }
             McpTransportSpec::Stdio { command, args, env } => {
                 let options = StdioOptions {
@@ -767,18 +859,13 @@ impl McpClient {
                         options,
                     )?);
                 let startup = self.limits.startup_timeout;
-                let version =
-                    match tokio::time::timeout(startup, initialize(transport.as_ref())).await {
-                        Ok(result) => result?,
-                        Err(_elapsed) => {
-                            return Err(McpError::transport(format!(
-                                "server '{}' did not complete initialize within {} ms",
-                                entry.server_id,
-                                startup.as_millis()
-                            )))
-                        }
-                    };
-                Ok((transport, Some(version)))
+                let version = match tokio::time::timeout(startup, initialize(transport.as_ref()))
+                    .await
+                {
+                    Ok(result) => result?,
+                    Err(_elapsed) => return Err(startup_timeout_error(&entry.server_id, startup)),
+                };
+                Ok((transport, Some(version.to_string())))
             }
         }
     }
@@ -795,44 +882,74 @@ impl McpClient {
 
 /// Open an MCP session on `transport`: send `initialize`, check that the server
 /// chose a version in [`SUPPORTED_PROTOCOL_VERSIONS`], then send
-/// `notifications/initialized`. Returns the agreed version. A server-chosen
-/// version string never reaches the caller; it goes to the host log, sanitized,
-/// once per connection attempt (the failure arms the reconnect backoff, which
-/// spaces the attempts out).
-async fn initialize(transport: &dyn McpTransport) -> Result<String, McpError> {
-    let params = serde_json::json!({
+/// `notifications/initialized`. Returns the agreed version. The exchange is
+/// made on no agent's behalf.
+async fn initialize(transport: &dyn McpTransport) -> Result<&'static str, McpError> {
+    let bytes = transport
+        .invoke(None, "initialize", initialize_params())
+        .await
+        .map_err(|e| with_step("initialize", e))?;
+    let version = agreed_protocol_version(transport.server_id(), &bytes)?;
+    transport
+        .notify("notifications/initialized", None)
+        .await
+        .map_err(|e| with_step("notifications/initialized", e))?;
+    Ok(version)
+}
+
+/// The params of an `initialize` request: the version this client asks for,
+/// no client capabilities, and the client's name and version.
+pub(crate) fn initialize_params() -> serde_json::Value {
+    serde_json::json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
         "capabilities": {},
         "clientInfo": {"name": "advance", "version": env!("CARGO_PKG_VERSION")},
-    });
-    let bytes = transport
-        .invoke("initialize", params)
-        .await
-        .map_err(|e| McpError::new(e.kind, format!("initialize: {}", e.message)))?;
-    let result: serde_json::Value = serde_json::from_slice(&bytes)
+    })
+}
+
+/// The protocol version `server_id` chose in its `initialize` result, when it
+/// is one of [`SUPPORTED_PROTOCOL_VERSIONS`]. A server-chosen version string
+/// never reaches the caller; it goes to the host log, sanitized, once per
+/// connection attempt (the failure arms the reconnect backoff, which spaces the
+/// attempts out).
+pub(crate) fn agreed_protocol_version(
+    server_id: &str,
+    result: &[u8],
+) -> Result<&'static str, McpError> {
+    let result: serde_json::Value = serde_json::from_slice(result)
         .map_err(|_| McpError::invalid_response("initialize: result is not JSON"))?;
     let chosen = result
         .get("protocolVersion")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| McpError::invalid_response("initialize: result has no protocolVersion"))?;
-    let Some(version) = SUPPORTED_PROTOCOL_VERSIONS
+    match SUPPORTED_PROTOCOL_VERSIONS
         .iter()
         .find(|supported| **supported == chosen)
-    else {
-        eprintln!(
-            "[cap_mcp {}] server chose unsupported protocol version {}",
-            transport.server_id(),
-            sanitize_log_text(chosen.as_bytes(), 64)
-        );
-        return Err(McpError::invalid_response(
-            "initialize: server chose an unsupported protocol version",
-        ));
-    };
-    transport
-        .notify("notifications/initialized", None)
-        .await
-        .map_err(|e| McpError::new(e.kind, format!("notifications/initialized: {}", e.message)))?;
-    Ok((*version).to_string())
+    {
+        Some(version) => Ok(version),
+        None => {
+            eprintln!(
+                "[cap_mcp {server_id}] server chose unsupported protocol version {}",
+                sanitize_log_text(chosen.as_bytes(), 64)
+            );
+            Err(McpError::invalid_response(
+                "initialize: server chose an unsupported protocol version",
+            ))
+        }
+    }
+}
+
+/// The error of a server that did not complete `initialize` within `startup`.
+pub(crate) fn startup_timeout_error(server_id: &str, startup: Duration) -> McpError {
+    McpError::transport(format!(
+        "server '{server_id}' did not complete initialize within {} ms",
+        startup.as_millis()
+    ))
+}
+
+/// `error` with its message prefixed by the protocol step that failed.
+pub(crate) fn with_step(step: &str, error: McpError) -> McpError {
+    McpError::new(error.kind, format!("{step}: {}", error.message))
 }
 
 #[cfg(test)]
@@ -956,6 +1073,7 @@ mod tests {
     impl McpTransport for ClosedTransport {
         async fn invoke(
             &self,
+            _caller: Option<&str>,
             _method: &str,
             _params: serde_json::Value,
         ) -> Result<Vec<u8>, McpError> {

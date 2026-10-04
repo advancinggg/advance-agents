@@ -450,6 +450,7 @@ struct ScriptedMcpTransport {
 impl McpTransport for ScriptedMcpTransport {
     async fn invoke(
         &self,
+        _caller: Option<&str>,
         _method: &str,
         _params: serde_json::Value,
     ) -> Result<Vec<u8>, cap_mcp::McpError> {
@@ -5993,7 +5994,8 @@ impl SystemUnderTest {
     }
 
     /// Invoke an MCP tool through the real `McpClient` (whitelist → tool-pattern →
-    /// input-schema → transport → output-schema) over the scripted transport.
+    /// input-schema → transport → output-schema) over the scripted transport, on
+    /// no agent's behalf.
     pub async fn drive_mcp_tool(
         &self,
         server_id: &str,
@@ -6003,7 +6005,7 @@ impl SystemUnderTest {
         self.mcp_client
             .as_ref()
             .expect(".with_mcp_transports() required")
-            .invoke_tool(server_id, tool, params)
+            .invoke_tool(None, server_id, tool, params)
             .await
     }
 
