@@ -71,14 +71,51 @@ impl ExitOutcome {
 }
 
 /// An exit expectation the owner has not decided yet, kept in one constant so a later step can
-/// change it in one place: the outcome, and the goldens that pin that scenario (each with its
-/// sha256). Changing the decision is the only sanctioned way to re-capture those goldens: change
-/// `outcome`, re-capture, and re-pin them here. Every other golden is pinned in
-/// [`BASELINE_GOLDEN_SHA256`] and never changes.
+/// change it in one place.
+///
+/// Only the decision-dependent part of the scenario belongs to the constant: one golden holding
+/// the rendered outcome and what the run does from the decision point on. Everything before that
+/// point (boot lines, files while running, stderr before the failing write) is a separate golden
+/// pinned in [`BASELINE_GOLDEN_SHA256`], which never changes, so a re-pin made for the decision
+/// cannot absorb a regression of the decision-independent part.
+///
+/// The pins are keyed by outcome. The active pin is the entry of `outcome`; each outcome has
+/// exactly one entry (checked), and an entry is never edited once captured. Changing the decision
+/// is therefore the only sanctioned way to re-capture a pending golden: set `outcome` to the new
+/// decision, re-capture, and add a new `(outcome, pins)` entry. A re-capture under an unchanged
+/// outcome has no entry to go to.
 pub struct PendingExpectation {
     pub outcome: ExitOutcome,
-    pub goldens: &'static [(&'static str, &'static str)],
+    pub pins_by_outcome: &'static [(ExitOutcome, &'static [(&'static str, &'static str)])],
 }
+
+impl PendingExpectation {
+    /// The pins of the decided `outcome` (`None` = no entry captured for it yet).
+    pub fn active_pins(&self) -> Option<&'static [(&'static str, &'static str)]> {
+        self.pins_by_outcome
+            .iter()
+            .find(|(outcome, _)| *outcome == self.outcome)
+            .map(|(_, pins)| *pins)
+    }
+
+    /// Whether any entry (of any outcome) names `golden`.
+    pub fn owns(&self, golden: &str) -> bool {
+        self.pins_by_outcome
+            .iter()
+            .any(|(_, pins)| pins.iter().any(|(name, _)| *name == golden))
+    }
+}
+
+/// Baseline: the stderr of the readiness-failure run up to the failing write (through the Client
+/// API line, the only line written before the readiness line).
+pub const READINESS_BEFORE_WRITE_GOLDEN: &str = "exit.readiness_write_failure.golden";
+/// Pending ([`READINESS_WRITE_FAILURE`]): the outcome, the stderr after the Client API line and
+/// the `.runtime` files after exit.
+pub const READINESS_AFTER_WRITE_GOLDEN: &str = "exit.readiness_write_failure.after_write.golden";
+/// Pending ([`H2_SIGTERM_AFTER_READINESS`]): the outcome, stdout after `advance: shutting down`,
+/// stderr after SIGTERM and the `.runtime` files after exit. H2's streams up to there and its
+/// files while running are baseline goldens.
+pub const H2_AFTER_SHUTDOWN_GOLDEN: &str = "start.h2_all_capabilities.after_shutdown.golden";
 
 /// Exit status of `advance start` when the readiness line cannot be written (stdout's read end
 /// closed right after spawn, so the first stdout write gets EPIPE). OWNER DECISION PENDING.
@@ -90,9 +127,12 @@ pub struct PendingExpectation {
 /// panic message. This constant records what the pre-move tree actually does.
 pub const READINESS_WRITE_FAILURE: PendingExpectation = PendingExpectation {
     outcome: ExitOutcome::Code(101),
-    goldens: &[(
-        "exit.readiness_write_failure.golden",
-        "b3b5e0738d80f27f0ebd5f3acbd845eba6ad39ee212dd80af543c4fbd4e7af0e",
+    pins_by_outcome: &[(
+        ExitOutcome::Code(101),
+        &[(
+            READINESS_AFTER_WRITE_GOLDEN,
+            "772b51026db0db9f08c60b8f51a79de240dbda4a82b4fb58056ae942faa69161",
+        )],
     )],
 };
 
@@ -105,24 +145,17 @@ pub const READINESS_WRITE_FAILURE: PendingExpectation = PendingExpectation {
 /// `spawn_blocking` task) still waits in `blocking_recv` because a sender of its queue is still
 /// held. It reproduces with `fs` + `llm` + `messaging` on a git repository; without `messaging`
 /// or without a git repository the run exits 0. The ADR D1 shutdown sequence (git queue closed
-/// and its worker joined) is expected to turn this into `ExitOutcome::Code(0)`; H2's streams and
-/// its runtime files after exit are pinned with this decision.
+/// and its worker joined) is expected to turn this into `ExitOutcome::Code(0)`. Only H2's
+/// after-shutdown golden is pinned with this decision.
 pub const H2_SIGTERM_AFTER_READINESS: PendingExpectation = PendingExpectation {
     outcome: ExitOutcome::NoExitAfterSigterm,
-    goldens: &[
-        (
-            "start.h2_all_capabilities.stdout.golden",
-            "7cc5dc4b13a18851c9a9c99e9ff3047eb74291e3450f0e3787b42dd9c5034958",
-        ),
-        (
-            "start.h2_all_capabilities.stderr.golden",
-            "b58d40bc68a24c86e793cc7cb34d7b6ba224bbccd4659e7f2c355e7c45384601",
-        ),
-        (
-            "runtime_files.h2_all_capabilities.golden",
-            "bdec39e526a121a289b26ef9b655f083ffe9d48ae960aff81858091ad4a2d5d8",
-        ),
-    ],
+    pins_by_outcome: &[(
+        ExitOutcome::NoExitAfterSigterm,
+        &[(
+            H2_AFTER_SHUTDOWN_GOLDEN,
+            "e20f4b427ebb2e10bef68956ca26a339d3bd927b4740aded3c1a5a167c2936c2",
+        )],
+    )],
 };
 
 /// The decisions above, for the pin lookup.
@@ -144,6 +177,10 @@ pub const BASELINE_GOLDEN_SHA256: &[(&str, &str)] = &[
     (
         "exit.missing_runtime_config.golden",
         "75561a44f8a477838b201b41d158d76f1ba9135d48d2ce546fca9cb525fbdb9d",
+    ),
+    (
+        READINESS_BEFORE_WRITE_GOLDEN,
+        "33ddd0fd84ec671190bdf42270e3c46cfe847d2c166602cb8d965ebb95522841",
     ),
     (
         "exit.runtime_lock_held.golden",
@@ -175,15 +212,19 @@ pub const BASELINE_GOLDEN_SHA256: &[(&str, &str)] = &[
     ),
     (
         "route_table.h1_fs_llm.golden",
-        "cb17018a476db2a18097d8ad10ab8ce9e44d5206d6daf4b06c6dd79e0d1fd374",
+        "bc4e050f3f091459bc71bccb2abc0320e7ab092dd530ca1197f3f35dd4bd67fe",
     ),
     (
         "route_table.h2_all_capabilities.golden",
-        "e64c49b0e5dd4bcd9427cde10057f14c1f6ce3e1e52831db3c919ace9169892d",
+        "52d08d66643ac2cb6fdbfc42827ded867c384c8834ab82aa4ca1ed2555925343",
     ),
     (
         "runtime_files.h1_fs_llm.golden",
         "85fdb5db5e9569be29b39bd32db2feb2350a6c85de4d564d932c7abea31dbec6",
+    ),
+    (
+        "runtime_files.h2_all_capabilities.golden",
+        "768fdfcb50d436fdb3e2af8eef26b73cdcfce9bd3b21f09dd3cb7f0e1a1eb7a4",
     ),
     (
         "start.h1_fs_llm.merged.golden",
@@ -196,6 +237,14 @@ pub const BASELINE_GOLDEN_SHA256: &[(&str, &str)] = &[
     (
         "start.h1_fs_llm.stdout.golden",
         "9e1d0ba7c2961614ee206dacb5cdabc2d6494ffc4a6d94558b540a13859d8ec7",
+    ),
+    (
+        "start.h2_all_capabilities.stderr.golden",
+        "c2bf81b5e2e7ebf22bf5efc0ccebc86630f5f63b1d729b94d01374880c2727e4",
+    ),
+    (
+        "start.h2_all_capabilities.stdout.golden",
+        "8e980afcf200483a3b9f919bdacffd1671d35cc9d56a97810a7bc27e50bc58d0",
     ),
     (
         "start.h3_fs_llm_lifecycle.stderr.golden",
@@ -672,8 +721,16 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         })
 }
 
+/// The pending constant (name, constant) any of whose outcome entries names `golden`.
+pub fn pending_owner(golden: &str) -> Option<(&'static str, &'static PendingExpectation)> {
+    PENDING_EXPECTATIONS
+        .iter()
+        .find(|(_, pending)| pending.owns(golden))
+        .map(|(owner, pending)| (*owner, *pending))
+}
+
 /// Where a golden is pinned: `Some((pin, owner))` with owner `BASELINE_GOLDEN_SHA256` or the
-/// pending constant's name.
+/// pending constant's name (its entry for the decided outcome).
 pub fn golden_pin(name: &str) -> Option<(&'static str, &'static str)> {
     let baseline = BASELINE_GOLDEN_SHA256
         .iter()
@@ -681,7 +738,7 @@ pub fn golden_pin(name: &str) -> Option<(&'static str, &'static str)> {
         .map(|(_, pin)| (*pin, "BASELINE_GOLDEN_SHA256"));
     let pending = PENDING_EXPECTATIONS.iter().find_map(|(owner, pending)| {
         pending
-            .goldens
+            .active_pins()?
             .iter()
             .find(|(n, _)| *n == name)
             .map(|(_, pin)| (*pin, *owner))
@@ -698,14 +755,20 @@ pub fn read_pinned_golden(name: &str) -> String {
             path.display()
         )
     });
-    let (pin, owner) = golden_pin(name)
-        .unwrap_or_else(|| panic!("golden {name} has no sha256 pin (BASELINE_GOLDEN_SHA256)"));
+    let (pin, owner) = golden_pin(name).unwrap_or_else(|| match pending_owner(name) {
+        Some((owner, pending)) => panic!(
+            "golden {name} belongs to {owner}, which has no pin entry for its decided outcome \
+             {:?}: capture it and add the `(outcome, pins)` entry",
+            pending.outcome
+        ),
+        None => panic!("golden {name} has no sha256 pin (BASELINE_GOLDEN_SHA256)"),
+    });
     let actual = sha256_hex(&bytes);
     assert_eq!(
         actual, pin,
         "golden {name} does not match its sha256 pin in {owner}: the captured baselines are \
-         immutable (intended wire changes go through D5_CHANGE_MATRIX, pending decisions through \
-         their constant)"
+         immutable (intended wire changes go through D5_CHANGE_MATRIX; a pending golden is \
+         re-pinned only with a new decided outcome, in a new entry of its constant)"
     );
     String::from_utf8(bytes).unwrap_or_else(|e| panic!("golden {name} is not utf-8: {e}"))
 }
@@ -793,16 +856,19 @@ impl Goldens {
         if update_mode() {
             let mut list = String::new();
             for (name, sha) in &self.written {
-                let state = match golden_pin(name) {
-                    Some((pin, _)) if pin == sha => "pin unchanged",
-                    Some((_, owner)) => {
-                        if owner == "BASELINE_GOLDEN_SHA256" {
-                            "CHANGED (a baseline: never re-pin after the capture)"
-                        } else {
-                            "CHANGED (re-pin in its pending constant)"
-                        }
+                let state = match (golden_pin(name), pending_owner(name)) {
+                    (Some((pin, _)), _) if pin == sha => "pin unchanged",
+                    (Some((_, "BASELINE_GOLDEN_SHA256")), _) => {
+                        "CHANGED (a baseline: never re-pin after the capture)"
                     }
-                    None => "NEW (no pin yet)",
+                    (Some(_), _) => {
+                        "CHANGED under an unchanged outcome (refused: a pending golden is \
+                         re-pinned only in a new entry for a new decided outcome)"
+                    }
+                    (None, Some(_)) => {
+                        "NEW outcome (add its `(outcome, pins)` entry to the pending constant)"
+                    }
+                    (None, None) => "NEW (no pin yet)",
                 };
                 let _ = writeln!(list, "    (\"{name}\", \"{sha}\"), // {state}");
             }

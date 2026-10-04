@@ -32,9 +32,11 @@ fn scope_name(scope: &Scope) -> String {
         .expect("scope serializes to a string")
 }
 
+/// The golden names no composition entry point: the runtime-compose move replaces the one this
+/// test calls today (see `composed_route_table`), and the pinned bytes must not change with it.
 fn render_route_table(title: &str, table: &[RouteTableEntry]) -> String {
     let mut out = format!(
-        "# MODULE-001-T111 (1) route table of the Client API composed in-process (RuntimeHostBuilder::new + wire_capabilities) on {title}\n\
+        "# MODULE-001-T111 (1) route table of the Client API composed in-process on {title}\n\
          # {CAPTURED_ON}\n\
          # method path | exact/templated session mutation scopes\n"
     );

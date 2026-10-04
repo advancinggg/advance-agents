@@ -1,4 +1,4 @@
-# MODULE-001-T111 (1) route table of the Client API composed in-process (RuntimeHostBuilder::new + wire_capabilities) on H2 (capabilities: every KNOWN_CAPABILITIES entry = secrets, fs, skills, memory, grant, llm, tools, messaging, lifecycle, genui; genui.enabled: true; deployed driver; no git repository)
+# MODULE-001-T111 (1) route table of the Client API composed in-process on H2 (capabilities: every KNOWN_CAPABILITIES entry = secrets, fs, skills, memory, grant, llm, tools, messaging, lifecycle, genui; genui.enabled: true; deployed driver; no git repository)
 # captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
 # method path | exact/templated session mutation scopes
 GET /client/agent-templates | exact session=true mutation=false scopes=[read_runs]

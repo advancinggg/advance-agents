@@ -1,0 +1,10 @@
+# MODULE-001-T111 (1) `advance start` on H1 (capabilities: fs, llm; deployed driver; no git repository) with stdout's read end closed right after spawn: the outcome of the failed readiness write (DECISION PENDING: READINESS_WRITE_FAILURE)
+# captured on the pre-lane OSS tree (main 678b7a77 = v0.1.26 + the sign-in retry fix + the workspace version bump after it, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
+exit=101
+--- stderr after the Client API line ---
+
+thread 'main' (<TID>) panicked at <PANIC_LOCATION>:
+failed printing to stdout: Broken pipe (os error 32)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--- .runtime after exit ---
+runtime.lock=absent client-api=present selected-provider=present

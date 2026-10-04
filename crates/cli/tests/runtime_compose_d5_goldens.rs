@@ -6,15 +6,21 @@
 //!
 //! What each golden pins (files under `tests/goldens/runtime_compose_d5/`):
 //! - `start.<home>.stdout.golden` / `start.<home>.stderr.golden` (H1..H6): every byte of each
-//!   stream of `advance start`, from spawn until EOF after SIGTERM;
+//!   stream of `advance start`, from spawn until EOF after SIGTERM. H2's SIGTERM outcome is a
+//!   pending decision, so its stdout golden stops after `advance: shutting down` and its stderr
+//!   golden at SIGTERM; `start.h2_all_capabilities.after_shutdown.golden` (owned by that
+//!   decision) holds the outcome, the rest of both streams and the `.runtime` files after exit;
 //! - `start.h1_fs_llm.merged.golden`: an H1 run with stderr joined to stdout's pipe, which pins
 //!   the order of the lines across the two streams;
 //! - `runtime_files.<home>.golden` (H1, H2): bytes and mode of `.runtime/runtime.lock`,
-//!   `.runtime/client-api` and `.runtime/selected-provider` while running, and which of them
+//!   `.runtime/client-api` and `.runtime/selected-provider` while running, and (H1) which of them
 //!   remain after exit;
 //! - `exit_codes.golden`: the exit status of every run; `exit.<scenario>.golden`: outcome, both
 //!   streams and the `.runtime` files of each startup failure (no runtime-config, a malformed
-//!   runtime-config, the runtime lock held by a live `advance start`, a failed readiness write);
+//!   runtime-config, the runtime lock held by a live `advance start`). The failed readiness write
+//!   is split the same way as H2: `exit.readiness_write_failure.golden` holds the stderr written
+//!   before the readiness line, `exit.readiness_write_failure.after_write.golden` (owned by that
+//!   decision) the outcome, the rest of stderr and the `.runtime` files after exit;
 //! - `route_probe.<home>.golden` (H1..H5): the full answer of every route of the route table
 //!   (status, plus error code + message, or the canonical JSON of `data`, plus warnings), the
 //!   session operations, logins from the allowed console Origin and from a foreign Origin, the
@@ -36,10 +42,14 @@
 //! No golden may contain the package version (the lane bumps it); every golden is checked.
 //!
 //! Update mode: `ADVANCE_UPDATE_D5_GOLDENS=1` writes every golden and then fails (update mode is
-//! never green). Every golden is pinned by sha256 (`BASELINE_GOLDEN_SHA256`, or the pending
-//! decision constant that owns it), and the pin is checked before the comparison and before the
-//! D5 overlay is applied. Intended wire changes go through [`D5_CHANGE_MATRIX`] only, and the
-//! overlay is checked against the ADR D5 rows derived from each home's declarations.
+//! never green). Every golden is pinned by sha256 (`BASELINE_GOLDEN_SHA256`, or the entry of the
+//! decided outcome in the pending constant that owns it), and the pin is checked before the
+//! comparison and before the D5 overlay is applied. Intended wire changes go through
+//! [`D5_CHANGE_MATRIX`] only, and the overlay is checked against the ADR D5 rows derived from
+//! each home's declarations, on the route-probe path itself.
+//!
+//! Runs that compose take one of a few boot slots (spawn until settled), and the harness reads
+//! `runtime.lock` only clear of its 30 s in-place heartbeat rewrite.
 #![cfg(unix)]
 
 // Shared with `runtime_compose_d5_route_table.rs`; each binary uses a different part of it.
@@ -54,17 +64,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use advance_client_api::{Method, RouteTableEntry, API_VERSION, CLIENT_WS_PROTOCOL};
 use runtime_compose_d5_common::{
-    declares, describe, field, golden_path, make_home, method_name, output_locked,
+    declares, describe, field, golden_path, make_home, method_name, output_locked, pending_owner,
     probe_route_table, read_pinned_golden, replace_field, sha256_hex, spawn_lock, spawn_locked,
     update_mode, ExitOutcome, Goldens, HomeSpec, Masks, PendingExpectation, TestHome,
-    BASELINE_GOLDEN_SHA256, CAPTURED_ON, GOLDEN_DIR, H1, H2, H2_SIGTERM_AFTER_READINESS, H3, H4,
-    H5, H6, PACKAGE_VERSION, PENDING_EXPECTATIONS, PROBE_HOMES, READINESS_WRITE_FAILURE,
+    BASELINE_GOLDEN_SHA256, CAPTURED_ON, GOLDEN_DIR, H1, H2, H2_AFTER_SHUTDOWN_GOLDEN,
+    H2_SIGTERM_AFTER_READINESS, H3, H4, H5, H6, PACKAGE_VERSION, PENDING_EXPECTATIONS, PROBE_HOMES,
+    READINESS_AFTER_WRITE_GOLDEN, READINESS_BEFORE_WRITE_GOLDEN, READINESS_WRITE_FAILURE,
     SIGTERM_EXIT_BUDGET_SECS,
 };
 use serde_json::Value;
@@ -478,6 +489,66 @@ fn boot_complete(t: &Transcript) -> bool {
         || t.has_line("advance: skipping readiness walk")
 }
 
+/// `advance start`'s stderr line when the component-registry open of its readiness walk runs
+/// past the product's 5 s `BOOT_REGISTRY_OPEN_TIMEOUT` (`start.rs`): the run then skips the walk
+/// and its streams differ from the goldens because the machine was too loaded, not because of a
+/// regression.
+const REGISTRY_OPEN_TIMED_OUT: &str = "advance: skipping readiness walk — registry open timed out";
+
+/// Fail with an explicit "environment overloaded" message, instead of a golden diff, when a
+/// boot hit the product's registry-open timeout.
+fn assert_boot_not_starved(s: &Streams) {
+    assert!(
+        !s.stderr.contains(REGISTRY_OPEN_TIMED_OUT) && !s.merged.contains(REGISTRY_OPEN_TIMED_OUT),
+        "ENVIRONMENT OVERLOADED, not a golden regression: `advance start` hit its 5 s \
+         registry-open timeout (BOOT_REGISTRY_OPEN_TIMEOUT) and skipped the readiness walk, so \
+         its streams cannot match the goldens. Rerun on a less loaded machine; if it reproduces \
+         on an idle machine, the boot path regressed.\nstdout:\n{}\nstderr:\n{}\nmerged:\n{}",
+        s.stdout,
+        s.stderr,
+        s.merged
+    );
+}
+
+// ── Boot slots ────────────────────────────────────────────────────────────────────────────
+
+/// How many runs of this binary may compose at once (from spawn until they settle or end).
+/// Each boot's registry open runs under that 5 s product timeout while every other
+/// debug-profile `advance start` competes for the CPU; the cap bounds that load.
+fn max_concurrent_boots() -> usize {
+    std::thread::available_parallelism()
+        .map_or(2, |n| n.get() / 2)
+        .clamp(2, 4)
+}
+
+/// Busy boot slots, and the condition a freed slot signals.
+static BOOT_SLOTS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// One of the [`max_concurrent_boots`] slots, released on drop. Taken before the spawn, so the
+/// wait for a slot does not count against [`BOOT_TIMEOUT`].
+struct BootSlot;
+
+impl BootSlot {
+    fn acquire() -> BootSlot {
+        let (busy, freed) = &BOOT_SLOTS;
+        let mut busy = busy.lock().unwrap_or_else(|e| e.into_inner());
+        while *busy >= max_concurrent_boots() {
+            busy = freed.wait(busy).unwrap_or_else(|e| e.into_inner());
+        }
+        *busy += 1;
+        BootSlot
+    }
+}
+
+impl Drop for BootSlot {
+    fn drop(&mut self) {
+        let (busy, freed) = &BOOT_SLOTS;
+        let mut busy = busy.lock().unwrap_or_else(|e| e.into_inner());
+        *busy -= 1;
+        freed.notify_one();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wiring {
     /// stdout and stderr on their own pipes.
@@ -495,10 +566,24 @@ struct LiveRun {
     reaped: bool,
     transcript: Arc<Mutex<Transcript>>,
     readers: Vec<JoinHandle<()>>,
+    /// Held from spawn until the run settles or ends; `None` for a run that fails before it
+    /// composes anything.
+    boot_slot: Option<BootSlot>,
 }
 
 impl LiveRun {
-    fn start(mut cmd: Command, wiring: Wiring) -> LiveRun {
+    /// A run that composes (takes a boot slot first).
+    fn start(cmd: Command, wiring: Wiring) -> LiveRun {
+        let slot = BootSlot::acquire();
+        LiveRun::spawn(cmd, wiring, Some(slot))
+    }
+
+    /// A run expected to fail before it composes anything (no boot slot).
+    fn start_early_failure(cmd: Command) -> LiveRun {
+        LiveRun::spawn(cmd, Wiring::Separate, None)
+    }
+
+    fn spawn(mut cmd: Command, wiring: Wiring, boot_slot: Option<BootSlot>) -> LiveRun {
         let transcript = Arc::new(Mutex::new(Transcript::default()));
         let mut readers = Vec::new();
         let child = match wiring {
@@ -545,6 +630,7 @@ impl LiveRun {
             reaped: false,
             transcript,
             readers,
+            boot_slot,
         }
     }
 
@@ -561,12 +647,14 @@ impl LiveRun {
         )
     }
 
-    /// Wait for the last boot line, then for the streams to stay quiet for [`QUIET_PERIOD`].
+    /// Wait for the last boot line, then for the streams to stay quiet for [`QUIET_PERIOD`];
+    /// releases the boot slot.
     fn wait_until_settled(&mut self) {
         let start = Instant::now();
         loop {
             let (complete, _, s) = self.snapshot();
             if complete {
+                assert_boot_not_starved(&s);
                 break;
             }
             if let Ok(Some(status)) = self.child.try_wait() {
@@ -588,6 +676,7 @@ impl LiveRun {
         loop {
             let (_, last, s) = self.snapshot();
             if last.is_some_and(|l| l.elapsed() >= QUIET_PERIOD) {
+                self.boot_slot = None;
                 return;
             }
             if settle_start.elapsed() > SETTLE_TIMEOUT {
@@ -624,6 +713,7 @@ impl LiveRun {
             }
         };
         self.reaped = true;
+        self.boot_slot = None;
         (outcome, self.collect())
     }
 
@@ -644,6 +734,7 @@ impl LiveRun {
             }
         };
         self.reaped = true;
+        self.boot_slot = None;
         (exit_outcome(status), self.collect())
     }
 
@@ -695,11 +786,37 @@ fn runtime_files_presence(ws: &Path) -> String {
     )
 }
 
-fn stream_golden(title: &str, stream: &str, masked: &str) -> String {
+/// A stream golden; `span` says which part of the run the stream covers.
+fn stream_golden(title: &str, stream: &str, span: &str, masked: &str) -> String {
     format!(
-        "# MODULE-001-T111 (1) `advance start` {stream} on {title} — normalised, spawn to EOF after SIGTERM\n\
+        "# MODULE-001-T111 (1) `advance start` {stream} on {title} — normalised, {span}\n\
          # {CAPTURED_ON}\n{masked}"
     )
+}
+
+/// The span of a whole-stream golden.
+const SPAN_TO_EOF: &str = "spawn to EOF after SIGTERM";
+
+/// The stdout line `advance start` prints once it has handled SIGTERM, before it returns.
+const SHUTTING_DOWN_LINE: &str = "advance: shutting down";
+
+/// The start of stderr's Client API line, the only line `advance start` writes before its
+/// readiness line (see `start.h1_fs_llm.merged.golden`).
+const CLIENT_API_LINE_PREFIX: &str = "advance: Client API and Web Console listening at http://";
+
+/// Split `text` after the first whole line (newline included) that starts at or after byte
+/// `from` and satisfies `is_split_line`. Without such a line everything stays on the first side
+/// (`(text, "")`), where the baseline comparison then fails.
+fn split_after_line(text: &str, from: usize, is_split_line: impl Fn(&str) -> bool) -> (&str, &str) {
+    let mut start = 0;
+    for line in text.split_inclusive('\n') {
+        let end = start + line.len();
+        if start >= from && line.strip_suffix('\n').is_some_and(&is_split_line) {
+            return text.split_at(end);
+        }
+        start = end;
+    }
+    (text, "")
 }
 
 // ── Runtime files ─────────────────────────────────────────────────────────────────────────
@@ -747,6 +864,90 @@ fn assert_rfc3339_utc(value: &str, what: &str) {
     );
 }
 
+/// `advance start` refreshes `runtime.lock` every 30 s after acquiring it (`start.rs`:
+/// `RuntimeLock::acquire(&workspace, Duration::from_secs(30))`). The refresh (`touch_heartbeat`,
+/// `runtime_lock.rs`) truncates the file and writes it again, so a read can land in between and
+/// see a partial file. (Making that rewrite atomic is a product follow-up, outside this lane.)
+const LOCK_HEARTBEAT_PERIOD: Duration = Duration::from_secs(30);
+/// The harness reads `runtime.lock` of a live run, and starts the lock-held second
+/// `advance start`, only while the next refresh is at least this far away.
+const HEARTBEAT_CLEARANCE: Duration = Duration::from_secs(10);
+
+/// The keys of a complete `runtime.lock`.
+const RUNTIME_LOCK_KEYS: [&str; 6] = [
+    "pid",
+    "platform_uid",
+    "started_at",
+    "heartbeat_at",
+    "workspace_root",
+    "version",
+];
+
+/// Whether `body` is a complete `runtime.lock`: every key on exactly one line, the pid in digits
+/// and every other value a closed quoted string.
+fn runtime_lock_complete(body: &str) -> bool {
+    RUNTIME_LOCK_KEYS.iter().all(|key| {
+        let prefix = format!("{key}: ");
+        let values: Vec<&str> = body
+            .split('\n')
+            .filter_map(|l| l.strip_prefix(prefix.as_str()))
+            .collect();
+        match values.as_slice() {
+            [pid] if *key == "pid" => !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()),
+            [value] => value.len() >= 2 && value.starts_with('"') && value.ends_with('"'),
+            _ => false,
+        }
+    })
+}
+
+/// `.runtime/runtime.lock` of a live run, read again (bounded) while a heartbeat refresh leaves
+/// it partial.
+fn read_runtime_lock(ws: &Path) -> String {
+    let path = ws.join(".runtime/runtime.lock");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        if runtime_lock_complete(&body) {
+            return body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runtime.lock stayed incomplete for 2s: {body:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Wait until the next `runtime.lock` refresh of a live run is at least [`HEARTBEAT_CLEARANCE`]
+/// away. The next refresh is due [`LOCK_HEARTBEAT_PERIOD`] after the last `heartbeat_at`; when it
+/// is closer, or overdue, wait for it to pass and look again.
+fn wait_clear_of_heartbeat(ws: &Path) {
+    let period_ms = i64::try_from(LOCK_HEARTBEAT_PERIOD.as_millis()).expect("period fits i64");
+    let clearance_ms = i64::try_from(HEARTBEAT_CLEARANCE.as_millis()).expect("clearance fits i64");
+    let deadline = Instant::now() + 2 * LOCK_HEARTBEAT_PERIOD;
+    loop {
+        let body = read_runtime_lock(ws);
+        let last = field(&body, "heartbeat_at");
+        assert_rfc3339_utc(last, "heartbeat_at");
+        let last_ms = chrono::DateTime::parse_from_rfc3339(last.trim_matches('"'))
+            .expect("heartbeat_at is RFC 3339")
+            .timestamp_millis();
+        let now = i64::try_from(now_ms()).expect("now fits i64");
+        let until_next_ms = last_ms + period_ms - now;
+        if until_next_ms >= clearance_ms {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runtime.lock's heartbeat_at did not advance within {:?}: {body:?}",
+            2 * LOCK_HEARTBEAT_PERIOD
+        );
+        let wait_ms = u64::try_from(until_next_ms.max(0)).expect("non-negative") + 500;
+        std::thread::sleep(Duration::from_millis(wait_ms));
+    }
+}
+
 /// `.runtime/runtime.lock` while running: mask pid / platform_uid / timestamps after checking
 /// them; the workspace path is masked by the path masks. Its `version` line is the literal
 /// lock-format version `"0.1.0"` (`runtime_lock.rs`), not the package version, and is kept.
@@ -779,21 +980,27 @@ fn normalised_pid_file(body: &str, pid: u32, masks: &Masks) -> String {
 /// The bound Client API address from stderr's `advance: Client API and Web Console listening at
 /// http://<addr>` line.
 fn client_api_addr_from_stderr(stderr: &str) -> String {
-    const PREFIX: &str = "advance: Client API and Web Console listening at http://";
     stderr
         .lines()
-        .find_map(|l| l.strip_prefix(PREFIX))
+        .find_map(|l| l.strip_prefix(CLIENT_API_LINE_PREFIX))
         .unwrap_or_else(|| panic!("no Client API line on stderr:\n{stderr}"))
         .to_string()
 }
 
-fn render_runtime_files(title: &str, home: &TestHome, pid: u32, stderr_so_far: &str) -> String {
+/// The runtime-files golden of a live run; `scope` completes the header (what it covers).
+fn render_runtime_files(
+    title: &str,
+    scope: &str,
+    home: &TestHome,
+    pid: u32,
+    stderr_so_far: &str,
+) -> String {
     let masks = home.masks();
     let dir = home.ws.join(".runtime");
     let lock = dir.join("runtime.lock");
     let discovery = dir.join("client-api");
     let selected = dir.join("selected-provider");
-    let lock_body = std::fs::read_to_string(&lock).expect("read runtime.lock");
+    let lock_body = read_runtime_lock(&home.ws);
     let discovery_body = std::fs::read_to_string(&discovery).expect("read client-api");
     let selected_body = std::fs::read_to_string(&selected).expect("read selected-provider");
     assert_eq!(
@@ -802,7 +1009,7 @@ fn render_runtime_files(title: &str, home: &TestHome, pid: u32, stderr_so_far: &
         "the discovery file names the bound Client API"
     );
     format!(
-        "# MODULE-001-T111 (1) runtime files of `advance start` on {title} while running, and after exit\n\
+        "# MODULE-001-T111 (1) runtime files of `advance start` on {title} {scope}\n\
          # {CAPTURED_ON}\n\
          # bytes = the exact file content as a Rust string literal (no trailing newline unless shown)\n\
          .runtime/runtime.lock mode={} bytes={:?}\n\
@@ -817,45 +1024,129 @@ fn render_runtime_files(title: &str, home: &TestHome, pid: u32, stderr_so_far: &
     )
 }
 
+/// What a start run records besides its streams.
+#[derive(Debug, Clone, Copy)]
+struct StartPlan {
+    /// The `.runtime` files while running (and after exit, unless that part is pending).
+    record_files: bool,
+    /// A second `advance start` on the workspace while this one runs (runtime lock held).
+    probe_lock_held: bool,
+    /// The SIGTERM outcome is a pending decision: this golden (owned by that constant) holds the
+    /// outcome and everything from the decision point on, and the stream goldens stop there.
+    after_shutdown_golden: Option<&'static str>,
+}
+
+/// H1 also records its runtime files and probes the held runtime lock; H2 records its runtime
+/// files, and its SIGTERM outcome is pending (`H2_SIGTERM_AFTER_READINESS`).
+fn start_plan(spec: &HomeSpec) -> StartPlan {
+    StartPlan {
+        record_files: spec.label == H1.label || spec.label == H2.label,
+        probe_lock_held: spec.label == H1.label,
+        after_shutdown_golden: (spec.label == H2.label).then_some(H2_AFTER_SHUTDOWN_GOLDEN),
+    }
+}
+
 /// One `advance start` run to EOF after SIGTERM.
 struct StartRun {
     outcome: ExitOutcome,
-    /// The stdout / stderr goldens.
+    /// The stdout / stderr goldens (up to the decision point when the outcome is pending).
     stdout: String,
     stderr: String,
-    /// The runtime-files golden (while running + after exit), when recorded.
+    /// The runtime-files golden, when recorded.
     runtime_files: Option<String>,
     /// The second `advance start` on the same workspace while this one runs, when probed.
     lock_held: Option<(ExitOutcome, String)>,
+    /// The pending after-shutdown golden (name, text), when the outcome is pending.
+    after_shutdown: Option<(&'static str, String)>,
 }
 
-fn start_run(spec: &HomeSpec, record_files: bool, probe_lock_held: bool) -> StartRun {
+fn start_run(spec: &HomeSpec, plan: StartPlan) -> StartRun {
     let home = make_home(spec);
+    let title = describe(spec);
+    let pending = plan.after_shutdown_golden.map(|golden| {
+        let (owner, _) = pending_owner(golden)
+            .unwrap_or_else(|| panic!("{golden} belongs to no pending constant"));
+        (golden, owner)
+    });
     let mut run = LiveRun::start(home.start_command(), Wiring::Separate);
     run.wait_until_settled();
     let pid = run.pid();
-    let runtime_files = record_files.then(|| {
+    if plan.record_files || plan.probe_lock_held {
+        wait_clear_of_heartbeat(&home.ws);
+    }
+    let runtime_files = plan.record_files.then(|| {
+        let scope = match pending {
+            Some((golden, owner)) => {
+                format!("while running (after exit: pinned by {owner} in {golden})")
+            }
+            None => "while running, and after exit".to_string(),
+        };
         let (_, _, s) = run.snapshot();
-        render_runtime_files(&describe(spec), &home, pid, &s.stderr)
+        render_runtime_files(&title, &scope, &home, pid, &s.stderr)
     });
-    let lock_held = probe_lock_held.then(|| lock_held_run(spec, &home, pid));
+    let lock_held = plan
+        .probe_lock_held
+        .then(|| lock_held_run(spec, &home, pid));
+    let (_, _, before_sigterm) = run.snapshot();
     let (outcome, streams) = run.sigterm_and_collect();
     let masks = home.masks();
-    let runtime_files = runtime_files
-        .map(|files| format!("{files}after exit: {}\n", runtime_files_presence(&home.ws)));
+    let after_exit = runtime_files_presence(&home.ws);
+    let Some((golden, owner)) = pending else {
+        return StartRun {
+            outcome,
+            stdout: stream_golden(&title, "stdout", SPAN_TO_EOF, &masks.apply(&streams.stdout)),
+            stderr: stream_golden(&title, "stderr", SPAN_TO_EOF, &masks.apply(&streams.stderr)),
+            runtime_files: runtime_files.map(|files| format!("{files}after exit: {after_exit}\n")),
+            lock_held,
+            after_shutdown: None,
+        };
+    };
+    // Pending outcome: stdout through `advance: shutting down` and stderr until SIGTERM are
+    // baseline goldens; what follows, the outcome and the files after exit are the pending one.
+    assert!(
+        streams.stdout.starts_with(&before_sigterm.stdout)
+            && streams.stderr.starts_with(&before_sigterm.stderr),
+        "a transcript only grows"
+    );
+    let (stdout_base, stdout_tail) =
+        split_after_line(&streams.stdout, before_sigterm.stdout.len(), |line| {
+            line == SHUTTING_DOWN_LINE
+        });
+    let (stderr_base, stderr_tail) = streams.stderr.split_at(before_sigterm.stderr.len());
+    let after_shutdown = format!(
+        "# MODULE-001-T111 (1) `advance start` on {title} after SIGTERM: the outcome, what each stream writes after the decision point, and the .runtime files after exit (DECISION PENDING: {owner})\n\
+         # {CAPTURED_ON}\n\
+         {}\n--- stdout after the `{SHUTTING_DOWN_LINE}` line ---\n{}--- stderr after SIGTERM ---\n{}--- .runtime after exit ---\n{after_exit}\n",
+        outcome.render(),
+        masks.apply(stdout_tail),
+        masks.apply(stderr_tail),
+    );
     StartRun {
         outcome,
-        stdout: stream_golden(&describe(spec), "stdout", &masks.apply(&streams.stdout)),
-        stderr: stream_golden(&describe(spec), "stderr", &masks.apply(&streams.stderr)),
+        stdout: stream_golden(
+            &title,
+            "stdout",
+            &format!(
+                "spawn through the `{SHUTTING_DOWN_LINE}` line after SIGTERM (what follows: {owner}, {golden})"
+            ),
+            &masks.apply(stdout_base),
+        ),
+        stderr: stream_golden(
+            &title,
+            "stderr",
+            &format!("spawn until SIGTERM (what follows: {owner}, {golden})"),
+            &masks.apply(stderr_base),
+        ),
         runtime_files,
         lock_held,
+        after_shutdown: Some((golden, after_shutdown)),
     }
 }
 
 /// A second `advance start` on the workspace of a live run (`holder_pid`): the runtime lock is
 /// held. The holder pid it names is checked, then masked.
 fn lock_held_run(spec: &HomeSpec, home: &TestHome, holder_pid: u32) -> (ExitOutcome, String) {
-    let (outcome, streams) = LiveRun::start(home.start_command(), Wiring::Separate).wait_for_exit();
+    let (outcome, streams) = LiveRun::start_early_failure(home.start_command()).wait_for_exit();
     let masks = home.masks();
     let holder = format!("pid={holder_pid}");
     assert!(
@@ -863,8 +1154,7 @@ fn lock_held_run(spec: &HomeSpec, home: &TestHome, holder_pid: u32) -> (ExitOutc
         "the lock-held failure names the holder pid {holder_pid}:\n{}",
         streams.stderr
     );
-    let lock_body =
-        std::fs::read_to_string(home.ws.join(".runtime/runtime.lock")).expect("read runtime.lock");
+    let lock_body = read_runtime_lock(&home.ws);
     let lock_names_holder = field(&lock_body, "pid") == holder_pid.to_string();
     let golden = format!(
         "# MODULE-001-T111 (1) a second `advance start` on {}'s workspace while the first one runs (runtime lock held)\n\
@@ -912,7 +1202,7 @@ fn failure_golden(title: &str, outcome: ExitOutcome, streams: &Streams, home: &T
 fn missing_runtime_config_run() -> (ExitOutcome, String) {
     let home = TestHome::new_root();
     std::fs::create_dir_all(home.ws.join(".advance")).expect("create .advance");
-    let (outcome, streams) = LiveRun::start(home.start_command(), Wiring::Separate).wait_for_exit();
+    let (outcome, streams) = LiveRun::start_early_failure(home.start_command()).wait_for_exit();
     let golden = failure_golden(
         "on a workspace without .advance/runtime-config.yaml",
         outcome,
@@ -933,7 +1223,7 @@ fn malformed_runtime_config_run() -> (ExitOutcome, String) {
         MALFORMED_RUNTIME_CONFIG,
     )
     .expect("write malformed runtime config");
-    let (outcome, streams) = LiveRun::start(home.start_command(), Wiring::Separate).wait_for_exit();
+    let (outcome, streams) = LiveRun::start_early_failure(home.start_command()).wait_for_exit();
     let golden = failure_golden(
         &format!(
             "on {} with .advance/runtime-config.yaml = {MALFORMED_RUNTIME_CONFIG:?} (malformed YAML)",
@@ -947,22 +1237,37 @@ fn malformed_runtime_config_run() -> (ExitOutcome, String) {
 }
 
 /// Readiness write failure: stdout's read end is closed right after spawn, so the first stdout
-/// write (the readiness line; nothing reaches stdout before it) fails with EPIPE.
-fn readiness_write_failure_run() -> (ExitOutcome, String) {
+/// write (the readiness line; nothing reaches stdout before it) fails with EPIPE. Returns the
+/// outcome, the baseline golden (stderr through the Client API line, written before the
+/// readiness line) and the pending golden (the outcome and everything after that line).
+fn readiness_write_failure_run() -> (ExitOutcome, String, String) {
     let home = make_home(&H1);
     let (outcome, streams) =
         LiveRun::start(home.start_command(), Wiring::StdoutClosed).wait_for_exit();
     let masks = home.masks();
-    let golden = format!(
-        "# MODULE-001-T111 (1) `advance start` on {} with stdout's read end closed right after spawn (EPIPE on the readiness line)\n\
+    let (before_write, after_write) = split_after_line(&streams.stderr, 0, |line| {
+        line.starts_with(CLIENT_API_LINE_PREFIX)
+    });
+    let (owner, _) =
+        pending_owner(READINESS_AFTER_WRITE_GOLDEN).expect("the after-write golden is pending");
+    let baseline = format!(
+        "# MODULE-001-T111 (1) `advance start` on {} with stdout's read end closed right after spawn (EPIPE on the readiness line): stderr up to the readiness write\n\
          # {CAPTURED_ON}\n\
-         {}\n--- stderr ---\n{}--- .runtime after exit ---\n{}\n",
+         # the outcome and what follows the Client API line: {owner}, {READINESS_AFTER_WRITE_GOLDEN}\n\
+         --- stderr through the Client API line ---\n{}",
+        describe(&H1),
+        masks.apply(before_write),
+    );
+    let pending = format!(
+        "# MODULE-001-T111 (1) `advance start` on {} with stdout's read end closed right after spawn: the outcome of the failed readiness write (DECISION PENDING: {owner})\n\
+         # {CAPTURED_ON}\n\
+         {}\n--- stderr after the Client API line ---\n{}--- .runtime after exit ---\n{}\n",
         describe(&H1),
         outcome.render(),
-        masks.apply(&streams.stderr),
+        masks.apply(after_write),
         runtime_files_presence(&home.ws)
     );
-    (outcome, golden)
+    (outcome, baseline, pending)
 }
 
 /// Render an exit row; a row bound to a pending constant renders the constant's name when the
@@ -974,42 +1279,81 @@ fn exit_row(observed: ExitOutcome, pending: Option<(&PendingExpectation, &str)>)
     }
 }
 
-fn join<T>(handle: JoinHandle<T>, what: &str) -> T {
-    handle
-        .join()
-        .unwrap_or_else(|_| panic!("{what} panicked (see its panic message above)"))
+/// A named worker thread of the start test (the name prefixes its panic message).
+struct Worker<T> {
+    what: String,
+    handle: JoinHandle<T>,
 }
 
-/// The start-run homes, in golden order. H1 also records its runtime files and probes the held
-/// runtime lock; H2 records its runtime files.
+impl<T: Send + 'static> Worker<T> {
+    fn spawn(what: impl Into<String>, body: impl FnOnce() -> T + Send + 'static) -> Worker<T> {
+        let what = what.into();
+        let handle = std::thread::Builder::new()
+            .name(what.clone())
+            .spawn(body)
+            .unwrap_or_else(|e| panic!("spawn worker {what}: {e}"));
+        Worker { what, handle }
+    }
+
+    /// Wait for the worker. A panic is recorded in `failed`; its message was already printed,
+    /// under the worker's thread name.
+    fn join(self, failed: &mut Vec<String>) -> Option<T> {
+        match self.handle.join() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                failed.push(self.what);
+                None
+            }
+        }
+    }
+}
+
+/// The start-run homes, in golden order (see [`start_plan`] for what each also records).
 const START_HOMES: [&HomeSpec; 6] = [&H1, &H2, &H3, &H4, &H5, &H6];
 
 #[test]
 fn module_001_t111_ac30_start_stdout_stderr_files_and_exit_codes() {
-    let runs: Vec<(&HomeSpec, JoinHandle<StartRun>)> = START_HOMES
+    let runs: Vec<(&HomeSpec, Worker<StartRun>)> = START_HOMES
         .into_iter()
         .map(|spec: &'static HomeSpec| {
-            let record_files = spec.label == H1.label || spec.label == H2.label;
-            let probe_lock = spec.label == H1.label;
-            (
-                spec,
-                std::thread::spawn(move || start_run(spec, record_files, probe_lock)),
-            )
+            let worker = Worker::spawn(format!("{} start run", spec.name), move || {
+                start_run(spec, start_plan(spec))
+            });
+            (spec, worker)
         })
         .collect();
-    let merged = std::thread::spawn(|| merged_run(&H1));
-    let missing = std::thread::spawn(missing_runtime_config_run);
-    let malformed = std::thread::spawn(malformed_runtime_config_run);
-    let readiness = std::thread::spawn(readiness_write_failure_run);
+    let merged = Worker::spawn("H1 merged-stream run", || merged_run(&H1));
+    let missing = Worker::spawn("missing-config run", missing_runtime_config_run);
+    let malformed = Worker::spawn("malformed-config run", malformed_runtime_config_run);
+    let readiness = Worker::spawn("readiness run", readiness_write_failure_run);
 
+    // Join every worker before asserting anything. A worker left detached by an early panic here
+    // would never run its `LiveRun::drop` if the binary then exits, and its `advance start`
+    // would outlive the test.
+    let mut failed = Vec::new();
+    let runs: Vec<(&HomeSpec, Option<StartRun>)> = runs
+        .into_iter()
+        .map(|(spec, worker)| (spec, worker.join(&mut failed)))
+        .collect();
+    let merged = merged.join(&mut failed);
+    let missing = missing.join(&mut failed);
+    let malformed = malformed.join(&mut failed);
+    let readiness = readiness.join(&mut failed);
+    assert!(
+        failed.is_empty(),
+        "worker(s) panicked: {} (each panic message is printed above under the worker's name; \
+         every worker was joined, so every `advance` process was reaped)",
+        failed.join(", ")
+    );
     let runs: Vec<(&HomeSpec, StartRun)> = runs
         .into_iter()
-        .map(|(spec, handle)| (spec, join(handle, &format!("{} start run", spec.name))))
+        .map(|(spec, run)| (spec, run.expect("joined without a panic")))
         .collect();
-    let (merged_outcome, merged_golden) = join(merged, "H1 merged-stream run");
-    let (missing_outcome, missing_golden) = join(missing, "missing-config run");
-    let (malformed_outcome, malformed_golden) = join(malformed, "malformed-config run");
-    let (readiness_outcome, readiness_golden) = join(readiness, "readiness run");
+    let (merged_outcome, merged_golden) = merged.expect("joined without a panic");
+    let (missing_outcome, missing_golden) = missing.expect("joined without a panic");
+    let (malformed_outcome, malformed_golden) = malformed.expect("joined without a panic");
+    let (readiness_outcome, readiness_before_write, readiness_after_write) =
+        readiness.expect("joined without a panic");
     let h1 = &runs[0].1;
     let (lock_held_outcome, lock_held_golden) =
         h1.lock_held.as_ref().expect("H1 probes the held lock");
@@ -1052,12 +1396,16 @@ fn module_001_t111_ac30_start_stdout_stderr_files_and_exit_codes() {
     goldens.check("exit.missing_runtime_config.golden", &missing_golden);
     goldens.check("exit.malformed_runtime_config.golden", &malformed_golden);
     goldens.check("exit.runtime_lock_held.golden", lock_held_golden);
-    goldens.check(READINESS_WRITE_FAILURE.goldens[0].0, &readiness_golden);
+    goldens.check(READINESS_BEFORE_WRITE_GOLDEN, &readiness_before_write);
+    goldens.check(READINESS_AFTER_WRITE_GOLDEN, &readiness_after_write);
     for (spec, run) in &runs {
         goldens.check(&format!("start.{}.stdout.golden", spec.label), &run.stdout);
         goldens.check(&format!("start.{}.stderr.golden", spec.label), &run.stderr);
         if let Some(files) = &run.runtime_files {
             goldens.check(&format!("runtime_files.{}.golden", spec.label), files);
+        }
+        if let Some((name, after_shutdown)) = &run.after_shutdown {
+            goldens.check(name, after_shutdown);
         }
     }
     goldens.check(&format!("start.{}.merged.golden", H1.label), &merged_golden);
@@ -1418,7 +1766,8 @@ const PROBE_MASKS: &[ProbeMask] = &[
             (KEY_WS_EVENTS_SEED, "/events/*/agent_id"),
         ],
     },
-    // The root run, created at boot on a `lifecycle` home.
+    // The root run, created at boot when a driver component is deployed (H1..H4, with or without
+    // `lifecycle`; absent on H5, which has no driver: `{"runs":[]}`).
     ProbeMask {
         name: "ROOT_RUN_ID",
         shape: Shape::RunId,
@@ -2123,6 +2472,12 @@ fn route_probe_golden(spec: &HomeSpec) {
         "route-probe goldens are captured once and never re-captured once the D5 overlay is in \
          use; change D5_CHANGE_MATRIX instead"
     );
+    if !update_mode() {
+        // The ADR rows are enforced on the path that applies the overlay, so a filtered run
+        // (`cargo test … route_probe`) checks them too. (Skipped in update mode, where the
+        // overlay is empty and the other homes' goldens are being rewritten.)
+        check_overlay_against_adr(&changes);
+    }
     let mut goldens = Goldens::new();
     goldens.check_with_overlay(&name, &actual, |golden| {
         apply_overlay(&changes, spec.label, golden)
@@ -2170,6 +2525,9 @@ fn expected_golden_names() -> BTreeSet<String> {
     for spec in START_HOMES {
         names.insert(format!("start.{}.stdout.golden", spec.label));
         names.insert(format!("start.{}.stderr.golden", spec.label));
+        if let Some(golden) = start_plan(spec).after_shutdown_golden {
+            names.insert(golden.to_string());
+        }
     }
     names.insert(format!("start.{}.merged.golden", H1.label));
     for name in [
@@ -2177,7 +2535,8 @@ fn expected_golden_names() -> BTreeSet<String> {
         "exit.missing_runtime_config.golden",
         "exit.malformed_runtime_config.golden",
         "exit.runtime_lock_held.golden",
-        "exit.readiness_write_failure.golden",
+        READINESS_BEFORE_WRITE_GOLDEN,
+        READINESS_AFTER_WRITE_GOLDEN,
     ] {
         names.insert(name.to_string());
     }
@@ -2205,7 +2564,32 @@ fn module_001_t111_ac30_golden_pins_cover_every_golden() {
         assert!(pinned.insert(name.to_string()), "{name} is pinned twice");
     }
     for (owner, pending) in PENDING_EXPECTATIONS {
-        for (name, _) in pending.goldens {
+        // One entry per outcome, an entry for the decided outcome, and every entry pins the
+        // same goldens (only the decision-dependent part of the scenario).
+        let mut outcomes = Vec::new();
+        for (outcome, _) in pending.pins_by_outcome {
+            assert!(
+                !outcomes.contains(outcome),
+                "{owner}: outcome {outcome:?} has two pin entries (a pending golden is re-pinned \
+                 only with a new outcome)"
+            );
+            outcomes.push(*outcome);
+        }
+        let active = pending.active_pins().unwrap_or_else(|| {
+            panic!(
+                "{owner}: no pin entry for its decided outcome {:?}",
+                pending.outcome
+            )
+        });
+        let active_names: BTreeSet<&str> = active.iter().map(|(name, _)| *name).collect();
+        for (outcome, pins) in pending.pins_by_outcome {
+            let names: BTreeSet<&str> = pins.iter().map(|(name, _)| *name).collect();
+            assert_eq!(
+                names, active_names,
+                "{owner}: the {outcome:?} entry pins other goldens than the decided one"
+            );
+        }
+        for name in active_names {
             assert!(
                 pinned.insert(name.to_string()),
                 "{name} is pinned twice (also by {owner})"
@@ -2213,6 +2597,20 @@ fn module_001_t111_ac30_golden_pins_cover_every_golden() {
         }
     }
     assert_eq!(pinned, expected, "every golden has exactly one sha256 pin");
+    // The decision-independent part of each pending scenario is a baseline golden.
+    for baseline in [
+        READINESS_BEFORE_WRITE_GOLDEN,
+        "start.h2_all_capabilities.stdout.golden",
+        "start.h2_all_capabilities.stderr.golden",
+        "runtime_files.h2_all_capabilities.golden",
+    ] {
+        assert!(
+            BASELINE_GOLDEN_SHA256
+                .iter()
+                .any(|(name, _)| *name == baseline),
+            "{baseline} is pinned in BASELINE_GOLDEN_SHA256"
+        );
+    }
     for name in &expected {
         read_pinned_golden(name);
         assert!(golden_path(name).is_file());
@@ -2261,6 +2659,64 @@ fn module_001_t111_ac30_masks_only_volatile_tokens() {
         goldens.finish();
     });
     assert!(refused.is_err(), "a golden with the package version fails");
+}
+
+#[test]
+fn module_001_t111_ac30_harness_splits_lock_reads_and_overload() {
+    // The split of a pending scenario: after the first matching whole line at or after `from`.
+    let stdout = "advance: runtime ready\nadvance: shutting down\nadvance: later\n";
+    let boot = "advance: runtime ready\n";
+    assert_eq!(
+        split_after_line(stdout, boot.len(), |l| l == SHUTTING_DOWN_LINE),
+        (
+            "advance: runtime ready\nadvance: shutting down\n",
+            "advance: later\n"
+        )
+    );
+    // Not after `from`, or not a whole line: no split, everything stays on the baseline side.
+    assert_eq!(
+        split_after_line(stdout, stdout.len(), |l| l == SHUTTING_DOWN_LINE),
+        (stdout, "")
+    );
+    assert_eq!(
+        split_after_line("advance: shutting down", 0, |l| l == SHUTTING_DOWN_LINE),
+        ("advance: shutting down", "")
+    );
+    let stderr =
+        "advance: Client API and Web Console listening at http://127.0.0.1:1\n\nthread 'main'\n";
+    assert_eq!(
+        split_after_line(stderr, 0, |l| l.starts_with(CLIENT_API_LINE_PREFIX)),
+        (
+            "advance: Client API and Web Console listening at http://127.0.0.1:1\n",
+            "\nthread 'main'\n"
+        )
+    );
+    // A `runtime.lock` read in the middle of a heartbeat rewrite is incomplete.
+    let lock = "pid: 42\nplatform_uid: \"macos:42:x\"\nstarted_at: \"a\"\nheartbeat_at: \"b\"\nworkspace_root: \"/w\"\nversion: \"0.1.0\"";
+    assert!(runtime_lock_complete(lock));
+    assert!(!runtime_lock_complete(""));
+    assert!(!runtime_lock_complete(&lock[..lock.len() - 3]));
+    assert!(!runtime_lock_complete(
+        &lock[..lock.find("version").unwrap()]
+    ));
+    assert!(!runtime_lock_complete(&lock.replace("pid: 42", "pid: ")));
+    // A boot that hit the registry-open timeout is reported as an overloaded environment.
+    let streams = |stderr: &str| Streams {
+        stdout: String::new(),
+        stderr: stderr.to_string(),
+        merged: String::new(),
+    };
+    assert_boot_not_starved(&streams(
+        "advance: Client API and Web Console listening at x\n",
+    ));
+    let starved = std::panic::catch_unwind(|| {
+        assert_boot_not_starved(&streams(&format!("{REGISTRY_OPEN_TIMED_OUT} after 5s\n")))
+    });
+    let message = starved.expect_err("a starved boot fails");
+    let message = message
+        .downcast_ref::<String>()
+        .expect("formatted panic message");
+    assert!(message.starts_with("ENVIRONMENT OVERLOADED"), "{message}");
 }
 
 #[test]
