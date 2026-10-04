@@ -60,7 +60,7 @@ use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -414,6 +414,7 @@ impl ChatGptSignIn {
                 generation: AtomicU64::new(0),
                 closed: AtomicBool::new(false),
                 closing: Mutex::new(Vec::new()),
+                in_flight: AtomicUsize::new(0),
             }),
             worker: RenewalWorker::default(),
         }
@@ -426,11 +427,14 @@ impl ChatGptSignIn {
     /// - the renewal thread gets no new work: the renewals it already started finish and
     ///   persist the rotated session (a renewal that reached the authorization server has
     ///   already rotated the refresh token), then the thread exits; nothing is aborted;
-    /// - from now on [`ChatGptSignInPort::start`] and
-    ///   [`ProviderCredentialSource::ensure_fresh`] answer `unavailable`.
+    /// - from now on no renewal starts: [`ChatGptSignInPort::start`],
+    ///   [`ProviderCredentialSource::ensure_fresh`] and [`ChatGptSignInPort::verify`] answer
+    ///   `unavailable`. A renewal `verify` began before (it runs on the caller's thread, not
+    ///   on the renewal thread) also finishes and persists.
     ///
-    /// [`Self::threads_exited`] tells when every such thread has ended; each is bounded by
-    /// its own work (an attempt's model-list request, a renewal's token request). Idempotent.
+    /// [`Self::threads_exited`] tells when every such thread and renewal has ended; each is
+    /// bounded by its own work (an attempt's model-list request, a renewal's token request).
+    /// Idempotent.
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
         let names: Vec<Arc<NameState>> = lock(&self.inner.names).values().cloned().collect();
@@ -449,8 +453,8 @@ impl ChatGptSignIn {
     }
 
     /// After [`Self::close`]: `true` once every attempt thread it ended and the renewal
-    /// thread have exited (the renewal thread is joined then, which returns at once).
-    /// Non-blocking; an owner polls it.
+    /// thread have exited (the renewal thread is joined then, which returns at once) and no
+    /// renewal is running on a caller's thread any more. Non-blocking; an owner polls it.
     pub fn threads_exited(&self) -> bool {
         let attempts_done = {
             let mut closing = lock(&self.inner.closing);
@@ -462,7 +466,9 @@ impl ChatGptSignIn {
             });
             closing.is_empty()
         };
-        attempts_done && self.worker.thread_exited()
+        attempts_done
+            && self.inner.in_flight.load(Ordering::SeqCst) == 0
+            && self.worker.thread_exited()
     }
 
     /// Override the clock (tests / product composition roots).
@@ -756,6 +762,26 @@ struct Inner {
     closed: AtomicBool,
     /// The exit receivers of the attempts `close` ended, until each thread has exited.
     closing: Mutex<Vec<std::sync::mpsc::Receiver<()>>>,
+    /// Calls of [`Inner::ensure_fresh`] still running, wherever they run (the renewal thread,
+    /// or the caller's thread for `verify`), so [`ChatGptSignIn::threads_exited`] also waits
+    /// for a renewal that started before `close`.
+    in_flight: AtomicUsize,
+}
+
+/// Counts one running [`Inner::ensure_fresh`] in [`Inner::in_flight`] until dropped.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    fn enter(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Everything kept per secret name. Lock order: `control` → `session` → `state`.
@@ -1444,7 +1470,10 @@ impl Inner {
         force: bool,
         usable: &mut Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<(), CredentialFailure> {
-        if !valid_secret_name(name) {
+        // Counted before `closed` is read: `close` followed by `threads_exited` either sees
+        // this call, and waits for it, or this call sees `closed` and starts nothing.
+        let _in_flight = InFlight::enter(&self.in_flight);
+        if self.closed.load(Ordering::SeqCst) || !valid_secret_name(name) {
             return Err(CredentialFailure::Unavailable);
         }
         let ns = self.name_state(name);
@@ -1453,6 +1482,10 @@ impl Inner {
             Err(_) if !force && self.usable_while_busy(&ns, name) => return Ok(()),
             Err(_) => ns.session.lock().await,
         };
+        // The wait for the session may have outlasted `close`: no renewal starts after it.
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(CredentialFailure::Unavailable);
+        }
         self.fresh_locked(&ns, name, force, usable).await
     }
 

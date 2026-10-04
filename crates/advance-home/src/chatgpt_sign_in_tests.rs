@@ -4195,3 +4195,60 @@ async fn module_001_ac30_chatgpt_sign_in_close_lets_the_inflight_renewal_finish_
     );
     assert_eq!(h.refreshes(), 1);
 }
+
+#[test]
+fn module_001_ac30_chatgpt_sign_in_verify_after_close_starts_no_renewal() {
+    // Control: the session is due, so an open sign-in renews on verify.
+    let open = harness();
+    open.seed_session(T0_MS + 60_000, FULL_SCOPE);
+    assert!(open.sign_in.verify(NAME).ok);
+    assert_eq!(open.refreshes(), 1, "verify renews a session that is due");
+
+    let h = harness();
+    h.seed_session(T0_MS + 60_000, FULL_SCOPE);
+    h.sign_in.close();
+    let verdict = h.sign_in.verify(NAME);
+    assert!(!verdict.ok);
+    assert_eq!(verdict.reason, Some(REASON_UNAVAILABLE));
+    assert_eq!(h.refreshes(), 0, "no renewal starts after close");
+    assert!(h.sign_in.threads_exited());
+}
+
+#[test]
+fn module_001_ac30_chatgpt_sign_in_threads_exited_waits_for_a_renewal_verify_began() {
+    let h = harness();
+    h.seed_session(T0_MS + 60_000, FULL_SCOPE);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    h.idp.with(|st| st.refresh_gate = Some(Arc::clone(&gate)));
+    // verify renews on its caller's thread, not on the renewal thread; the identity provider
+    // holds the token request.
+    let sign_in = Arc::clone(&h.sign_in);
+    let verifying = std::thread::spawn(move || sign_in.verify(NAME));
+    wait_until(
+        "the renewal verify began reached the identity provider",
+        || h.refreshes() == 1,
+    );
+
+    h.sign_in.close();
+    assert!(
+        !h.sign_in.threads_exited(),
+        "the renewal verify began is still in flight"
+    );
+
+    gate.notify_one();
+    wait_until("the renewal finished", || h.sign_in.threads_exited());
+    // It was awaited, not cut short: the rotated session is persisted.
+    let rotated = h.idp.with(|st| st.refresh.clone());
+    assert_ne!(
+        rotated.as_deref(),
+        Some("REFRESH-SEED-zq"),
+        "rotated upstream"
+    );
+    assert_eq!(
+        h.record().unwrap()["session"]["refresh_token"].as_str(),
+        rotated.as_deref(),
+        "the rotated refresh token is stored"
+    );
+    verifying.join().expect("verify returned");
+    assert_eq!(h.refreshes(), 1);
+}
