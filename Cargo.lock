@@ -273,6 +273,7 @@ dependencies = [
 name = "advance-git"
 version = "0.1.28"
 dependencies = [
+ "advance-git",
  "advance-shared-types",
  "async-trait",
  "chrono",

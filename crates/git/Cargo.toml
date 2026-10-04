@@ -8,6 +8,11 @@ description = "advance-agents Git-version module: serialized commit queue, repo 
 
 publish = false
 
+[features]
+default = []
+# Test-only seams: `commit_queue::active_queue_paths_for_test`.
+test-support = []
+
 [dependencies]
 advance-shared-types = { path = "../shared-types" }
 async-trait = { workspace = true }
@@ -19,6 +24,9 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# Self dev-dep: the crate's own tests build with `test-support` on, without shipping
+# the feature in production builds.
+advance-git = { path = ".", features = ["test-support"] }
 tempfile = { workspace = true }
 # tokio/test-util enables `tokio::time::pause()` / `advance()` / `start_paused`
 # for Slice C+D hot-reload integration tests. Workspace tokio stays lean;

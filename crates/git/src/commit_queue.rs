@@ -11,6 +11,7 @@ use advance_shared_types::traits::EventBusEmit;
 use git2::{Oid, Repository, Signature};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
@@ -35,6 +36,16 @@ static ACTIVE_QUEUES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 fn active_queues() -> &'static Mutex<HashSet<PathBuf>> {
     ACTIVE_QUEUES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Test-only view of the process-wide active-queue set: the canonical repo paths that
+/// currently have a registered `DefaultGitCommitQueue`.
+#[cfg(feature = "test-support")]
+pub fn active_queue_paths_for_test() -> Vec<PathBuf> {
+    let set = active_queues().lock().unwrap_or_else(|e| e.into_inner());
+    let mut paths: Vec<PathBuf> = set.iter().cloned().collect();
+    paths.sort();
+    paths
 }
 
 // Slice C+D — auto-gitignore threshold is now read from
@@ -117,9 +128,19 @@ pub trait GitCommitQueue: Send + Sync {
 /// Serialized commit-queue implementation. Spawns one Tokio blocking-pool worker
 /// that owns a re-opened `git2::Repository` handle. Drop of the queue closes the
 /// channel; the worker exits after draining remaining requests.
+///
+/// An owner that needs the worker gone before the repo can be queued again (an
+/// ordered shutdown) calls [`DefaultGitCommitQueue::close_and_join`] instead of
+/// relying on the drop.
 pub struct DefaultGitCommitQueue {
-    tx: mpsc::UnboundedSender<CommitRequest>,
-    _worker: JoinHandle<()>,
+    /// `None` once [`DefaultGitCommitQueue::close_and_join`] closed the channel.
+    tx: Mutex<Option<mpsc::UnboundedSender<CommitRequest>>>,
+    /// Taken (and awaited) by [`DefaultGitCommitQueue::close_and_join`]; the async
+    /// lock makes a concurrent second call wait for the first call's join.
+    worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Set once the `ACTIVE_QUEUES` entry was released by `close_and_join`, so the
+    /// later `Drop` never removes an entry a newer queue registered for this repo.
+    released: AtomicBool,
     registered_path: PathBuf,
     _config: Arc<dyn GitConfigProvider>,
 }
@@ -222,20 +243,48 @@ impl DefaultGitCommitQueue {
         // matches the one `rollback` / `checkpoint` use in the same process.
         let path_for_worker = registered_path.clone();
         let config_for_worker = Arc::clone(&config);
-        let _worker = tokio::task::spawn_blocking(move || {
+        let worker = tokio::task::spawn_blocking(move || {
             worker_loop(path_for_worker, rx, config_for_worker, event_bus)
         });
         Ok(Self {
-            tx,
-            _worker,
+            tx: Mutex::new(Some(tx)),
+            worker: tokio::sync::Mutex::new(Some(worker)),
+            released: AtomicBool::new(false),
             registered_path,
             _config: config,
         })
+    }
+
+    /// Close the queue and join its worker, then release the repo's process-wide
+    /// registration.
+    ///
+    /// 1. The channel is closed: a later [`GitCommitQueue::submit`] answers
+    ///    `GitError::WorkerClosed` at once.
+    /// 2. The worker commits every request already queued, then exits; it is
+    ///    awaited here.
+    /// 3. Only then is the `ACTIVE_QUEUES` entry removed, so a new queue on the same
+    ///    repo can never run next to a worker that is still committing. The later
+    ///    `Drop` of this queue leaves the registry alone.
+    ///
+    /// Idempotent; a concurrent second call returns after the first call's join.
+    pub async fn close_and_join(&self) {
+        drop(self.tx.lock().unwrap_or_else(|e| e.into_inner()).take());
+        let mut worker = self.worker.lock().await;
+        if let Some(handle) = worker.take() {
+            let _ = handle.await;
+        }
+        if !self.released.swap(true, Ordering::AcqRel) {
+            let mut set = active_queues().lock().unwrap_or_else(|e| e.into_inner());
+            set.remove(&self.registered_path);
+        }
     }
 }
 
 impl Drop for DefaultGitCommitQueue {
     fn drop(&mut self) {
+        if self.released.load(Ordering::Acquire) {
+            return;
+        }
         if let Ok(mut set) = active_queues().lock() {
             set.remove(&self.registered_path);
         }
@@ -246,8 +295,13 @@ impl GitCommitQueue for DefaultGitCommitQueue {
     fn submit(&self, mut req: CommitRequest) -> oneshot::Receiver<Result<Oid, GitError>> {
         let (tx, rx) = oneshot::channel();
         req.reply = Some(tx);
-        if self.tx.send(req).is_err() {
-            // Worker died — fabricate a pre-resolved receiver carrying WorkerClosed.
+        let sent = match self.tx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(sender) => sender.send(req).is_ok(),
+            None => false,
+        };
+        if !sent {
+            // Worker died, or the queue was closed — fabricate a pre-resolved receiver
+            // carrying WorkerClosed.
             let (etx, erx) = oneshot::channel();
             let _ = etx.send(Err(GitError::WorkerClosed));
             return erx;
