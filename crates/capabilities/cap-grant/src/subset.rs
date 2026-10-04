@@ -18,7 +18,8 @@
 //!   silently approve novel capability types and is forbidden).
 //! - Capability name mismatch between parent and child → `SubsetViolation`.
 //! - Empty parent params (`params == []`) = "whole-capability grant" — any
-//!   child params are subset.
+//!   child params are subset (an `mcp` child must still be well-formed; see
+//!   below).
 //! - Empty child params = "request whole capability" — fails closed against a
 //!   restricted parent (cannot widen).
 //! - A key the child leaves out is not requested, so it is never a violation,
@@ -38,6 +39,8 @@
 //!   malformed pattern on either side is a violation.
 //! - A key other than `servers` / `tool-patterns` is a violation, so a misspelled
 //!   key never leaves the tool axis unrestricted.
+//! - The child's keys and patterns are checked even under a whole-capability
+//!   parent, so a misspelled key or a malformed pattern never passes `validate`.
 //! - At call time ([`SubsetValidatorImpl::covers_request`]) request tokens are
 //!   literal server ids and tool names, a request must name its server, and a
 //!   request without `tool-patterns` asks for the server only, skipping the tool
@@ -100,6 +103,14 @@ impl SubsetValidator for SubsetValidatorImpl {
                 "capability mismatch: parent={:?} child={:?}",
                 parent.capability, child.capability
             )));
+        }
+
+        // An `mcp` child is checked for keys and pattern grammar whatever the parent holds:
+        // issued from a whole-capability parent, a misspelled key or a malformed pattern would
+        // otherwise make a grant that silently covers less than it reads.
+        if child.capability == "mcp" {
+            reject_unknown_mcp_keys(&child.params, "child")?;
+            parse_tool_patterns(&child.params, "child")?;
         }
 
         // Empty parent = whole-capability grant; any child params are subset.
@@ -450,8 +461,9 @@ fn check_lifecycle(parent: &[CapParam], child: &[CapParam]) -> Result<(), CapGra
             // exposed by the slice's `CapGrantSubsetAdapter` becoming the
             // first production caller of `check_lifecycle`. Pattern matches
             // the symmetric `else if c.is_some() && p.is_none()` guards in
-            // check_messaging / check_list_subset / check_mcp / check_skills
-            // / check_http / check_numeric_le / check_fs read-paths.
+            // check_messaging / check_list_subset / check_mcp's `servers` axis
+            // / check_skills / check_http / check_numeric_le / check_fs
+            // read-paths.
             (None, Some(c_str)) => {
                 // Reject regardless of c_str's value: even `c="false"` is
                 // a child request for the key, and the safe posture is

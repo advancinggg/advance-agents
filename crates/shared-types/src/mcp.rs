@@ -26,9 +26,17 @@
 //! those servers, either every tool or the tools its patterns match. Coverage is decided one
 //! grant at a time; two grants are never merged axis by axis, so `{servers: [a], tool-patterns:
 //! [x*]}` held next to `{servers: [b]}` never covers tool `y` on server `a`.
+//!
+//! A scope never covers a server id or tool name that a call cannot carry (see
+//! [`is_request_token`] and [`is_tool_name_safe`]), so a listing filtered through scopes holds
+//! no entry whose call the grant check refuses for its name.
 
 /// Longest tool pattern, in bytes.
 pub const MAX_TOOL_PATTERN_BYTES: usize = 256;
+
+/// Longest server id or tool name a call can carry, in bytes: the grant check refuses a request
+/// string longer than this.
+pub const MAX_REQUEST_TOKEN_BYTES: usize = 4096;
 
 /// The `tool-patterns` request token for a server-wide surface (a server's prompts and
 /// resources), which no tool pattern describes. Read as a literal name it matches no pattern,
@@ -153,6 +161,23 @@ fn is_spoofing_char(c: char) -> bool {
     )
 }
 
+/// Whether `name` can travel as one call-time request token. The grant check reads a request's
+/// params as comma-separated tokens and refuses a token that is empty, holds a `,`, has leading
+/// or trailing whitespace or is longer than [`MAX_REQUEST_TOKEN_BYTES`]. A name that passes
+/// this and [`is_tool_name_safe`] (which rejects the control and invisible characters the check
+/// also refuses) can be named in a call.
+pub fn is_request_token(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_REQUEST_TOKEN_BYTES
+        && !name.contains(',')
+        && name.trim() == name
+}
+
+/// A server id or tool name a call can carry: one request token, free of spoofing characters.
+fn is_callable_name(name: &str) -> bool {
+    is_request_token(name) && is_tool_name_safe(name)
+}
+
 /// What one `mcp` grant reaches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpGrantScope {
@@ -174,17 +199,22 @@ impl McpGrantScope {
     }
 
     /// Whether the grant reaches `server`. This answers a server-level request, one that names
-    /// no tool.
+    /// no tool. A server id no call can carry (see [`is_request_token`] and
+    /// [`is_tool_name_safe`]) is never reached.
     pub fn covers_server(&self, server: &str) -> bool {
-        self.servers
-            .as_ref()
-            .map_or(true, |ids| ids.iter().any(|id| id == server))
+        is_callable_name(server)
+            && self
+                .servers
+                .as_ref()
+                .map_or(true, |ids| ids.iter().any(|id| id == server))
     }
 
     /// Whether the grant reaches the tool named `tool` on `server`. `tool` is a literal name,
-    /// never a pattern; a name that fails [`is_tool_name_safe`] is never covered.
+    /// never a pattern. A name no call can carry (see [`is_request_token`] and
+    /// [`is_tool_name_safe`]) is never covered, so a listing never shows a tool whose call the
+    /// grant check refuses for its name.
     pub fn covers_tool(&self, server: &str, tool: &str) -> bool {
-        if !self.covers_server(server) || !is_tool_name_safe(tool) {
+        if !self.covers_server(server) || !is_callable_name(tool) {
             return false;
         }
         let Some(patterns) = &self.tool_patterns else {
@@ -331,6 +361,56 @@ mod tests {
         assert!(s.covers_tool("github", "get_*"));
         assert!(!s.covers_tool("github", "search_*"));
         assert!(!s.covers_tool("github", "get_\u{200B}x"));
+    }
+
+    #[test]
+    fn request_tokens_are_the_names_a_call_can_carry() {
+        assert!(is_request_token("get_issue"));
+        assert!(is_request_token(SERVER_WIDE_TOOL));
+        assert!(is_request_token(&"a".repeat(MAX_REQUEST_TOKEN_BYTES)));
+        assert!(!is_request_token(&"a".repeat(MAX_REQUEST_TOKEN_BYTES + 1)));
+        // Trimming is Unicode-aware: a no-break or ideographic space counts as whitespace.
+        for name in [
+            "",
+            ",",
+            "get_a,get_b",
+            " get",
+            "get ",
+            "get\u{00A0}",
+            "\u{3000}get",
+        ] {
+            assert!(!is_request_token(name), "{name:?}");
+        }
+    }
+
+    // A listing must not show a name the call-time check refuses: the call reads its tokens as
+    // comma-separated values, so a name that would split, trim or vanish is never covered, even
+    // by an unrestricted scope.
+    #[test]
+    fn scope_never_covers_a_name_no_call_can_carry() {
+        let open = McpGrantScope::unrestricted();
+        let restricted = scope(Some(&["github"]), Some(&["get_*"]));
+        let longest = format!("get_{}", "x".repeat(MAX_REQUEST_TOKEN_BYTES - 4));
+        assert!(open.covers_tool("github", &longest));
+        assert!(restricted.covers_tool("github", &longest));
+        let too_long = format!("{longest}x");
+        for tool in [
+            "",
+            "get_a,get_b",
+            "get_x ",
+            " get_x",
+            "get_x\u{00A0}",
+            too_long.as_str(),
+        ] {
+            assert!(!open.covers_tool("github", tool), "{tool:?}");
+            assert!(!restricted.covers_tool("github", tool), "{tool:?}");
+        }
+        for server in ["", "git,hub", " github", "github ", "git\u{200B}hub"] {
+            assert!(!open.covers_server(server), "{server:?}");
+            assert!(!open.covers_server_wide(server), "{server:?}");
+            assert!(!open.covers_tool(server, "get_x"), "{server:?}");
+        }
+        assert!(!restricted.covers_server("github "));
     }
 
     #[test]

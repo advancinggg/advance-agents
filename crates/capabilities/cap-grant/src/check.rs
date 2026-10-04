@@ -69,9 +69,10 @@ pub enum AuthzLevel {
 /// held grant COVERS it (`SubsetValidatorImpl::covers_request`); a request whose
 /// params fail projection → `Deny`. This closes the would-be elevation-of-privilege
 /// where a narrowly-scoped grant (e.g. `fs.read: { read-paths: /tmp/foo }`) must
-/// not authorize an `fs.read` request for a different path. The held grant's
-/// stored `Vec<CapParam>` is canonical (validated at issue time); only the
-/// request is projected.
+/// not authorize an `fs.read` request for a different path. Only the request is
+/// projected. Held grants are not re-validated at call time: a static-config
+/// grant is stored as written and may be malformed, and the family rule reads it
+/// as it is (the `mcp` rule reads a malformed part as covering nothing).
 pub struct GrantCheckImpl {
     store: Arc<GrantStore>,
     authz_level: AuthzLevel,
@@ -137,11 +138,12 @@ impl GrantCheck for GrantCheckImpl {
         // this capability COVERS the request under the CONTRACT-122 subset rules
         // (`SubsetValidatorImpl::covers_request(held_grant, request_draft)`, the
         // issuance rule except for `mcp` call requests). A request
-        // whose params fail the projection → Deny (fail-closed preserved). The
-        // held grant's stored `Vec<CapParam>` is already canonical (validated at
-        // issue time); only the request is projected. `CapParams::Null`
-        // (whole-capability) falls through to the unchanged capability-level path
-        // (Step 2).
+        // whose params fail the projection → Deny (fail-closed preserved). Only
+        // the request is projected; held grants are not re-validated here. A
+        // static-config grant is stored as written and may be malformed, and the
+        // family rule reads it as it is (`mcp` reads a malformed part as covering
+        // nothing). `CapParams::Null` (whole-capability) falls through to the
+        // unchanged capability-level path (Step 2).
         if !matches!(params.as_value(), serde_json::Value::Null) {
             let now = chrono::Utc::now();
             let child_params =

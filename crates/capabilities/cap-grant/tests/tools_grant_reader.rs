@@ -9,7 +9,7 @@
 mod common;
 
 use advance_shared_types::capability::{CapParams, GrantDecision};
-use advance_shared_types::mcp::McpGrantScope;
+use advance_shared_types::mcp::{McpGrantScope, MAX_REQUEST_TOKEN_BYTES};
 use advance_shared_types::traits::{GrantCheck, McpGrantReader, ToolsGrantReader};
 use cap_grant::data::{
     CapParam, Grant, GrantId, GrantIssuer, GrantProvenance, GrantStatus, GrantTtl,
@@ -254,7 +254,9 @@ fn mgr_03_colon_to_bare_bridge() {
 
 // A listing filtered through the scopes shows exactly what the call-time check allows,
 // keeps grants apart, and writes no `authz.checked` event, while the same filter run
-// through `GrantCheck` writes one deny event per hidden entry.
+// through `GrantCheck` writes one deny event per hidden entry. Names the call cannot carry
+// (they would split, trim or vanish as request tokens, or run past the request string limit)
+// stay hidden, even where a pattern or an open tool axis would match them.
 #[test]
 fn mgr_04_filtered_listing_matches_the_check_and_emits_nothing() {
     let (store, bus, _h) = make_store();
@@ -268,11 +270,21 @@ fn mgr_04_filtered_listing_matches_the_check_and_emits_nothing() {
     store
         .insert(mcp_grant("g-b", "alice", &[("servers", "notes")]))
         .unwrap();
+    let longest = "x".repeat(MAX_REQUEST_TOKEN_BYTES);
+    let too_long = "x".repeat(MAX_REQUEST_TOKEN_BYTES + 1);
     let listed = [
         ("github", "get_issue"),
         ("github", "get_pr"),
         ("github", "delete_repo"),
+        ("github", "get_x "),
+        ("github", "get_a,get_b"),
         ("notes", "delete_note"),
+        ("notes", ""),
+        ("notes", " note"),
+        ("notes", "note\u{00A0}"),
+        ("notes", "a,b"),
+        ("notes", longest.as_str()),
+        ("notes", too_long.as_str()),
         ("slack", "get_channel"),
         ("slack", "post"),
     ];
@@ -289,7 +301,8 @@ fn mgr_04_filtered_listing_matches_the_check_and_emits_nothing() {
         vec![
             ("github", "get_issue"),
             ("github", "get_pr"),
-            ("notes", "delete_note")
+            ("notes", "delete_note"),
+            ("notes", longest.as_str()),
         ]
     );
     assert_eq!(bus.count_of("authz.checked"), 0);

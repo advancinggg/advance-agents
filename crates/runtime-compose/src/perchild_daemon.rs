@@ -8,7 +8,9 @@
 //!   active-parent / `caller==parent.grantee` / SUBSET / TTL+expiry clamp), so the
 //!   child's own `send` passes the L1 grant gate — a served child that cannot act
 //!   is not live. A capability declared with params is delegated with exactly
-//!   those params; a bare one takes the parent grant's params;
+//!   those params; a bare one takes the parent grant's params. The parent's
+//!   grants for the capability are tried in id order, and the first that accepts
+//!   the delegation is used;
 //! - **(seam e)** registers the child's colon adjacency in the shared
 //!   [`DynamicRouting`] + its colon/bare pair in the shared [`AgentIdBridge`], so a
 //!   parent→child `send`/`await` routes with NO harness-supplied entry;
@@ -460,65 +462,95 @@ impl PerChildLoopManager {
     /// grants via the first-class `delegate_grant` primitive (which enforces
     /// active-parent / caller==parent.grantee / SUBSET / TTL+expiry clamp — the
     /// child grant provably cannot widen or outlive the parent). Best-effort per
-    /// cap: a cap the parent does not hold is simply not delegated.
+    /// cap: a cap the parent does not hold is simply not delegated. When the
+    /// parent holds several grants for a cap, they are tried in id order and the
+    /// first one that accepts the delegation is used, so the outcome never
+    /// depends on the store's hash order.
     fn delegate_child_grants(&self, parent_bare: &str, child_bare: &str, caps: &[Capability]) {
         let Some(grant_store) = self.grant_store.as_ref() else {
             return;
         };
         let now = chrono::Utc::now();
-        let parent_grants = grant_store.list_by_grantee(parent_bare);
+        // Only a grant that still authorizes the parent can be delegated from.
+        let mut parent_grants = grant_store.list_by_grantee(parent_bare);
+        parent_grants
+            .retain(|g| g.status == GrantStatus::Active && g.expires_at.map_or(true, |t| t > now));
+        parent_grants.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
         let validator = SubsetValidatorImpl::new();
         for cap in caps {
             let cap_name = cap.id.as_str();
-            // Only a grant that still authorizes the parent can be delegated from.
-            let Some(pg) = parent_grants.iter().find(|g| {
-                g.capability.as_str() == cap_name
-                    && g.status == GrantStatus::Active
-                    && g.expires_at.map_or(true, |t| t > now)
-            }) else {
-                continue;
-            };
-            // `fs` path params are relative to the grantee's own territory, so a restricted
-            // parent grant does not carry over to a child; that case is reported instead of
-            // delegated.
-            if cap_name == "fs" && !pg.params.is_empty() {
-                self.log.err(
-                    log_keys::PERCHILD_NO_FS_GRANT,
-                    format!(
-                        "advance: WARN child {child_bare} gets no `fs` grant: the parent's `fs` \
-                         grant is path-restricted and paths do not carry across territories"
-                    ),
-                );
+            let mut candidates = parent_grants
+                .iter()
+                .filter(|g| g.capability.as_str() == cap_name)
+                .peekable();
+            if candidates.peek().is_none() {
                 continue;
             }
             // A capability the child declared with params is delegated with exactly those
             // params, so the child never holds more than it asked for; `delegate_grant`
-            // refuses them when they are wider than the parent grant. A bare declaration
-            // takes what the parent holds (a whole-capability draft would be refused against
-            // a restricted parent grant as a widening).
-            let params = match project_capability_params(cap) {
-                Ok(own) if !own.is_empty() => own,
-                Ok(_) => pg.params.clone(),
+            // refuses them against a parent grant they are wider than. A bare declaration
+            // takes what the parent grant holds (a whole-capability draft would be refused
+            // against a restricted parent grant as a widening).
+            let declared = match project_capability_params(cap) {
+                Ok(declared) => declared,
                 Err(e) => {
-                    eprintln!("advance: WARN child {child_bare} gets no `{cap_name}` grant: {e}");
+                    self.log.err(
+                        log_keys::PERCHILD_NO_GRANT,
+                        format!("advance: WARN child {child_bare} gets no `{cap_name}` grant: {e}"),
+                    );
                     continue;
                 }
             };
-            let draft = GrantDraft {
-                capability: cap_name.to_string(),
-                params,
-                ttl: GrantTtl::Persistent,
-            };
-            if let Err(e) = grant_store.delegate_grant(
-                pg.id.as_str(),
-                child_bare,
-                draft,
-                parent_bare,
-                &validator,
-            ) {
+            let mut refusals: Vec<String> = Vec::new();
+            let mut refused_restricted_fs = false;
+            let delegated = candidates.any(|pg| {
+                // `fs` path params are relative to the grantee's own territory, so a
+                // restricted parent grant does not carry over to a child.
+                if cap_name == "fs" && !pg.params.is_empty() {
+                    refused_restricted_fs = true;
+                    refusals.push(
+                        "the parent's `fs` grant is path-restricted and paths do not carry \
+                         across territories"
+                            .to_string(),
+                    );
+                    return false;
+                }
+                let params = if declared.is_empty() {
+                    pg.params.clone()
+                } else {
+                    declared.clone()
+                };
+                let draft = GrantDraft {
+                    capability: cap_name.to_string(),
+                    params,
+                    ttl: GrantTtl::Persistent,
+                };
+                match grant_store.delegate_grant(
+                    pg.id.as_str(),
+                    child_bare,
+                    draft,
+                    parent_bare,
+                    &validator,
+                ) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        refusals.push(e.to_string());
+                        false
+                    }
+                }
+            });
+            if !delegated {
+                let key = if refused_restricted_fs && refusals.len() == 1 {
+                    log_keys::PERCHILD_NO_FS_GRANT
+                } else {
+                    log_keys::PERCHILD_NO_GRANT
+                };
                 self.log.err(
-                    log_keys::PERCHILD_NO_GRANT,
-                    format!("advance: WARN child {child_bare} gets no `{cap_name}` grant: {e}"),
+                    key,
+                    format!(
+                        "advance: WARN child {child_bare} gets no `{cap_name}` grant: {}",
+                        refusals.join("; ")
+                    ),
                 );
             }
         }
@@ -819,10 +851,11 @@ mod tests {
         }
     }
 
-    /// `root` holds `parent_grants`; its child `kid` declares `child_caps`. No runtime is bound,
-    /// so spawning the child runs the grant delegation and stops there.
+    /// `root` holds `parent_grants` (`(grant id, capability, params)`); its child `kid` declares
+    /// `child_caps`. No runtime is bound, so spawning the child runs the grant delegation and
+    /// stops there.
     fn spawn_kid(
-        parent_grants: Vec<(&str, Vec<CapParam>)>,
+        parent_grants: Vec<(&str, &str, Vec<CapParam>)>,
         child_caps: Vec<Capability>,
     ) -> Vec<Grant> {
         let ws = tempfile::TempDir::new().expect("tempdir");
@@ -862,10 +895,10 @@ mod tests {
         index.ensure_schema().expect("grant schema");
         let bus: Arc<dyn EventBusEmit> = Arc::new(NullBus);
         let grants = Arc::new(GrantStore::new(index, bus.clone()));
-        for (capability, params) in parent_grants {
+        for (id, capability, params) in parent_grants {
             grants
                 .insert(Grant {
-                    id: GrantId::new(format!("static:root:{capability}")),
+                    id: GrantId::new(id),
                     grantee: "root".to_string(),
                     capability: capability.to_string(),
                     params,
@@ -896,11 +929,14 @@ mod tests {
         grants.list_by_grantee("kid")
     }
 
-    fn params_of<'a>(grants: &'a [Grant], capability: &str) -> Option<&'a [CapParam]> {
+    fn grant_of<'a>(grants: &'a [Grant], capability: &str) -> Option<&'a Grant> {
         grants
             .iter()
             .find(|g| g.capability == capability && g.status == GrantStatus::Active)
-            .map(|g| g.params.as_slice())
+    }
+
+    fn params_of<'a>(grants: &'a [Grant], capability: &str) -> Option<&'a [CapParam]> {
+        grant_of(grants, capability).map(|g| g.params.as_slice())
     }
 
     fn value_of<'a>(params: &'a [CapParam], key: &str) -> Option<&'a str> {
@@ -913,7 +949,10 @@ mod tests {
     #[tokio::test]
     async fn a_child_declaring_params_gets_exactly_those_params() {
         let kid = spawn_kid(
-            vec![("mcp", Vec::new()), ("fs", Vec::new())],
+            vec![
+                ("static:root:mcp", "mcp", Vec::new()),
+                ("static:root:fs", "fs", Vec::new()),
+            ],
             vec![
                 declared(
                     "mcp",
@@ -934,7 +973,7 @@ mod tests {
     #[tokio::test]
     async fn a_bare_declaration_takes_the_parent_grant_params() {
         let kid = spawn_kid(
-            vec![("mcp", vec![param("servers", "github")])],
+            vec![("static:root:mcp", "mcp", vec![param("servers", "github")])],
             vec![declared("mcp", serde_json::Value::Null)],
         );
         let mcp = params_of(&kid, "mcp").expect("mcp delegated");
@@ -943,11 +982,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn declared_params_narrower_than_a_restricted_parent_grant_are_delegated() {
+        let kid = spawn_kid(
+            vec![(
+                "static:root:mcp",
+                "mcp",
+                vec![
+                    param("servers", "github,slack"),
+                    param("tool-patterns", "get_*,search_code"),
+                ],
+            )],
+            vec![declared(
+                "mcp",
+                json!({"servers": ["github"], "tool-patterns": ["get_issue"]}),
+            )],
+        );
+        let mcp = params_of(&kid, "mcp").expect("mcp delegated");
+        assert_eq!(mcp.len(), 2, "{mcp:?}");
+        assert_eq!(value_of(mcp, "servers"), Some("github"));
+        assert_eq!(value_of(mcp, "tool-patterns"), Some("get_issue"));
+    }
+
+    // The grant that sorts first by id does not cover the declaration (a different server; a
+    // path-restricted `fs` grant), so the delegation comes from the one after it that does,
+    // whatever order the store lists them in.
+    #[tokio::test]
+    async fn a_declaration_is_delegated_from_the_parent_grant_that_accepts_it() {
+        // Dynamic grant ids are UUIDs, which sort before `static:` ids.
+        let kid = spawn_kid(
+            vec![
+                (
+                    "00000000-0000-4000-8000-000000000001",
+                    "mcp",
+                    vec![param("servers", "github")],
+                ),
+                ("static:root:mcp", "mcp", vec![param("servers", "slack")]),
+                (
+                    "00000000-0000-4000-8000-000000000002",
+                    "fs",
+                    vec![param("read-paths", "/notes")],
+                ),
+                ("static:root:fs", "fs", Vec::new()),
+            ],
+            vec![
+                declared("mcp", json!({"servers": ["slack"]})),
+                declared("fs", serde_json::Value::Null),
+            ],
+        );
+        let mcp = grant_of(&kid, "mcp").expect("mcp delegated");
+        assert_eq!(mcp.params, vec![param("servers", "slack")]);
+        assert_eq!(
+            mcp.provenance,
+            GrantProvenance::Delegated(GrantId::new("static:root:mcp"))
+        );
+        let fs = grant_of(&kid, "fs").expect("fs delegated");
+        assert!(fs.params.is_empty(), "{fs:?}");
+        assert_eq!(
+            fs.provenance,
+            GrantProvenance::Delegated(GrantId::new("static:root:fs"))
+        );
+        assert_eq!(kid.len(), 2, "{kid:?}");
+    }
+
+    #[tokio::test]
     async fn declared_params_wider_than_the_parent_grant_get_nothing() {
         let kid = spawn_kid(
             vec![
-                ("mcp", vec![param("servers", "github")]),
-                ("fs", vec![param("read-paths", "/notes")]),
+                ("static:root:mcp", "mcp", vec![param("servers", "github")]),
+                ("static:root:fs", "fs", vec![param("read-paths", "/notes")]),
             ],
             vec![
                 declared("mcp", json!({"servers": ["github", "slack"]})),

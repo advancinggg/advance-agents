@@ -65,6 +65,11 @@ pub const MAX_PARAMS_ARRAY_LEN: usize = 256;
 /// `MAX_PARAMS_BYTES = 4096` in `delegate_grant` (store.rs:1148).
 pub const MAX_PARAMS_STRING_BYTES: usize = 4096;
 
+// An `mcp` grant scope covers no name longer than one request string may be, so a listing
+// filtered through the scopes never shows an entry this projection would refuse at call time.
+const _: () =
+    assert!(advance_shared_types::mcp::MAX_REQUEST_TOKEN_BYTES == MAX_PARAMS_STRING_BYTES);
+
 /// Whitelist of param keys per capability family. Matches the
 /// `SubsetValidatorImpl::validate` match dispatch in `subset.rs` exactly.
 fn allowed_param_keys(capability: &str) -> Option<&'static [&'static str]> {

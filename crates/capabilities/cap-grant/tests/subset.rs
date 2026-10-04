@@ -5,7 +5,7 @@
 //! spawn-child AND spawn-sub) + 8 boundary conditions + 2 URL-pattern
 //! abuse-vector tests (Round 5 Warning 2 fix).
 
-use advance_shared_types::mcp::SERVER_WIDE_TOOL;
+use advance_shared_types::mcp::{MAX_REQUEST_TOKEN_BYTES, SERVER_WIDE_TOOL};
 use cap_grant::data::{
     CapParam, Grant, GrantDraft, GrantId, GrantIssuer, GrantProvenance, GrantStatus, GrantTtl,
 };
@@ -472,6 +472,34 @@ fn mcp_keys_outside_servers_and_tool_patterns_are_violations() {
     assert!(violates(&v, &typo_parent, &ch));
 }
 
+// From `mcp: true` (the most common root form) `validate` still refuses a child with a
+// misspelled key or a malformed pattern, which would otherwise mint a grant that silently
+// covers less than it reads.
+#[test]
+fn mcp_child_grammar_is_checked_under_a_whole_capability_parent() {
+    let v = SubsetValidatorImpl::new();
+    let whole = parent("mcp", vec![]);
+    for well_formed in [
+        vec![],
+        vec![p("servers", "github")],
+        vec![
+            p("servers", "github"),
+            p("tool-patterns", "get_*,search_code"),
+        ],
+    ] {
+        let ch = draft("mcp", well_formed);
+        assert!(v.validate(&whole, &ch).is_ok(), "{ch:?}");
+    }
+    for bad in ["*", "a*b", "get_*_x", "*get", "get?", "x[1]", "x{a}"] {
+        let ch = draft("mcp", vec![p("servers", "github"), p("tool-patterns", bad)]);
+        assert!(violates(&v, &whole, &ch), "pattern {bad}");
+    }
+    for typo in ["tool_patterns", "server", "tools"] {
+        let ch = draft("mcp", vec![p("servers", "github"), p(typo, "get_*")]);
+        assert!(violates(&v, &whole, &ch), "key {typo}");
+    }
+}
+
 // ===== covers_request: the call-time check of the L1 gate =====
 
 #[test]
@@ -496,6 +524,15 @@ fn covers_request_reads_mcp_tokens_as_literal_names() {
     // A name never widens to a pattern: `get*` does not start with `get_`.
     assert!(v.covers_request(&held, &call("get*")).is_err());
     assert!(v.covers_request(&held, &call("get_\u{200B}x")).is_err());
+    // A name longer than one request string may be is never covered, even by a
+    // whole-capability grant.
+    let whole = parent("mcp", vec![]);
+    let longest = format!("get_{}", "x".repeat(MAX_REQUEST_TOKEN_BYTES - 4));
+    assert!(v.covers_request(&whole, &call(&longest)).is_ok());
+    assert!(v.covers_request(&held, &call(&longest)).is_ok());
+    let too_long = format!("{longest}x");
+    assert!(v.covers_request(&whole, &call(&too_long)).is_err());
+    assert!(v.covers_request(&held, &call(&too_long)).is_err());
 }
 
 #[test]
