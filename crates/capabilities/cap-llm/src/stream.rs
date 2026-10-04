@@ -2190,6 +2190,13 @@ impl StreamRegistry {
             .collect()
     }
 
+    /// Every live stream in the registry, of every agent (one map-lock acquisition, no
+    /// settlement I/O): the victim set of a shutdown reap.
+    pub(crate) fn select_all_victims(&self) -> Vec<(u64, Arc<LiveStream>)> {
+        let ltable = self.live_table.lock().unwrap_or_else(|p| p.into_inner());
+        ltable.iter().map(|(h, b)| (*h, b.clone())).collect()
+    }
+
     /// Host-authoritative turn-end reap (ADR 2026-07-22 D5, tee slice T3): settle
     /// every live stream still owned by `agent_id` (the BARE cap-id).
     ///
@@ -3257,6 +3264,28 @@ mod tests {
                 reg2.live_table.lock().unwrap().is_empty(),
                 "post-publish, the next boundary reclaims the slot"
             );
+        });
+    }
+
+    /// MODULE-001-AC-30: the shutdown victim set spans every agent, and settling it
+    /// leaves the registry empty.
+    #[test]
+    fn module_001_ac30_select_all_victims_spans_every_agent() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let reg = Arc::new(StreamRegistry::new());
+            let bus = Arc::new(RecBus::default());
+            let a = mk_live(mk_settlement(RecBudget::new(), bus.clone(), 1, 1));
+            let mut b = mk_live(mk_settlement(RecBudget::new(), bus.clone(), 1, 1));
+            b.agent_id = "agent-B".into();
+            assert!(reg.insert_live(a).is_ok());
+            assert!(reg.insert_live(b).is_ok());
+            assert_eq!(reg.select_agent_victims("agent-A").len(), 1);
+            let all = reg.select_all_victims();
+            assert_eq!(all.len(), 2, "both agents' streams");
+            assert_eq!(reg.settle_and_evict(all), 2, "two wins");
+            assert!(reg.live_table.lock().unwrap().is_empty());
+            assert!(reg.select_all_victims().is_empty());
         });
     }
 

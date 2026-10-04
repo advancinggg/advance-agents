@@ -412,9 +412,57 @@ impl ChatGptSignIn {
                 metadata: Mutex::new(None),
                 jwks: Mutex::new(None),
                 generation: AtomicU64::new(0),
+                closed: AtomicBool::new(false),
+                closing: Mutex::new(Vec::new()),
             }),
             worker: RenewalWorker::default(),
         }
+    }
+
+    /// Close the sign-in for an ordered shutdown, without blocking:
+    ///
+    /// - every sign-in attempt in flight is told to end (its thread closes its loopback
+    ///   listener and exits);
+    /// - the renewal thread gets no new work: the renewals it already started finish and
+    ///   persist the rotated session (a renewal that reached the authorization server has
+    ///   already rotated the refresh token), then the thread exits; nothing is aborted;
+    /// - from now on [`ChatGptSignInPort::start`] and
+    ///   [`ProviderCredentialSource::ensure_fresh`] answer `unavailable`.
+    ///
+    /// [`Self::threads_exited`] tells when every such thread has ended; each is bounded by
+    /// its own work (an attempt's model-list request, a renewal's token request). Idempotent.
+    pub fn close(&self) {
+        self.inner.closed.store(true, Ordering::SeqCst);
+        let names: Vec<Arc<NameState>> = lock(&self.inner.names).values().cloned().collect();
+        let mut exited = Vec::new();
+        for ns in names {
+            let slot = lock(&ns.state).attempt.take();
+            if let Some(mut slot) = slot {
+                slot.stop.notify_one();
+                if let Some(rx) = slot.exited.take() {
+                    exited.push(rx);
+                }
+            }
+        }
+        lock(&self.inner.closing).extend(exited);
+        self.worker.close();
+    }
+
+    /// After [`Self::close`]: `true` once every attempt thread it ended and the renewal
+    /// thread have exited (the renewal thread is joined then, which returns at once).
+    /// Non-blocking; an owner polls it.
+    pub fn threads_exited(&self) -> bool {
+        let attempts_done = {
+            let mut closing = lock(&self.inner.closing);
+            closing.retain(|exited| {
+                !matches!(
+                    exited.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected)
+                )
+            });
+            closing.is_empty()
+        };
+        attempts_done && self.worker.thread_exited()
     }
 
     /// Override the clock (tests / product composition roots).
@@ -544,6 +592,9 @@ impl ProviderCredentialSource for ChatGptSignIn {
         _provider_id: &str,
         secret_name: &str,
     ) -> Result<(), CredentialFailure> {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return Err(CredentialFailure::Unavailable);
+        }
         let inner = Arc::clone(&self.inner);
         let name = secret_name.to_string();
         let (reply, answer) = tokio::sync::oneshot::channel();
@@ -552,9 +603,12 @@ impl ProviderCredentialSource for ChatGptSignIn {
             let mut usable_tx = Some(usable_tx);
             let _ = reply.send(inner.ensure_fresh(&name, false, &mut usable_tx).await);
         });
-        if let Err(job) = self.worker.submit(job) {
+        match self.worker.submit(job) {
+            Ok(()) => {}
+            // Closed in the meantime: the job never started.
+            Err(Rejected::Closed) => return Err(CredentialFailure::Unavailable),
             // No renewal thread could be started: serve the call here.
-            job.await;
+            Err(Rejected::NoThread(job)) => job.await,
         }
         let unanswered = || Err(CredentialFailure::Unavailable);
         tokio::pin!(answer);
@@ -585,18 +639,32 @@ impl ProviderCredentialSource for ChatGptSignIn {
 type Job = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// A thread owned by one [`ChatGptSignIn`], with its own current-thread runtime, that runs the
-/// gateway's renewals. Started on first use; when its owner is dropped it finishes the renewals
-/// already started and exits.
+/// gateway's renewals. Started on first use; when its owner is dropped or closed it finishes the
+/// renewals already started and exits.
 #[derive(Default)]
 struct RenewalWorker {
     jobs: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Job>>>,
+    /// The thread last started, for [`RenewalWorker::thread_exited`].
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Set (under the `jobs` lock) by [`RenewalWorker::close`]: no thread is started any more.
+    closed: AtomicBool,
+}
+
+/// Why [`RenewalWorker::submit`] did not take a job.
+enum Rejected {
+    /// The worker was closed: the job must not run.
+    Closed,
+    /// No thread could be started: the caller may run the job itself.
+    NoThread(Job),
 }
 
 impl RenewalWorker {
-    /// Hand `job` to the thread (starting it when needed). `Err(job)` when no thread could be
-    /// started.
-    fn submit(&self, job: Job) -> Result<(), Job> {
+    /// Hand `job` to the thread (starting it when needed).
+    fn submit(&self, job: Job) -> Result<(), Rejected> {
         let mut slot = lock(&self.jobs);
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(Rejected::Closed);
+        }
         let job = match slot.as_ref() {
             Some(jobs) => match jobs.send(job) {
                 Ok(()) => return Ok(()),
@@ -608,14 +676,39 @@ impl RenewalWorker {
         let spawned = std::thread::Builder::new()
             .name("chatgpt-renewal".into())
             .spawn(move || run_renewal_worker(queue));
-        if spawned.is_err() {
-            return Err(job);
-        }
+        let Ok(thread) = spawned else {
+            return Err(Rejected::NoThread(job));
+        };
+        *lock(&self.thread) = Some(thread);
         let sent = jobs
             .send(job)
-            .map_err(|tokio::sync::mpsc::error::SendError(job)| job);
+            .map_err(|tokio::sync::mpsc::error::SendError(job)| Rejected::NoThread(job));
         *slot = Some(jobs);
         sent
+    }
+
+    /// Stop handing work to the thread: the job queue is closed, so the thread runs what it
+    /// already holds to completion and exits.
+    fn close(&self) {
+        let mut slot = lock(&self.jobs);
+        self.closed.store(true, Ordering::SeqCst);
+        drop(slot.take());
+    }
+
+    /// `true` when no renewal thread is running (none was started, or it has exited and is
+    /// joined now).
+    fn thread_exited(&self) -> bool {
+        let mut thread = lock(&self.thread);
+        match thread.as_ref() {
+            None => true,
+            Some(handle) if handle.is_finished() => {
+                if let Some(handle) = thread.take() {
+                    let _ = handle.join();
+                }
+                true
+            }
+            Some(_) => false,
+        }
     }
 }
 
@@ -659,6 +752,10 @@ struct Inner {
     metadata: Mutex<Option<IssuerMetadata>>,
     jwks: Mutex<Option<Arc<JwkSet>>>,
     generation: AtomicU64,
+    /// Set by [`ChatGptSignIn::close`]: no attempt starts and no renewal is accepted any more.
+    closed: AtomicBool,
+    /// The exit receivers of the attempts `close` ended, until each thread has exited.
+    closing: Mutex<Vec<std::sync::mpsc::Receiver<()>>>,
 }
 
 /// Everything kept per secret name. Lock order: `control` → `session` → `state`.
@@ -1190,7 +1287,7 @@ impl Inner {
 
     fn start(self: &Arc<Self>, name: &str) -> Result<SignInStarted, SignInRefusal> {
         let refuse = SignInRefusal(REASON_UNAVAILABLE);
-        if !valid_secret_name(name) {
+        if !valid_secret_name(name) || self.closed.load(Ordering::SeqCst) {
             return Err(refuse);
         }
         let host_id = self.ensure_host_id().map_err(|()| refuse)?;
@@ -1237,6 +1334,11 @@ impl Inner {
         let (exited_tx, exited_rx) = std::sync::mpsc::channel::<()>();
         {
             let mut st = lock(&ns.state);
+            // Checked under the state lock `close` takes the attempt slots with: an attempt is
+            // either refused here or ended by `close`.
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(refuse);
+            }
             st.attempt = Some(AttemptSlot {
                 generation,
                 expires_at_ms,

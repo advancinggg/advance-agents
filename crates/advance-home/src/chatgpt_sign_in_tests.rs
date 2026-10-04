@@ -4124,3 +4124,74 @@ async fn a_tls_handshake_failure_on_renewal_is_retried() {
     assert_eq!(h.chain.attempts_to(&token_endpoint()), 2);
     assert_eq!(h.idp.token_forms("refresh_token").len(), 1);
 }
+
+// ── close (MODULE-001-AC-30 ordered shutdown) ───────────────────────────────────────────────
+
+#[test]
+fn module_001_ac30_chatgpt_sign_in_close_is_non_blocking() {
+    let h = harness();
+    let started = h.sign_in.start(NAME).expect("start");
+    let port = port_of(&started);
+
+    let begun = Instant::now();
+    h.sign_in.close();
+    assert!(
+        begun.elapsed() < Duration::from_millis(200),
+        "close returns at once, took {:?}",
+        begun.elapsed()
+    );
+    wait_until("the attempt thread exited", || h.sign_in.threads_exited());
+    // Its loopback listener is closed.
+    assert!(
+        TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).is_err(),
+        "the callback listener is closed"
+    );
+    // Nothing starts any more.
+    assert_eq!(
+        h.sign_in.start(NAME),
+        Err(SignInRefusal(REASON_UNAVAILABLE)),
+        "a sign-in after close is refused"
+    );
+    assert_eq!(block(h.ensure()), Err(CredentialFailure::Unavailable));
+    // Idempotent.
+    h.sign_in.close();
+    assert!(h.sign_in.threads_exited());
+}
+
+#[tokio::test]
+async fn module_001_ac30_chatgpt_sign_in_close_lets_the_inflight_renewal_finish_and_persist() {
+    let h = harness();
+    h.seed_session(T0_MS + 60_000, FULL_SCOPE);
+    h.idp
+        .with(|st| st.refresh_delay = Duration::from_millis(400));
+    // The renewal starts on the renewal thread; this caller stops waiting.
+    let gave_up = tokio::time::timeout(Duration::from_millis(50), h.ensure()).await;
+    assert!(gave_up.is_err(), "the renewal is still in flight");
+
+    let begun = Instant::now();
+    h.sign_in.close();
+    assert!(
+        begun.elapsed() < Duration::from_millis(200),
+        "close never waits"
+    );
+    assert!(
+        !h.sign_in.threads_exited(),
+        "the renewal thread finishes the renewal it started"
+    );
+    assert_eq!(h.ensure().await, Err(CredentialFailure::Unavailable));
+
+    wait_until_async("the renewal thread exited", || h.sign_in.threads_exited()).await;
+    // The renewal was neither aborted nor detached: the rotated session is persisted.
+    let rotated = h.idp.with(|st| st.refresh.clone());
+    assert_ne!(
+        rotated.as_deref(),
+        Some("REFRESH-SEED-zq"),
+        "rotated upstream"
+    );
+    assert_eq!(
+        h.record().unwrap()["session"]["refresh_token"].as_str(),
+        rotated.as_deref(),
+        "the rotated refresh token is stored"
+    );
+    assert_eq!(h.refreshes(), 1);
+}

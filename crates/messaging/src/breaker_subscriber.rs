@@ -115,6 +115,13 @@ impl BreakerSubscriber {
     pub fn handle(&self) -> &JoinHandle<()> {
         &self.handle
     }
+
+    /// Abort the task and wait until it has ended (its `Arc<MailboxStore>` clone is
+    /// released when this returns). For an ordered shutdown; `Drop` still only aborts.
+    pub async fn shutdown(mut self) {
+        self.handle.abort();
+        let _ = (&mut self.handle).await;
+    }
 }
 
 impl Drop for BreakerSubscriber {
