@@ -472,8 +472,9 @@ struct AsyncState {
     join_handles: TokioMutex<Vec<JoinHandle<()>>>,
     /// `None` when the bus was built by [`EventBus::new_without_server`].
     server_addr: Option<SocketAddr>,
-    /// Cancels every connected `/events` WebSocket client (a child of
-    /// `cancel_token`); see [`EventBus::shutdown_shared`].
+    /// Cancels every connected `/events` WebSocket client; fired only by
+    /// [`EventBus::shutdown_shared`] (independent of `cancel_token`, so
+    /// [`EventBus::shutdown`] leaves the clients as they are).
     ws_cancel: CancellationToken,
     /// Tracks the upgraded `/events` client tasks, which axum spawns detached.
     ws_tasks: TaskTracker,
@@ -486,6 +487,38 @@ struct AsyncState {
     read_broadcaster: broadcast::Sender<Arc<Event>>,
     read_clock: Arc<dyn Clock>,
     read_retention_days: u32,
+}
+
+impl AsyncState {
+    /// Steps 1–5 of [`EventBus::shutdown`]. Each handle is awaited in place, under
+    /// the lock of the slot that holds it, and leaves the slot only once it has
+    /// resolved (see [`EventBus::shutdown_shared`]).
+    async fn stop_tasks(&self) {
+        // Step 1: cancel sweeper first.
+        self.sweeper_cancel_token.cancel();
+        // Step 2: await the sweeper's join; its slot stays locked, and keeps the
+        // handle, until the sweeper has ended.
+        {
+            let mut sweeper = self.sweeper_handle.lock().await;
+            if let Some(handle) = sweeper.as_mut() {
+                let _ = handle.await;
+                *sweeper = None;
+            }
+        }
+        // Step 3: soft flush barrier — yield once to let durable-sink actors poll
+        // their channels for any late sweeper warnings.
+        tokio::task::yield_now().await;
+        // Step 4: cancel remaining actors.
+        self.cancel_token.cancel();
+        // Step 5: join remaining actor handles in order, each removed once it has
+        // resolved (the guard is held across the joins, so a concurrent second
+        // call waits for them).
+        let mut handles = self.join_handles.lock().await;
+        while let Some(handle) = handles.first_mut() {
+            let _ = handle.await;
+            handles.remove(0);
+        }
+    }
 }
 
 /// MODULE-019 EventBus — implements CONTRACT-180 EventBusEmit.
@@ -829,17 +862,24 @@ impl EventBus {
     ///      `try_recv` drain (lib.rs spawn closures + stats_aggregator cancel
     ///      arm) processes any buffered events including the sweeper's late
     ///      warning.
-    ///   6. Cancel every connected `/events` WebSocket client (each gets a
-    ///      `Close` frame), then wait until no client task is left. axum's
-    ///      graceful server shutdown does not wait for upgraded connections.
     ///
-    /// Equivalent to [`EventBus::shutdown_shared`] followed by dropping the bus.
+    /// The upgraded `/events` WebSocket clients are left as they are: each one
+    /// ends when its peer goes away or the event broadcast closes. Use
+    /// [`EventBus::shutdown_shared`] to close and join them too.
     pub async fn shutdown(self) {
-        self.shutdown_shared().await;
+        if let EventBusMode::Async(state) = &self.mode {
+            state.stop_tasks().await;
+        }
     }
 
     /// The [`EventBus::shutdown`] sequence on a shared bus (`&self`), so an owner
-    /// holding an `Arc<EventBus>` can stop it without `Arc::try_unwrap`.
+    /// holding an `Arc<EventBus>` can stop it without `Arc::try_unwrap`, followed
+    /// by:
+    ///
+    ///   6. Cancel every connected `/events` WebSocket client (each gets a
+    ///      `Close` frame, bounded), then wait until no client task is left.
+    ///      axum's graceful server shutdown does not wait for upgraded
+    ///      connections.
     ///
     /// Idempotent and cancel-safe. Each join happens in place, under the lock of
     /// the slot that holds the handle, and the handle leaves its slot only once it
@@ -851,31 +891,7 @@ impl EventBus {
     /// dropped (`dropped_count`). No-op on the synchronous test bus.
     pub async fn shutdown_shared(&self) {
         if let EventBusMode::Async(state) = &self.mode {
-            // Step 1: cancel sweeper first.
-            state.sweeper_cancel_token.cancel();
-            // Step 2: await the sweeper's join; its slot stays locked, and keeps
-            // the handle, until the sweeper has ended.
-            {
-                let mut sweeper = state.sweeper_handle.lock().await;
-                if let Some(handle) = sweeper.as_mut() {
-                    let _ = handle.await;
-                    *sweeper = None;
-                }
-            }
-            // Step 3: soft flush barrier — yield once to let durable-sink
-            // actors poll their channels for any late sweeper warnings.
-            tokio::task::yield_now().await;
-            // Step 4: cancel remaining actors.
-            state.cancel_token.cancel();
-            // Step 5: join remaining actor handles in order, each removed once it
-            // has resolved (the guard is held across the joins, so a concurrent
-            // second call waits for them).
-            let mut handles = state.join_handles.lock().await;
-            while let Some(handle) = handles.first_mut() {
-                let _ = handle.await;
-                handles.remove(0);
-            }
-            drop(handles);
+            state.stop_tasks().await;
             // Step 6: close and join the upgraded `/events` client tasks.
             state.ws_cancel.cancel();
             state.ws_tasks.close();
@@ -1266,6 +1282,29 @@ mod shutdown_tests {
         retry.await.unwrap();
         assert!(done.load(Ordering::SeqCst));
         assert!(st.join_handles.lock().await.is_empty());
+    }
+
+    /// `shutdown(self)` keeps its sequence (steps 1–5): it neither cancels the upgraded
+    /// `/events` client tasks nor waits for them. Only `shutdown_shared` does (step 6).
+    #[tokio::test(flavor = "current_thread")]
+    async fn eventbus_shutdown_by_value_leaves_the_ws_clients_alone() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let bus = async_bus(temp.path()).await;
+        let (cancel, tasks) = {
+            let st = state(&bus);
+            (st.ws_cancel.clone(), st.ws_tasks.clone())
+        };
+        // A tracked client task that never ends by itself.
+        let client = tasks.token();
+        tokio::time::timeout(Duration::from_secs(10), bus.shutdown())
+            .await
+            .expect("shutdown(self) does not wait for the client tasks");
+        assert!(
+            !cancel.is_cancelled(),
+            "shutdown(self) does not cancel the client tasks"
+        );
+        assert_eq!(tasks.len(), 1, "the client task is still tracked");
+        drop(client);
     }
 
     /// A second call that arrives while the first one waits for the sweeper waits too: no

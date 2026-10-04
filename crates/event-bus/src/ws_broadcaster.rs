@@ -41,7 +41,8 @@ pub(crate) struct WsState {
     pub current_clients: Arc<AtomicUsize>,
     pub leak_detector: Option<Arc<dyn LeakDetector>>,
     /// Cancelled by `EventBus::shutdown_shared`: every connected `/events` client
-    /// gets a `Close` frame and its task ends. A child of the bus token.
+    /// gets a `Close` frame and its task ends. Independent of the bus token, so
+    /// `EventBus::shutdown` leaves the clients as they are.
     pub cancel: CancellationToken,
     /// Tracks every upgraded `/events` client task (axum spawns them detached), so
     /// the bus shutdown can wait until none is left.
@@ -70,7 +71,7 @@ pub(crate) fn spawn(
         max_clients: max_clients.unwrap_or(DEFAULT_MAX_CONCURRENT_WS_CLIENTS),
         current_clients: Arc::new(AtomicUsize::new(0)),
         leak_detector,
-        cancel: cancel_token.child_token(),
+        cancel: CancellationToken::new(),
         tasks: TaskTracker::new(),
     };
 
