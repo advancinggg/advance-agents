@@ -180,11 +180,16 @@ fn module_001_t52_no_hot_reload_api_in_module_001_src() {
         .to_path_buf();
     let runtime_src = ws_root.join("crates/runtime/src");
     let cli_src = ws_root.join("crates/cli/src");
+    // The `advance start` composition (the deploy loader included) lives in the
+    // runtime-compose library since CONTRACT-244.
+    let compose_src = ws_root.join("crates/runtime-compose/src");
 
     let mut runtime_files: Vec<std::path::PathBuf> = Vec::new();
     walk(&runtime_src, &mut runtime_files);
     let mut cli_files: Vec<std::path::PathBuf> = Vec::new();
     walk(&cli_src, &mut cli_files);
+    let mut compose_files: Vec<std::path::PathBuf> = Vec::new();
+    walk(&compose_src, &mut compose_files);
 
     // Anchors guard against a refactor/rename silently emptying the walker.
     assert!(
@@ -200,9 +205,15 @@ fn module_001_t52_no_hot_reload_api_in_module_001_src() {
             .any(|p| p.file_name().map(|n| n == "main.rs").unwrap_or(false)),
         "walker did not reach cli/src/main.rs"
     );
+    assert!(
+        compose_files
+            .iter()
+            .any(|p| p.file_name().map(|n| n == "wiring.rs").unwrap_or(false)),
+        "walker did not reach runtime-compose/src/wiring.rs"
+    );
 
     // MODULE-001-AC-20 (024, 2026-06-19): `behavior.wasm` was reconciled OUT of this
-    // list. The production deploy loader (cli `start.rs`) now references the
+    // list. The production deploy loader (runtime-compose `daemon`) now references the
     // materialized `behavior.wasm` for a ONE-SHOT boot load (AC-13 clause (a) — "read
     // exactly once at boot"), which is loading, NOT hot-reload. The no-mid-run-hot-
     // reload guarantee (clause (b)) stays carried by T51's byte-capture + compile-time
@@ -214,7 +225,11 @@ fn module_001_t52_no_hot_reload_api_in_module_001_src() {
         "reload_agent_behavior",
     ];
 
-    for rs in runtime_files.iter().chain(cli_files.iter()) {
+    for rs in runtime_files
+        .iter()
+        .chain(cli_files.iter())
+        .chain(compose_files.iter())
+    {
         let contents = std::fs::read_to_string(rs).unwrap_or_else(|e| panic!("read {rs:?}: {e}"));
         for needle in FORBIDDEN {
             assert!(
