@@ -18,12 +18,22 @@
 //! the session id. A session id must be 1..=[`MAX_SESSION_ID_BYTES`] visible
 //! ASCII characters; the server's answer is refused otherwise.
 //!
+//! A new session replaces the current one only once the server has accepted
+//! its `notifications/initialized`: until then every call goes out in the
+//! current session, so no request reaches the server in a session it has not
+//! seen initialized. A start that fails, runs out of time or is dropped (its
+//! caller cancelled) leaves the current session in place.
+//!
 //! A `404` to a POST that carried a session id means the server ended the
 //! session. The transport starts a new one (calls that found the same session
-//! ended share one restart) and sends the message once more. The restart must
-//! complete within [`HttpOptions::startup_timeout`] and agree the same protocol
-//! version; otherwise the transport closes ([`McpTransport::closed_at`]), later
-//! calls fail at once, and the client reconnects the server.
+//! ended share one restart) and sends the message once more; a `404` to that
+//! second POST fails the call, without another restart. The restart must
+//! complete within [`HttpOptions::startup_timeout`] and agree the same
+//! protocol version; otherwise the transport closes
+//! ([`McpTransport::closed_at`]), later calls fail at once, and the client
+//! reconnects the server. A restart whose caller is dropped does not close the
+//! transport: the ended session stays current, and the next call to find it
+//! ended restarts it.
 //!
 //! A server that refuses the `initialize` POST with `404` or `405`, or answers
 //! it with an `endpoint` event, speaks the older HTTP+SSE transport (a GET
@@ -253,7 +263,7 @@ impl HttpMcpTransport {
     pub async fn initialize(&self) -> Result<&'static str, McpError> {
         self.fail_if_closed()?;
         let _start = self.restarting.lock().await;
-        self.start_session_within_timeout().await
+        self.start_session_within_timeout(None).await
     }
 
     /// Invoke an MCP JSON-RPC method for `caller` (see the module docs),
@@ -305,7 +315,8 @@ impl HttpMcpTransport {
 
     /// Start a new session after the server ended session `ended`, unless
     /// another call has started one since. A restart that fails, or agrees a
-    /// different protocol version, closes the transport.
+    /// different protocol version, closes the transport; one dropped before it
+    /// completes changes nothing.
     async fn restart(&self, ended: u64) -> Result<(), McpError> {
         let _start = self.restarting.lock().await;
         self.fail_if_closed()?;
@@ -316,31 +327,40 @@ impl HttpMcpTransport {
         if epoch != ended {
             return Ok(());
         }
-        let outcome = match self.start_session_within_timeout().await {
-            Ok(version) if Some(version) == previous => Ok(()),
-            Ok(_) => Err(McpError::invalid_response(
-                "the server chose another protocol version for the new session",
-            )),
-            Err(error) => Err(error),
-        };
+        let outcome = self.start_session_within_timeout(previous).await;
         if outcome.is_err() {
             let mut closed_at = lock(&self.closed_at);
             closed_at.get_or_insert_with(Instant::now);
         }
-        outcome.map_err(|e| with_step("session restart", e))
+        outcome
+            .map(|_| ())
+            .map_err(|e| with_step("session restart", e))
     }
 
-    async fn start_session_within_timeout(&self) -> Result<&'static str, McpError> {
+    /// [`start_session`](Self::start_session) within
+    /// [`HttpOptions::startup_timeout`].
+    async fn start_session_within_timeout(
+        &self,
+        required: Option<&'static str>,
+    ) -> Result<&'static str, McpError> {
         let startup = self.options.startup_timeout;
-        match tokio::time::timeout(startup, self.start_session()).await {
+        match tokio::time::timeout(startup, self.start_session(required)).await {
             Ok(result) => result,
             Err(_elapsed) => Err(startup_timeout_error(&self.server_id, startup)),
         }
     }
 
-    /// The `initialize` exchange (see the module docs). The new session
-    /// replaces the current one once the server's answer is accepted.
-    async fn start_session(&self) -> Result<&'static str, McpError> {
+    /// The `initialize` exchange (see the module docs), agreeing `required`
+    /// when given. The new session is built aside and replaces the current one
+    /// only after the server accepted `notifications/initialized`, so a call
+    /// never goes out in a session the server has not seen initialized, and an
+    /// exchange that fails or is dropped leaves the current session in place.
+    /// The caller holds `restarting`, so no other start can take the next
+    /// epoch meanwhile.
+    async fn start_session(
+        &self,
+        required: Option<&'static str>,
+    ) -> Result<&'static str, McpError> {
         let id = self.allocate_id();
         let body = message_body(&JsonRpcRequest::new(id, "initialize", initialize_params()))?;
         let response = self
@@ -360,12 +380,15 @@ impl HttpMcpTransport {
             .map_err(|e| with_step("initialize", e))?;
         let session_id = session_id?;
         let version = agreed_protocol_version(&self.server_id, &result)?;
-        let session = {
-            let mut session = self.session();
-            session.epoch += 1;
-            session.id = session_id;
-            session.protocol_version = Some(version);
-            session.clone()
+        if required.is_some_and(|required| required != version) {
+            return Err(McpError::invalid_response(
+                "the server chose another protocol version for the new session",
+            ));
+        }
+        let session = Session {
+            epoch: self.session().epoch + 1,
+            id: session_id,
+            protocol_version: Some(version),
         };
         let body = message_body(&JsonRpcNotification::new("notifications/initialized", None))?;
         let response = self
@@ -373,6 +396,7 @@ impl HttpMcpTransport {
             .await
             .map_err(|e| with_step("notifications/initialized", e))?;
         accepted(&response).map_err(|e| with_step("notifications/initialized", e))?;
+        *self.session() = session;
         Ok(version)
     }
 

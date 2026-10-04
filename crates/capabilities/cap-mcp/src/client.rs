@@ -64,7 +64,9 @@
 //! [`MAX_TOOLS_PER_SERVER`](crate::MAX_TOOLS_PER_SERVER) tools. Each server's
 //! latest listing is kept in a tool cache of at most
 //! [`MAX_CACHED_TOOLS`](crate::MAX_CACHED_TOOLS) tools across all servers,
-//! read without any I/O through [`McpClient::cached_tools`].
+//! shared fairly among them, and read without any I/O through
+//! [`McpClient::cached_tools`]; an entry says when the cache keeps only part of
+//! its listing.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -76,7 +78,7 @@ use tokio::runtime::Handle;
 
 use crate::error::McpError;
 use crate::http_transport::{HttpMcpTransport, HttpOptions};
-use crate::listing::{ToolCache, ToolListing, MAX_TOOL_LIST_PAGES};
+use crate::listing::{CachedToolListing, ToolCache, ToolListing, MAX_TOOL_LIST_PAGES};
 use crate::schema_validator::SchemaValidator;
 use crate::stdio_transport::{
     sanitize_log_text, StdioMcpTransport, StdioOptions, MAX_STDIO_LINE_BYTES, MAX_STDIO_WALL_CLOCK,
@@ -456,9 +458,10 @@ impl McpClient {
     /// same as the one that asked for the page) and once it holds
     /// [`MAX_TOOLS_PER_SERVER`](crate::MAX_TOOLS_PER_SERVER) tools. A tool is
     /// kept when the server's tool patterns allow it and it meets the entry
-    /// limits (see the module docs). The listing becomes the server's entry in
-    /// the tool cache ([`cached_tools`](Self::cached_tools)); a failed listing
-    /// leaves the cache as it was.
+    /// limits (see the module docs). The caller receives the whole listing; it
+    /// also becomes the server's entry in the tool cache
+    /// ([`cached_tools`](Self::cached_tools)), within the server's share. A
+    /// failed listing leaves the cache as it was.
     pub async fn list_tools(
         &self,
         caller: Option<&str>,
@@ -487,13 +490,24 @@ impl McpClient {
         Ok(tools)
     }
 
-    /// The tools of each server's latest successful [`list_tools`](Self::list_tools),
-    /// in server-id order, read without contacting any server. The cache holds
-    /// at most [`MAX_CACHED_TOOLS`](crate::MAX_CACHED_TOOLS) tools across all
-    /// servers: a listing that does not fit beside the others is cached in
-    /// part, its first tools only.
-    pub fn cached_tools(&self) -> Vec<McpToolInfo> {
-        lock(&self.tool_cache).tools()
+    /// Each server's latest successful [`list_tools`](Self::list_tools), in
+    /// server-id order, read without contacting any server. A server not yet
+    /// listed has no entry; one that listed no tools has an empty entry.
+    ///
+    /// The cache holds at most [`MAX_CACHED_TOOLS`](crate::MAX_CACHED_TOOLS)
+    /// tools across all servers, shared fairly among them: a listing larger
+    /// than its server's share is kept in part, its first tools only, and its
+    /// entry says so ([`CachedToolListing::is_truncated`],
+    /// [`CachedToolListing::listed`]). The entries are shared, so a read clones
+    /// no tool.
+    ///
+    /// The entries hold what each server lists, narrowed only by the server's
+    /// own tool patterns and the listing limits. They are not filtered by any
+    /// agent's `mcp` grant, nor by the `web` rule that hides the web family
+    /// tools (`web.search`, `web.extract`) from an agent without the `web`
+    /// grant: filter them before showing them to an agent.
+    pub fn cached_tools(&self) -> Vec<Arc<CachedToolListing>> {
+        lock(&self.tool_cache).listings()
     }
 
     /// List prompts on a server (no filter), for `caller` (see the module

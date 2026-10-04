@@ -387,11 +387,13 @@ fn full_page(count: usize) -> Value {
 }
 
 // The cache keeps each server's latest listing, within MAX_CACHED_TOOLS tools
-// across servers: a listing that does not fit is cached in part while its
-// caller gets all of it; a new listing frees the room of the one it replaces;
-// a failed listing changes nothing.
+// across servers, shared fairly: once the listings do not all fit, each is
+// cut to its server's share (its first tools) and says so, while its caller
+// gets all of it. A server that lists no tools has an empty entry, and the
+// room it leaves goes to the others' next listings. A failed listing changes
+// nothing.
 #[tokio::test]
-async fn the_tool_cache_keeps_each_servers_latest_listing_within_the_total_cap() {
+async fn the_tool_cache_shares_the_total_cap_fairly_and_marks_cut_listings() {
     let fitting = MAX_CACHED_TOOLS / MAX_TOOLS_PER_SERVER;
     let ids: Vec<String> = (0..=fitting).map(|i| format!("srv{i}")).collect();
     let mocks: Vec<Arc<CountingMockTransport>> = ids
@@ -409,39 +411,67 @@ async fn the_tool_cache_keeps_each_servers_latest_listing_within_the_total_cap()
     let cached_of = |client: &McpClient, id: &str| {
         client
             .cached_tools()
-            .iter()
-            .filter(|t| t.server_id == id)
-            .count()
+            .into_iter()
+            .find(|listing| listing.server_id == id)
+            .unwrap_or_else(|| panic!("no entry for {id}"))
     };
+    let first_names =
+        |count: usize| -> Vec<String> { (0..count).map(|i| format!("t{i}")).collect() };
     assert!(client.cached_tools().is_empty());
 
-    for (id, mock) in ids.iter().zip(&mocks) {
+    // As many full listings as fit are cached whole.
+    for (id, mock) in ids.iter().zip(&mocks).take(fitting) {
         mock.push_ok(full_page(MAX_TOOLS_PER_SERVER));
-        let tools = client.list_tools(None, id).await.expect("listed");
-        assert_eq!(tools.len(), MAX_TOOLS_PER_SERVER, "the caller gets it all");
+        client.list_tools(None, id).await.expect("listed");
     }
-    let cached = client.cached_tools();
-    assert_eq!(cached.len(), MAX_CACHED_TOOLS);
-    let in_order: Vec<&str> = cached.iter().map(|t| t.server_id.as_str()).collect();
-    let mut sorted = in_order.clone();
-    sorted.sort();
-    assert_eq!(in_order, sorted, "server-id order");
-    let last = &ids[fitting];
-    assert_eq!(
-        cached_of(&client, last),
-        MAX_CACHED_TOOLS - fitting * MAX_TOOLS_PER_SERVER
-    );
+    assert!(client.cached_tools().iter().all(|l| !l.is_truncated()));
 
-    // A shorter listing of the first server frees room for the last one.
-    mocks[0].push_ok(full_page(10));
-    client.list_tools(None, &ids[0]).await.expect("listed");
-    assert_eq!(cached_of(&client, &ids[0]), 10);
+    // One more: every listing is cut to its share and marked.
     mocks[fitting].push_ok(full_page(MAX_TOOLS_PER_SERVER));
-    client.list_tools(None, last).await.expect("listed");
-    assert_eq!(client.cached_tools().len(), MAX_CACHED_TOOLS);
+    let tools = client
+        .list_tools(None, &ids[fitting])
+        .await
+        .expect("listed");
+    assert_eq!(tools.len(), MAX_TOOLS_PER_SERVER, "the caller gets it all");
+    let cached = client.cached_tools();
+    let in_order: Vec<&str> = cached.iter().map(|l| l.server_id.as_str()).collect();
+    let mut sorted: Vec<&str> = ids.iter().map(String::as_str).collect();
+    sorted.sort();
+    assert_eq!(in_order, sorted, "one entry per server, in server-id order");
     assert_eq!(
-        cached_of(&client, last),
-        MAX_CACHED_TOOLS - 10 - (fitting - 1) * MAX_TOOLS_PER_SERVER
+        cached.iter().map(|l| l.tools.len()).sum::<usize>(),
+        MAX_CACHED_TOOLS
+    );
+    let share = MAX_CACHED_TOOLS / ids.len();
+    for listing in &cached {
+        assert!(listing.is_truncated(), "{}", listing.server_id);
+        assert_eq!(listing.listed, MAX_TOOLS_PER_SERVER);
+        assert!((share..=share + 1).contains(&listing.tools.len()));
+        assert_eq!(names(&listing.tools), first_names(listing.tools.len()));
+    }
+
+    // A server listing no tools keeps an empty entry, and the last server's
+    // next listing takes the room it left.
+    mocks[0].push_ok(full_page(0));
+    client.list_tools(None, &ids[0]).await.expect("listed");
+    let empty = cached_of(&client, &ids[0]);
+    assert_eq!((empty.tools.len(), empty.listed), (0, 0));
+    assert!(!empty.is_truncated());
+    mocks[fitting].push_ok(full_page(MAX_TOOLS_PER_SERVER));
+    client
+        .list_tools(None, &ids[fitting])
+        .await
+        .expect("listed");
+    let last = cached_of(&client, &ids[fitting]);
+    assert_eq!(last.tools.len(), MAX_TOOLS_PER_SERVER);
+    assert!(!last.is_truncated());
+    assert!(
+        client
+            .cached_tools()
+            .iter()
+            .map(|l| l.tools.len())
+            .sum::<usize>()
+            <= MAX_CACHED_TOOLS
     );
 
     // A failed listing (nothing scripted) leaves the cache as it was.

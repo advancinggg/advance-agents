@@ -1,15 +1,15 @@
 //! Integration tests for `HttpMcpTransport` — SB-13..SB-17 + SB-17b, plus the
 //! MCP session (session id and protocol-version headers, a new session after a
-//! `404`), the refusal of the older HTTP+SSE transport, errors free of
-//! server-sent text, caller attribution and the request timeout, also through
-//! `McpClient`.
+//! `404` that carries calls only once the server accepted it), the refusal of
+//! the older HTTP+SSE transport, errors free of server-sent text, caller
+//! attribution and the request timeout, also through `McpClient`.
 //!
 //! Use a locally-defined `MockHttpSecurityChain` that captures the request
 //! + returns scripted responses, mirroring the cap-llm test pattern at
 //! `cap-llm/src/test_support/mock_chain.rs`. Verifies the AC-16 invariant
 //! that every MCP HTTP invocation routes through HttpSecurityChain.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,6 +20,7 @@ use advance_shared_types::security_validator::{
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tokio::sync::{Notify, Semaphore};
 
 use cap_mcp::{
     HttpMcpTransport, HttpOptions, McpClient, McpClientLimits, McpErrorKind, McpServerEntry,
@@ -536,7 +537,8 @@ async fn a_session_that_cannot_be_started_again_closes_the_transport() {
     );
 }
 
-// A new session must speak the version of the one it replaces.
+// A new session must speak the version of the one it replaces; one that does
+// not is refused before `notifications/initialized` and never replaces it.
 #[tokio::test]
 async fn a_new_session_on_another_protocol_version_closes_the_transport() {
     let chain = Arc::new(MockChain::default());
@@ -544,7 +546,6 @@ async fn a_new_session_on_another_protocol_version_closes_the_transport() {
     chain.push(Ok(accepted()));
     chain.push(Ok(status(404)));
     chain.push(Ok(initialize_answer(3, "2025-03-26", Some("s2"))));
-    chain.push(Ok(accepted()));
 
     let transport = transport(&chain);
     transport.initialize().await.expect("initialized");
@@ -559,6 +560,315 @@ async fn a_new_session_on_another_protocol_version_closes_the_transport() {
         err.message
     );
     assert!(transport.closed_at().is_some());
+    assert_eq!(
+        methods(&chain.captured()),
+        [
+            "initialize",
+            "notifications/initialized",
+            "tools/call",
+            "initialize"
+        ]
+    );
+    assert_eq!(transport.session_id().as_deref(), Some("s1"));
+    assert_eq!(transport.protocol_version(), Some("2025-06-18"));
+}
+
+// A 404 to the message sent again in the new session fails the call: the
+// message goes out twice at most, and the transport stays open in the new
+// session.
+#[tokio::test]
+async fn a_404_to_the_message_sent_again_fails_the_call_without_another_restart() {
+    let chain = Arc::new(MockChain::default());
+    chain.push(Ok(initialize_answer(1, "2025-06-18", Some("s1"))));
+    chain.push(Ok(accepted()));
+    chain.push(Ok(status(404)));
+    chain.push(Ok(initialize_answer(3, "2025-06-18", Some("s2"))));
+    chain.push(Ok(accepted()));
+    chain.push(Ok(status(404)));
+
+    let transport = transport(&chain);
+    transport.initialize().await.expect("initialized");
+    let err = transport
+        .invoke(None, "tools/call", json!({"name": "echo"}))
+        .await
+        .expect_err("404 in the new session too");
+    assert_eq!(err.kind, McpErrorKind::ServerError);
+    assert_eq!(err.message, "http 404 from mcp server");
+
+    let sent = chain.captured();
+    assert_eq!(sent.len(), 6, "{:?}", methods(&sent));
+    assert_eq!(
+        methods(&sent),
+        [
+            "initialize",
+            "notifications/initialized",
+            "tools/call",
+            "initialize",
+            "notifications/initialized",
+            "tools/call"
+        ]
+    );
+    assert_eq!(header(&sent[5], "Mcp-Session-Id").as_deref(), Some("s2"));
+    assert_eq!(sent[2].body, sent[5].body);
+    assert_eq!(transport.closed_at(), None, "the transport stays open");
+    assert_eq!(transport.session_id().as_deref(), Some("s2"));
+}
+
+// A notification answered 404 in a session starts a new session and goes
+// out once more in it.
+#[tokio::test]
+async fn a_404_to_a_notification_in_a_session_starts_a_new_session_and_sends_it_again() {
+    let chain = Arc::new(MockChain::default());
+    chain.push(Ok(initialize_answer(1, "2025-06-18", Some("s1"))));
+    chain.push(Ok(accepted()));
+    chain.push(Ok(status(404)));
+    chain.push(Ok(initialize_answer(2, "2025-06-18", Some("s2"))));
+    chain.push(Ok(accepted()));
+    chain.push(Ok(accepted()));
+
+    let transport = transport(&chain);
+    transport.initialize().await.expect("initialized");
+    transport
+        .notify("notifications/roots/list_changed", None)
+        .await
+        .expect("accepted in the new session");
+
+    let sent = chain.captured();
+    assert_eq!(
+        methods(&sent),
+        [
+            "initialize",
+            "notifications/initialized",
+            "notifications/roots/list_changed",
+            "initialize",
+            "notifications/initialized",
+            "notifications/roots/list_changed"
+        ]
+    );
+    assert_eq!(header(&sent[2], "Mcp-Session-Id").as_deref(), Some("s1"));
+    assert_eq!(header(&sent[3], "Mcp-Session-Id"), None);
+    for req in &sent[4..] {
+        assert_eq!(header(req, "Mcp-Session-Id").as_deref(), Some("s2"));
+    }
+    assert_eq!(sent[2].body, sent[5].body, "the same notification again");
+    assert_eq!(transport.session_id().as_deref(), Some("s2"));
+    assert_eq!(transport.closed_at(), None);
+}
+
+/// A server that, like the MCP Python SDK, refuses a request in a session it
+/// has not seen initialized with a JSON-RPC error rather than a `404`.
+/// `initialize` starts session `s<n>`; a request in a session other than the
+/// live one gets `404`. The server holds the `notifications/initialized` of
+/// session `s<hold>` until the test releases it. Every POST is logged as
+/// `<method> <session id or ->`, and an accepted `notifications/initialized`
+/// once more as `accepted <method> <session id>`.
+struct StrictSessionServer {
+    hold: String,
+    live: Mutex<Option<String>>,
+    initialized: Mutex<HashSet<String>>,
+    initializes: AtomicUsize,
+    /// Requests other than `initialize` received.
+    requests: AtomicUsize,
+    request_seen: Notify,
+    /// Requests refused because their session was not yet initialized.
+    premature: AtomicUsize,
+    held: Notify,
+    release: Semaphore,
+    log: Mutex<Vec<String>>,
+}
+
+impl StrictSessionServer {
+    fn holding(session: usize) -> Self {
+        Self {
+            hold: format!("s{session}"),
+            live: Mutex::new(None),
+            initialized: Mutex::new(HashSet::new()),
+            initializes: AtomicUsize::new(0),
+            requests: AtomicUsize::new(0),
+            request_seen: Notify::new(),
+            premature: AtomicUsize::new(0),
+            held: Notify::new(),
+            release: Semaphore::new(0),
+            log: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn end_session(&self) {
+        *self.live.lock().unwrap() = None;
+    }
+
+    fn log(&self) -> Vec<String> {
+        self.log.lock().unwrap().clone()
+    }
+
+    /// Wait until the server has received `count` requests other than
+    /// `initialize`.
+    async fn wait_for_requests(&self, count: usize) {
+        loop {
+            let seen = self.request_seen.notified();
+            if self.requests.load(Ordering::SeqCst) >= count {
+                return;
+            }
+            seen.await;
+        }
+    }
+}
+
+#[async_trait]
+impl HttpSecurityChain for StrictSessionServer {
+    async fn execute(
+        &self,
+        _agent_id: &str,
+        req: HttpRequest,
+        _cap: &HttpCapability,
+    ) -> Result<HttpResponse, HttpError> {
+        let message = body_of(&req);
+        let method = message["method"].as_str().unwrap_or_default().to_string();
+        let session = header(&req, "mcp-session-id");
+        let tag = session.clone().unwrap_or_else(|| "-".to_string());
+        self.log.lock().unwrap().push(format!("{method} {tag}"));
+        let Some(id) = message["id"].as_u64() else {
+            if method == "notifications/initialized" {
+                if session.as_deref() == Some(self.hold.as_str()) {
+                    self.held.notify_one();
+                    self.release.acquire().await.expect("open").forget();
+                }
+                self.initialized.lock().unwrap().insert(tag.clone());
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(format!("accepted {method} {tag}"));
+            }
+            return Ok(accepted());
+        };
+        if method == "initialize" {
+            let n = self.initializes.fetch_add(1, Ordering::SeqCst) + 1;
+            let started = format!("s{n}");
+            *self.live.lock().unwrap() = Some(started.clone());
+            return Ok(initialize_answer(id, "2025-06-18", Some(&started)));
+        }
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        self.request_seen.notify_one();
+        let live = self.live.lock().unwrap().clone();
+        if live.is_none() || session != live {
+            return Ok(status(404));
+        }
+        if !self.initialized.lock().unwrap().contains(&tag) {
+            self.premature.fetch_add(1, Ordering::SeqCst);
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32600, "message": "Received request before initialization was complete"},
+            });
+            return Ok(ok_response(
+                &serde_json::to_vec(&body).unwrap(),
+                "application/json",
+            ));
+        }
+        Ok(answer(id, json!({"ok": true})))
+    }
+}
+
+/// `future`'s output; the test fails if it takes longer than 10 s.
+async fn within<F: std::future::Future>(future: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(10), future)
+        .await
+        .expect("timed out")
+}
+
+fn spawn_call(
+    transport: &Arc<HttpMcpTransport>,
+    caller: &'static str,
+) -> tokio::task::JoinHandle<Result<Vec<u8>, cap_mcp::McpError>> {
+    let transport = Arc::clone(transport);
+    tokio::spawn(async move {
+        transport
+            .invoke(Some(caller), "tools/call", json!({}))
+            .await
+    })
+}
+
+// While a new session waits for the server to accept its
+// `notifications/initialized`, other calls go out in the current session; a
+// call reaches the new session only after the server accepted it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_session_carries_calls_only_once_the_server_accepted_initialized() {
+    let server = Arc::new(StrictSessionServer::holding(2));
+    let transport = Arc::new(HttpMcpTransport::new(
+        server.clone(),
+        "srv",
+        "https://mcp.example.com/mcp",
+        dummy_cap(),
+    ));
+    transport.initialize().await.expect("initialized");
+    server.end_session();
+
+    // The first call finds the session ended and starts `s2`, whose
+    // `notifications/initialized` the server holds.
+    let first = spawn_call(&transport, "agent-a");
+    within(server.held.notified()).await;
+    // A second call meanwhile still goes out in `s1`.
+    let second = spawn_call(&transport, "agent-b");
+    within(server.wait_for_requests(2)).await;
+    assert_eq!(transport.session_id().as_deref(), Some("s1"));
+    server.release.add_permits(1);
+
+    within(first)
+        .await
+        .expect("join")
+        .expect("the first call is answered");
+    within(second)
+        .await
+        .expect("join")
+        .expect("the second call is answered");
+    let log = server.log();
+    assert_eq!(server.premature.load(Ordering::SeqCst), 0, "{log:?}");
+    assert_eq!(server.initializes.load(Ordering::SeqCst), 2, "{log:?}");
+    assert_eq!(transport.session_id().as_deref(), Some("s2"));
+    let accepted_at = log
+        .iter()
+        .position(|entry| entry == "accepted notifications/initialized s2")
+        .expect("s2 initialized");
+    let calls_in_s2: Vec<usize> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| *entry == "tools/call s2")
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(calls_in_s2.len(), 2, "{log:?}");
+    assert!(calls_in_s2.iter().all(|&at| at > accepted_at), "{log:?}");
+}
+
+// A restart whose call is dropped before the server accepted its
+// `notifications/initialized` leaves the ended session current and the
+// transport open: the next call restarts it and is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_dropped_before_initialized_was_accepted_leaves_the_session_as_it_was() {
+    let server = Arc::new(StrictSessionServer::holding(2));
+    let transport = Arc::new(HttpMcpTransport::new(
+        server.clone(),
+        "srv",
+        "https://mcp.example.com/mcp",
+        dummy_cap(),
+    ));
+    transport.initialize().await.expect("initialized");
+    server.end_session();
+
+    let call = spawn_call(&transport, "agent-a");
+    within(server.held.notified()).await;
+    call.abort();
+    assert!(within(call).await.expect_err("aborted").is_cancelled());
+    assert_eq!(transport.session_id().as_deref(), Some("s1"));
+    assert_eq!(transport.closed_at(), None);
+
+    let out = within(transport.invoke(Some("agent-b"), "tools/call", json!({})))
+        .await
+        .expect("answered in a new session");
+    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["ok"], true);
+    let log = server.log();
+    assert_eq!(server.premature.load(Ordering::SeqCst), 0, "{log:?}");
+    assert_eq!(server.initializes.load(Ordering::SeqCst), 3, "{log:?}");
+    assert_eq!(transport.session_id().as_deref(), Some("s3"));
 }
 
 /// A server keeping one live session: `initialize` starts session `s<n>`,
@@ -946,6 +1256,65 @@ async fn the_client_initializes_an_http_server_and_calls_it_as_the_caller() {
         Some("sess-9")
     );
     assert_eq!(chain.agents(), ["srv", "srv", "agent-1"]);
+}
+
+// A session restart that fails closes the transport: the client evicts it,
+// and its next call connects the server afresh, starting with `initialize`.
+#[tokio::test]
+async fn the_client_reconnects_an_http_server_whose_session_could_not_be_restarted() {
+    let chain = Arc::new(MockChain::default());
+    chain.push(Ok(initialize_answer(1, "2025-06-18", Some("s1"))));
+    chain.push(Ok(accepted()));
+    chain.push(Ok(status(404)));
+    chain.push(Ok(status(500)));
+    // The new transport's first request id is 1 again.
+    chain.push(Ok(initialize_answer(1, "2025-06-18", Some("s9"))));
+    chain.push(Ok(accepted()));
+    chain.push(Ok(answer(2, json!({"ok": true}))));
+
+    let client = http_client(
+        chain.clone(),
+        McpClientLimits {
+            restart_backoff_initial: Duration::ZERO,
+            restart_backoff_max: Duration::ZERO,
+            ..McpClientLimits::default()
+        },
+    );
+    let err = client
+        .invoke_tool(Some("agent-1"), "srv", "echo", b"{}")
+        .await
+        .expect_err("the restart failed");
+    assert_eq!(
+        err.message,
+        "session restart: initialize: http 500 from mcp server"
+    );
+    assert_eq!(client.protocol_version("srv"), None, "evicted");
+
+    let out = client
+        .invoke_tool(Some("agent-1"), "srv", "echo", b"{}")
+        .await
+        .expect("reconnected");
+    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["ok"], true);
+    let sent = chain.captured();
+    assert_eq!(
+        methods(&sent),
+        [
+            "initialize",
+            "notifications/initialized",
+            "tools/call",
+            "initialize",
+            "initialize",
+            "notifications/initialized",
+            "tools/call"
+        ]
+    );
+    assert_eq!(header(&sent[4], "Mcp-Session-Id"), None);
+    assert_eq!(header(&sent[4], "MCP-Protocol-Version"), None);
+    assert_eq!(header(&sent[6], "Mcp-Session-Id").as_deref(), Some("s9"));
+    assert_eq!(
+        client.protocol_version("srv").as_deref(),
+        Some("2025-06-18")
+    );
 }
 
 // The client's request timeout bounds each POST of its http servers.
