@@ -463,10 +463,11 @@ struct AsyncState {
     /// writer channels before the sweeper's warning crossed try_send).
     sweeper_cancel_token: CancellationToken,
     /// Slice E: named `sweeper_handle` (NOT indexed into `join_handles` Vec)
-    /// so `EventBus::shutdown` consumes it via `take()` without ordering
-    /// fragility. The other 5 task handles (file_writer / db_indexer / ws /
-    /// stats / server) remain in `join_handles` since they share the main
-    /// cancel_token and are joined together after the flush barrier.
+    /// so `EventBus::shutdown` joins it first without ordering fragility (in
+    /// place; the slot is cleared once the handle resolved). The other 5 task
+    /// handles (file_writer / db_indexer / ws / stats / server) remain in
+    /// `join_handles` since they share the main cancel_token and are joined
+    /// together after the flush barrier.
     sweeper_handle: TokioMutex<Option<JoinHandle<()>>>,
     join_handles: TokioMutex<Vec<JoinHandle<()>>>,
     /// `None` when the bus was built by [`EventBus::new_without_server`].
@@ -813,8 +814,9 @@ impl EventBus {
     ///
     /// Sequence:
     ///   1. `sweeper_cancel_token.cancel()` — signal sweeper to exit.
-    ///   2. Await the sweeper's JoinHandle (consumed via `take()` from the
-    ///      named `sweeper_handle` field; no Vec-index ordering fragility).
+    ///   2. Await the sweeper's JoinHandle (in place in the named
+    ///      `sweeper_handle` field, cleared once it resolved; no Vec-index
+    ///      ordering fragility).
     ///   3. `tokio::task::yield_now().await` — soft flush barrier. Each
     ///      sweeper-emitted warning was `try_send`'d into the bounded mpsc
     ///      channels (capacity 10000) BEFORE the sweeper exited, so the
@@ -839,29 +841,39 @@ impl EventBus {
     /// The [`EventBus::shutdown`] sequence on a shared bus (`&self`), so an owner
     /// holding an `Arc<EventBus>` can stop it without `Arc::try_unwrap`.
     ///
-    /// Idempotent: a later call finds no task left and returns once the first
-    /// call's joins are done. After it, `emit` still accepts events but the sinks
-    /// are gone, so they only count as dropped (`dropped_count`). No-op on the
-    /// synchronous test bus.
+    /// Idempotent and cancel-safe. Each join happens in place, under the lock of
+    /// the slot that holds the handle, and the handle leaves its slot only once it
+    /// has resolved. A concurrent call therefore waits for the sweeper's join
+    /// before it cancels the actors (the step order holds for it too) and returns
+    /// once the first call's joins are done; a call dropped part-way (an owner's
+    /// timeout) leaves every task it had not joined for the next call. After it,
+    /// `emit` still accepts events but the sinks are gone, so they only count as
+    /// dropped (`dropped_count`). No-op on the synchronous test bus.
     pub async fn shutdown_shared(&self) {
         if let EventBusMode::Async(state) = &self.mode {
             // Step 1: cancel sweeper first.
             state.sweeper_cancel_token.cancel();
-            // Step 2: await sweeper's join via named-field take().
-            let sweeper = state.sweeper_handle.lock().await.take();
-            if let Some(handle) = sweeper {
-                let _ = handle.await;
+            // Step 2: await the sweeper's join; its slot stays locked, and keeps
+            // the handle, until the sweeper has ended.
+            {
+                let mut sweeper = state.sweeper_handle.lock().await;
+                if let Some(handle) = sweeper.as_mut() {
+                    let _ = handle.await;
+                    *sweeper = None;
+                }
             }
             // Step 3: soft flush barrier — yield once to let durable-sink
             // actors poll their channels for any late sweeper warnings.
             tokio::task::yield_now().await;
             // Step 4: cancel remaining actors.
             state.cancel_token.cancel();
-            // Step 5: join remaining actor handles (the guard is held across the
-            // joins, so a concurrent second call waits for them).
+            // Step 5: join remaining actor handles in order, each removed once it
+            // has resolved (the guard is held across the joins, so a concurrent
+            // second call waits for them).
             let mut handles = state.join_handles.lock().await;
-            for h in handles.drain(..) {
-                let _ = h.await;
+            while let Some(handle) = handles.first_mut() {
+                let _ = handle.await;
+                handles.remove(0);
             }
             drop(handles);
             // Step 6: close and join the upgraded `/events` client tasks.
@@ -1178,5 +1190,121 @@ impl std::io::Write for CountingSink {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    //! MODULE-001-AC-30 witnesses of the shutdown sequence's joins. Each test runs on a
+    //! current-thread runtime and puts a stand-in task in one of the bus's slots that ends
+    //! only when the test releases it, so "still waiting" and "returned" are decided by the
+    //! test, never by timing.
+
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::Notify;
+
+    async fn async_bus(dir: &std::path::Path) -> EventBus {
+        let mut cfg = EventBusConfig::new(dir.join("events"), dir.join("events.db"));
+        cfg.websocket_addr = "127.0.0.1:0".parse().unwrap();
+        EventBus::new(cfg).await.expect("bus")
+    }
+
+    fn state(bus: &EventBus) -> &AsyncState {
+        match &bus.mode {
+            EventBusMode::Async(state) => state,
+            EventBusMode::Sync { .. } => unreachable!("an async bus"),
+        }
+    }
+
+    /// A stand-in task: once `token` fires it waits for `release`, then sets `done`.
+    fn held(
+        token: CancellationToken,
+        release: Arc<Notify>,
+        done: Arc<AtomicBool>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            token.cancelled().await;
+            release.notified().await;
+            done.store(true, Ordering::SeqCst);
+        })
+    }
+
+    /// Yields to the runtime for `ms` milliseconds (lets the spawned calls progress).
+    async fn settle(ms: u64) {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
+    /// A call dropped while it joins the actors leaves every actor it had not joined in
+    /// its slot, and the next call joins them before it returns.
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_001_ac30_eventbus_shutdown_shared_is_cancel_safe() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let bus = Arc::new(async_bus(temp.path()).await);
+        let st = state(&bus);
+        let (release, done) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let actor = held(st.cancel_token.clone(), release.clone(), done.clone());
+        st.join_handles.lock().await.push(actor);
+
+        let dropped = tokio::time::timeout(Duration::from_millis(200), bus.shutdown_shared()).await;
+        assert!(dropped.is_err(), "the held actor keeps the call waiting");
+        assert!(
+            !st.join_handles.lock().await.is_empty(),
+            "the dropped call leaves the actor it had not joined in its slot"
+        );
+
+        let retry = tokio::spawn({
+            let bus = Arc::clone(&bus);
+            async move { bus.shutdown_shared().await }
+        });
+        settle(100).await;
+        assert!(
+            !retry.is_finished(),
+            "the next call joins the actor the dropped call left"
+        );
+        release.notify_one();
+        retry.await.unwrap();
+        assert!(done.load(Ordering::SeqCst));
+        assert!(st.join_handles.lock().await.is_empty());
+    }
+
+    /// A second call that arrives while the first one waits for the sweeper waits too: no
+    /// call cancels the actors before the sweeper has ended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_001_ac30_eventbus_concurrent_shutdown_keeps_the_sweeper_first() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let bus = Arc::new(async_bus(temp.path()).await);
+        let st = state(&bus);
+        // The stand-in takes the sweeper's slot; the real sweeper is joined with the actors.
+        let (release, done) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let sweeper = held(
+            st.sweeper_cancel_token.clone(),
+            release.clone(),
+            done.clone(),
+        );
+        let real = st.sweeper_handle.lock().await.replace(sweeper);
+        st.join_handles.lock().await.extend(real);
+
+        let spawn_call = || {
+            let bus = Arc::clone(&bus);
+            tokio::spawn(async move { bus.shutdown_shared().await })
+        };
+        let first = spawn_call();
+        settle(50).await;
+        let second = spawn_call();
+        settle(100).await;
+        assert!(
+            !st.cancel_token.is_cancelled(),
+            "no call cancels the actors while the sweeper is still running"
+        );
+        assert!(!first.is_finished() && !second.is_finished());
+
+        release.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+        assert!(done.load(Ordering::SeqCst));
+        assert!(st.cancel_token.is_cancelled());
+        assert!(st.sweeper_handle.lock().await.is_none());
+        assert!(st.join_handles.lock().await.is_empty());
     }
 }
