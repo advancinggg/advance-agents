@@ -1410,6 +1410,9 @@ pub enum DeltaPumpExit {
     PeerClosed,
     /// Socket-error leg (B3(ii)): recv error, or a ping-SEND error (same dead-peer class).
     PeerDead,
+    /// The server is shutting down (`ClientApiServer::shutdown_ingress`): the pump sent
+    /// `Close` and ended.
+    ServerShutdown,
 }
 
 impl DeltaPumpExit {
@@ -1421,6 +1424,7 @@ impl DeltaPumpExit {
             DeltaPumpExit::PongTimeout => "pong_timeout",
             DeltaPumpExit::PeerClosed => "peer_closed",
             DeltaPumpExit::PeerDead => "peer_dead",
+            DeltaPumpExit::ServerShutdown => "server_shutdown",
         }
     }
 }

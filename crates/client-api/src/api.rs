@@ -596,6 +596,33 @@ impl ClientApi {
         self
     }
 
+    /// Empty every provider slot (poison-tolerant), so each family answers `module_unavailable`
+    /// and the providers the slots held are dropped (the routes, sessions and stores stay). For an
+    /// owner that shuts the API down after its ingress has stopped.
+    pub fn clear_providers(&self) {
+        fn clear<T: ?Sized>(slot: &RwLock<Option<Arc<T>>>) {
+            *slot.write().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        clear(&self.run_provider);
+        clear(&self.messaging_provider);
+        clear(&self.tools_provider);
+        clear(&self.agent_provider);
+        clear(&self.cost_provider);
+        clear(&self.pack_provider);
+        clear(&self.provider_admin);
+        clear(&self.secrets_provider);
+        clear(&self.entity_provider);
+        clear(&self.event_provider);
+        clear(&self.leak_detector);
+        clear(&self.cursor_codec);
+        clear(&self.bound_grant_provider);
+        clear(&self.bound_history_provider);
+        clear(&self.observation_redactor);
+        clear(&self.llm_delta_hub);
+        #[cfg(feature = "test-support")]
+        clear(&self.delta_pump_observer);
+    }
+
     /// The injected delta hub, if wired (transport pump).
     pub(crate) fn llm_delta_hub(&self) -> Option<Arc<crate::deltas::LlmDeltaHub>> {
         self.llm_delta_hub

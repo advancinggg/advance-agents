@@ -25,6 +25,8 @@ use serde_json::{Map, Value};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::cursor::ClientCursorCodec;
 use crate::deltas::{
@@ -51,6 +53,9 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 /// the `select!` after this many frames, so an inbound flood cannot starve the cut / deadline
 /// arms and the per-frame error-envelope write is bounded per wake.
 const DELTA_INBOUND_DRAIN_PER_BEAT: usize = 32;
+/// How long an events WebSocket task waits to hand its `Close` frame to a peer that stopped
+/// reading, once [`ClientApiServer::shutdown_ingress`] cancels it.
+const WS_CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 /// Browser-visible WebSocket protocol.  The bearer token is sent as a second, unselected
 /// `advance.bearer.<hex>` protocol so it does not enter the URL, browser history, or proxy logs.
@@ -63,20 +68,50 @@ struct TransportState {
     /// Bounds concurrent blocking-pool dispatches (HTTP requests + WS seeds) so a caller cannot
     /// pin the pool / grow an unbounded queue; excess fails closed with `module_unavailable`.
     dispatch: Arc<Semaphore>,
+    /// The upgraded WebSocket tasks of this router (axum spawns them detached).
+    ws: WsTracking,
+}
+
+/// Cancellation and tracking of a router's upgraded WebSocket tasks: every `on_upgrade` task
+/// holds a tracker token and ends when `cancel` fires, so [`ClientApiServer::shutdown_ingress`]
+/// can close them and wait until none is left.
+#[derive(Clone)]
+struct WsTracking {
+    cancel: CancellationToken,
+    tasks: TaskTracker,
+}
+
+impl WsTracking {
+    fn new() -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            tasks: TaskTracker::new(),
+        }
+    }
+}
+
+/// The dispatch permit count for `api`. Clamped to a sane window: the lower bound guards a zero
+/// cap (would wedge the server); the upper clamp guards a misconfigured huge value (above tokio's
+/// `Semaphore::MAX_PERMITS` would panic).
+fn dispatch_permits(api: &ClientApi) -> u32 {
+    let permits = api.config().max_concurrent_dispatch.clamp(1, 65_536);
+    u32::try_from(permits).unwrap_or(65_536)
 }
 
 /// Build the public router.  It contains only embedded console assets and `/client/*` routes.
 /// ConnectInfo is required so the core can enforce loopback admission from the real peer address.
 pub fn client_api_router(api: Arc<ClientApi>) -> Router {
+    let dispatch = Arc::new(Semaphore::new(dispatch_permits(&api) as usize));
+    router_with(api, WsTracking::new(), dispatch)
+}
+
+fn router_with(api: Arc<ClientApi>, ws: WsTracking, dispatch: Arc<Semaphore>) -> Router {
     let max_body_bytes = api.config().max_body_bytes;
-    // Clamp to a sane window: `.max(1)` guards a zero cap (would wedge the server); the upper clamp
-    // guards a misconfigured huge value (above tokio's `Semaphore::MAX_PERMITS` would panic here).
-    let dispatch_permits = api.config().max_concurrent_dispatch.clamp(1, 65_536);
-    let dispatch = Arc::new(Semaphore::new(dispatch_permits));
     let state = TransportState {
         api,
         max_body_bytes,
         dispatch,
+        ws,
     };
     Router::new()
         .route("/", get(index))
@@ -98,6 +133,25 @@ pub struct ClientApiServer {
     api: Arc<ClientApi>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<io::Result<()>>,
+    ws: WsTracking,
+    dispatch: Arc<Semaphore>,
+    permits: u32,
+}
+
+/// What [`ClientApiServer::shutdown_ingress`] observed. The `Arc<ClientApi>` is always handed
+/// back, whatever happened to the listener, so its owner can still clear the provider slots.
+pub struct ShutdownIngress {
+    pub api: Arc<ClientApi>,
+    /// The serve task's own result; `Ok(())` when it overran the budget and was aborted.
+    pub serve: io::Result<()>,
+    /// Every upgraded WebSocket task ended within the budget.
+    pub ws_joined: bool,
+    /// Every in-flight dispatch (an HTTP request's or a WebSocket poll's `handle()` on the
+    /// blocking pool) returned its permit within the budget.
+    pub drained: bool,
+    /// The serve task (it waits for every open HTTP connection) did not finish within the budget
+    /// and was aborted.
+    pub serve_overran: bool,
 }
 
 impl ClientApiServer {
@@ -143,7 +197,10 @@ impl ClientApiServer {
         local_addr: SocketAddr,
         api: Arc<ClientApi>,
     ) -> io::Result<Self> {
-        let router = client_api_router(Arc::clone(&api));
+        let permits = dispatch_permits(&api);
+        let dispatch = Arc::new(Semaphore::new(permits as usize));
+        let ws = WsTracking::new();
+        let router = router_with(Arc::clone(&api), ws.clone(), Arc::clone(&dispatch));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             axum::serve(
@@ -161,6 +218,9 @@ impl ClientApiServer {
             api,
             shutdown: Some(shutdown_tx),
             task,
+            ws,
+            dispatch,
+            permits,
         })
     }
 
@@ -179,6 +239,58 @@ impl ClientApiServer {
         self.task
             .await
             .map_err(|error| io::Error::other(format!("client API task join: {error}")))?
+    }
+
+    /// Stop all ingress within `budget` (one deadline shared by every wait) and hand the API back.
+    ///
+    /// 1. The listener stops accepting (graceful signal) and every upgraded WebSocket task is
+    ///    cancelled: each sends `Close` (bounded) and ends.
+    /// 2. The serve task is awaited; it waits for every open HTTP connection. Past the deadline it
+    ///    is aborted (`serve_overran`).
+    /// 3. The WebSocket tasks are awaited (`ws_joined`).
+    /// 4. The dispatch permits are drained, i.e. every `handle()` still running on the blocking
+    ///    pool has returned (`drained`); then the dispatch semaphore is closed, so any straggling
+    ///    request fails closed with `module_unavailable`.
+    ///
+    /// Never fails: every abnormal outcome is reported in [`ShutdownIngress`].
+    pub async fn shutdown_ingress(mut self, budget: Duration) -> ShutdownIngress {
+        let deadline = tokio::time::Instant::now() + budget;
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        self.ws.cancel.cancel();
+        let (serve, serve_overran) = match tokio::time::timeout_at(deadline, &mut self.task).await {
+            Ok(Ok(result)) => (result, false),
+            Ok(Err(join)) => (
+                Err(io::Error::other(format!("client API task join: {join}"))),
+                false,
+            ),
+            Err(_) => {
+                self.task.abort();
+                let _ = (&mut self.task).await;
+                (Ok(()), true)
+            }
+        };
+        self.ws.tasks.close();
+        let ws_joined = tokio::time::timeout_at(deadline, self.ws.tasks.wait())
+            .await
+            .is_ok();
+        let drain = tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.dispatch).acquire_many_owned(self.permits),
+        )
+        .await;
+        // Closed while the drained permits are still held, so no dispatch can slip in between.
+        self.dispatch.close();
+        let drained = matches!(drain, Ok(Ok(_)));
+        drop(drain);
+        ShutdownIngress {
+            api: self.api,
+            serve,
+            ws_joined,
+            drained,
+            serve_overran,
+        }
     }
 }
 
@@ -304,9 +416,23 @@ async fn event_stream_transport(
     };
     let api = Arc::clone(&state.api);
     let dispatch = state.dispatch.clone();
+    // Taken BEFORE `on_upgrade`, so the window between axum's spawn and the callback is tracked.
+    let tracked = state.ws.tasks.token();
+    let cancel = state.ws.cancel.clone();
     ws.protocols([CLIENT_WS_PROTOCOL])
-        .on_upgrade(move |socket| {
-            websocket_loop(socket, api, dispatch, peer.ip(), token, origin, seed)
+        .on_upgrade(move |socket| async move {
+            let _tracked = tracked;
+            websocket_loop(
+                socket,
+                api,
+                dispatch,
+                peer.ip(),
+                token,
+                origin,
+                seed,
+                cancel,
+            )
+            .await
         })
 }
 
@@ -424,8 +550,31 @@ fn query_body(query: Option<&str>) -> Value {
     }
 }
 
+/// The events WebSocket task. The server shutdown preempts the stream loop wherever it waits (a
+/// send to a peer that stopped reading included); the courtesy `Close` is then bounded.
+#[allow(clippy::too_many_arguments)]
 async fn websocket_loop(
     mut socket: WebSocket,
+    api: Arc<ClientApi>,
+    dispatch: Arc<Semaphore>,
+    peer_ip: IpAddr,
+    token: Option<String>,
+    origin: Option<String>,
+    seed: ClientEnvelope<Value>,
+    cancel: CancellationToken,
+) {
+    let cancelled = tokio::select! {
+        biased;
+        () = cancel.cancelled() => true,
+        () = event_stream_loop(&mut socket, api, dispatch, peer_ip, token, origin, seed) => false,
+    };
+    if cancelled {
+        let _ = tokio::time::timeout(WS_CLOSE_GRACE, socket.send(Message::Close(None))).await;
+    }
+}
+
+async fn event_stream_loop(
+    socket: &mut WebSocket,
     api: Arc<ClientApi>,
     dispatch: Arc<Semaphore>,
     peer_ip: IpAddr,
@@ -445,7 +594,7 @@ async fn websocket_loop(
         })
         .unwrap_or_default();
 
-    if send_envelope(&mut socket, &seed).await.is_err() {
+    if send_envelope(socket, &seed).await.is_err() {
         return;
     }
     let mut poll = tokio::time::interval(Duration::from_millis(POLL_INTERVAL_MS));
@@ -465,7 +614,7 @@ async fn websocket_loop(
                             Ok(next) => stream_request = next,
                             Err(_) => {
                                 let envelope = transport_error(ClientErrorCode::InvalidState, "invalid event stream request");
-                                let _ = send_envelope(&mut socket, &envelope).await;
+                                let _ = send_envelope(socket, &envelope).await;
                                 break;
                             }
                         }
@@ -518,10 +667,10 @@ async fn websocket_loop(
                             || page.redacted_count > 0
                             || page.raw_limit_reached
                             || page.response_limit_reached;
-                        if noteworthy && send_envelope(&mut socket, &envelope).await.is_err() { break; }
+                        if noteworthy && send_envelope(socket, &envelope).await.is_err() { break; }
                     }
                 } else {
-                    let _ = send_envelope(&mut socket, &envelope).await;
+                    let _ = send_envelope(socket, &envelope).await;
                     break;
                 }
             }
@@ -635,8 +784,12 @@ async fn delta_stream_transport(
     };
     let api = Arc::clone(&state.api);
     let dispatch = state.dispatch.clone();
+    // Taken BEFORE `on_upgrade`, so the window between axum's spawn and the callback is tracked.
+    let tracked = state.ws.tasks.token();
+    let cancel = state.ws.cancel.clone();
     ws.protocols([CLIENT_WS_PROTOCOL])
         .on_upgrade(move |socket| async move {
+            let _tracked = tracked;
             let exit = delta_pump(
                 socket,
                 Arc::clone(&api),
@@ -650,6 +803,7 @@ async fn delta_stream_transport(
                 seed_start,
                 expires_at_ms,
                 subscribe_now_ms,
+                cancel,
             )
             .await;
             #[cfg(feature = "test-support")]
@@ -669,7 +823,8 @@ async fn delta_stream_transport(
 /// promoted ONLY on success; saturation = no in-beat retry, no anchor refresh); an auth-failure
 /// verdict cuts IMMEDIATELY; the unconditional `sleep_until(anchor + REAUTH_MAX_AGE)` cut; the
 /// subscribe-time `expires_at` cut; ping every beat with the pong required by the next beat;
-/// socket-error legs cut within the beat.
+/// socket-error legs cut within the beat. The server shutdown preempts the pump wherever it waits
+/// and ends it with [`DeltaPumpExit::ServerShutdown`] (then the same bounded `Close`).
 #[allow(clippy::too_many_arguments)]
 async fn delta_pump(
     mut socket: WebSocket,
@@ -684,6 +839,7 @@ async fn delta_pump(
     seed_start: tokio::time::Instant,
     expires_at_ms: Option<u64>,
     subscribe_now_ms: u64,
+    cancel: CancellationToken,
 ) -> DeltaPumpExit {
     // The RAII subscriber permit lives exactly as long as this pump — any return OR panic
     // unwind through this frame releases the slot.
@@ -735,195 +891,202 @@ async fn delta_pump(
     // permit. At most ONE dispatch permit per connection at a time — the pre-fix invariant.
     let mut reauth_inflight: Option<JoinHandle<ClientEnvelope<Value>>> = None;
 
-    let exit = 'pump: loop {
-        // Armed-then-recheck: mark the current generation seen, THEN read pages — a publish
-        // racing this point re-fires `changed()` on the next select.
-        {
-            let _ = gen_rx.borrow_and_update();
-        }
-
-        // FIX 1 / FIX 4: the most-imminent cut instant — the nearer of the start-anchored re-auth
-        // deadline and the subscribe-time `expires_at`. A send must never outlive it, and a page
-        // must never ship to a session already past it.
-        let reauth_cut = instant_at_ticks(reauth_deadline.deadline());
-        let imminent_cut = match expiry_deadline {
-            Some(exp) => reauth_cut.min(exp),
-            None => reauth_cut,
-        };
-        // The reason the imminent cut carries: `expires_at` only when it is the nearer bound.
-        let imminent_reason = match expiry_deadline {
-            Some(exp) if exp <= reauth_cut => DeltaPumpExit::ExpiresAt,
-            _ => DeltaPumpExit::ReauthDeadline,
-        };
-
-        // FIX 4: gate delivery on the imminent cut — an already-past instant cuts NOW, before a
-        // page can ship to an already-revoked / expired session (with the biased cut arms below,
-        // this closes the unconditional-pre-select-delivery escape).
-        if tokio::time::Instant::now() >= imminent_cut {
-            break imminent_reason;
-        }
-
-        // FIX 1: bound the whole delivery (its `socket.send` + flush) by the imminent cut, so the
-        // cut fires while a send is in flight. A peer that stops reading applies TCP backpressure;
-        // without this bound the blocking send parks the pump forever and a revoked session keeps
-        // receiving post-revocation pages. On elapse we STOP delivering and cut; the immediate
-        // Close below still runs and the RAII subscriber permit still drops.
-        match tokio::time::timeout_at(
-            imminent_cut,
-            deliver_pending(&mut socket, &hub, codec.as_deref(), &mut subscription),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(())) => break DeltaPumpExit::PeerDead,
-            Err(_) => break imminent_reason,
-        }
-
-        tokio::select! {
-            // FIX 4: biased — the cut arms (deadline / expiry) and the beat (which carries the
-            // auth-failure and pong-timeout cuts) are polled BEFORE the deliver/recv arms, so a
-            // due cut always wins over a ready page or a ready inbound frame.
-            biased;
-            // Unconditional revocation-cut deadline (start-anchored): fires on or off the beat
-            // grid; a saturated / failed / overrunning beat never pushed the anchor, so this holds.
-            _ = tokio::time::sleep_until(reauth_cut) => {
-                break DeltaPumpExit::ReauthDeadline;
-            }
-            // Subscribe-time session lifetime cap.
-            _ = async { tokio::time::sleep_until(expiry_deadline.unwrap()).await },
-                if expiry_deadline.is_some() =>
+    let pump = async {
+        'pump: loop {
+            // Armed-then-recheck: mark the current generation seen, THEN read pages — a publish
+            // racing this point re-fires `changed()` on the next select.
             {
-                break DeltaPumpExit::ExpiresAt;
+                let _ = gen_rx.borrow_and_update();
             }
-            _ = beat.tick() => {
-                // FIX 3: observe ALREADY-ARRIVED frames before judging the pong deadline (keeps
-                // the pong-race fix), but CAP the drain per wake and always yield back to the
-                // select — an inbound flood can no longer starve the cut / deadline arms, and the
-                // per-frame error-envelope write is bounded per wake.
-                for _ in 0..DELTA_INBOUND_DRAIN_PER_BEAT {
-                    match tokio::time::timeout(Duration::ZERO, socket.recv()).await {
-                        Err(_) => break, // nothing buffered
-                        Ok(incoming) => {
-                            if let Err(exit) = handle_delta_socket_message(
-                                incoming,
-                                &mut socket,
-                                codec.as_deref(),
-                                &mut subscription,
-                                &mut outstanding_ping,
-                                imminent_cut,
-                                imminent_reason,
-                            )
-                            .await
-                            {
-                                break 'pump exit;
-                            }
-                        }
-                    }
+
+            // FIX 1 / FIX 4: the most-imminent cut instant — the nearer of the start-anchored re-auth
+            // deadline and the subscribe-time `expires_at`. A send must never outlive it, and a page
+            // must never ship to a session already past it.
+            let reauth_cut = instant_at_ticks(reauth_deadline.deadline());
+            let imminent_cut = match expiry_deadline {
+                Some(exp) => reauth_cut.min(exp),
+                None => reauth_cut,
+            };
+            // The reason the imminent cut carries: `expires_at` only when it is the nearer bound.
+            let imminent_reason = match expiry_deadline {
+                Some(exp) if exp <= reauth_cut => DeltaPumpExit::ExpiresAt,
+                _ => DeltaPumpExit::ReauthDeadline,
+            };
+
+            // FIX 4: gate delivery on the imminent cut — an already-past instant cuts NOW, before a
+            // page can ship to an already-revoked / expired session (with the biased cut arms below,
+            // this closes the unconditional-pre-select-delivery escape).
+            if tokio::time::Instant::now() >= imminent_cut {
+                break imminent_reason;
+            }
+
+            // FIX 1: bound the whole delivery (its `socket.send` + flush) by the imminent cut, so the
+            // cut fires while a send is in flight. A peer that stops reading applies TCP backpressure;
+            // without this bound the blocking send parks the pump forever and a revoked session keeps
+            // receiving post-revocation pages. On elapse we STOP delivering and cut; the immediate
+            // Close below still runs and the RAII subscriber permit still drops.
+            match tokio::time::timeout_at(
+                imminent_cut,
+                deliver_pending(&mut socket, &hub, codec.as_deref(), &mut subscription),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(())) => break DeltaPumpExit::PeerDead,
+                Err(_) => break imminent_reason,
+            }
+
+            tokio::select! {
+                // FIX 4: biased — the cut arms (deadline / expiry) and the beat (which carries the
+                // auth-failure and pong-timeout cuts) are polled BEFORE the deliver/recv arms, so a
+                // due cut always wins over a ready page or a ready inbound frame.
+                biased;
+                // Unconditional revocation-cut deadline (start-anchored): fires on or off the beat
+                // grid; a saturated / failed / overrunning beat never pushed the anchor, so this holds.
+                _ = tokio::time::sleep_until(reauth_cut) => {
+                    break DeltaPumpExit::ReauthDeadline;
                 }
-                // FIX 5: half-open detection — the pong echoing the PREVIOUS beat's ping nonce
-                // must have arrived by this beat (~2 beats wall from failure, B3(ii)); an
-                // uncorrelated Pong no longer clears the wait.
-                if outstanding_ping.is_some() {
-                    break DeltaPumpExit::PongTimeout;
-                }
-                // Ping every beat with a fresh monotonic nonce; a ping-SEND error is the same
-                // dead-peer class (B3(ii)). Bound the send by the imminent cut so a non-reading
-                // peer cannot park the beat past the deadline.
-                let ping_id = next_ping_id;
-                next_ping_id = next_ping_id.wrapping_add(1);
-                match tokio::time::timeout_at(
-                    imminent_cut,
-                    socket.send(Message::Ping(ping_id.to_be_bytes().to_vec().into())),
-                )
-                .await
+                // Subscribe-time session lifetime cap.
+                _ = async { tokio::time::sleep_until(expiry_deadline.unwrap()).await },
+                    if expiry_deadline.is_some() =>
                 {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) => break DeltaPumpExit::PeerDead,
-                    Err(_) => break imminent_reason,
+                    break DeltaPumpExit::ExpiresAt;
                 }
-                outstanding_ping = Some(ping_id);
-                // Re-auth through the FULL handle() pipeline on the blocking pool under a dispatch
-                // permit. The anchor candidate is this beat's START instant, promoted ONLY on a
-                // successful verdict. A saturated permit neither retries in-beat nor refreshes the
-                // anchor — saturation fails CLOSED toward the deadline cut.
-                let beat_start = tokio::time::Instant::now();
-                // FIX 2: reclaim the slot once a prior detached re-auth has finished (its permit is
-                // already released), and while one is still outstanding COALESCE this beat's re-auth
-                // — no new permit, no anchor refresh — so the connection pins at most ONE dispatch
-                // permit at a time. Skipping does NOT touch the anchor, so the fail-closed deadline
-                // timing is unchanged and the unconditional cut still fires on schedule.
-                if let Some(inflight) = reauth_inflight.as_ref() {
-                    if inflight.is_finished() {
-                        reauth_inflight = None;
-                    }
-                }
-                if reauth_inflight.is_none() {
-                    match dispatch.clone().try_acquire_owned() {
-                        Err(_) => {}
-                        Ok(permit) => {
-                            let request = ClientRequest {
-                                api_version: API_VERSION.to_string(),
-                                method: Method::Get,
-                                path: routes::PATH_LLM_DELTAS_STREAM.into(),
-                                session_token: token.clone(),
-                                origin: origin.clone(),
-                                csrf_token: None,
-                                idempotency_key: None,
-                                is_loopback_peer: peer_ip.is_loopback(),
-                                body: Value::Null,
-                            };
-                            let worker_api = Arc::clone(&api);
-                            // Bound the re-auth join by `allowance` via a MUTABLE borrow of the
-                            // JoinHandle so an overrun can KEEP the handle (the task detaches and
-                            // holds its permit until handle() returns, but we still track it to
-                            // coalesce the next beat) instead of dropping it. An overrun does NOT
-                            // refresh the anchor (fail-closed): the unconditional deadline still
-                            // fires on schedule.
-                            let mut join = tokio::task::spawn_blocking(move || {
-                                let _permit = permit;
-                                worker_api.handle(request)
-                            });
-                            match tokio::time::timeout(timing.allowance, &mut join).await {
-                                Ok(Ok(envelope)) if envelope.is_ok() => {
-                                    // Promote the anchor to this beat's START (monotonic — an
-                                    // out-of-order older success never regresses it).
-                                    reauth_deadline
-                                        .record_success_start(ticks_since_base(beat_start));
+                _ = beat.tick() => {
+                    // FIX 3: observe ALREADY-ARRIVED frames before judging the pong deadline (keeps
+                    // the pong-race fix), but CAP the drain per wake and always yield back to the
+                    // select — an inbound flood can no longer starve the cut / deadline arms, and the
+                    // per-frame error-envelope write is bounded per wake.
+                    for _ in 0..DELTA_INBOUND_DRAIN_PER_BEAT {
+                        match tokio::time::timeout(Duration::ZERO, socket.recv()).await {
+                            Err(_) => break, // nothing buffered
+                            Ok(incoming) => {
+                                if let Err(exit) = handle_delta_socket_message(
+                                    incoming,
+                                    &mut socket,
+                                    codec.as_deref(),
+                                    &mut subscription,
+                                    &mut outstanding_ping,
+                                    imminent_cut,
+                                    imminent_reason,
+                                )
+                                .await
+                                {
+                                    break 'pump exit;
                                 }
-                                // A failure verdict (revocation/expiry/scope loss/kill switch) or a
-                                // panic escaping handle(): cut IMMEDIATELY (§2.4 A1).
-                                Ok(Ok(_)) | Ok(Err(_)) => break DeltaPumpExit::AuthFailureImmediate,
-                                // Re-auth overran `allowance`: KEEP the detached handle so the next
-                                // beat coalesces until it finishes (one permit at a time); no anchor
-                                // refresh; fail closed toward the deadline cut.
-                                Err(_) => reauth_inflight = Some(join),
+                            }
+                        }
+                    }
+                    // FIX 5: half-open detection — the pong echoing the PREVIOUS beat's ping nonce
+                    // must have arrived by this beat (~2 beats wall from failure, B3(ii)); an
+                    // uncorrelated Pong no longer clears the wait.
+                    if outstanding_ping.is_some() {
+                        break DeltaPumpExit::PongTimeout;
+                    }
+                    // Ping every beat with a fresh monotonic nonce; a ping-SEND error is the same
+                    // dead-peer class (B3(ii)). Bound the send by the imminent cut so a non-reading
+                    // peer cannot park the beat past the deadline.
+                    let ping_id = next_ping_id;
+                    next_ping_id = next_ping_id.wrapping_add(1);
+                    match tokio::time::timeout_at(
+                        imminent_cut,
+                        socket.send(Message::Ping(ping_id.to_be_bytes().to_vec().into())),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => break DeltaPumpExit::PeerDead,
+                        Err(_) => break imminent_reason,
+                    }
+                    outstanding_ping = Some(ping_id);
+                    // Re-auth through the FULL handle() pipeline on the blocking pool under a dispatch
+                    // permit. The anchor candidate is this beat's START instant, promoted ONLY on a
+                    // successful verdict. A saturated permit neither retries in-beat nor refreshes the
+                    // anchor — saturation fails CLOSED toward the deadline cut.
+                    let beat_start = tokio::time::Instant::now();
+                    // FIX 2: reclaim the slot once a prior detached re-auth has finished (its permit is
+                    // already released), and while one is still outstanding COALESCE this beat's re-auth
+                    // — no new permit, no anchor refresh — so the connection pins at most ONE dispatch
+                    // permit at a time. Skipping does NOT touch the anchor, so the fail-closed deadline
+                    // timing is unchanged and the unconditional cut still fires on schedule.
+                    if let Some(inflight) = reauth_inflight.as_ref() {
+                        if inflight.is_finished() {
+                            reauth_inflight = None;
+                        }
+                    }
+                    if reauth_inflight.is_none() {
+                        match dispatch.clone().try_acquire_owned() {
+                            Err(_) => {}
+                            Ok(permit) => {
+                                let request = ClientRequest {
+                                    api_version: API_VERSION.to_string(),
+                                    method: Method::Get,
+                                    path: routes::PATH_LLM_DELTAS_STREAM.into(),
+                                    session_token: token.clone(),
+                                    origin: origin.clone(),
+                                    csrf_token: None,
+                                    idempotency_key: None,
+                                    is_loopback_peer: peer_ip.is_loopback(),
+                                    body: Value::Null,
+                                };
+                                let worker_api = Arc::clone(&api);
+                                // Bound the re-auth join by `allowance` via a MUTABLE borrow of the
+                                // JoinHandle so an overrun can KEEP the handle (the task detaches and
+                                // holds its permit until handle() returns, but we still track it to
+                                // coalesce the next beat) instead of dropping it. An overrun does NOT
+                                // refresh the anchor (fail-closed): the unconditional deadline still
+                                // fires on schedule.
+                                let mut join = tokio::task::spawn_blocking(move || {
+                                    let _permit = permit;
+                                    worker_api.handle(request)
+                                });
+                                match tokio::time::timeout(timing.allowance, &mut join).await {
+                                    Ok(Ok(envelope)) if envelope.is_ok() => {
+                                        // Promote the anchor to this beat's START (monotonic — an
+                                        // out-of-order older success never regresses it).
+                                        reauth_deadline
+                                            .record_success_start(ticks_since_base(beat_start));
+                                    }
+                                    // A failure verdict (revocation/expiry/scope loss/kill switch) or a
+                                    // panic escaping handle(): cut IMMEDIATELY (§2.4 A1).
+                                    Ok(Ok(_)) | Ok(Err(_)) => break DeltaPumpExit::AuthFailureImmediate,
+                                    // Re-auth overran `allowance`: KEEP the detached handle so the next
+                                    // beat coalesces until it finishes (one permit at a time); no anchor
+                                    // refresh; fail closed toward the deadline cut.
+                                    Err(_) => reauth_inflight = Some(join),
+                                }
                             }
                         }
                     }
                 }
-            }
-            changed = gen_rx.changed() => {
-                if changed.is_err() {
-                    // Hub dropped (teardown): end the pump as an orderly close.
-                    break DeltaPumpExit::PeerClosed;
+                changed = gen_rx.changed() => {
+                    if changed.is_err() {
+                        // Hub dropped (teardown): end the pump as an orderly close.
+                        break DeltaPumpExit::PeerClosed;
+                    }
                 }
-            }
-            incoming = socket.recv() => {
-                if let Err(exit) = handle_delta_socket_message(
-                    incoming,
-                    &mut socket,
-                    codec.as_deref(),
-                    &mut subscription,
-                    &mut outstanding_ping,
-                    imminent_cut,
-                    imminent_reason,
-                )
-                .await
-                {
-                    break exit;
+                incoming = socket.recv() => {
+                    if let Err(exit) = handle_delta_socket_message(
+                        incoming,
+                        &mut socket,
+                        codec.as_deref(),
+                        &mut subscription,
+                        &mut outstanding_ping,
+                        imminent_cut,
+                        imminent_reason,
+                    )
+                    .await
+                    {
+                        break exit;
+                    }
                 }
             }
         }
+    };
+    let exit = tokio::select! {
+        biased;
+        () = cancel.cancelled() => DeltaPumpExit::ServerShutdown,
+        exit = pump => exit,
     };
     // Immediate cut: close without flushing any queued page — no delta frame after the close.
     // Bound the courtesy Close by `allowance` so a non-reading peer cannot park the pump (and

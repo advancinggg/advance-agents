@@ -51,6 +51,8 @@ chrono = { workspace = true, features = ["clock"] }
 # `ClientApi::handle`; axum owns sockets only and has no provider access.
 axum = { workspace = true, features = ["ws"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+# Cancellation + tracking of the upgraded WebSocket tasks for the bounded ingress shutdown.
+tokio-util = { workspace = true, features = ["rt"] }
 url = { workspace = true }
 
 [dev-dependencies]
