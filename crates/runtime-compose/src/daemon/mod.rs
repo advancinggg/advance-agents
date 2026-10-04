@@ -719,6 +719,23 @@ async fn run_async(workspace: Option<PathBuf>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// Compile-time witness: the daemon composition future is `Send + 'static`, so it can
+// be driven by `tokio::spawn` on a multi-thread runtime as well as by the CLI's
+// current-thread `block_on`. A `!Send` value held across an `.await` fails the build
+// here, not at an embedder's call site.
+const _: () = {
+    fn assert_send_static<F, Fut>(_: F)
+    where
+        F: Fn(Option<PathBuf>) -> Fut,
+        Fut: std::future::Future<Output = ExitCode> + Send + 'static,
+    {
+    }
+    #[allow(dead_code)]
+    fn witness() {
+        assert_send_static(run_async);
+    }
+};
+
 /// MODULE-001-AC-20 (024): discriminate a `wasm32` core module from an encoded WASM
 /// Component by the binary header. Both share the `\0asm` magic (bytes 0..4); the low
 /// byte of the version field (byte 4) is `0x01` for a core module and `0x0d` for a
