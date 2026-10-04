@@ -3,12 +3,14 @@
 mod common;
 
 use advance_shared_types::capability::{CapParams, GrantDecision};
+use advance_shared_types::mcp::SERVER_WIDE_TOOL;
 use advance_shared_types::traits::GrantCheck;
 use cap_grant::data::{
     CapParam, Grant, GrantId, GrantIssuer, GrantProvenance, GrantStatus, GrantTtl,
 };
 use cap_grant::{AuthzLevel, GrantCheckImpl};
 use chrono::Utc;
+use serde_json::json;
 use std::sync::Arc;
 
 use crate::common::make_store;
@@ -367,6 +369,179 @@ fn ac23_l1_subset_authz_emits_covering_grant_id() {
     // The emitted grant_id must be the covering grant, NOT the lex-min capability
     // match (which would be "g-aaa-no" under the old predicate).
     assert_eq!(evt.payload["grant_id"], "g-bbb-yes");
+}
+
+// ============================================================================
+// `mcp` call requests: literal server ids and tool names, each held grant judged
+// on its own.
+// ============================================================================
+
+fn allows(check: &dyn GrantCheck, agent: &str, request: serde_json::Value) -> bool {
+    matches!(
+        check.check(
+            agent,
+            "mcp",
+            "advance:runtime/mcp-client@0.1.0::invoke-mcp-tool",
+            &CapParams::from(request)
+        ),
+        GrantDecision::Allow
+    )
+}
+
+#[test]
+fn mcp_calls_are_checked_against_the_grant_tool_patterns() {
+    let (store, _bus, _h) = make_store();
+    store
+        .insert(grant_with_params(
+            "g1",
+            "alice",
+            "mcp",
+            vec![cp("servers", "github"), cp("tool-patterns", "get_*")],
+        ))
+        .unwrap();
+    let check = GrantCheckImpl::new(store.clone());
+    assert!(allows(
+        &check,
+        "alice",
+        json!({"servers": "github", "tool-patterns": "get_issue"})
+    ));
+    assert!(allows(&check, "alice", json!({"servers": "github"})));
+    assert!(allows(
+        &check,
+        "alice",
+        json!({"servers": ["github"], "tool-patterns": ["get_issue", "get_pr"]})
+    ));
+    for denied in [
+        json!({"servers": "github", "tool-patterns": "delete_repo"}),
+        json!({"servers": "github", "tool-patterns": ["get_issue", "delete_repo"]}),
+        json!({"servers": "slack"}),
+        json!({"servers": "slack", "tool-patterns": "get_issue"}),
+        json!({"tool-patterns": "get_issue"}),
+        json!({"servers": "github", "tool-patterns": SERVER_WIDE_TOOL}),
+    ] {
+        assert!(!allows(&check, "alice", denied.clone()), "{denied}");
+    }
+    assert!(!allows(
+        &check,
+        "bob",
+        json!({"servers": "github", "tool-patterns": "get_issue"})
+    ));
+}
+
+#[test]
+fn mcp_whole_capability_grant_covers_every_call() {
+    let (store, _bus, _h) = make_store();
+    store
+        .insert(grant_with_params("g1", "alice", "mcp", vec![]))
+        .unwrap();
+    let check = GrantCheckImpl::new(store.clone());
+    assert!(allows(
+        &check,
+        "alice",
+        json!({"servers": "any", "tool-patterns": "anything"})
+    ));
+    assert!(allows(
+        &check,
+        "alice",
+        json!({"servers": "any", "tool-patterns": SERVER_WIDE_TOOL})
+    ));
+    // Even an unrestricted grant needs the request to name its server.
+    assert!(!allows(
+        &check,
+        "alice",
+        json!({"tool-patterns": "anything"})
+    ));
+}
+
+#[test]
+fn mcp_grants_are_never_merged_across_axes() {
+    let (store, _bus, _h) = make_store();
+    store
+        .insert(grant_with_params(
+            "g-a",
+            "alice",
+            "mcp",
+            vec![cp("servers", "a"), cp("tool-patterns", "x*")],
+        ))
+        .unwrap();
+    store
+        .insert(grant_with_params(
+            "g-b",
+            "alice",
+            "mcp",
+            vec![cp("servers", "b")],
+        ))
+        .unwrap();
+    let check = GrantCheckImpl::new(store.clone());
+    let call = |server: &str, tool: &str| json!({"servers": server, "tool-patterns": tool});
+    assert!(allows(&check, "alice", call("a", "x1")));
+    assert!(allows(&check, "alice", call("b", "y")));
+    // `y` on `a` would need g-a's server and g-b's open tool axis at once.
+    assert!(!allows(&check, "alice", call("a", "y")));
+    // One request spanning both servers is judged against each grant alone.
+    assert!(!allows(
+        &check,
+        "alice",
+        json!({"servers": ["a", "b"], "tool-patterns": "x1"})
+    ));
+}
+
+// The `data` tool authorizes by `fs`: a read sends `read-paths` alone, a write sends
+// `read-paths` and `write-paths` on the same file, and `query` / `promote` / `demote` ask for
+// `/`. The call-time path keeps those decisions exactly.
+#[test]
+fn data_tool_fs_requests_keep_their_decisions() {
+    let read = |path: &str| json!({"read-paths": path});
+    let write = |path: &str| json!({"read-paths": path, "write-paths": path});
+    let cases: [(Vec<CapParam>, Vec<(serde_json::Value, bool)>); 3] = [
+        (
+            vec![cp("read-paths", "/notes")],
+            vec![
+                (read("/notes/a.md"), true),
+                (write("/notes/a.md"), false),
+                (read("/"), false),
+                (read("/launch.md"), false),
+            ],
+        ),
+        (
+            vec![cp("read-paths", "/"), cp("write-paths", "/notes")],
+            vec![
+                (read("/launch.md"), true),
+                (read("/"), true),
+                (write("/notes/a.md"), true),
+                (write("/launch.md"), false),
+                (write("/"), false),
+            ],
+        ),
+        (
+            vec![],
+            vec![
+                (read("/launch.md"), true),
+                (write("/launch.md"), true),
+                (write("/"), true),
+            ],
+        ),
+    ];
+    for (held, requests) in cases {
+        let (store, _bus, _h) = make_store();
+        store
+            .insert(grant_with_params("g1", "alice", "fs", held.clone()))
+            .unwrap();
+        let check = GrantCheckImpl::new(store.clone());
+        for (request, expected) in requests {
+            let decision = check.check(
+                "alice",
+                "fs",
+                "data.patch",
+                &CapParams::from(request.clone()),
+            );
+            assert_eq!(
+                matches!(decision, GrantDecision::Allow),
+                expected,
+                "held {held:?}, request {request}"
+            );
+        }
+    }
 }
 
 // T38-10 — capability mismatch: a grant for a DIFFERENT capability does not cover.

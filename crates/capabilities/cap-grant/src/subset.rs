@@ -1,10 +1,16 @@
 //! `SubsetValidator` (CONTRACT-122, MODULE-013 §1.4.3 / PRD §5.7.4).
 //!
-//! Implements the 14 parameter-level subset rules from spec §1.4.3 across 11
-//! capability families (`web` is whole-capability-only). Trait + impl live local to `cap-grant` (NOT promoted
-//! to shared-types — ARCH §4.2's dependency-inversion list excludes
+//! Parameter-level subset rules, one helper per capability family. `web` takes no
+//! params (whole-capability only), and the retired `data` family keeps its rule so
+//! persisted grants still narrow and revoke. Trait + impl live local to `cap-grant`
+//! (NOT promoted to shared-types — ARCH §4.2's dependency-inversion list excludes
 //! CONTRACT-122; ARCH §6.1's CONTRACT-122 row direction is M013 → M005 as a
 //! direct compile-time edge).
+//!
+//! [`SubsetValidator::validate`] answers "may `parent` issue `child`?" (narrow,
+//! delegate, preset apply, spawn admission). [`SubsetValidatorImpl::covers_request`]
+//! answers "does this held grant cover this call?" for the L1 gate; it is
+//! `validate` for every family except `mcp`.
 //!
 //! Fail-closed posture per PRD §5.7.4 mandate "Subset rules enforced
 //! unconditionally; no bypass path":
@@ -15,16 +21,37 @@
 //!   child params are subset.
 //! - Empty child params = "request whole capability" — fails closed against a
 //!   restricted parent (cannot widen).
+//! - A key the child leaves out is not requested, so it is never a violation,
+//!   whatever the parent holds (a data-tool read carries `read-paths` without
+//!   `write-paths`).
+//! - A key the child carries that the parent leaves out is a violation: the
+//!   parent grants nothing on that key.
 //! - Numeric `≤` rule on non-parsable values → `SubsetViolation`.
-//! - Set-subset on missing keys (parent has key, child is missing it) → child
-//!   inherits the unrestricted whole-capability semantic for that key only IF
-//!   parent's key is also missing; otherwise child's missing key is treated
-//!   as "request all" and fails closed.
+//!
+//! `mcp` departs from those key rules, because leaving its `tool-patterns` key
+//! out means every tool:
+//! - `servers` is a set of literal server ids; leaving it out reaches no server.
+//! - `tool-patterns` holds trailing-`*` patterns ([`advance_shared_types::mcp`]).
+//!   A parent without it covers any well-formed child patterns. A child that
+//!   leaves it out while the parent has it would reach every tool and is refused.
+//!   Otherwise every child pattern must be covered by a parent pattern. A
+//!   malformed pattern on either side is a violation.
+//! - A key other than `servers` / `tool-patterns` is a violation, so a misspelled
+//!   key never leaves the tool axis unrestricted.
+//! - At call time ([`SubsetValidatorImpl::covers_request`]) request tokens are
+//!   literal server ids and tool names, a request must name its server, and a
+//!   request without `tool-patterns` asks for the server only, skipping the tool
+//!   axis. The literal tool
+//!   [`SERVER_WIDE_TOOL`](advance_shared_types::mcp::SERVER_WIDE_TOOL), which
+//!   stands for a server's prompts and resources, matches no pattern, so only an
+//!   unrestricted tool axis covers it.
 //!
 //! URL pattern subset (`http.allowlist`) uses an inline string-prefix
 //! algorithm with `<prefix>/*` structural-separator enforcement — see
 //! `url_pattern_subset` rustdoc for the threat model and accepted/rejected
 //! shapes.
+
+use advance_shared_types::mcp::{McpGrantScope, ToolPattern};
 
 use crate::data::{CapParam, Grant, GrantDraft};
 use crate::error::CapGrantError;
@@ -35,12 +62,26 @@ pub trait SubsetValidator: Send + Sync {
     fn validate(&self, parent: &Grant, child: &GrantDraft) -> Result<(), CapGrantError>;
 }
 
-/// Concrete impl with the 14 subset rules from spec §1.4.3.
+/// Concrete impl with the per-family subset rules (see the module docs).
 pub struct SubsetValidatorImpl;
 
 impl SubsetValidatorImpl {
     pub fn new() -> Self {
         Self
+    }
+
+    /// The call-time check of the L1 gate: does the `held` grant cover `request`?
+    ///
+    /// For every family but `mcp` this is [`SubsetValidator::validate`]. An `mcp` request
+    /// describes a call, not a grant: its tokens are literal server ids and tool names, it must
+    /// name the server it addresses, and without `tool-patterns` it asks for the server only.
+    /// Coverage is decided by the held grant's [`McpGrantScope`], the same scope the listing
+    /// reader returns, so a listing and a call agree.
+    pub fn covers_request(&self, held: &Grant, request: &GrantDraft) -> Result<(), CapGrantError> {
+        if held.capability == "mcp" && request.capability == "mcp" {
+            return covers_mcp_request(&held.params, &request.params);
+        }
+        self.validate(held, request)
     }
 }
 
@@ -469,27 +510,199 @@ fn check_llm(parent: &[CapParam], child: &[CapParam]) -> Result<(), CapGrantErro
     Ok(())
 }
 
+/// The params an `mcp` grant may carry.
+const MCP_KEYS: [&str; 2] = ["servers", "tool-patterns"];
+
+/// Issuance rule for `mcp` (see the module docs): `servers` is a literal set that reaches no
+/// server when absent; `tool-patterns` reaches every tool when absent, so a child may not drop a
+/// parent's patterns, and child patterns must be covered by parent patterns.
 fn check_mcp(parent: &[CapParam], child: &[CapParam]) -> Result<(), CapGrantError> {
-    for key in ["servers", "tool-patterns"] {
-        let p = get_param(parent, key);
-        let c = get_param(child, key);
-        if let (Some(p), Some(c)) = (p, c) {
+    reject_unknown_mcp_keys(parent, "parent")?;
+    reject_unknown_mcp_keys(child, "child")?;
+
+    match (get_param(parent, "servers"), get_param(child, "servers")) {
+        (_, None) => {}
+        (None, Some(_)) => {
+            return Err(CapGrantError::SubsetViolation(
+                "mcp.servers: child requests servers but the parent reaches none".into(),
+            ))
+        }
+        (Some(p), Some(c)) => {
             let pp = parse_csv(p);
-            let cc = parse_csv(c);
-            for ct in &cc {
-                if !pp.contains(ct) {
+            for cs in parse_csv(c) {
+                if !pp.contains(&cs) {
                     return Err(CapGrantError::SubsetViolation(format!(
-                        "mcp.{key}: child {ct:?} not in parent set {pp:?}"
+                        "mcp.servers: child {cs:?} not in parent set {pp:?}"
                     )));
                 }
             }
-        } else if c.is_some() && p.is_none() {
+        }
+    }
+
+    match (
+        parse_tool_patterns(parent, "parent")?,
+        parse_tool_patterns(child, "child")?,
+    ) {
+        (None, _) => Ok(()),
+        (Some(_), None) => Err(CapGrantError::SubsetViolation(
+            "mcp.tool-patterns: child leaves out tool-patterns, which reaches every tool, but \
+             the parent restricts tools"
+                .into(),
+        )),
+        (Some(pp), Some(cc)) => {
+            for c in &cc {
+                if !pp.iter().any(|p| p.covers(c)) {
+                    return Err(CapGrantError::SubsetViolation(format!(
+                        "mcp.tool-patterns: child pattern `{c}` is not covered by a parent pattern"
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// One side's `tool-patterns`, `None` when the key is absent. A malformed pattern is a
+/// violation.
+fn parse_tool_patterns<'a>(
+    params: &'a [CapParam],
+    role: &str,
+) -> Result<Option<Vec<ToolPattern<'a>>>, CapGrantError> {
+    let Some(value) = get_param(params, "tool-patterns") else {
+        return Ok(None);
+    };
+    parse_csv(value)
+        .into_iter()
+        .map(|raw| {
+            ToolPattern::parse(raw).map_err(|e| {
+                CapGrantError::SubsetViolation(format!(
+                    "mcp.tool-patterns: {role} pattern {raw:?} is malformed: {e}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn reject_unknown_mcp_keys(params: &[CapParam], role: &str) -> Result<(), CapGrantError> {
+    match params.iter().find(|p| !MCP_KEYS.contains(&p.key.as_str())) {
+        Some(p) => Err(CapGrantError::SubsetViolation(format!(
+            "mcp: {role} carries {:?}, which is not an mcp param (servers, tool-patterns)",
+            p.key
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The scope one `mcp` grant reaches, or `None` when its params carry a key other than
+/// `servers` / `tool-patterns` (such a grant covers nothing). A grant without params reaches
+/// every server and tool; a restricted grant without `servers` reaches no server.
+pub(crate) fn mcp_scope(params: &[CapParam]) -> Option<McpGrantScope> {
+    if params.is_empty() {
+        return Some(McpGrantScope::unrestricted());
+    }
+    if reject_unknown_mcp_keys(params, "grant").is_err() {
+        return None;
+    }
+    let tokens = |key: &str| {
+        get_param(params, key).map(|v| {
+            parse_csv(v)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+    };
+    Some(McpGrantScope {
+        servers: Some(tokens("servers").unwrap_or_default()),
+        tool_patterns: tokens("tool-patterns"),
+    })
+}
+
+/// Call-time `mcp` coverage (see [`SubsetValidatorImpl::covers_request`]).
+fn covers_mcp_request(held: &[CapParam], request: &[CapParam]) -> Result<(), CapGrantError> {
+    let scope = mcp_scope(held).ok_or_else(|| {
+        CapGrantError::SubsetViolation(
+            "mcp: the held grant carries a param other than servers / tool-patterns and covers \
+             nothing"
+                .into(),
+        )
+    })?;
+    reject_unknown_mcp_keys(request, "request")?;
+    let servers = get_param(request, "servers")
+        .map(parse_csv)
+        .unwrap_or_default();
+    if servers.is_empty() {
+        return Err(CapGrantError::SubsetViolation(
+            "mcp: a request must name the server it addresses".into(),
+        ));
+    }
+    let tools = get_param(request, "tool-patterns").map(parse_csv);
+    if tools.as_ref().is_some_and(Vec::is_empty) {
+        return Err(CapGrantError::SubsetViolation(
+            "mcp: a request carrying tool-patterns must name a tool".into(),
+        ));
+    }
+    for server in &servers {
+        let covered = match &tools {
+            None => scope.covers_server(server),
+            Some(tools) => tools.iter().all(|tool| scope.covers_tool(server, tool)),
+        };
+        if !covered {
             return Err(CapGrantError::SubsetViolation(format!(
-                "mcp.{key}: child requests but parent has no {key}"
+                "mcp: the held grant does not cover the request on server {server:?}"
             )));
         }
     }
     Ok(())
+}
+
+/// What in an `mcp` grant's params makes part of it cover nothing, one line each; empty when
+/// they are well-formed. Static config is stored without these checks, so the static compiler
+/// reports them at boot.
+pub fn mcp_param_problems(params: &[CapParam]) -> Vec<String> {
+    let mut problems = Vec::new();
+    if params.is_empty() {
+        return problems;
+    }
+    for p in params
+        .iter()
+        .filter(|p| !MCP_KEYS.contains(&p.key.as_str()))
+    {
+        problems.push(format!(
+            "`{}` is not an mcp param (servers, tool-patterns); the grant covers nothing",
+            p.key
+        ));
+    }
+    match get_param(params, "servers").map(parse_csv) {
+        None => problems.push("`servers` is missing, so the grant reaches no server".to_string()),
+        Some(servers) if servers.is_empty() => {
+            problems.push("`servers` is empty, so the grant reaches no server".to_string())
+        }
+        Some(servers) => {
+            for server in servers
+                .into_iter()
+                .filter(|s| s.contains(['*', '?', '[', ']', '{', '}']))
+            {
+                problems.push(format!(
+                    "server {server:?} is a literal id and glob characters match nothing; list \
+                     the servers, or grant `mcp: true` for every server"
+                ));
+            }
+        }
+    }
+    if let Some(patterns) = get_param(params, "tool-patterns").map(parse_csv) {
+        if patterns.is_empty() {
+            problems.push("`tool-patterns` is empty, so the grant covers no tool".to_string());
+        }
+        for raw in patterns {
+            if let Err(e) = ToolPattern::parse(raw) {
+                problems.push(format!(
+                    "tool pattern {raw:?} is malformed ({e}); the grant covers no tool"
+                ));
+            }
+        }
+    }
+    problems
 }
 
 fn check_skills(parent: &[CapParam], child: &[CapParam]) -> Result<(), CapGrantError> {

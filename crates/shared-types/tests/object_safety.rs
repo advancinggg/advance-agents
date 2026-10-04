@@ -51,8 +51,9 @@ fn traits_are_object_safe() {
     let _ssrf_guard: fn(Box<dyn SsrfGuard>) = |_| {};
     let _redirect_check: fn(Box<dyn RedirectCheck>) = |_| {};
 
-    // Wave-15 Lane E (CONTRACT-183 ToolsGrantReader).
+    // Wave-15 Lane E (CONTRACT-183 ToolsGrantReader) and its MCP counterpart.
     let _tools_grant_reader: fn(Box<dyn ToolsGrantReader>) = |_| {};
+    let _mcp_grant_reader: fn(Box<dyn McpGrantReader>) = |_| {};
 
     // Wave-23 (CONTRACT-214 RememberContentPolicy — producer-boundary guard).
     let _remember_content_policy: fn(Box<dyn RememberContentPolicy>) = |_| {};
@@ -93,6 +94,7 @@ fn traits_are_object_safe() {
 
     // Wave-15 Lane E.
     assert_send_sync::<Box<dyn ToolsGrantReader>>();
+    assert_send_sync::<Box<dyn McpGrantReader>>();
 
     // Wave-23 (RememberContentPolicy).
     assert_send_sync::<Box<dyn RememberContentPolicy>>();

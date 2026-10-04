@@ -7,7 +7,8 @@
 //!   declared capabilities via `GrantStore::delegate_grant` (which enforces
 //!   active-parent / `caller==parent.grantee` / SUBSET / TTL+expiry clamp), so the
 //!   child's own `send` passes the L1 grant gate — a served child that cannot act
-//!   is not live;
+//!   is not live. A capability declared with params is delegated with exactly
+//!   those params; a bare one takes the parent grant's params;
 //! - **(seam e)** registers the child's colon adjacency in the shared
 //!   [`DynamicRouting`] + its colon/bare pair in the shared [`AgentIdBridge`], so a
 //!   parent→child `send`/`await` routes with NO harness-supplied entry;
@@ -34,11 +35,15 @@ use advance_scheduler::hook::{
     CrashCascadeSink, MessageHandler, ProtectedTurnExecutionBoundary, TurnObserver,
 };
 use advance_scheduler::types::{ComponentConfig, ComponentId, WasmInstance};
-use advance_shared_types::agent_tree::{AgentId, AgentKind, AgentTreeReader, AgentTreeSnapshot};
+use advance_shared_types::agent_tree::{
+    AgentId, AgentKind, AgentTreeReader, AgentTreeSnapshot, Capability,
+};
 use advance_shared_types::capability::CapRequest;
 use advance_shared_types::mailbox::AgentActionDispatcher;
 use advance_shared_types::traits::EventBusEmit;
-use cap_grant::{GrantDraft, GrantStatus, GrantStore, GrantTtl, SubsetValidatorImpl};
+use cap_grant::{
+    project_capability_params, GrantDraft, GrantStatus, GrantStore, GrantTtl, SubsetValidatorImpl,
+};
 use cap_lifecycle::{AgentTreeStore, SpawnObserver};
 
 use crate::agent_loop::{
@@ -456,7 +461,7 @@ impl PerChildLoopManager {
     /// active-parent / caller==parent.grantee / SUBSET / TTL+expiry clamp — the
     /// child grant provably cannot widen or outlive the parent). Best-effort per
     /// cap: a cap the parent does not hold is simply not delegated.
-    fn delegate_child_grants(&self, parent_bare: &str, child_bare: &str, caps: &[CapRequest]) {
+    fn delegate_child_grants(&self, parent_bare: &str, child_bare: &str, caps: &[Capability]) {
         let Some(grant_store) = self.grant_store.as_ref() else {
             return;
         };
@@ -464,7 +469,7 @@ impl PerChildLoopManager {
         let parent_grants = grant_store.list_by_grantee(parent_bare);
         let validator = SubsetValidatorImpl::new();
         for cap in caps {
-            let cap_name = cap.capability.as_str();
+            let cap_name = cap.id.as_str();
             // Only a grant that still authorizes the parent can be delegated from.
             let Some(pg) = parent_grants.iter().find(|g| {
                 g.capability.as_str() == cap_name
@@ -473,10 +478,9 @@ impl PerChildLoopManager {
             }) else {
                 continue;
             };
-            // The child gets what the parent holds: a restricted parent grant is delegated
-            // with the same params (a whole-capability draft would be refused as a widening).
-            // `fs` path params are relative to the grantee's own territory, so they do not
-            // carry over to a child; that case is reported instead of delegated.
+            // `fs` path params are relative to the grantee's own territory, so a restricted
+            // parent grant does not carry over to a child; that case is reported instead of
+            // delegated.
             if cap_name == "fs" && !pg.params.is_empty() {
                 self.log.err(
                     log_keys::PERCHILD_NO_FS_GRANT,
@@ -487,9 +491,22 @@ impl PerChildLoopManager {
                 );
                 continue;
             }
+            // A capability the child declared with params is delegated with exactly those
+            // params, so the child never holds more than it asked for; `delegate_grant`
+            // refuses them when they are wider than the parent grant. A bare declaration
+            // takes what the parent holds (a whole-capability draft would be refused against
+            // a restricted parent grant as a widening).
+            let params = match project_capability_params(cap) {
+                Ok(own) if !own.is_empty() => own,
+                Ok(_) => pg.params.clone(),
+                Err(e) => {
+                    eprintln!("advance: WARN child {child_bare} gets no `{cap_name}` grant: {e}");
+                    continue;
+                }
+            };
             let draft = GrantDraft {
                 capability: cap_name.to_string(),
-                params: pg.params.clone(),
+                params,
                 ttl: GrantTtl::Persistent,
             };
             if let Err(e) = grant_store.delegate_grant(
@@ -520,21 +537,20 @@ impl SpawnObserver for PerChildLoopManager {
         let parent_colon = (self.key_resolver)(parent_bare);
 
         // The child's declared capabilities (from the freshly-inserted tree node).
-        let caps: Vec<CapRequest> = self
+        let declared: Vec<Capability> = self
             .tree
             .get_node(child)
-            .map(|n| {
-                n.capabilities
-                    .iter()
-                    .map(|c| CapRequest {
-                        capability: c.id.clone(),
-                    })
-                    .collect()
-            })
+            .map(|n| n.capabilities)
             .unwrap_or_default();
+        let caps: Vec<CapRequest> = declared
+            .iter()
+            .map(|c| CapRequest {
+                capability: c.id.clone(),
+            })
+            .collect();
 
         // seam (d).i — L1 grant delegation so the child can act.
-        self.delegate_child_grants(parent_bare, child_bare, &caps);
+        self.delegate_child_grants(parent_bare, child_bare, &declared);
 
         // Discriminator: child-loop-absent — register seam-(e) routing but serve NO
         // loop (the intentional routable-but-unserved state the witness asserts).
@@ -767,5 +783,180 @@ impl PerChildLoopCascade {
 impl cap_lifecycle::LoopCascade for PerChildLoopCascade {
     fn abort_loop(&self, agent_id: &str) {
         self.manager.abort_child(agent_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use advance_database::{R2d2SqliteIndexHandle, SqliteIndexHandle};
+    use advance_shared_types::agent_tree::{AgentNode, AgentStatus};
+    use advance_shared_types::capability::{CapParams, CapabilityId};
+    use advance_shared_types::event::Event;
+    use cap_grant::{CapParam, Grant, GrantId, GrantIssuer, GrantProvenance, GrantSqliteIndex};
+    use serde_json::json;
+
+    use super::*;
+
+    struct NullBus;
+
+    impl EventBusEmit for NullBus {
+        fn emit(&self, _: Event) {}
+    }
+
+    fn declared(id: &str, params: serde_json::Value) -> Capability {
+        Capability {
+            id: CapabilityId::from(id),
+            params: CapParams::new(params),
+        }
+    }
+
+    fn param(key: &str, value: &str) -> CapParam {
+        CapParam {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    /// `root` holds `parent_grants`; its child `kid` declares `child_caps`. No runtime is bound,
+    /// so spawning the child runs the grant delegation and stops there.
+    fn spawn_kid(
+        parent_grants: Vec<(&str, Vec<CapParam>)>,
+        child_caps: Vec<Capability>,
+    ) -> Vec<Grant> {
+        let ws = tempfile::TempDir::new().expect("tempdir");
+        let root_dir = ws.path().join("root");
+        let kid_dir = root_dir.join("kid");
+        std::fs::create_dir_all(&kid_dir).expect("territories");
+        let root = AgentId("root".to_string());
+        let kid = AgentId("kid".to_string());
+        let tree = AgentTreeStore::new(ws.path().to_path_buf()).expect("tree");
+        tree.insert_root(AgentNode {
+            id: root.clone(),
+            kind: AgentKind::Root,
+            parent: None,
+            workspace_path: root_dir,
+            capabilities: Vec::new(),
+            template_ref: None,
+            status: AgentStatus::Active,
+        })
+        .expect("root node");
+        tree.insert_child(
+            &root,
+            AgentNode {
+                id: kid.clone(),
+                kind: AgentKind::Child,
+                parent: Some(root.clone()),
+                workspace_path: kid_dir.clone(),
+                capabilities: child_caps,
+                template_ref: None,
+                status: AgentStatus::Active,
+            },
+        )
+        .expect("child node");
+
+        let sqlite: Arc<dyn SqliteIndexHandle> =
+            Arc::new(R2d2SqliteIndexHandle::new_in_memory().expect("sqlite"));
+        let index = GrantSqliteIndex::new(sqlite);
+        index.ensure_schema().expect("grant schema");
+        let bus: Arc<dyn EventBusEmit> = Arc::new(NullBus);
+        let grants = Arc::new(GrantStore::new(index, bus.clone()));
+        for (capability, params) in parent_grants {
+            grants
+                .insert(Grant {
+                    id: GrantId::new(format!("static:root:{capability}")),
+                    grantee: "root".to_string(),
+                    capability: capability.to_string(),
+                    params,
+                    ttl: GrantTtl::Persistent,
+                    issuer: GrantIssuer::Config,
+                    provenance: GrantProvenance::StaticConfig,
+                    status: GrantStatus::Active,
+                    created_at: chrono::Utc::now(),
+                    expires_at: None,
+                })
+                .expect("parent grant");
+        }
+
+        let routing = Arc::new(DynamicRouting::new(
+            Arc::new(tree.clone()) as Arc<dyn AgentTreeReader>
+        ));
+        let manager = PerChildLoopManager::new(
+            Arc::new(MailboxStore::new(NonZeroUsize::new(8).expect("capacity"))),
+            bus,
+            routing,
+            Arc::new(AgentIdBridge::from_pairs([("agent:root", "root")])),
+            Some(grants.clone()),
+            tree,
+            tokio::runtime::Handle::current(),
+            Arc::new(|bare: &str| format!("agent:{bare}")),
+        );
+        manager.on_child_spawned(&root, &kid, &kid_dir);
+        grants.list_by_grantee("kid")
+    }
+
+    fn params_of<'a>(grants: &'a [Grant], capability: &str) -> Option<&'a [CapParam]> {
+        grants
+            .iter()
+            .find(|g| g.capability == capability && g.status == GrantStatus::Active)
+            .map(|g| g.params.as_slice())
+    }
+
+    fn value_of<'a>(params: &'a [CapParam], key: &str) -> Option<&'a str> {
+        params
+            .iter()
+            .find(|p| p.key == key)
+            .map(|p| p.value.as_str())
+    }
+
+    #[tokio::test]
+    async fn a_child_declaring_params_gets_exactly_those_params() {
+        let kid = spawn_kid(
+            vec![("mcp", Vec::new()), ("fs", Vec::new())],
+            vec![
+                declared(
+                    "mcp",
+                    json!({"servers": ["github"], "tool-patterns": ["get_*"]}),
+                ),
+                declared("fs", json!({"read-paths": ["/notes"]})),
+            ],
+        );
+        let mcp = params_of(&kid, "mcp").expect("mcp delegated");
+        assert_eq!(mcp.len(), 2, "{mcp:?}");
+        assert_eq!(value_of(mcp, "servers"), Some("github"));
+        assert_eq!(value_of(mcp, "tool-patterns"), Some("get_*"));
+        let fs = params_of(&kid, "fs").expect("fs delegated");
+        assert_eq!(fs.len(), 1, "{fs:?}");
+        assert_eq!(value_of(fs, "read-paths"), Some("/notes"));
+    }
+
+    #[tokio::test]
+    async fn a_bare_declaration_takes_the_parent_grant_params() {
+        let kid = spawn_kid(
+            vec![("mcp", vec![param("servers", "github")])],
+            vec![declared("mcp", serde_json::Value::Null)],
+        );
+        let mcp = params_of(&kid, "mcp").expect("mcp delegated");
+        assert_eq!(mcp.len(), 1, "{mcp:?}");
+        assert_eq!(value_of(mcp, "servers"), Some("github"));
+    }
+
+    #[tokio::test]
+    async fn declared_params_wider_than_the_parent_grant_get_nothing() {
+        let kid = spawn_kid(
+            vec![
+                ("mcp", vec![param("servers", "github")]),
+                ("fs", vec![param("read-paths", "/notes")]),
+            ],
+            vec![
+                declared("mcp", json!({"servers": ["github", "slack"]})),
+                declared("fs", json!({"read-paths": ["/notes"]})),
+            ],
+        );
+        // Neither the declared params (wider than the parent grant) nor the parent's own.
+        assert_eq!(params_of(&kid, "mcp"), None, "{kid:?}");
+        // A path-restricted parent `fs` grant never carries across territories.
+        assert_eq!(params_of(&kid, "fs"), None, "{kid:?}");
     }
 }

@@ -293,9 +293,10 @@ fn array_element_to_string(
 }
 
 /// Project a `shared_types::Capability` into a `Vec<CapParam>` (cap-grant's
-/// per-family helpers' input shape). Returns `Ok(vec![])` for whole-capability
-/// semantics (`Value::Null` or `Value::Object({})`).
-fn project_capability_params(capability: &Capability) -> Result<Vec<CapParam>, CapGrantError> {
+/// per-family helpers' input shape) through the same fail-closed whitelist and
+/// identity-loss guards as the subset gates. Returns `Ok(vec![])` for
+/// whole-capability semantics (`Value::Null` or `Value::Object({})`).
+pub fn project_capability_params(capability: &Capability) -> Result<Vec<CapParam>, CapGrantError> {
     project_params(capability.id.as_str(), capability.params.as_value())
 }
 

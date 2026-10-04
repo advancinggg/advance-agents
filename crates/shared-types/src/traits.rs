@@ -9,16 +9,18 @@
 //! [`RoundAdvancer`] / [`AwaitSessionRef`] / [`PromptInjectionHelpers`]),
 //! the Slice m012-B addition [`LeakDetector`], the Slice m012-C additions
 //! [`HttpSecurityChain`] / [`SsrfGuard`] / [`RedirectCheck`], [`CostTrackerQuery`],
-//! the Wave-15 Lane E addition [`ToolsGrantReader`] (CONTRACT-183), and the
-//! Wave-23 addition [`RememberContentPolicy`] (CONTRACT-214).
+//! the Wave-15 Lane E addition [`ToolsGrantReader`] (CONTRACT-183) and its MCP
+//! counterpart [`McpGrantReader`], and the Wave-23 addition [`RememberContentPolicy`]
+//! (CONTRACT-214).
 //! Object-safety + `Send + Sync` are regression-locked by
-//! `tests/object_safety.rs` — all 24 traits (5 prior + 12 Slice AC v2 +
+//! `tests/object_safety.rs` — all 25 traits (5 prior + 12 Slice AC v2 +
 //! 1 Slice m012-B + 3 Slice m012-C + CostTrackerQuery + ToolsGrantReader +
-//! RememberContentPolicy) `Box<dyn>`-constructible.
+//! McpGrantReader + RememberContentPolicy) `Box<dyn>`-constructible.
 
 use crate::capability::{BudgetDecision, CapParams, GrantDecision, McpToolEntry, ToolEntry};
 use crate::cost::{AttributedCost, CostLedgerError, CostWindow, RunCost};
 use crate::event::Event;
+use crate::mcp::McpGrantScope;
 use crate::repetition::{OutputHash, RepetitionDecision, ToolCallSignature};
 
 // Slice AC v2 re-exports — canonical trait definitions live in their
@@ -274,6 +276,24 @@ pub const MAX_ATTRIBUTION_ROWS: usize = 10_000;
 /// `#[derive(Debug)]`) hold an `Option<Arc<dyn ToolsGrantReader>>` field.
 pub trait ToolsGrantReader: Send + Sync + std::fmt::Debug {
     fn tool_allowlist(&self, agent_id: &str) -> Option<Vec<String>>;
+}
+
+/// Per-agent projection of the `mcp` grants, for filtering MCP listings.
+///
+/// Provided by MODULE-013 (`cap_grant::McpGrantReaderImpl` over `GrantStore`);
+/// dependency-inverted like [`ToolsGrantReader`] so an MCP consumer never imports cap-grant.
+///
+/// `mcp_grant_scopes(agent_id)` returns one [`McpGrantScope`] per active, unexpired `mcp` grant
+/// the agent holds (empty: no MCP access), built by the same rules as the call-time
+/// [`GrantCheck`]. A listing keeps an entry when one scope covers it on its own (scopes are never
+/// merged across grants), using the scope's `covers_*` methods, so it shows exactly what a call
+/// would be allowed to reach.
+///
+/// Read-only and silent: it authorizes nothing and emits no `authz.checked` event, so filtering
+/// a long listing writes no deny event per hidden entry. Calls stay checked through
+/// [`GrantCheck`].
+pub trait McpGrantReader: Send + Sync + std::fmt::Debug {
+    fn mcp_grant_scopes(&self, agent_id: &str) -> Vec<McpGrantScope>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────

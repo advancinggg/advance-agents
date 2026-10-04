@@ -143,6 +143,7 @@ pub mod entity;
 pub mod event;
 pub mod inference;
 pub mod mailbox;
+pub mod mcp;
 pub mod memory;
 pub mod observation_identity;
 pub mod outbound;
