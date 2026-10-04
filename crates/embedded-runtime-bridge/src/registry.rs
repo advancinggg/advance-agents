@@ -1,33 +1,30 @@
 //! Process-local multi-start registry (workspace key).
+//!
+//! The registry itself is the composition's ([`advance_runtime_compose::registry`]),
+//! so the bridge and an in-process composition refuse each other's home; this
+//! module keeps the bridge's answers.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+
+use advance_runtime_compose::registry::{self as shared, ReserveError};
 
 use crate::error::BridgeError;
 
-static REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-
-fn registry() -> &'static Mutex<HashSet<PathBuf>> {
-    REGISTRY.get_or_init(|| Mutex::new(HashSet::new()))
+fn bridge_error(error: ReserveError) -> BridgeError {
+    match error {
+        ReserveError::AlreadyReserved => BridgeError::AlreadyRunning,
+        ReserveError::Poisoned => BridgeError::Internal("registry lock poisoned".into()),
+    }
 }
 
 /// Reserve a workspace path; fails if already reserved.
 pub fn reserve(workspace: PathBuf) -> Result<(), BridgeError> {
-    let mut g = registry()
-        .lock()
-        .map_err(|_| BridgeError::Internal("registry lock poisoned".into()))?;
-    if !g.insert(workspace) {
-        return Err(BridgeError::AlreadyRunning);
-    }
-    Ok(())
+    shared::reserve(workspace).map_err(bridge_error)
 }
 
 /// Release a previously reserved workspace.
 pub(crate) fn release(workspace: &PathBuf) {
-    if let Ok(mut g) = registry().lock() {
-        g.remove(workspace);
-    }
+    shared::release(workspace);
 }
 
 /// RAII reservation: released on drop unless [`Reservation::persist`] is called.
@@ -74,6 +71,37 @@ mod tests {
         ));
         release(&p);
         reserve(p.clone()).unwrap();
+        release(&p);
+    }
+
+    #[test]
+    fn shared_registry_answers_keep_the_bridge_errors() {
+        assert!(matches!(
+            bridge_error(ReserveError::AlreadyReserved),
+            BridgeError::AlreadyRunning
+        ));
+        match bridge_error(ReserveError::Poisoned) {
+            BridgeError::Internal(text) => assert_eq!(text, "registry lock poisoned"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_home_reserved_by_the_composition_is_refused_to_the_bridge() {
+        let p = PathBuf::from("/tmp/bridge-registry-test-shared-c210");
+        release(&p);
+        let held = advance_runtime_compose::registry::HomeReservation::acquire(p.clone()).unwrap();
+        assert!(matches!(
+            Reservation::acquire(p.clone()),
+            Err(BridgeError::AlreadyRunning)
+        ));
+        drop(held);
+        let mine = Reservation::acquire(p.clone()).unwrap();
+        mine.persist();
+        assert!(matches!(
+            reserve(p.clone()),
+            Err(BridgeError::AlreadyRunning)
+        ));
         release(&p);
     }
 }

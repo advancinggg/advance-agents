@@ -215,6 +215,7 @@ name = "advance-embedded-runtime-bridge"
 version = "0.1.28"
 dependencies = [
  "advance-runtime",
+ "advance-runtime-compose",
  "advance-shared-types",
  "cap-grant",
  "cap-lifecycle",

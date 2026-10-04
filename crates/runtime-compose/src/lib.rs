@@ -16,6 +16,10 @@ pub use api::*;
 // The handle every composition module emits its lines through.
 pub mod compose_log;
 
+// The process-local registry of homes a runtime is composed in (the embedded
+// runtime bridge reserves through it too).
+pub mod registry;
+
 pub mod agent_config;
 // Lane agent-llm-policy (2026-09-16) — the production `AgentLlmPolicySource`: resolves an
 // agent's `.agent/config.yaml` `llm:` block (provider pin / default model / constraint) for the
