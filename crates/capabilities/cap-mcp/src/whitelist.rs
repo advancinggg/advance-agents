@@ -41,20 +41,6 @@ pub const MAX_PATTERNS_PER_SERVER: usize = 64;
 /// per-client transport pool size.
 pub const MAX_SERVERS: usize = 128;
 
-/// Longest server id, in bytes.
-pub const MAX_SERVER_ID_BYTES: usize = 128;
-
-/// Whether `server_id` is 1..=[`MAX_SERVER_ID_BYTES`] characters from
-/// `[A-Za-z0-9._-]`, the server-id grammar of a pack's `mcp-servers/*.yaml`.
-/// Such an id is safe in file names, log lines and display names.
-pub fn is_valid_server_id(server_id: &str) -> bool {
-    !server_id.is_empty()
-        && server_id.len() <= MAX_SERVER_ID_BYTES
-        && server_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
 /// Tool name pattern — literal or single-trailing-`*` prefix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolPattern {
@@ -265,13 +251,15 @@ pub struct McpServersConfigBuilder {
 
 impl McpServersConfigBuilder {
     /// Add a server entry. Returns an error if the id is not a valid server id
-    /// (see [`is_valid_server_id`]), collides with an existing entry, or if the
-    /// total would exceed `MAX_SERVERS`.
+    /// (the shared grammar, [`shared::is_valid_server_id`], which a pack's
+    /// `mcp-servers/*.yaml` follows too), collides with an existing entry, or if
+    /// the total would exceed `MAX_SERVERS`.
     pub fn add_server(mut self, entry: McpServerEntry) -> Result<Self, McpError> {
-        if !is_valid_server_id(&entry.server_id) {
+        if !shared::is_valid_server_id(&entry.server_id) {
             return Err(McpError::invalid_response(format!(
-                "server_id {:?} must be 1..={MAX_SERVER_ID_BYTES} characters from [A-Za-z0-9._-]",
-                entry.server_id
+                "server_id {:?} must be 1..={} characters from [A-Za-z0-9._-]",
+                entry.server_id,
+                shared::MAX_SERVER_ID_BYTES
             )));
         }
         if self.servers.contains_key(&entry.server_id) {

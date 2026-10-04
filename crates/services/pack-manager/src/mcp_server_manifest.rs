@@ -42,6 +42,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use advance_shared_types::mcp::{is_valid_server_id, MAX_SERVER_ID_BYTES};
 use serde::Deserialize;
 
 use crate::component_manifest::yaml_nesting_within_bound;
@@ -51,7 +52,6 @@ use crate::materialize_impl::read_bytes_nofollow_bounded;
 
 /// Size cap on `mcp-servers/{name}.yaml` (the document is a handful of lines).
 pub const MAX_MCP_SERVER_YAML_BYTES: u64 = 64 * 1024;
-const MAX_SERVER_ID_LEN: usize = 128;
 const MAX_DESCRIPTION_LEN: usize = 1024;
 const MAX_COMMAND_LEN: usize = 4096;
 const MAX_ARGS: usize = 64;
@@ -240,21 +240,21 @@ pub fn parse_mcp_server_manifest_str(yaml: &str) -> Result<McpServerManifest, Pa
     })
 }
 
+/// The shared server-id grammar (`advance_shared_types::mcp::is_valid_server_id`), which
+/// cap-mcp's whitelist applies too. The id is quoted in the error only when its length is in
+/// range.
 fn validate_server_id(id: &str) -> Result<(), PackError> {
-    if id.is_empty() || id.len() > MAX_SERVER_ID_LEN {
+    if is_valid_server_id(id) {
+        return Ok(());
+    }
+    if id.is_empty() || id.len() > MAX_SERVER_ID_BYTES {
         return Err(PackError::InvalidManifest(format!(
-            "server-id must be 1..={MAX_SERVER_ID_LEN} bytes"
+            "server-id must be 1..={MAX_SERVER_ID_BYTES} bytes"
         )));
     }
-    if !id
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        return Err(PackError::InvalidManifest(format!(
-            "server-id {id:?} must match [A-Za-z0-9._-]+"
-        )));
-    }
-    Ok(())
+    Err(PackError::InvalidManifest(format!(
+        "server-id {id:?} must match [A-Za-z0-9._-]+"
+    )))
 }
 
 fn validate_text(field: &str, value: &str, max: usize) -> Result<(), PackError> {
@@ -396,6 +396,31 @@ mod tests {
             parse_mcp_server_manifest_str("server-id: x\ntransport:\n  kind: ssh\n  host: h\n"),
             Err(PackError::InvalidManifest(_))
         ));
+    }
+
+    // The manifest accepts exactly the shared server-id grammar, which cap-mcp's whitelist
+    // applies too.
+    #[test]
+    fn server_ids_follow_the_shared_grammar() {
+        let longest = "a".repeat(MAX_SERVER_ID_BYTES);
+        let too_long = "a".repeat(MAX_SERVER_ID_BYTES + 1);
+        for id in [
+            "a",
+            "srv-1",
+            "alpha.beta_gamma",
+            longest.as_str(),
+            "",
+            "a b",
+            "srv:1",
+            "ü",
+            too_long.as_str(),
+        ] {
+            let doc = format!(
+                "server-id: {id:?}\ntransport:\n  kind: http\n  endpoint-url: https://h/\n"
+            );
+            let parsed = parse_mcp_server_manifest_str(&doc);
+            assert_eq!(parsed.is_ok(), is_valid_server_id(id), "{id:?}: {parsed:?}");
+        }
     }
 
     #[test]

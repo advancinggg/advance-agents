@@ -1,10 +1,16 @@
-//! The `mcp` grant family's shared shape: trailing-`*` tool patterns and the scope one grant
-//! reaches.
+//! The `mcp` grant family's shared shape: trailing-`*` tool patterns, the scope one grant
+//! reaches, and the server-id grammar.
 //!
 //! One grammar and one matcher serve every place that filters MCP tools by name: the `mcp`
 //! grant rules in cap-grant (issuance, the call-time check and the listing reader) and the
 //! per-server tool filter in cap-mcp. A listing and a call therefore never disagree about a
 //! name.
+//!
+//! # Server ids
+//!
+//! A server id is 1..=[`MAX_SERVER_ID_BYTES`] characters from `[A-Za-z0-9._-]` (see
+//! [`is_valid_server_id`]). A pack's `mcp-servers/*.yaml` and cap-mcp's server whitelist accept
+//! exactly these ids.
 //!
 //! # Tool patterns
 //!
@@ -33,6 +39,9 @@
 
 /// Longest tool pattern, in bytes.
 pub const MAX_TOOL_PATTERN_BYTES: usize = 256;
+
+/// Longest server id, in bytes.
+pub const MAX_SERVER_ID_BYTES: usize = 128;
 
 /// Longest server id or tool name a call can carry, in bytes: the grant check refuses a request
 /// string longer than this.
@@ -171,6 +180,17 @@ pub fn is_request_token(name: &str) -> bool {
         && name.len() <= MAX_REQUEST_TOKEN_BYTES
         && !name.contains(',')
         && name.trim() == name
+}
+
+/// Whether `server_id` is 1..=[`MAX_SERVER_ID_BYTES`] characters from `[A-Za-z0-9._-]`. Such an
+/// id holds no whitespace, comma, path separator, control or non-ASCII character, so it reads the
+/// same in a log line and a call can carry it.
+pub fn is_valid_server_id(server_id: &str) -> bool {
+    !server_id.is_empty()
+        && server_id.len() <= MAX_SERVER_ID_BYTES
+        && server_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// A server id or tool name a call can carry: one request token, free of spoofing characters.
@@ -411,6 +431,29 @@ mod tests {
             assert!(!open.covers_tool(server, "get_x"), "{server:?}");
         }
         assert!(!restricted.covers_server("github "));
+    }
+
+    #[test]
+    fn server_ids_are_short_names_from_the_charset_that_a_call_can_carry() {
+        let longest = "a".repeat(MAX_SERVER_ID_BYTES);
+        for id in ["a", "srv-1", "alpha.beta_gamma", "A9", longest.as_str()] {
+            assert!(is_valid_server_id(id), "{id:?}");
+            assert!(McpGrantScope::unrestricted().covers_server(id), "{id:?}");
+        }
+        let too_long = "a".repeat(MAX_SERVER_ID_BYTES + 1);
+        for id in [
+            "",
+            "a b",
+            "a/b",
+            "a,b",
+            "srv:1",
+            "ü",
+            "a\u{200B}b",
+            "a\nb",
+            too_long.as_str(),
+        ] {
+            assert!(!is_valid_server_id(id), "{id:?}");
+        }
     }
 
     #[test]

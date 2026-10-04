@@ -15,9 +15,10 @@
 //!   transport therefore keeps working after the runtime of the call that
 //!   created it has shut down.
 //! - The transport closes when the server's stdout ends, a stdout line overflows
-//!   the line cap, a read fails or stdin cannot be written. Closing fails every
-//!   pending call, makes later calls fail fast, turns
-//!   [`McpTransport::is_closed`] true and kills the process group.
+//!   the line cap, a read fails or stdin cannot be written. Closing records when
+//!   it happened ([`McpTransport::closed_at`]), fails every pending call, makes
+//!   later calls fail fast, turns [`McpTransport::is_closed`] true and kills the
+//!   process group.
 //! - `Drop` aborts the tasks, kills the process group while the child is still
 //!   unreaped (so the group id cannot name a recycled group), then kills the
 //!   child; `kill_on_drop(true)` covers a panic between spawn and return.
@@ -27,7 +28,13 @@
 //! A line carrying `method` comes from the server and never resolves a pending
 //! call, whatever its `id`. A `ping` request is answered with an empty result,
 //! any other request with JSON-RPC error -32601 (method not found), and
-//! notifications are dropped. A JSON array line is read as a batch of messages.
+//! notifications are dropped. Only a request whose id is a number or a string of
+//! at most `MAX_SERVER_REQUEST_ID_BYTES` is answered; one with a longer string
+//! id is dropped unanswered, so the replies queued for a server that does not
+//! read its stdin stay small. A response is read only when it answers a call
+//! still waiting; one for an id that was never issued, was already answered or
+//! was abandoned is dropped unread. A JSON array line is read as a batch of
+//! messages.
 //!
 //! ## Bounds
 //!
@@ -36,10 +43,14 @@
 //!   stdout line cap, enforced while reading: no more than the cap is buffered.
 //! - [`StdioOptions::request_timeout`] (default `MAX_STDIO_WALL_CLOCK = 30 s`) —
 //!   per-call budget over sending the request and receiving its answer.
-//! - stderr is never delivered to a caller. It is read line by line, keeping at
-//!   most `MAX_STDERR_LINE_BYTES` of each line, and logged with control,
-//!   invisible and bidi characters replaced, at most `STDERR_LINES_PER_WINDOW`
-//!   lines per `STDERR_WINDOW`.
+//! - Host log. stderr is never delivered to a caller: it is read line by line,
+//!   keeping at most `MAX_STDERR_LINE_BYTES` of each line. stderr lines and the
+//!   message of a JSON-RPC error answering a waiting call (at most
+//!   `MAX_LOGGED_ERROR_BYTES` of it) go to the host log with control, invisible
+//!   and bidi characters replaced. They share one budget per transport: at most
+//!   `LOG_LINES_PER_WINDOW` lines per `LOG_WINDOW`. Lines over the budget are
+//!   dropped and counted; the count is logged with the first line of a later
+//!   window, or when stderr ends or the transport closes.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -73,12 +84,13 @@ pub const MAX_STDIO_WALL_CLOCK: Duration = Duration::from_secs(30);
 /// of a longer line is read and dropped.
 pub const MAX_STDERR_LINE_BYTES: usize = 2048;
 
-/// stderr lines logged per server within one [`STDERR_WINDOW`]. Further lines
-/// in the window are counted and reported in one line when it ends.
-pub const STDERR_LINES_PER_WINDOW: u32 = 100;
+/// Host log lines one transport may write within one [`LOG_WINDOW`]: its stderr
+/// lines and the error messages of its JSON-RPC answers together. Further lines
+/// in the window are counted and reported in one line.
+pub const LOG_LINES_PER_WINDOW: u32 = 100;
 
-/// Length of the stderr logging window.
-pub const STDERR_WINDOW: Duration = Duration::from_secs(60);
+/// Length of the host logging window.
+pub const LOG_WINDOW: Duration = Duration::from_secs(60);
 
 /// Messages queued for the writer task before senders wait.
 const WRITER_QUEUE: usize = 64;
@@ -88,6 +100,11 @@ const METHOD_NOT_FOUND: i64 = -32601;
 
 /// Longest server-supplied error message copied into the host log, in bytes.
 const MAX_LOGGED_ERROR_BYTES: usize = 512;
+
+/// Longest string id of a server request that is answered, in bytes. A request
+/// with a longer string id is dropped unanswered: echoing such ids would let a
+/// server that never reads its stdin fill the writer queue with large replies.
+const MAX_SERVER_REQUEST_ID_BYTES: usize = 128;
 
 /// How a stdio transport runs.
 #[derive(Clone, Debug)]
@@ -126,15 +143,40 @@ struct Inner {
     next_id: AtomicU64,
     leak_detector: Arc<dyn LeakDetector>,
     server_id: String,
-    /// Set, under the `pending` lock, once the transport can carry no more
-    /// calls; a call registering afterwards sees it and fails fast.
+    /// Set, under the `pending` lock and after `close_record`, once the
+    /// transport can carry no more calls; a call registering afterwards sees it
+    /// and fails fast.
     closed: AtomicBool,
-    /// Why the transport closed: the error later calls get.
-    close_reason: Mutex<Option<String>>,
+    /// Why and when the transport closed.
+    close_record: Mutex<Option<CloseRecord>>,
+    /// The budget of host log lines this transport may write (see the module
+    /// docs).
+    log_budget: Mutex<LogBudget>,
     group: ProcessGroup,
 }
 
+/// Why and when a transport closed.
+struct CloseRecord {
+    /// The error later calls get.
+    reason: String,
+    /// When the transport closed.
+    at: Instant,
+}
+
 impl Inner {
+    fn new(server_id: String, leak_detector: Arc<dyn LeakDetector>, group: ProcessGroup) -> Self {
+        Self {
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            leak_detector,
+            server_id,
+            closed: AtomicBool::new(false),
+            close_record: Mutex::new(None),
+            log_budget: Mutex::new(LogBudget::new(Instant::now())),
+            group,
+        }
+    }
+
     /// Register a pending call, unless the transport has closed.
     fn register(&self, id: u64, slot: PendingSlot) -> Result<(), McpError> {
         let mut pending = lock(&self.pending);
@@ -147,27 +189,72 @@ impl Inner {
 
     /// The error a call gets once the transport has closed.
     fn closed_error(&self) -> McpError {
-        let reason = lock(&self.close_reason).clone();
+        let reason = lock(&self.close_record)
+            .as_ref()
+            .map(|record| record.reason.clone());
         McpError::transport(reason.unwrap_or_else(|| "subprocess channel closed".to_string()))
     }
 
-    /// Close the transport: record the first reason, fail every pending call
-    /// with it (in id order) and kill the process group.
+    /// When the transport closed; `None` while it is open.
+    fn closed_at(&self) -> Option<Instant> {
+        lock(&self.close_record).as_ref().map(|record| record.at)
+    }
+
+    /// Close the transport: record the first reason and when it happened, fail
+    /// every pending call with it (in id order), kill the process group and log
+    /// the count of suppressed log lines.
     fn close(&self, reason: &str) {
         let drained: Vec<(u64, PendingSlot)> = {
             let mut pending = lock(&self.pending);
-            if !self.closed.swap(true, Ordering::SeqCst) {
-                *lock(&self.close_reason) = Some(reason.to_string());
+            {
+                let mut record = lock(&self.close_record);
+                if record.is_none() {
+                    *record = Some(CloseRecord {
+                        reason: reason.to_string(),
+                        at: Instant::now(),
+                    });
+                }
             }
+            self.closed.store(true, Ordering::SeqCst);
             let mut entries: Vec<(u64, PendingSlot)> = pending.drain().collect();
             entries.sort_by_key(|(id, _)| *id);
             entries
         };
         self.group.kill();
+        self.flush_log();
         let error = self.closed_error();
         for (_, tx) in drained {
             let _ = tx.send(Err(error.clone()));
         }
+    }
+
+    /// Write one line about this server to the host log, unless the
+    /// transport's log budget for the current window is spent. `line` is built
+    /// only when the line is written.
+    fn log(&self, line: impl FnOnce() -> String) {
+        let (admitted, suppressed) = lock(&self.log_budget).admit(Instant::now());
+        if let Some(count) = suppressed {
+            self.log_suppressed(count);
+        }
+        if admitted {
+            eprintln!("[cap_mcp stdio:{}] {}", self.server_id, line());
+        }
+    }
+
+    /// Log how many lines the budget has suppressed in its current window, if
+    /// any.
+    fn flush_log(&self) {
+        let suppressed = lock(&self.log_budget).take_suppressed();
+        if let Some(count) = suppressed {
+            self.log_suppressed(count);
+        }
+    }
+
+    fn log_suppressed(&self, count: u64) {
+        eprintln!(
+            "[cap_mcp stdio:{}] {count} log lines suppressed",
+            self.server_id
+        );
     }
 }
 
@@ -338,7 +425,6 @@ impl StdioMcpTransport {
         // The child's pipes belong to the runtime that is current when it is
         // spawned, so spawn inside the transport's runtime.
         let _runtime_context = runtime.enter();
-        let server_id = server_id.into();
 
         let mut cmd = Command::new(command);
         cmd.args(args)
@@ -378,15 +464,7 @@ impl StdioMcpTransport {
             .take()
             .ok_or_else(|| McpError::transport("stdio: stderr handle missing"))?;
 
-        let inner = Arc::new(Inner {
-            pending: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-            leak_detector,
-            server_id: server_id.clone(),
-            closed: AtomicBool::new(false),
-            close_reason: Mutex::new(None),
-            group,
-        });
+        let inner = Arc::new(Inner::new(server_id.into(), leak_detector, group));
 
         let (writer_tx, writer_rx) = mpsc::channel::<Outbound>(WRITER_QUEUE);
 
@@ -397,7 +475,7 @@ impl StdioMcpTransport {
             options.max_line_bytes,
         ));
         let writer = runtime.spawn(writer_task(Arc::clone(&inner), writer_rx, stdin));
-        let stderr = runtime.spawn(stderr_task(server_id, stderr));
+        let stderr = runtime.spawn(stderr_task(Arc::clone(&inner), stderr));
 
         Ok(Self {
             inner,
@@ -419,6 +497,11 @@ impl StdioMcpTransport {
     /// True once the transport has closed (see the module docs).
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    /// When the transport closed; `None` while it is open.
+    pub fn closed_at(&self) -> Option<Instant> {
+        self.inner.closed_at()
     }
 
     /// Invoke a JSON-RPC method. Allocates a fresh id, registers a oneshot
@@ -500,6 +583,10 @@ impl McpTransport for StdioMcpTransport {
 
     fn server_id(&self) -> &str {
         &self.inner.server_id
+    }
+
+    fn closed_at(&self) -> Option<Instant> {
+        StdioMcpTransport::closed_at(self)
     }
 
     fn is_closed(&self) -> bool {
@@ -687,8 +774,12 @@ fn handle_line(inner: &Inner, replies: &mpsc::Sender<Outbound>, raw: &[u8]) {
     for message in into_messages(value) {
         match classify(message) {
             Incoming::Response { id, body } => {
-                let outcome = response_outcome(&inner.server_id, id, body);
-                send_pending(inner, id, outcome);
+                // Only the answer to a call still waiting is read. An answer for
+                // an id that was never issued, was already answered or was
+                // abandoned is dropped unread, so it never reaches the host log.
+                if let Some(slot) = take_pending(inner, id) {
+                    let _ = slot.send(response_outcome(inner, id, body));
+                }
             }
             Incoming::Request { id, method } => {
                 // A full writer queue drops the answer rather than stalling the
@@ -716,17 +807,21 @@ enum Incoming {
         id: u64,
         body: serde_json::Map<String, Value>,
     },
-    /// A request from the server (it carries `method` and an id).
+    /// A request from the server that gets an answer: it carries `method` and
+    /// an id short enough to echo.
     Request { id: Value, method: String },
     /// A notification from the server (`method` without a usable id).
     Notification,
-    /// Anything else.
+    /// Anything else, including a server request whose string id is too long
+    /// to echo.
     Invalid,
 }
 
 /// Classify a message. A message carrying `method` is server traffic and never
 /// a response, whatever its `id`; only an id this client can have issued (an
-/// unsigned integer) makes a response.
+/// unsigned integer) makes a response. A server request is answerable when its
+/// id is a number (a fixed-size value) or a string of at most
+/// [`MAX_SERVER_REQUEST_ID_BYTES`].
 fn classify(message: Value) -> Incoming {
     let Value::Object(mut body) = message else {
         return Incoming::Invalid;
@@ -734,7 +829,15 @@ fn classify(message: Value) -> Incoming {
     if let Some(method) = body.remove("method") {
         let method = method.as_str().unwrap_or_default().to_string();
         return match body.remove("id") {
-            Some(id @ (Value::String(_) | Value::Number(_))) => Incoming::Request { id, method },
+            Some(id @ Value::Number(_)) => Incoming::Request { id, method },
+            Some(Value::String(id)) if id.len() <= MAX_SERVER_REQUEST_ID_BYTES => {
+                Incoming::Request {
+                    id: Value::String(id),
+                    method,
+                }
+            }
+            // Too long to echo back: the request is dropped unanswered.
+            Some(Value::String(_)) => Incoming::Invalid,
             _ => Incoming::Notification,
         };
     }
@@ -753,12 +856,12 @@ fn response_id(message: &Value) -> Option<u64> {
     body.get("id").and_then(Value::as_u64)
 }
 
-/// A response's outcome for its caller. A server-supplied error message never
-/// reaches the caller (it could carry injected instructions or exfiltrated
-/// data): the caller sees the JSON-RPC error code, and the message goes to the
-/// host log, sanitized.
+/// The outcome of a response for the call it answers. A server-supplied error
+/// message never reaches the caller (it could carry injected instructions or
+/// exfiltrated data): the caller sees the JSON-RPC error code, and the message
+/// goes to the host log, sanitized and within the transport's log budget.
 fn response_outcome(
-    server_id: &str,
+    inner: &Inner,
     id: u64,
     mut body: serde_json::Map<String, Value>,
 ) -> Result<Vec<u8>, McpError> {
@@ -771,10 +874,12 @@ fn response_outcome(
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        eprintln!(
-            "[cap_mcp stdio:{server_id}] server error id={id} code={code} message={}",
-            sanitize_log_text(message.as_bytes(), MAX_LOGGED_ERROR_BYTES)
-        );
+        inner.log(|| {
+            format!(
+                "server error id={id} code={code} message={}",
+                sanitize_log_text(message.as_bytes(), MAX_LOGGED_ERROR_BYTES)
+            )
+        });
         return Err(McpError::server_error(format!("jsonrpc error code {code}")));
     }
     match body.remove("result") {
@@ -874,34 +979,27 @@ fn outbound_line(inner: &Inner, mut body: Vec<u8>) -> Result<Vec<u8>, McpError> 
 }
 
 /// Stderr task — logs the subprocess's stderr for host-side diagnostics,
-/// sanitized and rate-limited (see the module docs). Never delivered to a
-/// caller.
-async fn stderr_task(server_id: String, stderr: ChildStderr) {
+/// sanitized and within the transport's log budget (see the module docs).
+/// Never delivered to a caller.
+async fn stderr_task(inner: Arc<Inner>, stderr: ChildStderr) {
     let mut reader = BufReader::new(stderr);
     let mut line: Vec<u8> = Vec::with_capacity(256);
-    let mut budget = LogBudget::new(Instant::now());
     while let Ok(Some(cut)) = read_line_capped(&mut reader, &mut line, MAX_STDERR_LINE_BYTES).await
     {
-        let (admitted, suppressed) = budget.admit(Instant::now());
-        if let Some(n) = suppressed {
-            eprintln!("[cap_mcp stdio:{server_id}] {n} stderr lines suppressed");
-        }
-        if admitted {
-            let raw = line.strip_suffix(b"\r").unwrap_or(&line);
-            let ellipsis = if cut { " …" } else { "" };
-            eprintln!(
-                "[cap_mcp stdio:{server_id}] {}{ellipsis}",
+        let raw = line.strip_suffix(b"\r").unwrap_or(&line);
+        let ellipsis = if cut { " …" } else { "" };
+        inner.log(|| {
+            format!(
+                "{}{ellipsis}",
                 sanitize_log_text(raw, MAX_STDERR_LINE_BYTES)
-            );
-        }
+            )
+        });
     }
-    if let Some(n) = budget.finish() {
-        eprintln!("[cap_mcp stdio:{server_id}] {n} stderr lines suppressed");
-    }
+    inner.flush_log();
 }
 
-/// Rate limit for one server's stderr log: at most [`STDERR_LINES_PER_WINDOW`]
-/// lines per [`STDERR_WINDOW`].
+/// Rate limit for one transport's host log lines: at most
+/// [`LOG_LINES_PER_WINDOW`] lines per [`LOG_WINDOW`].
 struct LogBudget {
     window_start: Instant,
     logged: u32,
@@ -921,13 +1019,13 @@ impl LogBudget {
     /// suppressed lines has just ended, how many it suppressed.
     fn admit(&mut self, now: Instant) -> (bool, Option<u64>) {
         let mut ended = None;
-        if now.saturating_duration_since(self.window_start) >= STDERR_WINDOW {
+        if now.saturating_duration_since(self.window_start) >= LOG_WINDOW {
             ended = (self.suppressed > 0).then_some(self.suppressed);
             self.window_start = now;
             self.logged = 0;
             self.suppressed = 0;
         }
-        if self.logged < STDERR_LINES_PER_WINDOW {
+        if self.logged < LOG_LINES_PER_WINDOW {
             self.logged += 1;
             (true, ended)
         } else {
@@ -936,9 +1034,10 @@ impl LogBudget {
         }
     }
 
-    /// Lines suppressed in the current window, if any.
-    fn finish(self) -> Option<u64> {
-        (self.suppressed > 0).then_some(self.suppressed)
+    /// The lines suppressed in the current window so far, if any; the count
+    /// starts again from zero.
+    fn take_suppressed(&mut self) -> Option<u64> {
+        (self.suppressed > 0).then(|| std::mem::take(&mut self.suppressed))
     }
 }
 
@@ -975,12 +1074,16 @@ fn is_loggable(c: char) -> bool {
     is_tool_name_safe(c.encode_utf8(&mut buf))
 }
 
+/// Remove the pending slot of call `id`, if the call is still waiting.
+fn take_pending(inner: &Inner, id: u64) -> Option<PendingSlot> {
+    lock(&inner.pending).remove(&id)
+}
+
 fn send_pending(inner: &Inner, id: u64, outcome: Result<Vec<u8>, McpError>) {
-    let sender = lock(&inner.pending).remove(&id);
-    if let Some(tx) = sender {
+    // No pending slot: the caller already timed out or dropped the call.
+    if let Some(tx) = take_pending(inner, id) {
         let _ = tx.send(outcome);
     }
-    // No pending slot: the caller already timed out or dropped the call.
 }
 
 #[cfg(test)]
@@ -1099,14 +1202,137 @@ mod tests {
     fn log_budget_admits_one_window_then_reports_what_it_suppressed() {
         let start = Instant::now();
         let mut budget = LogBudget::new(start);
-        for _ in 0..STDERR_LINES_PER_WINDOW {
+        for _ in 0..LOG_LINES_PER_WINDOW {
             assert_eq!(budget.admit(start), (true, None));
         }
         assert_eq!(budget.admit(start), (false, None));
         assert_eq!(budget.admit(start), (false, None));
-        let next_window = start + STDERR_WINDOW;
+        let next_window = start + LOG_WINDOW;
         assert_eq!(budget.admit(next_window), (true, Some(2)));
-        assert_eq!(budget.finish(), None);
+        assert_eq!(budget.take_suppressed(), None);
+        for _ in 1..LOG_LINES_PER_WINDOW {
+            budget.admit(next_window);
+        }
+        assert_eq!(budget.admit(next_window), (false, None));
+        assert_eq!(budget.take_suppressed(), Some(1));
+        assert_eq!(budget.take_suppressed(), None);
+    }
+
+    fn test_inner() -> Inner {
+        Inner::new(
+            "srv".to_string(),
+            Arc::new(NoOpDetector),
+            ProcessGroup::new(None),
+        )
+    }
+
+    fn error_answers(ids: std::ops::Range<u64>) -> Vec<u8> {
+        let answers: Vec<Value> = ids
+            .map(|id| {
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {"code": 1, "message": "x"}})
+            })
+            .collect();
+        serde_json::to_vec(&answers).unwrap()
+    }
+
+    // Only the answer to a waiting call is read: a batch of unsolicited error
+    // answers writes no log line, and the error answer to a waiting call writes
+    // one and fails that call with the code alone.
+    #[test]
+    fn only_answers_to_waiting_calls_are_read_and_logged() {
+        let inner = test_inner();
+        let (replies, _queued) = mpsc::channel(WRITER_QUEUE);
+        let flood = error_answers(100..1100);
+        handle_line(&inner, &replies, &flood);
+        assert_eq!(lock(&inner.log_budget).logged, 0);
+
+        let (tx, mut rx) = oneshot::channel();
+        inner.register(100, tx).unwrap();
+        handle_line(&inner, &replies, &flood);
+        let err = rx
+            .try_recv()
+            .expect("the waiting call is answered")
+            .expect_err("with an error");
+        assert_eq!(err.kind, McpErrorKind::ServerError);
+        assert_eq!(err.message, "jsonrpc error code 1");
+        assert_eq!(lock(&inner.log_budget).logged, 1);
+        assert!(lock(&inner.pending).is_empty());
+    }
+
+    // stderr lines and the error messages of answers draw on one budget: once
+    // stderr has spent it, an error answer still fails its call, but its log
+    // line is suppressed.
+    #[test]
+    fn stderr_lines_and_error_answers_share_one_log_budget() {
+        let inner = test_inner();
+        for _ in 0..LOG_LINES_PER_WINDOW {
+            inner.log(|| "stderr line".to_string());
+        }
+        let (replies, _queued) = mpsc::channel(WRITER_QUEUE);
+        let (tx, mut rx) = oneshot::channel();
+        inner.register(7, tx).unwrap();
+        handle_line(&inner, &replies, &error_answers(7..8));
+        let err = rx.try_recv().unwrap().expect_err("an error answer");
+        assert_eq!(err.kind, McpErrorKind::ServerError);
+        let budget = lock(&inner.log_budget);
+        assert_eq!(
+            (budget.logged, budget.suppressed),
+            (LOG_LINES_PER_WINDOW, 1)
+        );
+    }
+
+    // A server request is answered only when its id is a number or a short
+    // string: echoing longer ids would let a server that does not read pin
+    // large replies in the writer queue.
+    #[test]
+    fn server_requests_with_an_overlong_string_id_go_unanswered() {
+        let ping = |id: Value| serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "ping"});
+        let longest = "i".repeat(MAX_SERVER_REQUEST_ID_BYTES);
+        assert!(matches!(
+            classify(ping(Value::String(longest.clone()))),
+            Incoming::Request { .. }
+        ));
+        assert_eq!(
+            classify(ping(Value::String(format!("{longest}i")))),
+            Incoming::Invalid
+        );
+        assert!(matches!(
+            classify(ping(serde_json::json!(u64::MAX))),
+            Incoming::Request { .. }
+        ));
+
+        let inner = test_inner();
+        let (replies, mut queued) = mpsc::channel(WRITER_QUEUE);
+        let long = serde_json::to_vec(&ping(Value::String("i".repeat(1 << 20)))).unwrap();
+        handle_line(&inner, &replies, &long);
+        assert!(queued.try_recv().is_err(), "the long id is not echoed");
+        handle_line(
+            &inner,
+            &replies,
+            br#"{"jsonrpc":"2.0","id":"s-1","method":"ping"}"#,
+        );
+        match queued.try_recv() {
+            Ok(Outbound::Reply(reply)) => assert_eq!(reply["id"], "s-1"),
+            _ => panic!("the short id is answered"),
+        }
+    }
+
+    // Closing records the first reason and when it happened; a later close
+    // keeps both.
+    #[test]
+    fn closing_records_the_first_reason_and_when() {
+        let inner = test_inner();
+        assert_eq!(inner.closed_at(), None);
+        let before = Instant::now();
+        inner.close("first");
+        let at = inner.closed_at().expect("closed");
+        assert!(before <= at && at <= Instant::now());
+        assert!(inner.closed.load(Ordering::SeqCst));
+        inner.close("second");
+        assert_eq!(inner.closed_at(), Some(at));
+        assert_eq!(inner.closed_error().message, "first");
+        let (tx, _rx) = oneshot::channel();
+        assert_eq!(inner.register(1, tx).unwrap_err().message, "first");
     }
 
     #[test]

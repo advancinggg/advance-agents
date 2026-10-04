@@ -628,6 +628,10 @@ async fn a_server_that_exits_closes_the_transport() {
     )
     .expect("spawn");
     assert!(wait_until(|| transport.is_closed(), Duration::from_secs(5)).await);
+    let closed_at = transport
+        .closed_at()
+        .expect("a closed transport says when it closed");
+    assert!(closed_at <= Instant::now());
     let started = Instant::now();
     let err = transport
         .invoke("x", serde_json::json!({}))
@@ -636,6 +640,45 @@ async fn a_server_that_exits_closes_the_transport() {
     assert_eq!(err.kind, McpErrorKind::TransportError);
     assert!(err.message.contains("subprocess"), "msg={}", err.message);
     assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(transport.closed_at(), Some(closed_at));
+}
+
+// A server request whose string id is too long to echo is dropped unanswered,
+// so a server that never reads its stdin cannot pin large replies in the
+// writer queue; a request with a short id is still answered.
+#[tokio::test]
+async fn a_server_request_with_an_overlong_id_is_dropped_unanswered() {
+    let long_id = "i".repeat(129);
+    let script = format!(
+        r#"
+read -r req
+printf '{{"jsonrpc":"2.0","id":"{long_id}","method":"ping"}}\n'
+printf '{{"jsonrpc":"2.0","id":"short","method":"ping"}}\n'
+read -r reply
+ok=false
+case "$reply" in *'"id":"short"'*) ok=true ;; esac
+printf '{{"jsonrpc":"2.0","id":1,"result":{{"first_reply_is_short":%s}}}}\n' "$ok"
+sleep 1
+"#
+    );
+    let (cmd, args) = bash(&script);
+    let transport = StdioMcpTransport::spawn_with_wall_clock(
+        "srv",
+        &cmd,
+        &args,
+        &empty_env(),
+        Arc::new(NoOpDetector),
+        Duration::from_secs(5),
+    )
+    .expect("spawn");
+    let out = transport
+        .invoke("x", serde_json::json!({}))
+        .await
+        .expect("the server answers after reading one reply");
+    assert_eq!(
+        json_of(&out),
+        serde_json::json!({"first_reply_is_short": true})
+    );
 }
 
 // The server leads its own process group: dropping the transport also stops
@@ -699,6 +742,13 @@ while read -r line; do
 done
 "#;
 
+/// Answers one further request like [`SERVE`], then exits.
+const SERVE_ONCE: &str = r#"
+read -r line
+id=${line##*\"id\":}; id=${id%%[!0-9]*}
+printf '{"jsonrpc":"2.0","id":%s,"result":{"pid":%s}}\n' "$id" "$$"
+"#;
+
 fn server_script(parts: &[&str], dir: &Path, version: &str) -> String {
     parts
         .concat()
@@ -706,8 +756,9 @@ fn server_script(parts: &[&str], dir: &Path, version: &str) -> String {
         .replace("@VERSION@", version)
 }
 
-/// A client with one stdio server `srv` running `bash -c <script>`.
-fn stdio_client(script: String, limits: McpClientLimits) -> McpClient {
+/// A client with one stdio server `srv` running `bash -c <script>`, given no
+/// runtime for its stdio servers.
+fn stdio_client_without_runtime(script: String, limits: McpClientLimits) -> McpClient {
     let config = McpServersConfig::builder()
         .add_server(McpServerEntry {
             server_id: "srv".into(),
@@ -723,6 +774,12 @@ fn stdio_client(script: String, limits: McpClientLimits) -> McpClient {
         .expect("add server")
         .build();
     McpClient::new(Arc::new(config), Arc::new(NoOpDetector), None).with_limits(limits)
+}
+
+/// [`stdio_client_without_runtime`] whose stdio servers run on the test's
+/// runtime, which outlives the client.
+fn stdio_client(script: String, limits: McpClientLimits) -> McpClient {
+    stdio_client_without_runtime(script, limits).with_runtime(tokio::runtime::Handle::current())
 }
 
 // The first call initializes the server (`initialize`, then
@@ -887,6 +944,41 @@ if [ ! -e '@DIR@/crashed' ]; then read -r call; : > '@DIR@/crashed'; exit 1; fi
     );
 }
 
+// A server that dies while idle is judged by when it died: the call that finds
+// it closed, after the backoff counted from that death has passed, reconnects
+// at once instead of starting a new wait.
+#[tokio::test]
+async fn a_server_that_died_while_idle_is_reconnected_once_its_backoff_has_passed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Each server answers one tool call and exits right after.
+    let client = stdio_client(
+        server_script(
+            &[LOG_START, HANDSHAKE, SERVE_ONCE],
+            dir.path(),
+            "2025-06-18",
+        ),
+        McpClientLimits {
+            restart_backoff_initial: Duration::from_millis(300),
+            restart_backoff_max: Duration::from_secs(30),
+            ..McpClientLimits::default()
+        },
+    );
+    let starts = dir.path().join("starts");
+    client
+        .invoke_tool("srv", "echo", b"{}")
+        .await
+        .expect("the first server answers, then exits");
+
+    // The server died young, so a wait follows its death; let it pass.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let out = client
+        .invoke_tool("srv", "echo", b"{}")
+        .await
+        .expect("reconnected at once: the wait counted from the death is over");
+    assert_eq!(lines(&starts).len(), 2);
+    assert_eq!(json_of(&out)["pid"].to_string(), lines(&starts)[1]);
+}
+
 // A connection attempt that completes after `disconnect` retired its slot
 // publishes nothing: its caller gets an error, its server is stopped, and the
 // next call starts a new server.
@@ -945,7 +1037,7 @@ fn stdio_transports_outlive_the_runtime_of_the_call_that_started_them() {
         .expect("daemon runtime");
     let dir = tempfile::tempdir().expect("tempdir");
     let client = Arc::new(
-        stdio_client(
+        stdio_client_without_runtime(
             server_script(&[LOG_START, HANDSHAKE, SERVE], dir.path(), "2025-06-18"),
             McpClientLimits::default(),
         )
@@ -973,19 +1065,22 @@ fn stdio_transports_outlive_the_runtime_of_the_call_that_started_them() {
     assert_eq!(lines(&dir.path().join("starts")).len(), 1);
 }
 
-// A client built outside any runtime and given none never borrows the runtime
-// of the call that would connect a stdio server: it refuses to start one.
+// A client given no runtime never takes one: neither the runtime current when
+// it is built (here a per-call runtime, as a Client API request has) nor that of
+// the call that would connect a stdio server. It refuses to start one.
 #[test]
-fn a_client_built_outside_a_runtime_starts_no_stdio_server_without_one() {
+fn a_client_given_no_runtime_starts_no_stdio_server() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let client = stdio_client(
-        server_script(&[LOG_START, HANDSHAKE, SERVE], dir.path(), "2025-06-18"),
-        McpClientLimits::default(),
-    );
     let call_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("call runtime");
+    let client = call_runtime.block_on(async {
+        stdio_client_without_runtime(
+            server_script(&[LOG_START, HANDSHAKE, SERVE], dir.path(), "2025-06-18"),
+            McpClientLimits::default(),
+        )
+    });
     let err = call_runtime
         .block_on(client.invoke_tool("srv", "echo", b"{}"))
         .expect_err("no runtime for stdio servers");

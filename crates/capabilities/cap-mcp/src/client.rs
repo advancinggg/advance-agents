@@ -31,12 +31,14 @@
 //! for [`McpClientLimits::restart_backoff_max`], is not reconnected for
 //! [`McpClientLimits::restart_backoff_initial`], doubling with each further
 //! failure up to the maximum; calls in that window fail fast. A transport that
-//! ran longer is replaced at once.
+//! ran longer is replaced at once. A transport's run and the wait after it are
+//! measured from when it closed ([`McpTransport::closed_at`]), not from when a
+//! call noticed: a server that died while idle long ago is reconnected at once.
 //!
 //! Stdio transports are spawned on, and run their tasks on, the runtime given
-//! to [`McpClient::with_runtime`] (by default the one current when the client
-//! was built), never on the runtime of whichever call connects them. A client
-//! built outside any runtime and given none refuses to start stdio servers.
+//! to [`McpClient::with_runtime`], and only that one: never the runtime current
+//! when the client was built, nor that of the call that connects them. A
+//! client given no runtime refuses to start stdio servers.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -76,11 +78,20 @@ pub trait McpTransport: Send + Sync {
 
     fn server_id(&self) -> &str;
 
-    /// True once the transport can carry no further calls (its process exited,
-    /// its stream overflowed). The client then evicts it and reconnects the
-    /// server on a later call. Defaults to `false`.
+    /// When the transport closed, once it can carry no further calls (its
+    /// process exited, its stream overflowed); `None` while it is open.
+    /// Defaults to `None`.
+    fn closed_at(&self) -> Option<Instant> {
+        None
+    }
+
+    /// True once the transport can carry no further calls. The client then
+    /// evicts it and reconnects the server on a later call, measuring how long
+    /// the transport ran, and the wait before reconnecting, from
+    /// [`closed_at`](Self::closed_at) (from the moment it noticed, when that is
+    /// `None`). Defaults to `closed_at().is_some()`.
     fn is_closed(&self) -> bool {
-        false
+        self.closed_at().is_some()
     }
 }
 
@@ -222,23 +233,35 @@ impl ServerSlot {
 }
 
 impl SlotState {
-    /// Take the live transport out and arm the backoff for its death. A
-    /// transport that ran at least `restart_backoff_max` resets the failure
-    /// count and is replaced at once.
+    /// Take the live transport out and arm the backoff for its death, dated by
+    /// the transport's [`McpTransport::closed_at`] (by `now` when it gives
+    /// none), so a transport found closed long after it died is judged by when
+    /// it died. A transport that ran at least `restart_backoff_max` resets the
+    /// failure count and is replaced at once; otherwise the wait runs from its
+    /// death.
     fn evict(&mut self, now: Instant, limits: &McpClientLimits) -> Option<Live> {
         let live = self.live.take()?;
-        if now.saturating_duration_since(live.since) >= limits.restart_backoff_max {
+        // Within the transport's life: not before it was published, not after now.
+        let died = live
+            .transport
+            .closed_at()
+            .unwrap_or(now)
+            .min(now)
+            .max(live.since);
+        if died.saturating_duration_since(live.since) >= limits.restart_backoff_max {
             self.failures = 0;
             self.retry_at = None;
         } else {
-            self.fail(now, limits);
+            self.fail(died, limits);
         }
         Some(live)
     }
 
-    fn fail(&mut self, now: Instant, limits: &McpClientLimits) {
+    /// Count a failure that happened at `at`: no connection attempt before the
+    /// backoff after it has passed.
+    fn fail(&mut self, at: Instant, limits: &McpClientLimits) {
         self.failures = self.failures.saturating_add(1);
-        self.retry_at = Some(now + backoff(self.failures, limits));
+        self.retry_at = Some(at + backoff(self.failures, limits));
     }
 }
 
@@ -260,6 +283,8 @@ pub struct McpClient {
     leak_detector: Arc<dyn LeakDetector>,
     http_chain: Option<Arc<dyn HttpSecurityChain>>,
     limits: McpClientLimits,
+    /// The runtime stdio servers run on; `None` until
+    /// [`with_runtime`](McpClient::with_runtime) gives one.
     runtime: Option<Handle>,
 }
 
@@ -268,10 +293,15 @@ impl McpClient {
     ///
     /// `leak_detector` is plumbed into stdio transports for request and
     /// response scanning. `http_chain` is required for HTTP transports — passed
-    /// as Option so test fixtures with no HTTP servers can omit it. Stdio
-    /// transports run on the runtime current at construction; a client built
-    /// outside any runtime needs [`with_runtime`](Self::with_runtime) before it
-    /// can start stdio servers.
+    /// as Option so test fixtures with no HTTP servers can omit it.
+    ///
+    /// The client holds no runtime: until [`with_runtime`](Self::with_runtime)
+    /// gives one, a call to a stdio server fails without starting it. The
+    /// client never takes the runtime current when it is built, or the one of
+    /// the call that connects a server: a stdio transport outlives that call,
+    /// and on a runtime that exists for one call (a Client API request runs on
+    /// one) its tasks would stop with that runtime, leaving the server
+    /// unreachable.
     pub fn new(
         config: Arc<McpServersConfig>,
         leak_detector: Arc<dyn LeakDetector>,
@@ -283,7 +313,7 @@ impl McpClient {
             leak_detector,
             http_chain,
             limits: McpClientLimits::default(),
-            runtime: Handle::try_current().ok(),
+            runtime: None,
         }
     }
 
@@ -295,7 +325,8 @@ impl McpClient {
 
     /// Spawn stdio servers on `runtime` and run their transports' tasks there,
     /// whatever runtime the connecting call runs on. Pass the daemon's runtime:
-    /// a transport outlives the call that connects it.
+    /// a transport outlives the call that connects it, and its server becomes
+    /// unreachable when `runtime` shuts down.
     pub fn with_runtime(mut self, runtime: Handle) -> Self {
         self.runtime = Some(runtime);
         self
@@ -329,7 +360,7 @@ impl McpClient {
             leak_detector,
             http_chain: None,
             limits: McpClientLimits::default(),
-            runtime: Handle::try_current().ok(),
+            runtime: None,
         }
     }
 
@@ -752,13 +783,11 @@ impl McpClient {
         }
     }
 
-    /// The runtime stdio transports run on: the one given to `with_runtime`, or
-    /// the one current when the client was built. Never the connecting call's.
+    /// The runtime stdio transports run on: the one given to `with_runtime`.
     fn runtime(&self) -> Result<Handle, McpError> {
         self.runtime.clone().ok_or_else(|| {
             McpError::transport(
-                "no runtime for stdio servers: build the McpClient inside a tokio runtime or \
-                 give one with `with_runtime`",
+                "no runtime for stdio servers: give the McpClient one with `with_runtime`",
             )
         })
     }
@@ -767,7 +796,9 @@ impl McpClient {
 /// Open an MCP session on `transport`: send `initialize`, check that the server
 /// chose a version in [`SUPPORTED_PROTOCOL_VERSIONS`], then send
 /// `notifications/initialized`. Returns the agreed version. A server-chosen
-/// version string never reaches the caller; it goes to the host log, sanitized.
+/// version string never reaches the caller; it goes to the host log, sanitized,
+/// once per connection attempt (the failure arms the reconnect backoff, which
+/// spaces the attempts out).
 async fn initialize(transport: &dyn McpTransport) -> Result<String, McpError> {
     let params = serde_json::json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -826,6 +857,8 @@ mod tests {
         assert_eq!(backoff(u32::MAX, &limits), Duration::from_millis(1000));
     }
 
+    // A transport that does not say when it closed is dated by the moment the
+    // client noticed.
     #[test]
     fn a_transport_that_dies_young_backs_off_and_a_long_run_resets_the_count() {
         let limits = McpClientLimits {
@@ -836,7 +869,7 @@ mod tests {
         let start = Instant::now();
         let mut state = SlotState::default();
         let live = |since| Live {
-            transport: Arc::new(ClosedTransport) as Arc<dyn McpTransport>,
+            transport: Arc::new(ClosedTransport { at: None }) as Arc<dyn McpTransport>,
             since,
             protocol_version: None,
         };
@@ -863,7 +896,61 @@ mod tests {
         assert!(state.evict(start, &limits).is_none());
     }
 
-    struct ClosedTransport;
+    // The run and the wait are measured from when the transport closed: a
+    // transport that died young while idle is found closed long after, and the
+    // call that finds it reconnects at once.
+    #[test]
+    fn the_backoff_runs_from_when_the_transport_closed() {
+        let limits = McpClientLimits {
+            restart_backoff_initial: Duration::from_secs(1),
+            restart_backoff_max: Duration::from_secs(60),
+            ..McpClientLimits::default()
+        };
+        let start = Instant::now();
+        // A slot whose live transport was published at `start` and closed at `at`.
+        let slot = |at, failures| SlotState {
+            live: Some(Live {
+                transport: Arc::new(ClosedTransport { at }) as Arc<dyn McpTransport>,
+                since: start,
+                protocol_version: None,
+            }),
+            failures,
+            retry_at: None,
+        };
+        let died = start + Duration::from_secs(5);
+
+        // Found 25 s after its death: it died young, but its wait is long over.
+        let mut state = slot(Some(died), 0);
+        let found = start + Duration::from_secs(30);
+        assert!(state.evict(found, &limits).is_some());
+        assert_eq!(state.failures, 1);
+        assert_eq!(state.retry_at, Some(died + Duration::from_secs(1)));
+        assert!(state.retry_at.is_some_and(|at| at <= found));
+
+        // Found right after its death: the rest of the wait remains.
+        let mut state = slot(Some(died), 0);
+        assert!(state
+            .evict(died + Duration::from_millis(200), &limits)
+            .is_some());
+        assert_eq!(state.retry_at, Some(died + Duration::from_secs(1)));
+
+        // It ran the maximum before it closed: replaced at once, the count reset.
+        let mut state = slot(Some(start + Duration::from_secs(60)), 3);
+        assert!(state
+            .evict(start + Duration::from_secs(600), &limits)
+            .is_some());
+        assert_eq!((state.failures, state.retry_at), (0, None));
+
+        // A closing instant outside the transport's life is held within it.
+        let mut state = slot(Some(start + Duration::from_secs(900)), 0);
+        assert!(state.evict(died, &limits).is_some());
+        assert_eq!(state.retry_at, Some(died + Duration::from_secs(1)));
+    }
+
+    /// A transport that has closed, at `at` when it says so.
+    struct ClosedTransport {
+        at: Option<Instant>,
+    }
 
     #[async_trait]
     impl McpTransport for ClosedTransport {
@@ -885,6 +972,10 @@ mod tests {
 
         fn server_id(&self) -> &str {
             "closed"
+        }
+
+        fn closed_at(&self) -> Option<Instant> {
+            self.at
         }
 
         fn is_closed(&self) -> bool {

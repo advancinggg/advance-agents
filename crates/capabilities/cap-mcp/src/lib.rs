@@ -32,8 +32,8 @@ pub use schema_validator::SchemaValidator;
 pub use stdio_transport::{StdioMcpTransport, StdioOptions};
 pub use web_provider::refuse_stdio_web_provider;
 pub use whitelist::{
-    is_valid_server_id, McpServerEntry, McpServersConfig, McpServersConfigBuilder,
-    McpTransportSpec, ToolPattern, ToolSchemas,
+    McpServerEntry, McpServersConfig, McpServersConfigBuilder, McpTransportSpec, ToolPattern,
+    ToolSchemas,
 };
 
 mod client;

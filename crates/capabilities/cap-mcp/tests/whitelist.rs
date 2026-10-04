@@ -5,12 +5,13 @@ use std::sync::Arc;
 
 use advance_runtime::host_registry::HostRegistry;
 use advance_runtime::host_registry::InMemoryHostRegistry;
+use advance_shared_types::mcp::is_valid_server_id;
 use advance_shared_types::security_validator::{
     Allowlist, HttpCapability, LeakDetector, ScanContext, ScanResult,
 };
 use cap_mcp::{
-    is_valid_server_id, register_mcp_client, McpClient, McpError, McpErrorKind, McpServerEntry,
-    McpServersConfig, McpTransportSpec, ToolPattern,
+    register_mcp_client, McpClient, McpError, McpErrorKind, McpServerEntry, McpServersConfig,
+    McpTransportSpec, ToolPattern,
 };
 
 struct NoOpDetector;
@@ -302,7 +303,8 @@ fn sd_15c_split_capability_registration() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Server ids: the builder admits only the pack manifest's grammar
+// Server ids: the builder admits only the shared grammar, which a pack's
+// `mcp-servers/*.yaml` follows too
 // ─────────────────────────────────────────────────────────────────────────
 #[test]
 fn builder_admits_only_server_ids_from_the_charset() {
