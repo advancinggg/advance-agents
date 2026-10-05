@@ -1,6 +1,6 @@
 # MODULE-001-T111 (1) `advance start` on H2 (capabilities: every KNOWN_CAPABILITIES entry = secrets, fs, skills, memory, grant, llm, tools, messaging, lifecycle, genui; genui.enabled: true; deployed driver; git repository) after SIGTERM: the outcome, what each stream writes after the decision point, and the .runtime files after exit (DECISION PENDING: H2_SIGTERM_AFTER_READINESS)
 # captured on the pre-lane OSS tree (main 84a82451, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
-no exit within 15s of SIGTERM (then SIGKILLed)
+exit=0
 --- stdout after the `advance: shutting down` line ---
 --- stderr after SIGTERM ---
 --- .runtime after exit ---

@@ -198,6 +198,10 @@ cap-http = { path = "../capabilities/cap-http", features = ["test-stream-gate"] 
 advance-scheduler = { path = "../scheduler", features = ["test-support"] }
 # Entity-data lane E2 witnesses build a `DataStore` over the in-memory doubles.
 cap-data = { path = "../capabilities/cap-data", features = ["test-support"] }
+# The ordered-shutdown witnesses read the process-wide set of active git commit queues
+# (`commit_queue::active_queue_paths_for_test`). Same prod-dep + dev-dep-with-extra-feature
+# pair as cap-http above; the feature never reaches a production `advance-cli` build.
+advance-git = { path = "../git", features = ["test-support"] }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }

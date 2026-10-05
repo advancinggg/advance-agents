@@ -13,7 +13,7 @@
 //!   at boot (the production index is not rebuilt from disk anywhere else).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use advance_shared_types::entity::{EntityIndex, EntityProjector, DATA_TOOL_ID};
 use advance_shared_types::traits::{EventBusEmit, GrantCheck};
@@ -262,7 +262,7 @@ impl DeterministicToolReducer {
 #[async_trait]
 impl PureReducer for DeterministicToolReducer {
     async fn available(&self, tool_id: &str) -> bool {
-        self.registry.list().await.iter().any(|t| t.id == tool_id)
+        tool_available(&self.registry, tool_id).await
     }
 
     async fn reduce(
@@ -272,16 +272,73 @@ impl PureReducer for DeterministicToolReducer {
         input: &[u8],
         ctx: DeterministicCtx,
     ) -> Result<Vec<u8>, String> {
-        self.registry
-            .invoke_deterministic(tool_id, method, input, ctx)
-            .await
-            .map_err(|e| e.to_string())
+        reduce_with(&self.registry, tool_id, method, input, ctx).await
     }
 }
 
 /// Build the reducer over `registry`.
 pub fn deterministic_reducer(registry: Arc<LazyToolRegistry>) -> Arc<DeterministicToolReducer> {
     Arc::new(DeterministicToolReducer { registry })
+}
+
+/// [`DeterministicToolReducer`] over a registry it does not keep alive. The composition
+/// registers the `data` tool, which holds the store, which holds this reducer, in that same
+/// registry: a strong reference here would make the registry and the store keep each other
+/// (and everything the store writes through) alive after every owner let go. While the
+/// registry lives it answers exactly as [`DeterministicToolReducer`]; once it is gone no tool
+/// is available.
+pub(crate) struct RegistryBoundReducer {
+    registry: Weak<LazyToolRegistry>,
+}
+
+#[async_trait]
+impl PureReducer for RegistryBoundReducer {
+    async fn available(&self, tool_id: &str) -> bool {
+        match self.registry.upgrade() {
+            Some(registry) => tool_available(&registry, tool_id).await,
+            None => false,
+        }
+    }
+
+    async fn reduce(
+        &self,
+        tool_id: &str,
+        method: &str,
+        input: &[u8],
+        ctx: DeterministicCtx,
+    ) -> Result<Vec<u8>, String> {
+        match self.registry.upgrade() {
+            Some(registry) => reduce_with(&registry, tool_id, method, input, ctx).await,
+            None => Err(format!(
+                "tool {tool_id} is unavailable: the tool registry is gone"
+            )),
+        }
+    }
+}
+
+/// [`deterministic_reducer`] over a registry the reducer does not keep alive
+/// ([`RegistryBoundReducer`]).
+pub(crate) fn registry_bound_reducer(registry: &Arc<LazyToolRegistry>) -> Arc<dyn PureReducer> {
+    Arc::new(RegistryBoundReducer {
+        registry: Arc::downgrade(registry),
+    })
+}
+
+async fn tool_available(registry: &LazyToolRegistry, tool_id: &str) -> bool {
+    registry.list().await.iter().any(|t| t.id == tool_id)
+}
+
+async fn reduce_with(
+    registry: &LazyToolRegistry,
+    tool_id: &str,
+    method: &str,
+    input: &[u8],
+    ctx: DeterministicCtx,
+) -> Result<Vec<u8>, String> {
+    registry
+        .invoke_deterministic(tool_id, method, input, ctx)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Build the production `DataStore` (system clock, ULID ids, event bus, reducer) and seed the
@@ -291,6 +348,18 @@ pub async fn build_data_store(
     index: Arc<dyn EntityIndex>,
     events: Arc<dyn EventBusEmit>,
     reducer: Arc<DeterministicToolReducer>,
+    seed_agent_id: &str,
+) -> Arc<DataStore> {
+    build_data_store_with(parts, index, events, reducer, seed_agent_id).await
+}
+
+/// [`build_data_store`] over any reducer (the composition passes a
+/// [`registry_bound_reducer`]).
+pub(crate) async fn build_data_store_with(
+    parts: DataFsParts,
+    index: Arc<dyn EntityIndex>,
+    events: Arc<dyn EventBusEmit>,
+    reducer: Arc<dyn PureReducer>,
     seed_agent_id: &str,
 ) -> Arc<DataStore> {
     let schema = Arc::clone(&parts.schema);
@@ -309,9 +378,12 @@ pub async fn build_data_store(
     let projector = SchemaEntityProjector::new(schema);
     seed_entity_index(&workspace_root, seed_agent_id, &projector, index.as_ref()).await;
     let store = Arc::new(store);
-    // The `fs.*` handlers share this maintainer: from here on their Markdown writes and
-    // deletes reach the index and emit the change event, like writes through the store.
-    maintainer.set_record_observer(Arc::new(StoreRecordObserver(Arc::clone(&store))));
+    // The `fs.*` handlers share this maintainer: from here on, for as long as the store
+    // lives, their Markdown writes and deletes reach the index and emit the change event,
+    // like writes through the store. The store writes through this same maintainer, so the
+    // observer refers to it weakly (a strong reference would make the two keep each other
+    // alive).
+    maintainer.set_record_observer(Arc::new(WeakStoreRecordObserver(Arc::downgrade(&store))));
     store
 }
 
@@ -381,6 +453,19 @@ pub struct StoreRecordObserver(pub Arc<DataStore>);
 impl cap_fs::RecordObserver for StoreRecordObserver {
     async fn record_file_changed(&self, agent_id: &str, path: &str) {
         self.0.sync_path(agent_id, path).await;
+    }
+}
+
+/// [`StoreRecordObserver`] over a store it does not keep alive: once the store is gone a
+/// change is not recorded (nothing reads the index without the store).
+struct WeakStoreRecordObserver(Weak<DataStore>);
+
+#[async_trait]
+impl cap_fs::RecordObserver for WeakStoreRecordObserver {
+    async fn record_file_changed(&self, agent_id: &str, path: &str) {
+        if let Some(store) = self.0.upgrade() {
+            store.sync_path(agent_id, path).await;
+        }
     }
 }
 

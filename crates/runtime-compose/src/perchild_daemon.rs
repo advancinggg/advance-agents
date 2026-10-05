@@ -17,12 +17,16 @@
 //!   drains at shutdown.
 //!
 //! The post-`builder.build()` `ComponentRuntime` + `CapabilityInjector` are
-//! LATE-BOUND (OnceLock) because `register_agent_spawn` — where the observer is
-//! attached — runs before `builder.build()`.
+//! LATE-BOUND because `register_agent_spawn` — where the observer is attached —
+//! runs before `builder.build()`. They are released again at shutdown
+//! ([`PerChildLoopManager::unbind`]): the injector reaches the host registry,
+//! whose spawn handler holds this manager as its observer, so while both stay
+//! bound the manager and the registry keep each other alive.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use advance_messaging::{AgentIdBridge, DynamicRouting, MailboxStore};
 use advance_runtime::{CapabilityInjector, ComponentRuntime};
@@ -85,9 +89,12 @@ impl TurnObserver for RecordingTurnObserver {
 /// retained by `WiringHandles` so `start.rs` can bind the post-build runtime and
 /// drain the loops at shutdown.
 pub struct PerChildLoopManager {
-    // Late-bound post-`builder.build()`.
-    runtime: OnceLock<Arc<ComponentRuntime>>,
-    injector: OnceLock<Arc<CapabilityInjector>>,
+    // Late-bound post-`builder.build()` ([`Self::bind_runtime`]); released by
+    // [`Self::unbind`].
+    runtime: Mutex<Option<Arc<ComponentRuntime>>>,
+    injector: Mutex<Option<Arc<CapabilityInjector>>>,
+    /// Set by [`Self::shutdown`]: no child is served from then on.
+    closed: AtomicBool,
     // Shared production deps (all exist before `register_agent_spawn`).
     store: Arc<MailboxStore>,
     event_bus: Arc<dyn EventBusEmit>,
@@ -151,8 +158,9 @@ impl PerChildLoopManager {
         key_resolver: KeyResolver,
     ) -> Self {
         Self {
-            runtime: OnceLock::new(),
-            injector: OnceLock::new(),
+            runtime: Mutex::new(None),
+            injector: Mutex::new(None),
+            closed: AtomicBool::new(false),
             store,
             event_bus,
             routing,
@@ -232,9 +240,39 @@ impl PerChildLoopManager {
 
     /// Late-bind the post-`builder.build()` runtime + injector. Call once, after
     /// `wire_capabilities`'s `builder.build()`, before the root serve loop starts.
+    /// The first binding wins: a later call leaves a bound runtime and injector in place.
     pub fn bind_runtime(&self, runtime: Arc<ComponentRuntime>, injector: Arc<CapabilityInjector>) {
-        let _ = self.runtime.set(runtime);
-        let _ = self.injector.set(injector);
+        lock(&self.runtime).get_or_insert(runtime);
+        lock(&self.injector).get_or_insert(injector);
+    }
+
+    /// Release the late-bound runtime and injector.
+    ///
+    /// The injector holds the host registry, and the registry's spawn handler holds
+    /// this manager (it is the spawner's observer): while both are bound, the manager
+    /// and the registry keep each other — and every handler the registry holds, with
+    /// the event bus and the git commit queue they reach — alive after their owners
+    /// let go. Unbinding breaks that cycle. A child spawned afterwards is not served
+    /// (it is reported as unbound). Idempotent.
+    pub fn unbind(&self) {
+        let runtime = lock(&self.runtime).take();
+        let injector = lock(&self.injector).take();
+        drop((runtime, injector));
+    }
+
+    /// Stop serving children, for an ordered shutdown: no child is served from now
+    /// on, every child serve loop is aborted and awaited, then the runtime and
+    /// injector are released ([`Self::unbind`]). Idempotent.
+    pub async fn shutdown(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        let loops = std::mem::take(&mut *lock(&self.loops));
+        for handle in loops.values() {
+            handle.abort();
+        }
+        for (_, handle) in loops {
+            let _ = handle.await;
+        }
+        self.unbind();
     }
 
     /// Install the tee-slice-T3 reap handle (observer path (ii)).
@@ -472,6 +510,10 @@ impl PerChildLoopManager {
 
 impl SpawnObserver for PerChildLoopManager {
     fn on_child_spawned(&self, parent: &AgentId, child: &AgentId, workspace: &Path) {
+        // Shut down: a child spawned now is never served.
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
         let parent_bare = parent.0.as_str();
         let child_bare = child.0.as_str();
         let child_colon = (self.key_resolver)(child_bare);
@@ -512,7 +554,9 @@ impl SpawnObserver for PerChildLoopManager {
         // returns (a component that loaded but trapped in `bootstrap_and_init`, or a
         // guest stop — audit r8 W2), so a child is routable EXACTLY while its loop can
         // run. (`skip_loop` above is the sole intentional register-without-loop path.)
-        let (Some(runtime), Some(injector)) = (self.runtime.get(), self.injector.get()) else {
+        let runtime = lock(&self.runtime).clone();
+        let injector = lock(&self.injector).clone();
+        let (Some(runtime), Some(injector)) = (runtime, injector) else {
             self.log.err(
                 log_keys::PERCHILD_UNBOUND,
                 format!("perchild: runtime/injector not bound; child {child_bare} not served"),
@@ -549,9 +593,9 @@ impl SpawnObserver for PerChildLoopManager {
         // BARE cap-id (the L1 grant grantee + `send` `from` body), COLON serve key.
         let handler: Arc<dyn MessageHandler> = Arc::new(
             WasmMessageHandler::new(
-                runtime.clone(),
+                runtime,
                 loaded,
-                injector.clone(),
+                injector,
                 caps,
                 child_bare.to_string(),
                 format!("trace-child-{child_bare}"),
@@ -672,10 +716,22 @@ impl SpawnObserver for PerChildLoopManager {
                 bridge.unregister(&colon, &bare);
             }
         });
-        if let Ok(mut loops) = self.loops.lock() {
-            loops.insert(child_colon, handle);
+        let mut loops = lock(&self.loops);
+        // A shutdown that began meanwhile has already drained the registry: this loop
+        // must not outlive it.
+        if self.closed.load(Ordering::SeqCst) {
+            drop(loops);
+            handle.abort();
+            return;
         }
+        loops.insert(child_colon, handle);
     }
+}
+
+/// Lock `mutex`, recovering the guard from a poisoned lock (every value it guards
+/// stays consistent across a panic: a slot or a map of task handles).
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// seam (f) glue: a cap-lifecycle [`cap_lifecycle::LoopCascade`] backed by the

@@ -143,26 +143,35 @@ pub const READINESS_WRITE_FAILURE: PendingExpectation = PendingExpectation {
     )],
 };
 
-/// Exit status after SIGTERM on H2 (every capability declared, a git repository). OWNER /
-/// LANE DECISION PENDING.
+/// Exit status after SIGTERM on H2 (every capability declared, a git repository). Decided
+/// (owner ruling 2026-10-03): exit 0 once the git commit queue is closed and its worker joined.
 ///
-/// T111 expects exit 0 after SIGTERM. On the pre-move tree H2 prints `advance: shutting down`,
-/// removes `runtime.lock` and then never exits: dropping the current-thread runtime waits on its
-/// blocking pool, where the git commit queue worker (`advance_git` `worker_loop`, a
-/// `spawn_blocking` task) still waits in `blocking_recv` because a sender of its queue is still
-/// held. It reproduces with `fs` + `llm` + `messaging` on a git repository; without `messaging`
-/// or without a git repository the run exits 0. The ADR D1 shutdown sequence (git queue closed
-/// and its worker joined) is expected to turn this into `ExitOutcome::Code(0)`. Only H2's
-/// after-shutdown golden is pinned with this decision.
+/// On the pre-move tree H2 prints `advance: shutting down`, removes `runtime.lock` and then
+/// never exits: dropping the current-thread runtime waits on its blocking pool, where the git
+/// commit queue worker (`advance_git` `worker_loop`, a `spawn_blocking` task) still waits in
+/// `blocking_recv` because a sender of its queue is still held — by reference cycles that keep
+/// the wiring graph alive (the per-child manager and the host registry, through the capability
+/// injector; the `data` store and the `.meta.yaml` maintainer; the `data` store and the tool
+/// registry). The runtime-compose lane cuts them, and H2 now exits 0 with the same output. The
+/// first entry records the pre-move outcome (no exit within the budget).
 pub const H2_SIGTERM_AFTER_READINESS: PendingExpectation = PendingExpectation {
-    outcome: ExitOutcome::NoExitAfterSigterm,
-    pins_by_outcome: &[(
-        ExitOutcome::NoExitAfterSigterm,
-        &[(
-            H2_AFTER_SHUTDOWN_GOLDEN,
-            "fad1479dbef4727cf33072ffd37761a4217a4f0398f700763bd7980f6a215fcd",
-        )],
-    )],
+    outcome: ExitOutcome::Code(0),
+    pins_by_outcome: &[
+        (
+            ExitOutcome::NoExitAfterSigterm,
+            &[(
+                H2_AFTER_SHUTDOWN_GOLDEN,
+                "fad1479dbef4727cf33072ffd37761a4217a4f0398f700763bd7980f6a215fcd",
+            )],
+        ),
+        (
+            ExitOutcome::Code(0),
+            &[(
+                H2_AFTER_SHUTDOWN_GOLDEN,
+                "8d393ac35a27cb99d2d701f6b8ffd23a16381e0baac94ac297bc300d5b7740f6",
+            )],
+        ),
+    ],
 };
 
 /// The decisions above, for the pin lookup.

@@ -2818,8 +2818,10 @@ async fn wire_capabilities_inner(
             let entity_index: Arc<dyn advance_shared_types::entity::EntityIndex> = Arc::new(
                 advance_database::SqliteEntityIndex::new(host.sqlite_index_handle()),
             );
-            let reducer = crate::data_wiring::deterministic_reducer(Arc::clone(&tools_concrete));
-            let store = crate::data_wiring::build_data_store(
+            // The reducer must not keep the registry alive: the registry holds the `data`
+            // tool, which holds the store, which holds the reducer.
+            let reducer = crate::data_wiring::registry_bound_reducer(&tools_concrete);
+            let store = crate::data_wiring::build_data_store_with(
                 parts,
                 Arc::clone(&entity_index),
                 event_bus_dyn.clone(),

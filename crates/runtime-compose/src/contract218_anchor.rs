@@ -2942,6 +2942,19 @@ fn process_custody_paths() -> &'static Mutex<HashSet<PathBuf>> {
     PATHS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// Test-only view of the process-wide custody set: the identities (platform custody
+/// files and workspace directories) a live custody object currently holds, sorted.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn custody_paths_for_test() -> Vec<PathBuf> {
+    let paths = process_custody_paths()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut paths: Vec<PathBuf> = paths.iter().cloned().collect();
+    paths.sort();
+    paths
+}
+
 impl ExclusiveCustody {
     fn acquire_platform(path: PathBuf) -> Result<Self, RegistryAnchorError> {
         let identity = path.clone();

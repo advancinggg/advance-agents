@@ -729,9 +729,13 @@ async fn run_async(workspace: Option<PathBuf>, log: LogHandle) -> ExitCode {
         }
     }
     // Wave-23 seam (d): abort any per-child serve loops the spawn observer started,
-    // alongside the root loop, before `_host`/`_lock` drop.
+    // alongside the root loop, before `_host`/`_lock` drop. Then release the manager's
+    // runtime and injector: through the host registry they hold the manager itself, a
+    // cycle that would otherwise keep the whole wiring graph (and the git commit
+    // queue's worker, which the runtime's drop waits for) alive.
     if let Some(mgr) = wiring_handles.perchild_manager.as_ref() {
         mgr.drain();
+        mgr.unbind();
     }
     // Wave-7 Lane B: stop the auto tick loop. cancel() FIRST (graceful — the loop's
     // `select!` sees the token and returns Ok at the next await point), THEN abort()
