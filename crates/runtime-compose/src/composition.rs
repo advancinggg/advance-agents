@@ -23,8 +23,10 @@
 //!
 //! Each step runs only for the parts that exist, so a composition that failed
 //! part-way stops exactly what it started. Nothing in the sequence fails: a bound
-//! that elapses is reported on stderr and the sequence goes on, and a startup-failure
-//! teardown prints nothing else.
+//! that elapses is reported on stderr and the sequence goes on (except the config
+//! watcher's release of its OS watcher, which then finishes on its own thread, holding
+//! nothing the rest of the sequence needs), and a startup-failure teardown prints
+//! nothing else.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
@@ -41,7 +43,9 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::api::{log_keys, ClientApiEndpoint, ComposeExtension, InstanceGuardKind, RuntimePhase};
+use crate::api::{
+    log_keys, BoxFuture, ClientApiEndpoint, ComposeExtension, InstanceGuardKind, RuntimePhase,
+};
 use crate::client_api_adapters::WorkerControl;
 use crate::compose_log::LogHandle;
 use crate::daemon::{ComposedGraph, Listener};
@@ -56,8 +60,9 @@ const CLIENT_API_DRAIN: Duration = Duration::from_secs(10);
 const LISTENER_DRAIN: Duration = Duration::from_secs(5);
 /// Budget of one extension's shutdown hook; past it the hook is abandoned.
 const EXTENSION_SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
-/// Budget of a thread join: the Client API adapter threads (one shared deadline), the
-/// config watcher's OS-watcher release, the WAL-mode observer.
+/// Budget of a thread join: the Client API adapter threads (one shared deadline; a thread
+/// still running past it is reported), the config watcher's OS-watcher release (never
+/// reported), the WAL-mode observer.
 const THREAD_JOIN_BOUND: Duration = Duration::from_secs(2);
 /// After this long, a ChatGPT token renewal still finishing is reported; the teardown
 /// keeps waiting for it (a renewal may already have rotated the refresh token, which
@@ -217,6 +222,19 @@ impl RuntimeView {
     }
 }
 
+/// The config watcher as the teardown stops it.
+trait StopConfigWatcher: Send + Sync {
+    /// Stop watching: everything at once but the release of the OS watcher, which the
+    /// returned future waits for last.
+    fn stop(&self) -> BoxFuture<'_, ()>;
+}
+
+impl StopConfigWatcher for RuntimeConfigWatcher {
+    fn stop(&self) -> BoxFuture<'_, ()> {
+        Box::pin(RuntimeConfigWatcher::stop(self))
+    }
+}
+
 /// Everything a daemon composition started, and its one teardown.
 pub(crate) struct Composition {
     log: LogHandle,
@@ -237,7 +255,7 @@ pub(crate) struct Composition {
     extension_tasks: TaskTracker,
     // Step 4: holds.
     selected_provider_task: Option<JoinHandle<()>>,
-    config_watcher: Option<Arc<RuntimeConfigWatcher>>,
+    config_watcher: Option<Arc<dyn StopConfigWatcher>>,
     wal_observer: Option<JoinHandle<()>>,
     stoppers: HoldStoppers,
     /// What the extensions hold that must outlive the graph's holds but not the
@@ -330,7 +348,7 @@ impl Composition {
             extensions: Vec::new(),
             extension_tasks: TaskTracker::new(),
             selected_provider_task: None,
-            config_watcher,
+            config_watcher: config_watcher.map(|watcher| watcher as Arc<dyn StopConfigWatcher>),
             wal_observer,
             stoppers,
             extension_holds: Vec::new(),
@@ -496,15 +514,13 @@ impl Composition {
         }
         if self.config_watcher.is_some() || self.wal_observer.is_some() {
             if let Some(watcher) = self.config_watcher.take() {
-                // Everything but the OS watcher's release happens at once; that release
-                // (on macOS a join of the FSEvents run loop) gets a bound, then finishes
-                // on its own thread.
-                if tokio::time::timeout(THREAD_JOIN_BOUND, watcher.stop())
-                    .await
-                    .is_err()
-                {
-                    report_thread_overrun("config watcher", &log);
-                }
+                // Everything but the OS watcher's release happens at once: no reload is
+                // applied any more, the poll and bridge tasks are stopped and every
+                // subscriber channel is closed. The release (on macOS it waits for the
+                // FSEvents run loop, which can take seconds) gets a bound; past it the
+                // release finishes on its own thread. It holds nothing the rest of the
+                // sequence needs, so going on without it is not reported.
+                let _ = tokio::time::timeout(THREAD_JOIN_BOUND, watcher.stop()).await;
             }
             if let Some(mut observer) = self.wal_observer.take() {
                 // It ends once the watcher closed its subscriber channels.
@@ -983,6 +999,67 @@ mod tests {
         .await;
         assert_eq!(*ran.lock().unwrap(), vec!["two", "one"]);
         assert_eq!(sink.keys(), vec![log_keys::SHUTTING_DOWN]);
+    }
+
+    /// A config watcher whose OS-watcher release takes `release`: everything else its stop
+    /// does happens at once.
+    struct SlowRelease {
+        stopped: AtomicBool,
+        release: Duration,
+    }
+
+    impl StopConfigWatcher for SlowRelease {
+        fn stop(&self) -> BoxFuture<'_, ()> {
+            Box::pin(async move {
+                self.stopped.store(true, Ordering::SeqCst);
+                tokio::time::sleep(self.release).await;
+            })
+        }
+    }
+
+    /// A release of the OS watcher that outlasts its bound (on macOS the FSEvents run loop
+    /// can take seconds) is left to finish on its own thread without a word: a requested
+    /// shutdown prints only `advance: shutting down`, a startup failure's teardown prints
+    /// nothing, and neither waits past the bound.
+    #[tokio::test(start_paused = true)]
+    async fn module_001_ac30_slow_config_watcher_release_is_bounded_and_silent() {
+        for (reason, expected) in [
+            (TeardownReason::Requested, vec![log_keys::SHUTTING_DOWN]),
+            (TeardownReason::StartupFailed, vec![]),
+        ] {
+            let watcher = Arc::new(SlowRelease {
+                stopped: AtomicBool::new(false),
+                release: Duration::from_secs(30),
+            });
+            let sink = Arc::new(Recording::default());
+            let probe = Arc::new(crate::test_support::ComposeProbe::new());
+            let mut composition = Composition::from_stoppers(
+                HoldStoppers::default(),
+                None,
+                None,
+                None,
+                LogHandle::new(sink.clone()),
+            )
+            .with_probe(Some(Arc::clone(&probe)));
+            composition.config_watcher = Some(watcher.clone() as Arc<dyn StopConfigWatcher>);
+            let started = Instant::now();
+            composition.teardown(reason).await;
+            let waited = started.elapsed();
+            assert!(
+                watcher.stopped.load(Ordering::SeqCst),
+                "{reason:?}: the watcher is stopped"
+            );
+            assert!(
+                waited >= THREAD_JOIN_BOUND && waited < THREAD_JOIN_BOUND + POLL,
+                "{reason:?}: the release gets its bound and no more: {waited:?}"
+            );
+            assert_eq!(sink.keys(), expected, "{reason:?}");
+            assert_eq!(
+                probe.record().step_names(),
+                vec!["holds.watchers"],
+                "{reason:?}"
+            );
+        }
     }
 
     /// A listener whose requests never finish is aborted once its budget has elapsed.
