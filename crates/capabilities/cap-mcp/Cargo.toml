@@ -26,6 +26,8 @@ advance-runtime = { path = "../../runtime" }
 wasmtime = { workspace = true }
 # Slice D — input/output JSON-Schema validation on invoke-mcp-tool
 jsonschema = { workspace = true }
+# Reduces a resource URI to its scheme and host in `mcp.resource_read` events.
+url = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "process", "io-util"] }

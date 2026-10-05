@@ -4,7 +4,8 @@
 //! Verifies the `tools.ids` allowlist projection: ids→narrow, no-ids→wildcard(None),
 //! no-grant→deny(Some([])), expired/revoked/non-tools excluded, CSV de-dup union,
 //! and the colon→bare grantee bridge. For `mcp`: one scope per active grant, never
-//! merged, agreeing with the call-time check, and silent (no `authz.checked`).
+//! merged, agreeing with the call-time check, and silent (no `authz.checked`); the
+//! mcp-client host functions over the real grant check and reader.
 
 mod common;
 
@@ -324,4 +325,294 @@ fn mgr_04_filtered_listing_matches_the_check_and_emits_nothing() {
         .collect();
     assert_eq!(allowed, visible);
     assert_eq!(bus.count_of("authz.checked"), listed.len() - visible.len());
+}
+
+// ===== The mcp-client host functions over the real grant check and reader =====
+
+/// An MCP server double answering each method with a fixed result, recording
+/// the methods it was sent.
+struct ScriptedServer {
+    id: String,
+    tools: Vec<String>,
+    sent: std::sync::Mutex<Vec<String>>,
+}
+
+impl ScriptedServer {
+    fn new(id: &str, tools: &[&str]) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            id: id.to_string(),
+            tools: tools.iter().map(|t| t.to_string()).collect(),
+            sent: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn sent(&self) -> Vec<String> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl cap_mcp::McpTransport for ScriptedServer {
+    async fn invoke(
+        &self,
+        _caller: Option<&str>,
+        method: &str,
+        _params: serde_json::Value,
+    ) -> Result<Vec<u8>, cap_mcp::McpError> {
+        self.sent.lock().unwrap().push(method.to_string());
+        let result = match method {
+            "tools/list" => serde_json::json!({
+                "tools": self.tools.iter().map(|n| serde_json::json!({"name": n})).collect::<Vec<_>>()
+            }),
+            "prompts/list" => serde_json::json!({"prompts": [{"name": "daily"}]}),
+            "resources/list" => serde_json::json!({"resources": [{"uri": "note://1"}]}),
+            "prompts/get" => serde_json::json!({"messages": []}),
+            "resources/read" => serde_json::json!({"contents": []}),
+            "tools/call" => serde_json::json!({"content": []}),
+            other => panic!("unexpected method {other}"),
+        };
+        Ok(serde_json::to_vec(&result).unwrap())
+    }
+
+    async fn notify(
+        &self,
+        _method: &str,
+        _params: Option<serde_json::Value>,
+    ) -> Result<(), cap_mcp::McpError> {
+        Ok(())
+    }
+
+    fn server_id(&self) -> &str {
+        &self.id
+    }
+}
+
+struct NoLeaks;
+impl advance_shared_types::security_validator::LeakDetector for NoLeaks {
+    fn scan(
+        &self,
+        _text: &str,
+        _context: advance_shared_types::security_validator::ScanContext,
+    ) -> advance_shared_types::security_validator::ScanResult {
+        advance_shared_types::security_validator::ScanResult::Clean
+    }
+    fn scan_headers(
+        &self,
+        _headers: &[(String, String)],
+    ) -> advance_shared_types::security_validator::ScanResult {
+        advance_shared_types::security_validator::ScanResult::Clean
+    }
+}
+
+struct NoEvents;
+impl advance_shared_types::traits::EventBusEmit for NoEvents {
+    fn emit(&self, _event: advance_shared_types::event::Event) {}
+}
+
+/// The mcp-client host functions over `servers`, each answered by its double,
+/// behind a gate that reads `store`'s grants.
+fn mcp_host_functions(
+    store: &std::sync::Arc<cap_grant::GrantStore>,
+    servers: &[&std::sync::Arc<ScriptedServer>],
+) -> advance_runtime::host_registry::InMemoryHostRegistry {
+    use std::sync::Arc;
+    let mut builder = cap_mcp::McpServersConfig::builder();
+    let mut injected: std::collections::HashMap<String, Arc<dyn cap_mcp::McpTransport>> =
+        std::collections::HashMap::new();
+    for server in servers {
+        builder = builder
+            .add_server(cap_mcp::McpServerEntry {
+                server_id: server.id.clone(),
+                description: String::new(),
+                transport: cap_mcp::McpTransportSpec::Http {
+                    endpoint_url: format!("https://{}.example.com/mcp", server.id),
+                    capability: advance_shared_types::security_validator::HttpCapability {
+                        allowlist: advance_shared_types::security_validator::Allowlist {
+                            patterns: vec![format!("{}.example.com", server.id)],
+                        },
+                        credentials: vec![],
+                        component_id: server.id.clone(),
+                    },
+                },
+                tool_patterns: None,
+                tool_schemas: Default::default(),
+            })
+            .unwrap();
+        injected.insert(
+            server.id.clone(),
+            Arc::clone(*server) as Arc<dyn cap_mcp::McpTransport>,
+        );
+    }
+    let client = Arc::new(cap_mcp::McpClient::new_with_transports(
+        Arc::new(builder.build()),
+        Arc::new(NoLeaks),
+        injected,
+    ));
+    let gate = cap_mcp::McpGate::new(
+        Arc::new(GrantCheckImpl::new(Arc::clone(store))),
+        Arc::new(McpGrantReaderImpl::new(Arc::clone(store))),
+        None,
+    );
+    let registry = advance_runtime::host_registry::InMemoryHostRegistry::new();
+    cap_mcp::register_mcp_client(&registry, client, gate, Arc::new(NoEvents));
+    registry
+}
+
+/// Call the mcp-client function `name` as `agent`; its result, `Ok` with the
+/// `field` of each listed record (empty for a non-list result) or `Err` with
+/// the `mcp-error` arm.
+async fn call_mcp(
+    registry: &advance_runtime::host_registry::InMemoryHostRegistry,
+    agent: &str,
+    name: &str,
+    params: &[&str],
+    field: &str,
+) -> Result<Vec<String>, String> {
+    use advance_runtime::host_registry::HostRegistry;
+    use wasmtime::component::Val;
+    let spec = registry
+        .lookup("mcp")
+        .into_iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("{name} is not registered under `mcp`"));
+    let mut vals: Vec<Val> = params.iter().map(|p| Val::String(p.to_string())).collect();
+    match name {
+        "invoke-mcp-tool" => vals.push(Val::List(vec![])),
+        "get-mcp-prompt" => vals.push(Val::List(vec![])),
+        _ => {}
+    }
+    let ctx = advance_runtime::host_registry::HostCallContext {
+        agent_id: agent.to_string(),
+        trace_id: "t".into(),
+        turn_id: None,
+        capability: "mcp".into(),
+        function: format!("advance:runtime/mcp-client@0.1.0::{name}"),
+        run_id: None,
+        iteration: None,
+    };
+    let out = spec.handler.call(ctx, vals, 1).await.expect("handled");
+    match &out[0] {
+        Val::Result(Ok(Some(inner))) => match inner.as_ref() {
+            Val::List(items) => Ok(items
+                .iter()
+                .filter_map(|item| match item {
+                    Val::Record(fields) => fields.iter().find_map(|(k, v)| match v {
+                        Val::String(s) if k == field => Some(s.clone()),
+                        _ => None,
+                    }),
+                    _ => None,
+                })
+                .collect()),
+            _ => Ok(Vec::new()),
+        },
+        Val::Result(Err(Some(inner))) => match inner.as_ref() {
+            Val::Variant(case, _) => Err(case.clone()),
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    }
+}
+
+// Under the real grant check and reader, the mcp-client listings show what the
+// grants reach and write no `authz.checked` event, however many entries they
+// hide; a refused call writes one. A grant restricting tools reaches none of
+// the server's prompts and resources. Refusals send nothing to the server.
+#[tokio::test]
+async fn mgr_05_mcp_client_host_functions_decide_by_the_grants() {
+    let (store, bus, _h) = make_store();
+    store
+        .insert(mcp_grant(
+            "g-a",
+            "alice",
+            &[("servers", "github"), ("tool-patterns", "get_*")],
+        ))
+        .unwrap();
+    store
+        .insert(mcp_grant("g-b", "alice", &[("servers", "notes")]))
+        .unwrap();
+    let mut github_tools = vec!["get_issue", "get_pr"];
+    let hidden: Vec<String> = (0..40).map(|i| format!("admin_{i}")).collect();
+    github_tools.extend(hidden.iter().map(String::as_str));
+    let github = ScriptedServer::new("github", &github_tools);
+    let notes = ScriptedServer::new("notes", &[]);
+    let slack = ScriptedServer::new("slack", &["post"]);
+    let registry = mcp_host_functions(&store, &[&github, &notes, &slack]);
+    let call = |name: &'static str, params: &'static [&'static str], field: &'static str| {
+        call_mcp(&registry, "alice", name, params, field)
+    };
+
+    assert_eq!(
+        call("list-mcp-servers", &[], "id").await,
+        Ok(vec!["github".to_string(), "notes".to_string()])
+    );
+    assert_eq!(
+        call("list-mcp-tools", &["github"], "name").await,
+        Ok(vec!["get_issue".to_string(), "get_pr".to_string()])
+    );
+    assert_eq!(
+        call("list-mcp-tools", &["slack"], "name").await,
+        Err("permission-denied".to_string())
+    );
+    for name in ["list-mcp-prompts", "list-mcp-resources"] {
+        assert_eq!(
+            call(name, &["github"], "name").await,
+            Err("permission-denied".to_string()),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        call("list-mcp-prompts", &["notes"], "name").await,
+        Ok(vec!["daily".to_string()])
+    );
+    assert_eq!(
+        call("list-mcp-resources", &["notes"], "uri").await,
+        Ok(vec!["note://1".to_string()])
+    );
+    assert_eq!(
+        bus.count_of("authz.checked"),
+        0,
+        "the listings hid 41 entries without one deny event"
+    );
+
+    assert_eq!(
+        call("invoke-mcp-tool", &["github", "admin_3"], "").await,
+        Err("permission-denied".to_string())
+    );
+    assert_eq!(
+        call("get-mcp-prompt", &["github", "daily"], "").await,
+        Err("permission-denied".to_string())
+    );
+    assert_eq!(
+        call("read-mcp-resource", &["github", "repo://x"], "").await,
+        Err("permission-denied".to_string())
+    );
+    let denied = bus.all_of("authz.checked");
+    assert_eq!(denied.len(), 3, "one deny event per refused call");
+    assert!(denied
+        .iter()
+        .all(|e| e.payload["capability"] == "mcp" && e.payload["decision"] == "denied"));
+
+    assert_eq!(
+        call("invoke-mcp-tool", &["github", "get_issue"], "").await,
+        Ok(vec![])
+    );
+    assert_eq!(
+        call("get-mcp-prompt", &["notes", "daily"], "").await,
+        Ok(vec![])
+    );
+    assert_eq!(
+        call("read-mcp-resource", &["notes", "note://1"], "").await,
+        Ok(vec![])
+    );
+    assert_eq!(github.sent(), ["tools/list", "tools/call"]);
+    assert_eq!(
+        notes.sent(),
+        [
+            "prompts/list",
+            "resources/list",
+            "prompts/get",
+            "resources/read"
+        ]
+    );
+    assert!(slack.sent().is_empty());
 }

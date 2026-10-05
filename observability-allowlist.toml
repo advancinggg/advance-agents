@@ -265,55 +265,36 @@ reason = "Wave-12 Lane C narrow decomposition-only handler: dispatches submit-de
 delegated_to = "cap_lifecycle::wit_impl::dispatch_decomposition"
 
 # ─── cap-mcp ────────────────────────────────────────────────────────────────
-# (Added during m017-slice-d. cap-mcp Slice D landed the mcp-client WIT
-# host_fn dispatch (7 handlers split across capability dimensions:
-# 5 server-level handlers registered under `mcp.servers` + 2 tool-level
-# handlers registered under `mcp.tool-patterns`, per MODULE-017 AC-30 +
-# MODULE-013 §1.5 dimension intent). None of these emit `mcp.*`
-# observability events today; per-handler emit wiring is the responsibility
-# of a future cap-mcp observability slice that wires MODULE-019 EventBus
-# through `register_mcp_client` — tracked at MODULE-017 §3.6 item (l).)
+# The 7 mcp-client host functions register under the one capability `mcp`.
+# GetMcpPromptHandler, ReadMcpResourceHandler and InvokeMcpToolHandler emit
+# mcp.prompt_fetched, mcp.resource_read and mcp.tool_invoked / mcp.tool_error
+# in their handler bodies, so they need no row. The four listing handlers below
+# emit no event: PRD §15.3.19 defines no mcp.* event for a listing, and their
+# grant filtering reads the grant scopes silently (no authz.checked per hidden
+# entry). They stay pending until a listing event is defined.
 
 [[handler]]
 crate = "cap-mcp"
 struct = "ListMcpServersHandler"
-reason = "Pending host-fn emit wiring — read-only `list-mcp-servers` query returning McpClient::list_servers(); no mcp.servers_listed event emitted yet. AC-01 coverage of read-only mcp-client handlers tracked here."
+reason = "Read-only `list-mcp-servers` query: the configured servers one of the caller's `mcp` grants reaches. PRD §15.3.19 defines no mcp.* event for a listing, so the handler emits none."
 pending_wiring_slice = "MODULE-017 §3.6 item (l) (cap-mcp observability follow-up)"
 
 [[handler]]
 crate = "cap-mcp"
 struct = "ListMcpToolsHandler"
-reason = "Pending host-fn emit wiring — read-only `list-mcp-tools` query (per-server, filtered by tool-patterns); no mcp.tools_listed event emitted yet."
+reason = "Read-only `list-mcp-tools` query: one server's tools, filtered by the caller's `mcp` grants and the web family rule. PRD §15.3.19 defines no mcp.* event for a listing, so the handler emits none."
 pending_wiring_slice = "MODULE-017 §3.6 item (l) (cap-mcp observability follow-up)"
 
 [[handler]]
 crate = "cap-mcp"
 struct = "ListMcpPromptsHandler"
-reason = "Pending host-fn emit wiring — read-only `list-mcp-prompts` query; no mcp.prompts_listed event emitted yet."
-pending_wiring_slice = "MODULE-017 §3.6 item (l) (cap-mcp observability follow-up)"
-
-[[handler]]
-crate = "cap-mcp"
-struct = "GetMcpPromptHandler"
-reason = "Pending host-fn emit wiring — read-shaped `get-mcp-prompt` retrieves a prompt template with args; no mcp.prompt_fetched event emitted yet."
+reason = "Read-only `list-mcp-prompts` query, for a caller whose `mcp` grant reaches the server with an unrestricted tool axis. PRD §15.3.19 defines no mcp.* event for a listing, so the handler emits none."
 pending_wiring_slice = "MODULE-017 §3.6 item (l) (cap-mcp observability follow-up)"
 
 [[handler]]
 crate = "cap-mcp"
 struct = "ListMcpResourcesHandler"
-reason = "Pending host-fn emit wiring — read-only `list-mcp-resources` query; no mcp.resources_listed event emitted yet."
-pending_wiring_slice = "MODULE-017 §3.6 item (l) (cap-mcp observability follow-up)"
-
-[[handler]]
-crate = "cap-mcp"
-struct = "ReadMcpResourceHandler"
-reason = "Pending host-fn emit wiring — read-only `read-mcp-resource` query fetches resource bytes by URI; no mcp.resource_read event emitted yet."
-pending_wiring_slice = "MODULE-017 §3.6 item (l) (cap-mcp observability follow-up)"
-
-[[handler]]
-crate = "cap-mcp"
-struct = "InvokeMcpToolHandler"
-reason = "Pending host-fn emit wiring — `invoke-mcp-tool` is the central mutating MCP path (schema-validates input, dispatches via http or stdio transport, schema-validates output); mcp.tool_invoked / mcp.tool_failed events not yet emitted. The 7-handler observability follow-on slice will add per-tool emission with tool_name + server_id + duration_ms + status fields."
+reason = "Read-only `list-mcp-resources` query, for a caller whose `mcp` grant reaches the server with an unrestricted tool axis. PRD §15.3.19 defines no mcp.* event for a listing, so the handler emits none."
 pending_wiring_slice = "MODULE-017 §3.6 item (l) (cap-mcp observability follow-up)"
 
 # ─── advance-reply-tracker (MODULE-007) ─────────────────────────────────────

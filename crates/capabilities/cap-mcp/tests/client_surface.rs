@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use wasmtime::component::Val;
 
 mod support;
+use support::gate::{open_gate, CapturingBus};
 use support::mock_transport::CountingMockTransport;
 
 struct NoOpDetector;
@@ -535,11 +536,8 @@ async fn the_host_functions_call_for_the_calling_agent() {
     }
     let client = Arc::new(build_client_with_mock("srv", mock.clone(), None));
     let registry = InMemoryHostRegistry::new();
-    register_mcp_client(&registry, client);
-    let specs: Vec<_> = ["mcp.servers", "mcp.tool-patterns"]
-        .into_iter()
-        .flat_map(|capability| registry.lookup(capability))
-        .collect();
+    register_mcp_client(&registry, client, open_gate(), CapturingBus::new());
+    let specs = registry.lookup("mcp");
     let server = || Val::String("srv".into());
     let calls: Vec<(&str, Vec<Val>)> = vec![
         ("list-mcp-tools", vec![server()]),

@@ -130,10 +130,12 @@ use advance_shared_types::event::Event;
 use advance_shared_types::mailbox::{
     AgentAction, DispatchError, Message, MessageContext, MessageKind,
 };
+use advance_shared_types::mcp::McpGrantScope;
 use advance_shared_types::outbound::DeliveryReport;
 use advance_shared_types::repetition::{OutputHash, RepetitionDecision, ToolCallSignature};
 use advance_shared_types::traits::{
-    EventBusEmit, GrantCheck, LlmDeltaSink, NotWiredDeltaSink, RepetitionGuardCheck, RunBudget,
+    EventBusEmit, GrantCheck, LlmDeltaSink, McpGrantReader, NotWiredDeltaSink,
+    RepetitionGuardCheck, RunBudget,
 };
 use cap_http::DefaultPromptInjectionHelpers;
 use cap_tools::web::{
@@ -152,8 +154,8 @@ use cap_grant::data::{Grant as CapGrant, GrantStatus};
 use cap_grant::{
     register_agent_grant, register_cap_grant, validate_capability_subset, AgentGrantBundle,
     AutoDenyResolver, BudgetCheckResolver, CapGrantError, ChannelApprovalPort, ChannelResolver,
-    GrantStore, ParentApprovalResolver, PresetRegistry, Resolver, ResolverChain,
-    SubsetAutoApproveResolver, SubsetValidator, SubsetValidatorImpl,
+    GrantStore, McpGrantReaderImpl, ParentApprovalResolver, PresetRegistry, Resolver,
+    ResolverChain, SubsetAutoApproveResolver, SubsetValidator, SubsetValidatorImpl,
 };
 use cap_memory::{
     register_agent_memory_with_git, BatchExtractor, Components, FailureCooldown,
@@ -191,7 +193,7 @@ use cap_lifecycle::{
     DefaultSpawner, SubsetCheckedComponentSubmit,
 };
 use cap_mcp::{
-    register_mcp_client, McpClient, McpServerEntry, McpServersConfig, McpTransport,
+    register_mcp_client, McpClient, McpGate, McpServerEntry, McpServersConfig, McpTransport,
     McpTransportSpec, ToolPattern,
 };
 use std::collections::BTreeMap;
@@ -792,6 +794,15 @@ struct AllowAll;
 impl GrantCheck for AllowAll {
     fn check(&self, _: &str, _: &str, _: &str, _: &CapParams) -> GrantDecision {
         GrantDecision::Allow
+    }
+}
+
+/// The `mcp` grant scopes that go with [`AllowAll`]: every server and tool.
+#[derive(Debug)]
+struct AllMcpScopes;
+impl McpGrantReader for AllMcpScopes {
+    fn mcp_grant_scopes(&self, _: &str) -> Vec<McpGrantScope> {
+        vec![McpGrantScope::unrestricted()]
     }
 }
 
@@ -2927,7 +2938,21 @@ impl SystemUnderTestBuilder {
                 Arc::new(NoOpLeakDetector),
                 injected,
             ));
-            register_mcp_client(&*registry, client.clone());
+            // The gate's listings read the grants its calls are decided by.
+            let reader: Arc<dyn McpGrantReader> = match self.grant {
+                GrantMode::Real => Arc::new(McpGrantReaderImpl::new(
+                    grant_store
+                        .clone()
+                        .expect("GrantMode::Real wires the grant check's store"),
+                )),
+                GrantMode::AllowAll => Arc::new(AllMcpScopes),
+            };
+            register_mcp_client(
+                &*registry,
+                client.clone(),
+                McpGate::new(grant_check.clone(), reader, None),
+                bus_dyn.clone(),
+            );
             Some(client)
         };
 

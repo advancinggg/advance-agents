@@ -34,7 +34,7 @@ pub fn mcp_tool_entries_from_infos(infos: Vec<McpToolInfo>) -> Vec<McpToolEntry>
 /// Gather a snapshot of MCP tool entries across all whitelisted servers.
 ///
 /// Enumerates [`McpClient::list_servers`] and, for each, [`McpClient::list_tools`]
-/// (which already applies the per-server `mcp.tool-patterns` filter and the
+/// (which already applies each server's configured tool patterns and the
 /// listing limits), on no agent's behalf. A server
 /// whose `list_tools` errors is **skipped** (defensive — one unreachable or
 /// misbehaving server must not blank the whole inventory). Order is

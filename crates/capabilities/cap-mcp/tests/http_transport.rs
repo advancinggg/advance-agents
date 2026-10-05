@@ -27,6 +27,9 @@ use cap_mcp::{
     McpServersConfig, McpTransport, McpTransportSpec, MAX_SESSION_ID_BYTES, MCP_PROTOCOL_VERSION,
 };
 
+mod support;
+use support::gate::CapturingBus;
+
 #[derive(Default)]
 struct MockChain {
     scripted: Mutex<Vec<Result<HttpResponse, HttpError>>>,
@@ -1315,6 +1318,54 @@ async fn the_client_reconnects_an_http_server_whose_session_could_not_be_restart
         client.protocol_version("srv").as_deref(),
         Some("2025-06-18")
     );
+}
+
+// A client given an event bus reports an http connection, the death of one
+// whose session could not be restarted, and the connection that replaces it.
+#[tokio::test]
+async fn the_client_reports_its_http_connections() {
+    let chain = Arc::new(MockChain::default());
+    chain.push(Ok(initialize_answer(1, "2025-06-18", Some("s1"))));
+    chain.push(Ok(accepted()));
+    chain.push(Ok(status(404)));
+    chain.push(Ok(status(500)));
+    chain.push(Ok(initialize_answer(1, "2025-06-18", Some("s9"))));
+    chain.push(Ok(accepted()));
+    chain.push(Ok(answer(2, json!({"ok": true}))));
+    let bus = CapturingBus::new();
+    let client = http_client(
+        chain.clone(),
+        McpClientLimits {
+            restart_backoff_initial: Duration::ZERO,
+            restart_backoff_max: Duration::ZERO,
+            ..McpClientLimits::default()
+        },
+    )
+    .with_event_bus(bus.clone());
+
+    client
+        .invoke_tool(Some("agent-1"), "srv", "echo", b"{}")
+        .await
+        .expect_err("the restart failed");
+    client
+        .invoke_tool(Some("agent-1"), "srv", "echo", b"{}")
+        .await
+        .expect("reconnected");
+
+    assert_eq!(
+        bus.types(),
+        [
+            "mcp.server_started",
+            "mcp.server_died",
+            "mcp.server_started"
+        ]
+    );
+    let events = bus.events();
+    assert_eq!(
+        events[0].payload,
+        json!({"server_id": "srv", "transport": "http"})
+    );
+    assert_eq!(events[1].agent_id, "runtime");
 }
 
 // The client's request timeout bounds each POST of its http servers.

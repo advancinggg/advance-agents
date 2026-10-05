@@ -41,6 +41,14 @@
 //! when the client was built, nor that of the call that connects them. A
 //! client given no runtime refuses to start stdio servers.
 //!
+//! A client given an event bus ([`McpClient::with_event_bus`]) reports each
+//! connection it makes as `mcp.server_started` (`server_id`, `transport`), and
+//! each live connection it finds closed and evicts as `mcp.server_died`
+//! (`server_id`; `exit_code` is `null`, no exit status being collected), both
+//! with the agent id `runtime`: a connection serves every agent. A connection
+//! attempt that fails, or one retired by [`McpClient::disconnect`], reports
+//! nothing.
+//!
 //! ## Callers
 //!
 //! Each method that sends a request takes `caller`: the agent the request is
@@ -72,17 +80,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use advance_shared_types::event::Event;
 use advance_shared_types::security_validator::{HttpSecurityChain, LeakDetector};
+use advance_shared_types::traits::EventBusEmit;
 use async_trait::async_trait;
 use tokio::runtime::Handle;
 
 use crate::error::McpError;
+use crate::events;
 use crate::http_transport::{HttpMcpTransport, HttpOptions};
 use crate::listing::{CachedToolListing, ToolCache, ToolListing, MAX_TOOL_LIST_PAGES};
 use crate::schema_validator::SchemaValidator;
 use crate::stdio_transport::{
     sanitize_log_text, StdioMcpTransport, StdioOptions, MAX_STDIO_LINE_BYTES, MAX_STDIO_WALL_CLOCK,
 };
+use crate::web_provider::refuse_stdio_web_provider;
 use crate::whitelist::{McpServerEntry, McpServersConfig, McpTransportSpec};
 
 /// MCP protocol version this client asks for in `initialize`.
@@ -257,20 +269,22 @@ impl ServerSlot {
         lock(&self.state)
     }
 
-    /// The live transport; `None` when there is none, after evicting one that
-    /// has closed.
-    fn live_transport(&self, limits: &McpClientLimits) -> Option<Arc<dyn McpTransport>> {
+    /// The live transport, or `Err` when there is none. A live transport that
+    /// has closed is evicted and returned in the `Err`, for the caller to
+    /// report and drop (stopping its process) outside the lock.
+    fn live_transport(
+        &self,
+        limits: &McpClientLimits,
+    ) -> Result<Arc<dyn McpTransport>, Option<Live>> {
         let mut state = self.state();
-        let transport = Arc::clone(&state.live.as_ref()?.transport);
+        let Some(live) = state.live.as_ref() else {
+            return Err(None);
+        };
+        let transport = Arc::clone(&live.transport);
         if !transport.is_closed() {
-            return Some(transport);
+            return Ok(transport);
         }
-        let evicted = state.evict(Instant::now(), limits);
-        drop(state);
-        // The evicted transport is dropped (its process stopped) outside the
-        // lock.
-        drop(evicted);
-        None
+        Err(state.evict(Instant::now(), limits))
     }
 
     /// How long a connection attempt must still wait.
@@ -337,6 +351,9 @@ pub struct McpClient {
     /// The runtime stdio servers run on; `None` until
     /// [`with_runtime`](McpClient::with_runtime) gives one.
     runtime: Option<Handle>,
+    /// Where connections are reported (see the module docs); `None` until
+    /// [`with_event_bus`](McpClient::with_event_bus) gives one.
+    event_bus: Option<Arc<dyn EventBusEmit>>,
 }
 
 impl McpClient {
@@ -366,12 +383,20 @@ impl McpClient {
             http_chain,
             limits: McpClientLimits::default(),
             runtime: None,
+            event_bus: None,
         }
     }
 
     /// Replace the limits.
     pub fn with_limits(mut self, limits: McpClientLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Report connections on `event_bus`: `mcp.server_started` and
+    /// `mcp.server_died` (see the module docs).
+    pub fn with_event_bus(mut self, event_bus: Arc<dyn EventBusEmit>) -> Self {
+        self.event_bus = Some(event_bus);
         self
     }
 
@@ -414,6 +439,7 @@ impl McpClient {
             http_chain: None,
             limits: McpClientLimits::default(),
             runtime: None,
+            event_bus: None,
         }
     }
 
@@ -435,6 +461,18 @@ impl McpClient {
         };
         let live = slot.state().live.take();
         drop(live);
+    }
+
+    /// Whether the web family tools (`web.search`, `web.extract`) of
+    /// `server_id` are refused whatever the caller's grants: a stdio server
+    /// reaches the network outside the http security chain, with keys of its
+    /// own, so the mcp-client host functions hide its web family tools and
+    /// refuse calls to them. False for an http server and for an id that is not
+    /// configured.
+    pub fn refuses_web_tools(&self, server_id: &str) -> bool {
+        self.config
+            .get(server_id)
+            .is_ok_and(|entry| refuse_stdio_web_provider(&entry.transport).is_err())
     }
 
     /// List configured servers (filtered by whitelist).
@@ -650,7 +688,8 @@ impl McpClient {
         let entry = self.config.get(server_id)?;
         if !entry.tool_allowed(tool_name) {
             return Err(McpError::tool_not_found(format!(
-                "tool '{tool_name}' does not match mcp.tool-patterns for '{server_id}'"
+                "tool '{tool_name}' does not match the tool patterns configured for server \
+                 '{server_id}'"
             )));
         }
         let schemas = entry.tool_schemas.get(tool_name);
@@ -736,7 +775,7 @@ impl McpClient {
     ) -> Result<Arc<dyn McpTransport>, McpError> {
         loop {
             let slot = self.slot(&entry.server_id);
-            if let Some(transport) = slot.live_transport(&self.limits) {
+            if let Some(transport) = self.live_transport(&entry.server_id, &slot) {
                 return Ok(transport);
             }
             let _attempt = slot.connecting.lock().await;
@@ -746,7 +785,7 @@ impl McpClient {
                 continue;
             }
             // A concurrent caller may have connected the server meanwhile.
-            if let Some(transport) = slot.live_transport(&self.limits) {
+            if let Some(transport) = self.live_transport(&entry.server_id, &slot) {
                 return Ok(transport);
             }
             if let Some(wait) = slot.backoff_remaining(Instant::now()) {
@@ -764,6 +803,10 @@ impl McpClient {
                         protocol_version,
                     };
                     if self.publish(&entry.server_id, &slot, live) {
+                        self.report(events::server_started(
+                            &entry.server_id,
+                            transport_kind(&entry.transport),
+                        ));
                         Ok(transport)
                     } else {
                         Err(McpError::transport(format!(
@@ -777,6 +820,34 @@ impl McpClient {
                     Err(error)
                 }
             };
+        }
+    }
+
+    /// The live transport in the server's `slot`, if any. A live transport
+    /// found closed is evicted and reported dead.
+    fn live_transport(&self, server_id: &str, slot: &ServerSlot) -> Option<Arc<dyn McpTransport>> {
+        match slot.live_transport(&self.limits) {
+            Ok(transport) => Some(transport),
+            Err(evicted) => {
+                if let Some(dead) = evicted {
+                    self.report_dead(server_id, dead);
+                }
+                None
+            }
+        }
+    }
+
+    /// Report an evicted connection as `mcp.server_died`, then drop it, which
+    /// stops its process once no call holds it.
+    fn report_dead(&self, server_id: &str, dead: Live) {
+        self.report(events::server_died(server_id));
+        drop(dead);
+    }
+
+    /// Emit `event` on the client's event bus, if it has one.
+    fn report(&self, event: Event) {
+        if let Some(bus) = &self.event_bus {
+            bus.emit(event);
         }
     }
 
@@ -821,7 +892,9 @@ impl McpClient {
                 None
             }
         };
-        drop(evicted);
+        if let Some(dead) = evicted {
+            self.report_dead(server_id, dead);
+        }
     }
 
     /// Open a transport for `entry` and initialize it within the startup
@@ -891,6 +964,14 @@ impl McpClient {
                 "no runtime for stdio servers: give the McpClient one with `with_runtime`",
             )
         })
+    }
+}
+
+/// The transport name a connection event carries.
+fn transport_kind(spec: &McpTransportSpec) -> &'static str {
+    match spec {
+        McpTransportSpec::Http { .. } => "http",
+        McpTransportSpec::Stdio { .. } => "stdio",
     }
 }
 

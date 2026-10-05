@@ -6,11 +6,9 @@
 //! input + output JSON schemas attach here too; they are consumed by `McpClient`
 //! through `SchemaValidator` (AC-13).
 //!
-//! Layer-3 (per-agent grant) is enforced by the framework `CapabilityInjector`
-//! via the SPLIT capability dimensions registered in `host_fn::register_mcp_client`
-//! — see that module for details. AC-30 architectural intent: server-level methods
-//! gate on `mcp.servers`, tool-level methods (`list-mcp-tools`, `invoke-mcp-tool`)
-//! gate on `mcp.tool-patterns`.
+//! Layer 3 (per-agent grant) is the `mcp` grant: the mcp-client host functions
+//! ask the caller's grants about the server and tool of each call (`McpGate`).
+//! A tool must pass both this server's patterns and the caller's grant.
 //!
 //! ## `ToolPattern` grammar
 //!

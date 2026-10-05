@@ -2,7 +2,9 @@
 //!
 //! Grant + revoke + un-granted across host-fn **and** MCP-HTTP. Refusal
 //! originates at GrantCheck. Offline withholds injection. `decoy.ping`
-//! keeps withheld lists as `Ok(List)` so empty-on-Err cannot pass.
+//! keeps withheld lists as `Ok(List)` so empty-on-Err cannot pass. The agent
+//! holds an `mcp` grant reaching the MCP server, so the mcp-client host
+//! functions' own gate passes and the `web` decision is the one under test.
 
 mod common;
 
@@ -28,12 +30,12 @@ use cap_grant::data::{
     CapParam, Grant, GrantDraft, GrantId, GrantIssuer, GrantProvenance, GrantStatus, GrantTtl,
 };
 use cap_grant::{
-    validate_capability_subset, AuthzLevel, GrantCheckImpl, StaticConfigCompiler, SubsetValidator,
-    SubsetValidatorImpl,
+    validate_capability_subset, AuthzLevel, GrantCheckImpl, GrantStore, McpGrantReaderImpl,
+    StaticConfigCompiler, SubsetValidator, SubsetValidatorImpl,
 };
 use cap_mcp::{
-    register_mcp_client, register_mcp_client_with_web_grant, McpClient, McpServerEntry,
-    McpServersConfig, McpTransportSpec, ToolPattern,
+    register_mcp_client, McpClient, McpGate, McpServerEntry, McpServersConfig, McpTransportSpec,
+    ToolPattern,
 };
 use cap_tools::host_fn::{WebAwareInvokeHandler, WebAwareListHandler};
 use cap_tools::lazy_registry::{LazyRegistryConfig, LazyToolRegistry};
@@ -244,7 +246,7 @@ fn mcp_ctx() -> HostCallContext {
         agent_id: AGENT.into(),
         trace_id: "t48".into(),
         turn_id: None,
-        capability: "mcp.tool-patterns".into(),
+        capability: "mcp".into(),
         function: "advance:runtime/mcp-client@0.1.0::invoke-mcp-tool".into(),
         run_id: None,
         iteration: None,
@@ -398,10 +400,33 @@ fn mcp_spec(
     name: &str,
 ) -> advance_runtime::host_registry::HostFunctionSpec {
     registry
-        .lookup("mcp.tool-patterns")
+        .lookup("mcp")
         .into_iter()
         .find(|s| s.name == name)
         .unwrap_or_else(|| panic!("missing {name}"))
+}
+
+/// Give `AGENT` an `mcp` grant reaching every server and tool.
+fn grant_mcp(store: &GrantStore) {
+    store.insert_dynamic(cap_grant("g-mcp", "mcp")).unwrap();
+}
+
+/// Register the mcp-client host functions behind a gate that decides calls with
+/// `check` and listings with `store`'s `mcp` grants; `web` decides the web
+/// family tools (`None`: withheld).
+fn register_mcp(
+    registry: &InMemoryHostRegistry,
+    client: Arc<McpClient>,
+    store: &Arc<GrantStore>,
+    check: Arc<dyn GrantCheck>,
+    web: Option<Arc<dyn GrantCheck>>,
+) {
+    let gate = McpGate::new(
+        check,
+        Arc::new(McpGrantReaderImpl::new(Arc::clone(store))),
+        web,
+    );
+    register_mcp_client(registry, client, gate, Arc::new(NoopBus));
 }
 
 fn authz_web(bus: &common::RecordingBus, decision: &str, function: &str) -> bool {
@@ -424,6 +449,7 @@ async fn t48_grant_revoke_both_realizations() {
     // MODULE-013-T48-a..d
     let (store, bus, _h) = make_store();
     let gid = store.insert_dynamic(web_grant("g-web")).unwrap();
+    grant_mcp(&store);
     let check: Arc<dyn GrantCheck> = Arc::new(GrantCheckImpl::with_authz_level(
         store.clone(),
         AuthzLevel::All,
@@ -480,7 +506,13 @@ async fn t48_grant_revoke_both_realizations() {
     let mock = WebHttpMock::new();
     let client = mcp_client(mock.clone());
     let registry = InMemoryHostRegistry::new();
-    register_mcp_client_with_web_grant(&registry, client, Arc::clone(&check));
+    register_mcp(
+        &registry,
+        client,
+        &store,
+        Arc::clone(&check),
+        Some(Arc::clone(&check)),
+    );
     let list_h = mcp_spec(&registry, "list-mcp-tools");
     let inv_h = mcp_spec(&registry, "invoke-mcp-tool");
     let mcp_listed = list_h
@@ -593,8 +625,11 @@ async fn t48_grant_revoke_both_realizations() {
 #[tokio::test]
 async fn t48_e_ungranted_both_realizations() {
     let (store, bus, _h) = make_store();
-    let check: Arc<dyn GrantCheck> =
-        Arc::new(GrantCheckImpl::with_authz_level(store, AuthzLevel::All));
+    grant_mcp(&store);
+    let check: Arc<dyn GrantCheck> = Arc::new(GrantCheckImpl::with_authz_level(
+        store.clone(),
+        AuthzLevel::All,
+    ));
     let (host_invoke, host_list) = host_handlers(Arc::clone(&check)).await;
     let listed = host_list.call(host_ctx(), vec![], 1).await.unwrap();
     let ids = ok_list_field(&listed[0], "id");
@@ -622,7 +657,7 @@ async fn t48_e_ungranted_both_realizations() {
     let mock = WebHttpMock::new();
     let client = mcp_client(mock.clone());
     let registry = InMemoryHostRegistry::new();
-    register_mcp_client_with_web_grant(&registry, client, check);
+    register_mcp(&registry, client, &store, Arc::clone(&check), Some(check));
     let list_h = mcp_spec(&registry, "list-mcp-tools");
     let inv_h = mcp_spec(&registry, "invoke-mcp-tool");
     let mcp_listed = list_h
@@ -656,10 +691,13 @@ async fn t48_e_ungranted_both_realizations() {
 async fn t48_f_offline_withholds_injection() {
     let (store, bus, _h) = make_store();
     store.insert_dynamic(web_grant("g-web")).unwrap();
-    let inner: Arc<dyn GrantCheck> =
-        Arc::new(GrantCheckImpl::with_authz_level(store, AuthzLevel::All));
+    grant_mcp(&store);
+    let inner: Arc<dyn GrantCheck> = Arc::new(GrantCheckImpl::with_authz_level(
+        store.clone(),
+        AuthzLevel::All,
+    ));
     let off: Arc<dyn GrantCheck> = Arc::new(OfflineDenyingGrantCheck {
-        inner,
+        inner: Arc::clone(&inner),
         offline: true,
     });
     let (host_invoke, host_list) = host_handlers(Arc::clone(&off)).await;
@@ -689,7 +727,7 @@ async fn t48_f_offline_withholds_injection() {
     let mock = WebHttpMock::new();
     let client = mcp_client(mock.clone());
     let registry = InMemoryHostRegistry::new();
-    register_mcp_client_with_web_grant(&registry, client, off);
+    register_mcp(&registry, client, &store, inner, Some(off));
     let list_h = mcp_spec(&registry, "list-mcp-tools");
     let inv_h = mcp_spec(&registry, "invoke-mcp-tool");
     let mcp_listed = list_h
@@ -723,7 +761,7 @@ fn t48_g_dimension_independence() {
     let (store, _bus, _h) = make_store();
     store.insert_dynamic(web_grant("g-web")).unwrap();
     let check = GrantCheckImpl::with_authz_level(store.clone(), AuthzLevel::All);
-    for cap in ["tools", "mcp.servers", "mcp.tool-patterns", "http", "fs"] {
+    for cap in ["tools", "mcp", "http", "fs"] {
         assert!(
             matches!(
                 check.check(AGENT, cap, "fn", &CapParams::empty()),
@@ -809,12 +847,22 @@ fn t48_i_subset_whitelist_and_web_arm() {
     assert!(!msg.contains("unknown capability"));
 }
 
+// A gate without a web checker withholds the web family tools, even from an
+// agent whose `mcp` grant covers them.
 #[tokio::test]
-async fn t48_j_two_arg_registrar_fail_closed() {
+async fn t48_j_gate_without_web_checker_fail_closed() {
+    let (store, _bus, _h) = make_store();
+    grant_mcp(&store);
     let mock = WebHttpMock::new();
     let client = mcp_client(mock.clone());
     let registry = InMemoryHostRegistry::new();
-    register_mcp_client(&registry, client);
+    register_mcp(
+        &registry,
+        client,
+        &store,
+        Arc::new(GrantCheckImpl::new(store.clone())),
+        None,
+    );
     let list_h = mcp_spec(&registry, "list-mcp-tools");
     let inv_h = mcp_spec(&registry, "invoke-mcp-tool");
     let mcp_listed = list_h

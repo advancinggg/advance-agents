@@ -19,6 +19,9 @@ use cap_mcp::{
     StdioMcpTransport, StdioOptions, SUPPORTED_PROTOCOL_VERSIONS,
 };
 
+mod support;
+use support::gate::CapturingBus;
+
 // ─────────────────────────────────────────────────────────────────────────
 // LeakDetector fixtures
 // ─────────────────────────────────────────────────────────────────────────
@@ -941,6 +944,60 @@ if [ ! -e '@DIR@/crashed' ]; then read -r call; : > '@DIR@/crashed'; exit 1; fi
         json_of(&out)["pid"].to_string(),
         lines(&starts)[1],
         "the call is answered by the new server"
+    );
+}
+
+// A client given an event bus reports each connection it makes and each death
+// it finds, as the runtime: a server that dies during a call, then the server
+// that replaces it after the backoff. Retiring a connection reports nothing.
+#[tokio::test]
+async fn the_client_reports_each_connection_and_each_death() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // The first server dies on its first tool call; later ones serve.
+    let crash_once = r#"
+if [ ! -e '@DIR@/crashed' ]; then read -r call; : > '@DIR@/crashed'; exit 1; fi
+"#;
+    let bus = CapturingBus::new();
+    let client = stdio_client(
+        server_script(&[HANDSHAKE, crash_once, SERVE], dir.path(), "2025-06-18"),
+        McpClientLimits {
+            restart_backoff_initial: Duration::from_millis(100),
+            restart_backoff_max: Duration::from_secs(30),
+            ..McpClientLimits::default()
+        },
+    )
+    .with_event_bus(bus.clone());
+
+    client
+        .invoke_tool(Some("agent-1"), "srv", "echo", b"{}")
+        .await
+        .expect_err("the server dies during the call");
+    assert_eq!(bus.types(), ["mcp.server_started", "mcp.server_died"]);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client
+        .invoke_tool(Some("agent-1"), "srv", "echo", b"{}")
+        .await
+        .expect("a new server after the backoff");
+    client.disconnect("srv");
+
+    assert_eq!(
+        bus.types(),
+        [
+            "mcp.server_started",
+            "mcp.server_died",
+            "mcp.server_started"
+        ]
+    );
+    let events = bus.events();
+    assert!(events.iter().all(|e| e.agent_id == "runtime"), "{events:?}");
+    assert_eq!(
+        events[0].payload,
+        serde_json::json!({"server_id": "srv", "transport": "stdio"})
+    );
+    assert_eq!(
+        events[1].payload,
+        serde_json::json!({"server_id": "srv", "exit_code": null})
     );
 }
 

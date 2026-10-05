@@ -1,26 +1,21 @@
-//! `mcp-client` WIT host_fn registration — MODULE-017 Slice D AC-15 + AC-23.
+//! `mcp-client` WIT host functions.
 //!
-//! Wires the 7 canonical `mcp-client` WIT methods into the runtime
-//! `HostRegistry`. Capability registration is SPLIT across two L1 grant
-//! dimensions per MODULE-013 §1.5 + AC-30 architectural intent:
+//! [`register_mcp_client`] registers the seven `mcp-client` functions under the
+//! one capability `mcp` ([`MCP_CAPABILITY`]), in the namespace
+//! `advance:runtime/mcp-client@0.1.0`. The injector lets an agent call them
+//! only while it holds an `mcp` grant. Each handler then asks the [`McpGate`]
+//! about the server and tool the call names, before any request reaches a
+//! server, and answers a refusal with the `permission-denied` arm:
 //!
-//! - `mcp.servers` — gates server-level reads:
-//!   - `list-mcp-servers`
-//!   - `list-mcp-prompts`
-//!   - `get-mcp-prompt`
-//!   - `list-mcp-resources`
-//!   - `read-mcp-resource`
-//!
-//! - `mcp.tool-patterns` — gates tool-level operations:
-//!   - `list-mcp-tools`
-//!   - `invoke-mcp-tool`
-//!
-//! The framework `CapabilityInjector` calls `gc.check(agent_id, capability,
-//! function, CapParams::empty())` before every invoke, so registering under
-//! the correct dimension auto-applies the L1 GrantCheck gate. PARAM-level
-//! subset enforcement at L1 (per-call CapParams carrying server_id /
-//! tool_name) is L1-V2 / future-slice scope mirroring MODULE-013 AC-21 §3.3
-//! T37.
+//! - `invoke-mcp-tool` needs a grant covering the tool on the server;
+//!   `get-mcp-prompt` and `read-mcp-resource` need a grant reaching the server
+//!   with an unrestricted tool axis. These are decided by the grant check.
+//! - `list-mcp-servers` lists the servers a grant reaches; `list-mcp-tools`
+//!   needs a grant reaching the server and lists the tools a grant covers;
+//!   `list-mcp-prompts` and `list-mcp-resources` need what `get-mcp-prompt`
+//!   needs. These read the grants' scopes and write no `authz.checked` event.
+//! - The web family tools (`web.search`, `web.extract`) also need the `web`
+//!   grant, and are hidden and refused on a stdio server.
 //!
 //! ## Caller
 //!
@@ -28,6 +23,14 @@
 //! (`HostCallContext::agent_id`): an http server's traffic is attributed to
 //! that agent in the security chain (rate limits, `http.*` events), not to the
 //! server.
+//!
+//! ## Events
+//!
+//! `invoke-mcp-tool` emits `mcp.tool_invoked` when it returns a result and
+//! `mcp.tool_error` when it fails, refusals included. `get-mcp-prompt` emits
+//! `mcp.prompt_fetched`, and `read-mcp-resource` `mcp.resource_read` (with the
+//! URI reduced to its scheme and host), when they return one. The listings
+//! emit no `mcp.*` event.
 //!
 //! ## Idempotent flag
 //!
@@ -38,24 +41,29 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use advance_runtime::host_registry::{
     HostCallContext, HostCallError, HostFunctionHandler, HostFunctionSpec, HostRegistry,
 };
-use advance_shared_types::capability::{CapParams, GrantDecision};
-use advance_shared_types::traits::GrantCheck;
-use advance_shared_types::web_search::{is_web_tool_id, WEB_GRANT_CAPABILITY};
+use advance_shared_types::traits::EventBusEmit;
+use advance_shared_types::web_search::is_web_tool_id;
 use wasmtime::component::Val;
 
 use crate::client::{McpClient, McpPromptInfo, McpResourceInfo, McpServerInfo, McpToolInfo};
 use crate::error::McpError;
+use crate::events;
+use crate::gate::{server_denied, server_wide_denied, McpGate, MCP_CAPABILITY};
 
 #[cfg(test)]
 use crate::error::McpErrorKind;
 
 const NAMESPACE: &str = "advance:runtime/mcp-client@0.1.0";
-pub const CAPABILITY_SERVERS: &str = "mcp.servers";
-pub const CAPABILITY_TOOL_PATTERNS: &str = "mcp.tool-patterns";
+
+/// `"{namespace}::{name}"`: how the grant check's event names a host function.
+fn function_id(name: &str) -> String {
+    format!("{NAMESPACE}::{name}")
+}
 
 /// Max bytes for a single string parameter (server_id / tool_name /
 /// prompt_name / uri). Conservative: 1 KiB allows long URIs.
@@ -296,91 +304,76 @@ fn encode_result_resource_list(r: Result<Vec<McpResourceInfo>, McpError>) -> Val
 // Public API
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Register all 7 mcp-client handlers under the SPLIT capability dimensions.
-///
-/// Family ids `web.search` / `web.extract` fail-closed (omit / permission-denied)
-/// because no [`GrantCheck`] is bound. Use
-/// [`register_mcp_client_with_web_grant`] for the realization-independent
-/// MODULE-013 `"web"` gate.
-pub fn register_mcp_client(registry: &dyn HostRegistry, client: Arc<McpClient>) {
-    register_mcp_client_inner(registry, client, None);
-}
-
-/// Same as [`register_mcp_client`], with a bound `"web"` family grant checker.
-pub fn register_mcp_client_with_web_grant(
+/// Register the seven mcp-client host functions under the capability `mcp`
+/// ([`MCP_CAPABILITY`]). Each handler decides its calls with `gate` (see the
+/// module docs), reaches servers through `client`, and emits its `mcp.*`
+/// events on `emitter`.
+pub fn register_mcp_client(
     registry: &dyn HostRegistry,
     client: Arc<McpClient>,
-    web_grant: Arc<dyn GrantCheck>,
+    gate: McpGate,
+    emitter: Arc<dyn EventBusEmit>,
 ) {
-    register_mcp_client_inner(registry, client, Some(web_grant));
-}
-
-fn register_mcp_client_inner(
-    registry: &dyn HostRegistry,
-    client: Arc<McpClient>,
-    web_grant: Option<Arc<dyn GrantCheck>>,
-) {
-    let entries: Vec<(&'static str, &'static str, Arc<dyn HostFunctionHandler>)> = vec![
-        // server-level reads → mcp.servers
+    let entries: Vec<(&'static str, Arc<dyn HostFunctionHandler>)> = vec![
         (
             "list-mcp-servers",
-            CAPABILITY_SERVERS,
             Arc::new(ListMcpServersHandler {
                 client: client.clone(),
+                gate: gate.clone(),
+            }),
+        ),
+        (
+            "list-mcp-tools",
+            Arc::new(ListMcpToolsHandler {
+                client: client.clone(),
+                gate: gate.clone(),
             }),
         ),
         (
             "list-mcp-prompts",
-            CAPABILITY_SERVERS,
             Arc::new(ListMcpPromptsHandler {
                 client: client.clone(),
+                gate: gate.clone(),
             }),
         ),
         (
             "get-mcp-prompt",
-            CAPABILITY_SERVERS,
             Arc::new(GetMcpPromptHandler {
                 client: client.clone(),
+                gate: gate.clone(),
+                emitter: emitter.clone(),
             }),
         ),
         (
             "list-mcp-resources",
-            CAPABILITY_SERVERS,
             Arc::new(ListMcpResourcesHandler {
                 client: client.clone(),
+                gate: gate.clone(),
             }),
         ),
         (
             "read-mcp-resource",
-            CAPABILITY_SERVERS,
             Arc::new(ReadMcpResourceHandler {
                 client: client.clone(),
-            }),
-        ),
-        // tool-level operations → mcp.tool-patterns
-        (
-            "list-mcp-tools",
-            CAPABILITY_TOOL_PATTERNS,
-            Arc::new(ListMcpToolsHandler {
-                client: client.clone(),
-                web_grant: web_grant.clone(),
+                gate: gate.clone(),
+                emitter: emitter.clone(),
             }),
         ),
         (
             "invoke-mcp-tool",
-            CAPABILITY_TOOL_PATTERNS,
             Arc::new(InvokeMcpToolHandler {
-                client: client.clone(),
-                web_grant: web_grant.clone(),
+                client,
+                gate,
+                emitter,
             }),
         ),
     ];
 
-    for (name, capability, handler) in entries {
+    for (name, handler) in entries {
         let idempotent =
             name.starts_with("list-") || name.starts_with("get-") || name.starts_with("read-");
         registry.register(HostFunctionSpec {
-            capability: capability.to_string(),
+            capability: MCP_CAPABILITY.to_string(),
             namespace: NAMESPACE.to_string(),
             name: name.to_string(),
             handler,
@@ -393,27 +386,35 @@ fn register_mcp_client_inner(
 // Handlers
 // ─────────────────────────────────────────────────────────────────────────
 
+/// `list-mcp-servers`: the configured servers one of the caller's `mcp` grants
+/// reaches.
 pub struct ListMcpServersHandler {
     pub client: Arc<McpClient>,
+    pub gate: McpGate,
 }
 impl HostFunctionHandler for ListMcpServersHandler {
     fn call(
         &self,
-        _ctx: HostCallContext,
+        ctx: HostCallContext,
         _params: Vec<Val>,
         _results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
         let client = Arc::clone(&self.client);
+        let gate = self.gate.clone();
         Box::pin(async move {
-            let r: Result<Vec<McpServerInfo>, McpError> = Ok(client.list_servers().await);
-            Ok(vec![encode_result_server_list(r)])
+            let scopes = gate.scopes(&ctx.agent_id);
+            let mut servers = client.list_servers().await;
+            servers.retain(|server| scopes.reaches_server(&server.id));
+            Ok(vec![encode_result_server_list(Ok(servers))])
         })
     }
 }
 
+/// `list-mcp-tools(server-id)`: the server's tools one of the caller's `mcp`
+/// grants covers, less the web family tools it may not use.
 pub struct ListMcpToolsHandler {
     pub client: Arc<McpClient>,
-    pub web_grant: Option<Arc<dyn GrantCheck>>,
+    pub gate: McpGate,
 }
 impl HostFunctionHandler for ListMcpToolsHandler {
     fn call(
@@ -423,32 +424,38 @@ impl HostFunctionHandler for ListMcpToolsHandler {
         _results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
         let client = Arc::clone(&self.client);
-        let web_grant = self.web_grant.clone();
-        let agent_id = ctx.agent_id.clone();
+        let gate = self.gate.clone();
         Box::pin(async move {
-            if params.len() < 1 {
+            if params.is_empty() {
                 return Err(HostCallError::HandlerError(
                     "list-mcp-tools: expected 1 param".to_string(),
                 ));
             }
             let server_id = decode_string(&params[0])?.to_string();
-            let allow_web = web_family_allowed(web_grant.as_deref(), &agent_id, "list-mcp-tools");
+            let agent_id = ctx.agent_id.as_str();
+            let scopes = gate.scopes(agent_id);
+            if !scopes.reaches_server(&server_id) {
+                return Ok(vec![encode_result_tool_list(Err(server_denied(
+                    &server_id,
+                )))]);
+            }
+            let refuses_web = client.refuses_web_tools(&server_id);
             let r = client
-                .list_tools(Some(&agent_id), &server_id)
+                .list_tools(Some(agent_id), &server_id)
                 .await
-                .map(|infos| {
-                    infos
-                        .into_iter()
-                        .filter(|info| !is_web_tool_id(&info.name) || allow_web)
-                        .collect::<Vec<_>>()
+                .map(|tools| {
+                    gate.visible_tools(agent_id, "list-mcp-tools", &scopes, refuses_web, tools)
                 });
             Ok(vec![encode_result_tool_list(r)])
         })
     }
 }
 
+/// `list-mcp-prompts(server-id)`: the server's prompts, for a caller whose
+/// `mcp` grant reaches the server with an unrestricted tool axis.
 pub struct ListMcpPromptsHandler {
     pub client: Arc<McpClient>,
+    pub gate: McpGate,
 }
 impl HostFunctionHandler for ListMcpPromptsHandler {
     fn call(
@@ -458,22 +465,31 @@ impl HostFunctionHandler for ListMcpPromptsHandler {
         _results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
         let client = Arc::clone(&self.client);
-        let agent_id = ctx.agent_id;
+        let gate = self.gate.clone();
         Box::pin(async move {
-            if params.len() < 1 {
+            if params.is_empty() {
                 return Err(HostCallError::HandlerError(
                     "list-mcp-prompts: expected 1 param".to_string(),
                 ));
             }
             let server_id = decode_string(&params[0])?.to_string();
-            let r = client.list_prompts(Some(&agent_id), &server_id).await;
+            if !gate.scopes(&ctx.agent_id).reaches_server_wide(&server_id) {
+                return Ok(vec![encode_result_prompt_list(Err(server_wide_denied(
+                    &server_id, None,
+                )))]);
+            }
+            let r = client.list_prompts(Some(&ctx.agent_id), &server_id).await;
             Ok(vec![encode_result_prompt_list(r)])
         })
     }
 }
 
+/// `get-mcp-prompt(server-id, prompt-name, args)`: one prompt, for a caller
+/// whose `mcp` grant reaches the server with an unrestricted tool axis.
 pub struct GetMcpPromptHandler {
     pub client: Arc<McpClient>,
+    pub gate: McpGate,
+    pub emitter: Arc<dyn EventBusEmit>,
 }
 impl HostFunctionHandler for GetMcpPromptHandler {
     fn call(
@@ -483,7 +499,8 @@ impl HostFunctionHandler for GetMcpPromptHandler {
         _results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
         let client = Arc::clone(&self.client);
-        let agent_id = ctx.agent_id;
+        let gate = self.gate.clone();
+        let emitter = Arc::clone(&self.emitter);
         Box::pin(async move {
             if params.len() < 3 {
                 return Err(HostCallError::HandlerError(
@@ -493,16 +510,34 @@ impl HostFunctionHandler for GetMcpPromptHandler {
             let server_id = decode_string(&params[0])?.to_string();
             let prompt_name = decode_string(&params[1])?.to_string();
             let args = decode_cap_param_list(&params[2])?;
+            let agent_id = ctx.agent_id.as_str();
+            if let Err(denied) =
+                gate.check_server_wide(agent_id, &function_id("get-mcp-prompt"), &server_id)
+            {
+                return Ok(vec![encode_result_bytes(Err(denied))]);
+            }
+            let started = Instant::now();
             let r = client
-                .get_prompt(Some(&agent_id), &server_id, &prompt_name, args)
+                .get_prompt(Some(agent_id), &server_id, &prompt_name, args)
                 .await;
+            if r.is_ok() {
+                emitter.emit(events::prompt_fetched(
+                    &ctx,
+                    &server_id,
+                    &prompt_name,
+                    elapsed_ms(started),
+                ));
+            }
             Ok(vec![encode_result_bytes(r)])
         })
     }
 }
 
+/// `list-mcp-resources(server-id)`: the server's resources, for a caller whose
+/// `mcp` grant reaches the server with an unrestricted tool axis.
 pub struct ListMcpResourcesHandler {
     pub client: Arc<McpClient>,
+    pub gate: McpGate,
 }
 impl HostFunctionHandler for ListMcpResourcesHandler {
     fn call(
@@ -512,22 +547,31 @@ impl HostFunctionHandler for ListMcpResourcesHandler {
         _results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
         let client = Arc::clone(&self.client);
-        let agent_id = ctx.agent_id;
+        let gate = self.gate.clone();
         Box::pin(async move {
-            if params.len() < 1 {
+            if params.is_empty() {
                 return Err(HostCallError::HandlerError(
                     "list-mcp-resources: expected 1 param".to_string(),
                 ));
             }
             let server_id = decode_string(&params[0])?.to_string();
-            let r = client.list_resources(Some(&agent_id), &server_id).await;
+            if !gate.scopes(&ctx.agent_id).reaches_server_wide(&server_id) {
+                return Ok(vec![encode_result_resource_list(Err(server_wide_denied(
+                    &server_id, None,
+                )))]);
+            }
+            let r = client.list_resources(Some(&ctx.agent_id), &server_id).await;
             Ok(vec![encode_result_resource_list(r)])
         })
     }
 }
 
+/// `read-mcp-resource(server-id, uri)`: one resource, for a caller whose `mcp`
+/// grant reaches the server with an unrestricted tool axis.
 pub struct ReadMcpResourceHandler {
     pub client: Arc<McpClient>,
+    pub gate: McpGate,
+    pub emitter: Arc<dyn EventBusEmit>,
 }
 impl HostFunctionHandler for ReadMcpResourceHandler {
     fn call(
@@ -537,7 +581,8 @@ impl HostFunctionHandler for ReadMcpResourceHandler {
         _results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
         let client = Arc::clone(&self.client);
-        let agent_id = ctx.agent_id;
+        let gate = self.gate.clone();
+        let emitter = Arc::clone(&self.emitter);
         Box::pin(async move {
             if params.len() < 2 {
                 return Err(HostCallError::HandlerError(
@@ -546,17 +591,34 @@ impl HostFunctionHandler for ReadMcpResourceHandler {
             }
             let server_id = decode_string(&params[0])?.to_string();
             let uri = decode_string(&params[1])?.to_string();
-            let r = client
-                .read_resource(Some(&agent_id), &server_id, &uri)
-                .await;
+            let agent_id = ctx.agent_id.as_str();
+            if let Err(denied) =
+                gate.check_server_wide(agent_id, &function_id("read-mcp-resource"), &server_id)
+            {
+                return Ok(vec![encode_result_bytes(Err(denied))]);
+            }
+            let started = Instant::now();
+            let r = client.read_resource(Some(agent_id), &server_id, &uri).await;
+            if let Ok(bytes) = &r {
+                emitter.emit(events::resource_read(
+                    &ctx,
+                    &server_id,
+                    &uri,
+                    bytes.len(),
+                    elapsed_ms(started),
+                ));
+            }
             Ok(vec![encode_result_bytes(r)])
         })
     }
 }
 
+/// `invoke-mcp-tool(server-id, tool-name, params)`: one tool call, for a caller
+/// whose `mcp` grant covers the tool on the server.
 pub struct InvokeMcpToolHandler {
     pub client: Arc<McpClient>,
-    pub web_grant: Option<Arc<dyn GrantCheck>>,
+    pub gate: McpGate,
+    pub emitter: Arc<dyn EventBusEmit>,
 }
 impl HostFunctionHandler for InvokeMcpToolHandler {
     fn call(
@@ -566,8 +628,8 @@ impl HostFunctionHandler for InvokeMcpToolHandler {
         _results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
         let client = Arc::clone(&self.client);
-        let web_grant = self.web_grant.clone();
-        let agent_id = ctx.agent_id.clone();
+        let gate = self.gate.clone();
+        let emitter = Arc::clone(&self.emitter);
         Box::pin(async move {
             if params.len() < 3 {
                 return Err(HostCallError::HandlerError(
@@ -577,45 +639,61 @@ impl HostFunctionHandler for InvokeMcpToolHandler {
             let server_id = decode_string(&params[0])?.to_string();
             let tool_name = decode_string(&params[1])?.to_string();
             let params_bytes = decode_byte_list(&params[2])?;
-            if is_web_tool_id(&tool_name) {
-                match web_family_decision(web_grant.as_deref(), &agent_id, "invoke-mcp-tool") {
-                    GrantDecision::Deny(reason) => {
-                        return Ok(vec![encode_result_bytes(Err(McpError::permission_denied(
-                            reason,
-                        )))]);
-                    }
-                    GrantDecision::Allow => {}
+            let agent_id = ctx.agent_id.as_str();
+            let authorized = authorize_tool_call(&gate, &client, agent_id, &server_id, &tool_name);
+            let started = Instant::now();
+            let r = match authorized {
+                Ok(()) => {
+                    client
+                        .invoke_tool(Some(agent_id), &server_id, &tool_name, &params_bytes)
+                        .await
                 }
+                Err(denied) => Err(denied),
+            };
+            match &r {
+                Ok(_) => emitter.emit(events::tool_invoked(
+                    &ctx,
+                    &server_id,
+                    &tool_name,
+                    elapsed_ms(started),
+                )),
+                Err(e) => emitter.emit(events::tool_error(
+                    &ctx,
+                    &server_id,
+                    &tool_name,
+                    e.kind.as_kebab(),
+                )),
             }
-            let r = client
-                .invoke_tool(Some(&agent_id), &server_id, &tool_name, &params_bytes)
-                .await;
             Ok(vec![encode_result_bytes(r)])
         })
     }
 }
 
-fn web_family_decision(
-    grant: Option<&dyn GrantCheck>,
-    agent_id: &str,
-    function: &str,
-) -> GrantDecision {
-    match grant {
-        None => GrantDecision::Deny("web grant checker unbound".into()),
-        Some(g) => g.check(
-            agent_id,
-            WEB_GRANT_CAPABILITY,
-            function,
-            &CapParams::empty(),
-        ),
+/// Whether `agent` may call `tool` on `server`: one of its `mcp` grants must
+/// cover the call, and a web family tool also needs a server that does not
+/// refuse them and the agent's `web` grant.
+fn authorize_tool_call(
+    gate: &McpGate,
+    client: &McpClient,
+    agent: &str,
+    server: &str,
+    tool: &str,
+) -> Result<(), McpError> {
+    gate.check_tool(agent, &function_id("invoke-mcp-tool"), server, tool)?;
+    if is_web_tool_id(tool) {
+        if client.refuses_web_tools(server) {
+            return Err(McpError::permission_denied(format!(
+                "web family tools are refused from stdio server {server:?}"
+            )));
+        }
+        gate.check_web(agent, "invoke-mcp-tool")?;
     }
+    Ok(())
 }
 
-fn web_family_allowed(grant: Option<&dyn GrantCheck>, agent_id: &str, function: &str) -> bool {
-    matches!(
-        web_family_decision(grant, agent_id, function),
-        GrantDecision::Allow
-    )
+/// Milliseconds since `started`.
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

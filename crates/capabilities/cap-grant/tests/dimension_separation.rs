@@ -8,9 +8,10 @@
 //! (CONTRACT-121) — it does NOT go through the agent-grant WIT.
 //!
 //! AC-21 scope per §1.5 line 333: "fails with capability denied because
-//! `mcp.servers` is empty" — capability-level dimension separation.
-//! Param-level subset enforcement at L1 is L1-V2 (future M001 bootstrap
-//! slice that wires `SubsetValidator` into the L1 path).
+//! `mcp.servers` is empty" — capability-level dimension separation. The
+//! mcp-client host functions register under the one capability `mcp`, whose
+//! `servers` and `tool-patterns` params narrow it per call, so a `tools` grant
+//! leaves `mcp` denied.
 
 mod common;
 
@@ -32,7 +33,7 @@ const AGENT: &str = "agent-1";
 fn ac21_capability_dimension_separation_one_allow_three_deny() {
     let (store, bus, _h) = make_store();
 
-    // Issue a `tools` grant ONLY (no mcp.servers / lifecycle / fs grants).
+    // Issue a `tools` grant ONLY (no mcp / lifecycle / fs grants).
     // Params encode the allowed tool name; the L1 gate authorizes by
     // capability+grantee membership only — param-level subset is L1-V2.
     let grant = Grant {
@@ -60,7 +61,7 @@ fn ac21_capability_dimension_separation_one_allow_three_deny() {
 
     // 4 checks across 4 distinct capability dimensions × distinct functions.
     let r1 = check.check(AGENT, "tools", "ns-tool::call", &CapParams::empty());
-    let r2 = check.check(AGENT, "mcp.servers", "ns-mcp::call", &CapParams::empty());
+    let r2 = check.check(AGENT, "mcp", "ns-mcp::call", &CapParams::empty());
     let r3 = check.check(
         AGENT,
         "lifecycle",
@@ -70,7 +71,7 @@ fn ac21_capability_dimension_separation_one_allow_three_deny() {
     let r4 = check.check(AGENT, "fs", "ns-fs::read", &CapParams::empty());
 
     assert!(matches!(r1, GrantDecision::Allow), "tools → Allow");
-    assert!(matches!(r2, GrantDecision::Deny(_)), "mcp.servers → Deny");
+    assert!(matches!(r2, GrantDecision::Deny(_)), "mcp → Deny");
     assert!(matches!(r3, GrantDecision::Deny(_)), "lifecycle → Deny");
     assert!(matches!(r4, GrantDecision::Deny(_)), "fs → Deny");
 
@@ -92,7 +93,7 @@ fn ac21_capability_dimension_separation_one_allow_three_deny() {
         "4 distinct capability values across events"
     );
     assert_eq!(by_cap["tools"].payload["decision"], "allowed");
-    assert_eq!(by_cap["mcp.servers"].payload["decision"], "denied");
+    assert_eq!(by_cap["mcp"].payload["decision"], "denied");
     assert_eq!(by_cap["lifecycle"].payload["decision"], "denied");
     assert_eq!(by_cap["fs"].payload["decision"], "denied");
 
@@ -100,7 +101,7 @@ fn ac21_capability_dimension_separation_one_allow_three_deny() {
     // proves the events are correctly scoped per capability dimension, not
     // mistakenly conflated.
     assert_eq!(by_cap["tools"].payload["function"], "ns-tool::call");
-    assert_eq!(by_cap["mcp.servers"].payload["function"], "ns-mcp::call");
+    assert_eq!(by_cap["mcp"].payload["function"], "ns-mcp::call");
     assert_eq!(
         by_cap["lifecycle"].payload["function"],
         "ns-lifecycle::spawn-child"

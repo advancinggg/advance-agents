@@ -10,17 +10,20 @@
 //! - `McpClient` — high-level dispatch surface over `Arc<dyn McpTransport>` with
 //!   one connection slot per server (servers initialized with the MCP
 //!   `initialize` exchange, dead transports evicted and reconnected with
-//!   backoff), requests attributed to the calling agent, paginated and bounded
-//!   tool listings kept in a tool cache, tool-pattern filter, and
+//!   backoff, connections reported as `mcp.server_started` /
+//!   `mcp.server_died`), requests attributed to the calling agent, paginated and
+//!   bounded tool listings kept in a tool cache, tool-pattern filter, and
 //!   schema-validated `invoke_tool` (AC-15).
 //! - `McpServersConfig` — programmatic whitelist + per-server `tool_patterns` glob
 //!   filter + per-tool schemas (AC-23 layers 1 + 2).
 //! - `SchemaValidator` — wraps `jsonschema::JSONSchema` for input/output validation
 //!   with a recursive `$ref` pre-scan that rejects external references (AC-13).
-//! - `register_mcp_client` — registers 7 `HostFunctionHandler` impls covering the
-//!   `mcp-client` WIT interface, split across `mcp.servers` (5 server-level
-//!   methods) and `mcp.tool-patterns` (2 tool-level methods) capability dimensions
-//!   per MODULE-017 AC-30 architectural split.
+//! - `register_mcp_client` — registers the 7 `mcp-client` WIT host functions under
+//!   the one capability `mcp`. Each call is decided against the caller's `mcp`
+//!   grants by an `McpGate` (AC-23 layer 3): calls through the grant check,
+//!   listings through the silent grant reader; the web family tools also need
+//!   the `web` grant and are refused from stdio servers. The handlers emit the
+//!   `mcp.*` call events.
 
 pub use client::{
     McpClient, McpClientLimits, McpToolInfo, McpTransport, MCP_PROTOCOL_VERSION,
@@ -28,7 +31,8 @@ pub use client::{
 };
 // Slice J (V1-b) — MCP half of the CONTRACT-165 inventory feed.
 pub use error::{McpError, McpErrorKind};
-pub use host_fn::{register_mcp_client, register_mcp_client_with_web_grant};
+pub use gate::{McpGate, McpScopes, MCP_CAPABILITY};
+pub use host_fn::register_mcp_client;
 pub use http_transport::{HttpMcpTransport, HttpOptions, MAX_SESSION_ID_BYTES};
 pub use inventory::{mcp_tool_entries, mcp_tool_entries_from_infos};
 pub use jsonrpc::{JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
@@ -46,6 +50,8 @@ pub use whitelist::{
 
 mod client;
 mod error;
+mod events;
+mod gate;
 mod host_fn;
 mod http_transport;
 mod inventory;
