@@ -229,8 +229,14 @@ impl Contract219EventProjector {
     }
 
     /// Register and publish a live agent identity before its first event. The
-    /// provider's journal makes a repeated operation/id pair idempotent.
+    /// provider's journal makes a repeated operation/id pair idempotent. An agent that
+    /// an earlier composition of this home registered and published is live already
+    /// (hydration in [`Self::build`] re-issued its source): it is not registered again,
+    /// since a second registration of a live identity conflicts with it.
     pub async fn register_agent(&self, exact_agent_id: &str) -> Result<(), String> {
+        if self.require_live_source(exact_agent_id).is_ok() {
+            return Ok(());
+        }
         let operation_id = format!("contract219-agent-{}", uuid::Uuid::new_v4().simple());
         self.provider
             .begin_agent_registration(&operation_id, exact_agent_id)
