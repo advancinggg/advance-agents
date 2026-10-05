@@ -61,34 +61,6 @@ impl fmt::Debug for LogHandle {
     }
 }
 
-/// The sink of the daemon entry ([`crate::daemon::run_daemon`]): each line goes to
-/// the stream it names, written exactly as `advance start` has always printed it,
-/// and the readiness line is flushed so a supervisor reading stdout through a pipe
-/// sees it at once.
-///
-/// [`ComposeLog::line`] writes with `writeln!` on the locked stream: the bytes and
-/// the buffering are those of `println!` / `eprintln!` (the text and its `\n` in one
-/// `write_fmt`), but a stream that refuses the write (its reader closed the pipe)
-/// drops the line instead of panicking, as the trait promises. A task that reports
-/// through the log therefore never unwinds because nobody reads its output.
-pub(crate) struct StdioComposeLog;
-
-impl ComposeLog for StdioComposeLog {
-    fn line(&self, line: &ComposeLogLine) {
-        use std::io::Write;
-        let _ = match line.stream {
-            LogStream::Stdout => writeln!(std::io::stdout().lock(), "{}", line.text),
-            LogStream::Stderr => writeln!(std::io::stderr().lock(), "{}", line.text),
-        };
-    }
-
-    fn ready(&self, line: &ComposeLogLine) -> std::io::Result<()> {
-        use std::io::Write;
-        println!("{}", line.text);
-        std::io::stdout().flush()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -27,8 +27,8 @@ name = "advance"
 path = "src/main.rs"
 
 [dependencies]
-# The composition behind `advance start` (`commands::start` forwards to
-# `advance_runtime_compose::run_daemon`); `lib.rs` re-exports its modules.
+# The composition behind `advance start` (`commands::start` is a thin main over
+# `advance_runtime_compose::compose`); `lib.rs` re-exports its modules.
 advance-runtime-compose = { path = "../runtime-compose" }
 advance-runtime = { path = "../runtime" }
 advance-home = { path = "../advance-home" }

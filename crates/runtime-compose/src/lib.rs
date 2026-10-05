@@ -3,11 +3,21 @@
 //! Owns everything `advance start` composes: the capability wiring
 //! ([`wiring::wire_capabilities`]), the agent loop and turn modules, the
 //! bootstraps, channel boot, the Client API adapters, the pack runtime, the
-//! data tool, and the daemon entry ([`daemon::run_daemon`]) that the `advance`
-//! binary's `start` command calls. `advance-cli` re-exports every public module
-//! here under its former `advance_cli::<module>` path.
+//! data tool, and the daemon composition graph (`daemon`) behind [`compose`].
+//! The `advance` binary's `start` command is a thin `main` over [`compose`]: it
+//! owns the process (the runtime, the signals, the workspace it resolves, the
+//! output and the exit code), so code in this crate never prints, installs no
+//! signal handler, never reads the current directory and never exits the process.
+//! `advance-cli` re-exports every public module here under its former
+//! `advance_cli::<module>` path.
 
 #![forbid(unsafe_code)]
+#![deny(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::dbg_macro,
+    clippy::exit
+)]
 
 /// `probe_record!(probe, |record| update)`: record into the composition's test-support
 /// probe (`test_support::ComposeProbe`), where `probe` is an
@@ -134,10 +144,9 @@ pub mod workspace_rollback;
 // ComponentMetricReader trait + predicate_breached) → IterationCloseCtx → close_iteration.
 // cli-only (auto-loop src untouched); flips ZERO SYS-AC.
 pub mod crash_coordinator;
-// The `advance start` daemon: `run_daemon` plus the agent-loop spawn, the `POST /msg`
-// listener, the post-processor, the tick loop and reconcile, and shutdown.
+// The daemon composition graph `compose` builds: the agent-loop spawn, the `POST /msg`
+// listener, the post-processor, the tick loop and reconcile.
 pub mod daemon;
-pub use daemon::run_daemon;
 // /dev Wave-14 Lane B (2026-06-24) — the SYS-AC-201 witness-floor seam: the concrete
 // evaluator-executing ComponentMetricReader that RUNS a resolved evaluator runnable
 // component over the runtime surface and reads its output_key metric (the value the

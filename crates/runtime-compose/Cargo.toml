@@ -4,7 +4,7 @@ version.workspace = true
 repository.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The runtime composition behind `advance start`: capability wiring, agent loop, bootstraps, channel boot, Client API adapters, pack runtime and the daemon entry."
+description = "The runtime composition behind `advance start` (`compose`): capability wiring, agent loop, bootstraps, channel boot, Client API adapters and the pack runtime."
 
 # Pathless internal dependencies are accepted by cargo-deny only for private crates.
 publish = false

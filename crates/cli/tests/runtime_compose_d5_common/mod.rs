@@ -125,22 +125,32 @@ pub const READINESS_AFTER_WRITE_GOLDEN: &str = "exit.readiness_write_failure.aft
 pub const H2_AFTER_SHUTDOWN_GOLDEN: &str = "start.h2_all_capabilities.after_shutdown.golden";
 
 /// Exit status of `advance start` when the readiness line cannot be written (stdout's read end
-/// closed right after spawn, so the first stdout write gets EPIPE). OWNER DECISION PENDING.
+/// closed right after spawn, so the first stdout write gets EPIPE). Decided (owner ruling
+/// 2026-10-03): exit 1, the composition's `ComposeError::Readiness`, printed as
+/// `advance start: failed to flush readiness signal: …`.
 ///
-/// ADR D1 "Output", MODULE-001-AC-30 and T111 say this "still ends `advance start` with exit 1,
-/// as today (`start.rs:367-374`)". The pre-move tree does not: the readiness line is written by
-/// `println!`, which panics on the EPIPE before the exit-1 flush branch can run, so the process
-/// exits 101 and stderr carries std's `failed printing to stdout: Broken pipe (os error 32)`
-/// panic message. This constant records what the pre-move tree actually does.
+/// On the pre-move tree the readiness line was written by `println!`, which panicked on the
+/// EPIPE before the exit-1 flush branch could run, so the process exited 101 and stderr carried
+/// std's `failed printing to stdout: Broken pipe (os error 32)` panic message. The first entry
+/// records that pre-move outcome.
 pub const READINESS_WRITE_FAILURE: PendingExpectation = PendingExpectation {
-    outcome: ExitOutcome::Code(101),
-    pins_by_outcome: &[(
-        ExitOutcome::Code(101),
-        &[(
-            READINESS_AFTER_WRITE_GOLDEN,
-            "5f983305de98cf724c689f8baf5d09418dca70a4db89dcbd6201ec170ed257f3",
-        )],
-    )],
+    outcome: ExitOutcome::Code(1),
+    pins_by_outcome: &[
+        (
+            ExitOutcome::Code(101),
+            &[(
+                READINESS_AFTER_WRITE_GOLDEN,
+                "5f983305de98cf724c689f8baf5d09418dca70a4db89dcbd6201ec170ed257f3",
+            )],
+        ),
+        (
+            ExitOutcome::Code(1),
+            &[(
+                READINESS_AFTER_WRITE_GOLDEN,
+                "a5b17d24f9613e11c66f6d759ef3ca1e75ea4cf464e9365d77caca4891cc0d6d",
+            )],
+        ),
+    ],
 };
 
 /// Exit status after SIGTERM on H2 (every capability declared, a git repository). Decided

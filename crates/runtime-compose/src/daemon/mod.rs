@@ -1,15 +1,16 @@
-//! `advance start [--workspace <path>]` — Slice AE (2026-05-09); guest-component
-//! autoload + agent-loop driver added in Slice BS-3 (2026-06-03, D12);
-//! multi-turn serving loop added in Phase-2 Step-2 (2026-06-05).
+//! The daemon composition graph behind [`crate::compose`] (what `advance start`
+//! composes) — Slice AE (2026-05-09); guest-component autoload + agent-loop driver
+//! added in Slice BS-3 (2026-06-03, D12); multi-turn serving loop added in Phase-2
+//! Step-2 (2026-06-05).
 //!
 //! Brings up the runtime construction surface ([`advance_runtime::RuntimeHost`]),
 //! then loads a deployed agent component if one is present at the conventional
 //! path `<workspace>/.agent/behavior.component.wasm` and spawns the scheduler
 //! agent-loop driver's `serve` SERVING LOOP ([`crate::agent_loop::build_agent_loop`]
 //! → `AgentLoopDriverImpl::serve`) on a cancellable task — serving consecutive
-//! `POST /msg` requests and carrying agent state across turns. Parks until
-//! SIGINT / SIGTERM, then stops everything in order (`crate::composition`),
-//! releasing the runtime lock last.
+//! `POST /msg` requests and carrying agent state across turns. The composition's
+//! teardown (`crate::composition`) stops everything in order, releasing the
+//! runtime lock last.
 //!
 //! The load is ONE-SHOT — the bytes are read exactly once at boot, there is no
 //! file watcher, and changing the deployed binary requires a restart (MODULE-001
@@ -23,7 +24,6 @@
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -93,8 +93,8 @@ use crate::channel_egress::{ChannelEgress, DaemonOutboundSink};
 use crate::channels_boot;
 use crate::execution_turn_ingress::ExecutionTurnIngress;
 
-use crate::api::{log_keys, ComposeError, ComposeLog, ComposeOptions, ListenerOptions};
-use crate::compose_log::{LogHandle, StdioComposeLog};
+use crate::api::{log_keys, ComposeError, ListenerOptions};
+use crate::compose_log::LogHandle;
 use crate::wiring::{HoldStoppers, WiringFailure, WiringHandles, WiringOptions};
 use tokio_util::sync::CancellationToken;
 
@@ -205,114 +205,6 @@ impl WebhookSource for BootNoopWebhookSource {
 /// `{:?}` formatting routes through Debug → `escape_debug` and DOES.
 fn safe_path(p: &Path) -> String {
     format!("{p:?}")
-}
-
-/// Sync entry point invoked from `main.rs`. Builds a current-thread Tokio
-/// runtime and drives `run_async`.
-///
-/// Incident (grok-housekeeping clippy stage 1): blessed CLI sync entry.
-/// This uses an *owned* `tokio::runtime::Runtime::block_on`, never
-/// `Handle::block_on` (nested-runtime panic) and never
-/// `futures::executor::block_on`. Root `clippy.toml` bans those two
-/// paths. `Runtime::block_on` itself is not banned; the allow documents
-/// the named site from DEV-TASK / Item 5.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "blessed CLI sync entry: owned Runtime::block_on, not Handle::block_on or futures::executor::block_on"
-)]
-pub fn run_daemon(workspace: Option<PathBuf>) -> ExitCode {
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("advance start: failed to build tokio runtime: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    rt.block_on(run_async(workspace, Arc::new(StdioComposeLog)))
-}
-
-async fn run_async(workspace: Option<PathBuf>, log: Arc<dyn ComposeLog>) -> ExitCode {
-    // 1. Install signal listeners FIRST. Tokio's `signal(SignalKind::*)` is
-    //    synchronous (installs the kernel handler eagerly), so subsequent
-    //    SIGINT/SIGTERM during lock-acquire or bootstrap is captured and
-    //    pending — preventing a window where the kernel default handler kills
-    //    the process before the lock can be released or bootstrap can clean up.
-    //    (Audit R1 W1 fix.)
-    #[cfg(unix)]
-    let listeners = match install_unix_listeners() {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("advance start: failed to install signal listeners: {e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    // 2. Resolve workspace: --workspace → $ADVANCE_WORKSPACE → CWD.
-    let workspace = match resolve_workspace(workspace) {
-        Ok(p) => p,
-        Err(msg) => {
-            eprintln!("advance start: {msg}");
-            return ExitCode::from(1);
-        }
-    };
-
-    // 3. Workspace must exist as a directory. canonicalize() requires the path
-    //    to exist; check first to produce a friendly error.
-    if !workspace.is_dir() {
-        eprintln!(
-            "advance start: workspace does not exist or is not a directory: {}",
-            safe_path(&workspace)
-        );
-        return ExitCode::from(1);
-    }
-    let workspace = match workspace.canonicalize() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "advance start: failed to canonicalize workspace {}: {e}",
-                safe_path(&workspace)
-            );
-            return ExitCode::from(1);
-        }
-    };
-
-    // 4. Compose: the instance guard (the runtime lock, heartbeat 30 s per MODULE-001
-    //    §1.4.3), the runtime host, the capability graph, the readiness line, the agent
-    //    loop and its listeners. A failure after part of it started stops what started
-    //    (no line printed), then is reported.
-    let runtime =
-        match crate::compose::compose(ComposeOptions::daemon(workspace, log), Vec::new()).await {
-            Ok(runtime) => runtime,
-            Err(error) => return startup_failed(error),
-        };
-
-    // 5. Park until SIGINT / SIGTERM. Listeners were installed in step 1 (above
-    //    lock-acquire) so any signal received during lock-acquire or bootstrap
-    //    is captured and pending; the .recv() here just resolves immediately
-    //    in that case.
-    #[cfg(unix)]
-    park_until_shutdown_unix(listeners).await;
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-
-    // 6. The ordered shutdown: ingress, loops (then `advance: shutting down`), the
-    //    holds in dependency order, the runtime lock last.
-    match runtime.shutdown().await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => startup_failed(error),
-    }
-}
-
-/// Report a startup failure the way `advance start` always has (`advance start: …` on
-/// stderr) and exit 1.
-fn startup_failed(error: ComposeError) -> ExitCode {
-    eprintln!("advance start: {error}");
-    ExitCode::from(1)
 }
 
 /// What [`compose_graph`] composes with.
@@ -834,23 +726,6 @@ pub(crate) async fn compose_graph(
         readiness_walk,
     })
 }
-
-// Compile-time witness: the daemon composition future is `Send + 'static`, so it can
-// be driven by `tokio::spawn` on a multi-thread runtime as well as by the CLI's
-// current-thread `block_on`. A `!Send` value held across an `.await` fails the build
-// here, not at an embedder's call site.
-const _: () = {
-    fn assert_send_static<F, Fut>(_: F)
-    where
-        F: Fn(Option<PathBuf>, Arc<dyn ComposeLog>) -> Fut,
-        Fut: std::future::Future<Output = ExitCode> + Send + 'static,
-    {
-    }
-    #[allow(dead_code)]
-    fn witness() {
-        assert_send_static(run_async);
-    }
-};
 
 /// MODULE-001-AC-20 (024): discriminate a `wasm32` core module from an encoded WASM
 /// Component by the binary header. Both share the `\0asm` magic (bytes 0..4); the low
@@ -2161,41 +2036,6 @@ mod tests {
             "in_flight must be released"
         );
     }
-}
-
-#[cfg(unix)]
-struct UnixSignalListeners {
-    sigint: tokio::signal::unix::Signal,
-    sigterm: tokio::signal::unix::Signal,
-}
-
-#[cfg(unix)]
-fn install_unix_listeners() -> std::io::Result<UnixSignalListeners> {
-    use tokio::signal::unix::{signal, SignalKind};
-    Ok(UnixSignalListeners {
-        sigint: signal(SignalKind::interrupt())?,
-        sigterm: signal(SignalKind::terminate())?,
-    })
-}
-
-#[cfg(unix)]
-async fn park_until_shutdown_unix(mut listeners: UnixSignalListeners) {
-    tokio::select! {
-        _ = listeners.sigint.recv() => {}
-        _ = listeners.sigterm.recv() => {}
-    }
-}
-
-fn resolve_workspace(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
-    if let Some(p) = explicit {
-        return Ok(p);
-    }
-    if let Some(ws) = std::env::var_os("ADVANCE_WORKSPACE") {
-        if !ws.is_empty() {
-            return Ok(PathBuf::from(ws));
-        }
-    }
-    std::env::current_dir().map_err(|e| format!("cannot resolve CWD as workspace: {e}"))
 }
 
 /// SAT-B (slice satB-postproc — #1 hazard fix / AC-44/45/46): build the live
