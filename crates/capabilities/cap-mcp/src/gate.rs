@@ -20,22 +20,25 @@
 //! merged axis by axis.
 //!
 //! A call is decided through [`GrantCheck`], which writes `authz.checked`
-//! events by its own policy. A listing is filtered with the scopes of the
-//! caller's grants, read through the silent [`McpGrantReader`], so filtering a
-//! long listing writes no event per hidden entry. Both apply the same
-//! coverage rules, so a listing shows exactly what a call may reach.
+//! events by its own policy. A listing is filtered with what the caller's
+//! grants reach, read through silent readers ([`McpGrantReader`], and
+//! [`WebGrantReader`] for the web family tools), so a listing writes no
+//! `authz.checked` event, however many entries it hides. Each reader follows
+//! the rules of the check it stands for, so a listing shows exactly what a call
+//! may reach.
 //!
 //! The web family tools (`web.search`, `web.extract`) also need the agent's
-//! `web` grant, asked of the gate's web checker (without one they are
-//! withheld). A stdio server reaches the network outside the http security
-//! chain, with keys of its own, so its web family tools are hidden and refused
-//! whatever the agent's grants ([`McpClient::refuses_web_tools`](crate::McpClient::refuses_web_tools)).
+//! `web` grant ([`McpWebGrant`]): a call asks its check, a listing its reader.
+//! A gate given no web grant withholds them from every agent. A stdio server
+//! reaches the network outside the http security chain, with keys of its own,
+//! so its web family tools are hidden and refused whatever the agent's grants
+//! ([`McpClient::refuses_web_tools`](crate::McpClient::refuses_web_tools)).
 
 use std::sync::Arc;
 
 use advance_shared_types::capability::{CapParams, GrantDecision};
 use advance_shared_types::mcp::{McpGrantScope, SERVER_WIDE_TOOL};
-use advance_shared_types::traits::{GrantCheck, McpGrantReader};
+use advance_shared_types::traits::{GrantCheck, McpGrantReader, WebGrantReader};
 use advance_shared_types::web_search::{is_web_tool_id, WEB_GRANT_CAPABILITY};
 
 use crate::client::McpToolInfo;
@@ -50,14 +53,43 @@ pub const MCP_CAPABILITY: &str = "mcp";
 pub struct McpGate {
     grant: Arc<dyn GrantCheck>,
     reader: Arc<dyn McpGrantReader>,
-    web: Option<Arc<dyn GrantCheck>>,
+    web: Option<McpWebGrant>,
 }
 
 impl std::fmt::Debug for McpGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpGate")
             .field("reader", &self.reader)
-            .field("web", &self.web.is_some())
+            .field("web", &self.web)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The `web` grant, as the gate asks it about the web family tools: `check`
+/// decides a call of one and writes `authz.checked` events by its own policy;
+/// `reader` tells a listing, silently, whether to show them.
+///
+/// The two must agree for every agent: bind them over the same grants, and
+/// let neither withhold the web family in a mode where the other offers it. A
+/// mode that withholds it from every agent (offline) is expressed by giving
+/// the gate no web grant.
+#[derive(Clone)]
+pub struct McpWebGrant {
+    check: Arc<dyn GrantCheck>,
+    reader: Arc<dyn WebGrantReader>,
+}
+
+impl McpWebGrant {
+    /// `check` decides calls and `reader` answers listings (see the type docs).
+    pub fn new(check: Arc<dyn GrantCheck>, reader: Arc<dyn WebGrantReader>) -> Self {
+        Self { check, reader }
+    }
+}
+
+impl std::fmt::Debug for McpWebGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpWebGrant")
+            .field("reader", &self.reader)
             .finish_non_exhaustive()
     }
 }
@@ -69,7 +101,7 @@ impl McpGate {
     pub fn new(
         grant: Arc<dyn GrantCheck>,
         reader: Arc<dyn McpGrantReader>,
-        web: Option<Arc<dyn GrantCheck>>,
+        web: Option<McpWebGrant>,
     ) -> Self {
         Self { grant, reader, web }
     }
@@ -107,16 +139,19 @@ impl McpGate {
             .map_err(|reason| server_wide_denied(server, Some(&reason)))
     }
 
-    /// Decide whether `agent` may use the web family tools: allowed when the
-    /// web checker allows its `web` capability. `function` names the calling
-    /// host function in the checker's `authz.checked` event.
+    /// Decide a call of a web family tool by `agent`: allowed when the web
+    /// grant's check allows its `web` capability. `function` names the calling
+    /// host function in the check's `authz.checked` event.
     pub fn check_web(&self, agent: &str, function: &str) -> Result<(), McpError> {
         let Some(web) = &self.web else {
             return Err(McpError::permission_denied(
-                "web family tools are withheld: no web grant checker is bound",
+                "web family tools are withheld: no web grant is bound",
             ));
         };
-        match web.check(agent, WEB_GRANT_CAPABILITY, function, &CapParams::empty()) {
+        match web
+            .check
+            .check(agent, WEB_GRANT_CAPABILITY, function, &CapParams::empty())
+        {
             GrantDecision::Allow => Ok(()),
             GrantDecision::Deny(reason) => Err(McpError::permission_denied(reason)),
         }
@@ -130,19 +165,18 @@ impl McpGate {
 
     /// The tools of one server's listing that `agent` may see: those one of
     /// its grants covers (`scopes`, read with [`scopes`](Self::scopes)), less
-    /// the web family tools when `server_refuses_web` or when `agent` may not
-    /// use them. The web checker is asked at most once, and only when a web
-    /// family tool would otherwise be shown; `function` names the calling host
-    /// function in its event.
+    /// the web family tools when `server_refuses_web` or when the web grant's
+    /// reader says `agent` may not use them. Nothing is decided and no event is
+    /// written: the reader is asked at most once, and only when a web family
+    /// tool would otherwise be shown.
     pub fn visible_tools(
         &self,
         agent: &str,
-        function: &str,
         scopes: &McpScopes,
         server_refuses_web: bool,
         mut tools: Vec<McpToolInfo>,
     ) -> Vec<McpToolInfo> {
-        let mut web_allowed: Option<bool> = None;
+        let mut web_visible: Option<bool> = None;
         tools.retain(|tool| {
             if !scopes.reaches_tool(&tool.server_id, &tool.name) {
                 return false;
@@ -150,10 +184,17 @@ impl McpGate {
             if !is_web_tool_id(&tool.name) {
                 return true;
             }
-            !server_refuses_web
-                && *web_allowed.get_or_insert_with(|| self.check_web(agent, function).is_ok())
+            !server_refuses_web && *web_visible.get_or_insert_with(|| self.web_visible(agent))
         });
         tools
+    }
+
+    /// Whether a listing may show `agent` the web family tools, read through
+    /// the web grant's silent reader; never without a web grant.
+    fn web_visible(&self, agent: &str) -> bool {
+        self.web
+            .as_ref()
+            .is_some_and(|web| web.reader.web_grant_held(agent))
     }
 
     /// Ask the grant check about an `mcp` request; the deny reason on refusal.
@@ -268,6 +309,39 @@ mod tests {
         }
     }
 
+    /// A web grant reader answering every agent with `held`, counting reads.
+    #[derive(Debug)]
+    struct WebHeld {
+        held: bool,
+        reads: Mutex<usize>,
+    }
+    impl WebHeld {
+        fn new(held: bool) -> Arc<Self> {
+            Arc::new(Self {
+                held,
+                reads: Mutex::new(0),
+            })
+        }
+        fn reads(&self) -> usize {
+            *self.reads.lock().unwrap()
+        }
+    }
+    impl WebGrantReader for WebHeld {
+        fn web_grant_held(&self, _agent_id: &str) -> bool {
+            *self.reads.lock().unwrap() += 1;
+            self.held
+        }
+    }
+
+    /// A gate whose web grant is `check` and `reader`.
+    fn web_gate(check: Arc<Recording>, reader: Arc<WebHeld>) -> McpGate {
+        McpGate::new(
+            Recording::new(true),
+            Arc::new(Scopes(vec![])),
+            Some(McpWebGrant::new(check, reader)),
+        )
+    }
+
     fn tool(server: &str, name: &str) -> McpToolInfo {
         McpToolInfo {
             name: name.into(),
@@ -316,23 +390,21 @@ mod tests {
         );
     }
 
+    // A call of a web family tool asks the web grant's check, never its
+    // reader; without a web grant it is refused.
     #[test]
-    fn web_family_tools_need_a_web_checker_that_allows_them() {
+    fn web_family_calls_ask_the_web_grant_check() {
         let gate = McpGate::new(Recording::new(true), Arc::new(Scopes(vec![])), None);
         assert!(gate.check_web("a", "f").is_err());
-        let web = Recording::new(true);
-        let gate = McpGate::new(
-            Recording::new(true),
-            Arc::new(Scopes(vec![])),
-            Some(web.clone()),
-        );
+
+        let check = Recording::new(true);
+        let reader = WebHeld::new(false);
+        let gate = web_gate(check.clone(), reader.clone());
         assert!(gate.check_web("a", "f").is_ok());
-        assert_eq!(web.seen()[0].1, WEB_GRANT_CAPABILITY);
-        let gate = McpGate::new(
-            Recording::new(true),
-            Arc::new(Scopes(vec![])),
-            Some(Recording::new(false)),
-        );
+        assert_eq!(check.seen()[0].1, WEB_GRANT_CAPABILITY);
+        assert_eq!(reader.reads(), 0, "a call never reads the listing answer");
+
+        let gate = web_gate(Recording::new(false), WebHeld::new(true));
         assert!(gate.check_web("a", "f").is_err());
     }
 
@@ -353,10 +425,12 @@ mod tests {
         assert!(!McpScopes::default().reaches_server("a"));
     }
 
-    // The listing filter keeps the covered tools and asks the web checker once,
-    // only for a covered web family tool on a server that does not refuse them.
+    // The listing filter keeps the covered tools, and shows the web family
+    // tools as the web grant's reader says: read once, and only for a covered
+    // web family tool on a server that does not refuse them. It never asks a
+    // grant check, so it writes no event.
     #[test]
-    fn visible_tools_follow_the_scopes_and_the_web_rule() {
+    fn visible_tools_follow_the_scopes_and_the_web_reader() {
         let listing = || {
             vec![
                 tool("srv", "get_a"),
@@ -366,30 +440,28 @@ mod tests {
             ]
         };
         let scopes = McpScopes(vec![scope(Some(&["srv"]), Some(&["get_*", "web.*"]))]);
-        let web = Recording::new(true);
-        let gate = McpGate::new(
-            Recording::new(true),
-            Arc::new(Scopes(vec![])),
-            Some(web.clone()),
-        );
-        let shown = gate.visible_tools("a", "list", &scopes, false, listing());
+        let check = Recording::new(true);
+        let reader = WebHeld::new(true);
+        let gate = web_gate(check.clone(), reader.clone());
+        let shown = gate.visible_tools("a", &scopes, false, listing());
         assert_eq!(names(&shown), ["get_a", "web.search", "web.extract"]);
-        assert_eq!(web.seen().len(), 1);
+        assert_eq!(reader.reads(), 1);
 
-        let shown = gate.visible_tools("a", "list", &scopes, true, listing());
+        let shown = gate.visible_tools("a", &scopes, true, listing());
         assert_eq!(names(&shown), ["get_a"]);
-        assert_eq!(web.seen().len(), 1, "a refusing server asks no web check");
+        assert_eq!(reader.reads(), 1, "a refusing server reads no web grant");
 
         let no_web = McpScopes(vec![scope(Some(&["srv"]), Some(&["get_*"]))]);
-        gate.visible_tools("a", "list", &no_web, false, listing());
-        assert_eq!(web.seen().len(), 1, "no covered web tool asks no web check");
+        gate.visible_tools("a", &no_web, false, listing());
+        assert_eq!(reader.reads(), 1, "no covered web tool reads no web grant");
+        assert!(check.seen().is_empty(), "a listing never asks the check");
 
-        let denied = McpGate::new(
-            Recording::new(true),
-            Arc::new(Scopes(vec![])),
-            Some(Recording::new(false)),
-        );
-        let shown = denied.visible_tools("a", "list", &scopes, false, listing());
+        let not_held = web_gate(Recording::new(true), WebHeld::new(false));
+        let shown = not_held.visible_tools("a", &scopes, false, listing());
+        assert_eq!(names(&shown), ["get_a"]);
+
+        let no_grant = McpGate::new(Recording::new(true), Arc::new(Scopes(vec![])), None);
+        let shown = no_grant.visible_tools("a", &scopes, false, listing());
         assert_eq!(names(&shown), ["get_a"]);
     }
 }

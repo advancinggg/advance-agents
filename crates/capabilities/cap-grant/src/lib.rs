@@ -44,7 +44,9 @@ pub use approval_intake::{
 };
 pub use capability_subset::{project_capability_params, validate_capability_subset};
 pub use cascade::CascadeResult;
-pub use check::{AuthzLevel, GrantCheckImpl, McpGrantReaderImpl, ToolsGrantReaderImpl};
+pub use check::{
+    AuthzLevel, GrantCheckImpl, McpGrantReaderImpl, ToolsGrantReaderImpl, WebGrantReaderImpl,
+};
 pub use compile::{StaticConfigCompiler, MAX_YAML_BYTES};
 pub use data::{
     CapParam, ChainDecision, ComponentId, Grant, GrantDraft, GrantId, GrantIssuer, GrantProvenance,

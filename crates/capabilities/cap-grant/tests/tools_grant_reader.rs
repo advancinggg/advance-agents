@@ -1,21 +1,24 @@
 //! CONTRACT-183 `ToolsGrantReader` unit coverage (Wave-15 Lane E), and its `mcp`
-//! counterpart `McpGrantReader`.
+//! and `web` counterparts `McpGrantReader` and `WebGrantReader`.
 //!
 //! Verifies the `tools.ids` allowlist projection: ids→narrow, no-ids→wildcard(None),
 //! no-grant→deny(Some([])), expired/revoked/non-tools excluded, CSV de-dup union,
 //! and the colon→bare grantee bridge. For `mcp`: one scope per active grant, never
 //! merged, agreeing with the call-time check, and silent (no `authz.checked`); the
-//! mcp-client host functions over the real grant check and reader.
+//! mcp-client host functions over the real grant check and readers. For `web`:
+//! held by an active, unexpired grant, agreeing with the check, and silent.
 
 mod common;
 
 use advance_shared_types::capability::{CapParams, GrantDecision};
 use advance_shared_types::mcp::{McpGrantScope, MAX_REQUEST_TOKEN_BYTES};
-use advance_shared_types::traits::{GrantCheck, McpGrantReader, ToolsGrantReader};
+use advance_shared_types::traits::{GrantCheck, McpGrantReader, ToolsGrantReader, WebGrantReader};
 use cap_grant::data::{
     CapParam, Grant, GrantId, GrantIssuer, GrantProvenance, GrantStatus, GrantTtl,
 };
-use cap_grant::{GrantCheckImpl, McpGrantReaderImpl, ToolsGrantReaderImpl};
+use cap_grant::{
+    AuthzLevel, GrantCheckImpl, McpGrantReaderImpl, ToolsGrantReaderImpl, WebGrantReaderImpl,
+};
 use chrono::Utc;
 
 use common::make_store;
@@ -327,6 +330,51 @@ fn mgr_04_filtered_listing_matches_the_check_and_emits_nothing() {
     assert_eq!(bus.count_of("authz.checked"), listed.len() - visible.len());
 }
 
+// ===== WebGrantReader =====
+
+fn web_grant(id: &str, grantee: &str) -> Grant {
+    let mut g = tools_grant(id, grantee, None, GrantStatus::Active);
+    g.capability = "web".to_string();
+    g
+}
+
+// The `web` grant is held through an active, unexpired `web` grant (the answer the call-time
+// check gives a whole-capability `web` request), also across the colon→bare bridge. Reading it
+// writes no `authz.checked` event.
+#[test]
+fn wgr_01_web_grant_held_by_an_active_unexpired_grant() {
+    let (store, bus, _h) = make_store();
+    store.insert(web_grant("g-1", "alice")).unwrap();
+    let mut revoked = web_grant("g-2", "bob");
+    revoked.status = GrantStatus::Revoked;
+    store.insert(revoked).unwrap();
+    let mut expired = web_grant("g-3", "carol");
+    expired.expires_at = Some(Utc::now() - chrono::Duration::hours(1));
+    store.insert(expired).unwrap();
+    store
+        .insert(tools_grant("g-4", "dave", None, GrantStatus::Active))
+        .unwrap();
+    store.insert(mcp_grant("g-5", "dave", &[])).unwrap();
+
+    let reader = WebGrantReaderImpl::new(store.clone());
+    assert!(reader.web_grant_held("alice"));
+    assert!(reader.web_grant_held("agent:alice"));
+    let agents = ["alice", "bob", "carol", "dave", "erin"];
+    for agent in &agents[1..] {
+        assert!(!reader.web_grant_held(agent), "{agent}");
+    }
+    assert_eq!(bus.count_of("authz.checked"), 0);
+
+    let check = GrantCheckImpl::new(store);
+    for agent in agents {
+        let allowed = matches!(
+            check.check(agent, "web", "f", &CapParams::empty()),
+            GrantDecision::Allow
+        );
+        assert_eq!(allowed, reader.web_grant_held(agent), "{agent}");
+    }
+}
+
 // ===== The mcp-client host functions over the real grant check and reader =====
 
 /// An MCP server double answering each method with a fixed result, recording
@@ -410,9 +458,24 @@ impl advance_shared_types::traits::EventBusEmit for NoEvents {
 }
 
 /// The mcp-client host functions over `servers`, each answered by its double,
-/// behind a gate that reads `store`'s grants.
+/// behind a gate that reads `store`'s grants (no web grant).
 fn mcp_host_functions(
     store: &std::sync::Arc<cap_grant::GrantStore>,
+    servers: &[&std::sync::Arc<ScriptedServer>],
+) -> advance_runtime::host_registry::InMemoryHostRegistry {
+    use std::sync::Arc;
+    let gate = cap_mcp::McpGate::new(
+        Arc::new(GrantCheckImpl::new(Arc::clone(store))),
+        Arc::new(McpGrantReaderImpl::new(Arc::clone(store))),
+        None,
+    );
+    mcp_host_functions_behind(gate, servers)
+}
+
+/// The mcp-client host functions over `servers` (http servers, each answered by
+/// its double), behind `gate`.
+fn mcp_host_functions_behind(
+    gate: cap_mcp::McpGate,
     servers: &[&std::sync::Arc<ScriptedServer>],
 ) -> advance_runtime::host_registry::InMemoryHostRegistry {
     use std::sync::Arc;
@@ -448,11 +511,6 @@ fn mcp_host_functions(
         Arc::new(NoLeaks),
         injected,
     ));
-    let gate = cap_mcp::McpGate::new(
-        Arc::new(GrantCheckImpl::new(Arc::clone(store))),
-        Arc::new(McpGrantReaderImpl::new(Arc::clone(store))),
-        None,
-    );
     let registry = advance_runtime::host_registry::InMemoryHostRegistry::new();
     cap_mcp::register_mcp_client(&registry, client, gate, Arc::new(NoEvents));
     registry
@@ -615,4 +673,72 @@ async fn mgr_05_mcp_client_host_functions_decide_by_the_grants() {
         ]
     );
     assert!(slack.sent().is_empty());
+}
+
+// Under the real grant check writing every decision (`AuthzLevel::All`) and the real readers, a
+// tool listing that hides `web.search` from an agent without the `web` grant, or shows it to one
+// holding it, writes no `authz.checked` event: the web family is listed through the silent web
+// grant reader. A call of `web.search` is decided by the check, which writes the `web` decision.
+#[tokio::test]
+async fn mgr_06_web_family_listings_read_the_web_grant_without_an_event() {
+    use std::sync::Arc;
+    let (store, bus, _h) = make_store();
+    store
+        .insert(mcp_grant("g-mcp", "alice", &[("servers", "search")]))
+        .unwrap();
+    let search = ScriptedServer::new("search", &["web.search", "lookup"]);
+    let check: Arc<dyn GrantCheck> = Arc::new(GrantCheckImpl::with_authz_level(
+        Arc::clone(&store),
+        AuthzLevel::All,
+    ));
+    let gate = cap_mcp::McpGate::new(
+        Arc::clone(&check),
+        Arc::new(McpGrantReaderImpl::new(Arc::clone(&store))),
+        Some(cap_mcp::McpWebGrant::new(
+            Arc::clone(&check),
+            Arc::new(WebGrantReaderImpl::new(Arc::clone(&store))),
+        )),
+    );
+    let registry = mcp_host_functions_behind(gate, &[&search]);
+    let call = |name: &'static str, params: &'static [&'static str], field: &'static str| {
+        call_mcp(&registry, "alice", name, params, field)
+    };
+
+    assert_eq!(
+        call("list-mcp-tools", &["search"], "name").await,
+        Ok(vec!["lookup".to_string()])
+    );
+    assert_eq!(
+        bus.count_of("authz.checked"),
+        0,
+        "the listing hid web.search without an event"
+    );
+    assert_eq!(
+        call("invoke-mcp-tool", &["search", "web.search"], "").await,
+        Err("permission-denied".to_string())
+    );
+    let web: Vec<_> = bus
+        .all_of("authz.checked")
+        .into_iter()
+        .filter(|e| e.payload["capability"] == "web")
+        .collect();
+    assert_eq!(web.len(), 1, "the refused call wrote the web decision");
+    assert_eq!(web[0].payload["decision"], "denied");
+
+    store.insert(web_grant("g-web", "alice")).unwrap();
+    let written = bus.count_of("authz.checked");
+    assert_eq!(
+        call("list-mcp-tools", &["search"], "name").await,
+        Ok(vec!["web.search".to_string(), "lookup".to_string()])
+    );
+    assert_eq!(
+        bus.count_of("authz.checked"),
+        written,
+        "the listing showed web.search without an event"
+    );
+    assert_eq!(
+        call("invoke-mcp-tool", &["search", "web.search"], "").await,
+        Ok(vec![])
+    );
+    assert_eq!(search.sent(), ["tools/list", "tools/list", "tools/call"]);
 }

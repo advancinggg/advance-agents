@@ -541,9 +541,12 @@ impl McpClient {
     ///
     /// The entries hold what each server lists, narrowed only by the server's
     /// own tool patterns and the listing limits. They are not filtered by any
-    /// agent's `mcp` grant, nor by the `web` rule that hides the web family
-    /// tools (`web.search`, `web.extract`) from an agent without the `web`
-    /// grant: filter them before showing them to an agent.
+    /// agent's `mcp` grant, nor by the rules for the web family tools
+    /// (`web.search`, `web.extract`), which are hidden from an agent without
+    /// the `web` grant and, on a server that
+    /// [refuses them](Self::refuses_web_tools), from every agent. Filter them
+    /// before showing them to an agent, as
+    /// [`McpGate::visible_tools`](crate::McpGate::visible_tools) does.
     pub fn cached_tools(&self) -> Vec<Arc<CachedToolListing>> {
         lock(&self.tool_cache).listings()
     }

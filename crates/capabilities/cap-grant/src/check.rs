@@ -33,12 +33,15 @@
 //! [`McpGrantReaderImpl`] is the listing counterpart for `mcp`: it returns the
 //! scopes of the held grants without deciding or emitting anything, so a
 //! filtered listing never writes one deny event per hidden entry.
+//! [`WebGrantReaderImpl`] is the same for `web`: whether a listing may offer
+//! the web family tools, read without an event.
 
 use std::sync::Arc;
 
 use advance_shared_types::capability::{CapParams, GrantDecision};
 use advance_shared_types::mcp::McpGrantScope;
-use advance_shared_types::traits::{GrantCheck, McpGrantReader, ToolsGrantReader};
+use advance_shared_types::traits::{GrantCheck, McpGrantReader, ToolsGrantReader, WebGrantReader};
+use advance_shared_types::web_search::WEB_GRANT_CAPABILITY;
 
 use crate::data::{Grant, GrantId, GrantStatus};
 use crate::events::authz_checked_event;
@@ -556,5 +559,38 @@ impl McpGrantReader for McpGrantReaderImpl {
             .iter()
             .filter_map(|g| crate::subset::mcp_scope(&g.params))
             .collect()
+    }
+}
+
+/// [`WebGrantReader`] provider: whether an agent holds an active, unexpired `web` grant.
+///
+/// The answer [`GrantCheckImpl`] gives a whole-capability `web` request (`CapParams::empty()`, as
+/// the web family tools ask it), read for a listing. Read-only LIST projection, NOT an
+/// authorization gate: it decides nothing and emits no `authz.checked` event.
+pub struct WebGrantReaderImpl {
+    store: Arc<GrantStore>,
+}
+
+impl WebGrantReaderImpl {
+    pub fn new(store: Arc<GrantStore>) -> Self {
+        Self { store }
+    }
+}
+
+// Manual `Debug` for the same reason as `ToolsGrantReaderImpl`: `GrantStore` is not `Debug`.
+impl std::fmt::Debug for WebGrantReaderImpl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebGrantReaderImpl").finish_non_exhaustive()
+    }
+}
+
+impl WebGrantReader for WebGrantReaderImpl {
+    fn web_grant_held(&self, agent_id: &str) -> bool {
+        let now = chrono::Utc::now();
+        reader_grants(&self.store, agent_id).iter().any(|g| {
+            g.status == GrantStatus::Active
+                && g.capability == WEB_GRANT_CAPABILITY
+                && g.expires_at.map_or(true, |t| t > now)
+        })
     }
 }

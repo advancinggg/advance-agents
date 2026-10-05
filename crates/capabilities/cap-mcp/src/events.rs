@@ -8,10 +8,14 @@
 //! |---|---|---|
 //! | `mcp.server_started` | the client connected a server (after `initialize`) | `server_id`, `transport` |
 //! | `mcp.server_died` | the client found a server's live connection closed | `server_id`, `exit_code` (always `null`: no exit status is collected) |
-//! | `mcp.tool_invoked` | `invoke-mcp-tool` returned a result | `server_id`, `tool_name`, `agent_id`, `duration_ms` |
-//! | `mcp.tool_error` | `invoke-mcp-tool` failed, refusals included | `server_id`, `tool_name`, `error_type` |
+//! | `mcp.tool_invoked` | `invoke-mcp-tool` returned a result that reports no tool failure | `server_id`, `tool_name`, `agent_id`, `duration_ms` |
+//! | `mcp.tool_error` | `invoke-mcp-tool` failed, refusals included, or returned a result marked `isError: true` | `server_id`, `tool_name`, `error_type` |
 //! | `mcp.prompt_fetched` | `get-mcp-prompt` returned a prompt | `server_id`, `prompt_name` |
 //! | `mcp.resource_read` | `read-mcp-resource` returned a resource | `server_id`, `uri`, `size_bytes` |
+//!
+//! `error_type` is the `mcp-error` arm a failed call returned
+//! (`permission-denied` for a refusal), or [`TOOL_FAILED`] for a result in
+//! which the tool reported its own failure (the guest receives that result).
 //!
 //! An event never carries params, prompt arguments, results or server-sent
 //! text. Server ids, tool and prompt names are cut to
@@ -42,6 +46,10 @@ pub(crate) const TOOL_ERROR: &str = "mcp.tool_error";
 pub(crate) const PROMPT_FETCHED: &str = "mcp.prompt_fetched";
 /// `mcp.resource_read`.
 pub(crate) const RESOURCE_READ: &str = "mcp.resource_read";
+
+/// `error_type` of an `mcp.tool_error` for a result marked `isError: true`: the
+/// call went through and the tool reported that it failed.
+pub(crate) const TOOL_FAILED: &str = "tool-error";
 
 /// Longest server id, tool or prompt name an event carries, in bytes.
 pub(crate) const MAX_EVENT_NAME_BYTES: usize = 256;
@@ -89,7 +97,8 @@ pub(crate) fn tool_invoked(
 }
 
 /// `mcp.tool_error`: the call of `tool` on `server_id` failed with the
-/// `mcp-error` arm `error_type` (`permission-denied` for a refusal).
+/// `mcp-error` arm `error_type` (`permission-denied` for a refusal), or its
+/// result reported a tool failure ([`TOOL_FAILED`]).
 pub(crate) fn tool_error(
     ctx: &HostCallContext,
     server_id: &str,

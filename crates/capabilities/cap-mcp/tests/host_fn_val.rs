@@ -11,13 +11,15 @@ use advance_shared_types::security_validator::{
 };
 use cap_mcp::{
     register_mcp_client, McpClient, McpError, McpErrorKind, McpGate, McpServerEntry,
-    McpServersConfig, McpTransport, McpTransportSpec, SchemaValidator, MCP_CAPABILITY,
+    McpServersConfig, McpTransport, McpTransportSpec, McpWebGrant, SchemaValidator, MCP_CAPABILITY,
 };
 use serde_json::json;
 use wasmtime::component::Val;
 
 mod support;
-use support::gate::{ctx, open_gate, scope, spec, CapturingBus, FixedScopes, RecordingCheck};
+use support::gate::{
+    ctx, open_gate, scope, spec, CapturingBus, FixedScopes, FixedWebReader, RecordingCheck,
+};
 use support::mock_transport::CountingMockTransport;
 
 struct NoOpDetector;
@@ -482,9 +484,11 @@ async fn listings_follow_the_grant_scopes_without_asking_the_grant_check() {
     assert!(bus.events().is_empty());
 }
 
-// The web family tools need the caller's web grant; a stdio server's are hidden
-// and refused whatever the grants say, without asking the web checker. Without
-// a web checker they are withheld on every server.
+// The web family tools need the caller's web grant: a call asks the web
+// grant's check, a listing its silent reader, so a listing writes no
+// `authz.checked` event. A stdio server's are hidden and refused whatever the
+// grants say, without asking either. Without a web grant they are withheld on
+// every server.
 #[tokio::test]
 async fn web_family_tools_need_the_web_grant_and_an_http_server() {
     let listing = || tools(&["web.search", "web.extract", "decoy"]);
@@ -494,13 +498,14 @@ async fn web_family_tools_need_the_web_grant_and_an_http_server() {
     remote.push_ok(listing());
     remote.push_ok(json!({"hits": []}));
     let web = RecordingCheck::allowing_all();
+    let web_reader = FixedWebReader::new(true);
     let bus = CapturingBus::new();
     let registry = registered(
         client_with(&[("local", true, &local), ("remote", false, &remote)]),
         McpGate::new(
             RecordingCheck::allowing_all(),
             FixedScopes::unrestricted(),
-            Some(web.clone()),
+            Some(McpWebGrant::new(web.clone(), web_reader.clone())),
         ),
         &bus,
     );
@@ -524,9 +529,12 @@ async fn web_family_tools_need_the_web_grant_and_an_http_server() {
         web.asked().is_empty(),
         "a stdio server's web tools ask no web check"
     );
+    assert_eq!(web_reader.reads(), 0, "nor read the web grant");
 
     let out = call(&registry, "agent-x", "list-mcp-tools", vec![s("remote")]).await;
     assert_eq!(listed(&out, "name"), ["web.search", "web.extract", "decoy"]);
+    assert_eq!(web_reader.reads(), 1, "the listing read the web grant once");
+    assert!(web.asked().is_empty(), "the listing asked no web check");
     let out = call(
         &registry,
         "agent-x",
@@ -542,11 +550,43 @@ async fn web_family_tools_need_the_web_grant_and_an_http_server() {
         .collect();
     assert_eq!(
         web_asked,
-        [
-            ("web".to_string(), "list-mcp-tools".to_string()),
-            ("web".to_string(), "invoke-mcp-tool".to_string()),
-        ]
+        [("web".to_string(), "invoke-mcp-tool".to_string())]
     );
+    assert_eq!(web_reader.reads(), 1, "a call reads no listing answer");
+
+    // A web grant the agent does not hold: the listing hides the web family
+    // tools without asking the check; a call is refused by the check.
+    let remote = Arc::new(CountingMockTransport::new("remote"));
+    remote.push_ok(listing());
+    let refusing = RecordingCheck::new(|_| false);
+    let registry = registered(
+        client_with(&[("remote", false, &remote)]),
+        McpGate::new(
+            RecordingCheck::allowing_all(),
+            FixedScopes::unrestricted(),
+            Some(McpWebGrant::new(
+                refusing.clone(),
+                FixedWebReader::new(false),
+            )),
+        ),
+        &bus,
+    );
+    let out = call(&registry, "agent-x", "list-mcp-tools", vec![s("remote")]).await;
+    assert_eq!(listed(&out, "name"), ["decoy"]);
+    assert!(
+        refusing.asked().is_empty(),
+        "the listing asked no web check"
+    );
+    let out = call(
+        &registry,
+        "agent-x",
+        "invoke-mcp-tool",
+        invoke_params("remote", "web.search"),
+    )
+    .await;
+    assert_eq!(err_class(&out).as_deref(), Some("permission-denied"));
+    assert_eq!(refusing.asked().len(), 1);
+    assert_eq!(remote.call_count(), 1, "the refused call sent nothing");
 
     let remote = Arc::new(CountingMockTransport::new("remote"));
     remote.push_ok(listing());
@@ -566,4 +606,65 @@ async fn web_family_tools_need_the_web_grant_and_an_http_server() {
     .await;
     assert_eq!(err_class(&out).as_deref(), Some("permission-denied"));
     assert_eq!(remote.call_count(), 1, "the withheld call sent nothing");
+}
+
+// A tool that fails while running answers with a result marked `isError`: the
+// guest receives that result, and the call emits `mcp.tool_error` with the
+// error type `tool-error` and none of the server's text, not
+// `mcp.tool_invoked`. A result marked `isError: false` is a success.
+#[tokio::test]
+async fn a_result_marked_is_error_is_a_tool_error() {
+    let mock = Arc::new(CountingMockTransport::new("srv"));
+    let failed = json!({
+        "content": [{"type": "text", "text": "quota exceeded for account 42"}],
+        "isError": true,
+    });
+    mock.push_ok(failed.clone());
+    mock.push_ok(json!({"content": [{"type": "text", "text": "done"}], "isError": false}));
+    let bus = CapturingBus::new();
+    let registry = registered(client_with(&[("srv", false, &mock)]), open_gate(), &bus);
+
+    let out = call(
+        &registry,
+        "agent-x",
+        "invoke-mcp-tool",
+        invoke_params("srv", "charge"),
+    )
+    .await;
+    let Val::Result(Ok(Some(inner))) = &out else {
+        panic!("expected the result bytes, got {out:?}");
+    };
+    let Val::List(items) = inner.as_ref() else {
+        panic!("expected list<u8>, got {inner:?}");
+    };
+    let received: Vec<u8> = items
+        .iter()
+        .map(|v| match v {
+            Val::U8(b) => *b,
+            other => panic!("expected u8, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&received).unwrap(),
+        failed,
+        "the guest receives the failed result"
+    );
+    let out = call(
+        &registry,
+        "agent-x",
+        "invoke-mcp-tool",
+        invoke_params("srv", "charge"),
+    )
+    .await;
+    assert_eq!(err_class(&out), None, "{out:?}");
+
+    assert_eq!(bus.types(), ["mcp.tool_error", "mcp.tool_invoked"]);
+    let events = bus.events();
+    assert_eq!(
+        events[0].payload,
+        json!({"server_id": "srv", "tool_name": "charge", "error_type": "tool-error"})
+    );
+    assert_eq!(events[0].agent_id, "agent-x");
+    assert_eq!(events[0].trace_id, "trace-invoke-mcp-tool");
+    assert!(!events[0].payload.to_string().contains("quota"));
 }

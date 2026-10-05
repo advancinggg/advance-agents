@@ -222,9 +222,9 @@ impl McpServersConfig {
     /// Lookup a server by id. Returns `McpError::not_found(...)` for unknown
     /// ids (AC-23 layer 1).
     pub fn get(&self, server_id: &str) -> Result<&McpServerEntry, McpError> {
-        self.servers.get(server_id).ok_or_else(|| {
-            McpError::not_found(format!("server '{server_id}' not in mcp.servers whitelist"))
-        })
+        self.servers
+            .get(server_id)
+            .ok_or_else(|| McpError::not_found(format!("server '{server_id}' is not configured")))
     }
 
     /// Iterate over the registered servers in stable (sorted-by-id) order.
@@ -405,7 +405,7 @@ mod tests {
             .unwrap()
             .build();
         let err = cfg.get("gamma").expect_err("miss");
-        assert!(err.message.contains("not in mcp.servers whitelist"));
+        assert_eq!(err.message, "server 'gamma' is not configured");
     }
 
     #[test]

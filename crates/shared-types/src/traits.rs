@@ -9,13 +9,13 @@
 //! [`RoundAdvancer`] / [`AwaitSessionRef`] / [`PromptInjectionHelpers`]),
 //! the Slice m012-B addition [`LeakDetector`], the Slice m012-C additions
 //! [`HttpSecurityChain`] / [`SsrfGuard`] / [`RedirectCheck`], [`CostTrackerQuery`],
-//! the Wave-15 Lane E addition [`ToolsGrantReader`] (CONTRACT-183) and its MCP
-//! counterpart [`McpGrantReader`], and the Wave-23 addition [`RememberContentPolicy`]
-//! (CONTRACT-214).
+//! the Wave-15 Lane E addition [`ToolsGrantReader`] (CONTRACT-183) and its MCP and
+//! web counterparts [`McpGrantReader`] and [`WebGrantReader`], and the Wave-23
+//! addition [`RememberContentPolicy`] (CONTRACT-214).
 //! Object-safety + `Send + Sync` are regression-locked by
-//! `tests/object_safety.rs` — all 25 traits (5 prior + 12 Slice AC v2 +
+//! `tests/object_safety.rs` — all 26 traits (5 prior + 12 Slice AC v2 +
 //! 1 Slice m012-B + 3 Slice m012-C + CostTrackerQuery + ToolsGrantReader +
-//! McpGrantReader + RememberContentPolicy) `Box<dyn>`-constructible.
+//! McpGrantReader + WebGrantReader + RememberContentPolicy) `Box<dyn>`-constructible.
 
 use crate::capability::{BudgetDecision, CapParams, GrantDecision, McpToolEntry, ToolEntry};
 use crate::cost::{AttributedCost, CostLedgerError, CostWindow, RunCost};
@@ -294,6 +294,22 @@ pub trait ToolsGrantReader: Send + Sync + std::fmt::Debug {
 /// [`GrantCheck`].
 pub trait McpGrantReader: Send + Sync + std::fmt::Debug {
     fn mcp_grant_scopes(&self, agent_id: &str) -> Vec<McpGrantScope>;
+}
+
+/// Whether an agent's grants let it use the web family tools (`web.search`, `web.extract`), for
+/// filtering a listing that offers them.
+///
+/// Provided by MODULE-013 (`cap_grant::WebGrantReaderImpl` over `GrantStore`);
+/// dependency-inverted like [`McpGrantReader`] so a consumer never imports cap-grant.
+///
+/// `web_grant_held(agent_id)` is true when the agent holds an active, unexpired `web` grant: the
+/// answer the call-time [`GrantCheck`] gives a whole-capability `web` request.
+///
+/// Read-only and silent: it authorizes nothing and emits no `authz.checked` event, so a listing
+/// that hides the web family tools writes no deny event. Calls stay checked through
+/// [`GrantCheck`].
+pub trait WebGrantReader: Send + Sync + std::fmt::Debug {
+    fn web_grant_held(&self, agent_id: &str) -> bool;
 }
 
 // ─────────────────────────────────────────────────────────────────────────

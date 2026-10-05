@@ -13,9 +13,11 @@
 //! - `list-mcp-servers` lists the servers a grant reaches; `list-mcp-tools`
 //!   needs a grant reaching the server and lists the tools a grant covers;
 //!   `list-mcp-prompts` and `list-mcp-resources` need what `get-mcp-prompt`
-//!   needs. These read the grants' scopes and write no `authz.checked` event.
+//!   needs. These read the grants through silent readers and write no
+//!   `authz.checked` event.
 //! - The web family tools (`web.search`, `web.extract`) also need the `web`
-//!   grant, and are hidden and refused on a stdio server.
+//!   grant: `invoke-mcp-tool` asks its check, `list-mcp-tools` its silent
+//!   reader. They are hidden and refused on a stdio server.
 //!
 //! ## Caller
 //!
@@ -27,10 +29,12 @@
 //! ## Events
 //!
 //! `invoke-mcp-tool` emits `mcp.tool_invoked` when it returns a result and
-//! `mcp.tool_error` when it fails, refusals included. `get-mcp-prompt` emits
-//! `mcp.prompt_fetched`, and `read-mcp-resource` `mcp.resource_read` (with the
-//! URI reduced to its scheme and host), when they return one. The listings
-//! emit no `mcp.*` event.
+//! `mcp.tool_error` when it fails, refusals included. A tool that fails while
+//! running answers with a result marked `isError: true`: the guest receives
+//! that result, and the event is `mcp.tool_error` with the `error_type`
+//! `tool-error`. `get-mcp-prompt` emits `mcp.prompt_fetched`, and
+//! `read-mcp-resource` `mcp.resource_read` (with the URI reduced to its scheme
+//! and host), when they return one. The listings emit no `mcp.*` event.
 //!
 //! ## Idempotent flag
 //!
@@ -443,9 +447,7 @@ impl HostFunctionHandler for ListMcpToolsHandler {
             let r = client
                 .list_tools(Some(agent_id), &server_id)
                 .await
-                .map(|tools| {
-                    gate.visible_tools(agent_id, "list-mcp-tools", &scopes, refuses_web, tools)
-                });
+                .map(|tools| gate.visible_tools(agent_id, &scopes, refuses_web, tools));
             Ok(vec![encode_result_tool_list(r)])
         })
     }
@@ -651,6 +653,12 @@ impl HostFunctionHandler for InvokeMcpToolHandler {
                 Err(denied) => Err(denied),
             };
             match &r {
+                Ok(result) if reports_tool_failure(result) => emitter.emit(events::tool_error(
+                    &ctx,
+                    &server_id,
+                    &tool_name,
+                    events::TOOL_FAILED,
+                )),
                 Ok(_) => emitter.emit(events::tool_invoked(
                     &ctx,
                     &server_id,
@@ -691,6 +699,23 @@ fn authorize_tool_call(
     Ok(())
 }
 
+/// Whether a `tools/call` result reports that the tool failed: MCP answers a
+/// tool that fails while running with a result whose top-level `isError` is
+/// `true`, not with a JSON-RPC error. Any other result, malformed ones
+/// included, reports no failure.
+fn reports_tool_failure(result: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct ToolCallResult {
+        #[serde(rename = "isError", default)]
+        is_error: Option<bool>,
+    }
+    // Only an object: a struct would also accept a JSON array.
+    let is_object = result.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{');
+    is_object
+        && serde_json::from_slice::<ToolCallResult>(result)
+            .is_ok_and(|parsed| parsed.is_error == Some(true))
+}
+
 /// Milliseconds since `started`.
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -702,17 +727,51 @@ mod tests {
 
     #[test]
     fn encode_mcp_error_round_trip() {
-        let err = McpError::not_found("server x not in whitelist");
+        let err = McpError::not_found("server 'x' is not configured");
         let v = encode_mcp_error(&err);
         match v {
             Val::Variant(case, Some(payload)) => {
                 assert_eq!(case, "not-found");
                 match *payload {
-                    Val::String(s) => assert!(s.contains("not in whitelist")),
+                    Val::String(s) => assert!(s.contains("is not configured")),
                     _ => panic!("expected string payload"),
                 }
             }
             _ => panic!("expected variant"),
+        }
+    }
+
+    #[test]
+    fn only_a_top_level_is_error_true_reports_a_tool_failure() {
+        let failed: &[&[u8]] = &[
+            br#"{"content":[{"type":"text","text":"rate limited"}],"isError":true}"#,
+            br#"  {"isError": true}"#,
+        ];
+        for result in failed {
+            assert!(
+                reports_tool_failure(result),
+                "{}",
+                String::from_utf8_lossy(result)
+            );
+        }
+        let succeeded: &[&[u8]] = &[
+            br#"{"content":[]}"#,
+            br#"{"content":[],"isError":false}"#,
+            br#"{"isError":"true"}"#,
+            br#"{"isError":1}"#,
+            br#"{"isError":null}"#,
+            br#"{"content":[{"type":"text","text":"{\"isError\":true}"}],"meta":{"isError":true}}"#,
+            br#"[true]"#,
+            br#"true"#,
+            b"",
+            b"not json",
+        ];
+        for result in succeeded {
+            assert!(
+                !reports_tool_failure(result),
+                "{}",
+                String::from_utf8_lossy(result)
+            );
         }
     }
 

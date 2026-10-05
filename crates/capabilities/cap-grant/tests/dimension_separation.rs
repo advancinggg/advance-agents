@@ -34,8 +34,8 @@ fn ac21_capability_dimension_separation_one_allow_three_deny() {
     let (store, bus, _h) = make_store();
 
     // Issue a `tools` grant ONLY (no mcp / lifecycle / fs grants).
-    // Params encode the allowed tool name; the L1 gate authorizes by
-    // capability+grantee membership only — param-level subset is L1-V2.
+    // Params encode the allowed tool name; the checks below pass no params, so
+    // the L1 gate decides by capability and grantee alone.
     let grant = Grant {
         id: GrantId::new("g-tools"),
         grantee: AGENT.to_string(),

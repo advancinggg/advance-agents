@@ -1,6 +1,7 @@
 //! Doubles for the mcp-client gate and its events: a grant check that records
-//! each request and answers by a rule, a grant reader with fixed scopes, an
-//! event bus that keeps every event, and a host call context.
+//! each request and answers by a rule, grant readers with fixed answers (the
+//! `mcp` scopes, the `web` grant), an event bus that keeps every event, and a
+//! host call context.
 
 use std::sync::{Arc, Mutex};
 
@@ -8,7 +9,7 @@ use advance_runtime::host_registry::{HostCallContext, HostFunctionSpec, HostRegi
 use advance_shared_types::capability::{CapParams, GrantDecision};
 use advance_shared_types::event::Event;
 use advance_shared_types::mcp::McpGrantScope;
-use advance_shared_types::traits::{EventBusEmit, GrantCheck, McpGrantReader};
+use advance_shared_types::traits::{EventBusEmit, GrantCheck, McpGrantReader, WebGrantReader};
 use cap_mcp::McpGate;
 
 /// One request a [`RecordingCheck`] was asked: agent, capability, function,
@@ -91,6 +92,33 @@ impl McpGrantReader for FixedScopes {
     fn mcp_grant_scopes(&self, _agent_id: &str) -> Vec<McpGrantScope> {
         *self.reads.lock().unwrap() += 1;
         self.scopes.clone()
+    }
+}
+
+/// A web grant reader answering every agent with `held`, counting reads.
+#[derive(Debug)]
+pub struct FixedWebReader {
+    held: bool,
+    reads: Mutex<usize>,
+}
+
+impl FixedWebReader {
+    pub fn new(held: bool) -> Arc<Self> {
+        Arc::new(Self {
+            held,
+            reads: Mutex::new(0),
+        })
+    }
+
+    pub fn reads(&self) -> usize {
+        *self.reads.lock().unwrap()
+    }
+}
+
+impl WebGrantReader for FixedWebReader {
+    fn web_grant_held(&self, _agent_id: &str) -> bool {
+        *self.reads.lock().unwrap() += 1;
+        self.held
     }
 }
 

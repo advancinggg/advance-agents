@@ -89,10 +89,10 @@ async fn sd_12_unknown_server_blocked() {
     let err = client
         .invoke_tool(None, "gamma", "x", b"{}")
         .await
-        .expect_err("not in whitelist");
+        .expect_err("not configured");
     assert_eq!(err.kind, McpErrorKind::NotFound);
     assert!(err.message.contains("'gamma'"));
-    assert!(err.message.contains("whitelist"));
+    assert!(err.message.contains("is not configured"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────

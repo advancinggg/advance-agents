@@ -21,9 +21,9 @@
 //! - `register_mcp_client` — registers the 7 `mcp-client` WIT host functions under
 //!   the one capability `mcp`. Each call is decided against the caller's `mcp`
 //!   grants by an `McpGate` (AC-23 layer 3): calls through the grant check,
-//!   listings through the silent grant reader; the web family tools also need
-//!   the `web` grant and are refused from stdio servers. The handlers emit the
-//!   `mcp.*` call events.
+//!   listings through the silent grant readers, which write no `authz.checked`
+//!   event; the web family tools also need the `web` grant (`McpWebGrant`) and
+//!   are refused from stdio servers. The handlers emit the `mcp.*` call events.
 
 pub use client::{
     McpClient, McpClientLimits, McpToolInfo, McpTransport, MCP_PROTOCOL_VERSION,
@@ -31,7 +31,7 @@ pub use client::{
 };
 // Slice J (V1-b) — MCP half of the CONTRACT-165 inventory feed.
 pub use error::{McpError, McpErrorKind};
-pub use gate::{McpGate, McpScopes, MCP_CAPABILITY};
+pub use gate::{McpGate, McpScopes, McpWebGrant, MCP_CAPABILITY};
 pub use host_fn::register_mcp_client;
 pub use http_transport::{HttpMcpTransport, HttpOptions, MAX_SESSION_ID_BYTES};
 pub use inventory::{mcp_tool_entries, mcp_tool_entries_from_infos};

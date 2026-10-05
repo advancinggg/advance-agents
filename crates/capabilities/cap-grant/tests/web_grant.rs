@@ -5,6 +5,9 @@
 //! keeps withheld lists as `Ok(List)` so empty-on-Err cannot pass. The agent
 //! holds an `mcp` grant reaching the MCP server, so the mcp-client host
 //! functions' own gate passes and the `web` decision is the one under test.
+//! The MCP tool listing reads the `web` grant silently, so it writes no
+//! `authz.checked` event; offline, the mcp-client host functions are given no
+//! web grant.
 
 mod common;
 
@@ -31,11 +34,11 @@ use cap_grant::data::{
 };
 use cap_grant::{
     validate_capability_subset, AuthzLevel, GrantCheckImpl, GrantStore, McpGrantReaderImpl,
-    StaticConfigCompiler, SubsetValidator, SubsetValidatorImpl,
+    StaticConfigCompiler, SubsetValidator, SubsetValidatorImpl, WebGrantReaderImpl,
 };
 use cap_mcp::{
     register_mcp_client, McpClient, McpGate, McpServerEntry, McpServersConfig, McpTransportSpec,
-    ToolPattern,
+    McpWebGrant, ToolPattern,
 };
 use cap_tools::host_fn::{WebAwareInvokeHandler, WebAwareListHandler};
 use cap_tools::lazy_registry::{LazyRegistryConfig, LazyToolRegistry};
@@ -412,8 +415,8 @@ fn grant_mcp(store: &GrantStore) {
 }
 
 /// Register the mcp-client host functions behind a gate that decides calls with
-/// `check` and listings with `store`'s `mcp` grants; `web` decides the web
-/// family tools (`None`: withheld).
+/// `check` and listings with `store`'s `mcp` grants. `web` decides calls of the
+/// web family tools, and `store`'s `web` grants their listing (`None`: withheld).
 fn register_mcp(
     registry: &InMemoryHostRegistry,
     client: Arc<McpClient>,
@@ -421,12 +424,24 @@ fn register_mcp(
     check: Arc<dyn GrantCheck>,
     web: Option<Arc<dyn GrantCheck>>,
 ) {
+    let web =
+        web.map(|web| McpWebGrant::new(web, Arc::new(WebGrantReaderImpl::new(Arc::clone(store)))));
     let gate = McpGate::new(
         check,
         Arc::new(McpGrantReaderImpl::new(Arc::clone(store))),
         web,
     );
     register_mcp_client(registry, client, gate, Arc::new(NoopBus));
+}
+
+/// Whether an `authz.checked` event names the mcp-client tool listing.
+fn authz_for_mcp_listing(bus: &common::RecordingBus) -> bool {
+    bus.all_of("authz.checked").iter().any(|e| {
+        e.payload
+            .get("function")
+            .and_then(|v| v.as_str())
+            .is_some_and(|f| f.ends_with("list-mcp-tools"))
+    })
 }
 
 fn authz_web(bus: &common::RecordingBus, decision: &str, function: &str) -> bool {
@@ -562,6 +577,10 @@ async fn t48_grant_revoke_both_realizations() {
     assert!(calls.contains(&WEB_SEARCH_TOOL_ID.to_string()));
     assert!(calls.contains(&WEB_EXTRACT_TOOL_ID.to_string()));
     assert!(authz_web(&bus, "allowed", "invoke-mcp-tool"));
+    assert!(
+        !authz_for_mcp_listing(&bus),
+        "the MCP listing read the web grant without an event"
+    );
     // The listing and the calls went out as the calling agent; the session
     // handshake as the server.
     assert_eq!(mock.agents_for("initialize"), [MCP_SERVER]);
@@ -619,6 +638,10 @@ async fn t48_grant_revoke_both_realizations() {
         assert_permission_denied(&out[0]);
     }
     assert!(authz_web(&bus, "denied", "invoke-mcp-tool"));
+    assert!(
+        !authz_for_mcp_listing(&bus),
+        "the MCP listing hid the web family without an event"
+    );
     assert_eq!(mock.tools_call_names().len(), calls_after_allow);
 }
 
@@ -684,6 +707,7 @@ async fn t48_e_ungranted_both_realizations() {
     }
     assert!(authz_web(&bus, "denied", "tool-invoke"));
     assert!(authz_web(&bus, "denied", "invoke-mcp-tool"));
+    assert!(!authz_for_mcp_listing(&bus));
     assert!(mock.tools_call_names().is_empty());
 }
 
@@ -724,10 +748,13 @@ async fn t48_f_offline_withholds_injection() {
         assert_permission_denied(&out[0]);
     }
 
+    // Offline, the mcp-client host functions are given no web grant: a web
+    // grant reader does not know the mode, and the listing must not offer what
+    // every call refuses.
     let mock = WebHttpMock::new();
     let client = mcp_client(mock.clone());
     let registry = InMemoryHostRegistry::new();
-    register_mcp(&registry, client, &store, inner, Some(off));
+    register_mcp(&registry, client, &store, inner, None);
     let list_h = mcp_spec(&registry, "list-mcp-tools");
     let inv_h = mcp_spec(&registry, "invoke-mcp-tool");
     let mcp_listed = list_h
@@ -847,7 +874,7 @@ fn t48_i_subset_whitelist_and_web_arm() {
     assert!(!msg.contains("unknown capability"));
 }
 
-// A gate without a web checker withholds the web family tools, even from an
+// A gate given no web grant withholds the web family tools, even from an
 // agent whose `mcp` grant covers them.
 #[tokio::test]
 async fn t48_j_gate_without_web_checker_fail_closed() {
