@@ -10,8 +10,8 @@
 //! The re-export set below is exactly the **supported embedding surface** enumerated in
 //! `docs/OPEN-CORE-BOUNDARY.md` §5 "OSS public API surface". OSS-internal
 //! harness crates (`advance-cli`, `build-agent`, `system-acceptance`,
-//! `observability-xtask`) are deliberately NOT re-exported — the CLI is a *reference*
-//! composition root, and per §7.4 its stray trait defs are to be hoisted into lib
+//! `observability-xtask`) are deliberately NOT re-exported — the CLI is a thin `main`
+//! over [`runtime_compose`], and per §7.4 its stray trait defs are to be hoisted into lib
 //! crates, not consumed through the façade.
 //!
 //! ## Granularity (first-slice decision per OPEN-CORE-BOUNDARY §9)
@@ -24,10 +24,10 @@
 //!
 //! ## Composition pattern
 //!
-//! The product/embedder is *another composition root* (OPEN-CORE-BOUNDARY §1): construct
-//! concrete impls, pass them as `Arc<dyn Trait>` through the seams in
-//! [`shared_types`], and wire capabilities the way `advance-cli`'s `wiring.rs` does —
-//! never fork a crate, only inject.
+//! The product/embedder does not assemble a second composition root: it composes the OSS
+//! runtime through [`runtime_compose::compose`], passing its own extensions
+//! ([`runtime_compose::ComposeExtension`]), and injects concrete impls only through the
+//! seams in [`shared_types`] — never forking a crate.
 
 // ── seam layer (dependency-inversion home; ships OSS wholesale per IRON LAW §2) ──
 pub use advance_shared_types as shared_types;
@@ -38,6 +38,9 @@ pub use advance_runtime as runtime;
 
 // ── CONTRACT-210 embed/supervise bridge (Wave-27 C210) ─────────────────────
 pub use advance_embedded_runtime_bridge as embedded_runtime_bridge;
+
+// ── CONTRACT-244 runtime composition (the API only) ──────────────────────────
+pub use advance_runtime_compose::api as runtime_compose;
 
 // ── capability crates (11) ────────────────────────────────────────────────────────
 pub use cap_channel;

@@ -165,6 +165,7 @@ dependencies = [
  "advance-reply-tracker",
  "advance-run-manager",
  "advance-runtime",
+ "advance-runtime-compose",
  "advance-scheduler",
  "advance-scheduler-auto-loop",
  "advance-shared-types",

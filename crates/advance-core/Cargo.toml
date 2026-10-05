@@ -21,6 +21,8 @@ advance-shared-types = { path = "../shared-types", version = "0.1.28" }
 advance-runtime = { path = "../runtime", version = "0.1.28" }
 advance-home = { path = "../advance-home", version = "0.1.28" }
 advance-embedded-runtime-bridge = { path = "../embedded-runtime-bridge", version = "0.1.28" }
+# The runtime composition (`runtime_compose`): its CONTRACT-244 API only.
+advance-runtime-compose = { path = "../runtime-compose", version = "0.1.28" }
 # ── capability crates (11) ─────────────────────────────────────────────────
 cap-channel = { path = "../capabilities/cap-channel", version = "0.1.28" }
 cap-fs = { path = "../capabilities/cap-fs", version = "0.1.28" }
