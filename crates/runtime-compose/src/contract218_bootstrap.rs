@@ -53,6 +53,17 @@ pub async fn bootstrap_contract218(
     workspace: &Path,
     registry: Arc<ComponentRegistry>,
 ) -> Result<Contract218Runtime, String> {
+    bootstrap_contract218_at(workspace, registry, None).await
+}
+
+/// [`bootstrap_contract218`] with the platform directory under a composition's state
+/// root (`<state_root>/contract218/<sha256(workspace)>`) instead of the process `HOME` /
+/// `XDG_STATE_HOME` location.
+pub(crate) async fn bootstrap_contract218_at(
+    workspace: &Path,
+    registry: Arc<ComponentRegistry>,
+    state_root: Option<&Path>,
+) -> Result<Contract218Runtime, String> {
     let canonical_workspace = fs::canonicalize(workspace)
         .map_err(|error| format!("canonicalize CONTRACT-218 workspace: {error}"))?;
     // The anchor's workspace-identity input must be byte-identical to the
@@ -68,7 +79,7 @@ pub async fn bootstrap_contract218(
     if !registry_trust_root.starts_with(&canonical_workspace) {
         return Err("CONTRACT-218 registry trust root escapes the workspace".to_owned());
     }
-    let platform = platform_directory(&canonical_workspace)?;
+    let platform = platform_directory(&canonical_workspace, state_root)?;
     fs::create_dir_all(&platform)
         .map_err(|error| format!("create CONTRACT-218 platform directory: {error}"))?;
 
@@ -274,10 +285,12 @@ fn selected_anchor_tuple(
     }
 }
 
-fn platform_directory(workspace: &Path) -> Result<PathBuf, String> {
+fn platform_directory(workspace: &Path, state_root: Option<&Path>) -> Result<PathBuf, String> {
     let digest = Sha256::digest(workspace.to_string_lossy().as_bytes());
     let workspace_key = hex::encode(digest);
-    let base = if cfg!(feature = "test-support") {
+    let base = if let Some(root) = state_root {
+        root.join("contract218")
+    } else if cfg!(feature = "test-support") {
         std::env::temp_dir().join("advance-agents-contract218-platform")
     } else if cfg!(target_os = "macos") {
         let home = std::env::var_os("HOME").ok_or("HOME is unavailable for CONTRACT-218")?;
@@ -357,4 +370,27 @@ fn fresh_nonzero_32() -> Result<[u8; 32], String> {
 
 fn catalog_error(context: &'static str) -> impl FnOnce(SensitiveParamCatalogError) -> String {
     move |error| format!("{context}: {error:?}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A state root holds the platform directory at `<root>/contract218/<sha256(home)>`;
+    /// without one, the test build keeps it under the temp dir.
+    #[test]
+    fn module_001_ac32_platform_directory_under_a_state_root() {
+        let workspace = Path::new("/w/home");
+        let key = hex::encode(Sha256::digest(b"/w/home"));
+        assert_eq!(
+            platform_directory(workspace, Some(Path::new("/state"))).unwrap(),
+            Path::new("/state/contract218").join(&key)
+        );
+        assert_eq!(
+            platform_directory(workspace, None).unwrap(),
+            std::env::temp_dir()
+                .join("advance-agents-contract218-platform")
+                .join(&key)
+        );
+    }
 }

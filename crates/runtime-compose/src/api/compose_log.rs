@@ -155,7 +155,8 @@ pub mod log_keys {
     /// stderr: the Client API is unavailable (loopback bind failed).
     pub const CLIENT_API_UNAVAILABLE: &str = "wiring.client_api_unavailable";
 
-    // The ordered shutdown (each only when a bound elapses or a listener fails).
+    // The ordered shutdown (each only when a bound elapses, a listener fails or a hook
+    // panics).
     /// stderr: Client API requests were still running when the drain budget ran out.
     pub const COMPOSE_CLIENT_API_DRAIN_OVERRUN: &str = "compose.client_api_drain_overrun";
     /// stderr: the Client API listener had stopped with an error.
@@ -168,6 +169,10 @@ pub mod log_keys {
     pub const COMPOSE_SIGN_IN_OVERRUN: &str = "compose.sign_in_overrun";
     /// stderr: a thread was still running when its join budget ran out (left detached).
     pub const COMPOSE_THREAD_JOIN_OVERRUN: &str = "compose.thread_join_overrun";
+    /// stderr: an extension's shutdown hook did not finish within its bound (abandoned).
+    pub const EXT_SHUTDOWN_ABANDONED: &str = "ext.shutdown_abandoned";
+    /// stderr: an extension's shutdown hook panicked (the shutdown continues).
+    pub const EXT_SHUTDOWN_PANICKED: &str = "ext.shutdown_panicked";
 
     // Objects the daemon does not start, available to embedders.
     /// stdout: an agent reply preview.
@@ -246,6 +251,8 @@ pub mod log_keys {
         COMPOSE_HOOKS_DRAIN_OVERRUN,
         COMPOSE_SIGN_IN_OVERRUN,
         COMPOSE_THREAD_JOIN_OVERRUN,
+        EXT_SHUTDOWN_ABANDONED,
+        EXT_SHUTDOWN_PANICKED,
         REPLY_AGENT_REPLY,
         WEBHOOK_TRIGGER_SEND_FAILED,
         ROLLBACK_MARK_PRE_TURN_FAILED,

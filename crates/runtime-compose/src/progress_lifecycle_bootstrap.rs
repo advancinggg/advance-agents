@@ -39,6 +39,8 @@ const JOURNAL_INTEGRITY_SUBKEY_DOMAIN: &[u8] =
 const WORKSPACE_ID_DOMAIN: &[u8] = b"advance.progress-lifecycle.workspace-id.v1";
 const JOURNAL_RELATIVE_PATH: [&str; 2] = [".runtime", "progress-lifecycle"];
 const ANCHOR_RELATIVE_PATH: [&str; 3] = [".advance", "platform-state", "progress-lifecycle"];
+/// Where the anchor directory lies under a composition's state root.
+const STATE_ROOT_ANCHOR_RELATIVE_PATH: [&str; 1] = ["contract216"];
 const ANCHOR_SUFFIX: &str = ".anchor";
 const RECOVERY_KEY_EPOCH: NonZeroU32 = NonZeroU32::MIN;
 
@@ -102,7 +104,10 @@ pub(crate) struct ProgressLifecycleBootstrapStaging {
 
 struct ProgressLifecyclePaths {
     canonical_workspace: PathBuf,
-    canonical_home: PathBuf,
+    /// The canonical directory the anchor directory is created under (the HOME, or the
+    /// composition's state root), and the anchor directory's path below it.
+    anchor_base: PathBuf,
+    anchor_relative: &'static [&'static str],
     journal_dir: PathBuf,
     anchor_parent: PathBuf,
     external_anchor_path: PathBuf,
@@ -137,6 +142,30 @@ pub(crate) fn bootstrap_progress_lifecycle(
     )
 }
 
+/// Where the external anchor directory is kept, outside the workspace.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AnchorBase<'a> {
+    /// `<home>/.advance/platform-state/progress-lifecycle`, under the canonical HOME;
+    /// `None` models an unavailable HOME.
+    Home(Option<&'a Path>),
+    /// `<root>/contract216`, under a composition's canonical state root.
+    StateRoot(&'a Path),
+}
+
+impl<'a> AnchorBase<'a> {
+    fn base_and_relative(
+        self,
+    ) -> Result<(&'a Path, &'static [&'static str]), ProgressLifecycleBootstrapError> {
+        match self {
+            AnchorBase::Home(home) => Ok((
+                home.ok_or(ProgressLifecycleBootstrapError::HomeUnavailable)?,
+                &ANCHOR_RELATIVE_PATH,
+            )),
+            AnchorBase::StateRoot(root) => Ok((root, &STATE_ROOT_ANCHOR_RELATIVE_PATH)),
+        }
+    }
+}
+
 /// Injectable path seam used by tests and composition witnesses. Passing
 /// `None` models an unavailable HOME without mutating process-global state.
 pub(crate) fn bootstrap_progress_lifecycle_with_home(
@@ -145,17 +174,33 @@ pub(crate) fn bootstrap_progress_lifecycle_with_home(
     home: Option<&Path>,
     failpoint: Option<ProgressLifecycleBootstrapFailpoint>,
 ) -> Result<ProgressLifecycleBootstrapStaging, ProgressLifecycleBootstrapError> {
-    let mut rng = rand::rngs::OsRng;
-    bootstrap_progress_lifecycle_with_home_and_rng(
+    bootstrap_progress_lifecycle_at(
         master_key,
         canonical_workspace,
-        home,
+        AnchorBase::Home(home),
+        failpoint,
+    )
+}
+
+/// Bootstrap with the external anchor kept under `anchor_base`.
+pub(crate) fn bootstrap_progress_lifecycle_at(
+    master_key: &[u8; 32],
+    canonical_workspace: &Path,
+    anchor_base: AnchorBase<'_>,
+    failpoint: Option<ProgressLifecycleBootstrapFailpoint>,
+) -> Result<ProgressLifecycleBootstrapStaging, ProgressLifecycleBootstrapError> {
+    let mut rng = rand::rngs::OsRng;
+    bootstrap_progress_lifecycle_at_with_rng(
+        master_key,
+        canonical_workspace,
+        anchor_base,
         &mut rng,
         failpoint,
         |_| {},
     )
 }
 
+#[cfg(test)]
 fn bootstrap_progress_lifecycle_with_home_and_rng<R, F>(
     master_key: &[u8; 32],
     canonical_workspace: &Path,
@@ -168,7 +213,29 @@ where
     R: RngCore + CryptoRng,
     F: FnMut(FactoryStage),
 {
-    let paths = resolve_paths(canonical_workspace, home)?;
+    bootstrap_progress_lifecycle_at_with_rng(
+        master_key,
+        canonical_workspace,
+        AnchorBase::Home(home),
+        rng,
+        failpoint,
+        observe_factory,
+    )
+}
+
+fn bootstrap_progress_lifecycle_at_with_rng<R, F>(
+    master_key: &[u8; 32],
+    canonical_workspace: &Path,
+    anchor_base: AnchorBase<'_>,
+    rng: &mut R,
+    failpoint: Option<ProgressLifecycleBootstrapFailpoint>,
+    observe_factory: F,
+) -> Result<ProgressLifecycleBootstrapStaging, ProgressLifecycleBootstrapError>
+where
+    R: RngCore + CryptoRng,
+    F: FnMut(FactoryStage),
+{
+    let paths = resolve_paths_at(canonical_workspace, anchor_base)?;
     prepare_persistence_directories(&paths)?;
     let integrity_key = derive_journal_integrity_subkey(master_key)?;
     let config = RecoveryJournalConfig::new_at_composition(
@@ -257,23 +324,33 @@ fn derive_journal_integrity_subkey(
     Ok(subkey)
 }
 
+#[cfg(test)]
 fn resolve_paths(
     workspace: &Path,
     home: Option<&Path>,
+) -> Result<ProgressLifecyclePaths, ProgressLifecycleBootstrapError> {
+    resolve_paths_at(workspace, AnchorBase::Home(home))
+}
+
+fn resolve_paths_at(
+    workspace: &Path,
+    anchor_base: AnchorBase<'_>,
 ) -> Result<ProgressLifecyclePaths, ProgressLifecycleBootstrapError> {
     let canonical_workspace = exact_canonical_directory(
         workspace,
         ProgressLifecycleBootstrapError::WorkspaceUnavailable,
     )?;
-    let home = home.ok_or(ProgressLifecycleBootstrapError::HomeUnavailable)?;
-    let canonical_home =
-        exact_canonical_directory(home, ProgressLifecycleBootstrapError::HomeUnavailable)?;
+    let (anchor_base, anchor_relative) = anchor_base.base_and_relative()?;
+    let anchor_base = exact_canonical_directory(
+        anchor_base,
+        ProgressLifecycleBootstrapError::HomeUnavailable,
+    )?;
 
     validate_relative_path(&canonical_workspace, &JOURNAL_RELATIVE_PATH)?;
-    validate_relative_path(&canonical_home, &ANCHOR_RELATIVE_PATH)?;
+    validate_relative_path(&anchor_base, anchor_relative)?;
 
     let journal_dir = join_components(&canonical_workspace, &JOURNAL_RELATIVE_PATH);
-    let anchor_parent = join_components(&canonical_home, &ANCHOR_RELATIVE_PATH);
+    let anchor_parent = join_components(&anchor_base, anchor_relative);
     if !journal_dir.starts_with(&canonical_workspace)
         || anchor_parent.starts_with(&canonical_workspace)
     {
@@ -284,7 +361,8 @@ fn resolve_paths(
     let external_anchor_path = anchor_parent.join(format!("{workspace_id}{ANCHOR_SUFFIX}"));
     Ok(ProgressLifecyclePaths {
         canonical_workspace,
-        canonical_home,
+        anchor_base,
+        anchor_relative,
         journal_dir,
         anchor_parent,
         external_anchor_path,
@@ -379,8 +457,8 @@ fn prepare_persistence_directories(
         &paths.journal_dir,
     )?;
     create_confined_owner_directory(
-        &paths.canonical_home,
-        &ANCHOR_RELATIVE_PATH,
+        &paths.anchor_base,
+        paths.anchor_relative,
         &paths.anchor_parent,
     )?;
 
@@ -511,6 +589,41 @@ mod tests {
         assert_eq!(
             resolve_paths(&workspace, Some(&nested_home)).err(),
             Some(ProgressLifecycleBootstrapError::UnsafePath)
+        );
+    }
+
+    /// Under a state root the anchor directory is `<root>/contract216` (same anchor name),
+    /// it is created owner-only, and a root inside the workspace is refused.
+    #[test]
+    fn module_001_ac32_state_root_anchor_lies_under_contract216() {
+        let (root_dir, workspace, home) = fixture();
+        let state_root = canonical_dir(&root_dir.path().join("state"));
+        let under_home = resolve_paths(&workspace, Some(&home)).expect("home paths");
+        let paths = resolve_paths_at(&workspace, AnchorBase::StateRoot(&state_root))
+            .expect("state-root paths");
+        assert_eq!(paths.anchor_parent, state_root.join("contract216"));
+        assert_eq!(
+            paths.external_anchor_path.file_name(),
+            under_home.external_anchor_path.file_name(),
+            "the anchor is named by the workspace alone"
+        );
+        assert_eq!(paths.journal_dir, under_home.journal_dir);
+        prepare_persistence_directories(&paths).expect("directories");
+        assert!(state_root.join("contract216").is_dir());
+        assert!(
+            !home.join(".advance").exists(),
+            "nothing is written under the HOME"
+        );
+
+        let inside = canonical_dir(&workspace.join("state"));
+        assert_eq!(
+            resolve_paths_at(&workspace, AnchorBase::StateRoot(&inside)).err(),
+            Some(ProgressLifecycleBootstrapError::UnsafePath)
+        );
+        let noncanonical = state_root.join("..").join("state");
+        assert_eq!(
+            resolve_paths_at(&workspace, AnchorBase::StateRoot(&noncanonical)).err(),
+            Some(ProgressLifecycleBootstrapError::HomeUnavailable)
         );
     }
 

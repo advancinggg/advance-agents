@@ -89,7 +89,7 @@ use cap_lifecycle::{
     WorkspaceFileResidentPolicy,
 };
 
-use crate::api::log_keys;
+use crate::api::{log_keys, ClientApiOptions};
 use crate::component_submit_bridge::{CapGrantSubmitSubsetGate, SchedulerSubmitBridge};
 use crate::compose_log::LogHandle;
 // Pack lane P1: the composition-root pack wiring (ONE rescanned pack
@@ -1176,8 +1176,8 @@ fn adopt_existing_declared(
     Ok(())
 }
 
-/// How [`wire_capabilities_inner`] composes: the existing test seams, and where the
-/// wiring and the objects it builds report.
+/// How [`wire_capabilities_inner`] composes: the existing test seams, the composition's
+/// options, and where the wiring and the objects it builds report.
 pub(crate) struct WiringOptions {
     /// Deterministic DNS and the external HTTP peer inside the channel security chain
     /// (test seam).
@@ -1185,16 +1185,32 @@ pub(crate) struct WiringOptions {
     /// The canonical HOME the progress-lifecycle anchor is kept under, instead of the
     /// process `HOME` (test seam).
     pub home_override: Option<PathBuf>,
+    /// The canonical root of the platform state kept outside the home (the
+    /// progress-lifecycle anchor, the CONTRACT-218 platform directory). It wins over
+    /// `home_override`, which wins over the process `HOME`.
+    pub state_root: Option<PathBuf>,
+    /// A master key the host holds: used as given whenever a key is needed (never
+    /// loaded, migrated, minted or persisted).
+    pub master_key: Option<Zeroizing<[u8; 32]>>,
+    /// Whether the EventBus runs its HTTP / WebSocket server.
+    pub event_bus_ws: bool,
+    /// Whether and how the Client API is bound.
+    pub client_api: ClientApiOptions,
     /// Where the wiring's diagnostics go.
     pub log: LogHandle,
 }
 
 impl WiringOptions {
-    /// What [`wire_capabilities`] does: no test seam, diagnostics discarded.
+    /// What [`wire_capabilities`] does: no test seam, today's platform-state locations and
+    /// master key, the EventBus server and the daemon's Client API, diagnostics discarded.
     pub(crate) fn compat() -> Self {
         Self {
             channel_security_override: None,
             home_override: None,
+            state_root: None,
+            master_key: None,
+            event_bus_ws: true,
+            client_api: ClientApiOptions::daemon(),
             log: LogHandle::null(),
         }
     }
@@ -1307,9 +1323,14 @@ pub(crate) async fn wire_capabilities_inner(
     let WiringOptions {
         channel_security_override,
         home_override,
+        state_root,
+        master_key: provided_master_key,
+        event_bus_ws,
+        client_api: client_api_options,
         log,
     } = opts;
     let home_override = home_override.as_deref();
+    let state_root = state_root.as_deref();
     // Step 1 — snapshot the agent config YAML ONCE.
     //
     // Audit-R1 (Slice AG) TOCTOU note: the snapshot lets the L0-active checks
@@ -1392,8 +1413,16 @@ pub(crate) async fn wire_capabilities_inner(
 
     // Step 2a — load the real master key and stage the complete C216→C215
     // journal/factory graph before EventBus, host registration, listeners, or
-    // any other externally reachable runtime object exists.
-    let mut master_key = if needs_key {
+    // any other externally reachable runtime object exists. A key the host provided is
+    // used as given (no migration, no load, no mint); a home that needs no key stays
+    // keyless either way. The provider admin keeps its own copy of a provided key
+    // (below).
+    let provided_key_for_admin = provided_master_key.clone();
+    let mut master_key = if !needs_key {
+        None
+    } else if let Some(provided) = provided_master_key {
+        Some(provided)
+    } else {
         // keychain-sync: a home whose config moved
         // to keychain-sync while it still carries `master.key` + `secrets.json` is migrated
         // HERE, before the key is loaded, so the daemon boots on the keychain items (each
@@ -1417,8 +1446,6 @@ pub(crate) async fn wire_capabilities_inner(
             Err(e) => return Err(CliWiringError::MasterKey(e).into()),
         }
         Some(load_real_master_key(workspace, &builder.config().secrets)?)
-    } else {
-        None
     };
     let progress_lifecycle_staging: Option<ProgressLifecycleBootstrapStaging> =
         if declares_messaging {
@@ -1426,8 +1453,16 @@ pub(crate) async fn wire_capabilities_inner(
                 .as_ref()
                 .expect("declares_messaging is included in needs_key");
             Some(
-                match home_override {
-                    Some(home) => {
+                match (state_root, home_override) {
+                    (Some(root), _) => {
+                        crate::progress_lifecycle_bootstrap::bootstrap_progress_lifecycle_at(
+                            &*key,
+                            workspace,
+                            crate::progress_lifecycle_bootstrap::AnchorBase::StateRoot(root),
+                            None,
+                        )
+                    }
+                    (None, Some(home)) => {
                         crate::progress_lifecycle_bootstrap::bootstrap_progress_lifecycle_with_home(
                             &*key,
                             workspace,
@@ -1435,7 +1470,7 @@ pub(crate) async fn wire_capabilities_inner(
                             None,
                         )
                     }
-                    None => bootstrap_progress_lifecycle(&*key, workspace),
+                    (None, None) => bootstrap_progress_lifecycle(&*key, workspace),
                 }
                 .map_err(|error| CliWiringError::ProgressLifecycle(error.code()))?,
             )
@@ -1463,6 +1498,18 @@ pub(crate) async fn wire_capabilities_inner(
     } else {
         drop(master_key.take());
         None
+    };
+    // A provided key also backs the provider admin's key store when no live store exists,
+    // so the admin never falls back to opening (and possibly minting) a key of its own.
+    // The capabilities' view is unchanged: `secret_store` stays as declared.
+    let provided_key_admin_store: Option<Arc<SecretStore>> = match provided_key_for_admin {
+        Some(key) if secret_store.is_none() => {
+            let storage: Arc<dyn SecretStorage> =
+                cap_secrets::open_storage(workspace, &builder.config().secrets, None, Some(&*key))
+                    .map_err(CliWiringError::SecretStorage)?;
+            Some(Arc::new(SecretStore::new(key, storage)))
+        }
+        _ => None,
     };
     // Pack lane P2: the pack materializer resolves workflow /
     // mcp `secret-refs` through the SAME cap-secrets store (P1 left the slot
@@ -1633,9 +1680,13 @@ pub(crate) async fn wire_capabilities_inner(
 
     let contract218_runtime = match component_registry.as_ref() {
         Some(registry) => Some(
-            crate::contract218_bootstrap::bootstrap_contract218(workspace, Arc::clone(registry))
-                .await
-                .map_err(CliWiringError::ConfigTree)?,
+            crate::contract218_bootstrap::bootstrap_contract218_at(
+                workspace,
+                Arc::clone(registry),
+                state_root,
+            )
+            .await
+            .map_err(CliWiringError::ConfigTree)?,
         ),
         None => None,
     };
@@ -1685,9 +1736,13 @@ pub(crate) async fn wire_capabilities_inner(
         .as_ref()
         .map(|projector| Arc::clone(projector) as Arc<dyn advance_event_bus::ObservationProjector>);
     let client_event_retention_days = event_cfg.jsonl_retention_days;
-    let bus = EventBus::new(event_cfg)
-        .await
-        .map_err(CliWiringError::EventBus)?;
+    let bus = if event_bus_ws {
+        EventBus::new(event_cfg).await
+    } else {
+        // No `/events` / `/query` server; the read API and the broadcaster are unchanged.
+        EventBus::new_without_server(event_cfg).await
+    }
+    .map_err(CliWiringError::EventBus)?;
     let bus_concrete: Arc<EventBus> = Arc::new(bus);
     let event_bus_dyn: Arc<dyn EventBusEmit> = bus_concrete.clone();
     // From here on every failure returns what was started; nothing after this
@@ -3032,7 +3087,7 @@ pub(crate) async fn wire_capabilities_inner(
         let admin = crate::client_api_providers::WiredProviderAdmin::new(
             workspace.to_path_buf(),
             host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
-            secret_store.clone(),
+            secret_store.clone().or(provided_key_admin_store),
             Arc::new(advance_home::GeneratePathPreflight::default()),
             Arc::new(crate::agent_llm_policy::WorkspaceAgentLlmPolicy::new(
                 agent_tree.clone(),
@@ -3049,8 +3104,15 @@ pub(crate) async fn wire_capabilities_inner(
         })
     };
     let provider_admin_for_api = provider_admin.clone();
-    let client_api_server = match observability_read_api.as_ref() {
-        Some(read) => {
+    let client_api_server = match (client_api_options, observability_read_api.as_ref()) {
+        (
+            ClientApiOptions::Loopback {
+                port,
+                write_discovery,
+                ..
+            },
+            Some(read),
+        ) => {
             let history_events = match (
                 contract219_projector.as_ref(),
                 observation_carrier_store.as_ref(),
@@ -3192,7 +3254,8 @@ pub(crate) async fn wire_capabilities_inner(
                 api = crate::client_api_adapters::compose_first_party_client(api, parts);
                 Arc::new(api)
             };
-            let bound = advance_client_api::ClientApiServer::bind_local_factory(0, factory).await;
+            let bound =
+                advance_client_api::ClientApiServer::bind_local_factory(port, factory).await;
             started.adapter_workers.append(
                 &mut run_control_workers
                     .lock()
@@ -3207,11 +3270,13 @@ pub(crate) async fn wire_capabilities_inner(
                             server.local_addr()
                         ),
                     );
-                    let _ = advance_home::write_client_api_discovery(
-                        workspace,
-                        std::process::id(),
-                        &format!("http://{}", server.local_addr()),
-                    );
+                    if write_discovery {
+                        let _ = advance_home::write_client_api_discovery(
+                            workspace,
+                            std::process::id(),
+                            &format!("http://{}", server.local_addr()),
+                        );
+                    }
                     Some(server)
                 }
                 Err(error) => {
@@ -3223,7 +3288,8 @@ pub(crate) async fn wire_capabilities_inner(
                 }
             }
         }
-        None => None,
+        // No Client API: nothing is bound and no adapter thread is started.
+        (ClientApiOptions::Off, _) | (_, None) => None,
     };
 
     let tools_grant_reader: Option<Arc<dyn ToolsGrantReader>> =

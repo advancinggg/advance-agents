@@ -9,14 +9,17 @@
 
 #![forbid(unsafe_code)]
 
-// The composition API (its output sink and keys), re-exported at the crate root.
+// The composition API (`compose`, its options, output sink, errors and the composed
+// runtime), re-exported at the crate root.
 pub mod api;
 pub use api::*;
 
 // The handle every composition module emits its lines through.
 pub mod compose_log;
 
-// The composition's ordered teardown, and the one place it starts OS threads.
+// `compose()` itself, the composition's ordered teardown, and the one place it starts
+// OS threads.
+mod compose;
 mod composition;
 mod threads;
 

@@ -29,7 +29,8 @@ build-agent = { path = "../build-agent" }
 # Same feature set as `advance-cli` declared before the move, so the `advance`
 # binary's unified tokio feature set is unchanged.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }
-tokio-util = { workspace = true }
+# `rt`: `TaskTracker` (the composition's extension tasks).
+tokio-util = { workspace = true, features = ["rt"] }
 axum = { workspace = true }
 advance-scheduler = { path = "../scheduler" }
 advance-scheduler-auto-loop = { path = "../scheduler/auto-loop" }
@@ -58,6 +59,8 @@ cap-lifecycle = { path = "../capabilities/cap-lifecycle" }
 cap-channel = { path = "../capabilities/cap-channel" }
 cap-mcp = { path = "../capabilities/cap-mcp" }
 async-trait = { workspace = true }
+# `BoxFuture` (the extension shutdown hook) and `FutureExt::catch_unwind`.
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }

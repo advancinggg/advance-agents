@@ -28,10 +28,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use advance_runtime::config::ConfigError;
 use advance_runtime::config::RuntimeConfigProvider;
-use advance_runtime::runtime_lock::RuntimeLock;
-use advance_runtime::{BootstrapError, RuntimeHost, RuntimeHostBuilder};
+use advance_runtime::{RuntimeHost, RuntimeHostBuilder};
 
 // Slice BS-3 (2026-06-03) — CLI-composition-root agent-loop wiring (D12).
 // WS-A (2026-06-04) — Message/MessageKind for the `POST /msg` inbound source.
@@ -94,9 +92,8 @@ use crate::channel_egress::{ChannelEgress, DaemonOutboundSink};
 use crate::channels_boot;
 use crate::execution_turn_ingress::ExecutionTurnIngress;
 
-use crate::api::{log_keys, ComposeError, LockFailure};
+use crate::api::{log_keys, ComposeError, ComposeLog, ComposeOptions, ListenerOptions};
 use crate::compose_log::{LogHandle, StdioComposeLog};
-use crate::composition::{Composition, GuardHold, TeardownReason};
 use crate::wiring::{HoldStoppers, WiringFailure, WiringHandles, WiringOptions};
 use tokio_util::sync::CancellationToken;
 
@@ -233,13 +230,10 @@ pub fn run_daemon(workspace: Option<PathBuf>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    rt.block_on(run_async(
-        workspace,
-        LogHandle::new(Arc::new(StdioComposeLog)),
-    ))
+    rt.block_on(run_async(workspace, Arc::new(StdioComposeLog)))
 }
 
-async fn run_async(workspace: Option<PathBuf>, log: LogHandle) -> ExitCode {
+async fn run_async(workspace: Option<PathBuf>, log: Arc<dyn ComposeLog>) -> ExitCode {
     // 1. Install signal listeners FIRST. Tokio's `signal(SignalKind::*)` is
     //    synchronous (installs the kernel handler eagerly), so subsequent
     //    SIGINT/SIGTERM during lock-acquire or bootstrap is captured and
@@ -283,76 +277,18 @@ async fn run_async(workspace: Option<PathBuf>, log: LogHandle) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let config_path = workspace.join(".advance").join("runtime-config.yaml");
 
-    // 4. Acquire the single-active-runtime lock. The teardown releases it last
-    //    (heartbeat joined, then the file removed); a failure before the composition
-    //    exists releases it at once.
-    //    Heartbeat default 30s per MODULE-001 §1.4.3; staleness threshold
-    //    is the lock's own concern (2 min internally).
-    let guard = match RuntimeLock::acquire(&workspace, Duration::from_secs(30)).await {
-        Ok(lock) => GuardHold::new(lock),
-        Err(e) => return startup_failed(ComposeError::Lock(LockFailure::from_lock_error(&e))),
-    };
+    // 4. Compose: the instance guard (the runtime lock, heartbeat 30 s per MODULE-001
+    //    §1.4.3), the runtime host, the capability graph, the readiness line, the agent
+    //    loop and its listeners. A failure after part of it started stops what started
+    //    (no line printed), then is reported.
+    let runtime =
+        match crate::compose::compose(ComposeOptions::daemon(workspace, log), Vec::new()).await {
+            Ok(runtime) => runtime,
+            Err(error) => return startup_failed(error),
+        };
 
-    // 5. Construct the runtime host via the Slice AG production wiring
-    //    path: RuntimeHostBuilder gives us the partial-construction surface
-    //    (sqlite_index_handle, host_registry) BEFORE the CapabilityInjector
-    //    is built, so wire_capabilities can construct cap-grant's real
-    //    GrantCheckImpl + EventBus + cap-secrets host fns and inject them
-    //    via builder.build(grant_check). Map missing-config to a friendly
-    //    hint via the CliWiringError::Bootstrap → BootstrapError::Config
-    //    → ConfigError::IoError(NotFound) variant chain (preserved
-    //    verbatim from Slice AE).
-    //
-    // 5a. Partial-construct.
-    let builder = match RuntimeHostBuilder::new(&config_path, &workspace).await {
-        Ok(b) => b,
-        Err(BootstrapError::Config(ConfigError::IoError { source, .. }))
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            guard.release().await;
-            return startup_failed(ComposeError::ConfigNotFound { path: config_path });
-        }
-        Err(e) => {
-            guard.release().await;
-            return startup_failed(ComposeError::Bootstrap(e.to_string()));
-        }
-    };
-    // The config watcher and its WAL-mode observer are stopped by the teardown.
-    let config_watcher = builder.config_watcher();
-    let wal_observer = builder.take_wal_observer();
-
-    // 5b–5d. Compose the capability graph, the agent loop and its listeners. A failure
-    //    after part of it started stops what started (no line printed), then reports.
-    let opts = GraphOptions {
-        log: log.clone(),
-        wiring: WiringOptions {
-            log: log.clone(),
-            ..WiringOptions::compat()
-        },
-    };
-    let composition = match compose_graph(builder, &workspace, opts).await {
-        Ok(graph) => Composition::from_graph(graph, config_watcher, wal_observer, guard, log),
-        Err(GraphFailure { error, partial }) => {
-            let composition = match partial {
-                PartialGraph::Graph(graph) => {
-                    Composition::from_graph(*graph, config_watcher, wal_observer, guard, log)
-                }
-                PartialGraph::Wiring(stoppers) => Composition::from_stoppers(
-                    stoppers,
-                    Some(config_watcher),
-                    wal_observer,
-                    Some(guard),
-                    log,
-                ),
-            };
-            composition.teardown(TeardownReason::StartupFailed).await;
-            return startup_failed(error);
-        }
-    };
-
-    // 6. Park until SIGINT / SIGTERM. Listeners were installed in step 1 (above
+    // 5. Park until SIGINT / SIGTERM. Listeners were installed in step 1 (above
     //    lock-acquire) so any signal received during lock-acquire or bootstrap
     //    is captured and pending; the .recv() here just resolves immediately
     //    in that case.
@@ -363,10 +299,12 @@ async fn run_async(workspace: Option<PathBuf>, log: LogHandle) -> ExitCode {
         let _ = tokio::signal::ctrl_c().await;
     }
 
-    // 7. The ordered shutdown: ingress, loops (then `advance: shutting down`), the
+    // 6. The ordered shutdown: ingress, loops (then `advance: shutting down`), the
     //    holds in dependency order, the runtime lock last.
-    composition.teardown(TeardownReason::Requested).await;
-    ExitCode::SUCCESS
+    match runtime.shutdown().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => startup_failed(error),
+    }
 }
 
 /// Report a startup failure the way `advance start` always has (`advance start: …` on
@@ -380,6 +318,8 @@ fn startup_failed(error: ComposeError) -> ExitCode {
 pub(crate) struct GraphOptions {
     /// Where the composition's lines go.
     pub log: LogHandle,
+    /// Which listeners the agent loop may bind.
+    pub listeners: ListenerOptions,
     /// The capability wiring's options.
     pub wiring: WiringOptions,
 }
@@ -394,6 +334,26 @@ pub(crate) struct ComposedGraph {
     pub msg_listener: Option<Listener>,
     pub auto_tick: Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
     pub readiness_walk: Option<crate::runnable_walk::ContinuousReadinessWalk>,
+}
+
+impl ComposedGraph {
+    /// Where the Client API listens, when one is bound (it is held weakly).
+    pub(crate) fn client_api_endpoint(&self) -> Option<crate::api::ClientApiEndpoint> {
+        self.wiring_handles
+            .client_api_server
+            .as_ref()
+            .map(|server| crate::api::ClientApiEndpoint {
+                base_url: format!("http://{}", server.local_addr()),
+                socket_addr: server.local_addr(),
+                api: Arc::downgrade(&server.api()),
+            })
+    }
+
+    /// The root serve loop's end-of-life signal (`true` once it has ended); `None`
+    /// without a deployed driver.
+    pub(crate) fn agent_loop_done(&self) -> Option<watch::Receiver<bool>> {
+        self.agent_loop.as_ref().map(|spawned| spawned.done.clone())
+    }
 }
 
 /// What a failed [`compose_graph`] had started.
@@ -425,7 +385,11 @@ pub(crate) async fn compose_graph(
     workspace: &Path,
     opts: GraphOptions,
 ) -> Result<ComposedGraph, GraphFailure> {
-    let GraphOptions { log, wiring } = opts;
+    let GraphOptions {
+        log,
+        listeners,
+        wiring,
+    } = opts;
     let workspace = workspace.to_path_buf();
     // 5b. Wire production cap-grant + cap-secrets + EventBus. The host and the
     // handles go to the composition, which stops them in order at shutdown; the
@@ -637,6 +601,8 @@ pub(crate) async fn compose_graph(
             );
             Ok(None)
         }
+        // The options leave the listener out.
+        Some(_) if !listeners.post_msg => Ok(None),
         Some(spawned) => spawn_msg_listener(
             spawned.store.clone(),
             spawned.execution_ingress.clone(),
@@ -860,7 +826,7 @@ pub(crate) async fn compose_graph(
 const _: () = {
     fn assert_send_static<F, Fut>(_: F)
     where
-        F: Fn(Option<PathBuf>, LogHandle) -> Fut,
+        F: Fn(Option<PathBuf>, Arc<dyn ComposeLog>) -> Fut,
         Fut: std::future::Future<Output = ExitCode> + Send + 'static,
     {
     }

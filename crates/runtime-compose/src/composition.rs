@@ -10,7 +10,8 @@
 //!    the auto tick loop and the readiness walk stop; then every live LLM stream is
 //!    settled and the stream reaper stopped. A requested shutdown then prints
 //!    `advance: shutting down`;
-//! 3. **extension hooks** — none are composed yet;
+//! 3. **extension hooks** — each extension's shutdown hook, in reverse registration
+//!    order, each bounded and isolated from the others' panics;
 //! 4. **holds**, in dependency order — the selected-provider writer, the config
 //!    watcher and its WAL-mode observer, the packs poll, the cap-grant sweeper, the
 //!    breaker subscriber, the ChatGPT sign-in (a renewal already started is awaited,
@@ -25,21 +26,26 @@
 //! that elapses is reported on stderr and the sequence goes on, and a startup-failure
 //! teardown prints nothing else.
 
-use std::sync::Arc;
+use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use advance_client_api::{ClientApi, ClientApiServer, ShutdownIngress};
 use advance_runtime::config::RuntimeConfigWatcher;
 use advance_runtime::runtime_lock::RuntimeLock;
 use advance_runtime::RuntimeHost;
+use futures::FutureExt;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
-use crate::api::log_keys;
+use crate::api::{log_keys, ClientApiEndpoint, ComposeExtension, InstanceGuardKind, RuntimePhase};
 use crate::client_api_adapters::WorkerControl;
 use crate::compose_log::LogHandle;
 use crate::daemon::{ComposedGraph, Listener};
+use crate::registry::HomeReservation;
 use crate::runnable_walk::ContinuousReadinessWalk;
 use crate::wiring::{HoldStoppers, WiringHandles};
 
@@ -48,6 +54,8 @@ use crate::wiring::{HoldStoppers, WiringHandles};
 const CLIENT_API_DRAIN: Duration = Duration::from_secs(10);
 /// Budget of the `POST /msg` and `/hooks` listeners' drains.
 const LISTENER_DRAIN: Duration = Duration::from_secs(5);
+/// Budget of one extension's shutdown hook; past it the hook is abandoned.
+const EXTENSION_SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
 /// Budget of a thread join: the Client API adapter threads (one shared deadline), the
 /// config watcher's OS-watcher release, the WAL-mode observer.
 const THREAD_JOIN_BOUND: Duration = Duration::from_secs(2);
@@ -108,21 +116,89 @@ impl StepLog {
     }
 }
 
-/// The instance guard a composition holds until the end of its teardown.
+/// The instance guard a composition holds until the end of its teardown: the home's
+/// process-local reservation and, under the pid-lock guard, the runtime lock.
 pub(crate) struct GuardHold {
+    reservation: HomeReservation,
     lock: Option<RuntimeLock>,
 }
 
 impl GuardHold {
-    pub(crate) fn new(lock: RuntimeLock) -> Self {
-        Self { lock: Some(lock) }
+    pub(crate) fn new(reservation: HomeReservation, lock: Option<RuntimeLock>) -> Self {
+        Self { reservation, lock }
     }
 
-    /// Release the guard: the runtime lock's heartbeat is joined, then its file removed.
+    pub(crate) fn kind(&self) -> InstanceGuardKind {
+        match self.lock {
+            Some(_) => InstanceGuardKind::PidLockFile,
+            None => InstanceGuardKind::ProcessLocal,
+        }
+    }
+
+    /// Release the guard: the runtime lock's heartbeat is joined, then its file removed;
+    /// then the home's reservation is released.
     pub(crate) async fn release(self) {
-        if let Some(lock) = self.lock {
+        let GuardHold { reservation, lock } = self;
+        if let Some(lock) = lock {
             lock.release().await;
         }
+        drop(reservation);
+    }
+}
+
+/// What a composed runtime reports about itself (read through
+/// [`ComposedRuntime`](crate::api::ComposedRuntime)). It holds the Client API only
+/// weakly and the root loop's end-of-life signal, never a part of the graph.
+pub(crate) struct RuntimeView {
+    phase: Mutex<RuntimePhase>,
+    root_agent_id: String,
+    client_api: Option<ClientApiEndpoint>,
+    /// `true` once the root serve loop has ended; `None` without a deployed driver.
+    agent_loop_done: Option<watch::Receiver<bool>>,
+    instance_guard: InstanceGuardKind,
+}
+
+impl RuntimeView {
+    pub(crate) fn new(
+        root_agent_id: String,
+        client_api: Option<ClientApiEndpoint>,
+        agent_loop_done: Option<watch::Receiver<bool>>,
+        instance_guard: InstanceGuardKind,
+    ) -> Self {
+        Self {
+            phase: Mutex::new(RuntimePhase::Running),
+            root_agent_id,
+            client_api,
+            agent_loop_done,
+            instance_guard,
+        }
+    }
+
+    pub(crate) fn phase(&self) -> RuntimePhase {
+        *self.phase.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_phase(&self, phase: RuntimePhase) {
+        *self.phase.lock().unwrap_or_else(|e| e.into_inner()) = phase;
+    }
+
+    pub(crate) fn root_agent_id(&self) -> &str {
+        &self.root_agent_id
+    }
+
+    pub(crate) fn client_api(&self) -> Option<&ClientApiEndpoint> {
+        self.client_api.as_ref()
+    }
+
+    /// Whether the root serve loop is still running.
+    pub(crate) fn agent_loop_alive(&self) -> bool {
+        self.agent_loop_done
+            .as_ref()
+            .is_some_and(|done| !*done.borrow())
+    }
+
+    pub(crate) fn instance_guard(&self) -> InstanceGuardKind {
+        self.instance_guard
     }
 }
 
@@ -130,6 +206,8 @@ impl GuardHold {
 pub(crate) struct Composition {
     log: LogHandle,
     steps: StepLog,
+    /// The state a composed runtime reports (none for a composition that failed to start).
+    view: Option<Arc<RuntimeView>>,
     // Step 1: ingress.
     client_api_server: Option<ClientApiServer>,
     msg_listener: Option<Listener>,
@@ -139,11 +217,17 @@ pub(crate) struct Composition {
     host_pump: Option<JoinHandle<()>>,
     auto_tick: Option<(CancellationToken, JoinHandle<()>)>,
     readiness_walk: Option<ContinuousReadinessWalk>,
+    // Step 3: the extensions, in registration order, and the tasks started for them.
+    extensions: Vec<Arc<dyn ComposeExtension>>,
+    extension_tasks: TaskTracker,
     // Step 4: holds.
     selected_provider_task: Option<JoinHandle<()>>,
     config_watcher: Option<Arc<RuntimeConfigWatcher>>,
     wal_observer: Option<JoinHandle<()>>,
     stoppers: HoldStoppers,
+    /// What the extensions hold that must outlive the graph's holds but not the
+    /// composition.
+    extension_holds: Vec<Box<dyn std::any::Any + Send + Sync>>,
     /// Everything else, dropped last (on the blocking pool).
     graph_rest: Option<(RuntimeHost, WiringHandles)>,
     // Step 5.
@@ -189,6 +273,7 @@ impl Composition {
         Self {
             log,
             steps: StepLog,
+            view: None,
             client_api_server,
             msg_listener,
             hooks,
@@ -196,10 +281,13 @@ impl Composition {
             host_pump,
             auto_tick,
             readiness_walk,
+            extensions: Vec::new(),
+            extension_tasks: TaskTracker::new(),
             selected_provider_task,
             config_watcher: Some(config_watcher),
             wal_observer,
             stoppers,
+            extension_holds: Vec::new(),
             graph_rest: Some((host, wiring_handles)),
             guard: Some(guard),
         }
@@ -216,6 +304,7 @@ impl Composition {
         Self {
             log,
             steps: StepLog,
+            view: None,
             client_api_server: None,
             msg_listener: None,
             hooks: None,
@@ -223,18 +312,53 @@ impl Composition {
             host_pump: None,
             auto_tick: None,
             readiness_walk: None,
+            extensions: Vec::new(),
+            extension_tasks: TaskTracker::new(),
             selected_provider_task: None,
             config_watcher,
             wal_observer,
             stoppers,
+            extension_holds: Vec::new(),
             graph_rest: None,
             guard,
         }
     }
 
+    /// What a composition refused right after the runtime host builder was made: the
+    /// config watcher, its WAL-mode observer and the instance guard.
+    pub(crate) fn early(
+        config_watcher: Arc<RuntimeConfigWatcher>,
+        wal_observer: Option<JoinHandle<()>>,
+        guard: GuardHold,
+        log: LogHandle,
+    ) -> Self {
+        Self::from_stoppers(
+            HoldStoppers::default(),
+            Some(config_watcher),
+            wal_observer,
+            Some(guard),
+            log,
+        )
+    }
+
+    /// The extensions composed with the runtime (their shutdown hooks run in step 3).
+    pub(crate) fn with_extensions(mut self, extensions: Vec<Arc<dyn ComposeExtension>>) -> Self {
+        self.extensions = extensions;
+        self
+    }
+
+    /// The view the composed runtime reports through; the teardown moves its phase.
+    pub(crate) fn with_view(mut self, view: Arc<RuntimeView>) -> Self {
+        self.view = Some(view);
+        self
+    }
+
     /// Stop everything, in order (see the module documentation).
     pub(crate) async fn teardown(mut self, reason: TeardownReason) {
         let log = self.log.clone();
+        if let Some(view) = self.view.as_ref() {
+            view.set_phase(RuntimePhase::ShuttingDown);
+        }
 
         // ── Step 1: ingress, the three drains concurrently. ──────────────────────
         let client_api_server = self.client_api_server.take();
@@ -328,7 +452,17 @@ impl Composition {
             log.out(log_keys::SHUTTING_DOWN, "advance: shutting down");
         }
 
-        // ── Step 3: extension hooks (none are composed yet). ─────────────────────
+        // ── Step 3: extension hooks. ─────────────────────────────────────────────
+        let extensions = std::mem::take(&mut self.extensions);
+        if !extensions.is_empty() {
+            run_extension_shutdown_hooks(&extensions, &log).await;
+            self.steps.record("extensions.hooks");
+        }
+        if !self.extension_tasks.is_empty() {
+            self.extension_tasks.close();
+            self.extension_tasks.wait().await;
+            self.steps.record("extensions.tasks");
+        }
 
         // ── Step 4: holds, in dependency order. ───────────────────────────────────
         if let Some(task) = self.selected_provider_task.take() {
@@ -398,6 +532,11 @@ impl Composition {
             bus.shutdown_shared().await;
             self.steps.record("holds.event_bus");
         }
+        let extension_holds = std::mem::take(&mut self.extension_holds);
+        if !extension_holds.is_empty() {
+            drop(extension_holds);
+            self.steps.record("holds.extension_holds");
+        }
         let rest = (self.graph_rest.take(), std::mem::take(&mut self.stoppers));
         if rest.0.is_some() || !rest.1.is_empty() {
             // The last references go here: the EventBus pipeline and its observation
@@ -412,6 +551,9 @@ impl Composition {
         if let Some(guard) = self.guard.take() {
             guard.release().await;
             self.steps.record("guard");
+        }
+        if let Some(view) = self.view.as_ref() {
+            view.set_phase(RuntimePhase::Stopped);
         }
     }
 }
@@ -449,6 +591,40 @@ impl HoldStoppers {
         Composition::from_stoppers(self, None, None, None, log.clone())
             .teardown(TeardownReason::StartupFailed)
             .await;
+    }
+}
+
+/// Run every extension's shutdown hook, in reverse registration order. Each hook gets
+/// [`EXTENSION_SHUTDOWN_BOUND`]; one that has not finished by then is abandoned (its
+/// future dropped) and reported. A hook that panics, while its future is built or
+/// polled, is reported; the remaining hooks still run.
+async fn run_extension_shutdown_hooks(extensions: &[Arc<dyn ComposeExtension>], log: &LogHandle) {
+    for extension in extensions.iter().rev() {
+        let id = extension.id();
+        // `Ok(true)`: the hook finished; `Ok(false)`: it panicked; `Err`: it overran.
+        let finished = match std::panic::catch_unwind(AssertUnwindSafe(|| extension.shutdown())) {
+            Ok(hook) => tokio::time::timeout(
+                EXTENSION_SHUTDOWN_BOUND,
+                AssertUnwindSafe(hook).catch_unwind(),
+            )
+            .await
+            .map(|outcome| outcome.is_ok()),
+            Err(_panic) => Ok(false),
+        };
+        match finished {
+            Ok(true) => {}
+            Ok(false) => log.err(
+                log_keys::EXT_SHUTDOWN_PANICKED,
+                format!("advance: WARN extension {id} shutdown hook panicked; continuing"),
+            ),
+            Err(_elapsed) => log.err(
+                log_keys::EXT_SHUTDOWN_ABANDONED,
+                format!(
+                    "advance: WARN extension {id} shutdown hook did not finish within {}s; abandoned",
+                    EXTENSION_SHUTDOWN_BOUND.as_secs()
+                ),
+            ),
+        }
     }
 }
 
@@ -564,7 +740,6 @@ mod tests {
     use super::*;
     use crate::api::{ComposeLog, ComposeLogLine, LogStream};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
 
     #[derive(Default)]
     struct Recording(Mutex<Vec<ComposeLogLine>>);
@@ -610,19 +785,179 @@ mod tests {
                 .expect("lock");
             let lock_path = lock.path().to_path_buf();
             assert!(lock_path.exists());
+            let reservation = HomeReservation::acquire(home.clone()).expect("reserve");
+            let guard = GuardHold::new(reservation, Some(lock));
+            assert_eq!(guard.kind(), InstanceGuardKind::PidLockFile);
             let sink = Arc::new(Recording::default());
             Composition::from_stoppers(
                 HoldStoppers::default(),
                 None,
                 None,
-                Some(GuardHold::new(lock)),
+                Some(guard),
                 LogHandle::new(sink.clone()),
             )
             .teardown(reason)
             .await;
             assert_eq!(sink.keys(), expected, "{reason:?}");
             assert!(!lock_path.exists(), "{reason:?}: the guard is released");
+            assert!(
+                !crate::registry::reserved_homes_for_test().contains(&home),
+                "{reason:?}: the reservation is released with the guard"
+            );
         }
+    }
+
+    /// A process-local guard is the reservation alone; the teardown moves a composed
+    /// runtime's view through `ShuttingDown` to `Stopped`.
+    #[tokio::test]
+    async fn module_001_ac30_process_local_guard_and_view_phases() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        let guard = GuardHold::new(HomeReservation::acquire(home.clone()).unwrap(), None);
+        assert_eq!(guard.kind(), InstanceGuardKind::ProcessLocal);
+        let view = Arc::new(RuntimeView::new("root-id".into(), None, None, guard.kind()));
+        assert_eq!(view.phase(), RuntimePhase::Running);
+        assert!(!view.agent_loop_alive(), "no driver, no loop");
+        Composition::from_stoppers(
+            HoldStoppers::default(),
+            None,
+            None,
+            Some(guard),
+            LogHandle::null(),
+        )
+        .with_view(Arc::clone(&view))
+        .teardown(TeardownReason::Requested)
+        .await;
+        assert_eq!(view.phase(), RuntimePhase::Stopped);
+        assert!(!crate::registry::reserved_homes_for_test().contains(&home));
+        assert!(
+            !home.join(".runtime").exists(),
+            "no lock file was ever written"
+        );
+    }
+
+    struct Hook {
+        id: &'static str,
+        behaviour: HookBehaviour,
+        ran: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    enum HookBehaviour {
+        Finish,
+        Hang(Duration),
+        PanicWhilePolled,
+        PanicWhileBuilt,
+    }
+
+    impl ComposeExtension for Hook {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn shutdown<'a>(&'a self) -> crate::api::BoxFuture<'a, ()> {
+            self.ran.lock().unwrap().push(self.id);
+            match self.behaviour {
+                HookBehaviour::Finish => Box::pin(async {}),
+                HookBehaviour::Hang(duration) => Box::pin(tokio::time::sleep(duration)),
+                HookBehaviour::PanicWhilePolled => Box::pin(async { panic!("hook panicked") }),
+                HookBehaviour::PanicWhileBuilt => panic!("hook panicked before its future"),
+            }
+        }
+    }
+
+    /// Hooks run in reverse registration order; a hook that hangs is abandoned at the
+    /// bound, a hook that panics (building or polling its future) is reported, and the
+    /// hooks after either still run.
+    #[tokio::test(start_paused = true)]
+    async fn module_001_ac30_extension_shutdown_hooks_reverse_bounded() {
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let hook = |id, behaviour| -> Arc<dyn ComposeExtension> {
+            Arc::new(Hook {
+                id,
+                behaviour,
+                ran: Arc::clone(&ran),
+            })
+        };
+        let extensions = vec![
+            hook("first", HookBehaviour::Finish),
+            hook("panics-built", HookBehaviour::PanicWhileBuilt),
+            hook("hangs", HookBehaviour::Hang(Duration::from_secs(10))),
+            hook("panics-polled", HookBehaviour::PanicWhilePolled),
+            hook("last", HookBehaviour::Finish),
+        ];
+        let sink = Arc::new(Recording::default());
+        let started = Instant::now();
+        run_extension_shutdown_hooks(&extensions, &LogHandle::new(sink.clone())).await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= EXTENSION_SHUTDOWN_BOUND && waited < EXTENSION_SHUTDOWN_BOUND + POLL,
+            "only the hanging hook waits, and only for its bound: {waited:?}"
+        );
+        assert_eq!(
+            *ran.lock().unwrap(),
+            vec!["last", "panics-polled", "hangs", "panics-built", "first"]
+        );
+        let lines: Vec<(&'static str, String)> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|line| {
+                assert_eq!(line.stream, LogStream::Stderr);
+                (line.key, line.text.clone())
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (
+                    log_keys::EXT_SHUTDOWN_PANICKED,
+                    "advance: WARN extension panics-polled shutdown hook panicked; continuing"
+                        .to_owned()
+                ),
+                (
+                    log_keys::EXT_SHUTDOWN_ABANDONED,
+                    "advance: WARN extension hangs shutdown hook did not finish within 5s; abandoned"
+                        .to_owned()
+                ),
+                (
+                    log_keys::EXT_SHUTDOWN_PANICKED,
+                    "advance: WARN extension panics-built shutdown hook panicked; continuing"
+                        .to_owned()
+                ),
+            ]
+        );
+    }
+
+    /// The teardown runs the hooks (and records the step) only when extensions exist.
+    #[tokio::test]
+    async fn module_001_ac30_teardown_runs_the_extension_hooks_in_step_3() {
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let extensions: Vec<Arc<dyn ComposeExtension>> = vec![
+            Arc::new(Hook {
+                id: "one",
+                behaviour: HookBehaviour::Finish,
+                ran: Arc::clone(&ran),
+            }),
+            Arc::new(Hook {
+                id: "two",
+                behaviour: HookBehaviour::Finish,
+                ran: Arc::clone(&ran),
+            }),
+        ];
+        let sink = Arc::new(Recording::default());
+        Composition::from_stoppers(
+            HoldStoppers::default(),
+            None,
+            None,
+            None,
+            LogHandle::new(sink.clone()),
+        )
+        .with_extensions(extensions)
+        .teardown(TeardownReason::Requested)
+        .await;
+        assert_eq!(*ran.lock().unwrap(), vec!["two", "one"]);
+        assert_eq!(sink.keys(), vec![log_keys::SHUTTING_DOWN]);
     }
 
     /// A listener whose requests never finish is aborted once its budget has elapsed.

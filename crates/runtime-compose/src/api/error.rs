@@ -25,6 +25,70 @@ pub enum ComposeError {
     Listener(String),
     /// The readiness line could not be written.
     Readiness(std::io::Error),
+    /// An extension's Client API route was refused.
+    Registration {
+        extension: &'static str,
+        route: String,
+        reason: String,
+    },
+    /// An extension's claim on an inference entry was refused.
+    InferenceClaim {
+        extension: &'static str,
+        entry: String,
+        reason: String,
+    },
+    /// An extension's capability name was refused.
+    CapabilityCollision {
+        extension: &'static str,
+        capability: String,
+        reason: String,
+    },
+    /// An extension callback failed or panicked.
+    Extension {
+        extension: &'static str,
+        phase: ExtensionPhase,
+        failure: ExtensionFailure,
+    },
+    /// These options ask for something this build or this home cannot compose. Nothing
+    /// was started.
+    Unsupported(Unsupported),
+}
+
+/// The composition step an extension callback belongs to.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionPhase {
+    Capabilities,
+    Inference,
+    HostFunctions,
+    Tools,
+    ClientFamilies,
+}
+
+/// How an extension callback ended badly.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionFailure {
+    /// It returned an error (its message).
+    Failed(String),
+    /// It panicked (the panic message).
+    Panicked(String),
+}
+
+/// What [`ComposeError::Unsupported`] refused.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unsupported {
+    /// An option value this build does not compose yet (its name).
+    NotYetAvailable(&'static str),
+    /// The home is not an absolute, canonical directory.
+    HomeNotCanonical(PathBuf),
+    /// The state root is unusable, and why.
+    StateRoot { path: PathBuf, reason: &'static str },
+    /// A Client API discovery file was asked for without the pid-lock instance guard.
+    DiscoveryRequiresPidLock,
+    /// The home's config needs a listener these options disable (its name).
+    ListenerRequired(&'static str),
 }
 
 /// Why the instance guard could not be taken.
@@ -83,6 +147,71 @@ impl fmt::Display for ComposeError {
             ComposeError::Wiring(msg) => write!(f, "wiring failed: {msg}"),
             ComposeError::AgentLoop(msg) | ComposeError::Listener(msg) => f.write_str(msg),
             ComposeError::Readiness(e) => write!(f, "failed to flush readiness signal: {e}"),
+            ComposeError::Registration {
+                extension,
+                route,
+                reason,
+            } => write!(f, "extension {extension}: route {route} refused: {reason}"),
+            ComposeError::InferenceClaim {
+                extension,
+                entry,
+                reason,
+            } => write!(
+                f,
+                "extension {extension}: inference claim on {entry} refused: {reason}"
+            ),
+            ComposeError::CapabilityCollision {
+                extension,
+                capability,
+                reason,
+            } => write!(
+                f,
+                "extension {extension}: capability {capability} refused: {reason}"
+            ),
+            ComposeError::Extension {
+                extension,
+                phase,
+                failure: ExtensionFailure::Failed(msg),
+            } => write!(f, "extension {extension} failed in {phase}: {msg}"),
+            ComposeError::Extension {
+                extension,
+                phase,
+                failure: ExtensionFailure::Panicked(msg),
+            } => write!(f, "extension {extension} panicked in {phase}: {msg}"),
+            ComposeError::Unsupported(what) => write!(f, "unsupported: {what}"),
+        }
+    }
+}
+
+impl fmt::Display for ExtensionPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ExtensionPhase::Capabilities => "capabilities",
+            ExtensionPhase::Inference => "inference",
+            ExtensionPhase::HostFunctions => "host_functions",
+            ExtensionPhase::Tools => "tools",
+            ExtensionPhase::ClientFamilies => "client_families",
+        })
+    }
+}
+
+impl fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unsupported::NotYetAvailable(what) => {
+                write!(f, "{what} is not available in this build")
+            }
+            Unsupported::HomeNotCanonical(path) => {
+                write!(f, "home {path:?} is not an absolute canonical directory")
+            }
+            Unsupported::StateRoot { path, reason } => write!(f, "state_root {path:?} {reason}"),
+            Unsupported::DiscoveryRequiresPidLock => {
+                f.write_str("a Client API discovery file requires the pid-lock instance guard")
+            }
+            Unsupported::ListenerRequired(which) => write!(
+                f,
+                "the home's config needs the {which} listener, which these options disable"
+            ),
         }
     }
 }
