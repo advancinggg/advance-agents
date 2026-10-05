@@ -1284,6 +1284,72 @@ mod shutdown_tests {
         assert!(st.join_handles.lock().await.is_empty());
     }
 
+    /// `shutdown_shared` joins the `/events` client tasks, it does not only cancel them: a
+    /// tracked client task that is still closing keeps the call waiting until it has ended.
+    /// A real upgraded client's task holds a tracker token, and gets its `Close` frame.
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_001_ac30_eventbus_shutdown_shared_waits_for_every_ws_client_task() {
+        use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let bus = Arc::new(async_bus(temp.path()).await);
+        let st = state(&bus);
+        let addr = bus.server_addr().expect("server_addr");
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/events"))
+            .await
+            .expect("ws connect");
+        assert_eq!(
+            st.ws_tasks.len(),
+            1,
+            "the upgraded client's task is tracked"
+        );
+
+        // A client task that is still closing after the cancel, until the test releases it.
+        let (release, done) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let closing = {
+            let (cancel, release, done) = (st.ws_cancel.clone(), release.clone(), done.clone());
+            st.ws_tasks.spawn(async move {
+                cancel.cancelled().await;
+                release.notified().await;
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+
+        let call = tokio::spawn({
+            let bus = Arc::clone(&bus);
+            async move { bus.shutdown_shared().await }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !st.ws_cancel.is_cancelled() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shutdown_shared reached step 6"
+            );
+            settle(10).await;
+        }
+        settle(100).await;
+        assert!(
+            !call.is_finished(),
+            "shutdown_shared waits for the client task that is still closing"
+        );
+
+        release.notify_one();
+        call.await.unwrap();
+        assert!(
+            done.load(Ordering::SeqCst) && closing.is_finished(),
+            "the client task had ended when shutdown_shared returned"
+        );
+        assert!(st.ws_tasks.is_empty(), "no client task is left");
+        match tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await
+            .expect("the real client saw the shutdown")
+        {
+            None | Some(Ok(Message::Close(_))) | Some(Err(_)) => {}
+            Some(Ok(other)) => panic!("expected Close or end of stream, got {other:?}"),
+        }
+    }
+
     /// `shutdown(self)` keeps its sequence (steps 1–5): it neither cancels the upgraded
     /// `/events` client tasks nor waits for them. Only `shutdown_shared` does (step 6).
     #[tokio::test(flavor = "current_thread")]

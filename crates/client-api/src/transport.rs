@@ -1327,6 +1327,80 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
+
+    async fn idle_server() -> ClientApiServer {
+        ClientApiServer::bind_local_factory(0, |addr| {
+            let mut config = crate::ClientApiConfig::default();
+            config.allowed_origins = vec![format!("http://{addr}")];
+            Arc::new(ClientApi::new(config))
+        })
+        .await
+        .expect("bind")
+    }
+
+    /// A tracked stand-in for an upgraded WebSocket task that is still closing: once the
+    /// server cancels its WebSocket tasks it waits for `release`, then sets `done`.
+    fn closing_ws_task(server: &ClientApiServer, release: Arc<Notify>, done: Arc<AtomicBool>) {
+        let cancel = server.ws.cancel.clone();
+        server.ws.tasks.spawn(async move {
+            cancel.cancelled().await;
+            release.notified().await;
+            done.store(true, Ordering::SeqCst);
+        });
+    }
+
+    /// MODULE-001-AC-30: `shutdown_ingress` joins the upgraded WebSocket tasks, it does not
+    /// only cancel them: a task that is still closing keeps the call waiting (within its
+    /// budget), and `ws_joined` is reported only once the task has ended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_001_ac30_shutdown_ingress_waits_for_every_ws_task() {
+        let server = idle_server().await;
+        let ws = server.ws.clone();
+        let (release, done) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        closing_ws_task(&server, release.clone(), done.clone());
+
+        let call = tokio::spawn(server.shutdown_ingress(Duration::from_secs(10)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ws.cancel.is_cancelled() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the WebSocket tasks were cancelled"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !call.is_finished(),
+            "shutdown_ingress waits for the task that is still closing"
+        );
+
+        release.notify_one();
+        let ingress = call.await.unwrap();
+        assert!(ingress.ws_joined);
+        assert!(
+            done.load(Ordering::SeqCst),
+            "the task had ended when shutdown_ingress returned"
+        );
+        assert!(ws.tasks.is_empty());
+    }
+
+    /// MODULE-001-AC-30: a WebSocket task still running at the deadline is reported
+    /// (`ws_joined == false`), not waited for past the budget.
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_001_ac30_shutdown_ingress_reports_a_ws_task_past_its_budget() {
+        let server = idle_server().await;
+        let ws = server.ws.clone();
+        let (release, done) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        closing_ws_task(&server, release.clone(), done.clone());
+
+        let ingress = server.shutdown_ingress(Duration::from_millis(200)).await;
+        assert!(!ingress.ws_joined, "the task outlived the budget");
+        assert!(!done.load(Ordering::SeqCst));
+        assert_eq!(ws.tasks.len(), 1);
+        release.notify_one();
+    }
 
     #[test]
     fn query_values_are_bounded_typed_dtos() {
