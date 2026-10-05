@@ -130,34 +130,32 @@ impl L6Committer for GitQueueL6Committer {
         // r3). The commit was already `submit`ted to the queue, so on spawn
         // failure the worker may still commit (idempotent on `l6_batch_id` if the
         // next trigger retries) — but the bridge never panics.
-        let spawned = std::thread::Builder::new()
-            .name("l6-git-bridge".to_string())
-            .spawn(move || {
-                let outcome = match tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .build()
-                {
-                    Ok(rt) => rt.block_on(async {
-                        // timeout(dur, rx).await:
-                        //   Result<Result<Result<Oid, GitError>, RecvError>, Elapsed>
-                        match tokio::time::timeout(L6_COMMIT_TIMEOUT, rx).await {
-                            Ok(Ok(Ok(oid))) => Ok(oid.to_string()),
-                            Ok(Ok(Err(e))) => Err(L6CommitError::Failed(format!("{e:?}"))),
-                            Ok(Err(_canceled)) => Err(L6CommitError::Failed(
-                                "git commit worker closed (oneshot canceled)".to_string(),
-                            )),
-                            Err(_elapsed) => Err(L6CommitError::Failed(format!(
-                                "git commit timed out after {}s",
-                                L6_COMMIT_TIMEOUT.as_secs()
-                            ))),
-                        }
-                    }),
-                    Err(e) => Err(L6CommitError::Failed(format!(
-                        "git commit bridge runtime build failed: {e}"
-                    ))),
-                };
-                let _ = tx.send(outcome);
-            });
+        let spawned = crate::threads::spawn_named("l6-git-bridge", move || {
+            let outcome = match tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+            {
+                Ok(rt) => rt.block_on(async {
+                    // timeout(dur, rx).await:
+                    //   Result<Result<Result<Oid, GitError>, RecvError>, Elapsed>
+                    match tokio::time::timeout(L6_COMMIT_TIMEOUT, rx).await {
+                        Ok(Ok(Ok(oid))) => Ok(oid.to_string()),
+                        Ok(Ok(Err(e))) => Err(L6CommitError::Failed(format!("{e:?}"))),
+                        Ok(Err(_canceled)) => Err(L6CommitError::Failed(
+                            "git commit worker closed (oneshot canceled)".to_string(),
+                        )),
+                        Err(_elapsed) => Err(L6CommitError::Failed(format!(
+                            "git commit timed out after {}s",
+                            L6_COMMIT_TIMEOUT.as_secs()
+                        ))),
+                    }
+                }),
+                Err(e) => Err(L6CommitError::Failed(format!(
+                    "git commit bridge runtime build failed: {e}"
+                ))),
+            };
+            let _ = tx.send(outcome);
+        });
         if spawned.is_err() {
             return Err(L6CommitError::Failed(
                 "git commit bridge thread spawn failed (host thread exhaustion)".to_string(),

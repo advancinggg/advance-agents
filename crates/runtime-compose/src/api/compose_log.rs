@@ -155,6 +155,20 @@ pub mod log_keys {
     /// stderr: the Client API is unavailable (loopback bind failed).
     pub const CLIENT_API_UNAVAILABLE: &str = "wiring.client_api_unavailable";
 
+    // The ordered shutdown (each only when a bound elapses or a listener fails).
+    /// stderr: Client API requests were still running when the drain budget ran out.
+    pub const COMPOSE_CLIENT_API_DRAIN_OVERRUN: &str = "compose.client_api_drain_overrun";
+    /// stderr: the Client API listener had stopped with an error.
+    pub const COMPOSE_CLIENT_API_SERVE_FAILED: &str = "compose.client_api_serve_failed";
+    /// stderr: `POST /msg` requests were still running when the drain budget ran out.
+    pub const COMPOSE_MSG_LISTENER_DRAIN_OVERRUN: &str = "compose.msg_listener_drain_overrun";
+    /// stderr: `/hooks` requests were still running when the drain budget ran out.
+    pub const COMPOSE_HOOKS_DRAIN_OVERRUN: &str = "compose.hooks_drain_overrun";
+    /// stderr: a ChatGPT token renewal is still finishing (the shutdown waits for it).
+    pub const COMPOSE_SIGN_IN_OVERRUN: &str = "compose.sign_in_overrun";
+    /// stderr: a thread was still running when its join budget ran out (left detached).
+    pub const COMPOSE_THREAD_JOIN_OVERRUN: &str = "compose.thread_join_overrun";
+
     // Objects the daemon does not start, available to embedders.
     /// stdout: an agent reply preview.
     pub const REPLY_AGENT_REPLY: &str = "reply.agent_reply";
@@ -226,6 +240,12 @@ pub mod log_keys {
         CLIENT_API_HISTORY_UNAVAILABLE,
         CLIENT_API_LISTENING,
         CLIENT_API_UNAVAILABLE,
+        COMPOSE_CLIENT_API_DRAIN_OVERRUN,
+        COMPOSE_CLIENT_API_SERVE_FAILED,
+        COMPOSE_MSG_LISTENER_DRAIN_OVERRUN,
+        COMPOSE_HOOKS_DRAIN_OVERRUN,
+        COMPOSE_SIGN_IN_OVERRUN,
+        COMPOSE_THREAD_JOIN_OVERRUN,
         REPLY_AGENT_REPLY,
         WEBHOOK_TRIGGER_SEND_FAILED,
         ROLLBACK_MARK_PRE_TURN_FAILED,

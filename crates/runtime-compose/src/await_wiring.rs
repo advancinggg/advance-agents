@@ -113,10 +113,10 @@ impl RunSuspendSink for RunManagerSuspendSink {
 /// transitive clone through the `MailboxDispatcherImpl` installed with
 /// `.with_event_bus`. At the `wiring.rs` call site the same manager allocation is
 /// retained by registry-held host functions, the `RunManager` await reference and
-/// `ComponentResolutionSink`, and the additive `await_manager_handle`. Therefore the
-/// `builder.build()` error path MUST drop `run_manager`, then `registry`, then
-/// `await_manager_handle` before `shutdown_event_bus_on_error` attempts
-/// `Arc::try_unwrap`; success moves the latter handle into `WiringHandles`.
+/// `ComponentResolutionSink`, and the additive `await_manager_handle`. A wiring
+/// failure hands the started EventBus back and it is shut down through a shared
+/// reference (`EventBus::shutdown_shared`), so these clones need no release order;
+/// success moves the latter handle into `WiringHandles`.
 /// Wave-20 Lane `messagingabi`: also accepts an optional [`AgentIdBridge`] (the
 /// colon/bare equivalence resolver — seam (a)/(b)) and RETURNS the shared concrete
 /// [`MailboxDispatcherImpl`] so the cli composition root can register the `notify`

@@ -37,13 +37,6 @@ const REDACTED: &str = "[REDACTED]";
 /// One adapter's worker thread and its job queue. The adapter submits through it; an
 /// owner shutting the composition down closes the queue (the thread then finishes the job
 /// in hand and exits) and joins the thread once it has finished, never blocking on it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "name and thread are read by the composition's ordered teardown"
-    )
-)]
 pub(crate) struct AdapterWorker<J> {
     name: &'static str,
     jobs: Mutex<Option<mpsc::Sender<J>>>,
@@ -57,9 +50,7 @@ impl<J: Send + 'static> AdapterWorker<J> {
         body: impl FnOnce(mpsc::Receiver<J>) + Send + 'static,
     ) -> std::io::Result<Arc<Self>> {
         let (jobs, receiver) = mpsc::channel::<J>();
-        let thread = std::thread::Builder::new()
-            .name(name.to_owned())
-            .spawn(move || body(receiver))?;
+        let thread = crate::threads::spawn_named(name, move || body(receiver))?;
         Ok(Arc::new(Self {
             name,
             jobs: Mutex::new(Some(jobs)),
@@ -95,19 +86,11 @@ impl<J: Send + 'static> AdapterWorker<J> {
 /// Shutdown control over an [`AdapterWorker`], independent of its job type.
 pub(crate) trait WorkerControl: Send + Sync {
     /// The thread name.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the composition's ordered teardown")
-    )]
     fn name(&self) -> &'static str;
     /// Close the job queue: the thread finishes the job in hand and exits.
     fn close(&self);
     /// Join the thread iff it has finished (never blocks); `true` when it is joined now
     /// or was never started / already joined.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the composition's ordered teardown")
-    )]
     fn try_join(&self) -> bool;
 }
 

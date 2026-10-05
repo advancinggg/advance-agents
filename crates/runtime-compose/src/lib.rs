@@ -16,6 +16,10 @@ pub use api::*;
 // The handle every composition module emits its lines through.
 pub mod compose_log;
 
+// The composition's ordered teardown, and the one place it starts OS threads.
+mod composition;
+mod threads;
+
 // The process-local registry of homes a runtime is composed in (the embedded
 // runtime bridge reserves through it too).
 pub mod registry;

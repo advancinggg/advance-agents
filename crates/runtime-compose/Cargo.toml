@@ -92,6 +92,8 @@ tempfile = { workspace = true }
 futures-core = { workspace = true }
 git2 = { workspace = true }
 wit-component = { workspace = true }
+# `start_paused` for the teardown's bounded waits.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

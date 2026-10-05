@@ -563,13 +563,10 @@ impl std::error::Error for CliWiringError {
     }
 }
 
-/// Aux handles produced by [`wire_capabilities`]. Held by the CLI's
-/// `start::run` (or test callers) for the lifetime of the runtime;
-/// holding `Arc<EventBus>` (concrete) in addition to
-/// `Arc<dyn EventBusEmit>` reserves the option of pre-exit
-/// `EventBus::shutdown(self).await` via `Arc::try_unwrap` (deferred
-/// to a future lifecycle slice; Slice AG relies on process termination
-/// for cleanup — see waived_scope).
+/// Aux handles produced by [`wire_capabilities`]. Held by the composition (or
+/// test callers) for the lifetime of the runtime; the composition takes the
+/// stoppable ones out at shutdown and stops them in order (the concrete
+/// `Arc<EventBus>` is the one it shuts down, `EventBus::shutdown_shared`).
 ///
 /// All other provider state (the real `SecretStore`, the cap-fs resolver +
 /// `AgentTreeStore`, the cap-memory store, the cap-llm gateway, the cap-tools
@@ -782,8 +779,10 @@ pub struct WiringHandles {
     pub pack_runtime: Arc<crate::pack_runtime::PackRuntime>,
     /// The Client API adapters' worker threads (events, history, run control), so an
     /// owner shutting down can close their queues and join them without blocking.
-    #[expect(dead_code, reason = "read by the composition's ordered teardown")]
     pub(crate) adapter_workers: Vec<Arc<dyn crate::client_api_adapters::WorkerControl>>,
+    /// The packs-dir poll task (installs made by another process), so an owner
+    /// shutting down can stop it; dropped, it ends with the runtime.
+    pub(crate) packs_watcher: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1177,23 +1176,74 @@ fn adopt_existing_declared(
     Ok(())
 }
 
-/// Wire the production capability graph. Its diagnostics are not reported; the
-/// daemon composition uses `wire_capabilities_with_log`.
+/// How [`wire_capabilities_inner`] composes: the existing test seams, and where the
+/// wiring and the objects it builds report.
+pub(crate) struct WiringOptions {
+    /// Deterministic DNS and the external HTTP peer inside the channel security chain
+    /// (test seam).
+    pub channel_security_override: Option<crate::channels_boot::ChannelSecurityTestOverride>,
+    /// The canonical HOME the progress-lifecycle anchor is kept under, instead of the
+    /// process `HOME` (test seam).
+    pub home_override: Option<PathBuf>,
+    /// Where the wiring's diagnostics go.
+    pub log: LogHandle,
+}
+
+impl WiringOptions {
+    /// What [`wire_capabilities`] does: no test seam, diagnostics discarded.
+    pub(crate) fn compat() -> Self {
+        Self {
+            channel_security_override: None,
+            home_override: None,
+            log: LogHandle::null(),
+        }
+    }
+}
+
+/// Every stoppable item the wiring starts, recorded as each one is created (an
+/// `Arc` clone or the moved task handle). A failure part-way through the wiring
+/// returns it ([`WiringFailure`]), so what was started is stopped exactly as on
+/// the success path, where the composition takes the same items out of
+/// [`WiringHandles`].
+#[derive(Default)]
+pub(crate) struct HoldStoppers {
+    pub event_bus: Option<Arc<EventBus>>,
+    /// The cap-grant TTL sweeper task and its strong `Arc` (the task holds a `Weak`).
+    pub cap_grant_sweeper_handle: Option<tokio::task::JoinHandle<()>>,
+    pub cap_grant_sweeper_arc: Option<Arc<cap_grant::TtlSweeper>>,
+    pub perchild_manager: Option<Arc<PerChildLoopManager>>,
+    pub git_queue: Option<Arc<DefaultGitCommitQueue>>,
+    pub chatgpt_sign_in: Option<Arc<advance_home::ChatGptSignIn>>,
+    pub packs_watcher: Option<tokio::task::JoinHandle<()>>,
+    pub breaker_subscriber: Option<advance_messaging::BreakerSubscriber>,
+    pub llm_stream_reaper: Option<Arc<cap_llm::AgentStreamReaper>>,
+    pub adapter_workers: Vec<Arc<dyn crate::client_api_adapters::WorkerControl>>,
+}
+
+/// A wiring failure, with everything the wiring had started by then.
+pub(crate) struct WiringFailure {
+    pub error: CliWiringError,
+    pub partial: HoldStoppers,
+}
+
+/// A failure before the wiring started anything that needs stopping (the steps
+/// before the EventBus: their objects are released when they drop).
+impl From<CliWiringError> for WiringFailure {
+    fn from(error: CliWiringError) -> Self {
+        Self {
+            error,
+            partial: HoldStoppers::default(),
+        }
+    }
+}
+
+/// Wire the production capability graph. Its diagnostics are not reported. On a
+/// failure, whatever the wiring had started is stopped before the error returns.
 pub async fn wire_capabilities(
     builder: RuntimeHostBuilder,
     workspace: &Path,
 ) -> Result<(RuntimeHost, WiringHandles), CliWiringError> {
-    wire_capabilities_inner(builder, workspace, None, None, LogHandle::null()).await
-}
-
-/// [`wire_capabilities`] reporting its diagnostics, and those of the objects it
-/// builds, to `log`.
-pub(crate) async fn wire_capabilities_with_log(
-    builder: RuntimeHostBuilder,
-    workspace: &Path,
-    log: LogHandle,
-) -> Result<(RuntimeHost, WiringHandles), CliWiringError> {
-    wire_capabilities_inner(builder, workspace, None, None, log).await
+    wire_and_stop_on_failure(builder, workspace, WiringOptions::compat()).await
 }
 
 /// Test seam: inject a canonical HOME so progress-lifecycle bootstrap does not
@@ -1206,7 +1256,11 @@ pub async fn wire_capabilities_with_home_for_test(
     workspace: &Path,
     home: &Path,
 ) -> Result<(RuntimeHost, WiringHandles), CliWiringError> {
-    wire_capabilities_inner(builder, workspace, None, Some(home), LogHandle::null()).await
+    let opts = WiringOptions {
+        home_override: Some(home.to_path_buf()),
+        ..WiringOptions::compat()
+    };
+    wire_and_stop_on_failure(builder, workspace, opts).await
 }
 
 /// Production-composition witness entry point.  It preserves the complete
@@ -1220,25 +1274,42 @@ pub async fn wire_capabilities_with_channel_security_for_test(
     ssrf: Arc<dyn SsrfGuard>,
     executor: Arc<dyn HttpExecutor>,
 ) -> Result<(RuntimeHost, WiringHandles), CliWiringError> {
-    wire_capabilities_inner(
-        builder,
-        workspace,
-        Some(crate::channels_boot::ChannelSecurityTestOverride::new(
+    let opts = WiringOptions {
+        channel_security_override: Some(crate::channels_boot::ChannelSecurityTestOverride::new(
             ssrf, executor,
         )),
-        None,
-        LogHandle::null(),
-    )
-    .await
+        ..WiringOptions::compat()
+    };
+    wire_and_stop_on_failure(builder, workspace, opts).await
 }
 
-async fn wire_capabilities_inner(
+/// The public entry points' shape: on a failure, stop what the wiring started
+/// (`HoldStoppers::teardown_standalone`), then return the error.
+async fn wire_and_stop_on_failure(
     builder: RuntimeHostBuilder,
     workspace: &Path,
-    channel_security_override: Option<crate::channels_boot::ChannelSecurityTestOverride>,
-    home_override: Option<&Path>,
-    log: LogHandle,
+    opts: WiringOptions,
 ) -> Result<(RuntimeHost, WiringHandles), CliWiringError> {
+    match wire_capabilities_inner(builder, workspace, opts).await {
+        Ok(pair) => Ok(pair),
+        Err(WiringFailure { error, partial }) => {
+            partial.teardown_standalone(&LogHandle::null()).await;
+            Err(error)
+        }
+    }
+}
+
+pub(crate) async fn wire_capabilities_inner(
+    builder: RuntimeHostBuilder,
+    workspace: &Path,
+    opts: WiringOptions,
+) -> Result<(RuntimeHost, WiringHandles), WiringFailure> {
+    let WiringOptions {
+        channel_security_override,
+        home_override,
+        log,
+    } = opts;
+    let home_override = home_override.as_deref();
     // Step 1 — snapshot the agent config YAML ONCE.
     //
     // Audit-R1 (Slice AG) TOCTOU note: the snapshot lets the L0-active checks
@@ -1343,7 +1414,7 @@ async fn wire_capabilities_inner(
                 ),
             ),
             Ok(None) => {}
-            Err(e) => return Err(CliWiringError::MasterKey(e)),
+            Err(e) => return Err(CliWiringError::MasterKey(e).into()),
         }
         Some(load_real_master_key(workspace, &builder.config().secrets)?)
     } else {
@@ -1619,25 +1690,29 @@ async fn wire_capabilities_inner(
         .map_err(CliWiringError::EventBus)?;
     let bus_concrete: Arc<EventBus> = Arc::new(bus);
     let event_bus_dyn: Arc<dyn EventBusEmit> = bus_concrete.clone();
+    // From here on every failure returns what was started; nothing after this
+    // point uses `?`.
+    let mut started = HoldStoppers {
+        event_bus: Some(Arc::clone(&bus_concrete)),
+        ..HoldStoppers::default()
+    };
     // Slice m019-readapi (CONTRACT-185): derive the host-side read surface from the
     // SAME wired bus. `read_api()` returns a handle over internal clones (pool /
-    // broadcaster / clock), NOT an `Arc<EventBus>`, so it does not add a strong ref
-    // to `bus_concrete` and the error-path `Arc::try_unwrap(bus_concrete)` below is
-    // unaffected. `Some` for the production async bus.
+    // broadcaster / clock), NOT an `Arc<EventBus>`. `Some` for the production async bus.
     let observability_read_api = bus_concrete.read_api();
     // Lane cost-attribution: the durable per-agent / per-provider cost ledger over the SAME
     // bus's `events` table. Like `read_api()`, a pool clone — no strong ref to `bus_concrete`.
     let cost_ledger_for_api: Arc<dyn advance_shared_types::traits::CostLedgerQuery> =
         bus_concrete.cost_ledger();
 
-    // Step 4 — cap-grant production. On failure, shut down the EventBus so we
-    // don't leak its background tasks.
+    // Step 4 — cap-grant production. On failure, the started EventBus is handed
+    // back with the error, so it is shut down rather than leaked.
     let agent_config_arg: Option<&Path> = if agent_yaml.is_some() {
         Some(agent_config.as_path())
     } else {
         None
     };
-    let cap_grant = match register_cap_grant(
+    let mut cap_grant = match register_cap_grant(
         builder.sqlite_index_handle(),
         event_bus_dyn.clone(),
         agent_config_arg,
@@ -1646,25 +1721,24 @@ async fn wire_capabilities_inner(
     ) {
         Ok(h) => h,
         Err(e) => {
-            shutdown_event_bus_on_error(bus_concrete, event_bus_dyn).await;
-            return Err(CliWiringError::CapGrant(e));
+            return Err(WiringFailure {
+                error: CliWiringError::CapGrant(e),
+                partial: started,
+            })
         }
     };
+    // The sweeper task is stopped through `started` until the handles are returned.
+    started.cap_grant_sweeper_handle = cap_grant.sweeper_handle.take();
+    started.cap_grant_sweeper_arc = cap_grant.sweeper.clone();
 
     // Step 4b (Phase-3 kickoff) — construct the live per-session RunManager,
     // wired to the EventBus's baked-in CostTracker so the cost gate reads the
-    // accrued per-run cost (CONTRACT-181). Constructed AFTER register_cap_grant
-    // so the cap-grant error path above holds no live `run_manager` clone; only
-    // the later `builder.build()` error path drops it (it holds an
-    // `event_bus_dyn` clone that would otherwise block `Arc::try_unwrap`).
+    // accrued per-run cost (CONTRACT-181).
     // Stage-D (2026-06-19) — build the MODULE-015 auto-loop driver (Some iff the
     // workspace is a git repo; auto-mode needs per-iteration git checkpoints,
     // degrading like git_sync otherwise) and thread its CONTRACT-141
     // RoundAdvancer into the RunManager so a `auto:{agent-id}` complete_round
-    // routes to the auto advancer (run.rs is_auto_mode gate). The driver holds
-    // EventBus sink clones, so it joins the builder.build() error-path drop list
-    // below (alongside run_manager) to keep the EventBus shutdown's
-    // `Arc::try_unwrap(bus_concrete)` unblocked. Wave-7 Lane B (2026-06-22) wires
+    // routes to the auto advancer (run.rs is_auto_mode gate). Wave-7 Lane B (2026-06-22) wires
     // the production scheduler tick-loop (`advance_scheduler::run_scheduler_tick_loop`
     // + `register_extension`, in `start.rs`); the Auto-mode start SUBCOMMAND that
     // populates the tick caller's session registry remains a harvest install point.
@@ -1678,11 +1752,8 @@ async fn wire_capabilities_inner(
     // `ChannelRuntime` is built later in `start.rs`, after this clone — so
     // `cr.transport` is unavailable here; the notify sink is self-contained with its
     // own standalone subscription — MODULE-016 §3.8). On a notify-config `Err`, fail
-    // CLOSED: drop `cap_grant` (it holds `event_bus_dyn` clones via its GrantStore +
-    // sweeper) THEN shut the EventBus down, mirroring the `builder.build()` error-path
-    // drop sequence — else `Arc::try_unwrap(bus_concrete)` fails and the 4 actor tasks
-    // + axum server leak. `run_manager`/`auto_loop_driver`/`registry` are not yet
-    // built at this point, so cap_grant + the bus are the only live bus-clone holders.
+    // CLOSED: the started EventBus and sweeper are handed back with the error and
+    // stopped.
     let runtime_config = builder.config();
     let auto_loop_driver = match runtime_config.channels.notify.as_ref() {
         Some(notify) => {
@@ -1706,8 +1777,10 @@ async fn wire_capabilities_inner(
                 Ok(driver) => driver,
                 Err(e) => {
                     drop(cap_grant);
-                    shutdown_event_bus_on_error(bus_concrete, event_bus_dyn).await;
-                    return Err(CliWiringError::AutoNotify(e));
+                    return Err(WiringFailure {
+                        error: CliWiringError::AutoNotify(e),
+                        partial: started,
+                    });
                 }
             }
         }
@@ -1719,9 +1792,9 @@ async fn wire_capabilities_inner(
     // driver `Arc` is provably UNIQUE here — nothing clones `auto_loop_driver`
     // between its fresh bind above and its FIRST clone (the round-advancer
     // `auto_loop_driver.clone()` in the `run_manager` build below) — so `try_unwrap`
-    // always succeeds; the Err arm is fail-CLOSED (drop cap_grant which holds bus
-    // clones, THEN shut the EventBus) rather than leaking the 4 actor tasks + axum
-    // server. `bus_concrete.cost_tracker_query()` clones an internal Arc (the same
+    // always succeeds; the Err arm is fail-CLOSED (the started EventBus and sweeper
+    // are handed back and stopped). `bus_concrete.cost_tracker_query()` clones an
+    // internal Arc (the same
     // one RunManager consumes below), so calling it here + at the RunManager build
     // is fine.
     // Pack lane P1: the same augment ALSO installs the composition-root
@@ -1737,8 +1810,10 @@ async fn wire_capabilities_inner(
             Ok(driver) => Some(driver),
             Err(e) => {
                 drop(cap_grant);
-                shutdown_event_bus_on_error(bus_concrete, event_bus_dyn).await;
-                return Err(CliWiringError::AutoIntegration(e));
+                return Err(WiringFailure {
+                    error: CliWiringError::AutoIntegration(e),
+                    partial: started,
+                });
             }
         },
         None => None,
@@ -1775,8 +1850,10 @@ async fn wire_capabilities_inner(
         Err(reason) => {
             drop(auto_loop_driver);
             drop(cap_grant);
-            shutdown_event_bus_on_error(bus_concrete, event_bus_dyn).await;
-            return Err(CliWiringError::ChannelRuntime(reason));
+            return Err(WiringFailure {
+                error: CliWiringError::ChannelRuntime(reason),
+                partial: started,
+            });
         }
     };
 
@@ -1835,8 +1912,10 @@ async fn wire_capabilities_inner(
                 drop(channel_runtime);
                 drop(auto_loop_driver);
                 drop(cap_grant);
-                shutdown_event_bus_on_error(bus_concrete, event_bus_dyn).await;
-                return Err(CliWiringError::ProgressLifecycle(error.code()));
+                return Err(WiringFailure {
+                    error: CliWiringError::ProgressLifecycle(error.code()),
+                    partial: started,
+                });
             }
         }
     } else {
@@ -2070,6 +2149,7 @@ async fn wire_capabilities_inner(
                 .with_log(log.clone()),
             );
             perchild_manager = Some(mgr.clone());
+            started.perchild_manager = Some(mgr.clone());
             let observer: Arc<dyn SpawnObserver> = mgr;
             Arc::new(spawner_concrete.with_spawn_observer(observer))
         } else {
@@ -2226,6 +2306,7 @@ async fn wire_capabilities_inner(
     } else {
         None
     };
+    started.git_queue = git_queue_handle.clone();
     // Entity-data lane E1: the cap-fs primitives the `data` host tool writes through are the
     // SAME instances the `fs.*` handlers use (one `.meta.yaml` maintainer = one write lock).
     let mut data_fs_parts: Option<crate::data_wiring::DataFsParts> = None;
@@ -2536,6 +2617,7 @@ async fn wire_capabilities_inner(
             ))
         };
         chatgpt_sign_in = Some(Arc::clone(&sign_in));
+        started.chatgpt_sign_in = Some(Arc::clone(&sign_in));
         // Wave-16 Lane-4 (MODULE-012 AC-17): build the leak/SSRF/rate components
         // with their `security.*` tunables sourced LIVE off the config provider, so
         // a hot-reload takes effect on this LLM-egress chain without restart.
@@ -2672,100 +2754,34 @@ async fn wire_capabilities_inner(
                 .as_ref()
                 .map(|activation| activation.cost_attribution.clone()),
         ));
+        started.llm_stream_reaper = llm_stream_reaper.clone();
     }
 
-    // Step 6 — finalize. On failure, release the registered providers + cap_grant
-    // so their `event_bus_dyn` clones drop, THEN shut down the EventBus.
-    //
-    // Audit-R5 (Codex-Diff W1) fix: the pre-build registrations (fs / memory /
-    // grant / llm) live inside the `InMemoryHostRegistry` that `registry` clones,
-    // and their handlers hold `event_bus_dyn` clones. `build()` consuming
-    // `builder` releases the builder-side registry Arc on its error path, but the
-    // LOCAL `registry` clone would otherwise keep the registry (and its handlers'
-    // bus clones) alive — making `Arc::try_unwrap(bus_concrete)` fail and silently
-    // skipping the EventBus shutdown. (Slice AG never hit this: cap-secrets, its
-    // only pre-build registration, holds no bus clone.) `drop(registry)` releases
-    // the handlers + their bus clones; `drop(cap_grant)` releases the GrantStore's
-    // clone. The spawned sweeper task's transient clone remains the documented
-    // best-effort caveat (process exit reaps it).
+    // Step 6 — finalize. On failure, everything started so far (the EventBus, the
+    // cap-grant sweeper, the per-child manager, the git commit queue, the sign-in
+    // object, the stream reaper) is handed back with the error and stopped in
+    // order; this function's own references are released first.
     let host = match builder.build(cap_grant.grant_check.clone()) {
         Ok(h) => h,
         Err(e) => {
-            // Phase-3 kickoff: `run_manager` (and the gateway's `budget()` clone,
-            // released via `drop(registry)`) hold `event_bus_dyn` clones; drop the
-            // manager too so `Arc::try_unwrap(bus_concrete)` in
-            // `shutdown_event_bus_on_error` can succeed and reap the EventBus tasks.
             drop(run_manager);
-            // W24 perchild-daemon-2 (Codex audit R9): the `PerChildLoopManager` holds an
-            // `event_bus_dyn` clone (SAME allocation as `bus_concrete`, since Wave-23). It
-            // is reachable both via this local `Option` AND the spawn observer inside
-            // `registry` (released by `drop(registry)` below); drop the local too so
-            // `Arc::try_unwrap(bus_concrete)` in `shutdown_event_bus_on_error` can succeed
-            // and reap the EventBus tasks — identical invariant to the sibling drops.
-            // (`crash_cascade_sink` / `breaker_subscriber` hold NO bus clone — the former
-            // takes tree+store+resolver, the latter is spawned only on the success path.)
             drop(perchild_manager);
-            // Stage-D: the auto-loop driver holds EventBus event/notify sink
-            // clones AND is reachable both via the RunManager's RoundAdvancer
-            // (dropped above) and this local Arc. Drop the local Arc too so the
-            // driver — and its bus clones — release before the EventBus shutdown.
             drop(auto_loop_driver);
-            // Backbone Step 2: the captured gateway clone (if llm declared) holds
-            // its own event_bus_dyn + budget clones; drop it too so
-            // `Arc::try_unwrap(bus_concrete)` can reap the EventBus tasks.
             drop(llm_gateway);
-            // Stage-C harvest pass-3: the `LlmGatewayVlm` (if llm declared) holds its OWN
-            // `event_bus_dyn` clone (its `#[allow(dead_code)]` `event_bus` field) — the
-            // SAME allocation as `bus_concrete`, so it must drop here too, else
-            // `Arc::try_unwrap(bus_concrete)` fails and the EventBus shutdown is skipped
-            // (identical invariant to the `drop(llm_gateway)` Audit-R5 fix above).
             drop(vlm_extractor);
-            // m013-intake (AC-24): the operator approval intake holds its own
-            // `event_bus_dyn` clone (SAME allocation as `bus_concrete`) and is
-            // reachable both via this local Arc and the resolver chain held by the
-            // registered request-capability handler (released via `drop(registry)`
-            // below). Drop the local too so `Arc::try_unwrap(bus_concrete)` can reap
-            // the EventBus tasks — identical invariant to the sibling drops above.
             drop(grant_approval_intake);
             drop(cap_grant);
             drop(registry);
-            // Wave-10 Lane C: the hoisted git commit queue's worker holds an
-            // `event_bus_dyn` clone (in its detached task). Drop the handle so it
-            // joins the sibling drops (best-effort EventBus-shutdown drain-signal;
-            // the worker's clone is reaped at process exit — same class as
-            // cap-grant's spawned sweeper).
             drop(git_queue_handle);
-            // W24 perchild-daemon-2 (Codex audit R10): the skills turn-runtime
-            // (`SkillTurnRuntime`, if the agent declares skills) holds its OWN
-            // `event_bus_dyn` clone — constructed from the `event_bus_dyn.clone()`
-            // ctor arg above, the SAME allocation as `bus_concrete`. The
-            // `skill_turn_runtime_handle` local is consumed only on the SUCCESS path
-            // (moved into the returned `WiringHandles`), so on this Err arm it is
-            // still a live holder; drop it too so `Arc::try_unwrap(bus_concrete)` in
-            // `shutdown_event_bus_on_error` can succeed and reap the EventBus tasks —
-            // identical invariant to the sibling drops. (Pre-existing since the
-            // live-skill-turn-persistence wave; completes the drop-list this lane's
-            // R9 `drop(perchild_manager)` fix began.)
             drop(skill_turn_runtime_handle);
-            // W24 req270-sink (Codex audit R1): the composition-root
-            // `await_manager_handle` clone (captured before the `if let Some(manager)
-            // = await_manager` consume, for `WiringHandles.await_manager`) retains an
-            // `AwaitSessionManagerImpl` Arc, which holds its OWN `event_bus_dyn` clone
-            // (SAME allocation as `bus_concrete`, since Wave-15). It is consumed only on
-            // the SUCCESS path (moved into `WiringHandles`), so on this Err arm it is
-            // still a live holder; drop it too so `Arc::try_unwrap(bus_concrete)` in
-            // `shutdown_event_bus_on_error` can succeed and reap the EventBus tasks —
-            // identical invariant to the sibling drops. `None` on the non-messaging
-            // daemon (drop is a no-op then).
             drop(await_manager_handle);
-            // Joint activation and the staged channel runtime each retain the
-            // production EventBus through rejection/HTTP sinks. They are not
-            // visible until success, so release both before attempting shutdown.
             drop(progress_lifecycle);
             drop(channel_runtime);
             drop(reply_registry);
-            shutdown_event_bus_on_error(bus_concrete, event_bus_dyn).await;
-            return Err(CliWiringError::Bootstrap(e));
+            return Err(WiringFailure {
+                error: CliWiringError::Bootstrap(e),
+                partial: started,
+            });
         }
     };
 
@@ -2774,8 +2790,9 @@ async fn wire_capabilities_inner(
     let _ = pack_runtime.apply().await;
     // Installs / uninstalls made by ANOTHER process (`advance pack install` from a shell while
     // the daemon runs) reach the runtime through the packs dir's `.meta.yaml` index. The task
-    // holds a weak reference and ends with the runtime.
-    let _packs_watcher = pack_runtime.spawn_packs_watcher(crate::pack_runtime::PACKS_POLL_INTERVAL);
+    // holds a weak reference; its owner stops it at shutdown.
+    started.packs_watcher =
+        Some(pack_runtime.spawn_packs_watcher(crate::pack_runtime::PACKS_POLL_INTERVAL));
 
     // Step 7 — cap-tools, POST-build. The `LazyToolRegistry` engine handle only
     // exists once `ComponentRuntime` is built. `host.host_registry()` is the
@@ -2941,7 +2958,7 @@ async fn wire_capabilities_inner(
     // W24 seam (f): attach the per-agent circuit-breaker→mailbox-freeze subscriber
     // over the shared messaging store (breaker-open for a served child freezes its
     // mailbox → pauses ingress; close unfreezes). ONE subscriber covers all children.
-    let breaker_subscriber = messaging_store.as_ref().map(|store| {
+    started.breaker_subscriber = messaging_store.as_ref().map(|store| {
         advance_messaging::BreakerSubscriber::spawn(host.circuit_breaker_bus(), store.clone())
     });
 
@@ -3032,7 +3049,6 @@ async fn wire_capabilities_inner(
         })
     };
     let provider_admin_for_api = provider_admin.clone();
-    let mut adapter_workers: Vec<Arc<dyn crate::client_api_adapters::WorkerControl>> = Vec::new();
     let client_api_server = match observability_read_api.as_ref() {
         Some(read) => {
             let history_events = match (
@@ -3047,12 +3063,12 @@ async fn wire_capabilities_inner(
                         Arc::clone(read),
                         Arc::clone(projector),
                         Arc::clone(carriers),
-                        &mut adapter_workers,
+                        &mut started.adapter_workers,
                     );
                     let events = Contract185EventAdapter::new_tracked(
                         Arc::clone(read),
                         client_event_retention_days,
-                        &mut adapter_workers,
+                        &mut started.adapter_workers,
                     );
                     match (history, events) {
                         (Ok(h), Ok(e)) => Some((h, e, Arc::clone(projector))),
@@ -3177,7 +3193,7 @@ async fn wire_capabilities_inner(
                 Arc::new(api)
             };
             let bound = advance_client_api::ClientApiServer::bind_local_factory(0, factory).await;
-            adapter_workers.append(
+            started.adapter_workers.append(
                 &mut run_control_workers
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
@@ -3212,6 +3228,8 @@ async fn wire_capabilities_inner(
 
     let tools_grant_reader: Option<Arc<dyn ToolsGrantReader>> =
         Some(Arc::new(ToolsGrantReaderImpl::new(cap_grant.store.clone())));
+    // The sweeper task goes back where its owners read it.
+    cap_grant.sweeper_handle = started.cap_grant_sweeper_handle.take();
     Ok((
         host,
         WiringHandles {
@@ -3221,7 +3239,7 @@ async fn wire_capabilities_inner(
             grant_approval_intake,
             perchild_manager,
             crash_cascade_sink: perchild_crash_sink,
-            breaker_subscriber,
+            breaker_subscriber: started.breaker_subscriber.take(),
             event_bus: bus_concrete,
             event_bus_dyn,
             observability_read_api,
@@ -3265,7 +3283,8 @@ async fn wire_capabilities_inner(
             web_grant: web_grant_handle,
             pack: pack_wiring,
             pack_runtime,
-            adapter_workers,
+            adapter_workers: std::mem::take(&mut started.adapter_workers),
+            packs_watcher: started.packs_watcher.take(),
         },
     ))
 }
@@ -3379,25 +3398,6 @@ impl RepetitionGuardCheck for NotWiredRepetitionGuard {
     }
     fn record_output(&self, _agent_id: &str, _output_hash: OutputHash) -> RepetitionDecision {
         RepetitionDecision::Pass
-    }
-}
-
-/// Audit-R1 (Slice AG) Codex-Warning 1 fix: on a post-EventBus-construction
-/// error, try to gracefully shut down the bus so we don't leak the 4 actor
-/// tasks + axum HTTP server. `EventBus::shutdown(self).await` consumes by
-/// value, so we reclaim the concrete EventBus via `Arc::try_unwrap` after
-/// dropping the dyn-Arc clone. On failure (an Arc we don't know about is
-/// alive), accept the leak; process exit reaps via the cancel_token mechanism.
-async fn shutdown_event_bus_on_error(
-    bus_concrete: Arc<EventBus>,
-    event_bus_dyn: Arc<dyn EventBusEmit>,
-) {
-    drop(event_bus_dyn);
-    match Arc::try_unwrap(bus_concrete) {
-        Ok(bus) => bus.shutdown().await,
-        Err(_arc_still_shared) => {
-            // Defensive — should not happen given the controlled call sites.
-        }
     }
 }
 

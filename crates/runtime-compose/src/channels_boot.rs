@@ -53,6 +53,7 @@ use zeroize::Zeroizing;
 use crate::api::log_keys;
 use crate::compose_log::LogHandle;
 use crate::execution_turn_ingress::ExecutionTurnIngress;
+use tokio_util::sync::CancellationToken;
 
 /// Build the three HTTP-security-chain components with their `security.*` tunables
 /// sourced **live** off the `RuntimeConfigProvider` (Wave-16 Lane-4, MODULE-012
@@ -494,15 +495,25 @@ pub async fn spawn_hooks_listener(
     supervisor: Arc<TransportSupervisor>,
     addr: SocketAddr,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
-    spawn_hooks_listener_with(supervisor, addr, LogHandle::null()).await
+    spawn_hooks_listener_with(
+        supervisor,
+        addr,
+        LogHandle::null(),
+        CancellationToken::new(),
+    )
+    .await
+    .map(|(task, _addr)| task)
 }
 
-/// [`spawn_hooks_listener`] reporting the bound address and a serve error to `log`.
+/// [`spawn_hooks_listener`] reporting the bound address and a serve error to `log`,
+/// and stopping gracefully once `shutdown` is cancelled (no new connection; the
+/// requests in flight finish). Returns the serve task and the bound address.
 pub(crate) async fn spawn_hooks_listener_with(
     supervisor: Arc<TransportSupervisor>,
     addr: SocketAddr,
     log: LogHandle,
-) -> Result<tokio::task::JoinHandle<()>, String> {
+    shutdown: CancellationToken,
+) -> Result<(tokio::task::JoinHandle<()>, SocketAddr), String> {
     let app = Router::new()
         .route("/hooks/{route}", post(handle_hook))
         .layer(DefaultBodyLimit::max(DEFAULT_MAX_BODY_BYTES))
@@ -517,14 +528,18 @@ pub(crate) async fn spawn_hooks_listener_with(
         log_keys::HOOKS_LISTENER,
         format!("advance: channel /hooks listener on http://{bound}/hooks/{{route}}"),
     );
-    Ok(tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+    let task = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+        {
             log.err(
                 log_keys::HOOKS_LISTENER_STOPPED,
                 format!("advance: /hooks listener stopped: {e}"),
             );
         }
-    }))
+    });
+    Ok((task, bound))
 }
 
 /// Spawn the host pump: drain `poll_host_pump` over every channel subscription,

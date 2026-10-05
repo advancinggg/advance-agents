@@ -3005,21 +3005,19 @@ impl ExclusiveCustody {
         };
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::channel();
-        let thread = std::thread::Builder::new()
-            .name("contract218-anchor-custody".to_owned())
-            .spawn(move || {
-                let mut lock = FileRwLock::new(file);
-                match lock.try_write() {
-                    Ok(_guard) => {
-                        let _ = ready_tx.send(Ok(()));
-                        let _ = release_rx.recv();
-                    }
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error));
-                    }
-                };
-            })
-            .map_err(|error| unavailable("spawn anchor custody thread", error))?;
+        let thread = crate::threads::spawn_named("contract218-anchor-custody", move || {
+            let mut lock = FileRwLock::new(file);
+            match lock.try_write() {
+                Ok(_guard) => {
+                    let _ = ready_tx.send(Ok(()));
+                    let _ = release_rx.recv();
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                }
+            };
+        })
+        .map_err(|error| unavailable("spawn anchor custody thread", error))?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 identity,

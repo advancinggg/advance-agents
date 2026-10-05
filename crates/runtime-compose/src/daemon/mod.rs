@@ -8,7 +8,8 @@
 //! agent-loop driver's `serve` SERVING LOOP ([`crate::agent_loop::build_agent_loop`]
 //! → `AgentLoopDriverImpl::serve`) on a cancellable task — serving consecutive
 //! `POST /msg` requests and carrying agent state across turns. Parks until
-//! SIGINT / SIGTERM; releases the runtime lock on shutdown via `RuntimeLock::Drop`.
+//! SIGINT / SIGTERM, then stops everything in order (`crate::composition`),
+//! releasing the runtime lock last.
 //!
 //! The load is ONE-SHOT — the bytes are read exactly once at boot, there is no
 //! file watcher, and changing the deployed binary requires a restart (MODULE-001
@@ -93,8 +94,11 @@ use crate::channel_egress::{ChannelEgress, DaemonOutboundSink};
 use crate::channels_boot;
 use crate::execution_turn_ingress::ExecutionTurnIngress;
 
-use crate::api::log_keys;
+use crate::api::{log_keys, ComposeError, LockFailure};
 use crate::compose_log::{LogHandle, StdioComposeLog};
+use crate::composition::{Composition, GuardHold, TeardownReason};
+use crate::wiring::{HoldStoppers, WiringFailure, WiringHandles, WiringOptions};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 struct ProgressLoopWiring {
@@ -281,15 +285,14 @@ async fn run_async(workspace: Option<PathBuf>, log: LogHandle) -> ExitCode {
     };
     let config_path = workspace.join(".advance").join("runtime-config.yaml");
 
-    // 4. Acquire the single-active-runtime lock. Drop releases it.
+    // 4. Acquire the single-active-runtime lock. The teardown releases it last
+    //    (heartbeat joined, then the file removed); a failure before the composition
+    //    exists releases it at once.
     //    Heartbeat default 30s per MODULE-001 §1.4.3; staleness threshold
     //    is the lock's own concern (2 min internally).
-    let _lock = match RuntimeLock::acquire(&workspace, Duration::from_secs(30)).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("advance start: failed to acquire runtime lock: {e}");
-            return ExitCode::from(1);
-        }
+    let guard = match RuntimeLock::acquire(&workspace, Duration::from_secs(30)).await {
+        Ok(lock) => GuardHold::new(lock),
+        Err(e) => return startup_failed(ComposeError::Lock(LockFailure::from_lock_error(&e))),
     };
 
     // 5. Construct the runtime host via the Slice AG production wiring
@@ -308,26 +311,125 @@ async fn run_async(workspace: Option<PathBuf>, log: LogHandle) -> ExitCode {
         Err(BootstrapError::Config(ConfigError::IoError { source, .. }))
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
-            eprintln!(
-                "advance start: runtime-config.yaml not found at {}; run `advance init <workspace>` first",
-                safe_path(&config_path)
-            );
-            return ExitCode::from(1);
+            guard.release().await;
+            return startup_failed(ComposeError::ConfigNotFound { path: config_path });
         }
         Err(e) => {
-            eprintln!("advance start: bootstrap failed: {e}");
-            return ExitCode::from(1);
+            guard.release().await;
+            return startup_failed(ComposeError::Bootstrap(e.to_string()));
+        }
+    };
+    // The config watcher and its WAL-mode observer are stopped by the teardown.
+    let config_watcher = builder.config_watcher();
+    let wal_observer = builder.take_wal_observer();
+
+    // 5b–5d. Compose the capability graph, the agent loop and its listeners. A failure
+    //    after part of it started stops what started (no line printed), then reports.
+    let opts = GraphOptions {
+        log: log.clone(),
+        wiring: WiringOptions {
+            log: log.clone(),
+            ..WiringOptions::compat()
+        },
+    };
+    let composition = match compose_graph(builder, &workspace, opts).await {
+        Ok(graph) => Composition::from_graph(graph, config_watcher, wal_observer, guard, log),
+        Err(GraphFailure { error, partial }) => {
+            let composition = match partial {
+                PartialGraph::Graph(graph) => {
+                    Composition::from_graph(*graph, config_watcher, wal_observer, guard, log)
+                }
+                PartialGraph::Wiring(stoppers) => Composition::from_stoppers(
+                    stoppers,
+                    Some(config_watcher),
+                    wal_observer,
+                    Some(guard),
+                    log,
+                ),
+            };
+            composition.teardown(TeardownReason::StartupFailed).await;
+            return startup_failed(error);
         }
     };
 
-    // 5b. Wire production cap-grant + cap-secrets + EventBus.
-    // Plan-Eval R1 Warning 4 fix: let-binding ORDER hints at forward-compat
-    // graceful-shutdown intent but is NOT load-bearing for Slice AG
-    // correctness — Slice AG relies on process termination for cleanup
-    // (Tokio runtime drops at process exit, cancelling all spawned tasks).
-    // wiring_handles is declared AFTER _lock so a future graceful-shutdown
-    // slice can rely on the drop order (handles before lock release). Its
-    // `event_bus_dyn` is threaded into the agent loop (EventBusRejectionSink).
+    // 6. Park until SIGINT / SIGTERM. Listeners were installed in step 1 (above
+    //    lock-acquire) so any signal received during lock-acquire or bootstrap
+    //    is captured and pending; the .recv() here just resolves immediately
+    //    in that case.
+    #[cfg(unix)]
+    park_until_shutdown_unix(listeners).await;
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+
+    // 7. The ordered shutdown: ingress, loops (then `advance: shutting down`), the
+    //    holds in dependency order, the runtime lock last.
+    composition.teardown(TeardownReason::Requested).await;
+    ExitCode::SUCCESS
+}
+
+/// Report a startup failure the way `advance start` always has (`advance start: …` on
+/// stderr) and exit 1.
+fn startup_failed(error: ComposeError) -> ExitCode {
+    eprintln!("advance start: {error}");
+    ExitCode::from(1)
+}
+
+/// What [`compose_graph`] composes with.
+pub(crate) struct GraphOptions {
+    /// Where the composition's lines go.
+    pub log: LogHandle,
+    /// The capability wiring's options.
+    pub wiring: WiringOptions,
+}
+
+/// Everything [`compose_graph`] started, handed to the composition's teardown.
+pub(crate) struct ComposedGraph {
+    pub host: RuntimeHost,
+    pub wiring_handles: WiringHandles,
+    /// Rewrites `.runtime/selected-provider` on every applied config reload.
+    pub selected_provider_task: Option<tokio::task::JoinHandle<()>>,
+    pub agent_loop: Option<SpawnedAgentLoop>,
+    pub msg_listener: Option<Listener>,
+    pub auto_tick: Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
+    pub readiness_walk: Option<crate::runnable_walk::ContinuousReadinessWalk>,
+}
+
+/// What a failed [`compose_graph`] had started.
+pub(crate) enum PartialGraph {
+    /// The capability wiring failed part-way: what it had started.
+    Wiring(HoldStoppers),
+    /// A later step failed: the graph so far.
+    Graph(Box<ComposedGraph>),
+}
+
+/// A [`compose_graph`] failure: the error `advance start` reports, and what to stop.
+pub(crate) struct GraphFailure {
+    pub error: ComposeError,
+    pub partial: PartialGraph,
+}
+
+/// A listener stopped gracefully: cancelling `shutdown` stops accepting and lets the
+/// requests in flight finish; `task` ends once they have.
+pub(crate) struct Listener {
+    pub shutdown: CancellationToken,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
+/// Compose the daemon graph on `builder`: the capability wiring, the readiness line,
+/// the agent loop and its listeners, the auto tick loop and the readiness walk. On a
+/// failure after part of it started, the error comes back with what started.
+pub(crate) async fn compose_graph(
+    builder: RuntimeHostBuilder,
+    workspace: &Path,
+    opts: GraphOptions,
+) -> Result<ComposedGraph, GraphFailure> {
+    let GraphOptions { log, wiring } = opts;
+    let workspace = workspace.to_path_buf();
+    // 5b. Wire production cap-grant + cap-secrets + EventBus. The host and the
+    // handles go to the composition, which stops them in order at shutdown; the
+    // handles' `event_bus_dyn` is threaded into the agent loop (EventBusRejectionSink).
     //
     // Audit-R1 Claude-Diff-Warning 2 fix: dropped the NotFound branch arm
     // that was unreachable in practice — the friendly missing-config
@@ -339,15 +441,17 @@ async fn run_async(workspace: Option<PathBuf>, log: LogHandle) -> ExitCode {
     // Step-2 fix in `wiring.rs`. Surface any wiring failure with the
     // generic diagnostic.
     let (host, wiring_handles) =
-        match crate::wiring::wire_capabilities_with_log(builder, &workspace, log.clone()).await {
+        match crate::wiring::wire_capabilities_inner(builder, &workspace, wiring).await {
             Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("advance start: wiring failed: {e}");
-                return ExitCode::from(1);
+            Err(WiringFailure { error, partial }) => {
+                return Err(GraphFailure {
+                    error: ComposeError::Wiring(error.to_string()),
+                    partial: PartialGraph::Wiring(partial),
+                })
             }
         };
 
-    {
+    let selected_provider_task = {
         let pid = std::process::id();
         let first = host
             .config()
@@ -358,7 +462,7 @@ async fn run_async(workspace: Option<PathBuf>, log: LogHandle) -> ExitCode {
         let _ = advance_home::write_selected_provider(&workspace, pid, &first);
         let mut rx = host.config_watcher().subscribe();
         let ws = workspace.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             while let Some(cfg) = rx.recv().await {
                 let id = cfg
                     .llm_providers
@@ -367,15 +471,25 @@ async fn run_async(workspace: Option<PathBuf>, log: LogHandle) -> ExitCode {
                     .unwrap_or_default();
                 let _ = advance_home::write_selected_provider(&ws, pid, &id);
             }
-        });
-    }
+        }))
+    };
 
     if let Err(e) = log.ready(format!(
         "advance: runtime ready (workspace={})",
         safe_path(&workspace)
     )) {
-        eprintln!("advance start: failed to flush readiness signal: {e}");
-        return ExitCode::from(1);
+        return Err(GraphFailure {
+            error: ComposeError::Readiness(e),
+            partial: PartialGraph::Graph(Box::new(ComposedGraph {
+                host,
+                wiring_handles,
+                selected_provider_task,
+                agent_loop: None,
+                msg_listener: None,
+                auto_tick: None,
+                readiness_walk: None,
+            })),
+        });
     }
 
     // 5c — Slice BS-3 (D12): one-shot load of a deployed agent component (if
@@ -460,14 +574,27 @@ async fn run_async(workspace: Option<PathBuf>, log: LogHandle) -> ExitCode {
         wiring_handles.tools_grant_reader.clone(),
         wiring_handles.web_grant.clone(),
         Some(wiring_handles.pack_runtime.clone()),
-        &log,
+        LoopSpawnExtras {
+            log: log.clone(),
+            hooks_shutdown: CancellationToken::new(),
+        },
     )
     .await
     {
         Ok(spawned) => spawned,
-        Err(msg) => {
-            eprintln!("advance start: {msg}");
-            return ExitCode::from(1);
+        Err(e) => {
+            return Err(GraphFailure {
+                error: e.into_compose_error(),
+                partial: PartialGraph::Graph(Box::new(ComposedGraph {
+                    host,
+                    wiring_handles,
+                    selected_provider_task,
+                    agent_loop: None,
+                    msg_listener: None,
+                    auto_tick: None,
+                    readiness_walk: None,
+                })),
+            })
         }
     };
     if let Some(spawned) = agent_loop.as_ref() {
@@ -497,40 +624,49 @@ async fn run_async(workspace: Option<PathBuf>, log: LogHandle) -> ExitCode {
     //      `POST /msg` inbound message source over the SAME `MailboxStore` the
     //      loop reads, so an external POST wakes the parked serving loop
     //      (`serve`). No loop (no deployed component) → no listener (nothing
-    //      to wake). Borrow `agent_loop` here (don't move it) so it stays owned
-    //      for the shutdown abort below.
+    //      to wake). Borrow `agent_loop` here (don't move it) so it stays in the
+    //      graph the teardown stops.
     //      Audit r1 Warning: when channels are configured they REPLACE the POST
     //      /msg shim — skip the POST listener so a channel turn can never cancel
     //      a pending POST reply slot (no POST↔channel mis-correlation).
-    let msg_listener = if let Some(spawned) = agent_loop.as_ref() {
-        if spawned.channels_active {
+    let msg_listener = match agent_loop.as_ref() {
+        Some(spawned) if spawned.channels_active => {
             log.out(
                 log_keys::CHANNELS_POST_MSG_DISABLED,
                 "advance: channels configured — POST /msg shim disabled (replaced by /hooks)",
             );
-            None
-        } else {
-            match spawn_msg_listener(
-                spawned.store.clone(),
-                spawned.execution_ingress.clone(),
-                spawned.agent_id.clone(),
-                spawned.reply_registry.clone(),
-                spawned.done.clone(),
-                spawned.in_flight.clone(),
-                log.clone(),
-            )
-            .await
-            {
-                Ok(handle) => Some(handle),
-                Err(msg) => {
-                    eprintln!("advance start: {msg}");
-                    spawned.handle.abort(); // tear down the loop we already spawned
-                    return ExitCode::from(1);
-                }
-            }
+            Ok(None)
         }
-    } else {
-        None
+        Some(spawned) => spawn_msg_listener(
+            spawned.store.clone(),
+            spawned.execution_ingress.clone(),
+            spawned.agent_id.clone(),
+            spawned.reply_registry.clone(),
+            spawned.done.clone(),
+            spawned.in_flight.clone(),
+            log.clone(),
+        )
+        .await
+        .map(Some),
+        None => Ok(None),
+    };
+    let msg_listener = match msg_listener {
+        Ok(listener) => listener,
+        // The loop already spawned is stopped by the teardown.
+        Err(msg) => {
+            return Err(GraphFailure {
+                error: ComposeError::Listener(msg),
+                partial: PartialGraph::Graph(Box::new(ComposedGraph {
+                    host,
+                    wiring_handles,
+                    selected_provider_task,
+                    agent_loop,
+                    msg_listener: None,
+                    auto_tick: None,
+                    readiness_walk: None,
+                })),
+            })
+        }
     };
 
     // Wave-7 Lane B (183/185): wire the PRODUCTION auto tick caller. When a
@@ -706,52 +842,15 @@ async fn run_async(workspace: Option<PathBuf>, log: LogHandle) -> ExitCode {
         }
     };
 
-    // 6. Park until SIGINT / SIGTERM. Listeners were installed in step 1 (above
-    //    lock-acquire) so any signal received during lock-acquire or bootstrap
-    //    is captured and pending; the .recv() here just resolves immediately
-    //    in that case.
-    #[cfg(unix)]
-    park_until_shutdown_unix(listeners).await;
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-
-    // Cancel the inbound listener + the agent-loop task before dropping the host
-    // so neither outlives the runtime it borrows capability handles from.
-    if let Some(handle) = msg_listener {
-        handle.abort();
-    }
-    if let Some(spawned) = agent_loop {
-        spawned.handle.abort();
-        for h in spawned.channel_handles {
-            h.abort();
-        }
-    }
-    // Wave-23 seam (d): abort any per-child serve loops the spawn observer started,
-    // alongside the root loop, before `_host`/`_lock` drop. Then release the manager's
-    // runtime and injector: through the host registry they hold the manager itself, a
-    // cycle that would otherwise keep the whole wiring graph (and the git commit
-    // queue's worker, which the runtime's drop waits for) alive.
-    if let Some(mgr) = wiring_handles.perchild_manager.as_ref() {
-        mgr.drain();
-        mgr.unbind();
-    }
-    // Wave-7 Lane B: stop the auto tick loop. cancel() FIRST (graceful — the loop's
-    // `select!` sees the token and returns Ok at the next await point), THEN abort()
-    // (force, in case it is mid in-flight tick), before `_host`/`_lock` drop so the
-    // loop never outlives the runtime whose handles the coordinator clones borrow.
-    if let Some((cancel, handle)) = auto_tick {
-        cancel.cancel();
-        handle.abort();
-    }
-    // Stop the registry reconciler and every driver before dropping the runtime host.
-    if let Some(walk) = readiness_walk {
-        walk.shutdown().await;
-    }
-    log.out(log_keys::SHUTTING_DOWN, "advance: shutting down");
-    // _host and _lock drop here, releasing resources.
-    ExitCode::SUCCESS
+    Ok(ComposedGraph {
+        host,
+        wiring_handles,
+        selected_provider_task,
+        agent_loop,
+        msg_listener,
+        auto_tick,
+        readiness_walk,
+    })
 }
 
 // Compile-time witness: the daemon composition future is `Send + 'static`, so it can
@@ -946,20 +1045,22 @@ async fn try_spawn_agent_loop(
     tools_grant_reader: Option<Arc<dyn advance_shared_types::traits::ToolsGrantReader>>,
     web_grant: Option<Arc<dyn advance_shared_types::traits::GrantCheck>>,
     pack_runtime: Option<Arc<crate::pack_runtime::PackRuntime>>,
-    log: &LogHandle,
-) -> Result<Option<SpawnedAgentLoop>, String> {
+    extras: LoopSpawnExtras,
+) -> Result<Option<SpawnedAgentLoop>, SpawnLoopError> {
+    let log = &extras.log;
     // MODULE-001-AC-20 (024): resolve the canonical materialized name + (if a core
     // module) encode it to a Component on the fly. `None` → no driver deployed → park.
-    let (driver_path, bytes) = match resolve_driver_component_bytes(workspace)? {
-        Some(pair) => pair,
-        None => return Ok(None),
-    };
+    let (driver_path, bytes) =
+        match resolve_driver_component_bytes(workspace).map_err(SpawnLoopError::AgentLoop)? {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
     let runtime = host.component_runtime();
     let loaded = runtime.load_component(&bytes).map_err(|e| {
-        format!(
+        SpawnLoopError::AgentLoop(format!(
             "deployed component {} failed to load: {e:?}",
             safe_path(&driver_path)
-        )
+        ))
     })?;
     let injector = host.capability_injector();
     // TWO agent ids — the two id grammars are incompatible (see DEFAULT_MSG_AGENT_ID):
@@ -1297,8 +1398,9 @@ async fn try_spawn_agent_loop(
         config_data: None,
         trigger_context: None,
     };
-    let component_id = ComponentId::new("agent-default-inst".to_string())
-        .map_err(|_| "internal: static component instance id is invalid".to_string())?;
+    let component_id = ComponentId::new("agent-default-inst".to_string()).map_err(|_| {
+        SpawnLoopError::AgentLoop("internal: static component instance id is invalid".to_string())
+    })?;
     let instance = WasmInstance::new(component_id);
     log.out(
         log_keys::AGENT_LOOP_WIRED,
@@ -1330,22 +1432,26 @@ async fn try_spawn_agent_loop(
         .map(|progress| progress.ingress.clone());
     // Phase-2 Step-3: when channels are configured, bind the shared `/hooks`
     // listener + spawn the host pump (poll_host_pump → Message → mailbox → serve).
-    let mut channel_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut hooks = None;
+    let mut host_pump = None;
     if let Some(cr) = channel_rt {
         match channels_boot::spawn_hooks_listener_with(
             cr.supervisor.clone(),
             cr.listen_addr,
             log.clone(),
+            extras.hooks_shutdown.clone(),
         )
         .await
         {
-            Ok(h) => channel_handles.push(h),
+            Ok((task, _addr)) => hooks = Some((extras.hooks_shutdown.clone(), task)),
             Err(msg) => {
+                // The loop spawned above ends here: it is aborted and awaited.
                 handle.abort();
-                return Err(msg);
+                let _ = handle.await;
+                return Err(SpawnLoopError::Listener(msg));
             }
         }
-        channel_handles.push(match execution_ingress.as_ref() {
+        host_pump = Some(match execution_ingress.as_ref() {
             Some(ingress) => channels_boot::spawn_protected_host_pump(
                 cr.manager.clone(),
                 cr.identity.clone(),
@@ -1372,18 +1478,55 @@ async fn try_spawn_agent_loop(
         done: done_rx,
         in_flight,
         execution_ingress,
-        channel_handles,
+        hooks,
+        host_pump,
         channels_active,
         tools_inventory: client_api_tools,
     }))
 }
 
+/// What the composition hands [`try_spawn_agent_loop`] besides the loop's own parts.
+#[derive(Default)]
+pub(crate) struct LoopSpawnExtras {
+    /// Where the loop, its observers and its listeners report.
+    pub log: LogHandle,
+    /// Cancelled to stop the channel `/hooks` listener gracefully.
+    pub hooks_shutdown: CancellationToken,
+}
+
+/// Why [`try_spawn_agent_loop`] failed.
+#[derive(Debug)]
+pub(crate) enum SpawnLoopError {
+    /// The deployed component could not be read, encoded or loaded.
+    AgentLoop(String),
+    /// The channel `/hooks` listener could not be bound.
+    Listener(String),
+}
+
+impl SpawnLoopError {
+    fn into_compose_error(self) -> ComposeError {
+        match self {
+            SpawnLoopError::AgentLoop(msg) => ComposeError::AgentLoop(msg),
+            SpawnLoopError::Listener(msg) => ComposeError::Listener(msg),
+        }
+    }
+}
+
+impl std::fmt::Display for SpawnLoopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnLoopError::AgentLoop(msg) | SpawnLoopError::Listener(msg) => f.write_str(msg),
+        }
+    }
+}
+
 /// A spawned agent loop plus the shared `MailboxStore` it reads from and the
-/// messaging agent id it runs under. `run_async` hands the store + reply registry
+/// messaging agent id it runs under. `compose_graph` hands the store + reply registry
 /// + done watch to the `POST /msg` listener so an inbound message wakes the parked
-/// turn and its reply is correlated back, and aborts `handle` on shutdown.
-struct SpawnedAgentLoop {
-    handle: tokio::task::JoinHandle<()>,
+/// turn and its reply is correlated back; the teardown stops `handle`, `hooks` and
+/// `host_pump`.
+pub(crate) struct SpawnedAgentLoop {
+    pub(crate) handle: tokio::task::JoinHandle<()>,
     store: Arc<MailboxStore>,
     /// The MESSAGING id (`DEFAULT_MSG_AGENT_ID`) — the mailbox key + POST target.
     agent_id: String,
@@ -1398,9 +1541,11 @@ struct SpawnedAgentLoop {
     in_flight: Arc<AtomicBool>,
     /// C216 external ingress. `Some` only when the joint graph is active.
     execution_ingress: Option<Arc<ExecutionTurnIngress>>,
-    /// Phase-2 Step-3: the `/hooks` listener + host-pump task handles (when
-    /// channels are configured). Aborted on shutdown alongside the loop.
-    channel_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Phase-2 Step-3 (when channels are configured): the `/hooks` listener with
+    /// its graceful-shutdown token, stopped with the other ingress at shutdown…
+    pub(crate) hooks: Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
+    /// …and the host pump, stopped with the loops.
+    pub(crate) host_pump: Option<tokio::task::JoinHandle<()>>,
     /// Phase-2 Step-3: true when channels are configured — the POST /msg shim
     /// listener is then NOT spawned (channels replace it).
     channels_active: bool,
@@ -1428,8 +1573,12 @@ impl TestServeLoop {
 impl Drop for TestServeLoop {
     fn drop(&mut self) {
         self.inner.handle.abort();
-        for handle in &self.inner.channel_handles {
-            handle.abort();
+        if let Some((shutdown, task)) = &self.inner.hooks {
+            shutdown.cancel();
+            task.abort();
+        }
+        if let Some(pump) = &self.inner.host_pump {
+            pump.abort();
         }
     }
 }
@@ -1496,10 +1645,11 @@ pub async fn spawn_test_agent_loop(
         handles.tools_grant_reader.clone(),
         handles.web_grant.clone(),
         Some(handles.pack_runtime.clone()),
-        &LogHandle::null(),
+        LoopSpawnExtras::default(),
     )
     .await
     .map(|spawned| spawned.map(|inner| TestServeLoop { inner }))
+    .map_err(|e| e.to_string())
 }
 
 /// Phase-2 Step-2 per-turn observer wired into the serving loop. Fired at the END
@@ -1580,13 +1730,17 @@ struct MsgListenerState {
     /// The agent-id-keyed registry holds one slot per agent, so a concurrent 2nd
     /// POST would collide; it is rejected (409) until the in-flight turn finishes.
     in_flight: Arc<AtomicBool>,
+    /// Cancelled when the daemon shuts down: the listener stops accepting, and a
+    /// POST still waiting for its turn's reply answers 503 (unless the reply landed).
+    shutdown: CancellationToken,
 }
 
 /// Spawn the in-process HTTP `POST /msg` listener over `store`. Binds
 /// `127.0.0.1:0` (OS-assigned port) and prints the bound address so operators
-/// and tests can discover it. Returns the serve task's `JoinHandle` (aborted on
-/// shutdown). This is the e2e-spine inbound seam; a configurable bind addr and
-/// the dispatcher-routed `/hooks/*` channel path are Phase-2 (MODULE-016).
+/// and tests can discover it. Returns the listener, stopped gracefully at
+/// shutdown through its token. This is the e2e-spine inbound seam; a configurable
+/// bind addr and the dispatcher-routed `/hooks/*` channel path are Phase-2
+/// (MODULE-016).
 async fn spawn_msg_listener(
     store: Arc<MailboxStore>,
     execution_ingress: Option<Arc<ExecutionTurnIngress>>,
@@ -1595,7 +1749,8 @@ async fn spawn_msg_listener(
     done: watch::Receiver<bool>,
     in_flight: Arc<AtomicBool>,
     log: LogHandle,
-) -> Result<tokio::task::JoinHandle<()>, String> {
+) -> Result<Listener, String> {
+    let shutdown = CancellationToken::new();
     let state = MsgListenerState {
         store,
         execution_ingress,
@@ -1606,6 +1761,7 @@ async fn spawn_msg_listener(
         // Phase-2 Step-2: SHARED with the serving loop's `WatchTurnObserver`
         // (which clears it at each turn boundary) — was created here per-listener.
         in_flight,
+        shutdown: shutdown.clone(),
     };
     // Cap the inbound body at the mailbox payload bound (1 MiB) so a grossly
     // oversized POST is rejected by axum BEFORE it is buffered + JSON-parsed +
@@ -1625,14 +1781,19 @@ async fn spawn_msg_listener(
         log_keys::MSG_LISTENER,
         format!("advance: msg listener on http://{addr}/msg"),
     );
-    Ok(tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+    let stop = shutdown.clone().cancelled_owned();
+    let task = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(stop)
+            .await
+        {
             log.err(
                 log_keys::MSG_LISTENER_STOPPED,
                 format!("advance: msg listener stopped: {e}"),
             );
         }
-    }))
+    });
+    Ok(Listener { shutdown, task })
 }
 
 /// Map a resolved reply to an HTTP outcome: a produced reply → `200` + raw bytes;
@@ -1671,9 +1832,9 @@ async fn handle_msg(
     if target != *state.default_agent_id {
         return (StatusCode::NOT_FOUND, Vec::new());
     }
-    // The serving loop has terminated (shutdown / abort / panic) — no future turn
-    // will fulfil a reply. Fail fast instead of hanging.
-    if *state.done.borrow() {
+    // The serving loop has terminated (shutdown / abort / panic) or the daemon is
+    // shutting down — no future turn will fulfil a reply. Fail fast instead of hanging.
+    if *state.done.borrow() || state.shutdown.is_cancelled() {
         return (StatusCode::SERVICE_UNAVAILABLE, Vec::new());
     }
     // Enforce single in-flight POST (the registry is agent-id-keyed). CAS the
@@ -1728,6 +1889,7 @@ async fn handle_msg(
         biased;
         r = &mut rx => Outcome::Reply(r),
         _ = done.wait_for(|&d| d) => Outcome::DaemonGone,
+        _ = state.shutdown.cancelled() => Outcome::DaemonGone,
         _ = tokio::time::sleep(REPLY_TIMEOUT) => Outcome::Timeout,
     };
     match outcome {
@@ -1737,9 +1899,10 @@ async fn handle_msg(
         // The observer cancelled a pending slot → this was a no-reply turn
         // (validator-reject / assemble-error / trap that never reached dispatch).
         Outcome::Reply(Err(_)) => (StatusCode::BAD_GATEWAY, Vec::new()),
-        // The serving loop terminated (shutdown / abort / panic) while we waited.
-        // Honor a reply that landed in the same instant; else the daemon is going
-        // away → 503. Cancel any still-pending slot so no sender leaks.
+        // The serving loop terminated (shutdown / abort / panic), or the daemon began
+        // shutting down, while we waited. Honor a reply that landed in the same
+        // instant; else the daemon is going away → 503. Cancel any still-pending slot
+        // so no sender leaks.
         Outcome::DaemonGone => match rx.try_recv() {
             Ok(reply) => map_reply(reply),
             Err(_) => {
