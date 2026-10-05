@@ -1987,11 +1987,17 @@ impl RuntimeConfigWatcher {
     /// Stop watching, while the owner still holds the watcher:
     ///
     /// 1. no `runtime.config_reloaded` event is emitted any more;
-    /// 2. the OS file watcher is dropped on the blocking pool (on macOS its drop
-    ///    joins the FSEvents thread);
-    /// 3. the fingerprint poll task and the bridge task are aborted and awaited;
-    /// 4. every subscriber channel is closed: each `subscribe()` receiver then
-    ///    yields `None`, so the tasks reading them end.
+    /// 2. the OS file watcher is handed to a thread of its own that drops it (on
+    ///    macOS that drop waits for the FSEvents run-loop thread to go idle and
+    ///    joins it, which can take seconds);
+    /// 3. meanwhile the fingerprint poll task and the bridge task are aborted and
+    ///    awaited, and every subscriber channel is closed: each `subscribe()`
+    ///    receiver then yields `None`, so the tasks reading them end;
+    /// 4. last, the release thread is awaited (polled, so no runtime thread blocks).
+    ///
+    /// A caller that bounds this call (a shutdown with a deadline) therefore gets
+    /// every effect but the end of the OS watcher's release, which then finishes on
+    /// its own thread: the OS watcher is never dropped inside a cancelled future.
     ///
     /// [`RuntimeConfigProvider::current`] keeps answering the last applied config.
     /// A `subscribe()` after `stop` gets a receiver that never yields. Idempotent.
@@ -2002,9 +2008,7 @@ impl RuntimeConfigWatcher {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some(watcher) = watcher {
-            let _ = tokio::task::spawn_blocking(move || drop(watcher)).await;
-        }
+        let release = watcher.and_then(release_os_watcher);
         let poll = self.poll.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(poll) = poll {
             poll.abort();
@@ -2023,6 +2027,12 @@ impl RuntimeConfigWatcher {
                 .unwrap_or_else(|e| e.into_inner()),
         );
         drop(subscribers);
+        if let Some(release) = release {
+            while !release.is_finished() {
+                tokio::time::sleep(OS_WATCHER_RELEASE_POLL).await;
+            }
+            let _ = release.join();
+        }
     }
 
     /// Install (or replace) the `runtime.config_reloaded` event sink
@@ -2059,6 +2069,19 @@ impl RuntimeConfigWatcher {
         // last-ref `Drop` under a held guard would poison the Mutex.
         drop(old);
     }
+}
+
+/// How often [`RuntimeConfigWatcher::stop`] checks whether the OS watcher's release
+/// thread has finished.
+const OS_WATCHER_RELEASE_POLL: Duration = Duration::from_millis(10);
+
+/// Drop `watcher` on a thread of its own and return that thread. When no thread can be
+/// started, `spawn` drops its closure, and with it the watcher, right here.
+fn release_os_watcher(watcher: RecommendedWatcher) -> Option<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("advance-config-watch-release".to_owned())
+        .spawn(move || drop(watcher))
+        .ok()
 }
 
 impl Drop for RuntimeConfigWatcher {

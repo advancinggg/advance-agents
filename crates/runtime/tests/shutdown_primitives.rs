@@ -4,11 +4,16 @@
 //! `current()`); `RuntimeHostBuilder::take_wal_observer` hands out the WAL-mode observer
 //! task, which ends once the watcher is stopped.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use advance_runtime::config::{RuntimeConfigProvider, RuntimeConfigWatcher};
 use advance_runtime::runtime_lock::RuntimeLock;
 use advance_runtime::RuntimeHostBuilder;
+
+/// Bound on the OS watcher's release inside `RuntimeConfigWatcher::stop`. Generous on purpose:
+/// on macOS it waits for the FSEvents run loop, whose latency is the platform's.
+const OS_WATCHER_RELEASE_BOUND: Duration = Duration::from_secs(60);
 
 const MINIMAL_VALID_YAML: &str = "\
 wasm:
@@ -87,28 +92,39 @@ async fn module_001_ac30_runtime_lock_release_joins_heartbeat() {
     assert!(!lock_path.exists(), "Drop still removes an unreleased lock");
 }
 
+/// `stop` closes every subscriber channel without waiting for the OS watcher's release: on
+/// macOS that release waits for the FSEvents run-loop thread, which can take seconds right
+/// after the watch started, so the subscribers are checked while `stop` may still be
+/// waiting, and `stop` itself only has to finish within a generous bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_001_ac30_config_watcher_stop_clears_subscribers() {
     let (_dir, _workspace, config_path) = fresh_workspace();
-    let watcher = RuntimeConfigWatcher::new(&config_path)
-        .await
-        .expect("watch");
+    let watcher = Arc::new(
+        RuntimeConfigWatcher::new(&config_path)
+            .await
+            .expect("watch"),
+    );
     let mut first = watcher.subscribe();
     let mut second = watcher.subscribe();
     let before = watcher.current();
 
-    tokio::time::timeout(Duration::from_secs(5), watcher.stop())
-        .await
-        .expect("stop finished");
+    let stopping = tokio::spawn({
+        let watcher = Arc::clone(&watcher);
+        async move { watcher.stop().await }
+    });
 
     for (name, rx) in [("first", &mut first), ("second", &mut second)] {
         let next = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
-            .unwrap_or_else(|_| panic!("{name} subscriber not closed within 2s"));
+            .unwrap_or_else(|_| panic!("{name} subscriber not closed within 2s of stop"));
         assert!(next.is_none(), "{name} subscriber channel is closed");
     }
+    tokio::time::timeout(OS_WATCHER_RELEASE_BOUND, stopping)
+        .await
+        .expect("stop finished once the OS watcher was released")
+        .expect("stop did not panic");
     // The last applied config is still served.
-    assert!(std::sync::Arc::ptr_eq(&before, &watcher.current()));
+    assert!(Arc::ptr_eq(&before, &watcher.current()));
 
     // A rewrite after stop is not applied (nothing watches any more).
     let rewritten = MINIMAL_VALID_YAML.replace("max_memory_pages: 1024", "max_memory_pages: 2048");
