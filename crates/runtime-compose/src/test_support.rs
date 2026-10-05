@@ -30,7 +30,8 @@ pub const WIRING_FAILPOINT: &str = "T111 wiring failpoint";
 #[derive(Clone, Default)]
 pub struct ComposeFailpoints {
     /// The `POST /msg` listener's bind fails with an `io::Error` of this kind (message
-    /// [`POST_MSG_FAILPOINT`]), after the agent loop started.
+    /// [`POST_MSG_FAILPOINT`]), after the agent loop started. The error takes the place
+    /// of the bind's result, so the listener reports it as it reports a real one.
     pub post_msg_bind: Option<io::ErrorKind>,
     /// The capability wiring fails right after the git commit queue started (message
     /// [`WIRING_FAILPOINT`]).

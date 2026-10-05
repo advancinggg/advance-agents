@@ -1682,15 +1682,6 @@ async fn spawn_msg_listener(
         #[cfg(feature = "test-support")]
         probe,
     } = extras;
-    #[cfg(feature = "test-support")]
-    {
-        if let Some(kind) = bind_failpoint {
-            return Err(format!(
-                "failed to bind POST /msg listener: {}",
-                std::io::Error::new(kind, crate::test_support::POST_MSG_FAILPOINT)
-            ));
-        }
-    }
     let shutdown = CancellationToken::new();
     let state = MsgListenerState {
         store,
@@ -1712,9 +1703,19 @@ async fn spawn_msg_listener(
         .route("/msg", post(handle_msg))
         .layer(DefaultBodyLimit::max(MAX_PAYLOAD_BYTES))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| format!("failed to bind POST /msg listener: {e}"))?;
+    #[cfg(not(feature = "test-support"))]
+    let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await;
+    // The failpoint stands in for the bind's result, so its error is reported exactly as
+    // a real bind failure is.
+    #[cfg(feature = "test-support")]
+    let bound = match bind_failpoint {
+        Some(kind) => Err(std::io::Error::new(
+            kind,
+            crate::test_support::POST_MSG_FAILPOINT,
+        )),
+        None => tokio::net::TcpListener::bind("127.0.0.1:0").await,
+    };
+    let listener = bound.map_err(|e| format!("failed to bind POST /msg listener: {e}"))?;
     let addr = listener
         .local_addr()
         .map_err(|e| format!("failed to read POST /msg listener address: {e}"))?;

@@ -39,6 +39,7 @@ async fn module_001_ac30_t111_7_post_msg_bind_failure_tears_down() {
     .await
     .expect_err("the POST /msg listener cannot bind");
     assert!(matches!(error, ComposeError::Listener(_)), "{error:?}");
+    // The failpoint replaces only the bind's result: the text is the listener's own.
     assert_eq!(
         error.to_string(),
         format!(
