@@ -10,18 +10,37 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use advance_client_api::clock::SystemClock;
 use advance_client_api::{
-    AeadClientCursorCodec, ClientApi, ClientApiConfig, ClientApiServer, ClientCursorCodec,
-    ClientErrorCode, ClientEventProvider, ClientRequest, ClientSession, DeltaHoldSplit,
-    DeltaPumpExit, HandlerSpec, LlmDeltaHub, MemoryCursorKeyCustody, Method, NormalizedEventFilter,
-    OsCursorEntropy, Platform, Principal, ProviderError, RawEventRow, Scope, SystemCursorClock,
-    API_VERSION, CLIENT_WS_PROTOCOL,
+    AeadClientCursorCodec, AgentAdminProvider, BoundGrantApprovalPort, BoundGrantMutation,
+    BoundHistoryPage, BoundHistoryReadPort, BoundMutationOutcome, ClientAgentCostEntry,
+    ClientAgentCostReport, ClientAgentDeleteResult, ClientAgentDetail, ClientAgentSummary,
+    ClientAgentTemplate, ClientAgentTreeNode, ClientApi, ClientApiConfig, ClientApiServer,
+    ClientCreateAgentRequest, ClientCreateProviderRequest, ClientCursorCodec,
+    ClientDeleteAgentRequest, ClientEntityApplyRequest, ClientEntityCreateRequest,
+    ClientEntityPage, ClientEntityPatchRequest, ClientEntityQueryRequest, ClientEntityRow,
+    ClientEntityTarget, ClientErrorCode, ClientEventProvider, ClientMessageAck,
+    ClientMessageStatus, ClientPackApplyResult, ClientPackDetail, ClientPackInstallRequest,
+    ClientPackInstallResult, ClientPackSummary, ClientPackUninstallResult, ClientProviderCostEntry,
+    ClientProviderCostReport, ClientProviderDeleteResult, ClientProviderKeyResult,
+    ClientProviderPreflightResult, ClientProviderSummary, ClientRequest, ClientRunMutation,
+    ClientRunSummary, ClientSchema, ClientSecretsMode, ClientSession, ClientSetSecretsModeRequest,
+    ClientToolInventory, ClientUpdateAgentRequest, ClientUpdateProviderRequest, CostProvider,
+    DeltaHoldSplit, DeltaPumpExit, DeltaPumpExitObserver, EntityProvider, HandlerSpec, LlmDeltaHub,
+    MemoryCursorKeyCustody, MessagingProvider, Method, NormalizedEventFilter, OsCursorEntropy,
+    PackAdminProvider, Platform, Principal, ProviderAdminOutcome, ProviderAdminProvider,
+    ProviderClientDoneReceipt, ProviderError, ProviderMutationRecovery, ProviderPrepareOutcome,
+    RawEventRow, RunControlProvider, Scope, SecretsAdminProvider, SystemCursorClock, ToolsProvider,
+    ValidatedCostWindow, API_VERSION, CLIENT_WS_PROTOCOL,
 };
 use advance_shared_types::security_validator::LeakDetector;
+use advance_shared_types::sensitive_observation::{
+    BoundObservationDocument, SensitiveObservationRedactor,
+};
+use advance_shared_types::test_support::observation_association_roles;
 use cap_http::canonical_facade::decoded_hold_split;
 use cap_http::DefaultLeakDetector;
 use futures::StreamExt;
@@ -354,23 +373,368 @@ fn events_request() -> ClientRequest {
     }
 }
 
+/// A provider for every port the Client API has a slot for. Never called: it only shows that
+/// `clear_providers` drops what each slot held.
+struct Sentinel;
+
+impl RunControlProvider for Sentinel {
+    fn list_runs(&self) -> Result<Vec<ClientRunSummary>, ProviderError> {
+        unreachable!()
+    }
+    fn agent_tree(&self) -> Result<Vec<ClientAgentTreeNode>, ProviderError> {
+        unreachable!()
+    }
+    fn pause(&self, _: &str, _: Option<&str>) -> Result<ClientRunMutation, ProviderError> {
+        unreachable!()
+    }
+    fn resume(&self, _: &str, _: Option<&str>) -> Result<ClientRunMutation, ProviderError> {
+        unreachable!()
+    }
+    fn cancel(&self, _: &str, _: Option<&str>) -> Result<ClientRunMutation, ProviderError> {
+        unreachable!()
+    }
+}
+
+impl MessagingProvider for Sentinel {
+    fn send(&self, _: &str, _: &[u8]) -> Result<ClientMessageAck, ProviderError> {
+        unreachable!()
+    }
+    fn message_status(&self, _: &str) -> Result<ClientMessageStatus, ProviderError> {
+        unreachable!()
+    }
+}
+
+impl ToolsProvider for Sentinel {
+    fn inventory(&self, _: &str) -> Result<ClientToolInventory, ProviderError> {
+        unreachable!()
+    }
+}
+
+impl AgentAdminProvider for Sentinel {
+    fn list_agents(&self) -> Result<Vec<ClientAgentSummary>, ProviderError> {
+        unreachable!()
+    }
+    fn get_agent(&self, _: &str) -> Result<ClientAgentDetail, ProviderError> {
+        unreachable!()
+    }
+    fn create_agent(
+        &self,
+        _: &ClientCreateAgentRequest,
+    ) -> Result<ClientAgentDetail, ProviderError> {
+        unreachable!()
+    }
+    fn update_agent(
+        &self,
+        _: &str,
+        _: &ClientUpdateAgentRequest,
+    ) -> Result<ClientAgentDetail, ProviderError> {
+        unreachable!()
+    }
+    fn delete_agent(
+        &self,
+        _: &str,
+        _: &ClientDeleteAgentRequest,
+    ) -> Result<ClientAgentDeleteResult, ProviderError> {
+        unreachable!()
+    }
+    fn list_templates(&self) -> Result<Vec<ClientAgentTemplate>, ProviderError> {
+        unreachable!()
+    }
+}
+
+impl CostProvider for Sentinel {
+    fn agent_totals(
+        &self,
+        _: &ValidatedCostWindow,
+    ) -> Result<Vec<ClientAgentCostEntry>, ProviderError> {
+        unreachable!()
+    }
+    fn agent_report(
+        &self,
+        _: &str,
+        _: &ValidatedCostWindow,
+    ) -> Result<ClientAgentCostReport, ProviderError> {
+        unreachable!()
+    }
+    fn provider_totals(
+        &self,
+        _: &ValidatedCostWindow,
+    ) -> Result<Vec<ClientProviderCostEntry>, ProviderError> {
+        unreachable!()
+    }
+    fn provider_report(
+        &self,
+        _: &str,
+        _: &ValidatedCostWindow,
+    ) -> Result<ClientProviderCostReport, ProviderError> {
+        unreachable!()
+    }
+}
+
+impl PackAdminProvider for Sentinel {
+    fn list_packs(&self) -> Result<Vec<ClientPackSummary>, ProviderError> {
+        unreachable!()
+    }
+    fn get_pack(&self, _: &str, _: &str) -> Result<ClientPackDetail, ProviderError> {
+        unreachable!()
+    }
+    fn install_pack(
+        &self,
+        _: &ClientPackInstallRequest,
+    ) -> Result<ClientPackInstallResult, ProviderError> {
+        unreachable!()
+    }
+    fn uninstall_pack(&self, _: &str, _: &str) -> Result<ClientPackUninstallResult, ProviderError> {
+        unreachable!()
+    }
+    fn apply_pack_workflow(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<ClientPackApplyResult, ProviderError> {
+        unreachable!()
+    }
+}
+
+impl EntityProvider for Sentinel {
+    fn describe(&self) -> Result<ClientSchema, ProviderError> {
+        unreachable!()
+    }
+    fn query(&self, _: &ClientEntityQueryRequest) -> Result<ClientEntityPage, ProviderError> {
+        unreachable!()
+    }
+    fn get(&self, _: &str, _: &str) -> Result<ClientEntityRow, ProviderError> {
+        unreachable!()
+    }
+    fn create(&self, _: &ClientEntityCreateRequest) -> Result<ClientEntityRow, ProviderError> {
+        unreachable!()
+    }
+    fn patch(
+        &self,
+        _: &str,
+        _: &ClientEntityPatchRequest,
+    ) -> Result<ClientEntityRow, ProviderError> {
+        unreachable!()
+    }
+    fn apply(
+        &self,
+        _: &str,
+        _: &ClientEntityApplyRequest,
+    ) -> Result<Vec<ClientEntityRow>, ProviderError> {
+        unreachable!()
+    }
+    fn promote(&self, _: &str, _: &str) -> Result<ClientEntityTarget, ProviderError> {
+        unreachable!()
+    }
+    fn demote(&self, _: &str, _: &str) -> Result<ClientEntityTarget, ProviderError> {
+        unreachable!()
+    }
+}
+
+impl ProviderAdminProvider for Sentinel {
+    fn list_providers(&self) -> Result<Vec<ClientProviderSummary>, ProviderError> {
+        unreachable!()
+    }
+    fn get_provider(&self, _: &str) -> Result<ClientProviderSummary, ProviderError> {
+        unreachable!()
+    }
+    fn create_provider(
+        &self,
+        _: &ClientCreateProviderRequest,
+    ) -> Result<ProviderAdminOutcome<ClientProviderSummary>, ProviderError> {
+        unreachable!()
+    }
+    fn update_provider(
+        &self,
+        _: &str,
+        _: &ClientUpdateProviderRequest,
+    ) -> Result<ProviderAdminOutcome<ClientProviderSummary>, ProviderError> {
+        unreachable!()
+    }
+    fn delete_provider(
+        &self,
+        _: &str,
+    ) -> Result<ProviderAdminOutcome<ClientProviderDeleteResult>, ProviderError> {
+        unreachable!()
+    }
+    fn set_key(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<ProviderAdminOutcome<ClientProviderKeyResult>, ProviderError> {
+        unreachable!()
+    }
+    fn clear_key(&self, _: &str) -> Result<ClientProviderSummary, ProviderError> {
+        unreachable!()
+    }
+    fn preflight(&self, _: &str) -> Result<ClientProviderPreflightResult, ProviderError> {
+        unreachable!()
+    }
+    fn select_provider(
+        &self,
+        _: &str,
+    ) -> Result<ProviderAdminOutcome<ClientProviderSummary>, ProviderError> {
+        unreachable!()
+    }
+}
+
+impl SecretsAdminProvider for Sentinel {
+    fn mode(&self) -> Result<ClientSecretsMode, ProviderError> {
+        unreachable!()
+    }
+    fn set_mode(
+        &self,
+        _: &ClientSetSecretsModeRequest,
+    ) -> Result<ClientSecretsMode, ProviderError> {
+        unreachable!()
+    }
+}
+
+impl BoundGrantApprovalPort for Sentinel {
+    fn list_pending_bound(&self) -> Result<Vec<BoundObservationDocument>, ProviderError> {
+        unreachable!()
+    }
+    fn prepare_mutation_bound(
+        &self,
+        _: [u8; 32],
+        _: [u8; 32],
+        _: BoundGrantMutation,
+    ) -> ProviderPrepareOutcome {
+        unreachable!()
+    }
+    fn verify_recovery_ticket_bound(
+        &self,
+        _: [u8; 32],
+        _: [u8; 32],
+        _: u8,
+        _: &ProviderMutationRecovery,
+    ) -> Result<(), ProviderError> {
+        unreachable!()
+    }
+    fn execute_prepared_bound(&self, _: &ProviderMutationRecovery) -> BoundMutationOutcome {
+        unreachable!()
+    }
+    fn recover_mutation_bound(&self, _: &ProviderMutationRecovery) -> BoundMutationOutcome {
+        unreachable!()
+    }
+    fn acknowledge_client_done_bound(
+        &self,
+        _: &ProviderClientDoneReceipt,
+    ) -> Result<(), ProviderError> {
+        unreachable!()
+    }
+}
+
+impl BoundHistoryReadPort for Sentinel {
+    fn task_history_bound(
+        &self,
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<BoundHistoryPage, ProviderError> {
+        unreachable!()
+    }
+    fn run_history_bound(
+        &self,
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<BoundHistoryPage, ProviderError> {
+        unreachable!()
+    }
+}
+
+/// An observation redactor that is never called.
+fn sentinel_redactor() -> SensitiveObservationRedactor {
+    let roles = observation_association_roles([0x55; 32], [0x66; 16], Vec::new()).expect("roles");
+    roles
+        .provider
+        .bind_once(roles.verifier, |_| unreachable!())
+        .expect("redactor")
+}
+
+/// A probe that tells whether anything still holds `held`.
+fn probe<T: ?Sized + 'static>(
+    name: &'static str,
+    held: &Arc<T>,
+) -> (&'static str, Box<dyn Fn() -> bool>) {
+    let weak = Arc::downgrade(held);
+    (name, Box::new(move || weak.strong_count() > 0))
+}
+
+/// `clear_providers` empties every provider slot: each provider installed through its builder
+/// (and held by nothing else) is dropped, and the families answer `module_unavailable`.
 #[test]
 fn module_001_ac30_client_api_clear_providers() {
-    let events: Arc<dyn ClientEventProvider> = Arc::new(EmptyEvents);
-    let detector: Arc<dyn LeakDetector> = Arc::new(DefaultLeakDetector::new());
-    let cursor = codec();
-    let hub = delta_hub();
-    let weak_events: Weak<dyn ClientEventProvider> = Arc::downgrade(&events);
-    let weak_detector: Weak<dyn LeakDetector> = Arc::downgrade(&detector);
-    let weak_cursor: Weak<dyn ClientCursorCodec> = Arc::downgrade(&cursor);
-    let weak_hub = Arc::downgrade(&hub);
-
-    let api = ClientApi::new(ClientApiConfig::default())
-        .with_event_provider(events)
-        .with_leak_detector(detector)
-        .with_cursor_codec(cursor)
-        .with_llm_delta_hub(hub);
+    let (api, probes) = {
+        let run = Arc::new(Sentinel);
+        let messaging = Arc::new(Sentinel);
+        let tools = Arc::new(Sentinel);
+        let agent = Arc::new(Sentinel);
+        let cost = Arc::new(Sentinel);
+        let pack = Arc::new(Sentinel);
+        let provider_admin = Arc::new(Sentinel);
+        let secrets = Arc::new(Sentinel);
+        let entity = Arc::new(Sentinel);
+        let events: Arc<dyn ClientEventProvider> = Arc::new(EmptyEvents);
+        let detector: Arc<dyn LeakDetector> = Arc::new(DefaultLeakDetector::new());
+        let cursor = codec();
+        let bound_grant = Arc::new(Sentinel);
+        let bound_history = Arc::new(Sentinel);
+        let redactor = Arc::new(sentinel_redactor());
+        let hub = delta_hub();
+        let observer: DeltaPumpExitObserver = Arc::new(|_| {});
+        let probes = vec![
+            probe("run", &run),
+            probe("messaging", &messaging),
+            probe("tools", &tools),
+            probe("agent", &agent),
+            probe("cost", &cost),
+            probe("pack", &pack),
+            probe("provider_admin", &provider_admin),
+            probe("secrets", &secrets),
+            probe("entity", &entity),
+            probe("event", &events),
+            probe("leak_detector", &detector),
+            probe("cursor_codec", &cursor),
+            probe("bound_grant", &bound_grant),
+            probe("bound_history", &bound_history),
+            probe("observation_redactor", &redactor),
+            probe("llm_delta_hub", &hub),
+            probe("delta_pump_observer", &observer),
+        ];
+        let api = ClientApi::new(ClientApiConfig::default())
+            .with_run_provider(run)
+            .with_messaging_provider(messaging)
+            .with_tools_provider(tools)
+            .with_agent_provider(agent)
+            .with_cost_provider(cost)
+            .with_pack_provider(pack)
+            .with_provider_admin(provider_admin)
+            .with_secrets_provider(secrets)
+            .with_entity_provider(entity)
+            .with_event_provider(events)
+            .with_leak_detector(detector)
+            .with_cursor_codec(cursor)
+            .with_bound_grant_provider(bound_grant)
+            .with_bound_history_provider(bound_history)
+            .with_observation_redactor(redactor)
+            .with_llm_delta_hub(hub)
+            .with_delta_pump_observer(observer);
+        (api, probes)
+    };
     install_session(&api);
+    let alive = |probes: &[(&'static str, Box<dyn Fn() -> bool>)]| -> Vec<&'static str> {
+        probes
+            .iter()
+            .filter(|(_, alive)| alive())
+            .map(|(name, _)| *name)
+            .collect()
+    };
+    assert_eq!(
+        alive(&probes).len(),
+        probes.len(),
+        "every provider is held by its slot before the clear"
+    );
 
     let before = api.handle(events_request());
     assert!(before.is_ok(), "events family served before: {before:?}");
@@ -380,10 +744,11 @@ fn module_001_ac30_client_api_clear_providers() {
     let after = api.handle(events_request());
     let error = after.error.as_ref().expect("events family refused after");
     assert_eq!(error.code, ClientErrorCode::ModuleUnavailable);
-    assert!(weak_events.upgrade().is_none(), "event provider dropped");
-    assert!(weak_detector.upgrade().is_none(), "leak detector dropped");
-    assert!(weak_cursor.upgrade().is_none(), "cursor codec dropped");
-    assert!(weak_hub.upgrade().is_none(), "delta hub dropped");
+    assert_eq!(
+        alive(&probes),
+        Vec::<&str>::new(),
+        "slots still holding their provider after clear_providers"
+    );
 
     // Idempotent; the sessions survive.
     api.clear_providers();
