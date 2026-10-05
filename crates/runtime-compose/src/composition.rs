@@ -11,7 +11,8 @@
 //!    settled and the stream reaper stopped. A requested shutdown then prints
 //!    `advance: shutting down`;
 //! 3. **extension hooks** — each extension's shutdown hook, in reverse registration
-//!    order, each bounded and isolated from the others' panics;
+//!    order, each bounded and isolated from the others' panics; then the composition
+//!    lets go of the extensions;
 //! 4. **holds**, in dependency order — the selected-provider writer, the config
 //!    watcher and its WAL-mode observer, the packs poll, the cap-grant sweeper, the
 //!    breaker subscriber, the ChatGPT sign-in (a renewal already started is awaited,
@@ -506,6 +507,9 @@ impl Composition {
             self.extension_tasks.wait().await;
             self.steps.record("extensions.tasks");
         }
+        // The composition lets go of its extensions here: nothing of theirs is dropped
+        // after the holds or the instance guard.
+        drop(extensions);
 
         // ── Step 4: holds, in dependency order. ───────────────────────────────────
         if let Some(task) = self.selected_provider_task.take() {
@@ -1060,6 +1064,81 @@ mod tests {
                 "{reason:?}"
             );
         }
+    }
+
+    /// An extension that records, when it is dropped, the teardown steps that had run by
+    /// then and whether the runtime lock file still existed.
+    struct DropWitness {
+        probe: Arc<crate::test_support::ComposeProbe>,
+        lock_path: std::path::PathBuf,
+        seen: Arc<Mutex<Option<(Vec<&'static str>, bool)>>>,
+    }
+
+    impl ComposeExtension for DropWitness {
+        fn id(&self) -> &'static str {
+            "drop-witness"
+        }
+
+        fn shutdown<'a>(&'a self) -> crate::api::BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    impl Drop for DropWitness {
+        fn drop(&mut self) {
+            *self.seen.lock().unwrap() =
+                Some((self.probe.record().step_names(), self.lock_path.exists()));
+        }
+    }
+
+    /// The composition lets go of an extension right after the shutdown hooks: before
+    /// any hold is released and while the instance guard is still held.
+    #[tokio::test]
+    async fn module_001_ac30_extensions_are_let_go_after_their_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        let lock = RuntimeLock::acquire(&home, Duration::from_secs(30))
+            .await
+            .expect("lock");
+        let lock_path = lock.path().to_path_buf();
+        let guard = GuardHold::new(
+            HomeReservation::acquire(home.clone()).expect("reserve"),
+            Some(lock),
+        );
+        let probe = Arc::new(crate::test_support::ComposeProbe::new());
+        let seen = Arc::new(Mutex::new(None));
+        let extension: Arc<dyn ComposeExtension> = Arc::new(DropWitness {
+            probe: Arc::clone(&probe),
+            lock_path: lock_path.clone(),
+            seen: Arc::clone(&seen),
+        });
+        Composition::from_stoppers(
+            HoldStoppers::default(),
+            None,
+            None,
+            Some(guard),
+            LogHandle::null(),
+        )
+        .with_extensions(vec![extension])
+        .with_probe(Some(Arc::clone(&probe)))
+        .teardown(TeardownReason::Requested)
+        .await;
+        let (steps, lock_held) = seen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the extension was dropped");
+        assert_eq!(
+            steps,
+            vec!["extensions.hooks"],
+            "dropped right after its hook"
+        );
+        assert!(lock_held, "dropped while the instance guard was still held");
+        assert_eq!(
+            probe.record().step_names(),
+            vec!["extensions.hooks", "guard"]
+        );
+        assert!(!lock_path.exists(), "the guard is released after");
     }
 
     /// A listener whose requests never finish is aborted once its budget has elapsed.
