@@ -13,7 +13,9 @@ mod t111;
 use std::sync::Arc;
 
 use advance_runtime_compose::registry::reserved_homes_for_test;
-use advance_runtime_compose::test_support::{ComposeFailpoints, ComposeProbe, MemoryComposeLog};
+use advance_runtime_compose::test_support::{
+    ComposeFailpoints, ComposeProbe, MemoryComposeLog, ProbeRecord,
+};
 use advance_runtime_compose::{compose, log_keys, ComposeError};
 use t111::{alive_tasks, assert_composition_gone, assert_steps, serial, T111Home};
 
@@ -111,4 +113,30 @@ async fn module_001_ac30_unloadable_driver_is_agent_loop_error_and_tears_down() 
         record.render_steps()
     );
     assert_composition_gone(baseline, &probe, &home.home).await;
+}
+
+/// The order witness itself: steps recorded out of the shutdown order (the EventBus stopped
+/// before the git queue), a mandatory step that did not run, or mandatory steps that ran
+/// in another order than listed each fail `assert_steps`; the shutdown order passes.
+#[test]
+fn module_001_ac30_assert_steps_rejects_another_order() {
+    let record = |steps: &[&'static str]| ProbeRecord {
+        teardown_steps: steps.iter().map(|step| (*step, 0)).collect(),
+        ..ProbeRecord::default()
+    };
+    let in_order = ["holds.git_queue", "holds.event_bus", "guard"];
+    assert_steps(&record(&in_order), &in_order);
+    let rejected: [(&[&'static str], &[&str]); 3] = [
+        (&["holds.event_bus", "holds.git_queue", "guard"], &in_order),
+        (&["holds.git_queue", "guard"], &in_order),
+        (&in_order, &["holds.event_bus", "holds.git_queue"]),
+    ];
+    for (steps, mandatory) in rejected {
+        let rec = record(steps);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_steps(&rec, mandatory)
+        }))
+        .is_err();
+        assert!(failed, "{steps:?} with mandatory {mandatory:?} must fail");
+    }
 }

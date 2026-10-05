@@ -365,14 +365,53 @@ pub async fn assert_ws_closed(ws: &mut ClientWs, budget: Duration) {
     );
 }
 
-/// The steps the teardown ran are in [`TEARDOWN_ORDER`]'s order (each at most once) and
-/// include every `mandatory` one.
+/// The order the shutdown runs its steps in, written out here rather than read from the
+/// implementation: ingress, loops, extension hooks, holds, and the instance guard last;
+/// the loops in the order the daemon has always stopped them, then the LLM stream reaper;
+/// the holds in dependency order: the selected-provider writer, the watchers, the packs
+/// poll, the cap-grant sweeper, the breaker, the ChatGPT sign-in, the git commit queue
+/// (closed and its worker joined), the Client API provider slots, the EventBus, the
+/// extensions' holds, then the rest of the graph (whose drop releases the CONTRACT-218
+/// custody).
+pub const D1_ORDER: &[&str] = &[
+    "ingress.client_api",
+    "ingress.post_msg",
+    "ingress.hooks",
+    "loops.root",
+    "loops.host_pump",
+    "loops.perchild",
+    "loops.auto_tick",
+    "loops.readiness_walk",
+    "loops.llm_stream_reaper",
+    "extensions.hooks",
+    "extensions.tasks",
+    "holds.selected_provider",
+    "holds.watchers",
+    "holds.packs_poll",
+    "holds.cap_grant_sweeper",
+    "holds.breaker",
+    "holds.chatgpt_sign_in",
+    "holds.git_queue",
+    "holds.client_api_slots",
+    "holds.event_bus",
+    "holds.extension_holds",
+    "holds.drop_graph",
+    "guard",
+];
+
+/// The steps the teardown ran follow [`D1_ORDER`] (each at most once), and the
+/// `mandatory` ones all ran, in the order `mandatory` lists them. The teardown's own step
+/// catalogue ([`TEARDOWN_ORDER`]) is [`D1_ORDER`].
 pub fn assert_steps(rec: &ProbeRecord, mandatory: &[&str]) {
+    assert_eq!(
+        TEARDOWN_ORDER, D1_ORDER,
+        "the teardown's step catalogue is the shutdown order"
+    );
     let names = rec.step_names();
     let positions: Vec<usize> = names
         .iter()
         .map(|name| {
-            TEARDOWN_ORDER
+            D1_ORDER
                 .iter()
                 .position(|step| step == name)
                 .unwrap_or_else(|| panic!("unknown teardown step {name}"))
@@ -383,13 +422,17 @@ pub fn assert_steps(rec: &ProbeRecord, mandatory: &[&str]) {
         "the teardown steps are out of order:\n{}",
         rec.render_steps()
     );
-    for step in mandatory {
-        assert!(
-            names.contains(step),
-            "teardown step {step} did not run:\n{}",
-            rec.render_steps()
-        );
-    }
+    let ran: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| mandatory.contains(name))
+        .collect();
+    assert_eq!(
+        ran,
+        mandatory,
+        "the mandatory teardown steps, in this order:\n{}",
+        rec.render_steps()
+    );
 }
 
 /// Nothing of the composition `probe` recorded is left: every object it built is dead,
