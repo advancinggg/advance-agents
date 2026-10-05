@@ -1,7 +1,8 @@
 //! CONTRACT-219 composition for EventBus observation output.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 use advance_event_bus::{Event, ObservationProjection, ObservationProjector};
 use advance_scheduler::sensitive_params::RegistrySensitiveParamProvider;
@@ -56,6 +57,11 @@ const PENDING_SINGLE_PARAM_KEYS: &[&str] = &[
 
 const PENDING_FS_PARAM_KEYS: &[&str] = &["read-paths", "write-paths"];
 const UNKNOWN_C219_SOURCE: &str = "unknown C219 observation source";
+
+/// The root agents that compositions in this process registered, each with its home
+/// (see [`Contract219EventProjector::register_root_agent`]).
+static ROOT_AGENTS_REGISTERED_HERE: Mutex<BTreeSet<(PathBuf, String)>> =
+    Mutex::new(BTreeSet::new());
 
 /// Production C219 boundary. The non-clone issuer and sealed redactor stay in
 /// this object; callers can only refresh authenticated sources or request an
@@ -228,15 +234,38 @@ impl Contract219EventProjector {
         Ok(*digest.as_bytes())
     }
 
-    /// Register and publish a live agent identity before its first event. The
-    /// provider's journal makes a repeated operation/id pair idempotent. An agent that
-    /// an earlier composition of this home registered and published is live already
-    /// (hydration in [`Self::build`] re-issued its source): it is not registered again,
-    /// since a second registration of a live identity conflicts with it.
-    pub async fn register_agent(&self, exact_agent_id: &str) -> Result<(), String> {
-        if self.require_live_source(exact_agent_id).is_ok() {
+    /// Register the root agent of a composition of `home` before its first event.
+    ///
+    /// When a composition of the same home earlier in this process registered it, the
+    /// registration is durable and hydration in [`Self::build`] re-issued its source, so
+    /// the root agent is live already: that registration is reused, since a second
+    /// registration of a live identity conflicts with it. Every other case, a
+    /// registration another process left included, goes through
+    /// [`Self::register_agent`].
+    pub(crate) async fn register_root_agent(
+        &self,
+        home: &Path,
+        exact_agent_id: &str,
+    ) -> Result<(), String> {
+        let key = (home.to_path_buf(), exact_agent_id.to_owned());
+        let registered_here = ROOT_AGENTS_REGISTERED_HERE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&key);
+        if registered_here && self.require_live_source(exact_agent_id).is_ok() {
             return Ok(());
         }
+        self.register_agent(exact_agent_id).await?;
+        ROOT_AGENTS_REGISTERED_HERE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key);
+        Ok(())
+    }
+
+    /// Register and publish a live agent identity before its first event. The
+    /// provider's journal makes a repeated operation/id pair idempotent.
+    pub async fn register_agent(&self, exact_agent_id: &str) -> Result<(), String> {
         let operation_id = format!("contract219-agent-{}", uuid::Uuid::new_v4().simple());
         self.provider
             .begin_agent_registration(&operation_id, exact_agent_id)

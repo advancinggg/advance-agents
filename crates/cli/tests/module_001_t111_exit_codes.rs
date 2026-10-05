@@ -1,8 +1,8 @@
 //! MODULE-001-T111 (1) / MODULE-001-AC-30 — the thin `advance start` over `compose`: the
 //! exit codes of the real binary (1 after a startup failure, 0 after SIGTERM on the home
-//! declaring every capability on a git repository, which never exited before the lane), a
-//! home declaring `lifecycle` that starts again after a clean exit, and the order of the
-//! thin `main` (runtime, signal listeners before the lock, workspace, then `compose`).
+//! declaring every capability on a git repository, which never exited before the lane), what
+//! a restart does on a home declaring `lifecycle`, and the order of the thin `main` (runtime,
+//! signal listeners before the lock, workspace, then `compose`).
 #![cfg(unix)]
 
 #[path = "support/all_caps_home.rs"]
@@ -151,23 +151,49 @@ impl Drop for Daemon {
     }
 }
 
-/// A home declaring `lifecycle` (here with `fs` and `llm`) keeps its CONTRACT-219 agent
-/// registration across runs: `advance start` comes up again after a clean exit instead of
-/// failing to register the root agent a second time.
+/// What a restart of `advance start` does on a home declaring `lifecycle` (here with `fs`
+/// and `llm`) is what it did before `compose`: the first run registers the root agent with
+/// the CONTRACT-219 projector and exits 0 after SIGTERM; the second run, a new process,
+/// registers the root agent again, which conflicts with the live registration the first run
+/// left, and exits 1 with that wiring failure. Reusing the registration is limited to a
+/// composition earlier in the same process
+/// (`crates/runtime-compose/tests/module_001_compose_lifecycle_again.rs`).
 #[test]
-fn module_001_ac30_lifecycle_home_starts_again_after_a_clean_exit() {
+fn module_001_ac30_lifecycle_home_restart_keeps_its_wiring_failure() {
     let home = AllCapsHome::declaring(&["fs", "llm", "lifecycle"], true);
-    for run in ["first", "second"] {
-        let mut daemon = Daemon::start(&home);
-        daemon.wait_ready();
-        let (status, _) = daemon.stop();
-        assert_eq!(
-            status.code(),
-            Some(0),
-            "the {run} run exits 0 after SIGTERM; stderr:\n{}",
-            daemon.stderr.finish()
-        );
-    }
+    let mut first = Daemon::start(&home);
+    first.wait_ready();
+    let (status, _) = first.stop();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the first run exits 0 after SIGTERM; stderr:\n{}",
+        first.stderr.finish()
+    );
+
+    let mut second = Daemon::start(&home);
+    let status = second
+        .wait_exit(FAILURE_EXIT_BUDGET)
+        .expect("the second run exits on its own");
+    let stderr = second.stderr.finish();
+    let stdout = second.stdout.finish();
+    assert_eq!(status.code(), Some(1), "stderr:\n{stderr}");
+    assert_eq!(
+        stderr.lines().last(),
+        Some(
+            "advance start: wiring failed: agent-tree config materialization failure: \
+             begin C219 agent registration: InvalidIdentity"
+        ),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("advance: runtime ready"),
+        "the second run fails before readiness; stdout:\n{stdout}"
+    );
+    assert!(
+        !home.ws.join(".runtime/runtime.lock").exists(),
+        "the failed run released the runtime lock"
+    );
 }
 
 /// A second `advance start` on a home whose daemon is up exits 1 with the lock failure,

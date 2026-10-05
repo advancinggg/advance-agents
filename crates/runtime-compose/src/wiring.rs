@@ -1726,7 +1726,7 @@ pub(crate) async fn wire_capabilities_inner(
             .await
             .map_err(CliWiringError::ConfigTree)?;
             projector
-                .register_agent(root_uid.as_str())
+                .register_root_agent(workspace, root_uid.as_str())
                 .await
                 .map_err(CliWiringError::ConfigTree)?;
             Some(projector)

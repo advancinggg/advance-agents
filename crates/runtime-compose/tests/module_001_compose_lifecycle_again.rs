@@ -1,8 +1,10 @@
-//! MODULE-001-AC-30 — a home declaring `lifecycle` composes again after a shutdown: the
-//! root agent registered with the CONTRACT-219 projector by the first composition is live
-//! in the home's durable registry, and the second composition reuses that registration
-//! (the same root agent id) instead of failing to register it a second time. The same
-//! holds for a restart of `advance start`, which composes the home the same way.
+//! MODULE-001-AC-30 — a home declaring `lifecycle` composes again in the same process
+//! after a shutdown: the root agent registered with the CONTRACT-219 projector by the first
+//! composition is live in the home's durable registry, and the second composition reuses
+//! that registration (the same root agent id) instead of failing to register it a second
+//! time. Only a registration made in this process is reused: a new process registers the
+//! root agent as `advance start` always has (`crates/cli/tests/module_001_t111_exit_codes.rs`
+//! pins what a restart does).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Once};
