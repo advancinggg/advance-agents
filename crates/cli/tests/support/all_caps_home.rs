@@ -1,17 +1,19 @@
 //! The home that declares every capability on a git repository (the D5 goldens' H2), built
 //! the way the goldens build it: `advance init` through the real binary with a cleared
 //! environment, then the runtime config, the agent config, the deployed driver and a git
-//! repository with one empty commit.
+//! repository with one empty commit. [`AllCapsHome::declaring`] builds the same home with
+//! fewer capabilities.
 //!
 //! The pieces are copies of the goldens' own (`runtime_compose_d5_common`: `runtime_yaml(&H2)`,
 //! `agent_yaml(&H2)`, the minimal driver, `init_git_repo`, `TestHome::command`), not shared
 //! with them, so the goldens' harness stays untouched by the witnesses that use this home.
 //!
 //! Including test: `#[path = "support/all_caps_home.rs"] mod all_caps_home;`.
+#![allow(dead_code)]
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, Once};
 
 use advance_cli::agent_config::KNOWN_CAPABILITIES;
@@ -52,6 +54,11 @@ pub struct AllCapsHome {
 impl AllCapsHome {
     /// `advance init <root>/ws`, then H2's runtime config, agent config, driver and git repo.
     pub fn new() -> AllCapsHome {
+        AllCapsHome::declaring(KNOWN_CAPABILITIES, true)
+    }
+
+    /// The same home declaring only `caps`, on a git repository when `git` is set.
+    pub fn declaring(caps: &[&str], git: bool) -> AllCapsHome {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = std::fs::canonicalize(dir.path()).expect("canonicalize temp root");
         std::fs::create_dir_all(root.join("home")).expect("create HOME dir");
@@ -79,15 +86,25 @@ impl AllCapsHome {
             String::from_utf8_lossy(&out.stderr)
         );
         std::fs::write(home.config_path(), runtime_yaml()).expect("write runtime config");
-        std::fs::write(home.ws.join(".agent/config.yaml"), agent_yaml())
+        std::fs::write(home.ws.join(".agent/config.yaml"), agent_yaml(caps))
             .expect("write agent config");
         std::fs::write(
             home.ws.join(".agent/behavior.component.wasm"),
             component_bytes(),
         )
         .expect("deploy driver component");
-        init_git_repo(&home.ws);
+        if git {
+            init_git_repo(&home.ws);
+        }
         home
+    }
+
+    /// `<root>/state` (created): the state root of an in-process composition of this home,
+    /// so its platform state stays out of the process `HOME`.
+    pub fn state_root(&self) -> PathBuf {
+        let root = self.root.join("state");
+        std::fs::create_dir_all(&root).expect("create the state root");
+        root
     }
 
     /// `<ws>/.advance/runtime-config.yaml`.
@@ -116,6 +133,12 @@ impl AllCapsHome {
         }
         cmd
     }
+}
+
+/// Spawn `cmd` holding the binary's spawn lock (see [`SPAWN_LOCK`]).
+pub fn spawn_locked(cmd: &mut Command) -> Child {
+    let _guard = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    cmd.spawn().expect("spawn the advance binary")
 }
 
 /// The goldens' `runtime_yaml(&H2)`: one OpenAI provider, the master key from the
@@ -163,10 +186,10 @@ database:
     yaml
 }
 
-/// The goldens' `agent_yaml(&H2)`: every `KNOWN_CAPABILITIES` entry declared.
-fn agent_yaml() -> String {
+/// The goldens' `agent_yaml(&H2)` for `caps` (every `KNOWN_CAPABILITIES` entry for H2).
+fn agent_yaml(caps: &[&str]) -> String {
     let mut yaml = String::from("capabilities:\n");
-    for cap in KNOWN_CAPABILITIES {
+    for cap in caps {
         let _ = writeln!(yaml, "  {cap}: true");
     }
     yaml

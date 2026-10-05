@@ -99,6 +99,8 @@ git2 = { workspace = true }
 wit-component = { workspace = true }
 # `start_paused` for the teardown's bounded waits.
 tokio = { workspace = true, features = ["test-util"] }
+# The ordered-shutdown witnesses keep a Client API WebSocket open across the shutdown.
+tokio-tungstenite = { workspace = true }
 
 [lints]
 workspace = true

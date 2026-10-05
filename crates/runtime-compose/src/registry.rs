@@ -27,17 +27,25 @@ pub enum ReserveError {
 
 /// Reserve `home` (a canonical path); fails if it is already reserved.
 pub fn reserve(home: PathBuf) -> Result<(), ReserveError> {
-    let mut reserved = registry().lock().map_err(|_| ReserveError::Poisoned)?;
+    reserve_in(registry(), home)
+}
+
+/// Release a reservation of `home`. A no-op when `home` is not reserved or the
+/// registry's lock is poisoned.
+pub fn release(home: &Path) {
+    release_in(registry(), home);
+}
+
+fn reserve_in(registry: &Mutex<HashSet<PathBuf>>, home: PathBuf) -> Result<(), ReserveError> {
+    let mut reserved = registry.lock().map_err(|_| ReserveError::Poisoned)?;
     if !reserved.insert(home) {
         return Err(ReserveError::AlreadyReserved);
     }
     Ok(())
 }
 
-/// Release a reservation of `home`. A no-op when `home` is not reserved or the
-/// registry's lock is poisoned.
-pub fn release(home: &Path) {
-    if let Ok(mut reserved) = registry().lock() {
+fn release_in(registry: &Mutex<HashSet<PathBuf>>, home: &Path) {
+    if let Ok(mut reserved) = registry.lock() {
         reserved.remove(home);
     }
 }
@@ -82,6 +90,46 @@ pub fn reserved_homes_for_test() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A poisoned registry refuses every reservation with `Poisoned` (which `compose`
+    /// reports as `Lock(RegistryPoisoned)` and the embedded bridge as its internal
+    /// error) and ignores a release, keeping its entries. A registry of the test's own:
+    /// the process-wide one is shared by every test of this binary.
+    #[test]
+    fn module_001_ac30_registry_poison_answers_unchanged() {
+        let registry = Mutex::new(HashSet::new());
+        let home = PathBuf::from("/tmp/runtime-compose-registry-test-poison");
+        reserve_in(&registry, home.clone()).unwrap();
+        let poisoner = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _held = registry.lock().unwrap();
+                    panic!("poison the registry");
+                })
+                .join()
+        });
+        assert!(poisoner.is_err() && registry.is_poisoned());
+
+        assert_eq!(
+            reserve_in(
+                &registry,
+                PathBuf::from("/tmp/runtime-compose-registry-test-other")
+            ),
+            Err(ReserveError::Poisoned)
+        );
+        assert_eq!(
+            reserve_in(&registry, home.clone()),
+            Err(ReserveError::Poisoned)
+        );
+        release_in(&registry, &home);
+        assert!(
+            registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&home),
+            "a release on a poisoned registry changes nothing"
+        );
+    }
 
     #[test]
     fn a_home_is_reserved_once_until_released() {

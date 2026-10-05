@@ -501,6 +501,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite 0.27.0",
  "tokio-util",
  "uuid",
  "walkdir",
