@@ -77,7 +77,7 @@ pub(crate) enum TeardownReason {
 
 /// The teardown steps, in order. A step runs (and is recorded) only when its part
 /// exists.
-pub(crate) const TEARDOWN_ORDER: &[&str] = &[
+pub const TEARDOWN_ORDER: &[&str] = &[
     "ingress.client_api",
     "ingress.post_msg",
     "ingress.hooks",
@@ -103,17 +103,32 @@ pub(crate) const TEARDOWN_ORDER: &[&str] = &[
     "guard",
 ];
 
-/// Where the teardown records the steps it ran.
+/// Where the teardown records the steps it ran: in test-support builds, the
+/// composition's probe (each step with tokio's `num_alive_tasks` right after it).
 #[derive(Default)]
-struct StepLog;
+pub(crate) struct StepLog {
+    #[cfg(feature = "test-support")]
+    probe: Option<Arc<crate::test_support::ComposeProbe>>,
+}
 
 impl StepLog {
-    fn record(&self, step: &'static str) {
+    pub(crate) fn record(&self, step: &'static str) {
         debug_assert!(
             TEARDOWN_ORDER.contains(&step),
             "unknown teardown step {step}"
         );
+        probe_record!(self.probe, |record| record
+            .teardown_steps
+            .push((step, alive_tasks())));
     }
+}
+
+/// The tasks alive on the current tokio runtime.
+#[cfg(feature = "test-support")]
+fn alive_tasks() -> usize {
+    tokio::runtime::Handle::try_current()
+        .map(|handle| handle.metrics().num_alive_tasks())
+        .unwrap_or(0)
 }
 
 /// The instance guard a composition holds until the end of its teardown: the home's
@@ -272,7 +287,7 @@ impl Composition {
         };
         Self {
             log,
-            steps: StepLog,
+            steps: StepLog::default(),
             view: None,
             client_api_server,
             msg_listener,
@@ -303,7 +318,7 @@ impl Composition {
     ) -> Self {
         Self {
             log,
-            steps: StepLog,
+            steps: StepLog::default(),
             view: None,
             client_api_server: None,
             msg_listener: None,
@@ -350,6 +365,16 @@ impl Composition {
     /// The view the composed runtime reports through; the teardown moves its phase.
     pub(crate) fn with_view(mut self, view: Arc<RuntimeView>) -> Self {
         self.view = Some(view);
+        self
+    }
+
+    /// Record every teardown step into `probe`.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn with_probe(
+        mut self,
+        probe: Option<Arc<crate::test_support::ComposeProbe>>,
+    ) -> Self {
+        self.steps.probe = probe;
         self
     }
 

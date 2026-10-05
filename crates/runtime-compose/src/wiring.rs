@@ -1198,6 +1198,12 @@ pub(crate) struct WiringOptions {
     pub client_api: ClientApiOptions,
     /// Where the wiring's diagnostics go.
     pub log: LogHandle,
+    /// Records the objects and listeners the wiring builds (test-only).
+    #[cfg(feature = "test-support")]
+    pub probe: Option<Arc<crate::test_support::ComposeProbe>>,
+    /// The wiring fails right after the git commit queue started (test-only).
+    #[cfg(feature = "test-support")]
+    pub fail_after_git_queue: bool,
 }
 
 impl WiringOptions {
@@ -1212,6 +1218,10 @@ impl WiringOptions {
             event_bus_ws: true,
             client_api: ClientApiOptions::daemon(),
             log: LogHandle::null(),
+            #[cfg(feature = "test-support")]
+            probe: None,
+            #[cfg(feature = "test-support")]
+            fail_after_git_queue: false,
         }
     }
 }
@@ -1328,6 +1338,10 @@ pub(crate) async fn wire_capabilities_inner(
         event_bus_ws,
         client_api: client_api_options,
         log,
+        #[cfg(feature = "test-support")]
+        probe,
+        #[cfg(feature = "test-support")]
+        fail_after_git_queue,
     } = opts;
     let home_override = home_override.as_deref();
     let state_root = state_root.as_deref();
@@ -1744,6 +1758,12 @@ pub(crate) async fn wire_capabilities_inner(
     }
     .map_err(CliWiringError::EventBus)?;
     let bus_concrete: Arc<EventBus> = Arc::new(bus);
+    probe_record!(probe, |record| {
+        record.event_bus = Some(Arc::downgrade(&bus_concrete));
+        if let Some(addr) = bus_concrete.server_addr() {
+            record.listeners.push(("event_bus", addr));
+        }
+    });
     let event_bus_dyn: Arc<dyn EventBusEmit> = bus_concrete.clone();
     // From here on every failure returns what was started; nothing after this
     // point uses `?`.
@@ -2045,6 +2065,8 @@ pub(crate) async fn wire_capabilities_inner(
         }
         Arc::new(rm)
     };
+    probe_record!(probe, |record| record.run_manager =
+        Some(Arc::downgrade(&run_manager)));
     let run_config = run_config_from(&builder.config().run_budget);
 
     // Step 5 — register the pre-build providers into the builder's registry.
@@ -2205,6 +2227,8 @@ pub(crate) async fn wire_capabilities_inner(
             );
             perchild_manager = Some(mgr.clone());
             started.perchild_manager = Some(mgr.clone());
+            probe_record!(probe, |record| record.perchild_manager =
+                Some(Arc::downgrade(&mgr)));
             let observer: Arc<dyn SpawnObserver> = mgr;
             Arc::new(spawner_concrete.with_spawn_observer(observer))
         } else {
@@ -2362,6 +2386,17 @@ pub(crate) async fn wire_capabilities_inner(
         None
     };
     started.git_queue = git_queue_handle.clone();
+    probe_record!(probe, |record| record.git_queue =
+        git_queue_handle.as_ref().map(Arc::downgrade));
+    #[cfg(feature = "test-support")]
+    {
+        if fail_after_git_queue {
+            return Err(WiringFailure {
+                error: CliWiringError::ConfigTree(crate::test_support::WIRING_FAILPOINT.into()),
+                partial: started,
+            });
+        }
+    }
     // Entity-data lane E1: the cap-fs primitives the `data` host tool writes through are the
     // SAME instances the `fs.*` handlers use (one `.meta.yaml` maintainer = one write lock).
     let mut data_fs_parts: Option<crate::data_wiring::DataFsParts> = None;
@@ -2673,6 +2708,8 @@ pub(crate) async fn wire_capabilities_inner(
         };
         chatgpt_sign_in = Some(Arc::clone(&sign_in));
         started.chatgpt_sign_in = Some(Arc::clone(&sign_in));
+        probe_record!(probe, |record| record.chatgpt_sign_in =
+            Some(Arc::downgrade(&sign_in)));
         // Wave-16 Lane-4 (MODULE-012 AC-17): build the leak/SSRF/rate components
         // with their `security.*` tunables sourced LIVE off the config provider, so
         // a hot-reload takes effect on this LLM-egress chain without restart.
@@ -2800,6 +2837,8 @@ pub(crate) async fn wire_capabilities_inner(
         // moves one into the host-fn handlers (all clones share the one gateway,
         // so its per-agent assembled-context store is the same on both sides).
         llm_gateway = Some(gateway.clone());
+        probe_record!(probe, |record| record.llm_gateway =
+            Some(Arc::downgrade(&gateway)));
         // Tee slice T3: RETAIN the reap handle — the composition root drives
         // turn-end reap through it on both observer paths.
         llm_stream_reaper = Some(register_agent_llm_with_turn_cost(
@@ -2839,6 +2878,9 @@ pub(crate) async fn wire_capabilities_inner(
             });
         }
     };
+
+    probe_record!(probe, |record| record.component_runtime =
+        Some(Arc::downgrade(&host.component_runtime())));
 
     // Installed packs: meta-schema extensions + presets now; their skill tools join once the
     // tool registry exists (step 7). Conflicts are logged and skipped, never fatal.
@@ -3263,6 +3305,10 @@ pub(crate) async fn wire_capabilities_inner(
             );
             match bound {
                 Ok(server) => {
+                    probe_record!(probe, |record| {
+                        record.client_api = Some(Arc::downgrade(&server.api()));
+                        record.listeners.push(("client_api", server.local_addr()));
+                    });
                     log.err(
                         log_keys::CLIENT_API_LISTENING,
                         format!(

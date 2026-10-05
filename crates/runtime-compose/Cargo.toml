@@ -16,10 +16,12 @@ path = "src/lib.rs"
 [features]
 default = []
 # Test-only seams (fixture-only monotonic-record backends, failpoints, `*_for_test`
-# constructors, `daemon::{TestServeLoop, spawn_test_agent_loop}`) and the test-only
-# CONTRACT-218 platform root under the temp dir. `advance-cli`'s `test-support`
-# forwards here.
-test-support = []
+# constructors, `daemon::{TestServeLoop, spawn_test_agent_loop}`, the `test_support`
+# module) and the test-only CONTRACT-218 platform root under the temp dir. It also
+# turns on advance-git's (`commit_queue::active_queue_paths_for_test`), so every
+# crate that enables this one can read the git queue registrations. `advance-cli`'s
+# `test-support` forwards here.
+test-support = ["advance-git/test-support"]
 
 [dependencies]
 advance-runtime = { path = "../runtime" }

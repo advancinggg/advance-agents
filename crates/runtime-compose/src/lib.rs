@@ -9,6 +9,23 @@
 
 #![forbid(unsafe_code)]
 
+/// `probe_record!(probe, |record| update)`: record into the composition's test-support
+/// probe (`test_support::ComposeProbe`), where `probe` is an
+/// `Option<Arc<ComposeProbe>>`. Without the `test-support` feature the whole statement
+/// is compiled out, its expressions included.
+macro_rules! probe_record {
+    ($probe:expr, |$record:ident| $update:expr) => {{
+        #[cfg(feature = "test-support")]
+        {
+            if let Some(probe) = ($probe).as_ref() {
+                probe.update(|$record| {
+                    $update;
+                });
+            }
+        }
+    }};
+}
+
 // The composition API (`compose`, its options, output sink, errors and the composed
 // runtime), re-exported at the crate root.
 pub mod api;
@@ -22,6 +39,12 @@ pub mod compose_log;
 mod compose;
 mod composition;
 mod threads;
+
+// Test-only seams of the composition: failpoints, the turn gate, the probe, the
+// in-memory log.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
 
 // The process-local registry of homes a runtime is composed in (the embedded
 // runtime bridge reserves through it too).

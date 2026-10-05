@@ -75,6 +75,7 @@ use crate::agent_loop::{
 // Backbone Step 2 (2026-06-07): the cap-llm gateway type for the assembled-context
 // seam (the gateway Arc comes from `WiringHandles.llm_gateway`).
 use advance_shared_types::agent_tree::AgentTreeSnapshot;
+use advance_shared_types::context::ContextAssembler;
 use cap_llm::{resolve_provider_and_model, LlmGateway};
 // Wave-12 Lane C: the decomposition reader trait (for the assembler port) + the
 // concrete store type (the `WiringHandles.decomposition_store` handle).
@@ -322,6 +323,9 @@ pub(crate) struct GraphOptions {
     pub listeners: ListenerOptions,
     /// The capability wiring's options.
     pub wiring: WiringOptions,
+    /// Test-only failpoints and observers.
+    #[cfg(feature = "test-support")]
+    pub failpoints: crate::test_support::ComposeFailpoints,
 }
 
 /// Everything [`compose_graph`] started, handed to the composition's teardown.
@@ -389,6 +393,8 @@ pub(crate) async fn compose_graph(
         log,
         listeners,
         wiring,
+        #[cfg(feature = "test-support")]
+        failpoints,
     } = opts;
     let workspace = workspace.to_path_buf();
     // 5b. Wire production cap-grant + cap-secrets + EventBus. The host and the
@@ -541,6 +547,10 @@ pub(crate) async fn compose_graph(
         LoopSpawnExtras {
             log: log.clone(),
             hooks_shutdown: CancellationToken::new(),
+            #[cfg(feature = "test-support")]
+            turn_gate: failpoints.turn_gate.clone(),
+            #[cfg(feature = "test-support")]
+            probe: failpoints.probe.clone(),
         },
     )
     .await
@@ -611,6 +621,12 @@ pub(crate) async fn compose_graph(
             spawned.done.clone(),
             spawned.in_flight.clone(),
             log.clone(),
+            MsgListenerExtras {
+                #[cfg(feature = "test-support")]
+                bind_failpoint: failpoints.post_msg_bind,
+                #[cfg(feature = "test-support")]
+                probe: failpoints.probe.clone(),
+            },
         )
         .await
         .map(Some),
@@ -1339,11 +1355,13 @@ async fn try_spawn_agent_loop(
         if let Some(guard) = &repetition_guard {
             guard.set_context_assembler(inner.clone());
         }
-        let publishing = Arc::new(PublishingContextAssembler::new(
+        let publishing: Arc<dyn ContextAssembler> = Arc::new(PublishingContextAssembler::new(
             inner,
             gateway,
             cap_agent_id.clone(),
         ));
+        #[cfg(feature = "test-support")]
+        let publishing = gated(publishing, &extras);
         driver = driver.with_context_assembler(publishing);
     } else if let Some(reg) = tool_registry.as_ref() {
         let listed = cap_tools::ToolRegistry::list(reg.as_ref()).await;
@@ -1409,7 +1427,12 @@ async fn try_spawn_agent_loop(
         )
         .await
         {
-            Ok((task, _addr)) => hooks = Some((extras.hooks_shutdown.clone(), task)),
+            Ok((task, _addr)) => {
+                probe_record!(extras.probe, |record| record
+                    .listeners
+                    .push(("hooks", _addr)));
+                hooks = Some((extras.hooks_shutdown.clone(), task));
+            }
             Err(msg) => {
                 // The loop spawned above ends here: it is aborted and awaited.
                 handle.abort();
@@ -1458,6 +1481,56 @@ pub(crate) struct LoopSpawnExtras {
     pub log: LogHandle,
     /// Cancelled to stop the channel `/hooks` listener gracefully.
     pub hooks_shutdown: CancellationToken,
+    /// Holds each root-loop turn before its context is assembled (test-only).
+    #[cfg(feature = "test-support")]
+    pub turn_gate: Option<crate::test_support::TurnGate>,
+    /// Records the gate's installation and the `/hooks` address (test-only).
+    #[cfg(feature = "test-support")]
+    pub probe: Option<Arc<crate::test_support::ComposeProbe>>,
+}
+
+/// The root loop's context assembler, behind the turn gate when one is configured.
+#[cfg(feature = "test-support")]
+fn gated(
+    assembler: Arc<dyn ContextAssembler>,
+    extras: &LoopSpawnExtras,
+) -> Arc<dyn ContextAssembler> {
+    match extras.turn_gate.clone() {
+        Some(gate) => {
+            probe_record!(extras.probe, |record| record.turn_gate_installed = true);
+            Arc::new(GatedAssembler {
+                inner: assembler,
+                gate,
+            })
+        }
+        None => assembler,
+    }
+}
+
+/// Holds each turn at the gate, then assembles through `inner`.
+#[cfg(feature = "test-support")]
+struct GatedAssembler {
+    inner: Arc<dyn ContextAssembler>,
+    gate: crate::test_support::TurnGate,
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait]
+impl ContextAssembler for GatedAssembler {
+    async fn assemble(
+        &self,
+        ctx: advance_shared_types::context::AssemblyContext,
+    ) -> Result<
+        advance_shared_types::context::AssemblyResult,
+        advance_shared_types::context::AssemblyError,
+    > {
+        self.gate.pass().await;
+        self.inner.assemble(ctx).await
+    }
+
+    fn inject_tier3_warning(&self, agent_id: &str, msg: &str) {
+        self.inner.inject_tier3_warning(agent_id, msg);
+    }
 }
 
 /// Why [`try_spawn_agent_loop`] failed.
@@ -1701,6 +1774,17 @@ struct MsgListenerState {
     shutdown: CancellationToken,
 }
 
+/// What the composition hands [`spawn_msg_listener`] besides the listener's own parts
+/// (test-only knobs; empty in production builds).
+struct MsgListenerExtras {
+    /// The bind fails with an error of this kind.
+    #[cfg(feature = "test-support")]
+    bind_failpoint: Option<std::io::ErrorKind>,
+    /// Records the bound address.
+    #[cfg(feature = "test-support")]
+    probe: Option<Arc<crate::test_support::ComposeProbe>>,
+}
+
 /// Spawn the in-process HTTP `POST /msg` listener over `store`. Binds
 /// `127.0.0.1:0` (OS-assigned port) and prints the bound address so operators
 /// and tests can discover it. Returns the listener, stopped gracefully at
@@ -1715,7 +1799,23 @@ async fn spawn_msg_listener(
     done: watch::Receiver<bool>,
     in_flight: Arc<AtomicBool>,
     log: LogHandle,
+    extras: MsgListenerExtras,
 ) -> Result<Listener, String> {
+    let MsgListenerExtras {
+        #[cfg(feature = "test-support")]
+        bind_failpoint,
+        #[cfg(feature = "test-support")]
+        probe,
+    } = extras;
+    #[cfg(feature = "test-support")]
+    {
+        if let Some(kind) = bind_failpoint {
+            return Err(format!(
+                "failed to bind POST /msg listener: {}",
+                std::io::Error::new(kind, crate::test_support::POST_MSG_FAILPOINT)
+            ));
+        }
+    }
     let shutdown = CancellationToken::new();
     let state = MsgListenerState {
         store,
@@ -1747,6 +1847,7 @@ async fn spawn_msg_listener(
         log_keys::MSG_LISTENER,
         format!("advance: msg listener on http://{addr}/msg"),
     );
+    probe_record!(probe, |record| record.listeners.push(("post_msg", addr)));
     let stop = shutdown.clone().cancelled_owned();
     let task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app)

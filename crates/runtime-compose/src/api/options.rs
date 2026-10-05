@@ -42,6 +42,10 @@ pub struct ComposeOptions {
     pub hot_reload: bool,
     /// Where every line the composition emits goes.
     pub log: Arc<dyn ComposeLog>,
+    /// Test-only failpoints and observers (all off by default).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub failpoints: crate::test_support::ComposeFailpoints,
 }
 
 impl ComposeOptions {
@@ -64,7 +68,16 @@ impl ComposeOptions {
             wasm_engine: WasmEngine::Native,
             hot_reload: true,
             log,
+            #[cfg(feature = "test-support")]
+            failpoints: crate::test_support::ComposeFailpoints::default(),
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_failpoints(mut self, failpoints: crate::test_support::ComposeFailpoints) -> Self {
+        self.failpoints = failpoints;
+        self
     }
 
     pub fn with_profile(mut self, profile: ComposeProfile) -> Self {

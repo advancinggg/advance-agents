@@ -45,6 +45,8 @@ pub async fn compose(
         client_api,
         listeners,
         log,
+        #[cfg(feature = "test-support")]
+        failpoints,
         ..
     } = options;
     let log = LogHandle::new(log);
@@ -93,9 +95,10 @@ pub async fn compose(
     let config_watcher = builder.config_watcher();
     let wal_observer = builder.take_wal_observer();
     if !listeners.channel_hooks && channels_need_hooks(&builder.config()) {
-        Composition::early(config_watcher, wal_observer, guard, log)
-            .teardown(TeardownReason::StartupFailed)
-            .await;
+        let composition = Composition::early(config_watcher, wal_observer, guard, log);
+        #[cfg(feature = "test-support")]
+        let composition = composition.with_probe(failpoints.probe.clone());
+        composition.teardown(TeardownReason::StartupFailed).await;
         return Err(ComposeError::Unsupported(Unsupported::ListenerRequired(
             "channel /hooks",
         )));
@@ -115,8 +118,14 @@ pub async fn compose(
             event_bus_ws: listeners.event_bus_ws,
             client_api,
             log: log.clone(),
+            #[cfg(feature = "test-support")]
+            probe: failpoints.probe.clone(),
+            #[cfg(feature = "test-support")]
+            fail_after_git_queue: failpoints.wiring_after_git_queue,
             ..WiringOptions::compat()
         },
+        #[cfg(feature = "test-support")]
+        failpoints: failpoints.clone(),
     };
     match compose_graph(builder, &plan.home, opts).await {
         Ok(graph) => {
@@ -130,6 +139,8 @@ pub async fn compose(
                 Composition::from_graph(graph, config_watcher, wal_observer, guard, log)
                     .with_extensions(extensions)
                     .with_view(Arc::clone(&view));
+            #[cfg(feature = "test-support")]
+            let composition = composition.with_probe(failpoints.probe.clone());
             // The one task that owns the composition: it runs the shutdown sequence once
             // the handle is triggered.
             let shutdown = ShutdownHandle::new();
@@ -155,10 +166,10 @@ pub async fn compose(
                     log,
                 ),
             };
-            composition
-                .with_extensions(extensions)
-                .teardown(TeardownReason::StartupFailed)
-                .await;
+            let composition = composition.with_extensions(extensions);
+            #[cfg(feature = "test-support")]
+            let composition = composition.with_probe(failpoints.probe.clone());
+            composition.teardown(TeardownReason::StartupFailed).await;
             Err(error)
         }
     }
