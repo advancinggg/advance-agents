@@ -260,6 +260,11 @@ impl ToolCache {
     pub(crate) fn listings(&self) -> Vec<Arc<CachedToolListing>> {
         self.listings.values().cloned().collect()
     }
+
+    /// Drop the cached listing of `server_id`, if any.
+    pub(crate) fn drop_server(&mut self, server_id: &str) {
+        self.listings.remove(server_id);
+    }
 }
 
 /// The max-min fair split of `capacity` among `demands`, in their order: each

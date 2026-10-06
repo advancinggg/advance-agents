@@ -31,7 +31,7 @@ pub mod meta_schema;
 pub mod presets;
 pub mod skills;
 
-pub use mcp::{InMemoryMcpEntrySink, McpEntrySink, PackMcpBridge};
+pub use mcp::{McpEntrySink, McpRegister, McpRegistration, PackMcpBridge};
 pub use memory_seed::{PackMemorySeedBridge, SeedReport};
 pub use meta_schema::{MergeReport, PackMetaSchemaBridge};
 pub use presets::PackPresetBridge;

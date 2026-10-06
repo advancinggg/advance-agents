@@ -187,6 +187,65 @@ pub struct McpServerEntry {
 }
 
 impl McpServerEntry {
+    /// A digest of the fields that decide whether a live connection can be
+    /// reused: the transport (command, args, env values, endpoint, allowlist),
+    /// the tool patterns and the schemas. Two entries with the same digest
+    /// describe the same server; a secret rotation changes it.
+    pub fn fingerprint(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        self.server_id.hash(&mut hasher);
+        self.description.hash(&mut hasher);
+        match &self.transport {
+            McpTransportSpec::Stdio { command, args, env } => {
+                0u8.hash(&mut hasher);
+                command.hash(&mut hasher);
+                args.hash(&mut hasher);
+                for (key, value) in env {
+                    key.hash(&mut hasher);
+                    value.hash(&mut hasher);
+                }
+            }
+            McpTransportSpec::Http {
+                endpoint_url,
+                capability,
+            } => {
+                1u8.hash(&mut hasher);
+                endpoint_url.hash(&mut hasher);
+                capability.allowlist.patterns.hash(&mut hasher);
+                for binding in &capability.credentials {
+                    format!("{:?}", binding.position).hash(&mut hasher);
+                    binding.secret_name.hash(&mut hasher);
+                }
+                capability.component_id.hash(&mut hasher);
+            }
+        }
+        match &self.tool_patterns {
+            None => 0u8.hash(&mut hasher),
+            Some(patterns) => {
+                1u8.hash(&mut hasher);
+                for pattern in patterns {
+                    format!("{pattern:?}").hash(&mut hasher);
+                }
+            }
+        }
+        for (name, schemas) in &self.tool_schemas {
+            name.hash(&mut hasher);
+            schemas
+                .input
+                .as_ref()
+                .map(ToString::to_string)
+                .hash(&mut hasher);
+            schemas
+                .output
+                .as_ref()
+                .map(ToString::to_string)
+                .hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     /// True iff the given tool name passes the tool-pattern filter (or no
     /// filter is configured) AND contains no forbidden Unicode characters.
     ///

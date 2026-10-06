@@ -1249,6 +1249,114 @@ done
         );
     }
 
+    // A pack workflow's register-mcp-server writes the operator file and makes the
+    // server callable; applying it again succeeds; uninstalling the pack removes the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pack_workflow_registers_an_mcp_server_and_uninstall_removes_it() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        with_master_key();
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let pk = hex::encode(key.verifying_key().to_bytes());
+        let home = home(
+            "capabilities:\n  mcp: true\n  lifecycle: true\n",
+            KEY_ENV,
+            &format!("\npack:\n  trust-roots:\n    - {pk}\n"),
+        );
+        let script = home.marks.join("srv.sh");
+        std::fs::write(
+            &script,
+            SERVER_SCRIPT
+                .replace("@EXTRA@", "")
+                .replace("@MARKS@", home.marks.to_str().unwrap())
+                .replace("@ID@", "srv"),
+        )
+        .unwrap();
+        let src = home.root.parent().unwrap().join("src/p");
+        std::fs::create_dir_all(src.join("mcp-servers")).unwrap();
+        std::fs::create_dir_all(src.join("workflows")).unwrap();
+        std::fs::write(
+            src.join("mcp-servers/srv.yaml"),
+            format!(
+                "server-id: srv\ntransport:\n  kind: stdio\n  command: /bin/bash\n  args: [\"{}\"]\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("workflows/mcp.yaml"),
+            "name: mcp\nsteps:\n  - type: register-mcp-server\n    config-ref: p@1.0.0/mcp-servers/srv\n",
+        )
+        .unwrap();
+        let pack_yaml = "name: p\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\ntrust-level: trusted\nprovides:\n  mcp-servers:\n    - srv\n  workflows:\n    - mcp\nchecksums:\n  algo: sha256\n  files: {}\n";
+        std::fs::write(src.join("pack.yaml"), pack_yaml).unwrap();
+        let sig = key.sign(pack_yaml.as_bytes());
+        std::fs::write(
+            src.join("pack.sig"),
+            format!(
+                "alg: ed25519\npublic-key: {}\nsignature: {}\n",
+                pk,
+                hex::encode(sig.to_bytes())
+            ),
+        )
+        .unwrap();
+
+        let (host, handles) = boot(&home).await;
+        let api = super::operator_api(&handles);
+        let env = super::post(
+            &api,
+            "/client/packs:install",
+            json!({ "source": src.to_str().unwrap(), "accepted_capabilities": ["mcp"] }),
+            "install-mcp-pack",
+        );
+        assert!(env.is_ok(), "{:?}", env.error);
+
+        let env = super::post(
+            &api,
+            "/client/packs/p@1.0.0:apply",
+            json!({ "workflow": "mcp" }),
+            "apply-mcp",
+        );
+        assert!(env.is_ok(), "{:?}", env.error);
+        assert_eq!(
+            env.data.unwrap()["steps_executed"],
+            json!(["register-mcp-server"])
+        );
+        let file = home.root.join(".advance/mcp-servers/srv.yaml");
+        assert!(file.is_file(), "the pack materialized a server file");
+        let body = std::fs::read_to_string(&file).unwrap();
+        assert!(body.contains("origin:"), "{body}");
+
+        let root = handles.root_agent_id.clone();
+        invoke(&host, &root, "srv", "echo")
+            .await
+            .expect("the pack's server is callable");
+
+        let env = super::post(
+            &api,
+            "/client/packs/p@1.0.0:apply",
+            json!({ "workflow": "mcp" }),
+            "apply-mcp-again",
+        );
+        assert!(env.is_ok(), "re-applying is idempotent: {:?}", env.error);
+
+        let env = super::post(
+            &api,
+            "/client/packs/p@1.0.0:uninstall",
+            json!({}),
+            "uninstall-mcp-pack",
+        );
+        assert!(env.is_ok(), "{:?}", env.error);
+        assert!(
+            !file.exists(),
+            "uninstalling the origin pack removes the file"
+        );
+        let (arm, _) = invoke(&host, &root, "srv", "echo")
+            .await
+            .expect_err("the server is gone");
+        assert_eq!(arm, "not-found");
+    }
+
     // Server files that cannot serve do not stop the daemon: each is skipped with a warning
     // and the good server next to them works. With `allow-stdio: false` no stdio server is
     // loaded at all.

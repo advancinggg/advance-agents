@@ -16,21 +16,18 @@
 //!   through [`PackMcpBridge::entry_with_env`] under the same env-name grammar.
 //!
 //! [`McpEntrySink`] is where a `WorkflowExecutor::register_mcp_server` hands
-//! the built entry: the daemon has no live MCP-client whitelist to hot-swap yet,
-//! so the composition root retains entries in an [`InMemoryMcpEntrySink`]
-//! (duplicate `server_id` refused, mirroring the whitelist builder) for the MCP
-//! client wiring to consume — nothing is silently dropped and no fake id is
-//! minted for an entry that went nowhere.
+//! a planned registration: the control-plane sink writes a server file (secret-ref
+//! ids only, origin recorded) and the MCP client reloads.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use advance_pack_manager::{
     parse_mcp_server_manifest, ComponentKind, McpTransportDecl, PackError, PackRegistry,
     SecretStore, SecretValue, TrustLevel as PackTrust,
 };
 use advance_shared_types::security_validator::{Allowlist, HttpCapability};
-use cap_mcp::{McpError, McpServerEntry, McpServersConfig, McpTransportSpec};
+use cap_mcp::{McpServerEntry, McpTransportSpec};
 
 use super::{effective_trust, pack_id, resolve_kind, PackBridgeError};
 
@@ -153,74 +150,134 @@ impl PackMcpBridge {
             tool_schemas: BTreeMap::new(),
         })
     }
+
+    /// The registration a control-plane sink would persist: the pack's
+    /// manifest, extra secret-ref *ids* (never values), and the origin pack.
+    /// Same trust and loopback checks as [`Self::entry_with_env`].
+    pub fn plan(
+        &self,
+        pack_ref: &str,
+        extra_secret_refs: &BTreeMap<String, String>,
+    ) -> Result<McpRegistration, PackBridgeError> {
+        let resolution = resolve_kind(&*self.registry, pack_ref, ComponentKind::McpServer)?;
+        let pack = pack_id(&resolution);
+        let manifest = parse_mcp_server_manifest(&resolution.local_path)?;
+        let trust = effective_trust(&*self.registry, &resolution.pack_name, &resolution.version)?;
+
+        match &manifest.transport {
+            McpTransportDecl::Stdio { .. } => {
+                if trust != PackTrust::Trusted {
+                    return Err(PackBridgeError::TrustDenied {
+                        pack,
+                        reason: format!(
+                            "mcp-server {} declares a stdio transport (a subprocess runs \
+                             arbitrary code); only an admin-approved trusted pack may register \
+                             one — effective trust is untrusted",
+                            manifest.server_id
+                        ),
+                    });
+                }
+            }
+            McpTransportDecl::Http { endpoint_url } => {
+                if !extra_secret_refs.is_empty() {
+                    return Err(PackBridgeError::Pack(PackError::ConstraintViolation {
+                        reason: format!(
+                            "register-mcp-server secret-refs have no destination on the http \
+                             transport of {} (http credentials belong to the cap-http \
+                             credential chain)",
+                            manifest.server_id
+                        ),
+                    }));
+                }
+                if cap_http::LoopbackExemptions::is_loopback_endpoint(endpoint_url) {
+                    return Err(PackBridgeError::Pack(PackError::ConstraintViolation {
+                        reason: format!(
+                            "mcp-server {} of pack {pack} points at a loopback endpoint; a \
+                             pack's server may not reach the host's loopback (only an \
+                             operator's own server file may)",
+                            manifest.server_id
+                        ),
+                    }));
+                }
+            }
+        }
+
+        let mut secret_refs = manifest.secret_refs.clone();
+        for (env_name, key) in extra_secret_refs {
+            if !is_env_var_name(env_name) {
+                return Err(PackBridgeError::Pack(PackError::ConstraintViolation {
+                    reason: format!(
+                        "register-mcp-server secret-ref placeholder {env_name:?} is not \
+                         an environment-variable name ([A-Za-z_][A-Za-z0-9_]*)"
+                    ),
+                }));
+            }
+            if secret_refs.contains_key(env_name) {
+                return Err(PackBridgeError::Pack(PackError::ConstraintViolation {
+                    reason: format!(
+                        "register-mcp-server secret-ref {env_name} collides with the \
+                         server manifest's own secret-refs"
+                    ),
+                }));
+            }
+            secret_refs.insert(env_name.clone(), key.clone());
+        }
+
+        Ok(McpRegistration {
+            server_id: manifest.server_id,
+            description: manifest.description,
+            transport: manifest.transport,
+            secret_refs,
+            origin_pack: pack,
+            origin_ref: pack_ref.to_string(),
+        })
+    }
 }
 
-/// Where a workflow's `register-mcp-server` step delivers its built entry.
+/// A pack server ready to persist as an operator server file (ids only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpRegistration {
+    pub server_id: String,
+    pub description: String,
+    pub transport: McpTransportDecl,
+    pub secret_refs: BTreeMap<String, String>,
+    pub origin_pack: String,
+    pub origin_ref: String,
+}
+
+/// Outcome of [`McpEntrySink::register`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpRegister {
+    /// A new file was written.
+    Created(String),
+    /// The same origin already had this exact server; nothing was written.
+    Unchanged(String),
+}
+
+impl McpRegister {
+    /// The server id, whether created or already present.
+    pub fn server_id(&self) -> &str {
+        match self {
+            Self::Created(id) | Self::Unchanged(id) => id,
+        }
+    }
+
+    pub fn created(&self) -> bool {
+        matches!(self, Self::Created(_))
+    }
+}
+
+/// Where a workflow's `register-mcp-server` step delivers its planned server.
 pub trait McpEntrySink: Send + Sync {
-    /// Retain / publish `entry`. A duplicate `server_id` must be refused.
-    fn register(&self, entry: McpServerEntry) -> Result<(), PackBridgeError>;
-}
+    /// Persist `registration`. Idempotent: the same origin and the same
+    /// content succeed without writing. A different origin or different
+    /// content for the same server id is refused.
+    fn register(&self, registration: McpRegistration) -> Result<McpRegister, PackBridgeError>;
 
-/// Retains registered entries (duplicate `server_id` refused) until an MCP
-/// client consumer drains them into a `McpServersConfig`.
-#[derive(Default)]
-pub struct InMemoryMcpEntrySink {
-    entries: Mutex<Vec<McpServerEntry>>,
-}
-
-impl InMemoryMcpEntrySink {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Registered server ids, in registration order.
-    pub fn server_ids(&self) -> Vec<String> {
-        self.entries
-            .lock()
-            .expect("mcp entry sink poisoned")
-            .iter()
-            .map(|e| e.server_id.clone())
-            .collect()
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.lock().expect("mcp entry sink poisoned").len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Move every retained entry out (the sink is empty afterwards).
-    pub fn take_all(&self) -> Vec<McpServerEntry> {
-        std::mem::take(&mut *self.entries.lock().expect("mcp entry sink poisoned"))
-    }
-
-    /// Drain the retained entries into a whitelist config (the consumer then
-    /// hot-swaps it into its MCP client). Fails on a builder refusal (cap,
-    /// pattern) — the drained entries are NOT restored, so callers treat an
-    /// error as terminal for those entries.
-    pub fn drain_into_config(&self) -> Result<McpServersConfig, McpError> {
-        let mut builder = McpServersConfig::builder();
-        for entry in self.take_all() {
-            builder = builder.add_server(entry)?;
-        }
-        Ok(builder.build())
-    }
-}
-
-impl McpEntrySink for InMemoryMcpEntrySink {
-    fn register(&self, entry: McpServerEntry) -> Result<(), PackBridgeError> {
-        let mut entries = self.entries.lock().expect("mcp entry sink poisoned");
-        if entries.iter().any(|e| e.server_id == entry.server_id) {
-            return Err(PackBridgeError::Mcp(McpError::invalid_response(format!(
-                "duplicate server_id '{}'",
-                entry.server_id
-            ))));
-        }
-        entries.push(entry);
-        Ok(())
-    }
+    /// Remove the persisted file of `server_id` when it is a pack-origin file
+    /// this sink created. An operator file (no origin) is left alone and
+    /// reported as an error.
+    fn deregister(&self, server_id: &str) -> Result<(), PackBridgeError>;
 }
 
 fn is_env_var_name(s: &str) -> bool {
@@ -255,30 +312,5 @@ mod tests {
         );
         assert_eq!(endpoint_host("http://127.0.0.1:8080/x"), "127.0.0.1");
         assert_eq!(endpoint_host("http://[::1]:9/x"), "::1");
-    }
-
-    #[test]
-    fn sink_refuses_duplicate_server_ids() {
-        let sink = InMemoryMcpEntrySink::new();
-        let mk = |id: &str| McpServerEntry {
-            server_id: id.into(),
-            description: String::new(),
-            transport: McpTransportSpec::Stdio {
-                command: "true".into(),
-                args: vec![],
-                env: BTreeMap::new(),
-            },
-            tool_patterns: None,
-            tool_schemas: BTreeMap::new(),
-        };
-        sink.register(mk("a")).unwrap();
-        assert!(matches!(
-            sink.register(mk("a")),
-            Err(PackBridgeError::Mcp(_))
-        ));
-        assert_eq!(sink.server_ids(), vec!["a".to_string()]);
-        let cfg = sink.drain_into_config().unwrap();
-        assert!(cfg.get("a").is_ok());
-        assert!(sink.is_empty());
     }
 }

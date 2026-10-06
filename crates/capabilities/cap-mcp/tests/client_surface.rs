@@ -13,7 +13,7 @@ use std::sync::Arc;
 use advance_runtime::host_registry::{HostCallContext, HostRegistry, InMemoryHostRegistry};
 use advance_shared_types::security_validator::{LeakDetector, ScanContext, ScanResult};
 use cap_mcp::{
-    register_mcp_client, McpClient, McpClientLimits, McpErrorKind, McpServerEntry,
+    register_mcp_client, McpClient, McpClientLimits, McpErrorKind, McpReconfig, McpServerEntry,
     McpServersConfig, McpTransport, McpTransportSpec, ToolPattern, MAX_CACHED_TOOLS,
     MAX_TOOLS_PER_SERVER, MAX_TOOL_DESCRIPTION_BYTES, MAX_TOOL_LIST_CURSOR_BYTES,
     MAX_TOOL_LIST_PAGES, MAX_TOOL_NAME_BYTES, MAX_TOOL_SCHEMA_BYTES,
@@ -578,4 +578,26 @@ async fn the_host_functions_call_for_the_calling_agent() {
         );
     }
     assert_eq!(mock.callers(), vec![Some("agent-x".to_string()); 6]);
+}
+
+#[tokio::test]
+async fn replace_config_drops_removed_and_changed_servers_and_their_cache() {
+    let mock = Arc::new(CountingMockTransport::new("old"));
+    mock.push_ok(json!({"tools": [{"name": "echo"}]}));
+    let client = build_client_with_mock("old", mock, None);
+    client.list_tools(None, "old").await.unwrap();
+    assert_eq!(client.cached_tools().len(), 1);
+
+    let unchanged = McpServersConfig::builder()
+        .add_server(entry_with_patterns("old", None))
+        .unwrap()
+        .build();
+    assert_eq!(client.replace_config(unchanged), McpReconfig::default());
+    assert_eq!(client.cached_tools().len(), 1);
+
+    let empty = McpServersConfig::builder().build();
+    let reconfig = client.replace_config(empty);
+    assert_eq!(reconfig.removed, ["old"]);
+    assert!(client.cached_tools().is_empty());
+    assert!(client.list_servers().await.is_empty());
 }

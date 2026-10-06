@@ -96,8 +96,8 @@ pub use manifest::{
 pub use materialize::{GrantId, MaterializeAction, McpServerId, WorkflowContext, WorkflowReport};
 pub use materialize_impl::DefaultMaterializer;
 pub use mcp_server_manifest::{
-    parse_mcp_server_manifest, parse_mcp_server_manifest_str, McpServerManifest, McpTransportDecl,
-    MAX_MCP_SERVER_YAML_BYTES,
+    parse_mcp_server_manifest, parse_mcp_server_manifest_str, McpServerManifest, McpServerOrigin,
+    McpTransportDecl, MAX_MCP_SERVER_YAML_BYTES,
 };
 pub use meta::{MetaIndex, MetaPackEntry, MetaScope};
 pub use meta_schema_merge::{

@@ -1435,8 +1435,12 @@ pub(crate) async fn wire_capabilities_inner(
     // The operator's MCP server files, read once and only for a root that declares
     // `mcp` (bad files are skipped, never fatal). A server that needs secrets opens
     // the secret store, as `secrets` / `llm` do; without one, `mcp` needs no key.
-    let mcp_servers = declares("mcp")
-        .then(|| crate::mcp_wiring::McpControlPlane::new(workspace, &builder.config().mcp).scan());
+    let mcp_plane = crate::mcp_wiring::McpControlPlane::new(workspace, &builder.config().mcp)
+        .with_log(log.clone());
+    let mcp_sink = Arc::new(crate::mcp_wiring::ControlPlaneMcpSink::new(
+        mcp_plane.clone(),
+    ));
+    let mcp_servers = declares("mcp").then(|| mcp_plane.scan());
     let mcp_needs_secrets = mcp_servers
         .as_ref()
         .is_some_and(|servers| servers.need_secrets());
@@ -2260,7 +2264,7 @@ pub(crate) async fn wire_capabilities_inner(
         // Pack lane P2: the production `WorkflowExecutor` —
         // `spawn-child` through THIS spawner (template-resolving, observer-bearing),
         // `submit-component` through the scheduler submit API, `register-mcp-server`
-        // through the trust-gated MCP bridge into `PackWiring::mcp_entries` — bound
+        // through the trust-gated MCP bridge into the control-plane sink — bound
         // into the pack materializer's slot so `apply_workflow` stops failing closed
         // with `NotImplemented`. Without a scheduler API (no component registry) the
         // slot stays unbound.
@@ -2273,7 +2277,7 @@ pub(crate) async fn wire_capabilities_inner(
                 root_uid.as_str(),
                 pack_wiring.registry.clone() as Arc<dyn advance_pack_manager::PackRegistry>,
                 pack_wiring.secret_store.clone() as Arc<dyn advance_pack_manager::SecretStore>,
-                pack_wiring.mcp_entries.clone() as Arc<dyn crate::pack_bridges::McpEntrySink>,
+                Arc::clone(&mcp_sink) as Arc<dyn crate::pack_bridges::McpEntrySink>,
             ));
             let _ = pack_wiring
                 .workflow_executor
@@ -3079,10 +3083,16 @@ pub(crate) async fn wire_capabilities_inner(
             web_mode: web_cfg_snapshot.mode,
             runtime: tokio::runtime::Handle::current(),
             root_agent_id: root_uid.as_str(),
+            plane: mcp_plane.clone(),
             log: log.clone(),
         })
     });
     started.mcp = mcp_runtime.clone();
+    pack_runtime.attach_mcp_plane(mcp_plane);
+    if let Some(runtime) = mcp_runtime.as_ref() {
+        mcp_sink.bind_runtime(Arc::clone(runtime));
+        pack_runtime.attach_mcp(Arc::clone(runtime));
+    }
 
     // Wave-23 seam (d): late-bind the post-`build()` runtime + injector into the
     // per-child manager (constructed pre-build when it was attached as the spawner's

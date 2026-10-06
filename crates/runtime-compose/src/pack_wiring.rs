@@ -22,8 +22,8 @@
 //!   and `CapSecretsSecretStore` are built LATER in `wiring.rs` (they depend on
 //!   the template resolver / master key this wiring provides) and bound into
 //!   the slots; until then every leg fails closed (`NotImplemented` / no
-//!   secret), never silently succeeding. [`PackWiring::mcp_entries`] is where a
-//!   workflow's `register-mcp-server` entries are retained for the MCP client.
+//!   secret), never silently succeeding. A workflow's `register-mcp-server`
+//!   is persisted by the control-plane MCP sink wired in `wiring.rs`.
 //!
 //! Boot semantics (fail-closed): a missing `packs_dir` is created (empty
 //! registry — a fresh `advance init` workspace boots); an existing one is
@@ -48,7 +48,6 @@ use cap_lifecycle::templates::{
 };
 
 use crate::auto_wiring::PackEvaluatorResolver;
-use crate::pack_bridges::InMemoryMcpEntrySink;
 use crate::pack_production::{LateBoundSecretStore, LateBoundWorkflowExecutor};
 
 /// Boot-time pack wiring failure. Every variant aborts `advance start`.
@@ -114,10 +113,6 @@ pub struct PackWiring {
     /// cap-secrets-backed store once the master key is loaded; unbound → every
     /// `secret-refs` lookup is `MissingSecret`.
     pub secret_store: Arc<LateBoundSecretStore>,
-    /// P2 (§3.1): entries a workflow's `register-mcp-server` produced (trust +
-    /// secrets already applied), retained for the MCP client wiring to drain
-    /// into a `McpServersConfig`.
-    pub mcp_entries: Arc<InMemoryMcpEntrySink>,
     /// Reserved for an in-daemon `Installer`: the bus pack lifecycle events
     /// (`pack.registry_reloaded` / `pack.uninstalled`) would go to. The
     /// read-only registry/resolvers built here emit nothing.
@@ -172,7 +167,6 @@ pub async fn build_pack_wiring(
         materializer,
         workflow_executor,
         secret_store,
-        mcp_entries: Arc::new(InMemoryMcpEntrySink::new()),
         event_bus,
     })
 }
@@ -275,6 +269,5 @@ mod tests {
             Err(PackError::NotImplemented(_))
         ));
         assert!(wiring.secret_store.get("anything").is_none());
-        assert!(wiring.mcp_entries.is_empty());
     }
 }

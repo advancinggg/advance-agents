@@ -75,6 +75,18 @@ pub struct McpServerManifest {
     pub transport: McpTransportDecl,
     /// `ENV_NAME → secret-store key`; empty unless `transport` is `stdio`.
     pub secret_refs: BTreeMap<String, String>,
+    /// The pack that materialized this file into the operator's servers
+    /// directory. `None` on a file the operator wrote.
+    pub origin: Option<McpServerOrigin>,
+}
+
+/// The pack that wrote a server file under `.advance/mcp-servers/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerOrigin {
+    /// `name@version` of the installed pack.
+    pub pack: String,
+    /// The FQ ref that registered it (`{pack}@{ver}/mcp-servers/{name}`).
+    pub config_ref: String,
 }
 
 /// The declared transport. Mirrors `cap_mcp::McpTransportSpec` minus the
@@ -108,6 +120,16 @@ struct RawManifest {
     transport: RawTransport,
     #[serde(default, rename = "secret-refs")]
     secret_refs: BTreeMap<String, String>,
+    #[serde(default)]
+    origin: Option<RawOrigin>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOrigin {
+    pack: String,
+    #[serde(rename = "config-ref")]
+    config_ref: String,
 }
 
 #[derive(Deserialize)]
@@ -237,11 +259,38 @@ pub fn parse_mcp_server_manifest_str(yaml: &str) -> Result<McpServerManifest, Pa
         });
     }
 
+    let origin = match raw.origin {
+        None => None,
+        Some(origin) => {
+            if origin.pack.trim().is_empty()
+                || origin.pack.contains('\0')
+                || origin.pack.len() > MAX_SECRET_REF_LEN
+            {
+                return Err(PackError::InvalidManifest(
+                    "origin.pack must be a non-empty pack id (name@version)".into(),
+                ));
+            }
+            if origin.config_ref.trim().is_empty()
+                || origin.config_ref.contains('\0')
+                || origin.config_ref.len() > MAX_COMMAND_LEN
+            {
+                return Err(PackError::InvalidManifest(
+                    "origin.config-ref must be a non-empty pack FQ ref".into(),
+                ));
+            }
+            Some(McpServerOrigin {
+                pack: origin.pack,
+                config_ref: origin.config_ref,
+            })
+        }
+    };
+
     Ok(McpServerManifest {
         server_id: raw.server_id,
         description,
         transport,
         secret_refs: raw.secret_refs,
+        origin,
     })
 }
 

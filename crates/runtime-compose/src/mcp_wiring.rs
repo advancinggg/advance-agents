@@ -69,10 +69,10 @@
 //! [`McpRuntime::shutdown`] closes every connection and stops those groups; the daemon calls
 //! it when it stops, and dropping the last handle to the runtime does the same.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use advance_pack_manager::mcp_server_manifest::MAX_MCP_SERVER_YAML_BYTES;
@@ -101,6 +101,7 @@ use zeroize::Zeroizing;
 
 use crate::api::log_keys;
 use crate::compose_log::LogHandle;
+use crate::pack_bridges::{McpEntrySink, McpRegister, McpRegistration, PackBridgeError};
 use crate::pack_production::CapSecretsSecretStore;
 
 /// The suffix of a server file's name.
@@ -167,6 +168,7 @@ fn printable(text: &str) -> String {
 pub struct McpControlPlane {
     dir: PathBuf,
     allow_stdio: bool,
+    log: LogHandle,
 }
 
 impl McpControlPlane {
@@ -175,12 +177,49 @@ impl McpControlPlane {
         Self {
             dir: workspace.join(&config.servers_dir),
             allow_stdio: config.allow_stdio,
+            log: LogHandle::null(),
         }
+    }
+
+    /// Report skip and stale-file warnings to `log`.
+    pub fn with_log(mut self, log: LogHandle) -> Self {
+        self.log = log;
+        self
     }
 
     /// The directory the server files are read from.
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Delete pack-origin server files whose origin pack is not in
+    /// `installed` (`name@version`). Operator files (no origin) are left.
+    /// Returns the server ids removed.
+    pub fn remove_origins_not_in(&self, installed: &BTreeSet<String>) -> Vec<String> {
+        let mut removed = Vec::new();
+        for manifest in self.scan().manifests() {
+            let Some(origin) = &manifest.origin else {
+                continue;
+            };
+            if installed.contains(&origin.pack) {
+                continue;
+            }
+            let path = self
+                .dir
+                .join(format!("{}{SERVER_FILE_SUFFIX}", manifest.server_id));
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed.push(manifest.server_id.clone()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => self.log.err(
+                    log_keys::MCP_WARN,
+                    format!(
+                        "advance: WARN mcp: could not remove stale server file {}: {e}",
+                        path.display()
+                    ),
+                ),
+            }
+        }
+        removed
     }
 
     /// Read every server file. Never fails: what cannot serve is left out, with a warning
@@ -360,6 +399,11 @@ impl McpServerFiles {
     /// The ids of the servers read, in order.
     pub fn server_ids(&self) -> Vec<&str> {
         self.servers.iter().map(|m| m.server_id.as_str()).collect()
+    }
+
+    /// The manifests that can serve, in server-id order.
+    pub fn manifests(&self) -> &[McpServerManifest] {
+        &self.servers
     }
 
     /// Whether a server needs the secret store: it names `secret-refs`.
@@ -592,6 +636,8 @@ pub struct McpComposition<'a> {
     pub runtime: tokio::runtime::Handle,
     /// The root agent's id, whose grants say which servers the warm-up connects.
     pub root_agent_id: &'a str,
+    /// The control plane the runtime reloads from.
+    pub plane: McpControlPlane,
     /// Where skip and warm-up warnings go (`advance start` prints them on stderr).
     pub log: LogHandle,
 }
@@ -603,8 +649,9 @@ pub struct McpComposition<'a> {
 pub fn compose_mcp(parts: McpComposition<'_>) -> Arc<McpRuntime> {
     // One store for everything MCP reads secrets from: the daemon's when a server needs
     // secrets, an empty one otherwise.
-    let secret_store = match parts.secret_store {
-        Some(store) if parts.servers.need_secrets() => Some(store),
+    let live_secrets = parts.secret_store.clone();
+    let secret_store = match live_secrets.as_ref() {
+        Some(store) if parts.servers.need_secrets() => Some(Arc::clone(store)),
         _ => None,
     };
     let manifest_secrets = secret_store
@@ -649,6 +696,8 @@ pub fn compose_mcp(parts: McpComposition<'_>) -> Arc<McpRuntime> {
         gate,
         runtime: parts.runtime,
         warnings: servers.warnings,
+        plane: parts.plane,
+        secret_store: live_secrets,
         log: parts.log,
     });
     if parts.config.warm_tool_cache {
@@ -666,6 +715,8 @@ pub struct McpRuntime {
     gate: McpGate,
     runtime: tokio::runtime::Handle,
     warnings: Vec<String>,
+    plane: McpControlPlane,
+    secret_store: Option<Arc<SecretStore>>,
     log: LogHandle,
 }
 
@@ -692,6 +743,7 @@ impl McpRuntime {
     pub fn warm_tool_cache(&self, agent_id: &str) {
         let scopes = self.gate.scopes(agent_id);
         let client = Arc::clone(&self.client);
+        let log = self.log.clone();
         self.runtime.spawn(async move {
             let mut servers = client
                 .list_servers()
@@ -706,7 +758,7 @@ impl McpRuntime {
                         break;
                     };
                     let client = Arc::clone(&client);
-                    let log = self.log.clone();
+                    let log = log.clone();
                     listings.spawn(async move {
                         if let Err(e) = client.list_tools(None, &server_id).await {
                             // A client shut down meanwhile fails every listing: say nothing.
@@ -736,6 +788,256 @@ impl McpRuntime {
     pub fn shutdown(&self) {
         self.client.shutdown();
     }
+
+    /// Re-read the server files and swap them into the client. Connections of a
+    /// removed or changed server are closed and their tool-cache entries
+    /// dropped. Listings of added or changed servers run on the daemon runtime
+    /// and are not awaited here.
+    pub fn reload(&self) {
+        let files = self.plane.scan();
+        let manifest_secrets = self
+            .secret_store
+            .as_ref()
+            .map(|store| CapSecretsSecretStore::new(Arc::clone(store)));
+        let servers = files.into_servers(
+            manifest_secrets
+                .as_ref()
+                .map(|secrets| secrets as &dyn ManifestSecrets),
+        );
+        for warning in &servers.warnings {
+            self.log.err(
+                log_keys::MCP_WARN,
+                format!("advance: WARN mcp: {warning}"),
+            );
+        }
+        let reconfig = self.client.replace_config(servers.config);
+        for id in reconfig.added.iter().chain(reconfig.changed.iter()) {
+            let client = Arc::clone(&self.client);
+            let id = id.clone();
+            self.runtime.spawn(async move {
+                let _ = client.list_tools(None, &id).await;
+            });
+        }
+    }
+
+    /// Delete pack-origin files whose origin pack is not installed, then
+    /// [`reload`](Self::reload).
+    pub fn drop_uninstalled_origins(&self, installed: &BTreeSet<String>) {
+        self.plane.remove_origins_not_in(installed);
+        self.reload();
+    }
+}
+
+/// Persists a pack's MCP server as a file in the operator's servers directory.
+pub struct ControlPlaneMcpSink {
+    plane: McpControlPlane,
+    runtime: Mutex<Option<Weak<McpRuntime>>>,
+}
+
+impl ControlPlaneMcpSink {
+    /// A sink that writes under `plane`'s directory.
+    pub fn new(plane: McpControlPlane) -> Self {
+        Self {
+            plane,
+            runtime: Mutex::new(None),
+        }
+    }
+
+    /// The runtime that reloads after a register or deregister. Absent: files
+    /// are still written, and nothing is connected.
+    pub fn bind_runtime(&self, runtime: Arc<McpRuntime>) {
+        *self.runtime.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&runtime));
+    }
+
+    fn reload(&self) {
+        if let Some(runtime) = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+        {
+            runtime.reload();
+        }
+    }
+
+    fn path_for(&self, server_id: &str) -> PathBuf {
+        self.plane
+            .dir()
+            .join(format!("{server_id}{SERVER_FILE_SUFFIX}"))
+    }
+}
+
+impl McpEntrySink for ControlPlaneMcpSink {
+    fn register(&self, registration: McpRegistration) -> Result<McpRegister, PackBridgeError> {
+        let id = registration.server_id.clone();
+        let path = self.path_for(&id);
+        let body = render_server_file(&registration);
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            match parse_mcp_server_manifest_str(&existing) {
+                Ok(manifest) => match &manifest.origin {
+                    None => {
+                        return Err(PackBridgeError::Pack(PackError::ConstraintViolation {
+                            reason: format!(
+                                "mcp-server '{id}' already exists as an operator file; a \
+                                     pack may not replace it"
+                            ),
+                        }));
+                    }
+                    Some(origin)
+                        if origin.pack != registration.origin_pack
+                            || origin.config_ref != registration.origin_ref =>
+                    {
+                        return Err(PackBridgeError::Pack(PackError::ConstraintViolation {
+                            reason: format!(
+                                "mcp-server '{id}' already belongs to pack {}",
+                                origin.pack
+                            ),
+                        }));
+                    }
+                    Some(_) if existing_matches(&manifest, &registration) => {
+                        return Ok(McpRegister::Unchanged(id));
+                    }
+                    Some(_) => {
+                        return Err(PackBridgeError::Pack(PackError::ConstraintViolation {
+                            reason: format!(
+                                "mcp-server '{id}' is already registered with different \
+                                     content"
+                            ),
+                        }));
+                    }
+                },
+                Err(e) => {
+                    return Err(PackBridgeError::Pack(PackError::ConstraintViolation {
+                        reason: format!("mcp-server '{id}' already exists and cannot be read: {e}"),
+                    }));
+                }
+            }
+        }
+        std::fs::create_dir_all(self.plane.dir()).map_err(|source| {
+            PackBridgeError::Pack(PackError::Io {
+                path: self.plane.dir().to_path_buf(),
+                source,
+            })
+        })?;
+        let tmp = self.plane.dir().join(format!(".{id}.yaml.tmp"));
+        std::fs::write(&tmp, body.as_bytes()).map_err(|source| {
+            PackBridgeError::Pack(PackError::Io {
+                path: tmp.clone(),
+                source,
+            })
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&tmp, &path).map_err(|source| {
+            PackBridgeError::Pack(PackError::Io {
+                path: path.clone(),
+                source,
+            })
+        })?;
+        self.reload();
+        Ok(McpRegister::Created(id))
+    }
+
+    fn deregister(&self, server_id: &str) -> Result<(), PackBridgeError> {
+        let path = self.path_for(server_id);
+        match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(PackBridgeError::Pack(PackError::Io {
+                    path: path.clone(),
+                    source,
+                }));
+            }
+            Ok(text) => {
+                let manifest =
+                    parse_mcp_server_manifest_str(&text).map_err(PackBridgeError::Pack)?;
+                if manifest.origin.is_none() {
+                    return Err(PackBridgeError::Pack(PackError::ConstraintViolation {
+                        reason: format!(
+                            "mcp-server '{server_id}' is an operator file and is not removed \
+                             by a pack"
+                        ),
+                    }));
+                }
+            }
+        }
+        std::fs::remove_file(&path)
+            .map_err(|source| PackBridgeError::Pack(PackError::Io { path, source }))?;
+        self.reload();
+        Ok(())
+    }
+}
+
+fn existing_matches(manifest: &McpServerManifest, registration: &McpRegistration) -> bool {
+    manifest.server_id == registration.server_id
+        && manifest.description == registration.description
+        && manifest.transport == registration.transport
+        && manifest.secret_refs == registration.secret_refs
+}
+
+fn render_server_file(registration: &McpRegistration) -> String {
+    let mut yaml = format!("server-id: {}\n", registration.server_id);
+    if !registration.description.is_empty() {
+        yaml.push_str(&format!(
+            "description: {}\n",
+            yaml_string(&registration.description)
+        ));
+    }
+    match &registration.transport {
+        McpTransportDecl::Stdio { command, args } => {
+            yaml.push_str("transport:\n  kind: stdio\n");
+            yaml.push_str(&format!("  command: {}\n", yaml_string(command)));
+            if !args.is_empty() {
+                yaml.push_str("  args:\n");
+                for arg in args {
+                    yaml.push_str(&format!("    - {}\n", yaml_string(arg)));
+                }
+            }
+        }
+        McpTransportDecl::Http { endpoint_url } => {
+            yaml.push_str("transport:\n  kind: http\n");
+            yaml.push_str(&format!("  endpoint-url: {}\n", yaml_string(endpoint_url)));
+        }
+    }
+    if !registration.secret_refs.is_empty() {
+        yaml.push_str("secret-refs:\n");
+        for (env, key) in &registration.secret_refs {
+            yaml.push_str(&format!("  {env}: {}\n", yaml_string(key)));
+        }
+    }
+    yaml.push_str("origin:\n");
+    yaml.push_str(&format!(
+        "  pack: {}\n  config-ref: {}\n",
+        yaml_string(&registration.origin_pack),
+        yaml_string(&registration.origin_ref)
+    ));
+    yaml
+}
+
+/// A YAML double-quoted scalar, so a value with `:`, `#` or a newline cannot
+/// change the document's shape.
+fn yaml_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 impl Drop for McpRuntime {
@@ -1362,5 +1664,54 @@ mod tests {
         );
         assert!(gate.scopes("root").reaches_server("srv"));
         assert!(!gate.scopes("someone-else").reaches_server("srv"));
+    }
+
+    fn registration(id: &str, pack: &str) -> McpRegistration {
+        McpRegistration {
+            server_id: id.into(),
+            description: "d".into(),
+            transport: McpTransportDecl::Http {
+                endpoint_url: "https://mcp.example.com/mcp".into(),
+            },
+            secret_refs: BTreeMap::new(),
+            origin_pack: pack.into(),
+            origin_ref: format!("{pack}/mcp-servers/{id}"),
+        }
+    }
+
+    #[test]
+    fn the_control_plane_sink_is_idempotent_and_refuses_a_collision() {
+        let ws = tempfile::tempdir().unwrap();
+        let sink = ControlPlaneMcpSink::new(plane(ws.path()));
+        let first = sink.register(registration("srv", "p@1.0.0")).unwrap();
+        assert!(first.created());
+        let body =
+            std::fs::read_to_string(ws.path().join(".advance/mcp-servers/srv.yaml")).unwrap();
+        assert!(body.contains("origin:"));
+        assert!(body.contains("p@1.0.0"));
+        assert!(!body.contains("secret:"));
+        let again = sink.register(registration("srv", "p@1.0.0")).unwrap();
+        assert!(!again.created());
+        let other = sink.register(registration("srv", "q@1.0.0"));
+        assert!(other.is_err(), "{other:?}");
+        sink.deregister("srv").unwrap();
+        assert!(!ws.path().join(".advance/mcp-servers/srv.yaml").exists());
+    }
+
+    #[test]
+    fn stale_pack_origin_files_are_removed_when_the_pack_is_gone() {
+        let ws = tempfile::tempdir().unwrap();
+        let control = plane(ws.path());
+        let sink = ControlPlaneMcpSink::new(control.clone());
+        sink.register(registration("srv", "p@1.0.0")).unwrap();
+        http_server(ws.path(), "ops", "https://mcp.example.com/ops");
+        let mut installed = BTreeSet::new();
+        assert_eq!(control.remove_origins_not_in(&installed), ["srv"]);
+        assert!(!ws.path().join(".advance/mcp-servers/srv.yaml").exists());
+        assert!(ws.path().join(".advance/mcp-servers/ops.yaml").exists());
+        installed.insert("p@1.0.0".into());
+        sink.register(registration("srv", "p@1.0.0")).unwrap();
+        assert!(control.remove_origins_not_in(&installed).is_empty());
+        assert!(ws.path().join(".advance/mcp-servers/srv.yaml").exists());
     }
 }

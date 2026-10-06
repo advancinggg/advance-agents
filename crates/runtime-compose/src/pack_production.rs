@@ -24,9 +24,9 @@
 //! real objects exist. Until then every leg fails closed (`NotImplemented` /
 //! no secret), exactly as P1's unwired stubs did; nothing silently succeeds.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use advance_pack_manager::{
     DependencyResolver, McpServerId, PackError, PackRegistry, RegistryClient, SecretStore,
@@ -189,6 +189,26 @@ impl WorkflowExecutor for LateBoundWorkflowExecutor {
     fn withdraw_component(&self, component_ref: &str) -> Result<(), PackError> {
         self.bound()?.withdraw_component(component_ref)
     }
+
+    fn register_mcp_server_refs(
+        &self,
+        config_ref: &str,
+        secret_ref_ids: &BTreeMap<String, String>,
+        resolved_secrets: &BTreeMap<String, SecretValue>,
+    ) -> Result<McpServerId, PackError> {
+        self.bound()?
+            .register_mcp_server_refs(config_ref, secret_ref_ids, resolved_secrets)
+    }
+
+    fn deregister_mcp_server(&self, server_id: &str) -> Result<(), PackError> {
+        self.bound()?.deregister_mcp_server(server_id)
+    }
+
+    fn mcp_register_created(&self, server_id: &str) -> bool {
+        self.inner
+            .get()
+            .is_some_and(|executor| executor.mcp_register_created(server_id))
+    }
 }
 
 // ─────────────────────────── DependencyResolver ────────────────────────
@@ -336,9 +356,11 @@ pub struct SchedulerWorkflowExecutor {
     submit: Arc<dyn ComponentSubmitApi>,
     submitter: String,
     registry: Arc<dyn PackRegistry>,
-    secrets: Arc<dyn SecretStore>,
+    _secrets: Arc<dyn SecretStore>,
     mcp: PackMcpBridge,
     mcp_sink: Arc<dyn McpEntrySink>,
+    /// Server ids whose last register created a file (compensation).
+    mcp_created: Mutex<HashSet<String>>,
 }
 
 impl SchedulerWorkflowExecutor {
@@ -362,8 +384,9 @@ impl SchedulerWorkflowExecutor {
             submitter: submitter.into(),
             mcp: PackMcpBridge::new(Arc::clone(&registry)),
             registry,
-            secrets,
+            _secrets: secrets,
             mcp_sink,
+            mcp_created: Mutex::new(HashSet::new()),
         }
     }
 
@@ -566,13 +589,49 @@ impl WorkflowExecutor for SchedulerWorkflowExecutor {
         config_ref: &str,
         resolved_secrets: &BTreeMap<String, SecretValue>,
     ) -> Result<McpServerId, PackError> {
-        let entry = self
+        self.register_mcp_server_refs(config_ref, &BTreeMap::new(), resolved_secrets)
+    }
+
+    fn register_mcp_server_refs(
+        &self,
+        config_ref: &str,
+        secret_ref_ids: &BTreeMap<String, String>,
+        _resolved_secrets: &BTreeMap<String, SecretValue>,
+    ) -> Result<McpServerId, PackError> {
+        let registration = self
             .mcp
-            .entry_with_env(config_ref, &*self.secrets, resolved_secrets)
+            .plan(config_ref, secret_ref_ids)
             .map_err(bridge_to_pack)?;
-        let id = entry.server_id.clone();
-        self.mcp_sink.register(entry).map_err(bridge_to_pack)?;
+        let outcome = self
+            .mcp_sink
+            .register(registration)
+            .map_err(bridge_to_pack)?;
+        let id = outcome.server_id().to_string();
+        let mut created = self.mcp_created.lock().unwrap_or_else(|e| e.into_inner());
+        if outcome.created() {
+            created.insert(id.clone());
+        } else {
+            created.remove(&id);
+        }
         Ok(McpServerId(id))
+    }
+
+    fn deregister_mcp_server(&self, server_id: &str) -> Result<(), PackError> {
+        self.mcp_sink
+            .deregister(server_id)
+            .map_err(bridge_to_pack)?;
+        self.mcp_created
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(server_id);
+        Ok(())
+    }
+
+    fn mcp_register_created(&self, server_id: &str) -> bool {
+        self.mcp_created
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(server_id)
     }
 
     /// Compensation for an earlier `spawn_child`. With a terminate controller

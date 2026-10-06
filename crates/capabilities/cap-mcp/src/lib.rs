@@ -28,7 +28,7 @@
 //!   are refused from stdio servers. The handlers emit the `mcp.*` call events.
 
 pub use client::{
-    McpClient, McpClientLimits, McpToolInfo, McpTransport, MCP_PROTOCOL_VERSION,
+    McpClient, McpClientLimits, McpReconfig, McpToolInfo, McpTransport, MCP_PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
 };
 // Slice J (V1-b) — MCP half of the CONTRACT-165 inventory feed.

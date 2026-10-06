@@ -376,10 +376,21 @@ fn backoff(failures: u32, limits: &McpClientLimits) -> Duration {
         .min(limits.restart_backoff_max)
 }
 
+/// What [`McpClient::replace_config`] changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpReconfig {
+    /// Server ids that were not configured before.
+    pub added: Vec<String>,
+    /// Server ids that are no longer configured.
+    pub removed: Vec<String>,
+    /// Server ids whose fingerprint changed (transport, patterns or schemas).
+    pub changed: Vec<String>,
+}
+
 /// High-level MCP client. Owns the `McpServersConfig` whitelist, the
 /// per-server connection slots and the tool cache.
 pub struct McpClient {
-    config: Arc<McpServersConfig>,
+    config: Mutex<Arc<McpServersConfig>>,
     slots: Mutex<HashMap<String, Arc<ServerSlot>>>,
     tool_cache: Mutex<ToolCache>,
     leak_detector: Arc<dyn LeakDetector>,
@@ -416,7 +427,7 @@ impl McpClient {
         http_chain: Option<Arc<dyn HttpSecurityChain>>,
     ) -> Self {
         Self {
-            config,
+            config: Mutex::new(config),
             slots: Mutex::new(HashMap::new()),
             tool_cache: Mutex::new(ToolCache::default()),
             leak_detector,
@@ -473,7 +484,7 @@ impl McpClient {
             })
             .collect();
         Self {
-            config,
+            config: Mutex::new(config),
             slots: Mutex::new(slots),
             tool_cache: Mutex::new(ToolCache::default()),
             leak_detector,
@@ -483,6 +494,45 @@ impl McpClient {
             event_bus: None,
             shut_down: AtomicBool::new(false),
         }
+    }
+
+    fn servers(&self) -> Arc<McpServersConfig> {
+        Arc::clone(&lock(&self.config))
+    }
+
+    /// Replace the configured servers. Connections of a removed or changed
+    /// server are closed ([`disconnect`](Self::disconnect)); their tool-cache
+    /// entries are dropped. An unchanged server keeps its connection. A client
+    /// that has been shut down ignores the new set.
+    pub fn replace_config(&self, new: McpServersConfig) -> McpReconfig {
+        if self.is_shut_down() {
+            return McpReconfig::default();
+        }
+        let new = Arc::new(new);
+        let old = {
+            let mut guard = lock(&self.config);
+            let old = Arc::clone(&*guard);
+            *guard = Arc::clone(&new);
+            old
+        };
+        let mut reconfig = McpReconfig::default();
+        for entry in old.list_servers() {
+            match new.get(&entry.server_id) {
+                Ok(next) if next.fingerprint() == entry.fingerprint() => {}
+                Ok(_) => reconfig.changed.push(entry.server_id.clone()),
+                Err(_) => reconfig.removed.push(entry.server_id.clone()),
+            }
+        }
+        for entry in new.list_servers() {
+            if old.get(&entry.server_id).is_err() {
+                reconfig.added.push(entry.server_id.clone());
+            }
+        }
+        for id in reconfig.removed.iter().chain(reconfig.changed.iter()) {
+            self.disconnect(id);
+            lock(&self.tool_cache).drop_server(id);
+        }
+        reconfig
     }
 
     /// The protocol version agreed with the server when the client initialized
@@ -533,14 +583,14 @@ impl McpClient {
     /// refuse calls to them. False for an http server and for an id that is not
     /// configured.
     pub fn refuses_web_tools(&self, server_id: &str) -> bool {
-        self.config
+        self.servers()
             .get(server_id)
             .is_ok_and(|entry| refuse_stdio_web_provider(&entry.transport).is_err())
     }
 
     /// List configured servers (filtered by whitelist).
     pub async fn list_servers(&self) -> Vec<McpServerInfo> {
-        self.config
+        self.servers()
             .list_servers()
             .map(|e| McpServerInfo {
                 id: e.server_id.clone(),
@@ -568,7 +618,8 @@ impl McpClient {
         caller: Option<&str>,
         server_id: &str,
     ) -> Result<Vec<McpToolInfo>, McpError> {
-        let entry = self.config.get(server_id)?;
+        let servers = self.servers();
+        let entry = servers.get(server_id)?;
         let mut listing = ToolListing::new(server_id);
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_TOOL_LIST_PAGES {
@@ -621,7 +672,8 @@ impl McpClient {
         caller: Option<&str>,
         server_id: &str,
     ) -> Result<Vec<McpPromptInfo>, McpError> {
-        let entry = self.config.get(server_id)?;
+        let servers = self.servers();
+        let entry = servers.get(server_id)?;
         let bytes = self
             .call(
                 caller,
@@ -664,7 +716,8 @@ impl McpClient {
         prompt_name: &str,
         args: Vec<(String, String)>,
     ) -> Result<Vec<u8>, McpError> {
-        let entry = self.config.get(server_id)?;
+        let servers = self.servers();
+        let entry = servers.get(server_id)?;
         let args_obj: serde_json::Map<String, serde_json::Value> = args
             .into_iter()
             .map(|(k, v)| (k, serde_json::Value::String(v)))
@@ -679,7 +732,8 @@ impl McpClient {
         caller: Option<&str>,
         server_id: &str,
     ) -> Result<Vec<McpResourceInfo>, McpError> {
-        let entry = self.config.get(server_id)?;
+        let servers = self.servers();
+        let entry = servers.get(server_id)?;
         let bytes = self
             .call(
                 caller,
@@ -723,7 +777,8 @@ impl McpClient {
         server_id: &str,
         uri: &str,
     ) -> Result<Vec<u8>, McpError> {
-        let entry = self.config.get(server_id)?;
+        let servers = self.servers();
+        let entry = servers.get(server_id)?;
         let params = serde_json::json!({"uri": uri});
         self.call(caller, entry, "resources/read", params).await
     }
@@ -751,7 +806,8 @@ impl McpClient {
             )));
         }
 
-        let entry = self.config.get(server_id)?;
+        let servers = self.servers();
+        let entry = servers.get(server_id)?;
         if !entry.tool_allowed(tool_name) {
             return Err(McpError::tool_not_found(format!(
                 "tool '{tool_name}' does not match the tool patterns configured for server \

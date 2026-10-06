@@ -172,9 +172,10 @@ pub enum PackError {
     // Pack lane P2 addition — variant 26.
     /// `WorkflowApplier::apply`: step `i` failed AFTER at least one earlier step
     /// had already executed. Every earlier successful `spawn-child` /
-    /// `submit-component` was compensated in reverse order (`terminate_child` /
-    /// `withdraw_component` on the executor) BEFORE this error was returned;
-    /// `register-mcp-server` has no compensation (it only returns an id).
+    /// `submit-component` / `register-mcp-server` (when it created a server)
+    /// was compensated in reverse order (`terminate_child` /
+    /// `withdraw_component` / `deregister_mcp_server` on the executor) BEFORE
+    /// this error was returned.
     ///
     /// - `step` — `"step[{i}]:{type}"` of the failing step.
     /// - `source` — the failing step's own error (validation or executor).
