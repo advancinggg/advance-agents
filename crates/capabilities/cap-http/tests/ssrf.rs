@@ -1,8 +1,9 @@
 //! T11a-k — SSRF unit tests (AC-11). Use `MockResolver` to bypass real DNS.
 
 use advance_shared_types::security_validator::{CidrClass, SsrfError, SsrfGuard};
-use cap_http::{DefaultSsrfGuard, MockResolver};
+use cap_http::{DefaultSsrfGuard, LoopbackExemptSsrfGuard, LoopbackExemptions, MockResolver};
 use std::net::IpAddr;
+use std::sync::Arc;
 
 fn ipv4(s: &str) -> IpAddr {
     s.parse().unwrap()
@@ -200,4 +201,156 @@ async fn t11m_ipv4_compatible_ipv6_rejected() {
     let g2 = guard_with("v6unspec.example.com", vec![ipv6("::")]);
     let r2 = g2.check("https://v6unspec.example.com/").await;
     assert_eq!(r2, Err(SsrfError::Forbidden(CidrClass::Loopback)));
+}
+
+// ─── Loopback exemptions ─────────────────────────────────────────────────────
+
+fn exempting(urls: &[&str]) -> LoopbackExemptions {
+    let mut exemptions = LoopbackExemptions::none();
+    for url in urls {
+        assert!(exemptions.allow_endpoint(url), "{url} can be exempt");
+    }
+    exemptions
+}
+
+// Only an http(s) URL without user info whose host is `localhost` or a loopback address
+// literal can be exempt.
+#[test]
+fn only_loopback_endpoints_can_be_exempt() {
+    for url in [
+        "http://127.0.0.1:8931/mcp",
+        "http://127.8.9.10/",
+        "http://localhost:8931/mcp?x=1#frag",
+        "http://LOCALHOST:8931/",
+        "https://localhost/",
+        "http://[::1]:9/",
+        // A loopback address in another notation.
+        "http://127.1:8931/",
+        "https://2130706433/mcp",
+        "https://0x7f.0.0.1/",
+    ] {
+        assert!(LoopbackExemptions::is_loopback_endpoint(url), "{url}");
+        let mut exemptions = LoopbackExemptions::none();
+        assert!(exemptions.allow_endpoint(url), "{url}");
+        assert!(!exemptions.is_empty());
+        assert!(exemptions.covers(url), "{url}");
+    }
+    for url in [
+        "https://mcp.example.com/mcp",
+        "http://10.0.0.1/",
+        "http://192.168.1.1:8080/",
+        "http://169.254.169.254/",
+        "http://0.0.0.0:8931/",
+        "http://[::ffff:127.0.0.1]:8931/",
+        "http://[::]/",
+        "http://localhost.example.com/",
+        "http://localhost./",
+        "http://user@127.0.0.1:8931/",
+        "http://user:pw@localhost:8931/",
+        "ftp://127.0.0.1/",
+        "file:///etc/hosts",
+        "127.0.0.1:8931",
+        "not a url",
+        "",
+    ] {
+        assert!(!LoopbackExemptions::is_loopback_endpoint(url), "{url}");
+        let mut exemptions = LoopbackExemptions::none();
+        assert!(!exemptions.allow_endpoint(url), "{url}");
+        assert!(exemptions.is_empty(), "{url} exempts nothing");
+        assert!(!exemptions.covers(url), "{url}");
+    }
+}
+
+// An exemption is one host on one port: not another port, not the other name of the same
+// machine, not a URL that only mentions the endpoint.
+#[test]
+fn an_exemption_covers_exactly_its_host_and_port() {
+    let exemptions = exempting(&["http://127.0.0.1:8931/mcp", "https://localhost/mcp"]);
+
+    for url in [
+        "http://127.0.0.1:8931/",
+        "http://127.0.0.1:8931/other/path?q=1",
+        // The same address, written another way.
+        "http://127.1:8931/mcp",
+        "http://2130706433:8931/mcp",
+        // The scheme's default port.
+        "https://localhost/",
+        "https://localhost:443/x",
+        "http://localhost:443/x",
+    ] {
+        assert!(exemptions.covers(url), "{url}");
+    }
+    for url in [
+        "http://127.0.0.1:8932/mcp",
+        "http://127.0.0.1/mcp",
+        "http://127.0.0.2:8931/mcp",
+        "http://localhost:8931/mcp",
+        "https://127.0.0.1/mcp",
+        "http://localhost/mcp",
+        "https://localhost:8443/mcp",
+        "http://[::1]:8931/mcp",
+        // The exempt endpoint as user info, a path or a query of another host.
+        "http://127.0.0.1:8931@evil.example.com/",
+        "http://evil.example.com/127.0.0.1:8931/",
+        "http://evil.example.com/?next=http://127.0.0.1:8931/mcp",
+        "http://user@127.0.0.1:8931/mcp",
+        "ftp://127.0.0.1:8931/mcp",
+    ] {
+        assert!(!exemptions.covers(url), "{url}");
+    }
+    assert!(!LoopbackExemptions::none().covers("http://127.0.0.1:8931/mcp"));
+}
+
+// The guard lets an exempt endpoint through without asking the guard it wraps, and leaves
+// every other URL to it.
+#[tokio::test]
+async fn the_exempting_guard_passes_exempt_endpoints_and_asks_the_inner_guard_otherwise() {
+    // The inner guard knows no host, so any URL it is asked about fails.
+    let unresolving = || -> Arc<dyn SsrfGuard> {
+        Arc::new(DefaultSsrfGuard::with_resolver(Box::new(
+            MockResolver::new(),
+        )))
+    };
+    let guard = LoopbackExemptSsrfGuard::new(
+        unresolving(),
+        exempting(&["http://127.0.0.1:8931/mcp", "http://localhost:8931/mcp"]),
+    );
+    assert_eq!(guard.check("http://127.0.0.1:8931/mcp").await, Ok(()));
+    assert_eq!(guard.check("http://localhost:8931/tools").await, Ok(()));
+    assert_eq!(
+        guard.check("http://127.0.0.1:8932/mcp").await,
+        Err(SsrfError::DnsFailed),
+        "another port is the inner guard's to decide"
+    );
+
+    // With a resolving inner guard, loopback outside the exemptions is still forbidden and a
+    // public host still passes.
+    let resolver = MockResolver::new()
+        .with("127.0.0.1", vec![ipv4("127.0.0.1")])
+        .with("localhost", vec![ipv4("127.0.0.1"), ipv6("::1")])
+        .with("public.example.com", vec![ipv4("8.8.8.8")]);
+    let guard = LoopbackExemptSsrfGuard::new(
+        Arc::new(DefaultSsrfGuard::with_resolver(Box::new(resolver))),
+        exempting(&["http://127.0.0.1:8931/mcp"]),
+    );
+    assert_eq!(guard.check("http://127.0.0.1:8931/mcp").await, Ok(()));
+    for url in [
+        "http://127.0.0.1:8932/mcp",
+        "http://127.0.0.1/mcp",
+        "http://localhost:8931/mcp",
+    ] {
+        assert_eq!(
+            guard.check(url).await,
+            Err(SsrfError::Forbidden(CidrClass::Loopback)),
+            "{url}"
+        );
+    }
+    assert_eq!(guard.check("https://public.example.com/").await, Ok(()));
+
+    // No exemption: the guard is the inner guard.
+    let plain = LoopbackExemptSsrfGuard::new(unresolving(), LoopbackExemptions::none());
+    assert_eq!(
+        plain.check("http://127.0.0.1:8931/mcp").await,
+        Err(SsrfError::DnsFailed)
+    );
 }

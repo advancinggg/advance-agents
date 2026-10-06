@@ -2347,3 +2347,149 @@ fn chatgpt_oauth_refuses_other_classes_dialects_schemes_endpoints_and_shared_sec
     );
     load_config(&config_path).expect("a distinct secret name beside a chatgpt-oauth entry loads");
 }
+
+// -----------------------------------------------------------------------
+// The `mcp:` block
+// -----------------------------------------------------------------------
+
+/// The minimal config followed by `mcp_block` (empty: the block is absent).
+fn yaml_with_mcp_block(mcp_block: &str) -> String {
+    let mut yaml = minimal_yaml();
+    yaml.push_str(mcp_block);
+    yaml
+}
+
+fn load_with_mcp_block(mcp_block: &str) -> Result<RuntimeConfig, ConfigError> {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("runtime-config.yaml");
+    write_config(&config_path, &yaml_with_mcp_block(mcp_block));
+    load_config(&config_path)
+}
+
+// A config without the block loads, with the documented defaults; writing the
+// defaults out changes nothing.
+#[test]
+fn mcp_block_is_optional_and_defaults() {
+    let absent = load_with_mcp_block("").expect("a config without an mcp block loads");
+    assert_eq!(absent.mcp, McpConfig::default());
+    assert_eq!(absent.mcp.servers_dir, ".advance/mcp-servers");
+    assert!(absent.mcp.allow_stdio);
+    assert_eq!(absent.mcp.request_timeout_sec, 30);
+    assert_eq!(absent.mcp.startup_timeout_sec, 10);
+    assert_eq!(absent.mcp.max_result_bytes, 4 * 1024 * 1024);
+    assert!(!absent.mcp.warm_tool_cache);
+    absent.mcp.validate().expect("the defaults validate");
+
+    let empty = load_with_mcp_block("mcp: {}\n").expect("an empty block loads");
+    let spelled_out = load_with_mcp_block(
+        "mcp:\n  servers-dir: .advance/mcp-servers\n  allow-stdio: true\n  \
+         request-timeout-sec: 30\n  startup-timeout-sec: 10\n  max-result-bytes: 4194304\n  \
+         warm-tool-cache: false\n",
+    )
+    .expect("the defaults, spelled out, load");
+    for same in [&empty, &spelled_out] {
+        assert_eq!(same, &absent);
+        assert!(config_sections_changed(&absent, same).is_empty());
+    }
+}
+
+#[test]
+fn mcp_block_reads_its_kebab_case_keys_and_refuses_unknown_ones() {
+    let cfg = load_with_mcp_block(
+        "mcp:\n  servers-dir: .advance/ops/mcp\n  allow-stdio: false\n  \
+         request-timeout-sec: 120\n  startup-timeout-sec: 45\n  max-result-bytes: 65536\n  \
+         warm-tool-cache: true\n",
+    )
+    .expect("a full block loads");
+    assert_eq!(
+        cfg.mcp,
+        McpConfig {
+            servers_dir: ".advance/ops/mcp".into(),
+            allow_stdio: false,
+            request_timeout_sec: 120,
+            startup_timeout_sec: 45,
+            max_result_bytes: 65536,
+            warm_tool_cache: true,
+        }
+    );
+
+    for unknown in [
+        "mcp:\n  servers_dir: x\n",
+        "mcp:\n  servers:\n    - id: x\n",
+        "mcp:\n  allow-stdio: maybe\n",
+    ] {
+        assert!(load_with_mcp_block(unknown).is_err(), "{unknown:?}");
+    }
+}
+
+#[test]
+fn mcp_block_shape_is_validated() {
+    let cases = [
+        ("servers-dir: /etc/mcp", "mcp.servers-dir"),
+        ("servers-dir: .advance/../mcp", "mcp.servers-dir"),
+        ("servers-dir: \"\"", "mcp.servers-dir"),
+        ("servers-dir: \"  \"", "mcp.servers-dir"),
+        // Outside `.advance/`, where an agent could write a server file.
+        ("servers-dir: mcp-servers", "inside `.advance/`"),
+        ("servers-dir: ops/.advance/mcp", "inside `.advance/`"),
+        ("servers-dir: .advance", "inside `.advance/`"),
+        ("servers-dir: .advance/", "inside `.advance/`"),
+        ("servers-dir: ./.advance", "inside `.advance/`"),
+        ("servers-dir: .advance-mcp/servers", "inside `.advance/`"),
+        ("servers-dir: .Advance/mcp", "inside `.advance/`"),
+        ("servers-dir: \".advance /mcp\"", "inside `.advance/`"),
+        ("request-timeout-sec: 0", "mcp.request-timeout-sec"),
+        ("request-timeout-sec: 301", "mcp.request-timeout-sec"),
+        ("startup-timeout-sec: 0", "mcp.startup-timeout-sec"),
+        ("startup-timeout-sec: 121", "mcp.startup-timeout-sec"),
+        ("max-result-bytes: 0", "mcp.max-result-bytes"),
+        ("max-result-bytes: 4194305", "mcp.max-result-bytes"),
+    ];
+    for (line, field) in cases {
+        let err = load_with_mcp_block(&format!("mcp:\n  {line}\n"))
+            .expect_err("an out-of-range value is refused");
+        assert!(err.to_string().contains(field), "{line}: {err}");
+    }
+    for line in [
+        "request-timeout-sec: 1",
+        "request-timeout-sec: 300",
+        "startup-timeout-sec: 1",
+        "startup-timeout-sec: 120",
+        "max-result-bytes: 1",
+        "max-result-bytes: 4194304",
+        "servers-dir: .advance/mcp",
+        "servers-dir: ./.advance/ops/mcp/",
+    ] {
+        load_with_mcp_block(&format!("mcp:\n  {line}\n"))
+            .unwrap_or_else(|e| panic!("{line} is within bounds: {e}"));
+    }
+    // On Unix a backslash is part of a name, not a separator: this names a directory
+    // beside `.advance/`, not one inside it.
+    #[cfg(unix)]
+    assert!(load_with_mcp_block("mcp:\n  servers-dir: '.advance\\mcp'\n").is_err());
+
+    // The standalone form applies the same rules.
+    for (dir, why) in [
+        ("../outside", "`..` segments"),
+        ("mcp-servers", "inside `.advance/`"),
+    ] {
+        let standalone = McpConfig {
+            servers_dir: dir.into(),
+            ..McpConfig::default()
+        };
+        let err = standalone.validate().expect_err("refused");
+        assert!(err.to_string().contains("mcp.servers-dir"), "{dir}: {err}");
+        assert!(err.to_string().contains(why), "{dir}: {err}");
+    }
+}
+
+#[test]
+fn an_mcp_edit_is_reported_as_a_changed_section() {
+    let base: RuntimeConfig = serde_yml::from_str(&minimal_yaml()).expect("minimal yaml parses");
+    let mut edit = base.clone();
+    edit.mcp.warm_tool_cache = true;
+    assert_eq!(config_sections_changed(&base, &edit), vec!["mcp"]);
+
+    edit.pack.fetch_timeout_sec = 7;
+    assert_eq!(config_sections_changed(&base, &edit), vec!["pack", "mcp"]);
+}

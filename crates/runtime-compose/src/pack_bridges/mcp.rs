@@ -7,6 +7,9 @@
 //! - `http` transport is admitted from any pack: the entry carries an
 //!   `HttpCapability` whose allowlist is exactly the endpoint's host, so the
 //!   cap-http security chain (SSRF / redirect / TLS policy) governs every request;
+//!   an endpoint on loopback is refused
+//!   ([`PackError::ConstraintViolation`]): only a server file the operator wrote
+//!   may reach the host's own loopback;
 //! - the manifest's `secret-refs` (`ENV_NAME → secret key`) are resolved through
 //!   the pack-manager `SecretStore` into the stdio child's `env` (missing key →
 //!   `MissingSecret`); a workflow step's pre-resolved secrets can be merged in
@@ -114,6 +117,16 @@ impl PackMcpBridge {
                             "register-mcp-server secret-refs have no destination on the http \
                              transport of {} (http credentials belong to the cap-http \
                              credential chain)",
+                            manifest.server_id
+                        ),
+                    }));
+                }
+                if cap_http::LoopbackExemptions::is_loopback_endpoint(&endpoint_url) {
+                    return Err(PackBridgeError::Pack(PackError::ConstraintViolation {
+                        reason: format!(
+                            "mcp-server {} of pack {pack} points at a loopback endpoint; a \
+                             pack's server may not reach the host's loopback (only an \
+                             operator's own server file may)",
                             manifest.server_id
                         ),
                     }));

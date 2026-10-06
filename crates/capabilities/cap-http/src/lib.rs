@@ -52,7 +52,10 @@ pub use executor::{
 pub use local_transport::DefaultLocalInferenceTransport;
 pub use rate_limit::{DefaultRateLimiter, RateLimiter};
 pub use security_chain::DefaultHttpSecurityChain;
-pub use ssrf::{DefaultSsrfGuard, MockResolver, RealResolver, Resolver};
+pub use ssrf::{
+    DefaultSsrfGuard, LoopbackExemptSsrfGuard, LoopbackExemptions, MockResolver, RealResolver,
+    Resolver,
+};
 
 // ADR 2026-07-22 slice S3 public surface (CONTRACT-233)
 pub use streaming::MAX_HOLD_BYTES;

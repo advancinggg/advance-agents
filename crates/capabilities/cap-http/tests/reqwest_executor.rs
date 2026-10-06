@@ -628,6 +628,7 @@ async fn t25k_oversized_response_body_rejected() {
             )],
             max_redirects: 10,
             max_response_bytes: 1024,
+            ..Default::default()
         }));
     let chain = DefaultHttpSecurityChain::new(store(&[]), leak, ssrf, rl, exec);
     let err = chain
@@ -784,6 +785,7 @@ fn stream_executor_for(
         dns_overrides: vec![("api.stream.test".to_string(), addr)],
         max_redirects: 10,
         max_response_bytes: max_bytes,
+        ..Default::default()
     })
 }
 
@@ -962,6 +964,7 @@ fn connect_executor_for(host: &str, addr: SocketAddr) -> ReqwestHttpExecutor {
         dns_overrides: vec![(host.to_string(), addr)],
         max_redirects: 0,
         max_response_bytes: 1024,
+        ..Default::default()
     })
 }
 
@@ -1051,4 +1054,268 @@ async fn a_failure_after_the_connection_stays_a_plain_transport_failure() {
         .await
         .unwrap_err();
     assert!(matches!(err, ExecutorError::Transport), "got {err:?}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Loopback exemptions: an exempt endpoint is reachable on exactly its host and
+// port, and only where both the guard and the executor carry the exemption.
+// Every refusal below is discriminating: the refused server is up.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use advance_shared_types::security_validator::CidrClass;
+use cap_http::{LoopbackExemptSsrfGuard, LoopbackExemptions};
+
+fn exempting(urls: &[String]) -> LoopbackExemptions {
+    let mut exemptions = LoopbackExemptions::none();
+    for url in urls {
+        assert!(exemptions.allow_endpoint(url), "{url} can be exempt");
+    }
+    exemptions
+}
+
+/// The production guard with `exemptions`, over a resolver that knows what the loopback
+/// names and addresses really are (so a refusal never depends on a DNS timing).
+fn exempting_guard(exemptions: &LoopbackExemptions) -> Arc<dyn SsrfGuard> {
+    let resolver = MockResolver::new()
+        .with("127.0.0.1", vec![ip("127.0.0.1")])
+        .with("localhost", vec![ip("127.0.0.1"), ip("::1")]);
+    Arc::new(LoopbackExemptSsrfGuard::new(
+        Arc::new(DefaultSsrfGuard::with_resolver(Box::new(resolver))),
+        exemptions.clone(),
+    ))
+}
+
+/// The production executor with `exemptions` and no DNS override: it resolves names itself,
+/// within a DNS budget wide enough for a loaded machine.
+fn exempting_executor(exemptions: &LoopbackExemptions) -> Arc<ReqwestHttpExecutor> {
+    Arc::new(ReqwestHttpExecutor::from_config_with_dns_timeout_source(
+        ReqwestExecutorConfig {
+            timeout: Duration::from_secs(5),
+            loopback_exemptions: exemptions.clone(),
+            ..Default::default()
+        },
+        Arc::new(|| 5_000),
+    ))
+}
+
+fn chain_of(ssrf: Arc<dyn SsrfGuard>, exec: Arc<dyn HttpExecutor>) -> DefaultHttpSecurityChain {
+    let leak: Arc<dyn LeakDetector> = Arc::new(DefaultLeakDetector::new());
+    let rl: Arc<dyn RateLimiter> = Arc::new(AlwaysAllow);
+    DefaultHttpSecurityChain::new(store(&[]), leak, ssrf, rl, exec)
+}
+
+/// A chain whose guard and executor both carry `exemptions`.
+fn exempting_chain(exemptions: &LoopbackExemptions) -> DefaultHttpSecurityChain {
+    chain_of(exempting_guard(exemptions), exempting_executor(exemptions))
+}
+
+fn get_url(url: String) -> HttpRequest {
+    HttpRequest {
+        method: HttpMethod::Get,
+        url,
+        headers: vec![],
+        body: vec![],
+    }
+}
+
+#[tokio::test]
+async fn an_exempt_loopback_endpoint_is_reached_and_no_other_port_is() {
+    let (exempt, _h1, exempt_rec) = start_mock_server().await;
+    let (other, _h2, other_rec) = start_mock_server().await;
+    let exemptions = exempting(&[format!("http://127.0.0.1:{}/mcp", exempt.port())]);
+    let chain = exempting_chain(&exemptions);
+    let loopback = cap(&["127.0.0.1"], vec![]);
+
+    // The exempt endpoint answers, and a redirect that stays on it is followed.
+    let resp = chain
+        .execute(
+            "agent-1",
+            get_url(format!("http://127.0.0.1:{}/get", exempt.port())),
+            &loopback,
+        )
+        .await
+        .expect("the exempt endpoint is reachable");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"hello-get");
+    let resp = chain
+        .execute(
+            "agent-1",
+            get_url(format!("http://127.0.0.1:{}/redirect", exempt.port())),
+            &loopback,
+        )
+        .await
+        .expect("a redirect within the exempt endpoint is followed");
+    assert_eq!(resp.body, b"final-ok");
+    let reached = |rec: &Recorder| -> Vec<String> {
+        rec.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.path.clone())
+            .collect()
+    };
+    assert_eq!(reached(&exempt_rec), ["/redirect", "/final"]);
+
+    // Another loopback port is refused by the guard, and by the executor on its own.
+    let other_url = format!("http://127.0.0.1:{}/echo", other.port());
+    let err = chain
+        .execute("agent-1", get_url(other_url.clone()), &loopback)
+        .await
+        .unwrap_err();
+    assert_eq!(err, HttpError::SsrfBlocked(CidrClass::Loopback));
+    let err = exempting_executor(&exemptions)
+        .execute(&get_url(other_url), Arc::new(AllowAllRedirect))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ExecutorError::Transport), "got {err:?}");
+
+    // The other name of the same machine is not the exempt endpoint either.
+    let by_name = format!("http://localhost:{}/echo", exempt.port());
+    let err = chain
+        .execute(
+            "agent-1",
+            get_url(by_name.clone()),
+            &cap(&["localhost"], vec![]),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, HttpError::SsrfBlocked(CidrClass::Loopback));
+    exempting_executor(&exemptions)
+        .execute(&get_url(by_name), Arc::new(AllowAllRedirect))
+        .await
+        .expect_err("the executor's resolver refuses loopback for a name that is not exempt");
+
+    assert!(
+        reached(&other_rec).is_empty(),
+        "nothing reached the other port"
+    );
+    assert_eq!(
+        reached(&exempt_rec),
+        ["/redirect", "/final"],
+        "nothing more reached the exempt server under its other name"
+    );
+}
+
+// The guard and the executor each forbid loopback on their own: an exemption in only one of
+// them reaches nothing.
+#[tokio::test]
+async fn an_exemption_needs_both_the_guard_and_the_executor() {
+    let (addr, _h, rec) = start_mock_server().await;
+    let exemptions = exempting(&[format!("http://127.0.0.1:{}/mcp", addr.port())]);
+    let none = LoopbackExemptions::none();
+    let loopback = cap(&["127.0.0.1"], vec![]);
+    let request = || get_url(format!("http://127.0.0.1:{}/echo", addr.port()));
+
+    let guard_only = chain_of(exempting_guard(&exemptions), exempting_executor(&none));
+    let err = guard_only
+        .execute("agent-1", request(), &loopback)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HttpError::Transport(_)), "got {err:?}");
+
+    let executor_only = chain_of(exempting_guard(&none), exempting_executor(&exemptions));
+    let err = executor_only
+        .execute("agent-1", request(), &loopback)
+        .await
+        .unwrap_err();
+    assert_eq!(err, HttpError::SsrfBlocked(CidrClass::Loopback));
+
+    assert!(rec.0.lock().unwrap().is_empty(), "no request was sent");
+}
+
+#[tokio::test]
+async fn an_exempt_localhost_endpoint_is_reached_and_its_other_ports_are_refused() {
+    let (exempt, _h1, exempt_rec) = start_mock_server().await;
+    let (other, _h2, other_rec) = start_mock_server().await;
+    let exemptions = exempting(&[format!("http://localhost:{}/mcp", exempt.port())]);
+    let chain = exempting_chain(&exemptions);
+    let localhost = cap(&["localhost"], vec![]);
+
+    let resp = chain
+        .execute(
+            "agent-1",
+            get_url(format!("http://localhost:{}/echo", exempt.port())),
+            &localhost,
+        )
+        .await
+        .expect("the exempt localhost endpoint is reachable");
+    assert_eq!(resp.body, b"echo-ok");
+    assert_eq!(exempt_rec.0.lock().unwrap().len(), 1);
+
+    // Another port of the exempt name: refused by the guard, and by the executor before it
+    // resolves the name.
+    let other_url = format!("http://localhost:{}/echo", other.port());
+    let err = chain
+        .execute("agent-1", get_url(other_url.clone()), &localhost)
+        .await
+        .unwrap_err();
+    assert_eq!(err, HttpError::SsrfBlocked(CidrClass::Loopback));
+    let err = exempting_executor(&exemptions)
+        .execute(&get_url(other_url), Arc::new(AllowAllRedirect))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ExecutorError::Transport), "got {err:?}");
+
+    // The address the name stands for is not the exempt endpoint, and neither is a URL
+    // that carries user info, on the other port or on the exempt one.
+    for url in [
+        format!("http://127.0.0.1:{}/echo", exempt.port()),
+        format!("http://user@localhost:{}/echo", other.port()),
+        format!("http://user:pw@localhost:{}/echo", exempt.port()),
+    ] {
+        let err = exempting_executor(&exemptions)
+            .execute(&get_url(url.clone()), Arc::new(AllowAllRedirect))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ExecutorError::Transport), "{url}: {err:?}");
+    }
+
+    assert!(other_rec.0.lock().unwrap().is_empty());
+    assert_eq!(exempt_rec.0.lock().unwrap().len(), 1);
+}
+
+// A redirect from the exempt endpoint to another loopback port is not followed: the chain's
+// per-hop check refuses it, and so does the executor when the check lets it through.
+#[tokio::test]
+async fn a_redirect_from_an_exempt_endpoint_to_another_loopback_port_is_refused() {
+    let (other, _h, other_rec) = start_mock_server().await;
+    let target = format!("http://127.0.0.1:{}/echo", other.port());
+    let location = HeaderValue::from_str(&target).unwrap();
+    let app = Router::new().route(
+        "/hop",
+        get(move || {
+            let location = location.clone();
+            async move { (StatusCode::FOUND, [(header::LOCATION, location)]) }
+        }),
+    );
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let hop = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let exemptions = exempting(&[format!("http://127.0.0.1:{}/mcp", hop.port())]);
+    let hop_url = format!("http://127.0.0.1:{}/hop", hop.port());
+
+    let err = exempting_chain(&exemptions)
+        .execute(
+            "agent-1",
+            get_url(hop_url.clone()),
+            &cap(&["127.0.0.1"], vec![]),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        HttpError::RedirectRejected {
+            reason: RedirectRejectReason::SsrfBlocked,
+            target,
+        }
+    );
+
+    let err = exempting_executor(&exemptions)
+        .execute(&get_url(hop_url), Arc::new(AllowAllRedirect))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ExecutorError::Transport), "got {err:?}");
+    assert!(other_rec.0.lock().unwrap().is_empty());
 }

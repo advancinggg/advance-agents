@@ -316,7 +316,9 @@ pub struct HomeSpec {
     pub label: &'static str,
     /// Short name in golden headers (the full description is [`describe`]).
     pub name: &'static str,
-    /// Declared capabilities; `None` = every `KNOWN_CAPABILITIES` entry.
+    /// Declared capabilities; `None` = the set the goldens were captured with, which was every
+    /// `KNOWN_CAPABILITIES` entry of that tree. A capability the runtime learned since is not
+    /// declared, so what the home's goldens pin does not move.
     pub caps: Option<&'static [&'static str]>,
     /// Deploy the driver component.
     pub driver: bool,
@@ -441,9 +443,29 @@ fn agent_yaml(spec: &HomeSpec) -> String {
 }
 
 pub fn declared_caps(spec: &HomeSpec) -> Vec<&'static str> {
+    const CAPTURED: [&str; 10] = [
+        "secrets",
+        "fs",
+        "skills",
+        "memory",
+        "grant",
+        "llm",
+        "tools",
+        "messaging",
+        "lifecycle",
+        "genui",
+    ];
     match spec.caps {
         Some(caps) => caps.to_vec(),
-        None => KNOWN_CAPABILITIES.to_vec(),
+        None => {
+            for cap in CAPTURED {
+                assert!(
+                    KNOWN_CAPABILITIES.contains(&cap),
+                    "captured capability {cap:?} is no longer a KNOWN_CAPABILITIES entry"
+                );
+            }
+            CAPTURED.to_vec()
+        }
     }
 }
 

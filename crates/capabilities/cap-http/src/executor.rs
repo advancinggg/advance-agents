@@ -11,7 +11,7 @@
 //! `DefaultRedirectCheck` impl wraps the chain's allowlist + leak_detector +
 //! ssrf_guard fields and is constructed per-execute.
 
-use crate::ssrf::{build_forbidden_table, normalize_ip};
+use crate::ssrf::{build_forbidden_table, normalize_ip, LoopbackExemptions};
 use advance_shared_types::security_validator::Allowlist;
 use advance_shared_types::security_validator::{
     CidrClass, HttpMethod, HttpRequest, HttpResponse, HttpResponseHead, LeakDetector,
@@ -772,6 +772,12 @@ struct SsrfDnsResolver {
     /// value the chain's `DefaultSsrfGuard` pre-flight resolver reads — so a
     /// hot-reloaded timeout is applied to BOTH DNS lookups, not just the pre-flight.
     timeout_source: Option<crate::ssrf::DnsTunableSource>,
+    /// Whether the name `localhost` may resolve, to loopback addresses only: the
+    /// executor has an exempt endpoint on it
+    /// ([`ReqwestExecutorConfig::loopback_exemptions`]). The resolver sees a name
+    /// without its port, so the executor refuses every other port of that name
+    /// before it sends.
+    localhost_exempt: bool,
 }
 
 impl SsrfDnsResolver {
@@ -780,6 +786,7 @@ impl SsrfDnsResolver {
             forbidden: build_forbidden_table(),
             timeout: Duration::from_millis(crate::ssrf::DEFAULT_DNS_TIMEOUT_MS),
             timeout_source: None,
+            localhost_exempt: false,
         }
     }
 
@@ -788,7 +795,14 @@ impl SsrfDnsResolver {
             forbidden: build_forbidden_table(),
             timeout: Duration::from_millis(crate::ssrf::DEFAULT_DNS_TIMEOUT_MS),
             timeout_source: Some(source),
+            localhost_exempt: false,
         }
+    }
+
+    /// Let the name `localhost` resolve when `exempt`, to loopback addresses only.
+    fn with_localhost_exempt(mut self, exempt: bool) -> Self {
+        self.localhost_exempt = exempt;
+        self
     }
 
     /// Effective per-resolve DNS timeout: the live source if wired, else the fixed
@@ -806,6 +820,7 @@ impl reqwest::dns::Resolve for SsrfDnsResolver {
         let host = name.as_str().to_string();
         let forbidden = self.forbidden.clone();
         let timeout = self.effective_timeout();
+        let exempt_localhost = self.localhost_exempt && host.eq_ignore_ascii_case("localhost");
         // `Resolve::resolve` is synchronous even though it returns a future.
         // The live timeout callback above may cross CONTRACT-233's deadline;
         // capture the task-scoped instant after it returns and carry that value
@@ -835,8 +850,18 @@ impl reqwest::dns::Resolve for SsrfDnsResolver {
             }
             // Fail-closed: reject the WHOLE resolution if ANY resolved IP is forbidden
             // (defends multi-record DNS rebinding at resolution time, like `check_ips`).
+            // The exempt name `localhost` is held to loopback instead: an address
+            // anywhere else rejects the resolution too.
             for sa in &addrs {
                 let ip = normalize_ip(sa.ip());
+                if exempt_localhost {
+                    if !ip.is_loopback() {
+                        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                            "ssrf-dns-resolver: localhost resolved to a non-loopback address",
+                        ));
+                    }
+                    continue;
+                }
                 if forbidden.iter().any(|(net, _)| net.contains(&ip)) {
                     return Err(Box::<dyn std::error::Error + Send + Sync>::from(
                         "ssrf-dns-resolver: resolved IP in forbidden range",
@@ -865,6 +890,12 @@ pub struct ReqwestExecutorConfig {
     pub max_redirects: usize,
     /// Hard cap on the buffered response-body size (see [`DEFAULT_MAX_RESPONSE_BYTES`]).
     pub max_response_bytes: usize,
+    /// Loopback endpoints the executor connects to although it refuses loopback
+    /// (see [`LoopbackExemptions`]); none by default. An exempt endpoint is
+    /// reachable on exactly its host and port, as the first request or as a
+    /// redirect target. Every other loopback URL is refused as before,
+    /// including any other port of an exempt host.
+    pub loopback_exemptions: LoopbackExemptions,
 }
 
 impl Default for ReqwestExecutorConfig {
@@ -874,6 +905,7 @@ impl Default for ReqwestExecutorConfig {
             dns_overrides: Vec::new(),
             max_redirects: DEFAULT_MAX_REDIRECTS,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            loopback_exemptions: LoopbackExemptions::none(),
         }
     }
 }
@@ -890,6 +922,9 @@ pub struct ReqwestHttpExecutor {
     /// short-circuits DNS for IP-literal hosts so the `SsrfDnsResolver` is never consulted
     /// for them; this is the executor-layer backstop (round-11 adversarial W1).
     forbidden: Vec<(IpNet, CidrClass)>,
+    /// The loopback endpoints this executor connects to
+    /// ([`ReqwestExecutorConfig::loopback_exemptions`]).
+    loopback_exemptions: LoopbackExemptions,
 }
 
 impl ReqwestHttpExecutor {
@@ -954,7 +989,8 @@ impl ReqwestHttpExecutor {
         let resolver = match dns_timeout_source {
             Some(s) => SsrfDnsResolver::with_timeout_source(s),
             None => SsrfDnsResolver::new(),
-        };
+        }
+        .with_localhost_exempt(config.loopback_exemptions.names_localhost());
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(config.timeout)
@@ -980,6 +1016,7 @@ impl ReqwestHttpExecutor {
             max_response_bytes: config.max_response_bytes,
             timeout: config.timeout,
             forbidden: build_forbidden_table(),
+            loopback_exemptions: config.loopback_exemptions,
         }
     }
 
@@ -1071,7 +1108,14 @@ impl ReqwestHttpExecutor {
             // for literals so the SsrfDnsResolver never sees them (round-11 adversarial W1).
             // Hostname hosts return false here and are validated by the SsrfDnsResolver at
             // connect time. Covers the initial request AND every redirect target.
-            if literal_host_forbidden(&current_url, &self.forbidden) {
+            //
+            // An exempt loopback endpoint passes. No other URL of an exempt host does:
+            // the resolver lets the exempt name `localhost` resolve without seeing a
+            // port, so its other ports are refused here.
+            if !self.loopback_exemptions.covers(&current_url)
+                && (literal_host_forbidden(&current_url, &self.forbidden)
+                    || self.loopback_exemptions.names_host_of(&current_url))
+            {
                 return Err(ExecutorError::Transport);
             }
             let resp = if first_hop {

@@ -213,3 +213,202 @@ fn t70_advance_start_friendly_diagnostic_when_config_missing() {
         "runtime.lock should not be created when bootstrap fails"
     );
 }
+
+/// A bash MCP server over stdio for the daemon's warm-up: it records its pid and the pid of
+/// a process it starts, completes the handshake, and answers every request with one tool,
+/// recording each answer. Builtins and absolute paths only: it starts with an empty
+/// environment.
+#[cfg(unix)]
+const WARMED_MCP_SERVER: &str = r#"
+echo $$ > '@DIR@/server.pid'
+/bin/sleep 300 &
+echo $! > '@DIR@/child.pid'
+read -r init
+printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"srv","version":"1"}}}\n'
+read -r initialized
+while read -r line; do
+  id=${line##*\"id\":}; id=${id%%[!0-9]*}
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echo"}]}}\n' "$id"
+  echo listed >> '@DIR@/listed'
+done
+"#;
+
+/// `kill -0 <pid>`: whether the process exists.
+#[cfg(unix)]
+fn pid_alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Poll `condition` every 50 ms until it holds or `limit` passes.
+#[cfg(unix)]
+fn wait_until(mut condition: impl FnMut() -> bool, limit: Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    condition()
+}
+
+/// The spawned daemon. Dropping it kills the daemon if it still runs, and then whichever of
+/// the MCP server's processes (recorded under `marks`) outlived it, so a failing test leaves
+/// nothing behind.
+#[cfg(unix)]
+struct StartedDaemon {
+    child: std::process::Child,
+    marks: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for StartedDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        for name in ["server.pid", "child.pid"] {
+            let Ok(pid) = std::fs::read_to_string(self.marks.join(name)) else {
+                continue;
+            };
+            if pid_alive(pid.trim()) {
+                let _ = Command::new("kill")
+                    .args(["-9", pid.trim()])
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+}
+
+// `advance start` on a home that declares `mcp`, with the tool-cache warm-up on, starts the
+// operator's stdio MCP server by itself. A stdio server leads its own process group, so it
+// does not end with the daemon unless the daemon stops it: after SIGTERM the daemon exits
+// cleanly and promptly, and neither the server nor the process it started is left running.
+#[test]
+#[cfg(unix)]
+fn advance_start_stops_its_mcp_servers_on_sigterm() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = init_workspace(&dir);
+    std::fs::write(
+        workspace.join(".advance").join("runtime-config.yaml"),
+        format!("{START_SMOKE_RUNTIME_CONFIG}\nmcp:\n  warm-tool-cache: true\n"),
+    )
+    .expect("write runtime config");
+    std::fs::write(
+        workspace.join(".agent").join("config.yaml"),
+        "capabilities:\n  mcp: true\n",
+    )
+    .expect("write agent config");
+    // The script and what it records live outside the workspace.
+    let marks_dir = tempfile::tempdir().unwrap();
+    let marks = marks_dir.path().canonicalize().unwrap();
+    let script = marks.join("srv.sh");
+    std::fs::write(
+        &script,
+        WARMED_MCP_SERVER.replace("@DIR@", marks.to_str().unwrap()),
+    )
+    .expect("write server script");
+    let servers = workspace.join(".advance").join("mcp-servers");
+    std::fs::create_dir_all(&servers).expect("create the servers dir");
+    std::fs::write(
+        servers.join("srv.yaml"),
+        format!(
+            "server-id: srv\ntransport:\n  kind: stdio\n  command: /bin/bash\n  args: [\"{}\"]\n",
+            script.display()
+        ),
+    )
+    .expect("write server file");
+
+    let mut child = Command::new(advance_bin())
+        .arg("start")
+        .arg("--workspace")
+        .arg(&workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn advance start");
+    // Drain both streams so the daemon never blocks on a full pipe.
+    let drain = |stream: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut BufReader::new(stream), &mut text);
+            text
+        })
+    };
+    let stdout = drain(Box::new(child.stdout.take().expect("child stdout")));
+    let stderr = drain(Box::new(child.stderr.take().expect("child stderr")));
+    let mut daemon = StartedDaemon {
+        child,
+        marks: marks.clone(),
+    };
+
+    // The warm-up started the server and listed its tools.
+    let listed = wait_until(|| marks.join("listed").exists(), START_READY_TIMEOUT);
+    if !listed {
+        drop(daemon);
+        panic!(
+            "the daemon did not list its MCP server's tools within 90s; stderr: {}",
+            stderr.join().unwrap_or_default()
+        );
+    }
+    let read_pid = |name: &str| {
+        std::fs::read_to_string(marks.join(name))
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .trim()
+            .to_string()
+    };
+    let (server, server_child) = (read_pid("server.pid"), read_pid("child.pid"));
+    assert!(pid_alive(&server), "the MCP server {server} runs");
+    assert!(
+        pid_alive(&server_child),
+        "the process the MCP server started ({server_child}) runs"
+    );
+
+    let pid = daemon.child.id() as i32;
+    // SAFETY: kill(2) with SIGTERM on the child this test spawned and has not waited for.
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    assert_eq!(rc, 0, "kill(SIGTERM): {}", std::io::Error::last_os_error());
+
+    let mut status = None;
+    let exited = wait_until(
+        || {
+            status = daemon.child.try_wait().expect("try_wait");
+            status.is_some()
+        },
+        Duration::from_secs(15),
+    );
+    assert!(exited, "advance start did not exit within 15s of SIGTERM");
+    let status = status.expect("exit status");
+    let gone = wait_until(
+        || !pid_alive(&server) && !pid_alive(&server_child),
+        Duration::from_secs(5),
+    );
+    let (server_alive, child_alive) = (pid_alive(&server), pid_alive(&server_child));
+    drop(daemon);
+    let (stdout, stderr) = (
+        stdout.join().unwrap_or_default(),
+        stderr.join().unwrap_or_default(),
+    );
+    assert!(
+        status.success(),
+        "advance start should exit 0 on SIGTERM, got {status:?}; stderr: {stderr}"
+    );
+    assert!(
+        gone,
+        "after the daemon exited, its MCP server (alive: {server_alive}) or the process that \
+         server started (alive: {child_alive}) is still running"
+    );
+    assert!(
+        stdout.contains("advance: shutting down"),
+        "the daemon went through its shutdown sequence; stdout: {stdout}"
+    );
+    assert!(
+        !stderr.contains("WARN mcp") && !stderr.contains("cap_mcp"),
+        "a clean MCP start and stop prints nothing about MCP; stderr: {stderr}"
+    );
+}

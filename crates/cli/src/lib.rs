@@ -47,6 +47,7 @@ pub use advance_runtime_compose::evaluator_reader;
 pub use advance_runtime_compose::grant_adapter;
 pub use advance_runtime_compose::l6_classifier;
 pub use advance_runtime_compose::l6_wiring;
+pub use advance_runtime_compose::mcp_wiring;
 pub use advance_runtime_compose::memory_extractor;
 pub use advance_runtime_compose::observation_carriers;
 pub use advance_runtime_compose::observation_projection;

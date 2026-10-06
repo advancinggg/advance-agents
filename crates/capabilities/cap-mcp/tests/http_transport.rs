@@ -540,6 +540,39 @@ async fn a_session_that_cannot_be_started_again_closes_the_transport() {
     );
 }
 
+// A transport its owner closed sends nothing further, and says why; a second
+// close changes nothing.
+#[tokio::test]
+async fn a_transport_closed_by_its_owner_fails_every_call_without_a_post() {
+    let chain = Arc::new(MockChain::default());
+    chain.push(Ok(initialize_answer(1, "2025-06-18", Some("s1"))));
+    chain.push(Ok(accepted()));
+
+    let transport = transport(&chain);
+    transport.initialize().await.expect("initialized");
+    assert!(!McpTransport::is_closed(&transport));
+
+    McpTransport::close(&transport);
+    let closed_at = transport.closed_at().expect("closed");
+    McpTransport::close(&transport);
+    assert_eq!(transport.closed_at(), Some(closed_at));
+    assert!(McpTransport::is_closed(&transport));
+
+    let err = transport
+        .invoke(None, "tools/call", json!({}))
+        .await
+        .expect_err("closed");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert_eq!(err.message, "the transport was closed");
+    assert!(transport.notify("x", None).await.is_err());
+    assert!(transport.initialize().await.is_err());
+    assert_eq!(
+        chain.captured().len(),
+        2,
+        "a closed transport posts nothing"
+    );
+}
+
 // A new session must speak the version of the one it replaces; one that does
 // not is refused before `notifications/initialized` and never replaces it.
 #[tokio::test]
@@ -872,6 +905,50 @@ async fn a_restart_dropped_before_initialized_was_accepted_leaves_the_session_as
     assert_eq!(server.premature.load(Ordering::SeqCst), 0, "{log:?}");
     assert_eq!(server.initializes.load(Ordering::SeqCst), 3, "{log:?}");
     assert_eq!(transport.session_id().as_deref(), Some("s3"));
+}
+
+// Closing a transport stops an exchange under way before its next POST: the
+// POST the server holds runs to its end, and the request the new session was
+// started for is not sent in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transport_closed_during_a_session_start_posts_nothing_after_the_post_under_way() {
+    let server = Arc::new(StrictSessionServer::holding(2));
+    let transport = Arc::new(HttpMcpTransport::new(
+        server.clone(),
+        "srv",
+        "https://mcp.example.com/mcp",
+        dummy_cap(),
+    ));
+    transport.initialize().await.expect("initialized");
+    server.end_session();
+
+    // The call finds the session ended and starts `s2`, whose
+    // `notifications/initialized` the server holds.
+    let call = spawn_call(&transport, "agent-a");
+    within(server.held.notified()).await;
+    transport.close();
+    server.release.add_permits(1);
+
+    let err = within(call)
+        .await
+        .expect("join")
+        .expect_err("the transport was closed under the call");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert_eq!(err.message, "the transport was closed");
+    let log = server.log();
+    assert_eq!(
+        log,
+        [
+            "initialize -",
+            "notifications/initialized s1",
+            "accepted notifications/initialized s1",
+            "tools/call s1",
+            "initialize -",
+            "notifications/initialized s2",
+            "accepted notifications/initialized s2",
+        ],
+        "nothing is posted after the POST that was under way"
+    );
 }
 
 /// A server keeping one live session: `initialize` starts session `s<n>`,
@@ -1259,6 +1336,40 @@ async fn the_client_initializes_an_http_server_and_calls_it_as_the_caller() {
         Some("sess-9")
     );
     assert_eq!(chain.agents(), ["srv", "srv", "agent-1"]);
+}
+
+// A client that was shut down closes its http connection and makes no other:
+// a later call fails without a POST.
+#[tokio::test]
+async fn a_client_shut_down_posts_nothing_more() {
+    let chain = Arc::new(MockChain::default());
+    chain.push(Ok(initialize_answer(1, "2025-06-18", Some("s1"))));
+    chain.push(Ok(accepted()));
+    chain.push(Ok(answer(2, json!({"ok": true}))));
+    // What a call after the shutdown would be answered with, were it sent.
+    chain.push(Ok(initialize_answer(1, "2025-06-18", Some("s2"))));
+
+    let client = http_client(chain.clone(), McpClientLimits::default());
+    client
+        .invoke_tool(None, "srv", "echo", b"{}")
+        .await
+        .expect("called");
+    assert!(client.protocol_version("srv").is_some());
+
+    client.shutdown();
+
+    assert_eq!(client.protocol_version("srv"), None);
+    let err = client
+        .invoke_tool(None, "srv", "echo", b"{}")
+        .await
+        .expect_err("the client is shut down");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert!(err.message.contains("shut down"), "msg={}", err.message);
+    assert_eq!(
+        chain.captured().len(),
+        3,
+        "nothing is posted after a shutdown"
+    );
 }
 
 // A session restart that fails closes the transport: the client evicts it,

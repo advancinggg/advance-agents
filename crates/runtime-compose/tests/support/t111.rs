@@ -385,6 +385,7 @@ pub const D1_ORDER: &[&str] = &[
     "loops.root",
     "loops.host_pump",
     "loops.perchild",
+    "loops.mcp",
     "loops.auto_tick",
     "loops.readiness_walk",
     "loops.llm_stream_reaper",

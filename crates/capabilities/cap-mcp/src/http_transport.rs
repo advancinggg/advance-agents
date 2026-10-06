@@ -35,6 +35,10 @@
 //! transport: the ended session stays current, and the next call to find it
 //! ended restarts it.
 //!
+//! The transport's owner can close it too ([`HttpMcpTransport::close`]): later
+//! calls fail at once, without a POST, and an exchange under way (a session
+//! being started) stops before its next POST.
+//!
 //! A server that refuses the `initialize` POST with `404` or `405`, or answers
 //! it with an `endpoint` event, speaks the older HTTP+SSE transport (a GET
 //! stream, often `/sse`, plus a separate endpoint for messages). That
@@ -168,6 +172,21 @@ struct Session {
     protocol_version: Option<&'static str>,
 }
 
+/// Why and when a transport closed.
+#[derive(Clone, Copy, Debug)]
+struct Closed {
+    /// The error later calls get.
+    reason: &'static str,
+    /// When the transport closed.
+    at: Instant,
+}
+
+/// The error of a call on a transport whose session could not be restarted.
+const SESSION_LOST: &str = "the server ended the session and a new one could not be started";
+
+/// The error of a call on a transport its owner closed.
+const CLOSED_BY_OWNER: &str = "the transport was closed";
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -186,8 +205,8 @@ pub struct HttpMcpTransport {
     session: Mutex<Session>,
     /// Serializes session starts.
     restarting: tokio::sync::Mutex<()>,
-    /// When a session restart failed; the transport carries no calls since.
-    closed_at: Mutex<Option<Instant>>,
+    /// Why and when the transport closed; it carries no calls since.
+    closed: Mutex<Option<Closed>>,
     /// The budget of host log lines this transport may write.
     log_budget: Mutex<LogBudget>,
 }
@@ -226,7 +245,7 @@ impl HttpMcpTransport {
             options,
             session: Mutex::new(Session::default()),
             restarting: tokio::sync::Mutex::new(()),
-            closed_at: Mutex::new(None),
+            closed: Mutex::new(None),
             log_budget: Mutex::new(LogBudget::new(Instant::now())),
         }
     }
@@ -251,10 +270,28 @@ impl HttpMcpTransport {
         self.session().id.clone()
     }
 
-    /// When the transport closed (a session restart failed); `None` while it
-    /// is open.
+    /// When the transport closed (a session restart failed, or its owner
+    /// closed it); `None` while it is open.
     pub fn closed_at(&self) -> Option<Instant> {
-        *lock(&self.closed_at)
+        lock(&self.closed).map(|closed| closed.at)
+    }
+
+    /// Close the transport now: no further POST is sent. Every later call
+    /// fails at once, and an exchange under way (a session being started, a
+    /// request about to be sent again in a new session) fails before its next
+    /// POST. A POST already under way is not interrupted; it ends by itself or
+    /// with its caller. A transport that has already closed keeps its first
+    /// reason.
+    pub fn close(&self) {
+        self.close_because(CLOSED_BY_OWNER);
+    }
+
+    /// Record that the transport closed for `reason`, unless it already has.
+    fn close_because(&self, reason: &'static str) {
+        lock(&self.closed).get_or_insert_with(|| Closed {
+            reason,
+            at: Instant::now(),
+        });
     }
 
     /// Start a session within [`HttpOptions::startup_timeout`] (see the module
@@ -329,8 +366,7 @@ impl HttpMcpTransport {
         }
         let outcome = self.start_session_within_timeout(previous).await;
         if outcome.is_err() {
-            let mut closed_at = lock(&self.closed_at);
-            closed_at.get_or_insert_with(Instant::now);
+            self.close_because(SESSION_LOST);
         }
         outcome
             .map(|_| ())
@@ -401,13 +437,15 @@ impl HttpMcpTransport {
     }
 
     /// POST one JSON-RPC message through the security chain in `session`, for
-    /// `caller`, under the size cap and the request timeout.
+    /// `caller`, under the size cap and the request timeout. A closed transport
+    /// posts nothing.
     async fn post(
         &self,
         caller: Option<&str>,
         session: &Session,
         body: Vec<u8>,
     ) -> Result<HttpResponse, McpError> {
+        self.fail_if_closed()?;
         if body.len() > MAX_JSONRPC_REQ_BYTES {
             return Err(McpError::new(
                 McpErrorKind::TransportError,
@@ -492,10 +530,8 @@ impl HttpMcpTransport {
     }
 
     fn fail_if_closed(&self) -> Result<(), McpError> {
-        match self.closed_at() {
-            Some(_) => Err(McpError::transport(
-                "the server ended the session and a new one could not be started",
-            )),
+        match *lock(&self.closed) {
+            Some(closed) => Err(McpError::transport(closed.reason)),
             None => Ok(()),
         }
     }
@@ -768,6 +804,10 @@ impl McpTransport for HttpMcpTransport {
 
     fn closed_at(&self) -> Option<Instant> {
         HttpMcpTransport::closed_at(self)
+    }
+
+    fn close(&self) {
+        HttpMcpTransport::close(self);
     }
 }
 

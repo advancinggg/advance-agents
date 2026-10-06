@@ -720,8 +720,9 @@ pub struct WiringHandles {
     pub agent_admin: Option<Arc<crate::client_api_agents::AgentAdminAdapter>>,
     /// Providers family (lane providers-family): the daemon's LIVE `SecretStore` — the ONE
     /// instance the LLM egress chain resolves keys from (`Some` iff `llm` / `secrets` is
-    /// declared) — and the composed `WiredProviderAdmin` the Client API serves (always
-    /// composed; it falls back to opening the file when no live store exists).
+    /// declared, or `mcp` is and one of its server files needs secrets) — and the composed
+    /// `WiredProviderAdmin` the Client API serves (always composed; it falls back to
+    /// opening the file when no live store exists).
     pub secret_store: Option<Arc<SecretStore>>,
     pub provider_admin: Option<Arc<crate::client_api_providers::WiredProviderAdmin>>,
     /// Sign in with ChatGPT: the ONE sign-in object the gateway (as the credential source of
@@ -777,6 +778,11 @@ pub struct WiringHandles {
     /// Installed packs → the running runtime (schema extensions, presets, skill tools);
     /// re-applied on every install / uninstall. See [`crate::pack_runtime`].
     pub pack_runtime: Arc<crate::pack_runtime::PackRuntime>,
+    /// The MCP client and the gate of its `mcp-client` host functions
+    /// ([`crate::mcp_wiring`]). `Some` iff `.agent/config.yaml` declares `mcp`. The
+    /// composition shuts it down with the loops, which stops the stdio servers;
+    /// dropping the last handle does the same.
+    pub mcp: Option<Arc<crate::mcp_wiring::McpRuntime>>,
     /// The Client API adapters' worker threads (events, history, run control), so an
     /// owner shutting down can close their queues and join them without blocking.
     pub(crate) adapter_workers: Vec<Arc<dyn crate::client_api_adapters::WorkerControl>>,
@@ -1244,6 +1250,8 @@ pub(crate) struct HoldStoppers {
     pub breaker_subscriber: Option<advance_messaging::BreakerSubscriber>,
     pub llm_stream_reaper: Option<Arc<cap_llm::AgentStreamReaper>>,
     pub adapter_workers: Vec<Arc<dyn crate::client_api_adapters::WorkerControl>>,
+    /// The MCP client, shut down with the loops so stdio process groups do not outlive them.
+    pub mcp: Option<Arc<crate::mcp_wiring::McpRuntime>>,
 }
 
 /// A wiring failure, with everything the wiring had started by then.
@@ -1424,6 +1432,16 @@ pub(crate) async fn wire_capabilities_inner(
     // journal-only integrity subkey. Messaging therefore needs the key even
     // when neither secrets nor llm is guest-visible.
     let needs_key = declares_secrets || declares_llm || declares_messaging || declares_lifecycle;
+    // The operator's MCP server files, read once and only for a root that declares
+    // `mcp` (bad files are skipped, never fatal). A server that needs secrets opens
+    // the secret store, as `secrets` / `llm` do; without one, `mcp` needs no key.
+    let mcp_servers = declares("mcp")
+        .then(|| crate::mcp_wiring::McpControlPlane::new(workspace, &builder.config().mcp).scan());
+    let mcp_needs_secrets = mcp_servers
+        .as_ref()
+        .is_some_and(|servers| servers.need_secrets());
+    let opens_secret_store = declares_secrets || declares_llm || mcp_needs_secrets;
+    let needs_key = needs_key || mcp_needs_secrets;
 
     // Step 2a — load the real master key and stage the complete C216→C215
     // journal/factory graph before EventBus, host registration, listeners, or
@@ -1495,10 +1513,10 @@ pub(crate) async fn wire_capabilities_inner(
     // cap-secrets/cap-llm consume the original operator key after the journal
     // has derived its purpose-separated subkey. A messaging-only boot does not
     // open the secret-value storage backend.
-    let secret_store: Option<Arc<SecretStore>> = if declares_secrets || declares_llm {
+    let secret_store: Option<Arc<SecretStore>> = if opens_secret_store {
         let key = master_key
             .take()
-            .expect("secrets/llm declaration is included in needs_key");
+            .expect("what opens the secret store is included in needs_key");
         // WS-A: persistent backend so the daemon resolves provider keys (provisioned via
         // `advance secrets set` / the providers family) at request time. Was
         // `InMemorySecretStorage`, which started EMPTY every boot, so a provider
@@ -1527,8 +1545,8 @@ pub(crate) async fn wire_capabilities_inner(
     };
     // Pack lane P2: the pack materializer resolves workflow /
     // mcp `secret-refs` through the SAME cap-secrets store (P1 left the slot
-    // unwired, so every ref was `MissingSecret`). No store (no secrets/llm
-    // declaration) → the slot stays unbound and keeps failing closed.
+    // unwired, so every ref was `MissingSecret`). No store (nothing above opened
+    // one) → the slot stays unbound and keeps failing closed.
     if let Some(store) = secret_store.as_ref() {
         let _ = pack_wiring.secret_store.bind(Arc::new(
             crate::pack_production::CapSecretsSecretStore::new(Arc::clone(store)),
@@ -3045,6 +3063,27 @@ pub(crate) async fn wire_capabilities_inner(
         repetition_guard_handle = Some(guard);
     }
 
+    // The MCP client, for a root that declares `mcp`: the `mcp-client` host functions
+    // join the registry the injector reads at link time (post-build, like cap-tools),
+    // each call decided by the caller's `mcp` grants. Infallible: see `mcp_wiring`.
+    let mcp_runtime = mcp_servers.map(|servers| {
+        crate::mcp_wiring::compose_mcp(crate::mcp_wiring::McpComposition {
+            servers,
+            config: &host.config().mcp,
+            registry: &*host.host_registry(),
+            grant_check: cap_grant.grant_check.clone(),
+            grant_store: cap_grant.store.clone(),
+            secret_store: secret_store.clone(),
+            event_bus: event_bus_dyn.clone(),
+            config_provider: host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
+            web_mode: web_cfg_snapshot.mode,
+            runtime: tokio::runtime::Handle::current(),
+            root_agent_id: root_uid.as_str(),
+            log: log.clone(),
+        })
+    });
+    started.mcp = mcp_runtime.clone();
+
     // Wave-23 seam (d): late-bind the post-`build()` runtime + injector into the
     // per-child manager (constructed pre-build when it was attached as the spawner's
     // observer) so a runtime spawn can load + serve the child.
@@ -3395,6 +3434,7 @@ pub(crate) async fn wire_capabilities_inner(
             web_grant: web_grant_handle,
             pack: pack_wiring,
             pack_runtime,
+            mcp: mcp_runtime,
             adapter_workers: std::mem::take(&mut started.adapter_workers),
             packs_watcher: started.packs_watcher.take(),
         },

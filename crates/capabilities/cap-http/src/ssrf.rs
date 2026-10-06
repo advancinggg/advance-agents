@@ -354,6 +354,140 @@ impl SsrfGuard for DefaultSsrfGuard {
     }
 }
 
+/// Loopback endpoints a chain may reach although loopback is a forbidden SSRF
+/// range.
+///
+/// An exemption is one endpoint, a host and a port: the host is the name
+/// `localhost` or a loopback address literal (`127.0.0.0/8`, `::1`), the port
+/// the endpoint's own or its scheme's default. Nothing else is exempt: not
+/// another port on that host, not `localhost` for an exempt address or the
+/// reverse, not a name that merely resolves to loopback, and not a host in
+/// any other forbidden range.
+///
+/// An exemption takes effect where it is installed. A chain that should reach
+/// an exempt endpoint needs it in both places that forbid loopback: its
+/// pre-flight guard ([`LoopbackExemptSsrfGuard`]) and its executor
+/// ([`ReqwestExecutorConfig::loopback_exemptions`](crate::ReqwestExecutorConfig)).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoopbackExemptions {
+    endpoints: std::collections::BTreeSet<(LoopbackHost, u16)>,
+}
+
+/// The host of an exempt endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LoopbackHost {
+    /// The name `localhost`.
+    Localhost,
+    /// A loopback address literal.
+    Address(IpAddr),
+}
+
+impl LoopbackExemptions {
+    /// No exemption: loopback stays forbidden.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Whether `url` addresses a loopback endpoint, one an exemption can name:
+    /// an `http` or `https` URL without user info whose host is `localhost` or
+    /// a loopback address literal, however the literal is written.
+    pub fn is_loopback_endpoint(url: &str) -> bool {
+        loopback_endpoint(url).is_some()
+    }
+
+    /// Exempt the endpoint `url` addresses, when it is a loopback endpoint
+    /// ([`is_loopback_endpoint`](Self::is_loopback_endpoint)). Returns whether
+    /// the endpoint is now exempt; any other URL exempts nothing.
+    pub fn allow_endpoint(&mut self, url: &str) -> bool {
+        match loopback_endpoint(url) {
+            Some(endpoint) => {
+                self.endpoints.insert(endpoint);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether no endpoint is exempt.
+    pub fn is_empty(&self) -> bool {
+        self.endpoints.is_empty()
+    }
+
+    /// Whether `url` addresses an exempt endpoint: the same host on the same
+    /// port. With no exemption the answer is `false` and `url` is not parsed.
+    pub fn covers(&self, url: &str) -> bool {
+        !self.endpoints.is_empty()
+            && loopback_endpoint(url).is_some_and(|endpoint| self.endpoints.contains(&endpoint))
+    }
+
+    /// Whether `url`'s host has an exempt endpoint on some port. Only the host is
+    /// read: a URL that cannot itself be exempt (another scheme, user info) still
+    /// names its host, so whoever refuses the other URLs of an exempt host
+    /// refuses it too.
+    pub(crate) fn names_host_of(&self, url: &str) -> bool {
+        !self.endpoints.is_empty()
+            && url::Url::parse(url)
+                .ok()
+                .and_then(|parsed| loopback_host(&parsed))
+                .is_some_and(|host| self.names(host))
+    }
+
+    /// Whether the name `localhost` has an exempt endpoint on some port.
+    pub(crate) fn names_localhost(&self) -> bool {
+        self.names(LoopbackHost::Localhost)
+    }
+
+    fn names(&self, host: LoopbackHost) -> bool {
+        self.endpoints.iter().any(|(exempt, _)| *exempt == host)
+    }
+}
+
+/// The loopback endpoint `url` addresses, when it is one an exemption can name
+/// (see [`LoopbackExemptions::allow_endpoint`]).
+fn loopback_endpoint(url: &str) -> Option<(LoopbackHost, u16)> {
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    Some((loopback_host(&parsed)?, parsed.port_or_known_default()?))
+}
+
+/// The host of `url`, when it is `localhost` or a loopback address literal.
+fn loopback_host(url: &url::Url) -> Option<LoopbackHost> {
+    match url.host()? {
+        url::Host::Domain("localhost") => Some(LoopbackHost::Localhost),
+        url::Host::Ipv4(v4) if v4.is_loopback() => Some(LoopbackHost::Address(IpAddr::V4(v4))),
+        url::Host::Ipv6(v6) if v6.is_loopback() => Some(LoopbackHost::Address(IpAddr::V6(v6))),
+        _ => None,
+    }
+}
+
+/// An [`SsrfGuard`] that lets the exempt loopback endpoints through and asks
+/// `inner` about every other URL.
+pub struct LoopbackExemptSsrfGuard {
+    inner: Arc<dyn SsrfGuard>,
+    exemptions: LoopbackExemptions,
+}
+
+impl LoopbackExemptSsrfGuard {
+    pub fn new(inner: Arc<dyn SsrfGuard>, exemptions: LoopbackExemptions) -> Self {
+        Self { inner, exemptions }
+    }
+}
+
+#[async_trait]
+impl SsrfGuard for LoopbackExemptSsrfGuard {
+    async fn check(&self, url: &str) -> Result<(), SsrfError> {
+        if self.exemptions.covers(url) {
+            return Ok(());
+        }
+        self.inner.check(url).await
+    }
+}
+
 /// Build the forbidden CIDR table in **first-match-wins** order — metadata
 /// pins FIRST so 169.254.169.254 classifies as `CloudMetadata` not `LinkLocal`.
 ///
@@ -454,6 +588,64 @@ pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
 fn normalize_host(host: &str) -> String {
     let lc = host.to_ascii_lowercase();
     lc.strip_suffix('.').unwrap_or(&lc).to_string()
+}
+
+#[cfg(test)]
+mod loopback_exemption_hosts {
+    use super::*;
+
+    // A host that has an exempt endpoint is recognised in every URL that names it, also in
+    // one that can never be exempt itself: the executor refuses each of those.
+    #[test]
+    fn a_host_with_an_exempt_endpoint_is_named_by_every_url_of_that_host() {
+        let mut exemptions = LoopbackExemptions::none();
+        assert!(exemptions.allow_endpoint("http://localhost:8931/mcp"));
+        assert!(exemptions.allow_endpoint("http://127.0.0.1:9000/mcp"));
+        assert!(exemptions.names_localhost());
+
+        for url in [
+            "http://localhost:8931/mcp",
+            "http://localhost:1/",
+            "https://localhost/",
+            "http://user@localhost:8931/mcp",
+            "http://user:pw@localhost:1/",
+            "ftp://localhost/",
+            "http://127.0.0.1:1/",
+            "http://user@127.0.0.1:9000/mcp",
+        ] {
+            assert!(exemptions.names_host_of(url), "{url}");
+        }
+        // Only the exempt endpoints themselves are covered.
+        assert!(exemptions.covers("http://localhost:8931/x"));
+        assert!(exemptions.covers("http://127.0.0.1:9000/x"));
+        for url in [
+            "http://user@localhost:8931/mcp",
+            "http://user:pw@localhost:8931/mcp",
+            "http://localhost:1/",
+            "ftp://localhost:8931/",
+            "http://user@127.0.0.1:9000/mcp",
+        ] {
+            assert!(!exemptions.covers(url), "{url}");
+        }
+        for url in [
+            "http://127.0.0.2:9000/",
+            "http://[::1]:8931/",
+            "http://localhost.example.com:8931/",
+            "https://mcp.example.com/",
+            "not a url",
+        ] {
+            assert!(!exemptions.names_host_of(url), "{url}");
+        }
+
+        let addresses_only = {
+            let mut exemptions = LoopbackExemptions::none();
+            assert!(exemptions.allow_endpoint("http://127.0.0.1:9000/mcp"));
+            exemptions
+        };
+        assert!(!addresses_only.names_localhost());
+        assert!(!addresses_only.names_host_of("http://localhost:9000/"));
+        assert!(!LoopbackExemptions::none().names_host_of("http://localhost:8931/"));
+    }
 }
 
 #[cfg(test)]

@@ -15,10 +15,11 @@
 //!   transport therefore keeps working after the runtime of the call that
 //!   created it has shut down.
 //! - The transport closes when the server's stdout ends, a stdout line overflows
-//!   the line cap, a read fails or stdin cannot be written. Closing records when
-//!   it happened ([`McpTransport::closed_at`]), fails every pending call, makes
-//!   later calls fail fast, turns [`McpTransport::is_closed`] true and kills the
-//!   process group.
+//!   the line cap, a read fails, stdin cannot be written, or its owner closes it
+//!   ([`StdioMcpTransport::close`]). Closing records when it happened
+//!   ([`McpTransport::closed_at`]), fails every pending call, makes later calls
+//!   fail fast, turns [`McpTransport::is_closed`] true and kills the process
+//!   group.
 //! - `Drop` aborts the tasks, kills the process group while the child is still
 //!   unreaped (so the group id cannot name a recycled group), then kills the
 //!   child; `kill_on_drop(true)` covers a panic between spawn and return.
@@ -504,6 +505,13 @@ impl StdioMcpTransport {
         self.inner.closed_at()
     }
 
+    /// Close the transport now (see the module docs): the calls waiting on it
+    /// fail, later calls fail fast and the server's process group is killed.
+    /// A transport that has already closed keeps its first reason.
+    pub fn close(&self) {
+        self.inner.close("the transport was closed");
+    }
+
     /// Invoke a JSON-RPC method. Allocates a fresh id, registers a oneshot
     /// channel into `pending`, sends the request to the writer task, and awaits
     /// the response; the per-call budget covers both the send and the wait.
@@ -598,6 +606,10 @@ impl McpTransport for StdioMcpTransport {
 
     fn is_closed(&self) -> bool {
         StdioMcpTransport::is_closed(self)
+    }
+
+    fn close(&self) {
+        StdioMcpTransport::close(self);
     }
 }
 

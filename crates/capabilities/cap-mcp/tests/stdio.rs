@@ -1145,3 +1145,203 @@ fn a_client_given_no_runtime_starts_no_stdio_server() {
     assert!(err.message.contains("with_runtime"), "msg={}", err.message);
     assert!(lines(&dir.path().join("starts")).is_empty());
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Shutdown
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Starts a process of the server's own and records its pid, one line per
+/// start.
+const LOG_CHILD: &str = r#"
+sleep 300 &
+echo $! >> '@DIR@/children'
+"#;
+
+/// Answers one further request like [`SERVE`], then reads requests without
+/// ever answering, recording each.
+const SERVE_ONCE_THEN_HANG: &str = r#"
+read -r line
+id=${line##*\"id\":}; id=${id%%[!0-9]*}
+printf '{"jsonrpc":"2.0","id":%s,"result":{"pid":%s}}\n' "$id" "$$"
+while read -r line; do echo got >> '@DIR@/unanswered'; done
+"#;
+
+// Shutting the client down stops a server at once, with a call still running
+// on it: the call fails without waiting out its timeout, the server and the
+// process it started are gone, and no later call starts a server again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_stops_a_server_whatever_calls_run_on_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = Arc::new(stdio_client(
+        server_script(
+            &[LOG_START, LOG_CHILD, HANDSHAKE, SERVE_ONCE_THEN_HANG],
+            dir.path(),
+            "2025-06-18",
+        ),
+        McpClientLimits::default(),
+    ));
+    let starts = dir.path().join("starts");
+    client
+        .invoke_tool(None, "srv", "echo", b"{}")
+        .await
+        .expect("the server answers its first call");
+    let server = lines(&starts)[0].clone();
+    let child = lines(&dir.path().join("children"))[0].clone();
+    assert!(pid_alive(&server) && pid_alive(&child));
+    assert!(!client.is_shut_down());
+
+    // A call the server never answers holds the connection for the request
+    // timeout, 30 s.
+    let hung = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.invoke_tool(None, "srv", "echo", b"{}").await })
+    };
+    assert!(
+        wait_until(
+            || !lines(&dir.path().join("unanswered")).is_empty(),
+            Duration::from_secs(5)
+        )
+        .await,
+        "the server read the call it will not answer"
+    );
+
+    client.shutdown();
+
+    let err = tokio::time::timeout(Duration::from_secs(5), hung)
+        .await
+        .expect("the call ends with the shutdown, not with its timeout")
+        .expect("join")
+        .expect_err("its connection was closed");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    for pid in [&child, &server] {
+        let stopped = wait_until(|| !pid_alive(pid), Duration::from_secs(5)).await;
+        if !stopped {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid])
+                .status();
+        }
+        assert!(stopped, "process {pid} outlived the shutdown");
+    }
+    assert!(client.is_shut_down());
+    assert_eq!(client.protocol_version("srv"), None);
+
+    // Nothing connects afterwards, and a second shutdown changes nothing.
+    client.shutdown();
+    let err = client
+        .invoke_tool(None, "srv", "echo", b"{}")
+        .await
+        .expect_err("the client is shut down");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert!(err.message.contains("shut down"), "msg={}", err.message);
+    assert!(client.list_tools(None, "srv").await.is_err());
+    assert_eq!(lines(&starts).len(), 1, "no server starts after a shutdown");
+}
+
+// A server still being connected is stopped too: its attempt fails at once
+// instead of holding the server for the startup timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_stops_a_server_that_is_still_connecting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Reads `initialize` and never answers it.
+    let silent = r#"
+read -r init
+sleep 300
+"#;
+    let client = Arc::new(stdio_client(
+        server_script(&[LOG_START, LOG_CHILD, silent], dir.path(), "2025-06-18"),
+        McpClientLimits {
+            startup_timeout: Duration::from_secs(60),
+            ..McpClientLimits::default()
+        },
+    ));
+    let connecting = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.invoke_tool(None, "srv", "echo", b"{}").await })
+    };
+    let children = dir.path().join("children");
+    assert!(wait_until(|| !lines(&children).is_empty(), Duration::from_secs(5)).await);
+    let server = lines(&dir.path().join("starts"))[0].clone();
+    let child = lines(&children)[0].clone();
+    assert!(pid_alive(&server) && pid_alive(&child));
+
+    client.shutdown();
+
+    let err = tokio::time::timeout(Duration::from_secs(5), connecting)
+        .await
+        .expect("the attempt ends with the shutdown, not with the startup timeout")
+        .expect("join")
+        .expect_err("the server it was connecting was stopped");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    for pid in [&child, &server] {
+        let stopped = wait_until(|| !pid_alive(pid), Duration::from_secs(5)).await;
+        if !stopped {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid])
+                .status();
+        }
+        assert!(stopped, "process {pid} outlived the shutdown");
+    }
+    assert!(client
+        .invoke_tool(None, "srv", "echo", b"{}")
+        .await
+        .is_err());
+    assert_eq!(lines(&dir.path().join("starts")).len(), 1);
+}
+
+// Closing a transport is what its owner does to stop the server while calls
+// still hold the transport: they fail, and the process group is killed.
+#[tokio::test]
+async fn closing_a_transport_fails_its_calls_and_stops_the_server() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("grandchild");
+    // Reads every request and answers none.
+    let script = format!(
+        "sleep 300 & echo $! > '{}'; while read -r x; do :; done",
+        marker.display()
+    );
+    let transport = Arc::new(
+        StdioMcpTransport::spawn(
+            "srv",
+            "bash",
+            &["-c".to_string(), script],
+            &path_env(),
+            Arc::new(NoOpDetector),
+        )
+        .expect("spawn"),
+    );
+    assert!(wait_until(|| !lines(&marker).is_empty(), Duration::from_secs(5)).await);
+    let pid = lines(&marker)[0].clone();
+    let waiting = {
+        let transport = Arc::clone(&transport);
+        tokio::spawn(async move { transport.invoke("tools/call", serde_json::json!({})).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!transport.is_closed());
+
+    transport.close();
+    transport.close();
+
+    assert!(transport.is_closed() && transport.closed_at().is_some());
+    let err = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("the waiting call fails at once")
+        .expect("join")
+        .expect_err("closed");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert_eq!(err.message, "the transport was closed");
+    let stopped = wait_until(|| !pid_alive(&pid), Duration::from_secs(5)).await;
+    if !stopped {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid])
+            .status();
+    }
+    assert!(
+        stopped,
+        "the server's child {pid} outlived the closed transport"
+    );
+    let err = transport
+        .invoke("tools/call", serde_json::json!({}))
+        .await
+        .expect_err("a closed transport carries no call");
+    assert_eq!(err.message, "the transport was closed");
+}

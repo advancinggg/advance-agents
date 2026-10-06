@@ -30,7 +30,9 @@ use advance_shared_types::capability::{CapRequest, CapabilityId};
 /// `"messaging"` here is what makes a `messaging`-declaring guest LINK the
 /// interface (so its `await-replies` parks the Run via the host-fn suspend sink);
 /// DORMANT for shipped agents (no shipped guest imports `agent-messaging`, no
-/// shipped `.agent/config.yaml` declares `messaging:true`).
+/// shipped `.agent/config.yaml` declares `messaging:true`). cap-mcp `"mcp"`
+/// (`MCP_CAPABILITY`) names the seven `mcp-client` host functions, which
+/// `wire_capabilities` registers for a root that declares it.
 pub const KNOWN_CAPABILITIES: &[&str] = &[
     "secrets",
     "fs",
@@ -49,6 +51,10 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     // MODULE-001-AC-29 / T110: CapRequest gate only. L0 registration is
     // `RuntimeConfig.genui.enabled` (see module rustdoc two-gate note).
     "genui",
+    // The MCP client: a declaring guest links `mcp-client`, whose every call is
+    // then decided by the caller's `mcp` grants (servers and tool patterns). It
+    // is the one name for MCP servers; `tools` covers local tools only.
+    "mcp",
 ];
 
 /// Defence-in-depth bound on `.agent/config.yaml` size (mirrors the read in
@@ -445,6 +451,31 @@ mod tests {
             !got.contains(&"genui"),
             "undeclared yaml must not yield a genui CapRequest: {got:?}"
         );
+    }
+
+    // `mcp` is a capability the runtime wires: declaring it, with or without grant params,
+    // yields the `mcp` CapRequest the agent loop links `mcp-client` with; a config that
+    // does not declare it yields none.
+    #[test]
+    fn known_capabilities_includes_mcp() {
+        assert!(KNOWN_CAPABILITIES.contains(&cap_mcp::MCP_CAPABILITY));
+        assert_eq!(cap_mcp::MCP_CAPABILITY, "mcp");
+        for yaml in [
+            &b"capabilities:\n  mcp: true\n"[..],
+            &b"capabilities:\n  mcp:\n    servers: [github]\n    tool-patterns: [\"get_*\"]\n"[..],
+        ] {
+            assert_eq!(names(&active_capabilities(Some(yaml))), vec!["mcp"]);
+        }
+        for yaml in [
+            &b"capabilities:\n  fs: true\n  tools: true\n"[..],
+            &b"capabilities:\n  mcp: false\n"[..],
+        ] {
+            let caps = active_capabilities(Some(yaml));
+            assert!(!names(&caps).contains(&"mcp"), "{:?}", names(&caps));
+        }
+        // A pack may require it: the install catalog is the known capabilities.
+        use advance_pack_manager::CapabilityCatalog as _;
+        assert!(crate::capability_catalog::capability_catalog().is_known("mcp"));
     }
 
     #[test]

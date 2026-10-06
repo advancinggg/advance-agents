@@ -13,7 +13,9 @@
 //!   backoff, connections reported as `mcp.server_started` /
 //!   `mcp.server_died`), requests attributed to the calling agent, paginated and
 //!   bounded tool listings kept in a tool cache, tool-pattern filter, and
-//!   schema-validated `invoke_tool` (AC-15).
+//!   schema-validated `invoke_tool` (AC-15). `McpClient::shutdown` closes every
+//!   connection at once and stops the stdio servers, which do not end with the
+//!   host process on their own.
 //! - `McpServersConfig` — programmatic whitelist + per-server `tool_patterns` glob
 //!   filter + per-tool schemas (AC-23 layers 1 + 2).
 //! - `SchemaValidator` — wraps `jsonschema::JSONSchema` for input/output validation
@@ -45,7 +47,7 @@ pub use stdio_transport::{StdioMcpTransport, StdioOptions};
 pub use web_provider::refuse_stdio_web_provider;
 pub use whitelist::{
     McpServerEntry, McpServersConfig, McpServersConfigBuilder, McpTransportSpec, ToolPattern,
-    ToolSchemas,
+    ToolSchemas, MAX_SERVERS,
 };
 
 mod client;

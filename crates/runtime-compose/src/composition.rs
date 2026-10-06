@@ -7,9 +7,9 @@
 //!    `/hooks` listener stop accepting and drain their requests, concurrently, each
 //!    within its budget;
 //! 2. **loops** — the root serve loop, the channel host pump, the per-child loops,
-//!    the auto tick loop and the readiness walk stop; then every live LLM stream is
-//!    settled and the stream reaper stopped. A requested shutdown then prints
-//!    `advance: shutting down`;
+//!    the MCP client (stdio process groups), the auto tick loop and the readiness
+//!    walk stop; then every live LLM stream is settled and the stream reaper stopped.
+//!    A requested shutdown then prints `advance: shutting down`;
 //! 3. **extension hooks** — each extension's shutdown hook, in reverse registration
 //!    order, each bounded and isolated from the others' panics; then the composition
 //!    lets go of the extensions;
@@ -90,6 +90,7 @@ pub const TEARDOWN_ORDER: &[&str] = &[
     "loops.root",
     "loops.host_pump",
     "loops.perchild",
+    "loops.mcp",
     "loops.auto_tick",
     "loops.readiness_walk",
     "loops.llm_stream_reaper",
@@ -298,6 +299,7 @@ impl Composition {
             breaker_subscriber: wiring_handles.breaker_subscriber.take(),
             llm_stream_reaper: wiring_handles.llm_stream_reaper.take(),
             adapter_workers: std::mem::take(&mut wiring_handles.adapter_workers),
+            mcp: wiring_handles.mcp.take(),
         };
         let client_api_server = wiring_handles.client_api_server.take();
         let (root_loop, hooks, host_pump) = match agent_loop {
@@ -475,6 +477,13 @@ impl Composition {
             manager.shutdown().await;
             self.steps.record("loops.perchild");
         }
+        if let Some(mcp) = self.stoppers.mcp.take() {
+            // A stdio server leads its own process group and would otherwise outlive
+            // this process. Drop of the last handle does the same; doing it here keeps
+            // those groups from outliving the loops.
+            mcp.shutdown();
+            self.steps.record("loops.mcp");
+        }
         if let Some((cancel, task)) = self.auto_tick.take() {
             cancel.cancel();
             abort_and_join(task).await;
@@ -617,6 +626,7 @@ impl HoldStoppers {
             breaker_subscriber,
             llm_stream_reaper,
             adapter_workers,
+            mcp,
         } = self;
         event_bus.is_none()
             && cap_grant_sweeper_handle.is_none()
@@ -628,6 +638,7 @@ impl HoldStoppers {
             && breaker_subscriber.is_none()
             && llm_stream_reaper.is_none()
             && adapter_workers.is_empty()
+            && mcp.is_none()
     }
 
     /// Stop what a failed wiring had started (no ingress and no loop exist yet): the

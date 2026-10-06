@@ -14,7 +14,7 @@ use advance_cli::pack_bridges::{
     PackSkillBridge,
 };
 use advance_pack_manager::{
-    AutoApprove, InMemoryPackRegistry, Installer, PackRegistry, SecretStore, SecretValue,
+    AutoApprove, InMemoryPackRegistry, Installer, PackError, PackRegistry, SecretStore, SecretValue,
 };
 use cap_fs::meta_schema::{FieldType, MetaSchemaLoader};
 use cap_grant::preset::PresetRegistry;
@@ -33,6 +33,7 @@ fn trust_root_key() -> SigningKey {
 
 const MCP_STDIO: &str = "server-id: local-tools\ndescription: stdio server\ntransport:\n  kind: stdio\n  command: /usr/bin/true\n  args: []\nsecret-refs:\n  API_TOKEN: mcp-token\n";
 const MCP_HTTP: &str = "server-id: remote-tools\ndescription: http server\ntransport:\n  kind: http\n  endpoint-url: https://mcp.example.com/sse\n";
+const MCP_LOOPBACK: &str = "server-id: host-tools\ndescription: http server on the host\ntransport:\n  kind: http\n  endpoint-url: http://127.0.0.1:8931/mcp\n";
 // FIXTURE-GRAMMAR: `cap_grant::preset::parse_preset` requires `default-ttl` and a
 // per-grant `ttl` (once | lifecycle | persistent | {duration|until}); the plan's
 // draft omitted both.
@@ -57,6 +58,7 @@ fn write_pack(root: &Path, name: &str, trust: &str) -> PathBuf {
     .unwrap();
     std::fs::write(dir.join("mcp-servers/local.yaml"), MCP_STDIO).unwrap();
     std::fs::write(dir.join("mcp-servers/remote.yaml"), MCP_HTTP).unwrap();
+    std::fs::write(dir.join("mcp-servers/loopback.yaml"), MCP_LOOPBACK).unwrap();
     std::fs::write(dir.join("presets/data-readonly.yaml"), PRESET).unwrap();
     std::fs::write(
         dir.join("meta-schema-extensions/todo.yaml"),
@@ -64,7 +66,7 @@ fn write_pack(root: &Path, name: &str, trust: &str) -> PathBuf {
     )
     .unwrap();
     std::fs::write(dir.join("memory-seeds/base.jsonl"), SEEDS).unwrap();
-    let pack_yaml = format!("name: {name}\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\ntrust-level: {trust}\nprovides:\n  skills:\n    - web-search\n  mcp-servers:\n    - local\n    - remote\n  presets:\n    - data-readonly\n  meta-schema-extensions:\n    - todo\n  memory-seeds:\n    - base\nchecksums:\n  algo: sha256\n  files: {{}}\n");
+    let pack_yaml = format!("name: {name}\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\ntrust-level: {trust}\nprovides:\n  skills:\n    - web-search\n  mcp-servers:\n    - local\n    - remote\n    - loopback\n  presets:\n    - data-readonly\n  meta-schema-extensions:\n    - todo\n  memory-seeds:\n    - base\nchecksums:\n  algo: sha256\n  files: {{}}\n");
     std::fs::write(dir.join("pack.yaml"), &pack_yaml).unwrap();
     if trust == "trusted" {
         let key = trust_root_key();
@@ -180,6 +182,40 @@ async fn br_02_mcp_bridge_refuses_stdio_from_untrusted_and_resolves_secrets() {
             );
         }
         other => panic!("expected stdio, got {other:?}"),
+    }
+}
+
+// A pack's http server on loopback is refused, whatever the pack's trust: the host's own
+// loopback is reachable only through a server file the operator wrote.
+#[tokio::test]
+async fn br_02b_mcp_bridge_refuses_a_loopback_endpoint_from_any_pack() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let packs = tmp.path().join("packs");
+    let reg = registry_with(
+        &packs,
+        &[
+            write_pack(tmp.path(), "u", "untrusted"),
+            write_pack(tmp.path(), "t", "trusted"),
+        ],
+    )
+    .await;
+    let bridge = PackMcpBridge::new(reg);
+
+    for pack in ["u", "t"] {
+        let err = bridge
+            .entry(&format!("{pack}@1.0.0/mcp-servers/loopback"), &Secrets)
+            .expect_err("a pack may not reach the host's loopback");
+        match err {
+            PackBridgeError::Pack(PackError::ConstraintViolation { reason }) => {
+                assert!(reason.contains("loopback"), "{reason}");
+                assert!(reason.contains("host-tools"), "{reason}");
+            }
+            other => panic!("{pack}: expected a constraint violation, got {other:?}"),
+        }
+        // Its other http server is still admitted.
+        bridge
+            .entry(&format!("{pack}@1.0.0/mcp-servers/remote"), &Secrets)
+            .expect("http off loopback");
     }
 }
 

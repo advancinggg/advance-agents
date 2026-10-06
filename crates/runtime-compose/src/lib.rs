@@ -169,6 +169,10 @@ pub mod l6_classifier;
 // SAT-B (slice satB-postproc): production BatchExtractor adapter (AC-43) — bridges
 // cap_memory::BatchExtractor → cap_llm CONTRACT-081 (cap-memory has no cap-llm dep).
 pub mod memory_extractor;
+// The MCP client of a root that declares `mcp`: the operator's server files
+// (`<ws>/.advance/mcp-servers/*.yaml`), the client built from them and the gated
+// `mcp-client` host functions, composed by `wiring.rs`.
+pub mod mcp_wiring;
 pub mod perchild_daemon;
 pub(crate) mod progress_lifecycle_activation;
 pub(crate) mod progress_lifecycle_bootstrap;

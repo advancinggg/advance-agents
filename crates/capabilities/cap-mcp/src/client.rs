@@ -46,8 +46,19 @@
 //! each live connection it finds closed and evicts as `mcp.server_died`
 //! (`server_id`; `exit_code` is `null`, no exit status being collected), both
 //! with the agent id `runtime`: a connection serves every agent. A connection
-//! attempt that fails, or one retired by [`McpClient::disconnect`], reports
-//! nothing.
+//! attempt that fails, or one retired by [`McpClient::disconnect`] or
+//! [`McpClient::shutdown`], reports nothing.
+//!
+//! ## Shutdown
+//!
+//! [`McpClient::shutdown`] ends the client: every connection is closed at
+//! once, whether live or still being connected and whatever calls run on it.
+//! A stdio server's process group is stopped and the calls waiting on it
+//! fail; an http request already under way runs to its end, and nothing is
+//! sent after it. No connection is made afterwards: every later call fails
+//! without starting a server. A stdio server leads its own process group and
+//! does not end with the host process: the host shuts the client down before
+//! it exits.
 //!
 //! ## Callers
 //!
@@ -77,7 +88,8 @@
 //! its listing.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use advance_shared_types::event::Event;
@@ -147,6 +159,13 @@ pub trait McpTransport: Send + Sync {
     fn is_closed(&self) -> bool {
         self.closed_at().is_some()
     }
+
+    /// Close the transport now: it carries no further call. A stdio transport
+    /// fails the calls waiting on it and stops its server's process group; an
+    /// http transport lets a request already under way run to its end. A
+    /// second close changes nothing. Defaults to doing nothing: a transport
+    /// that holds no process and no connection has nothing to release.
+    fn close(&self) {}
 }
 
 /// Bounds on one client's connections and calls.
@@ -242,6 +261,9 @@ struct ServerSlot {
 #[derive(Default)]
 struct SlotState {
     live: Option<Live>,
+    /// The transport the connection attempt in flight has opened, if any:
+    /// [`McpClient::shutdown`] closes it without waiting for the attempt.
+    opening: Option<Weak<dyn McpTransport>>,
     /// Consecutive failures: failed connection attempts and transports that
     /// died young.
     failures: u32,
@@ -293,6 +315,21 @@ impl ServerSlot {
             .retry_at
             .map(|at| at.saturating_duration_since(now))
             .filter(|wait| !wait.is_zero())
+    }
+
+    /// Close the slot's live transport and the one its connection attempt has
+    /// opened, outside the state lock.
+    fn close_transports(&self) {
+        let (live, opening) = {
+            let mut state = self.state();
+            (state.live.take(), state.opening.take())
+        };
+        if let Some(live) = live {
+            live.transport.close();
+        }
+        if let Some(transport) = opening.and_then(|transport| transport.upgrade()) {
+            transport.close();
+        }
     }
 }
 
@@ -354,6 +391,9 @@ pub struct McpClient {
     /// Where connections are reported (see the module docs); `None` until
     /// [`with_event_bus`](McpClient::with_event_bus) gives one.
     event_bus: Option<Arc<dyn EventBusEmit>>,
+    /// Set by [`shutdown`](McpClient::shutdown). Written and read under the
+    /// `slots` lock, so no slot is created once it is set.
+    shut_down: AtomicBool,
 }
 
 impl McpClient {
@@ -384,6 +424,7 @@ impl McpClient {
             limits: McpClientLimits::default(),
             runtime: None,
             event_bus: None,
+            shut_down: AtomicBool::new(false),
         }
     }
 
@@ -440,6 +481,7 @@ impl McpClient {
             limits: McpClientLimits::default(),
             runtime: None,
             event_bus: None,
+            shut_down: AtomicBool::new(false),
         }
     }
 
@@ -461,6 +503,27 @@ impl McpClient {
         };
         let live = slot.state().live.take();
         drop(live);
+    }
+
+    /// End the client (see the module docs): close every connection now, live
+    /// or still being connected, and make none afterwards. Each stdio server's
+    /// process group is stopped and the calls waiting on it fail, and every
+    /// later call fails without starting a server. A second call changes
+    /// nothing.
+    pub fn shutdown(&self) {
+        let retired: Vec<Arc<ServerSlot>> = {
+            let mut slots = self.slots();
+            self.shut_down.store(true, Ordering::SeqCst);
+            slots.drain().map(|(_, slot)| slot).collect()
+        };
+        for slot in retired {
+            slot.close_transports();
+        }
+    }
+
+    /// Whether [`shutdown`](Self::shutdown) has ended the client.
+    pub fn is_shut_down(&self) -> bool {
+        self.shut_down.load(Ordering::SeqCst)
     }
 
     /// Whether the web family tools (`web.search`, `web.extract`) of
@@ -759,15 +822,19 @@ impl McpClient {
         lock(&self.slots)
     }
 
-    /// The server's current slot, created on first use. Only whitelisted ids
-    /// reach here, so the map is bounded by the config.
-    fn slot(&self, server_id: &str) -> Arc<ServerSlot> {
+    /// The server's current slot, created on first use; none once the client
+    /// is shut down. Only whitelisted ids reach here, so the map is bounded by
+    /// the config.
+    fn slot(&self, server_id: &str) -> Result<Arc<ServerSlot>, McpError> {
         let mut slots = self.slots();
-        Arc::clone(
+        if self.shut_down.load(Ordering::SeqCst) {
+            return Err(McpError::transport("the mcp client is shut down"));
+        }
+        Ok(Arc::clone(
             slots
                 .entry(server_id.to_string())
                 .or_insert_with(|| Arc::new(ServerSlot::new())),
-        )
+        ))
     }
 
     /// The server's live transport, connecting it if it has none (see the
@@ -777,7 +844,7 @@ impl McpClient {
         entry: &McpServerEntry,
     ) -> Result<Arc<dyn McpTransport>, McpError> {
         loop {
-            let slot = self.slot(&entry.server_id);
+            let slot = self.slot(&entry.server_id)?;
             if let Some(transport) = self.live_transport(&entry.server_id, &slot) {
                 return Ok(transport);
             }
@@ -798,7 +865,7 @@ impl McpClient {
                     wait.as_millis().max(1)
                 )));
             }
-            return match self.connect(entry).await {
+            return match self.connect(entry, &slot).await {
                 Ok((transport, protocol_version)) => {
                     let live = Live {
                         transport: Arc::clone(&transport),
@@ -812,10 +879,7 @@ impl McpClient {
                         ));
                         Ok(transport)
                     } else {
-                        Err(McpError::transport(format!(
-                            "server '{}' was disconnected while connecting",
-                            entry.server_id
-                        )))
+                        Err(disconnected_while_connecting(&entry.server_id))
                     }
                 }
                 Err(error) => {
@@ -870,10 +934,30 @@ impl McpClient {
             .get(server_id)
             .is_some_and(|current| Arc::ptr_eq(current, slot));
         if current {
-            slot.state().live = Some(live);
+            let mut state = slot.state();
+            state.live = Some(live);
+            state.opening = None;
         }
         drop(slots);
         current
+    }
+
+    /// Record `transport` as the one the attempt on `slot` has opened, so that
+    /// [`shutdown`](Self::shutdown) can close it. A slot retired before the
+    /// transport was recorded is not seen by the call that retired it: the
+    /// transport is then closed here and the attempt fails.
+    fn opened(
+        &self,
+        server_id: &str,
+        slot: &Arc<ServerSlot>,
+        transport: &Arc<dyn McpTransport>,
+    ) -> Result<(), McpError> {
+        slot.state().opening = Some(Arc::downgrade(transport));
+        if self.is_current(server_id, slot) {
+            return Ok(());
+        }
+        transport.close();
+        Err(disconnected_while_connecting(server_id))
     }
 
     /// Evict `transport` if it has closed and is still the server's live one.
@@ -904,10 +988,12 @@ impl McpClient {
     /// timeout. A stdio server is spawned on the client's runtime; an http
     /// transport posts through the client's security chain with the client's
     /// request timeout. A failed or late initialization drops the transport,
-    /// which stops a stdio server's process.
+    /// which stops a stdio server's process. The transport is recorded in
+    /// `slot` while it connects (see [`opened`](Self::opened)).
     async fn connect(
         &self,
         entry: &McpServerEntry,
+        slot: &Arc<ServerSlot>,
     ) -> Result<(Arc<dyn McpTransport>, Option<String>), McpError> {
         match &entry.transport {
             McpTransportSpec::Http {
@@ -929,9 +1015,10 @@ impl McpClient {
                         startup_timeout: self.limits.startup_timeout,
                     },
                 ));
+                let shared: Arc<dyn McpTransport> = transport.clone();
+                self.opened(&entry.server_id, slot, &shared)?;
                 let version = transport.initialize().await?;
-                let transport: Arc<dyn McpTransport> = transport;
-                Ok((transport, Some(version.to_string())))
+                Ok((shared, Some(version.to_string())))
             }
             McpTransportSpec::Stdio { command, args, env } => {
                 let options = StdioOptions {
@@ -948,6 +1035,7 @@ impl McpClient {
                         Arc::clone(&self.leak_detector),
                         options,
                     )?);
+                self.opened(&entry.server_id, slot, &transport)?;
                 let startup = self.limits.startup_timeout;
                 let version = match tokio::time::timeout(startup, initialize(transport.as_ref()))
                     .await
@@ -968,6 +1056,13 @@ impl McpClient {
             )
         })
     }
+}
+
+/// The error of a connection attempt whose slot was retired meanwhile.
+fn disconnected_while_connecting(server_id: &str) -> McpError {
+    McpError::transport(format!(
+        "server '{server_id}' was disconnected while connecting"
+    ))
 }
 
 /// The transport name a connection event carries.
@@ -1129,6 +1224,7 @@ mod tests {
                 since: start,
                 protocol_version: None,
             }),
+            opening: None,
             failures,
             retry_at: None,
         };
