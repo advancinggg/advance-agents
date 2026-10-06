@@ -665,6 +665,13 @@ impl McpClient {
         lock(&self.tool_cache).listings()
     }
 
+    /// Put `tools` in the cache as the listing of `server_id`, without contacting
+    /// the server.
+    #[doc(hidden)]
+    pub fn store_cached_tools(&self, server_id: &str, tools: Vec<McpToolInfo>) {
+        lock(&self.tool_cache).store(server_id, &tools);
+    }
+
     /// List prompts on a server (no filter), for `caller` (see the module
     /// docs).
     pub async fn list_prompts(

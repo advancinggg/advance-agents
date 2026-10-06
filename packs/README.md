@@ -75,6 +75,14 @@ bundle`) refuses a manifest that declares it, and the layout check refuses a top
 loads; the runtime ignores the key and logs a warning for that pack. A pack's
 `dependencies:` are installed from the configured registry when they are not present already.
 
+## MCP servers
+
+Declare `mcp` on the root agent (`mcp: true`, or `mcp: { servers: [...], tool-patterns: [...] }`).
+Operator server files live in `.advance/mcp-servers/<server-id>.yaml` (the `mcp.servers-dir`
+knob). A pack registers a server with a workflow `register-mcp-server` step; that writes the
+same directory (secret-ref ids only) and is removed when the pack is uninstalled. The model
+sees each tool as `<server>__<tool>`.
+
 ## Contribution rules
 
 1. `trust-level: untrusted` always. A `trusted` pack must ship a `pack.sig` (ed25519 over

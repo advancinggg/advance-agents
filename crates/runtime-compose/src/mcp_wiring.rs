@@ -72,6 +72,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -82,9 +83,11 @@ use advance_pack_manager::{
 };
 use advance_runtime::config::{McpConfig, RuntimeConfigProvider};
 use advance_runtime::host_registry::HostRegistry;
+use advance_shared_types::capability::{McpToolEntry, ToolEntry};
 use advance_shared_types::security_validator::{
     Allowlist, HttpCapability, HttpSecurityChain, LeakDetector, SsrfGuard,
 };
+use advance_shared_types::traits::CallableInventoryReader;
 use advance_shared_types::traits::{EventBusEmit, GrantCheck};
 use advance_shared_types::web_search::WebRunMode;
 use cap_grant::{GrantStore, McpGrantReaderImpl, WebGrantReaderImpl};
@@ -93,8 +96,8 @@ use cap_http::{
     ReqwestHttpExecutor,
 };
 use cap_mcp::{
-    register_mcp_client, McpClient, McpClientLimits, McpGate, McpServerEntry, McpServersConfig,
-    McpTransportSpec, McpWebGrant,
+    mcp_tool_entries_from_infos, register_mcp_client, McpClient, McpClientLimits, McpGate,
+    McpServerEntry, McpServersConfig, McpTransportSpec, McpWebGrant,
 };
 use cap_secrets::{InMemorySecretStorage, SecretStore};
 use zeroize::Zeroizing;
@@ -649,6 +652,17 @@ pub struct McpComposition<'a> {
 pub fn compose_mcp(parts: McpComposition<'_>) -> Arc<McpRuntime> {
     // One store for everything MCP reads secrets from: the daemon's when a server needs
     // secrets, an empty one otherwise.
+    let origins: BTreeMap<String, String> = parts
+        .servers
+        .manifests()
+        .iter()
+        .filter_map(|manifest| {
+            manifest
+                .origin
+                .as_ref()
+                .map(|origin| (manifest.server_id.clone(), origin.pack.clone()))
+        })
+        .collect();
     let live_secrets = parts.secret_store.clone();
     let secret_store = match live_secrets.as_ref() {
         Some(store) if parts.servers.need_secrets() => Some(Arc::clone(store)),
@@ -698,6 +712,7 @@ pub fn compose_mcp(parts: McpComposition<'_>) -> Arc<McpRuntime> {
         warnings: servers.warnings,
         plane: parts.plane,
         secret_store: live_secrets,
+        origins: Mutex::new(origins),
         log: parts.log,
     });
     if parts.config.warm_tool_cache {
@@ -717,6 +732,7 @@ pub struct McpRuntime {
     warnings: Vec<String>,
     plane: McpControlPlane,
     secret_store: Option<Arc<SecretStore>>,
+    origins: Mutex<BTreeMap<String, String>>,
     log: LogHandle,
 }
 
@@ -795,6 +811,17 @@ impl McpRuntime {
     /// and are not awaited here.
     pub fn reload(&self) {
         let files = self.plane.scan();
+        let origins: BTreeMap<String, String> = files
+            .manifests()
+            .iter()
+            .filter_map(|manifest| {
+                manifest
+                    .origin
+                    .as_ref()
+                    .map(|origin| (manifest.server_id.clone(), origin.pack.clone()))
+            })
+            .collect();
+        *self.origins.lock().unwrap_or_else(|e| e.into_inner()) = origins;
         let manifest_secrets = self
             .secret_store
             .as_ref()
@@ -825,6 +852,127 @@ impl McpRuntime {
     pub fn drop_uninstalled_origins(&self, installed: &BTreeSet<String>) {
         self.plane.remove_origins_not_in(installed);
         self.reload();
+    }
+
+    /// The pack `name@version` that materialized `server_id`, if it is a
+    /// pack-origin server.
+    pub fn pack_origin(&self, server_id: &str) -> Option<String> {
+        self.origins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(server_id)
+            .cloned()
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        client: Arc<McpClient>,
+        gate: McpGate,
+        origins: BTreeMap<String, String>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            client,
+            gate,
+            runtime: tokio::runtime::Handle::current(),
+            warnings: Vec::new(),
+            plane: McpControlPlane::new(Path::new("/"), &McpConfig::default()),
+            secret_store: None,
+            origins: Mutex::new(origins),
+            log: LogHandle::null(),
+        })
+    }
+}
+
+/// Live MCP half of the callable inventory: listings are filtered per agent
+/// through the gate, filled from the client's tool cache, and a first read
+/// starts a background refresh on the daemon runtime.
+pub struct LiveCallableInventory {
+    wasm: Vec<ToolEntry>,
+    tools_grant: Option<Arc<dyn advance_shared_types::traits::ToolsGrantReader>>,
+    mcp: Arc<McpRuntime>,
+    refresh: AtomicBool,
+}
+
+impl LiveCallableInventory {
+    /// The WASM snapshot plus the live MCP client of `mcp`.
+    pub fn new(wasm: Vec<ToolEntry>, mcp: Arc<McpRuntime>) -> Self {
+        Self {
+            wasm,
+            tools_grant: None,
+            mcp,
+            refresh: AtomicBool::new(false),
+        }
+    }
+
+    pub fn with_tools_grant_reader(
+        mut self,
+        reader: Arc<dyn advance_shared_types::traits::ToolsGrantReader>,
+    ) -> Self {
+        self.tools_grant = Some(reader);
+        self
+    }
+
+    fn kick_refresh(&self) {
+        if self.refresh.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let client = Arc::clone(self.mcp.client());
+        self.mcp.runtime.spawn(async move {
+            for server in client.list_servers().await {
+                let _ = client.list_tools(None, &server.id).await;
+            }
+        });
+    }
+}
+
+impl CallableInventoryReader for LiveCallableInventory {
+    fn list_wasm_tools(&self, agent_id: &str) -> Vec<ToolEntry> {
+        match &self.tools_grant {
+            None => self.wasm.clone(),
+            Some(reader) => match reader.tool_allowlist(agent_id) {
+                None => self.wasm.clone(),
+                Some(allow) => self
+                    .wasm
+                    .iter()
+                    .filter(|t| allow.iter().any(|a| a == &t.name))
+                    .cloned()
+                    .collect(),
+            },
+        }
+    }
+
+    fn list_mcp_tools(&self, agent_id: &str) -> Vec<McpToolEntry> {
+        self.kick_refresh();
+        let scopes = self.mcp.gate().scopes(agent_id);
+        let mut out = Vec::new();
+        for listing in self.mcp.client().cached_tools() {
+            let visible = self.mcp.gate().visible_tools(
+                agent_id,
+                &scopes,
+                self.mcp.client().refuses_web_tools(&listing.server_id),
+                listing.tools.clone(),
+            );
+            let pack = self.mcp.pack_origin(&listing.server_id);
+            for mut entry in mcp_tool_entries_from_infos(visible) {
+                if let Some(origin) = &pack {
+                    if !entry.description.is_empty() {
+                        entry.description.push(' ');
+                    }
+                    entry.description.push_str("[pack ");
+                    entry.description.push_str(origin);
+                    entry.description.push(']');
+                }
+                let prefix = format!("{}__", entry.server_id);
+                if !entry.name.starts_with(&prefix) {
+                    entry.name = format!("{}{}", prefix, entry.name);
+                }
+                out.push(entry);
+                if out.len() >= cap_mcp::MAX_CACHED_TOOLS {
+                    return out;
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1051,8 +1199,10 @@ mod tests {
     use advance_database::{R2d2SqliteIndexHandle, SqliteIndexHandle};
     use advance_shared_types::capability::{CapParams, GrantDecision};
     use advance_shared_types::event::Event;
+    use advance_shared_types::security_validator::{ScanContext, ScanResult};
     use cap_grant::{
-        Grant, GrantId, GrantIssuer, GrantProvenance, GrantSqliteIndex, GrantStatus, GrantTtl,
+        CapParam, Grant, GrantId, GrantIssuer, GrantProvenance, GrantSqliteIndex, GrantStatus,
+        GrantTtl,
     };
 
     use super::*;
@@ -1575,12 +1725,22 @@ mod tests {
     }
 
     fn grant(store: &GrantStore, grantee: &str, capability: &str) {
+        grant_params(store, grantee, capability, &[]);
+    }
+
+    fn grant_params(store: &GrantStore, grantee: &str, capability: &str, params: &[(&str, &str)]) {
         store
             .insert(Grant {
                 id: GrantId::new(format!("static:{grantee}:{capability}")),
                 grantee: grantee.to_string(),
                 capability: capability.to_string(),
-                params: Vec::new(),
+                params: params
+                    .iter()
+                    .map(|(key, value)| CapParam {
+                        key: (*key).into(),
+                        value: (*value).into(),
+                    })
+                    .collect(),
                 ttl: GrantTtl::Persistent,
                 issuer: GrantIssuer::Config,
                 provenance: GrantProvenance::StaticConfig,
@@ -1664,6 +1824,104 @@ mod tests {
         );
         assert!(gate.scopes("root").reaches_server("srv"));
         assert!(!gate.scopes("someone-else").reaches_server("srv"));
+    }
+
+    struct CleanLeak;
+    impl LeakDetector for CleanLeak {
+        fn scan(&self, _: &str, _: ScanContext) -> ScanResult {
+            ScanResult::Clean
+        }
+        fn scan_headers(&self, _: &[(String, String)]) -> ScanResult {
+            ScanResult::Clean
+        }
+    }
+
+    fn cached_tool(server: &str, name: &str, description: &str) -> cap_mcp::McpToolInfo {
+        cap_mcp::McpToolInfo {
+            name: name.into(),
+            description: description.into(),
+            server_id: server.into(),
+            input_schema: None,
+        }
+    }
+
+    // A grant-filtered cache listing is what the model sees: `<server>__<tool>`,
+    // pack origin in the description, web-family tools only with the `web` grant.
+    #[tokio::test]
+    async fn a_grant_filtered_cache_listing_is_shown_as_server_tool() {
+        let store = grant_store();
+        grant_params(
+            &store,
+            "alice",
+            "mcp",
+            &[("servers", "scholar"), ("tool-patterns", "search*,web.*")],
+        );
+        grant(&store, "alice", "web");
+        grant(&store, "bob", "mcp");
+        let client = Arc::new(McpClient::new(
+            Arc::new(McpServersConfig::builder().build()),
+            Arc::new(CleanLeak),
+            None,
+        ));
+        client.store_cached_tools(
+            "scholar",
+            vec![
+                cached_tool("scholar", "search_papers", "Search papers"),
+                cached_tool("scholar", "fetch_pdf", "Fetch a PDF"),
+                cached_tool("scholar", "web.search", "Search the web"),
+                cached_tool("scholar", "scholar__already", "Already named"),
+            ],
+        );
+        let mut origins = BTreeMap::new();
+        origins.insert("scholar".into(), "papers@1.0.0".into());
+        let runtime = McpRuntime::for_test(
+            client,
+            mcp_gate(
+                Arc::new(RecordingCheck::default()),
+                store,
+                WebRunMode::Standard,
+            ),
+            origins,
+        );
+        let inv = LiveCallableInventory::new(
+            vec![ToolEntry {
+                name: "editor.format".into(),
+                description: "Format".into(),
+                params_schema: serde_json::json!({}),
+            }],
+            runtime,
+        );
+
+        let names = |agent: &str| -> Vec<String> {
+            inv.list_mcp_tools(agent)
+                .into_iter()
+                .map(|e| e.name)
+                .collect()
+        };
+        assert_eq!(
+            names("alice"),
+            ["scholar__search_papers", "scholar__web.search"]
+        );
+        assert_eq!(
+            names("bob"),
+            [
+                "scholar__search_papers",
+                "scholar__fetch_pdf",
+                "scholar__already"
+            ]
+        );
+        assert!(names("carol").is_empty());
+
+        let alice = inv.list_mcp_tools("alice");
+        assert_eq!(alice[0].description, "Search papers [pack papers@1.0.0]");
+        assert_eq!(alice[0].server_id, "scholar");
+        assert_eq!(
+            inv.list_wasm_tools("alice")
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>(),
+            ["editor.format"]
+        );
     }
 
     fn registration(id: &str, pack: &str) -> McpRegistration {

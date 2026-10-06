@@ -28,6 +28,9 @@
 //! scope for Slice A — see MODULE-010 §3.6 Known Gaps row 2 for the dispatch
 //! round-trip story).
 
+use std::borrow::Cow;
+use std::collections::BTreeSet;
+
 use advance_shared_types::capability::{McpToolEntry, ToolEntry};
 
 use crate::inventory::HostFnEntry;
@@ -45,11 +48,11 @@ pub enum UnifiedToolRecord {
 }
 
 impl UnifiedToolRecord {
-    fn name(&self) -> &str {
+    fn name(&self) -> Cow<'_, str> {
         match self {
-            Self::HostFn(e) => &e.name,
-            Self::WasmTool(e) => &e.name,
-            Self::McpTool(e) => &e.name,
+            Self::HostFn(e) => Cow::Borrowed(&e.name),
+            Self::WasmTool(e) => Cow::Borrowed(&e.name),
+            Self::McpTool(e) => Cow::Owned(mcp_display_name(e)),
         }
     }
     fn description(&self) -> &str {
@@ -92,18 +95,33 @@ pub fn assemble_unified(
 /// alphabetically for stability across `serde_json::Map` feature toggles).
 pub fn format_available_tools_section(records: &[UnifiedToolRecord]) -> String {
     let mut s = String::from("# Available Tools\n\n");
+    let mut seen = BTreeSet::new();
     for r in records {
+        let name = sanitize_tool_name(&r.name());
+        if !seen.insert(name.clone()) {
+            continue;
+        }
         let mut args = extract_top_level_arg_names(r.params_schema());
         args.sort();
         let sanitized_args: Vec<String> = args.into_iter().map(|a| sanitize_arg_name(&a)).collect();
         s.push_str(&format!(
             "- {}({}) — {}\n",
-            sanitize_tool_name(r.name()),
+            name,
             sanitized_args.join(", "),
             sanitize_description(r.description()),
         ));
     }
     s
+}
+
+/// Model-facing MCP tool name: `<server>__<tool>`.
+fn mcp_display_name(entry: &McpToolEntry) -> String {
+    let prefix = format!("{}__", entry.server_id);
+    if entry.server_id.is_empty() || entry.name.starts_with(&prefix) {
+        entry.name.clone()
+    } else {
+        format!("{}{}", prefix, entry.name)
+    }
 }
 
 fn extract_top_level_arg_names(schema: &serde_json::Value) -> Vec<String> {

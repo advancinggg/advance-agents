@@ -16,8 +16,8 @@
 //! context), [`CallableInventory`] holds two **point-in-time snapshot** vectors
 //! gathered async at construction via [`wasm_tool_entries`] (WASM half) +
 //! `cap_mcp::mcp_tool_entries` (MCP half). Tools/servers registered later are
-//! not reflected until re-gathered; a live-refresh model is future work
-//! (MODULE-017 §3.6 (J-a)).
+//! not reflected until re-gathered. The production MCP half is the live
+//! inventory in `advance-runtime-compose::mcp_wiring`, filtered per agent.
 //!
 //! ## `params_schema = {}` (empty object)
 //!
@@ -36,9 +36,8 @@
 //! wildcard/all; `Some(set)` = retain granted names). With NO reader wired the set is
 //! returned unfiltered (matching the `MockCallableInventory`/`EmptyCallableInventory`
 //! precedent — and production currently wires `EmptyCallableInventory`, so the filter is
-//! dormant in prod). The MCP half (`list_mcp_tools`) per-agent `mcp.servers`/
-//! `mcp.tool-patterns` L1 narrowing remains L1-V2-deferred (MODULE-017 §3.6 (m)); the
-//! `mcp.tool-patterns` filter IS already applied inside `McpClient::list_tools` at gather.
+//! dormant in prod). The MCP half of this snapshot type is unfiltered per agent;
+//! production uses the live inventory, which filters through the agent's `mcp` grants.
 //!
 //! ## No cap-* cycle
 //!
@@ -149,8 +148,8 @@ impl CallableInventoryReader for CallableInventory {
     }
 
     fn list_mcp_tools(&self, _agent_id: &str) -> Vec<McpToolEntry> {
-        // Returns ONLY the MCP inventory (post `mcp.tool-patterns` filter, which
-        // `McpClient::list_tools` applied at gather time); never the WASM entries.
+        // Snapshot MCP inventory (unfiltered per agent). Production uses
+        // `LiveCallableInventory` for grant-filtered listings.
         self.mcp.clone()
     }
 }

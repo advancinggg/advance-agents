@@ -88,8 +88,8 @@ async fn tier2_merges_host_wasm_mcp_into_one_section_excluding_delegate() {
         "db.query",
         "editor.format",
         "editor.lint",
-        "web.search_papers",
-        "web.fetch_pdf",
+        "scholar__web.search_papers",
+        "scholar__web.fetch_pdf",
     ] {
         assert!(section.contains(name), "missing tool: {name}");
     }
@@ -106,8 +106,8 @@ async fn tier2_merges_host_wasm_mcp_into_one_section_excluding_delegate() {
                 "db.query",
                 "editor.format",
                 "editor.lint",
-                "web.search_papers",
-                "web.fetch_pdf",
+                "scholar__web.search_papers",
+                "scholar__web.fetch_pdf",
             ]
             .iter()
             .position(|n| e.contains(n))
@@ -121,6 +121,25 @@ async fn tier2_merges_host_wasm_mcp_into_one_section_excluding_delegate() {
     assert!(
         fs_write.contains("(data, path)"),
         "fs.write args must sort alphabetically; got: {fs_write:?}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_tools_are_shown_as_server_then_tool_and_not_doubled() {
+    let mcp_tools = vec![
+        mcp("search", "Search", json!({}), "scholar"),
+        mcp("scholar__fetch", "Fetch", json!({}), "scholar"),
+    ];
+    let asm = build_assembler_with(vec![], vec![], mcp_tools);
+    let result = asm.assemble(stub_ctx()).await.unwrap();
+    let section = find_tier2_section(&result.messages);
+    let entries: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(entries.len(), 2, "got entries: {entries:?}");
+    assert!(section.contains("scholar__search"), "{section}");
+    assert!(section.contains("scholar__fetch"), "{section}");
+    assert!(
+        !section.contains("scholar__scholar__"),
+        "already-prefixed name was prefixed again: {section}"
     );
 }
 
@@ -147,7 +166,7 @@ async fn arg_names_and_descriptions_are_sanitized() {
     let section = find_tier2_section(&r.messages);
     let entry = section
         .lines()
-        .find(|l| l.starts_with("- evil.tool"))
+        .find(|l| l.starts_with("- untrusted_mcp_server__evil.tool"))
         .unwrap_or_else(|| panic!("section missing evil.tool entry: {section:?}"));
     // After sort: `a,b` → `a_b`, `c)` → `c_`, `ok` → `ok`. Sorted alphabetically:
     //   `a_b`, `c_`, `ok`.
@@ -172,7 +191,7 @@ async fn tool_name_and_em_dash_in_description_are_sanitized() {
     let section = find_tier2_section(&r.messages);
     let entry = section
         .lines()
-        .find(|l| l.starts_with("- evil_name"))
+        .find(|l| l.starts_with("- bad_server__evil_name"))
         .unwrap_or_else(|| panic!("section missing sanitized entry: {section:?}"));
     // The formatter's own ` — ` delimiter is the ONLY em-dash allowed on the
     // line; the name's em-dash and the description's em-dashes must all be
@@ -223,7 +242,7 @@ async fn bidi_override_marks_are_sanitized_trojan_source_defense() {
     // Sanity: the line still exists and has the well-formed shape.
     let entry = section
         .lines()
-        .find(|l| l.starts_with("- fs.read_txt.exe"))
+        .find(|l| l.starts_with("- bad_server__fs.read_txt.exe"))
         .unwrap_or_else(|| panic!("sanitized entry missing: {section:?}"));
     assert_eq!(entry.matches(" — ").count(), 1);
 }
@@ -252,7 +271,7 @@ async fn hangul_filler_tag_block_and_cache_marker_in_description_are_neutralized
     let section = find_tier2_section(&r.messages);
     let entry = section
         .lines()
-        .find(|l| l.starts_with("- fs_read"))
+        .find(|l| l.starts_with("- bad_server__fs_read"))
         .unwrap_or_else(|| panic!("name's U+3164 should be substituted to `_`; got: {section:?}"));
 
     // (1) No Hangul filler / Tag-block / Braille survives.
@@ -296,7 +315,7 @@ async fn unicode_dash_lookalikes_and_zero_width_chars_are_sanitized() {
     let section = find_tier2_section(&r.messages);
     let entry = section
         .lines()
-        .find(|l| l.starts_with("- spoof_name"))
+        .find(|l| l.starts_with("- bad_server__spoof_name"))
         .unwrap_or_else(|| panic!("section missing sanitized spoof entry: {section:?}"));
 
     // (1) No Unicode dash variant survives anywhere on the line, EXCEPT the
