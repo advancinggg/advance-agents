@@ -12,9 +12,9 @@ use advance_runtime_compose::test_support::{
 use advance_runtime_compose::{compose, log_keys};
 
 use crate::t111::{
-    alive_tasks, assert_composition_gone, assert_steps, assert_ws_closed, head_commits, head_file,
-    head_paths, join_thread, mint_session, open_events_ws, poll_until, serial, spawn_post_msg,
-    T111Home, J01_FILE, J01_REPLY,
+    alive_tasks, assert_composition_gone, assert_steps, assert_ws_closed, config_watcher_threads,
+    head_commits, head_file, head_paths, join_thread, mint_session, open_events_ws, poll_until,
+    serial, spawn_post_msg, T111Home, J01_FILE, J01_REPLY,
 };
 
 /// How long a message turn may take to reach the gate, or to complete.
@@ -93,6 +93,15 @@ pub async fn t111_6_recompose_after_ordered_shutdown() {
         !advance_git::commit_queue::active_queue_paths_for_test().is_empty(),
         "the git home has an active commit queue while composed"
     );
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        assert!(
+            config_watcher_threads()
+                .iter()
+                .any(|name| name.starts_with("notify-rs ")),
+            "the config watcher's OS-watcher thread is found by name while composed: {:?}",
+            config_watcher_threads()
+        );
+    }
 
     // An operator keeps /client/events/stream open.
     let endpoint = runtime.client_api().expect("the Client API is bound");

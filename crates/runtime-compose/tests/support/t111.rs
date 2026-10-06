@@ -46,6 +46,11 @@ pub const OBJECTS_BUDGET: Duration = Duration::from_secs(2);
 pub const TASKS_BUDGET: Duration = Duration::from_secs(6);
 /// Budget of the composition's own threads to end.
 pub const THREADS_BUDGET: Duration = Duration::from_secs(5);
+/// Budget of the config watcher's threads to end: the teardown waits a bounded time for
+/// the release of the OS watcher, which on macOS waits for the FSEvents run loop (its
+/// latency is the platform's, seconds under load), and past that bound the release ends
+/// on its own thread.
+pub const OS_WATCHER_RELEASE_BUDGET: Duration = Duration::from_secs(60);
 /// Budget of one HTTP exchange with a composition.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(10);
@@ -437,7 +442,8 @@ pub fn assert_steps(rec: &ProbeRecord, mandatory: &[&str]) {
 
 /// Nothing of the composition `probe` recorded is left: every object it built is dead,
 /// tokio's alive tasks are back to `baseline_tasks`, no thread the composition started
-/// runs, the process-wide CONTRACT-218 custody paths, git commit queues and reserved
+/// runs (counted, and on Linux and macOS also found by name, the config watcher's threads
+/// included), the process-wide CONTRACT-218 custody paths, git commit queues and reserved
 /// homes are empty, `home`'s runtime lock is gone and every port it bound can be bound
 /// again. Each failure names what is left and the teardown's step table (each step with
 /// the alive tasks right after it).
@@ -472,13 +478,26 @@ pub async fn assert_composition_gone(baseline_tasks: usize, probe: &ComposeProbe
             live_composition_threads_for_test()
         ))
     );
-    #[cfg(target_os = "linux")]
     assert!(
-        poll_until(THREADS_BUDGET, || composition_threads_on_linux().is_empty()).await,
+        poll_until(THREADS_BUDGET, || {
+            named_threads(COMPOSITION_THREADS).is_empty()
+        })
+        .await,
         "{}",
         report(&format!(
             "threads still running: {:?}",
-            composition_threads_on_linux()
+            named_threads(COMPOSITION_THREADS)
+        ))
+    );
+    assert!(
+        poll_until(OS_WATCHER_RELEASE_BUDGET, || {
+            config_watcher_threads().is_empty()
+        })
+        .await,
+        "{}",
+        report(&format!(
+            "config watcher threads still running: {:?}",
+            config_watcher_threads()
         ))
     );
     assert!(
@@ -515,31 +534,111 @@ pub async fn assert_composition_gone(baseline_tasks: usize, probe: &ComposeProbe
     }
 }
 
-/// The threads of this process whose name says the composition started them (Linux
-/// truncates a thread name to 15 bytes).
+/// Name prefixes of the threads a composition starts, itself or through the crates it
+/// composes, each at most 15 bytes long (Linux truncates a thread's name to that).
+const COMPOSITION_THREADS: &[&str] = &[
+    "advance-client-",
+    "contract218-anc",
+    "advance-host-ep",
+    "chatgpt-renewal",
+    "chatgpt-sign-in",
+    "cap-grant-chann",
+    "l6-git-bridge",
+];
+
+/// Name prefixes of the config watcher's threads: the OS watcher's own (`notify-rs inotify
+/// loop` on Linux, `notify-rs fsevents loop` on macOS) and the one that releases it at
+/// shutdown (`advance-config-watch-release`).
+const CONFIG_WATCHER_THREADS: &[&str] = &["notify-rs ", "advance-config-"];
+
+/// The config watcher's threads running now, by name.
+pub fn config_watcher_threads() -> Vec<String> {
+    named_threads(CONFIG_WATCHER_THREADS)
+}
+
+/// The names of this process's threads that start with one of `prefixes` (none where
+/// this process's thread names are not read: other than Linux and macOS).
+fn named_threads(prefixes: &[&str]) -> Vec<String> {
+    thread_names()
+        .into_iter()
+        .filter(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn thread_names() -> Vec<String> {
+    Vec::new()
+}
+
+/// The name of every thread of this process (`/proc/self/task/*/comm`).
 #[cfg(target_os = "linux")]
-fn composition_threads_on_linux() -> Vec<String> {
-    const PREFIXES: &[&str] = &[
-        "advance-client-",
-        "contract218-anc",
-        "advance-host-ep",
-        "chatgpt-renewal",
-        "chatgpt-sign-in",
-        "cap-grant-chann",
-        "l6-git-bridge",
-    ];
+fn thread_names() -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
         for task in tasks.flatten() {
             if let Ok(comm) = std::fs::read_to_string(task.path().join("comm")) {
-                let comm = comm.trim().to_owned();
-                if PREFIXES.iter().any(|prefix| comm.starts_with(prefix)) {
-                    names.push(comm);
-                }
+                names.push(comm.trim().to_owned());
             }
         }
     }
     names
+}
+
+/// The name of every thread of this process: `proc_pidinfo` lists the process's threads,
+/// then gives each one's info, its name included.
+#[cfg(target_os = "macos")]
+fn thread_names() -> Vec<String> {
+    /// `PROC_PIDLISTTHREADS` of `<sys/proc_info.h>`, which `libc` does not export.
+    const PROC_PIDLISTTHREADS: libc::c_int = 6;
+    let pid = std::process::id() as libc::c_int;
+    let mut handles = vec![0u64; 256];
+    let listed = loop {
+        let capacity = std::mem::size_of_val(handles.as_slice()) as libc::c_int;
+        // SAFETY: `handles` is valid for writes of `capacity` bytes.
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDLISTTHREADS,
+                0,
+                handles.as_mut_ptr().cast(),
+                capacity,
+            )
+        };
+        if bytes <= 0 {
+            return Vec::new();
+        }
+        if bytes < capacity {
+            break bytes as usize / std::mem::size_of::<u64>();
+        }
+        // The list may have been cut short: retry with room to spare.
+        let grown = handles.len() * 2;
+        handles.resize(grown, 0);
+    };
+    handles.truncate(listed);
+    handles
+        .into_iter()
+        .filter_map(|handle| {
+            // SAFETY: `proc_threadinfo` is plain data, valid when zeroed.
+            let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<libc::proc_threadinfo>() as libc::c_int;
+            // SAFETY: `info` is valid for writes of `size` bytes.
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTHREADINFO,
+                    handle,
+                    std::ptr::addr_of_mut!(info).cast(),
+                    size,
+                )
+            };
+            // A thread that ended after the list was taken has no info any more.
+            (got == size).then(|| {
+                let name: Vec<u8> = info.pth_name.iter().map(|&c| c as u8).collect();
+                let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+                String::from_utf8_lossy(&name[..end]).into_owned()
+            })
+        })
+        .collect()
 }
 
 /// The commits reachable from the home repository's `HEAD` (none on an unborn branch).
