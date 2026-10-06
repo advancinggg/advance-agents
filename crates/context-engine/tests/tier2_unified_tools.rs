@@ -166,7 +166,7 @@ async fn arg_names_and_descriptions_are_sanitized() {
     let section = find_tier2_section(&r.messages);
     let entry = section
         .lines()
-        .find(|l| l.starts_with("- untrusted_mcp_server__evil.tool"))
+        .find(|l| l.starts_with("- untrusted-mcp-server__evil.tool"))
         .unwrap_or_else(|| panic!("section missing evil.tool entry: {section:?}"));
     // After sort: `a,b` → `a_b`, `c)` → `c_`, `ok` → `ok`. Sorted alphabetically:
     //   `a_b`, `c_`, `ok`.
@@ -191,7 +191,7 @@ async fn tool_name_and_em_dash_in_description_are_sanitized() {
     let section = find_tier2_section(&r.messages);
     let entry = section
         .lines()
-        .find(|l| l.starts_with("- bad_server__evil_name"))
+        .find(|l| l.starts_with("- bad-server__evil_name"))
         .unwrap_or_else(|| panic!("section missing sanitized entry: {section:?}"));
     // The formatter's own ` — ` delimiter is the ONLY em-dash allowed on the
     // line; the name's em-dash and the description's em-dashes must all be
@@ -242,7 +242,7 @@ async fn bidi_override_marks_are_sanitized_trojan_source_defense() {
     // Sanity: the line still exists and has the well-formed shape.
     let entry = section
         .lines()
-        .find(|l| l.starts_with("- bad_server__fs.read_txt.exe"))
+        .find(|l| l.starts_with("- bad-server__fs.read_txt.exe"))
         .unwrap_or_else(|| panic!("sanitized entry missing: {section:?}"));
     assert_eq!(entry.matches(" — ").count(), 1);
 }
@@ -271,7 +271,7 @@ async fn hangul_filler_tag_block_and_cache_marker_in_description_are_neutralized
     let section = find_tier2_section(&r.messages);
     let entry = section
         .lines()
-        .find(|l| l.starts_with("- bad_server__fs_read"))
+        .find(|l| l.starts_with("- bad-server__fs_read"))
         .unwrap_or_else(|| panic!("name's U+3164 should be substituted to `_`; got: {section:?}"));
 
     // (1) No Hangul filler / Tag-block / Braille survives.
@@ -315,7 +315,7 @@ async fn unicode_dash_lookalikes_and_zero_width_chars_are_sanitized() {
     let section = find_tier2_section(&r.messages);
     let entry = section
         .lines()
-        .find(|l| l.starts_with("- bad_server__spoof_name"))
+        .find(|l| l.starts_with("- bad-server__spoof_name"))
         .unwrap_or_else(|| panic!("section missing sanitized spoof entry: {section:?}"));
 
     // (1) No Unicode dash variant survives anywhere on the line, EXCEPT the

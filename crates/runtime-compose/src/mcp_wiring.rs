@@ -72,7 +72,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -677,10 +676,9 @@ pub fn compose_mcp(parts: McpComposition<'_>) -> Arc<McpRuntime> {
             .map(|secrets| secrets as &dyn ManifestSecrets),
     );
     for warning in &servers.warnings {
-        parts.log.err(
-            log_keys::MCP_WARN,
-            format!("advance: WARN mcp: {warning}"),
-        );
+        parts
+            .log
+            .err(log_keys::MCP_WARN, format!("advance: WARN mcp: {warning}"));
     }
 
     let limits = client_limits(parts.config);
@@ -713,6 +711,7 @@ pub fn compose_mcp(parts: McpComposition<'_>) -> Arc<McpRuntime> {
         plane: parts.plane,
         secret_store: live_secrets,
         origins: Mutex::new(origins),
+        listings_in_flight: Mutex::new(BTreeSet::new()),
         log: parts.log,
     });
     if parts.config.warm_tool_cache {
@@ -733,6 +732,9 @@ pub struct McpRuntime {
     plane: McpControlPlane,
     secret_store: Option<Arc<SecretStore>>,
     origins: Mutex<BTreeMap<String, String>>,
+    /// Server ids whose `list_tools` is running; dropped when it finishes so a
+    /// failed listing can be tried again.
+    listings_in_flight: Mutex<BTreeSet<String>>,
     log: LogHandle,
 }
 
@@ -832,10 +834,8 @@ impl McpRuntime {
                 .map(|secrets| secrets as &dyn ManifestSecrets),
         );
         for warning in &servers.warnings {
-            self.log.err(
-                log_keys::MCP_WARN,
-                format!("advance: WARN mcp: {warning}"),
-            );
+            self.log
+                .err(log_keys::MCP_WARN, format!("advance: WARN mcp: {warning}"));
         }
         let reconfig = self.client.replace_config(servers.config);
         for id in reconfig.added.iter().chain(reconfig.changed.iter()) {
@@ -878,9 +878,27 @@ impl McpRuntime {
             plane: McpControlPlane::new(Path::new("/"), &McpConfig::default()),
             secret_store: None,
             origins: Mutex::new(origins),
+            listings_in_flight: Mutex::new(BTreeSet::new()),
             log: LogHandle::null(),
         })
     }
+}
+
+/// Append `[pack {origin}]` to a tool description, replacing `[]` and controls
+/// so the marker cannot be spoofed from the origin string.
+fn append_pack_origin(description: &mut String, origin: &str) {
+    if !description.is_empty() {
+        description.push(' ');
+    }
+    description.push_str("[pack ");
+    for c in origin.chars() {
+        description.push(if c == '[' || c == ']' || c.is_control() {
+            '_'
+        } else {
+            c
+        });
+    }
+    description.push(']');
 }
 
 /// Live MCP half of the callable inventory: listings are filtered per agent
@@ -890,7 +908,6 @@ pub struct LiveCallableInventory {
     wasm: Vec<ToolEntry>,
     tools_grant: Option<Arc<dyn advance_shared_types::traits::ToolsGrantReader>>,
     mcp: Arc<McpRuntime>,
-    refresh: AtomicBool,
 }
 
 impl LiveCallableInventory {
@@ -900,7 +917,6 @@ impl LiveCallableInventory {
             wasm,
             tools_grant: None,
             mcp,
-            refresh: AtomicBool::new(false),
         }
     }
 
@@ -912,14 +928,39 @@ impl LiveCallableInventory {
         self
     }
 
-    fn kick_refresh(&self) {
-        if self.refresh.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let client = Arc::clone(self.mcp.client());
+    /// List tools of servers `agent_id` can reach that are not in the cache yet.
+    /// A failed listing is not cached, so a later read tries again. A caller
+    /// who reaches no server starts none.
+    fn kick_refresh(&self, agent_id: &str) {
+        let scopes = self.mcp.gate().scopes(agent_id);
+        let mcp = Arc::clone(&self.mcp);
         self.mcp.runtime.spawn(async move {
+            let client = mcp.client();
             for server in client.list_servers().await {
+                if !scopes.reaches_server(&server.id) {
+                    continue;
+                }
+                if client
+                    .cached_tools()
+                    .iter()
+                    .any(|listing| listing.server_id == server.id)
+                {
+                    continue;
+                }
+                {
+                    let mut guard = mcp
+                        .listings_in_flight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if !guard.insert(server.id.clone()) {
+                        continue;
+                    }
+                }
                 let _ = client.list_tools(None, &server.id).await;
+                mcp.listings_in_flight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&server.id);
             }
         });
     }
@@ -942,7 +983,7 @@ impl CallableInventoryReader for LiveCallableInventory {
     }
 
     fn list_mcp_tools(&self, agent_id: &str) -> Vec<McpToolEntry> {
-        self.kick_refresh();
+        self.kick_refresh(agent_id);
         let scopes = self.mcp.gate().scopes(agent_id);
         let mut out = Vec::new();
         for listing in self.mcp.client().cached_tools() {
@@ -955,12 +996,7 @@ impl CallableInventoryReader for LiveCallableInventory {
             let pack = self.mcp.pack_origin(&listing.server_id);
             for mut entry in mcp_tool_entries_from_infos(visible) {
                 if let Some(origin) = &pack {
-                    if !entry.description.is_empty() {
-                        entry.description.push(' ');
-                    }
-                    entry.description.push_str("[pack ");
-                    entry.description.push_str(origin);
-                    entry.description.push(']');
+                    append_pack_origin(&mut entry.description, origin);
                 }
                 let prefix = format!("{}__", entry.server_id);
                 if !entry.name.starts_with(&prefix) {
@@ -1858,6 +1894,7 @@ mod tests {
         );
         grant(&store, "alice", "web");
         grant(&store, "bob", "mcp");
+        grant(&store, "dave", "web");
         let client = Arc::new(McpClient::new(
             Arc::new(McpServersConfig::builder().build()),
             Arc::new(CleanLeak),
@@ -1872,8 +1909,16 @@ mod tests {
                 cached_tool("scholar", "scholar__already", "Already named"),
             ],
         );
+        client.store_cached_tools(
+            "private",
+            vec![cached_tool("private", "secret", "Do not leak")],
+        );
+        client.store_cached_tools(
+            "local-tools",
+            vec![cached_tool("local-tools", "echo", "Echo")],
+        );
         let mut origins = BTreeMap::new();
-        origins.insert("scholar".into(), "papers@1.0.0".into());
+        origins.insert("scholar".into(), "papers]@1.0.0".into());
         let runtime = McpRuntime::for_test(
             client,
             mcp_gate(
@@ -1905,15 +1950,18 @@ mod tests {
         assert_eq!(
             names("bob"),
             [
+                "local-tools__echo",
+                "private__secret",
                 "scholar__search_papers",
                 "scholar__fetch_pdf",
                 "scholar__already"
             ]
         );
         assert!(names("carol").is_empty());
+        assert!(names("dave").is_empty());
 
         let alice = inv.list_mcp_tools("alice");
-        assert_eq!(alice[0].description, "Search papers [pack papers@1.0.0]");
+        assert_eq!(alice[0].description, "Search papers [pack papers_@1.0.0]");
         assert_eq!(alice[0].server_id, "scholar");
         assert_eq!(
             inv.list_wasm_tools("alice")

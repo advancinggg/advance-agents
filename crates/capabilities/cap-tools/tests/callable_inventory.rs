@@ -46,9 +46,9 @@ use cap_tools::{tool_entries_from_infos, CallableInventory, MethodInfo, ToolInfo
 // ─── synthetic inventory snapshots (no WASM build, no real MCP server) ───
 
 // Sanitization-stable identifiers: M010's `tier2::sanitize_tool_name` rewrites
-// `-` (and other delimiter/Unicode-spoof chars) to `_` in the rendered line, so
-// we use underscore names whose raw form == rendered form. This keeps the e2e
-// assertions about "the tool appears in the section" decoupled from M010's
+// delimiter and Unicode-spoof chars to `_` in the rendered line (ASCII '-' is
+// kept). Underscore names have raw form == rendered form, so e2e assertions
+// about "the tool appears in the section" stay decoupled from M010's
 // substitution rule (which has its own M010 sanitizer tests).
 const WASM_TOOL: &str = "fs_read";
 const MCP_TOOL: &str = "web_search";

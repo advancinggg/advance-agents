@@ -163,9 +163,9 @@ pub(crate) fn is_unsafe_for_tier2_line(c: char) -> bool {
         ','
             | '('
             | ')'
-            // ASCII hyphen + every Unicode dash that looks like the ASCII
-            // bullet prefix / ` — ` delimiter to operator audit text.
-            | '-'
+            // Unicode dashes that look like the ASCII hyphen / ` — ` delimiter
+            // to operator audit text. ASCII '-' is kept so MCP server ids
+            // (`[A-Za-z0-9._-]`) round-trip in the prompt.
             | '\u{2010}'
             | '\u{2011}'
             | '\u{2012}'
@@ -213,9 +213,11 @@ fn sanitize_tool_name(s: &str) -> String {
     // for rejection. Substitute (not reject) so a well-formed line is always
     // produced; dispatch round-trip story deferred to future M014 wiring
     // slice — see MODULE-010 §3.6 Known Gaps row 2.
-    s.chars()
+    let mapped: String = s
+        .chars()
         .map(|c| if is_unsafe_for_tier2_line(c) { '_' } else { c })
-        .collect()
+        .collect();
+    neutralize_cache_breakpoint_markers(&mapped)
 }
 
 /// Cache-breakpoint marker prefix that the future M009 gateway stripper will
