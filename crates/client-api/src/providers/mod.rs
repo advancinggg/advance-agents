@@ -16,6 +16,9 @@ use crate::envelope::{ClientError, ClientErrorCode};
 pub mod grants;
 pub mod history;
 
+#[cfg(test)]
+mod read_view_tests;
+
 pub(crate) struct Projectable<T> {
     bound: BoundObservationDocument,
     schema: PhantomData<fn() -> T>,

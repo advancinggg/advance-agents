@@ -18,7 +18,7 @@ use crate::envelope::API_VERSION;
 use crate::envelope::{ClientError, ClientErrorCode, ClientWarning};
 use crate::provider::{
     provider_or_unavailable, BoundGrantProviderSlot, LeakDetectorSlot, ObservationRedactorSlot,
-    ProviderError,
+    PendingGrantListSlot, ProviderError,
 };
 use crate::providers::Projectable;
 use crate::request::Method;
@@ -314,8 +314,19 @@ pub trait BoundGrantApprovalPort: Send + Sync {
     ) -> Result<(), ProviderError>;
 }
 
+/// The pending-grant list of a home that has no CONTRACT-123 grant intake (MODULE-020-AC-18,
+/// ADR 2026-10-03 D4). It serves only `GET /client/grants/pending`: the five grant mutations
+/// never read it, so they keep answering `module_unavailable` before any provider entry.
+pub trait PendingGrantListPort: Send + Sync {
+    /// The parked requests, association-bound. A port without an intake returns none.
+    fn list_pending_bound(&self) -> Result<Vec<BoundObservationDocument>, ProviderError>;
+    /// The redactor every listed document passes (fail-closed for a port without an intake).
+    fn redactor(&self) -> Arc<SensitiveObservationRedactor>;
+}
+
 struct GrantSlots {
     provider: BoundGrantProviderSlot,
+    list_only: PendingGrantListSlot,
     redactor: ObservationRedactorSlot,
     detector: LeakDetectorSlot,
 }
@@ -323,11 +334,13 @@ struct GrantSlots {
 pub(crate) fn register(
     api: &mut ClientApi,
     provider: BoundGrantProviderSlot,
+    list_only: PendingGrantListSlot,
     redactor: ObservationRedactorSlot,
     detector: LeakDetectorSlot,
 ) {
     let slots = Arc::new(GrantSlots {
         provider,
+        list_only,
         redactor,
         detector,
     });
@@ -456,12 +469,34 @@ fn register_decision(
 }
 
 fn list_pending(slots: &GrantSlots) -> Result<HandlerResponse, ClientError> {
-    let provider = provider_or_unavailable(&slots.provider)?;
-    let redactor = provider_or_unavailable(&slots.redactor)?;
-    let detector = provider_or_unavailable(&slots.detector)?;
-    let documents = provider
-        .list_pending_bound()
-        .map_err(ProviderError::into_client_error)?;
+    let bound = slots
+        .provider
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let (documents, redactor, detector) = match bound {
+        Some(provider) => {
+            let redactor = provider_or_unavailable(&slots.redactor)?;
+            let detector = provider_or_unavailable(&slots.detector)?;
+            (
+                provider
+                    .list_pending_bound()
+                    .map_err(ProviderError::into_client_error)?,
+                redactor,
+                detector,
+            )
+        }
+        None => {
+            let port = provider_or_unavailable(&slots.list_only)?;
+            let detector = provider_or_unavailable(&slots.detector)?;
+            (
+                port.list_pending_bound()
+                    .map_err(ProviderError::into_client_error)?,
+                port.redactor(),
+                detector,
+            )
+        }
+    };
 
     let mut requests = Vec::with_capacity(documents.len());
     let mut warnings = Vec::new();

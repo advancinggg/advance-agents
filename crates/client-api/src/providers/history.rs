@@ -11,7 +11,7 @@ use crate::api::{ClientApi, HandlerResponse, HandlerSpec};
 use crate::envelope::{ClientError, ClientErrorCode};
 use crate::provider::{
     provider_or_unavailable, BoundHistoryProviderSlot, LeakDetectorSlot, ObservationRedactorSlot,
-    ProviderError,
+    ProviderError, UnboundHistoryProviderSlot,
 };
 use crate::providers::grants::{scan_client_text, ClientCapParam};
 use crate::providers::Projectable;
@@ -77,8 +77,43 @@ pub trait BoundHistoryReadPort: Send + Sync {
     ) -> Result<BoundHistoryPage, ProviderError>;
 }
 
+/// One task/run history entry of a home without CONTRACT-219 (`lifecycle` not declared):
+/// MODULE-020-AC-18, ADR 2026-10-03 D4. It has no parameter field, so the history route
+/// answers `params: []` for it by construction. A port type, not a wire DTO: no serde, no
+/// `JsonSchema`, not in the CONTRACT-192 schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnboundHistoryEntry {
+    /// The raw CONTRACT-185 event id (the bound path's `event_id`).
+    pub event_id: String,
+    /// The event time, RFC 3339 (`DateTime::to_rfc3339`, the bound path's form).
+    pub occurred_at: String,
+    /// The event type.
+    pub kind: String,
+    /// The bound path's constant summary.
+    pub summary: String,
+}
+
+/// The unbound history read port (MODULE-020-AC-18): newest first within the composer's read
+/// window, the task filter applied in memory, the request `cursor` matched against raw event
+/// ids (rows up to and including it are skipped), no next cursor. An unknown cursor is
+/// `ProviderError::NotFound`.
+pub trait UnboundHistoryReadPort: Send + Sync {
+    fn task_history_unbound(
+        &self,
+        task_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<Vec<UnboundHistoryEntry>, ProviderError>;
+
+    fn run_history_unbound(
+        &self,
+        run_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<Vec<UnboundHistoryEntry>, ProviderError>;
+}
+
 struct HistorySlots {
     provider: BoundHistoryProviderSlot,
+    unbound: UnboundHistoryProviderSlot,
     redactor: ObservationRedactorSlot,
     detector: LeakDetectorSlot,
 }
@@ -86,11 +121,13 @@ struct HistorySlots {
 pub(crate) fn register(
     api: &mut ClientApi,
     provider: BoundHistoryProviderSlot,
+    unbound: UnboundHistoryProviderSlot,
     redactor: ObservationRedactorSlot,
     detector: LeakDetectorSlot,
 ) {
     let slots = Arc::new(HistorySlots {
         provider,
+        unbound,
         redactor,
         detector,
     });
@@ -132,13 +169,36 @@ fn handle(
             )
         })?
     };
-    let provider = provider_or_unavailable(&slots.provider)?;
+    let bound = slots
+        .provider
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    match bound {
+        Some(provider) => bound_page(slots, provider, id, request.cursor.as_deref(), task),
+        None => unbound_page(
+            slots,
+            provider_or_unavailable(&slots.unbound)?,
+            id,
+            request.cursor.as_deref(),
+            task,
+        ),
+    }
+}
+
+fn bound_page(
+    slots: &HistorySlots,
+    provider: Arc<dyn BoundHistoryReadPort>,
+    id: &str,
+    cursor: Option<&str>,
+    task: bool,
+) -> Result<HandlerResponse, ClientError> {
     let redactor = provider_or_unavailable(&slots.redactor)?;
     let detector = provider_or_unavailable(&slots.detector)?;
     let page = if task {
-        provider.task_history_bound(id, request.cursor.as_deref())
+        provider.task_history_bound(id, cursor)
     } else {
-        provider.run_history_bound(id, request.cursor.as_deref())
+        provider.run_history_bound(id, cursor)
     }
     .map_err(ProviderError::into_client_error)?;
     let (documents, next_cursor) = page.into_parts();
@@ -170,6 +230,51 @@ fn handle(
         serde_json::to_value(ClientHistoryResponse {
             entries,
             next_cursor,
+        })
+        .expect("history serializes"),
+        warnings,
+    ))
+}
+
+fn unbound_page(
+    slots: &HistorySlots,
+    port: Arc<dyn UnboundHistoryReadPort>,
+    id: &str,
+    cursor: Option<&str>,
+    task: bool,
+) -> Result<HandlerResponse, ClientError> {
+    let detector = provider_or_unavailable(&slots.detector)?;
+    let page = if task {
+        port.task_history_unbound(id, cursor)
+    } else {
+        port.run_history_unbound(id, cursor)
+    }
+    .map_err(ProviderError::into_client_error)?;
+    let mut entries = Vec::with_capacity(page.len());
+    let mut warnings = Vec::new();
+    for unbound in page {
+        chrono::DateTime::parse_from_rfc3339(&unbound.occurred_at)
+            .map_err(|_| projection_error())?;
+        let mut entry = ClientHistoryEntry {
+            event_id: unbound.event_id,
+            occurred_at: unbound.occurred_at,
+            kind: unbound.kind,
+            summary: unbound.summary,
+            params: Vec::new(),
+        };
+        scan_client_text(
+            &mut entry.summary,
+            detector.as_ref(),
+            "summary",
+            true,
+            &mut warnings,
+        )?;
+        entries.push(entry);
+    }
+    Ok(HandlerResponse::with_warnings(
+        serde_json::to_value(ClientHistoryResponse {
+            entries,
+            next_cursor: None,
         })
         .expect("history serializes"),
         warnings,

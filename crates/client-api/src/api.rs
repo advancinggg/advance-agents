@@ -29,10 +29,11 @@ use crate::idempotency::{Begin, IdempotencyOutcome, IdempotencyScope, Idempotenc
 use crate::provider::{
     AgentAdminProvider, AgentProviderSlot, BoundGrantProviderSlot, BoundHistoryProviderSlot,
     CursorCodecSlot, EventProviderSlot, LeakDetectorSlot, MessagingProvider, MessagingProviderSlot,
-    ObservationRedactorSlot, RunControlProvider, RunProviderSlot, ToolsProvider, ToolsProviderSlot,
+    ObservationRedactorSlot, PendingGrantListSlot, RunControlProvider, RunProviderSlot,
+    ToolsProvider, ToolsProviderSlot, UnboundHistoryProviderSlot,
 };
-use crate::providers::grants::BoundGrantApprovalPort;
-use crate::providers::history::BoundHistoryReadPort;
+use crate::providers::grants::{BoundGrantApprovalPort, PendingGrantListPort};
+use crate::providers::history::{BoundHistoryReadPort, UnboundHistoryReadPort};
 use crate::request::{ClientRequest, Method};
 use crate::routes::{self, RoutePattern, SessionOp};
 use crate::session::{Platform, Principal, Scope, SessionInfo, SessionStore};
@@ -323,6 +324,8 @@ pub struct ClientApi {
     bound_grant_provider: BoundGrantProviderSlot,
     bound_history_provider: BoundHistoryProviderSlot,
     observation_redactor: ObservationRedactorSlot,
+    unbound_history_provider: UnboundHistoryProviderSlot,
+    pending_grant_list: PendingGrantListSlot,
     /// Tee T2 (CONTRACT-235) `LlmDeltaHub` slot. Empty by default → `module_unavailable`;
     /// the cli root wiring is EXPLICITLY out of scope (backlog #12) — the headless default
     /// upstream stays `NotWiredDeltaSink` and this slot stays empty.
@@ -392,6 +395,8 @@ impl ClientApi {
             bound_grant_provider: Arc::new(RwLock::new(None)),
             bound_history_provider: Arc::new(RwLock::new(None)),
             observation_redactor: Arc::new(RwLock::new(None)),
+            unbound_history_provider: Arc::new(RwLock::new(None)),
+            pending_grant_list: Arc::new(RwLock::new(None)),
             llm_delta_hub: Arc::new(RwLock::new(None)),
             #[cfg(feature = "test-support")]
             delta_pump_observer: Arc::new(RwLock::new(None)),
@@ -464,13 +469,27 @@ impl ClientApi {
             &cfg,
         );
         let grant_slot = Arc::clone(&self.bound_grant_provider);
+        let grant_list = Arc::clone(&self.pending_grant_list);
         let grant_redactor = Arc::clone(&self.observation_redactor);
         let grant_detector = Arc::clone(&self.leak_detector);
-        crate::providers::grants::register(self, grant_slot, grant_redactor, grant_detector);
+        crate::providers::grants::register(
+            self,
+            grant_slot,
+            grant_list,
+            grant_redactor,
+            grant_detector,
+        );
         let history_slot = Arc::clone(&self.bound_history_provider);
+        let history_unbound = Arc::clone(&self.unbound_history_provider);
         let history_redactor = Arc::clone(&self.observation_redactor);
         let history_detector = Arc::clone(&self.leak_detector);
-        crate::providers::history::register(self, history_slot, history_redactor, history_detector);
+        crate::providers::history::register(
+            self,
+            history_slot,
+            history_unbound,
+            history_redactor,
+            history_detector,
+        );
         // Tee T2 (CONTRACT-235): the scope-gated LLM delta subscribe route.
         let delta_slot = Arc::clone(&self.llm_delta_hub);
         let llm_deltas_enabled = self.config.llm_deltas_enabled;
@@ -635,6 +654,20 @@ impl ClientApi {
         self
     }
 
+    /// MODULE-020-AC-18: the history port of a home without CONTRACT-219. The bound provider,
+    /// when present, always wins (the route reads the bound slot first).
+    pub fn with_unbound_history_provider(self, provider: Arc<dyn UnboundHistoryReadPort>) -> Self {
+        *self.unbound_history_provider.write().unwrap() = Some(provider);
+        self
+    }
+
+    /// MODULE-020-AC-18: the list-only pending-grant port of a home without a grant intake.
+    /// The bound grant provider, when present, always wins; mutations never read this slot.
+    pub fn with_pending_grant_list_provider(self, provider: Arc<dyn PendingGrantListPort>) -> Self {
+        *self.pending_grant_list.write().unwrap() = Some(provider);
+        self
+    }
+
     pub fn with_observation_redactor(self, redactor: Arc<SensitiveObservationRedactor>) -> Self {
         *self.observation_redactor.write().unwrap() = Some(redactor);
         self
@@ -669,6 +702,8 @@ impl ClientApi {
         clear(&self.cursor_codec);
         clear(&self.bound_grant_provider);
         clear(&self.bound_history_provider);
+        clear(&self.unbound_history_provider);
+        clear(&self.pending_grant_list);
         clear(&self.observation_redactor);
         clear(&self.llm_delta_hub);
         #[cfg(feature = "test-support")]

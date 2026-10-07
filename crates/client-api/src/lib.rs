@@ -119,11 +119,12 @@ pub use providers::grants::{
     BoundGrantApprovalPort, BoundGrantMutation, BoundMutationOutcome, ClientCapParam,
     ClientGrantApproveRequest, ClientGrantDecision, ClientGrantDenyRequest,
     ClientGrantNarrowRequest, ClientGrantRevokeRequest, ClientGrantRevokeResult, ClientGrantTtl,
-    ClientPendingGrant, ClientPresetApplyRequest, ClientPresetApplyResult,
+    ClientPendingGrant, ClientPresetApplyRequest, ClientPresetApplyResult, PendingGrantListPort,
     ProviderClientDoneReceipt, ProviderMutationRecovery, ProviderPrepareOutcome,
 };
 pub use providers::history::{
     BoundHistoryPage, BoundHistoryReadPort, ClientHistoryEntry, ClientHistoryResponse,
+    UnboundHistoryEntry, UnboundHistoryReadPort,
 };
 pub use request::{ClientRequest, Method};
 pub use routes::RouteTableEntry;
