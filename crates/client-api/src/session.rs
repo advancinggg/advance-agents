@@ -230,6 +230,14 @@ impl SessionStore {
             .retain(|_, s| s.session_id != session_id);
     }
 
+    /// Revoke every session (every token of every session id). Returns how many tokens were removed.
+    pub fn revoke_all(&self) -> usize {
+        let mut map = self.inner.lock().expect("session store lock");
+        let n = map.len();
+        map.clear();
+        n
+    }
+
     /// Live session count (test/introspection helper).
     pub fn len(&self) -> usize {
         self.inner.lock().expect("session store lock").len()

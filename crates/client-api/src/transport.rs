@@ -98,7 +98,8 @@ fn dispatch_permits(api: &ClientApi) -> u32 {
     u32::try_from(permits).unwrap_or(65_536)
 }
 
-/// Build the public router.  It contains only embedded console assets and `/client/*` routes.
+/// Build the public router.  It contains embedded console assets (not under
+/// `SessionAdmission::InProcessOnly`) and `/client/*` routes.
 /// ConnectInfo is required so the core can enforce loopback admission from the real peer address.
 pub fn client_api_router(api: Arc<ClientApi>) -> Router {
     let dispatch = Arc::new(Semaphore::new(dispatch_permits(&api) as usize));
@@ -106,6 +107,7 @@ pub fn client_api_router(api: Arc<ClientApi>) -> Router {
 }
 
 fn router_with(api: Arc<ClientApi>, ws: WsTracking, dispatch: Arc<Semaphore>) -> Router {
+    let console = api.config().serves_web_console();
     let max_body_bytes = api.config().max_body_bytes;
     let state = TransportState {
         api,
@@ -113,11 +115,15 @@ fn router_with(api: Arc<ClientApi>, ws: WsTracking, dispatch: Arc<Semaphore>) ->
         dispatch,
         ws,
     };
-    Router::new()
-        .route("/", get(index))
-        .route("/index.html", get(index))
-        .route("/app.js", get(app_js))
-        .route("/styles.css", get(styles_css))
+    let mut router = Router::new();
+    if console {
+        router = router
+            .route("/", get(index))
+            .route("/index.html", get(index))
+            .route("/app.js", get(app_js))
+            .route("/styles.css", get(styles_css));
+    }
+    router
         .route(routes::PATH_EVENTS_STREAM, get(event_stream_transport))
         .route(routes::PATH_LLM_DELTAS_STREAM, get(delta_stream_transport))
         .route(

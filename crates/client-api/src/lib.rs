@@ -56,7 +56,7 @@ pub use agents::{
 pub use api::{ClientApi, ClientMutationContext, HandlerCtx, HandlerResponse, HandlerSpec};
 pub use audit::{AuditEvent, AuditSink, NoopSink};
 pub use clock::{Clock, SystemClock};
-pub use config::ClientApiConfig;
+pub use config::{ClientApiConfig, SessionAdmission};
 pub use costs::{
     ClientAgentCostEntry, ClientAgentCostList, ClientAgentCostReport, ClientCostQuery,
     ClientCostTotals, ClientCostWindow, ClientProviderCostEntry, ClientProviderCostList,

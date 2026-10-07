@@ -18,7 +18,7 @@ use advance_shared_types::sensitive_observation::SensitiveObservationRedactor;
 use crate::audit::{AuditEvent, AuditSink, NoopSink};
 use crate::auth::ClientSessionAuth;
 use crate::clock::{Clock, SystemClock};
-use crate::config::ClientApiConfig;
+use crate::config::{ClientApiConfig, SessionAdmission};
 use crate::cursor::ClientCursorCodec;
 use crate::durable_idempotency::{
     DurableBegin, DurableIdempotencyRepository, DurableReservation, DurableReserveInput,
@@ -1029,6 +1029,23 @@ impl ClientApi {
         &self.config
     }
 
+    /// A native operator session minted inside the host process (ADR 2026-10-03 D3). No request, no
+    /// transport and no credential check are involved: the caller already holds this `ClientApi`.
+    /// The session is a credential-less loopback login's: operator principal (`auth().os_user()`),
+    /// `Scope::operator_default()`, no CSRF token, lifetime `session_ttl_ms` by this API's clock.
+    /// Emits no audit event (no request exists). Works under either admission. The returned
+    /// `SessionInfo.token` is a bearer credential: never write, log or URL-encode it.
+    pub fn mint_in_process_session(&self, platform: Platform) -> SessionInfo {
+        self.mint_operator_session(platform, false, self.clock.now_millis())
+    }
+
+    /// True when `token` names a live session that stays valid at least `min_remaining_ms` longer
+    /// by this API's clock (an expired session is swept, as `SessionStore::get_valid` does).
+    pub fn session_valid_for(&self, token: &str, min_remaining_ms: u64) -> bool {
+        self.session_expires_at(token)
+            .is_some_and(|exp| exp > self.clock.now_millis().saturating_add(min_remaining_ms))
+    }
+
     /// Every installed extension route, in registration order (empty without extensions).
     pub fn extension_route_report(&self) -> Vec<crate::families::ExtensionRouteInfo> {
         self.extension_routes.clone()
@@ -1659,7 +1676,9 @@ impl ClientApi {
         now: u64,
     ) -> ClientEnvelope<serde_json::Value> {
         // Bootstrap: loopback → OS-user operator; non-loopback → one-time code.
-        if !req.is_loopback_peer {
+        // InProcessOnly requires a credential even from loopback.
+        if !req.is_loopback_peer || self.config.session_admission == SessionAdmission::InProcessOnly
+        {
             let code = match req.body.get("bootstrap_code").and_then(|v| v.as_str()) {
                 Some(c) => c,
                 None => {
@@ -1677,37 +1696,8 @@ impl ClientApi {
             }
         }
 
-        let principal = Principal::operator(self.auth.os_user());
         let platform = platform_from_body(&req.body, req.origin.is_some());
-        let csrf_token = if req.origin.is_some() {
-            Some(self.auth.generate_csrf_token())
-        } else {
-            None
-        };
-        let token = self.auth.generate_token();
-        let session_id = self.auth.generate_session_id();
-        let expires_at = now.saturating_add(self.config.session_ttl_ms);
-        let scopes = Scope::operator_default();
-
-        let session = crate::session::ClientSession {
-            session_id: session_id.clone(),
-            principal: principal.clone(),
-            platform,
-            scopes: scopes.clone(),
-            csrf_token: csrf_token.clone(),
-            expires_at,
-        };
-        self.sessions.insert(token.clone(), session, now);
-
-        let info = SessionInfo {
-            session_id,
-            token,
-            principal,
-            platform,
-            scopes,
-            csrf_token,
-            expires_at,
-        };
+        let info = self.mint_operator_session(platform, req.origin.is_some(), now);
         self.audit.emit(AuditEvent::new(
             "client_api.response",
             request_id,
@@ -1719,6 +1709,37 @@ impl ClientApi {
             serde_json::to_value(info).expect("SessionInfo serializes"),
             vec![],
         )
+    }
+
+    fn mint_operator_session(&self, platform: Platform, browser: bool, now: u64) -> SessionInfo {
+        let principal = Principal::operator(self.auth.os_user());
+        let csrf_token = if browser {
+            Some(self.auth.generate_csrf_token())
+        } else {
+            None
+        };
+        let token = self.auth.generate_token();
+        let session_id = self.auth.generate_session_id();
+        let expires_at = now.saturating_add(self.config.session_ttl_ms);
+        let scopes = Scope::operator_default();
+        let session = crate::session::ClientSession {
+            session_id: session_id.clone(),
+            principal: principal.clone(),
+            platform,
+            scopes: scopes.clone(),
+            csrf_token: csrf_token.clone(),
+            expires_at,
+        };
+        self.sessions.insert(token.clone(), session, now);
+        SessionInfo {
+            session_id,
+            token,
+            principal,
+            platform,
+            scopes,
+            csrf_token,
+            expires_at,
+        }
     }
 
     fn session_refresh(

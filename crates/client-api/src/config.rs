@@ -10,6 +10,22 @@ use std::net::IpAddr;
 const MINUTE_MS: u64 = 60_000;
 const HOUR_MS: u64 = 60 * MINUTE_MS;
 
+/// Who may obtain a Client API session (CONTRACT-193; ADR 2026-10-03 D3).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionAdmission {
+    /// The desktop daemon's same-user model: a loopback login needs no credential, any other peer
+    /// needs the one-time bootstrap code; the Web Console is served and `allowed_origins` admits
+    /// its browser origin.
+    #[default]
+    SameUserLoopback,
+    /// The embedded profile: every login needs a credential (the one-time bootstrap code), loopback
+    /// peers included; sessions are minted in process ([`crate::ClientApi::mint_in_process_session`]);
+    /// no Web Console asset is served and no browser `Origin` is admitted, whatever
+    /// `allowed_origins` holds.
+    InProcessOnly,
+}
+
 /// Client API configuration and operational parameters.
 #[derive(Debug, Clone)]
 pub struct ClientApiConfig {
@@ -66,6 +82,8 @@ pub struct ClientApiConfig {
     /// unauthorized callers (an under-scoped caller sees 403 regardless of the flag). Gates
     /// route + subscription only — producer-side tee cost is NOT stopped (§2.4).
     pub llm_deltas_enabled: bool,
+    /// Login admission. Default [`SessionAdmission::SameUserLoopback`].
+    pub session_admission: SessionAdmission,
 }
 
 impl Default for ClientApiConfig {
@@ -96,14 +114,21 @@ impl Default for ClientApiConfig {
             event_stream_recv_idle_ms: 250,
             max_concurrent_dispatch: 64,
             llm_deltas_enabled: true,
+            session_admission: SessionAdmission::SameUserLoopback,
         }
     }
 }
 
 impl ClientApiConfig {
-    /// True iff `origin` is exactly present in the allowlist (exact match, never substring).
+    /// Exact-match allowlist; never true under [`SessionAdmission::InProcessOnly`].
     pub fn origin_allowed(&self, origin: &str) -> bool {
-        self.allowed_origins.iter().any(|o| o == origin)
+        self.session_admission == SessionAdmission::SameUserLoopback
+            && self.allowed_origins.iter().any(|o| o == origin)
+    }
+
+    /// Whether the transport serves the embedded Web Console assets (`SameUserLoopback` only).
+    pub fn serves_web_console(&self) -> bool {
+        self.session_admission == SessionAdmission::SameUserLoopback
     }
 
     /// True iff `addr` is a loopback address.
