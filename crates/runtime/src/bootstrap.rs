@@ -29,7 +29,7 @@ use crate::capability_injector::CapabilityInjector;
 use crate::circuit_breaker::{
     BreakerState, CircuitBreaker, CircuitBreakerBus, DefaultCircuitBreakerBus,
 };
-use crate::component_loader::{ComponentLoadError, ComponentRuntime};
+use crate::component_loader::{ComponentLoadError, ComponentRuntime, WasmBackend};
 use crate::config::{ConfigError, RuntimeConfigProvider, RuntimeConfigWatcher};
 use crate::host_registry::{HostRegistry, InMemoryHostRegistry};
 
@@ -296,6 +296,8 @@ pub struct RuntimeHostBuilder {
     /// The WAL-mode reload observer task, until an owner takes it
     /// ([`RuntimeHostBuilder::take_wal_observer`]); left here it stays detached.
     wal_observer: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The code the engines `build` constructs emit. Default `Native`.
+    wasm_backend: WasmBackend,
 }
 
 impl RuntimeHostBuilder {
@@ -460,6 +462,7 @@ impl RuntimeHostBuilder {
             breaker,
             workspace_root: workspace_root.to_path_buf(),
             wal_observer: Mutex::new(Some(wal_observer)),
+            wasm_backend: WasmBackend::Native,
         })
     }
 
@@ -474,13 +477,24 @@ impl RuntimeHostBuilder {
             .take()
     }
 
+    /// Which code both Wasmtime engines emit (ADR 2026-10-03 D3). `build` passes it to
+    /// `ComponentRuntime::with_backend`. Default `Native`.
+    pub fn with_wasm_backend(mut self, backend: WasmBackend) -> Self {
+        self.wasm_backend = backend;
+        self
+    }
+
+    pub fn wasm_backend(&self) -> WasmBackend {
+        self.wasm_backend
+    }
+
     /// Finalize construction with the given `GrantCheck`. Runs steps 6–8
     /// of the Slice AE construction order:
     ///   6. Accept the injected `grant_check: Arc<dyn GrantCheck>`
     ///      (replaces the original `Arc::new(AllowAllGrantCheck)` stub).
     ///   7. Construct `CapabilityInjector::new(host_registry.clone(),
     ///      grant_check.clone(), breaker.clone())`.
-    ///   8. Construct `ComponentRuntime::new(&config.wasm)` — may fail
+    ///   8. Construct `ComponentRuntime::with_backend(&config.wasm, self.wasm_backend)` — may fail
     ///      with `ComponentLoadError` mapped to
     ///      [`BootstrapError::ComponentLoad`].
     ///
@@ -500,7 +514,10 @@ impl RuntimeHostBuilder {
         ));
 
         // 8. Wasmtime ComponentRuntime per the canonical wasm config block.
-        let component_runtime = Arc::new(ComponentRuntime::new(&config.wasm)?);
+        let component_runtime = Arc::new(ComponentRuntime::with_backend(
+            &config.wasm,
+            self.wasm_backend,
+        )?);
 
         Ok(RuntimeHost {
             config_watcher: self.config_watcher,
@@ -657,5 +674,87 @@ impl RuntimeHost {
     /// Workspace root path passed into [`RuntimeHost::new`].
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL_YAML: &str = "\
+wasm:
+  max_memory_pages: 512
+  epoch_interruption_ms: 100
+  fuel_enabled: false
+
+llm-providers: []
+
+cron:
+  max_jitter_ratio: 0.1
+
+git:
+  gc_interval_hours: 24
+  max_tracked_file_mb: 10
+
+secrets:
+  master-key-source: keychain
+  env-var-name: SECRETS_MASTER_KEY
+
+post-processor:
+  llm-model: sonnet-light
+  llm-failure-cooldown-seconds: 600
+
+database:
+  db-path: \".runtime/index.db\"
+  pool-size: 4
+";
+
+    fn fresh_workspace() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        std::fs::create_dir_all(workspace.join(".advance")).unwrap();
+        std::fs::create_dir_all(workspace.join(".runtime")).unwrap();
+        let config_path = workspace.join(".advance").join("runtime-config.yaml");
+        std::fs::write(&config_path, MINIMAL_YAML).unwrap();
+        (dir, workspace, config_path)
+    }
+
+    #[tokio::test]
+    async fn module_001_ac32_builder_builds_pulley_engines_when_asked() {
+        let (_keep, workspace, config_path) = fresh_workspace();
+        let host = RuntimeHostBuilder::new(&config_path, &workspace)
+            .await
+            .expect("builder")
+            .with_wasm_backend(WasmBackend::Pulley)
+            .build(Arc::new(AllowAllGrantCheck))
+            .expect("build");
+        let rt = host.component_runtime();
+        assert_eq!(rt.backend(), WasmBackend::Pulley);
+        let report = rt.engine_report();
+        assert!(report.host.is_pulley);
+        assert!(report.tool.is_pulley);
+        assert_eq!(report.host.memory_reservation, Some(33_554_432));
+        assert_eq!(report.tool.memory_reservation, Some(33_554_432));
+    }
+
+    #[tokio::test]
+    async fn module_001_ac32_builder_defaults_to_native_engines() {
+        let (_keep, workspace, config_path) = fresh_workspace();
+        let builder = RuntimeHostBuilder::new(&config_path, &workspace)
+            .await
+            .expect("builder");
+        assert_eq!(builder.wasm_backend(), WasmBackend::Native);
+        let host = builder.build(Arc::new(AllowAllGrantCheck)).expect("build");
+        let rt = host.component_runtime();
+        assert_eq!(rt.backend(), WasmBackend::Native);
+        let report = rt.engine_report();
+        assert!(!report.host.is_pulley);
+        assert!(!report.tool.is_pulley);
+        assert_eq!(report.host.target, None);
+        assert_eq!(report.tool.target, None);
+        assert_eq!(report.host.memory_reservation, None);
+        assert_eq!(report.tool.memory_reservation, None);
+        assert_eq!(report.host.memory_reservation_for_growth, None);
+        assert_eq!(report.tool.memory_reservation_for_growth, None);
     }
 }

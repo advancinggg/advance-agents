@@ -33,6 +33,109 @@ use crate::config::WasmConfig;
 /// yield bound — well below typical request/response timeouts.
 pub(crate) const HOST_YIELD_EPOCHS_PER_DEADLINE: u64 = 1;
 
+/// Which code the two Wasmtime engines emit (ADR 2026-10-03 D3). CONTRACT-244's `WasmEngine`
+/// maps onto it one-to-one.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum WasmBackend {
+    /// Cranelift native code for this host: the engines `ComponentRuntime::new` has always built.
+    #[default]
+    Native,
+    /// Pulley bytecode (`Config::target("pulley64")`) run by Wasmtime's interpreter. Creates no
+    /// executable memory and installs no signal handler.
+    Pulley,
+}
+
+/// The Wasmtime target of a Pulley engine.
+pub const PULLEY_TARGET: &str = "pulley64";
+/// `pulley64` runs only where the host's pointer width and endianness match it.
+pub const PULLEY_HOST_SUPPORTED: bool =
+    cfg!(all(target_pointer_width = "64", target_endian = "little"));
+/// Bytes per wasm page.
+pub const WASM_PAGE_BYTES: u64 = 65_536;
+/// Most pages a 32-bit linear memory can have (memory64 is off on both engines).
+pub const WASM32_MAX_PAGES: u64 = 65_536;
+/// `memory_reservation_for_growth` of a Pulley engine.
+pub const PULLEY_MEMORY_RESERVATION_FOR_GROWTH: u64 = 1 << 20;
+
+/// `memory_reservation` of both Pulley engines (ADR 2026-10-03 D3): the configured maximum
+/// memory, `max_memory_pages × 64 KiB`, capped at wasm32's 4 GiB.
+pub fn pulley_memory_reservation(max_memory_pages: u32) -> u64 {
+    u64::from(max_memory_pages).min(WASM32_MAX_PAGES) * WASM_PAGE_BYTES
+}
+
+/// How one engine was built.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineSettings {
+    /// The backend this engine was built for.
+    pub backend: WasmBackend,
+    /// `wasmtime::Engine::is_pulley()`, read back from the built engine.
+    pub is_pulley: bool,
+    /// The target this crate set; `None` = the host.
+    pub target: Option<&'static str>,
+    /// `Config::memory_reservation` this crate set; `None` = Wasmtime's default.
+    pub memory_reservation: Option<u64>,
+    /// `Config::memory_reservation_for_growth` this crate set; `None` = Wasmtime's default.
+    pub memory_reservation_for_growth: Option<u64>,
+}
+
+/// Both engines' settings.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineReport {
+    pub host: EngineSettings,
+    pub tool: EngineSettings,
+}
+
+#[derive(Clone, Copy)]
+struct Applied {
+    target: &'static str,
+    memory_reservation: u64,
+    memory_reservation_for_growth: u64,
+}
+
+/// `Native` leaves `cfg` untouched (`Ok(None)`).
+fn apply_backend(
+    cfg: &mut wasmtime::Config,
+    backend: WasmBackend,
+    memory_reservation: u64,
+) -> Result<Option<Applied>, ComponentLoadError> {
+    match backend {
+        WasmBackend::Native => Ok(None),
+        WasmBackend::Pulley => {
+            if !PULLEY_HOST_SUPPORTED {
+                return Err(ComponentLoadError::EngineInit(wasmtime::Error::msg(
+                    "pulley64 needs a 64-bit little-endian host",
+                )));
+            }
+            cfg.target(PULLEY_TARGET)
+                .map_err(ComponentLoadError::EngineInit)?;
+            cfg.signals_based_traps(false);
+            cfg.memory_guard_size(0);
+            cfg.memory_reservation(memory_reservation);
+            cfg.memory_reservation_for_growth(PULLEY_MEMORY_RESERVATION_FOR_GROWTH);
+            Ok(Some(Applied {
+                target: PULLEY_TARGET,
+                memory_reservation,
+                memory_reservation_for_growth: PULLEY_MEMORY_RESERVATION_FOR_GROWTH,
+            }))
+        }
+    }
+}
+
+impl EngineSettings {
+    fn read(backend: WasmBackend, engine: &wasmtime::Engine, applied: Option<Applied>) -> Self {
+        Self {
+            backend,
+            is_pulley: engine.is_pulley(),
+            target: applied.map(|a| a.target),
+            memory_reservation: applied.map(|a| a.memory_reservation),
+            memory_reservation_for_growth: applied.map(|a| a.memory_reservation_for_growth),
+        }
+    }
+}
+
 /// Slice AB — handle to an OS-thread epoch ticker.
 ///
 /// The ticker is an OS thread (via `std::thread::spawn`, NOT `tokio::spawn`) that calls
@@ -220,6 +323,8 @@ pub struct ComponentRuntime {
     host_ticker: OnceLock<Arc<EpochTickerHandle>>,
     max_memory_pages: u32,
     epoch_interruption_ms: u64,
+    backend: WasmBackend,
+    report: EngineReport,
 }
 
 /// Opaque handle to the `host_engine`. Cheap `Clone` (Engine is Arc-backed).
@@ -415,6 +520,20 @@ impl ComponentRuntime {
     /// (Slice AB) is spawned on the first `instantiate_advance_host_async` call, not
     /// at construction.
     pub fn new(wasm_cfg: &WasmConfig) -> Result<Self, ComponentLoadError> {
+        Self::with_backend(wasm_cfg, WasmBackend::Native)
+    }
+
+    /// Both engines per Decision 16 for `backend`. `Native` = today's engines (no setter added).
+    /// `Pulley` sets on BOTH engines: `target(PULLEY_TARGET)`, `signals_based_traps(false)`,
+    /// `memory_guard_size(0)`, `memory_reservation(pulley_memory_reservation(max_memory_pages))`
+    /// and `memory_reservation_for_growth(PULLEY_MEMORY_RESERVATION_FOR_GROWTH)`.
+    ///
+    /// Errors: `EngineInit` when `!PULLEY_HOST_SUPPORTED`, or when a built engine does not
+    /// report `is_pulley()` (defensive).
+    pub fn with_backend(
+        wasm_cfg: &WasmConfig,
+        backend: WasmBackend,
+    ) -> Result<Self, ComponentLoadError> {
         let base_config = || {
             let mut c = wasmtime::Config::new();
             c.wasm_component_model(true);
@@ -424,24 +543,50 @@ impl ComponentRuntime {
             c.max_wasm_stack(256 * 1024);
             c
         };
+        // ADR D3: both engines reserve the configured maximum memory. One value, passed per engine,
+        // so a later ruling for the tool engine is one argument.
+        let reservation = pulley_memory_reservation(wasm_cfg.max_memory_pages);
 
         let mut host_cfg = base_config();
         host_cfg.consume_fuel(false);
+        let host_applied = apply_backend(&mut host_cfg, backend, reservation)?;
         let host_engine =
             wasmtime::Engine::new(&host_cfg).map_err(ComponentLoadError::EngineInit)?;
 
         let mut tool_cfg = base_config();
         tool_cfg.consume_fuel(wasm_cfg.fuel_enabled);
+        let tool_applied = apply_backend(&mut tool_cfg, backend, reservation)?;
         let tool_engine =
             wasmtime::Engine::new(&tool_cfg).map_err(ComponentLoadError::EngineInit)?;
 
+        let report = EngineReport {
+            host: EngineSettings::read(backend, &host_engine, host_applied),
+            tool: EngineSettings::read(backend, &tool_engine, tool_applied),
+        };
+        if backend == WasmBackend::Pulley && !(report.host.is_pulley && report.tool.is_pulley) {
+            return Err(ComponentLoadError::EngineInit(wasmtime::Error::msg(
+                "a pulley64 engine was requested but an engine targets the host",
+            )));
+        }
         Ok(Self {
             host_engine,
             tool_engine,
             host_ticker: OnceLock::new(),
             max_memory_pages: wasm_cfg.max_memory_pages,
             epoch_interruption_ms: wasm_cfg.epoch_interruption_ms,
+            backend,
+            report,
         })
+    }
+
+    /// The backend both engines were built for.
+    pub fn backend(&self) -> WasmBackend {
+        self.backend
+    }
+
+    /// Settings read back from the built engines.
+    pub fn engine_report(&self) -> EngineReport {
+        self.report
     }
 
     /// Opaque handle to the host engine. Pass the `.engine()` reference into
@@ -826,3 +971,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod pulley_tests;

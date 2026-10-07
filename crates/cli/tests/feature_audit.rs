@@ -27,6 +27,10 @@
 //!   wasmtime-wasi: `p0` (legacy alias for p1), `p1` (WASI preview1 — REQ-015 excludes),
 //!                  `p3` (experimental tier that pulls Component Model async features)
 //!
+//! `pulley` is allowed: it selects Wasmtime's Pulley interpreter for engines
+//! configured with `Config::target("pulley64")`, adds no dependency, and is a
+//! Wasmtime backend, so REQ-015 holds.
+//!
 //! Fuel is NOT a Wasmtime Cargo feature — it is runtime-configured via
 //! `wasmtime::Config::consume_fuel` per ARCH §8 Decision 16 Implication (i);
 //! asserting its absence would be a no-op.
@@ -113,7 +117,7 @@ fn default_features_is_false(line: &str) -> bool {
 fn wasmtime_feature_whitelist_exact() {
     let line = find_dep_line("wasmtime");
     let actual = features_in_line(line);
-    let expected: HashSet<String> = ["runtime", "component-model", "async", "cranelift"]
+    let expected: HashSet<String> = ["runtime", "component-model", "async", "cranelift", "pulley"]
         .iter()
         .map(|s| s.to_string())
         .collect();

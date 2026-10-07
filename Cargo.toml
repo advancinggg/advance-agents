@@ -273,12 +273,15 @@ walkdir = "=2.5.0"
 #     MODULE-001-AC-02 / MODULE-001:529 prohibits.
 #   - "cranelift": JIT compiler backend. `winch` is structurally incompatible with
 #     Component Model + async on Wasmtime 43 (see MODULE-001 §3.6).
+#   - "pulley": Pulley interpreter (ADR 2026-10-03 D3). Engines built for
+#     `WasmBackend::Pulley` set `Config::target("pulley64")`. Cranelift stays the
+#     compiler. The feature adds no dependency.
 # Fuel is NOT a Cargo feature — controlled at runtime via wasmtime::Config::consume_fuel
 # per the two-Engine architecture in Decision 16 Implication (i). cache/pooling features
 # deferred per Decision 16 (measurement-driven).
 # Feature names asserted against Wasmtime 43.0.0 published Cargo.toml; Slice S performs
 # fail-fast verification when the first member crate pulls the dep in.
-wasmtime = { version = "=43.0.1", default-features = false, features = ["runtime", "component-model", "async", "cranelift"] }
+wasmtime = { version = "=43.0.1", default-features = false, features = ["runtime", "component-model", "async", "cranelift", "pulley"] }
 # Slice m012-A (2026-04-25): cap-secrets workspace deps.
 # secrecy 0.8 wraps resolved-secret values in Secret<String> (Debug-hiding + zeroize on drop
 # via custom Drop; does NOT impl ZeroizeOnDrop marker trait — that's why the master key uses
@@ -487,3 +490,8 @@ overflow-checks = true
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Debug and test builds run the Pulley interpreter optimised; release and the
+# `advance` binary's behaviour are unaffected.
+[profile.dev.package.pulley-interpreter]
+opt-level = 2

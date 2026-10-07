@@ -30,8 +30,8 @@ pub use agent_genui::register_agent_genui;
 pub use bootstrap::{BootstrapError, RuntimeHost, RuntimeHostBuilder};
 pub use capability_injector::{add_wasi_to_linker, CapabilityInjector, ComponentCtx, HostError};
 pub use component_loader::{
-    ComponentLoadError, ComponentRuntime, HostEngineHandle, InstantiateError, LoadedComponent,
-    ToolEngineHandle,
+    ComponentLoadError, ComponentRuntime, EngineReport, EngineSettings, HostEngineHandle,
+    InstantiateError, LoadedComponent, ToolEngineHandle, WasmBackend,
 };
 // Slice m001-slice-bootstrap (2026-05-28) — sibling bindgen exports for the new
 // `advance-host-with-capabilities` world.
