@@ -3,9 +3,9 @@
 //! [`Composition`] owns everything the daemon composition started and stops all of
 //! it in one order, on a requested shutdown and after a startup failure alike:
 //!
-//! 1. **ingress** — the Client API, the `POST /msg` listener and the channel
-//!    `/hooks` listener stop accepting and drain their requests, concurrently, each
-//!    within its budget;
+//! 1. **ingress** — the Client API, the `POST /msg` listener, the channel
+//!    `/hooks` listener and any claimed-entry preflight stop accepting and drain
+//!    concurrently, each within its budget;
 //! 2. **loops** — the root serve loop, the channel host pump, the per-child loops,
 //!    the auto tick loop and the readiness walk stop; then every live LLM stream is
 //!    settled and the stream reaper stopped. A requested shutdown then prints
@@ -83,6 +83,7 @@ pub const TEARDOWN_ORDER: &[&str] = &[
     "ingress.client_api",
     "ingress.post_msg",
     "ingress.hooks",
+    "ingress.claimed_preflight",
     "loops.root",
     "loops.host_pump",
     "loops.perchild",
@@ -302,6 +303,7 @@ impl Composition {
             adapter_workers: std::mem::take(&mut wiring_handles.adapter_workers),
             extension_secret_store: wiring_handles.extension_secret_store.take(),
             extension_holds: Vec::new(),
+            claimed_preflight: wiring_handles.claimed_preflight.take(),
         };
         let extension_holds = std::mem::take(&mut wiring_handles.extension_holds);
         let client_api_server = wiring_handles.client_api_server.take();
@@ -409,11 +411,12 @@ impl Composition {
             view.set_phase(RuntimePhase::ShuttingDown);
         }
 
-        // ── Step 1: ingress, the three drains concurrently. ──────────────────────
+        // ── Step 1: ingress, the four drains concurrently. ───────────────────────
         let client_api_server = self.client_api_server.take();
         let msg_listener = self.msg_listener.take();
         let hooks = self.hooks.take();
-        let (client_api, msg_overran, hooks_overran) = tokio::join!(
+        let claimed_preflight = self.stoppers.claimed_preflight.take();
+        let (client_api, msg_overran, hooks_overran, preflight_ran) = tokio::join!(
             async {
                 match client_api_server {
                     Some(server) => Some(server.shutdown_ingress(CLIENT_API_DRAIN).await),
@@ -434,6 +437,20 @@ impl Composition {
                         Some(drain_listener(shutdown, task, LISTENER_DRAIN).await)
                     }
                     None => None,
+                }
+            },
+            async {
+                match claimed_preflight {
+                    Some(p) => {
+                        if !p.stop(LISTENER_DRAIN).await {
+                            log.err(
+                                log_keys::COMPOSE_CLAIMED_PREFLIGHT_OVERRUN,
+                                "advance: WARN provider preflight still running after 5s; abandoned",
+                            );
+                        }
+                        true
+                    }
+                    None => false,
                 }
             },
         );
@@ -465,6 +482,9 @@ impl Composition {
                 );
             }
             self.steps.record("ingress.hooks");
+        }
+        if preflight_ran {
+            self.steps.record("ingress.claimed_preflight");
         }
 
         // ── Step 2: loops. ────────────────────────────────────────────────────────
@@ -616,6 +636,7 @@ impl HoldStoppers {
             adapter_workers,
             extension_secret_store,
             extension_holds,
+            claimed_preflight,
         } = self;
         event_bus.is_none()
             && cap_grant_sweeper_handle.is_none()
@@ -629,6 +650,7 @@ impl HoldStoppers {
             && adapter_workers.is_empty()
             && extension_secret_store.is_none()
             && extension_holds.is_empty()
+            && claimed_preflight.is_none()
     }
 
     /// Stop what a failed wiring had started (no ingress and no loop exist yet): the

@@ -361,6 +361,8 @@ const _: () = {
         assert_send_sync::<crate::inference::contained::ContainedInferencePort>();
         assert_send_sync::<crate::inference::contained::ContainedMeshDispatch>();
         assert_send::<crate::inference::contained::ContainedStream>();
+        assert_send_sync::<crate::inference::ComposedClaimedPreflight>();
+        assert_send_sync::<crate::inference::ClaimedPreflightStopper>();
     }
 };
 

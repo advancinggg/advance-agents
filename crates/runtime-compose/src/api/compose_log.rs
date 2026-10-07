@@ -165,6 +165,8 @@ pub mod log_keys {
     pub const COMPOSE_MSG_LISTENER_DRAIN_OVERRUN: &str = "compose.msg_listener_drain_overrun";
     /// stderr: `/hooks` requests were still running when the drain budget ran out.
     pub const COMPOSE_HOOKS_DRAIN_OVERRUN: &str = "compose.hooks_drain_overrun";
+    /// stderr: a claimed-entry provider preflight was still running when the drain budget ran out.
+    pub const COMPOSE_CLAIMED_PREFLIGHT_OVERRUN: &str = "compose.claimed_preflight_overrun";
     /// stderr: a ChatGPT token renewal is still finishing (the shutdown waits for it).
     pub const COMPOSE_SIGN_IN_OVERRUN: &str = "compose.sign_in_overrun";
     /// stderr: a thread was still running when its join budget ran out (left detached).
@@ -275,6 +277,7 @@ pub mod log_keys {
         COMPOSE_CLIENT_API_SERVE_FAILED,
         COMPOSE_MSG_LISTENER_DRAIN_OVERRUN,
         COMPOSE_HOOKS_DRAIN_OVERRUN,
+        COMPOSE_CLAIMED_PREFLIGHT_OVERRUN,
         COMPOSE_SIGN_IN_OVERRUN,
         COMPOSE_THREAD_JOIN_OVERRUN,
         EXT_SHUTDOWN_ABANDONED,

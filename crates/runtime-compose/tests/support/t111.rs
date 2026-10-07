@@ -378,11 +378,13 @@ pub async fn assert_ws_closed(ws: &mut ClientWs, budget: Duration) {
 /// (closed and its worker joined), the Client API provider slots, the EventBus, then
 /// the rest of the graph (whose drop releases the CONTRACT-218 custody), then the
 /// extensions' holds (after the graph so a hold whose Drop joins an engine worker
-/// can return).
+/// can return). Claimed-entry preflight drains with the other ingress arms, after
+/// `/hooks`, and is recorded only when a stopper exists.
 pub const D1_ORDER: &[&str] = &[
     "ingress.client_api",
     "ingress.post_msg",
     "ingress.hooks",
+    "ingress.claimed_preflight",
     "loops.root",
     "loops.host_pump",
     "loops.perchild",

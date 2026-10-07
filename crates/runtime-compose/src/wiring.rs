@@ -861,6 +861,9 @@ pub struct WiringHandles {
     /// Extension inference holds, moved into the composition at construction
     /// so they cannot drop inside `drop_graph`.
     pub(crate) extension_holds: Vec<crate::inference::ExtensionHold>,
+    /// Stopper for claimed-entry preflight tasks. `Composition::from_graph`
+    /// takes it onto `HoldStoppers` so step 1 can drain it.
+    pub(crate) claimed_preflight: Option<crate::inference::ClaimedPreflightStopper>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1345,6 +1348,11 @@ pub(crate) struct HoldStoppers {
     pub adapter_workers: Vec<Arc<dyn crate::client_api_adapters::WorkerControl>>,
     pub extension_secret_store: Option<Arc<SecretStore>>,
     pub extension_holds: Vec<crate::inference::ExtensionHold>,
+    /// Claimed-entry preflight tasks. Reaches teardown on both the wiring-failure
+    /// path (`started` is the returned `partial`) and the success path
+    /// (`WiringHandles` takes it and `Composition::from_graph` moves it onto
+    /// these stoppers).
+    pub claimed_preflight: Option<crate::inference::ClaimedPreflightStopper>,
 }
 
 /// An error inside wiring: either an existing CLI wiring failure or a
@@ -3369,8 +3377,6 @@ pub(crate) async fn wire_capabilities_inner(
     // policy source reads, so the two can never disagree about who pins what.
     // `auth-source: chatgpt-oauth` entries are served through the gateway's own sign-in object
     // (when llm is declared); without it such an entry cannot be created here.
-    // Consumed later by the provider-admin claimable mark and the claimed preflight.
-    let _ = (inference_claimed, inference_marks_claimable);
     let provider_admin: Arc<crate::client_api_providers::WiredProviderAdmin> = {
         let admin = crate::client_api_providers::WiredProviderAdmin::new(
             workspace.to_path_buf(),
@@ -3384,12 +3390,29 @@ pub(crate) async fn wire_capabilities_inner(
                 event_bus_dyn.clone(),
             )),
         );
-        Arc::new(match chatgpt_sign_in.as_ref() {
+        let admin = match chatgpt_sign_in.as_ref() {
             Some(sign_in) => admin.with_chatgpt_sign_in(
                 Arc::clone(sign_in) as Arc<dyn advance_home::ChatGptSignInPort>
             ),
             None => admin,
-        })
+        };
+        let admin = if inference_marks_claimable {
+            admin.with_claimable_local_entries(true)
+        } else {
+            admin
+        };
+        let admin = match (llm_gateway.as_ref(), inference_claimed.is_empty()) {
+            (Some(gateway), false) => {
+                let (port, stopper) = crate::inference::ComposedClaimedPreflight::new(
+                    gateway,
+                    inference_claimed.clone(),
+                );
+                started.claimed_preflight = Some(stopper);
+                admin.with_claimed_preflight(Arc::new(port))
+            }
+            _ => admin,
+        };
+        Arc::new(admin)
     };
     let provider_admin_for_api = provider_admin.clone();
     let client_api_server = match (client_api_options, observability_read_api.as_ref()) {
@@ -3648,6 +3671,7 @@ pub(crate) async fn wire_capabilities_inner(
             adapter_workers: std::mem::take(&mut started.adapter_workers),
             packs_watcher: started.packs_watcher.take(),
             extension_holds: std::mem::take(&mut started.extension_holds),
+            claimed_preflight: started.claimed_preflight.take(),
         },
     ))
 }
