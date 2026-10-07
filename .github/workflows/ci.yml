@@ -142,6 +142,8 @@ jobs:
       # Grep-guard tests (e.g. sole_round_advancer_grep_guard) shell out to `rg`.
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Generate test locales (pid-lock probe env matrix)
+        run: sudo apt-get install -y locales && sudo locale-gen de_DE.UTF-8 en_GB.UTF-8 zh_CN.UTF-8
       # Guest fixtures are excluded + prebuilt (.core.wasm committed), so the
       # workspace test run loads them as bytes. The wasm target is needed for the
       # pack build below (the agenda pack's skill tool.wasm is built from
@@ -156,6 +158,8 @@ jobs:
             cargo run -p advance-cli --locked -- pack build "packs/$name" --out target/packs
           done
       - name: cargo test --workspace --locked
+        env:
+          ADVANCE_TEST_REQUIRE_LOCALES: "1"
         run: cargo test --workspace --locked
       # Feature-gated suites: `advance-reply-tracker`'s integration tests
       # (mode_dispatch, session_lifecycle, timeout_policy, deadlock_detection, …)

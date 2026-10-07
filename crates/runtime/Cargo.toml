@@ -45,6 +45,7 @@ libc = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
+advance-shared-types = { path = "../shared-types", features = ["spawn-counter"] }
 tempfile = { workspace = true }
 # Slice T — valid Component binary generation for integration tests.
 wat = { workspace = true }

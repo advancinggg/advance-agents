@@ -9,7 +9,9 @@
 //! **Slice D** adds `RuntimeConfig` loader + hot-reload (CONTRACT-003).
 //! **Slice C** ships the `RuntimeLock` (single active runtime constraint).
 
-#![forbid(unsafe_code)]
+// The one FFI module of this crate is `process_probe::ffi`;
+// `module_001_ac32_runtime_unsafe_code_is_only_the_pid_probe_ffi` keeps it the only one.
+#![deny(unsafe_code)]
 
 pub mod agent_genui;
 pub mod bootstrap;
@@ -19,8 +21,9 @@ pub mod component_loader;
 pub mod component_spec;
 pub mod config;
 pub mod host_registry;
+mod process_probe;
 pub mod runtime_lock;
-pub use runtime_lock::{inspect_lock, LockInspection};
+pub use runtime_lock::{inspect_lock, inspect_lock_with_policy, LockInspection};
 pub mod wit_bindings;
 
 // Top-level re-exports of the Slice T public surface.
