@@ -739,7 +739,7 @@ pub(crate) async fn compose_graph(
 /// buffer too short to hold the 8-byte preamble, or not `\0asm`, is treated as "not a
 /// core module" so `load_component` surfaces the real parse error rather than this
 /// path mis-encoding it.
-fn is_core_module(bytes: &[u8]) -> bool {
+pub(crate) fn is_core_module(bytes: &[u8]) -> bool {
     bytes.len() >= 8 && &bytes[0..4] == b"\0asm" && bytes[4] == 0x01
 }
 

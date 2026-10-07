@@ -12,13 +12,15 @@ use advance_client_api::ClientApi;
 use advance_event_bus::EventBus;
 use advance_git::DefaultGitCommitQueue;
 use advance_run_manager::RunManager;
-use advance_runtime::capability_injector::CapabilityInjector;
+use advance_runtime::capability_injector::{CapabilityInjector, ComponentCtx};
 use advance_runtime::ComponentRuntime;
 use cap_llm::{LlmGateway, ModelProfileCatalog};
 use cap_tools::{LazyToolRegistry, ToolRegistry};
 use tokio::sync::Notify;
 
+use crate::agent_config::{active_capabilities_with, read_agent_yaml};
 use crate::api::{ComposeLog, ComposeLogLine};
+use crate::daemon::is_core_module;
 use crate::effective_capabilities::EffectiveCapabilities;
 use crate::perchild_daemon::PerChildLoopManager;
 
@@ -226,6 +228,48 @@ impl ProbeRecord {
             .find(|(listener, _)| *listener == name)
             .map(|(_, addr)| *addr)
     }
+}
+
+/// L0 probe: link `guest` exactly as the root loop links its driver — request set =
+/// `active_capabilities_with(read_agent_yaml(agent_workspace), record.effective_capabilities)`,
+/// on the composed `ComponentRuntime` and `CapabilityInjector`, in a fresh Store —
+/// and return the request set's names, or the instantiate error text. It instantiates
+/// (`instantiate_pre` + `instantiate_async`; no export such as `init` or
+/// `handle-message` is called).
+pub async fn link_guest_for_test(
+    record: &ProbeRecord,
+    agent_workspace: &Path,
+    guest: &[u8],
+) -> Result<Vec<String>, String> {
+    let runtime = record
+        .component_runtime
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .ok_or_else(|| "composition gone".to_string())?;
+    let injector = record
+        .capability_injector
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .ok_or_else(|| "composition gone".to_string())?;
+    let effective = record.effective_capabilities.clone().unwrap_or_default();
+    let bytes = if is_core_module(guest) {
+        build_agent::encode_core_to_component(guest).map_err(|e| format!("{e:?}"))?
+    } else {
+        guest.to_vec()
+    };
+    let loaded = runtime
+        .load_component(&bytes)
+        .map_err(|e| format!("{e:?}"))?;
+    let ctx = ComponentCtx::new("t112c-link-probe".into(), "t112c".into(), Vec::new());
+    let caps = active_capabilities_with(read_agent_yaml(agent_workspace).as_deref(), &effective);
+    let names: Vec<String> = caps.iter().map(|cap| cap.capability.to_string()).collect();
+    let (bindings, store) = runtime
+        .instantiate_advance_host_with_capabilities_async(&loaded, ctx, &caps, &injector)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    drop(bindings);
+    drop(store);
+    Ok(names)
 }
 
 /// Keeps every line in memory. [`MemoryComposeLog::failing_ready`] makes the readiness

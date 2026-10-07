@@ -1,23 +1,28 @@
 //! Neutral fixture shell: lifecycle knobs, home, guests, client helpers, gone-check.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::api::{
     BoxFuture, ComposeCx, ComposeExtension, ExtensionError, ExtensionPhase, GatewayHandle,
-    StartedCx,
+    HostFunctionDef, HostFunctionRegistrar, StartedCx, ToolRegistrar,
 };
 
+mod capabilities;
 mod client;
 mod gone;
 mod guests;
 mod home;
 mod lifecycle;
 
+pub use capabilities::{
+    EchoTool, FixtureHostFn, FixtureSpec, FixtureTool, ProbeHandler, ECHO_TOOL, PROBE_CAPABILITY,
+    PROBE_FUNCTION, PROBE_NAMESPACE,
+};
 pub use client::{mint_browser_session, mint_session, post_msg, Http, HttpResponse};
 pub use gone::assert_gone_for_home;
-pub use guests::{hello_llm_core, llm_noerr_core, minimal_core};
+pub use guests::{ext_probe_core, hello_llm_core, llm_noerr_core, minimal_core};
 pub use home::{CapDecl, FixtureDriver, FixtureHome, FixtureHomeSpec, FIXTURE_MASTER_KEY};
 pub use lifecycle::{FixtureLifecycle, OnStartedMode, ShutdownMode};
 
@@ -30,6 +35,7 @@ pub struct FixtureExtension {
     secret_need: bool,
     breaks: FixtureBreaks,
     record: Arc<FixtureRecord>,
+    spec: Option<FixtureSpec>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -48,7 +54,17 @@ impl FixtureExtension {
             secret_need: false,
             breaks: FixtureBreaks::default(),
             record: Arc::new(FixtureRecord::default()),
+            spec: None,
         }
+    }
+
+    pub fn with_spec(mut self, spec: FixtureSpec) -> Self {
+        self.spec = Some(spec);
+        self
+    }
+
+    pub fn standard() -> Self {
+        Self::new(FIXTURE_ID).with_spec(FixtureSpec::standard())
     }
 
     pub fn with_lifecycle(mut self, lifecycle: FixtureLifecycle) -> Self {
@@ -131,7 +147,51 @@ impl ComposeExtension for FixtureExtension {
 
     fn capabilities(&self) -> &'static [&'static str] {
         let _ = self.enter_phase(ExtensionPhase::Capabilities, None);
-        &[]
+        self.spec
+            .as_ref()
+            .map(|spec| spec.capabilities)
+            .unwrap_or(&[])
+    }
+
+    fn host_functions(
+        &self,
+        cx: &ComposeCx,
+        reg: &mut HostFunctionRegistrar,
+    ) -> Result<(), ExtensionError> {
+        self.enter_phase(ExtensionPhase::HostFunctions, Some(cx))?;
+        if let Some(spec) = &self.spec {
+            for host_fn in &spec.host_functions {
+                let handler = Arc::new(ProbeHandler {
+                    record: Arc::clone(&self.record),
+                });
+                reg.register(HostFunctionDef::new(
+                    host_fn.capability,
+                    host_fn.namespace,
+                    host_fn.name,
+                    handler,
+                ))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn tools<'a>(
+        &'a self,
+        cx: &'a ComposeCx,
+        reg: &'a mut ToolRegistrar,
+    ) -> BoxFuture<'a, Result<(), ExtensionError>> {
+        Box::pin(async move {
+            self.enter_phase(ExtensionPhase::Tools, Some(cx))?;
+            if let Some(spec) = &self.spec {
+                for tool in &spec.tools {
+                    let echo = Arc::new(EchoTool {
+                        record: Arc::clone(&self.record),
+                    });
+                    reg.register(tool.id, echo).await?;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn needs_secret_store(&self) -> bool {
@@ -159,6 +219,8 @@ pub struct FixtureRecord {
     pub hooks: Mutex<Vec<&'static str>>,
     pub ticks: AtomicU64,
     pub ticker_dropped: AtomicBool,
+    pub host_calls: AtomicUsize,
+    pub tool_calls: AtomicUsize,
     gate: tokio::sync::Notify,
     panic_ticker: AtomicBool,
 }

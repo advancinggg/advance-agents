@@ -1,0 +1,27 @@
+[package]
+name = "guest-rust-ext-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Probe guest: imports fixture:probe/host@0.1.0 (provided
+# dynamically by the host CapabilityInjector) and on handle-message
+# dispatches `call <arg>` to that host function. Excluded from the
+# workspace (built for wasm32-unknown-unknown). The committed
+# `../guest-rust-ext-probe.core.wasm` is wrapped to a Component at test time.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

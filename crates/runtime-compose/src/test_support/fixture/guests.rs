@@ -11,3 +11,7 @@ pub fn hello_llm_core() -> &'static [u8] {
 pub fn llm_noerr_core() -> &'static [u8] {
     include_bytes!("../../../tests/fixtures/guest-rust-llm-noerr.core.wasm")
 }
+
+pub fn ext_probe_core() -> &'static [u8] {
+    include_bytes!("../../../tests/fixtures/guest-rust-ext-probe.core.wasm")
+}

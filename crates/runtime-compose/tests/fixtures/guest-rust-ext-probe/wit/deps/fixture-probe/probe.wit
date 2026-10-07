@@ -1,0 +1,5 @@
+package fixture:probe@0.1.0;
+
+interface host {
+    call: func(input: string) -> result<string, string>;
+}
