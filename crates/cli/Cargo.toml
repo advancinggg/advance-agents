@@ -188,7 +188,7 @@ rustix = { workspace = true }
 # explicit fixture-only monotonic-record backends without exposing them in a
 # default/production `advance-cli` build.
 advance-cli = { path = ".", features = ["test-support"] }
-advance-shared-types = { path = "../shared-types", features = ["test-support"] }
+advance-shared-types = { path = "../shared-types", features = ["test-support", "spawn-counter"] }
 # Tee slice T3 (plan R8): the T120 turn-end-reap witness needs a stream that STAYS
 # IN-FLIGHT across a serve-loop turn, which only cap-http's gated mock stream
 # provides. Same prod-dep + dev-dep-with-extra-feature pair as advance-reply-tracker

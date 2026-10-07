@@ -9,15 +9,16 @@ use advance_runtime_compose::test_support::fixture::inference::{
 use advance_runtime_compose::test_support::fixture::{
     assert_gone_for_home, FixtureBreaks, FixtureExtension, FixtureHome, Http, FIXTURE_TWO_ID,
 };
+use advance_runtime_compose::test_support::{ComposeProbe, MemoryComposeLog};
 use advance_runtime_compose::{
-    log_keys, ComposeError, ComposeExtension, ExtensionFailure, ExtensionPhase, InferenceRefusal,
-    InferenceSubject, OssBinding,
+    compose, log_keys, ComposeError, ComposeExtension, ExtensionFailure, ExtensionPhase,
+    InferenceRefusal, InferenceSubject, OssBinding, ProcessPolicy,
 };
 use serde_json::json;
 
 #[path = "support/t112b.rs"]
 mod t112b;
-use t112b::{api, compose_with, home, msg, restart_required_count, CREATE_LOCAL_TWO};
+use t112b::{alive_tasks, api, compose_with, home, msg, restart_required_count, CREATE_LOCAL_TWO};
 
 fn dummy_port() -> Arc<StubInferencePort> {
     StubInferencePort::new("stub-pong", 1, 1)
@@ -612,4 +613,46 @@ async fn module_001_ac31_t112b_without_inference_contributor_admin_answers_as_v0
         rt.shutdown().await.expect("shutdown");
         assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
     }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac31_t112b_forbid_sidecar_claim_refused_typed() {
+    use advance_runtime_compose::test_support::fixture::inference::SidecarMarker;
+
+    let marker = SidecarMarker::new().expect("marker");
+    let (side, rest) = sidecar_list(marker.command());
+    let providers = providers_with_side(&side, rest);
+    let home = home(&["fs", "llm"], &providers);
+    let log = MemoryComposeLog::new();
+    let probe = Arc::new(ComposeProbe::new());
+    let baseline = alive_tasks();
+    let error = compose(
+        home.options(Arc::new(log.clone()), Arc::clone(&probe))
+            .with_processes(ProcessPolicy::Forbid),
+        vec![FixtureExtension::new("fixture")
+            .with_inference(FixtureInference::new().claim("side", dummy_port()))
+            .arc()],
+    )
+    .await
+    .expect_err("Forbid + sidecar claim");
+    assert!(
+        matches!(
+            error,
+            ComposeError::InferenceClaim {
+                extension: "fixture",
+                subject: InferenceSubject::Entry(ref id),
+                reason: InferenceRefusal::SidecarUnderForbid,
+            } if id == "side"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "extension fixture: inference claim on entry \"side\" refused: a local entry with a sidecar is bound to a typed refusal under ProcessPolicy::Forbid"
+    );
+    assert_eq!(log.count(log_keys::READY), 0);
+    assert!(!home.home().join(".runtime/client-api").exists());
+    assert!(!marker.ran(), "sidecar ran on a Forbid claim");
+    assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
 }
