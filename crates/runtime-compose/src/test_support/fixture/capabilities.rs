@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crate::api::async_trait;
 use crate::api::{
-    HostCallContext, HostCallError, HostFunctionHandler, HostTool, MethodInfo, ToolDescription,
-    ToolError, Val,
+    CapParams, ComposeCx, GrantDecision, HostCallContext, HostCallError, HostFunctionHandler,
+    HostTool, MethodInfo, ToolDescription, ToolError, Val,
 };
 
 use super::FixtureRecord;
@@ -57,12 +57,13 @@ impl FixtureSpec {
 
 pub struct ProbeHandler {
     pub(crate) record: Arc<FixtureRecord>,
+    pub(crate) cx: ComposeCx,
 }
 
 impl HostFunctionHandler for ProbeHandler {
     fn call(
         &self,
-        _ctx: HostCallContext,
+        ctx: HostCallContext,
         params: Vec<Val>,
         _results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
@@ -73,6 +74,18 @@ impl HostFunctionHandler for ProbeHandler {
         };
         if input == "panic-sync" {
             panic!("fixture host function panic (sync)");
+        }
+        if let Some(cap) = input.strip_prefix("grant:") {
+            let decision = self.cx.grants().check(cap, &CapParams::empty());
+            let d = match decision {
+                GrantDecision::Allow => "allow",
+                GrantDecision::Deny(_) => "deny",
+            };
+            let agent = ctx.agent_id;
+            let reply = format!("probe:grant:{cap}={d} agent={agent}");
+            return Box::pin(async move {
+                Ok(vec![Val::Result(Ok(Some(Box::new(Val::String(reply)))))])
+            });
         }
         Box::pin(async move {
             if input == "panic" {

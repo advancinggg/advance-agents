@@ -196,6 +196,7 @@ impl ComposeExtension for FixtureExtension {
             for host_fn in &spec.host_functions {
                 let handler = Arc::new(ProbeHandler {
                     record: Arc::clone(&self.record),
+                    cx: cx.clone(),
                 });
                 reg.register(HostFunctionDef::new(
                     host_fn.capability,

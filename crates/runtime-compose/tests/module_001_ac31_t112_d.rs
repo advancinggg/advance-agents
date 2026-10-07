@@ -6,9 +6,12 @@ use std::time::{Duration, Instant};
 
 use advance_event_bus::read_api::EventFilter;
 use advance_runtime_compose::extension::{SecretNeedRule, SECRET_NEED_RULE};
+use advance_runtime_compose::test_support::fixture::inference::{
+    provider_yaml, FixtureInference, StubInferencePort,
+};
 use advance_runtime_compose::test_support::fixture::{
-    assert_gone_for_home, mint_session, CapDecl, FixtureDriver, FixtureExtension, FixtureHome,
-    FixtureHomeSpec, FixtureLifecycle, Http, OnStartedMode,
+    assert_gone_for_home, mint_session, post_msg, CapDecl, FixtureDriver, FixtureExtension,
+    FixtureFamilies, FixtureHome, FixtureHomeSpec, FixtureLifecycle, Http, OnStartedMode,
 };
 use advance_runtime_compose::test_support::{ComposeProbe, MemoryComposeLog};
 use advance_runtime_compose::{
@@ -18,7 +21,7 @@ use advance_runtime_compose::{
 use advance_shared_types::security_validator::{ScanContext, ScanResult};
 use chrono::Utc;
 use secrecy::ExposeSecret;
-use serde_json::json;
+use serde_json::{json, Value};
 
 const POLL: Duration = Duration::from_millis(10);
 
@@ -785,4 +788,187 @@ async fn module_001_ac31_no_extension_compose_is_unchanged() {
         .iter()
         .all(|step| !step.starts_with("extensions.")));
     assert_gone_for_home(&probe, home.home(), None).await;
+}
+
+fn turn_home() -> FixtureHome {
+    FixtureHome::new(FixtureHomeSpec {
+        capabilities: vec![CapDecl::Granted("fs"), CapDecl::Granted("llm")],
+        driver: FixtureDriver::LlmNoErr,
+        git: false,
+        providers_yaml: Some(provider_yaml::llm_providers_block(&[
+            provider_yaml::LOCAL_STUB,
+        ])),
+    })
+    .expect("turn home")
+}
+
+fn alive_tasks() -> usize {
+    tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks()
+}
+
+fn has_data(body: &Value) -> bool {
+    !body.get("data").is_none_or(Value::is_null)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac31_t112_d1_ext_events_absent_from_cost_ledger_after_a_turn() {
+    let home = turn_home();
+    let stub = StubInferencePort::new("stub-pong", 7, 3);
+    let ext = FixtureExtension::new("fixture").with_inference(FixtureInference::standard(stub));
+    let rec = ext.record();
+    let log = MemoryComposeLog::new();
+    let probe = Arc::new(ComposeProbe::new());
+    let baseline = alive_tasks();
+    let rt = compose(
+        home.options(Arc::new(log), Arc::clone(&probe)),
+        vec![ext.arc()],
+    )
+    .await
+    .expect("compose");
+    let snap = rec
+        .started(Duration::from_secs(2))
+        .await
+        .expect("on_started");
+    snap.cx
+        .emitter()
+        .emit("ext.fixture.ping", json!({"n": 1}))
+        .expect("emit");
+    let addr = probe
+        .record()
+        .listener("post_msg")
+        .expect("POST /msg is bound");
+    let (status, body) = post_msg(addr, "llm:hi").await;
+    assert_eq!((status, body.as_str()), (200, "llm-ok:stub-pong"), "{body}");
+    let ep = rt.client_api().expect("client api");
+    let tok = mint_session(&ep);
+    let api_addr = ep.socket_addr;
+    drop(ep);
+    let root = rt.root_agent_id().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let agents = loop {
+        let resp = Http::get(api_addr, "/client/costs/agents")
+            .session(&tok)
+            .send()
+            .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.body);
+        let agents = resp
+            .body
+            .pointer("/data/agents")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !agents.is_empty() {
+            break agents;
+        }
+        if Instant::now() >= deadline {
+            panic!("cost ledger stayed empty: {:?}", resp.body);
+        }
+        tokio::time::sleep(POLL).await;
+    };
+    assert!(
+        agents
+            .iter()
+            .any(|row| row.get("agent_id").and_then(Value::as_str) == Some(root.as_str())),
+        "root agent missing from costs: {agents:?} root={root}"
+    );
+    assert!(
+        agents
+            .iter()
+            .all(|row| row.get("agent_id").and_then(Value::as_str) != Some("ext.fixture")),
+        "ext.fixture appeared in the cost ledger: {agents:?}"
+    );
+    rt.shutdown().await.expect("shutdown");
+    assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac31_t112_d2_run_view_reflects_turn_tokens() {
+    let home = turn_home();
+    let stub = StubInferencePort::new("stub-pong", 7, 3);
+    let ext = FixtureExtension::new("fixture").with_inference(FixtureInference::standard(stub));
+    let rec = ext.record();
+    let log = MemoryComposeLog::new();
+    let probe = Arc::new(ComposeProbe::new());
+    let baseline = alive_tasks();
+    let rt = compose(
+        home.options(Arc::new(log), Arc::clone(&probe)),
+        vec![ext.arc()],
+    )
+    .await
+    .expect("compose");
+    let snap = rec
+        .started(Duration::from_secs(2))
+        .await
+        .expect("on_started");
+    let addr = probe
+        .record()
+        .listener("post_msg")
+        .expect("POST /msg is bound");
+    let (status, body) = post_msg(addr, "llm:hi").await;
+    assert_eq!((status, body.as_str()), (200, "llm-ok:stub-pong"), "{body}");
+    assert!(
+        poll_until(Duration::from_secs(5), || {
+            snap.cx
+                .runs()
+                .runs()
+                .ok()
+                .and_then(|runs| runs.into_iter().map(|run| run.token_used).max())
+                .unwrap_or(0)
+                >= 10
+        })
+        .await,
+        "session run token_used stayed below 10: {:?}",
+        snap.cx.runs().runs()
+    );
+    rt.shutdown().await.expect("shutdown");
+    assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac31_t112_d5_failed_extension_keeps_serving() {
+    let home = turn_home();
+    let stub = StubInferencePort::new("stub-pong", 7, 3);
+    let ext = FixtureExtension::new("fixture")
+        .with_lifecycle(FixtureLifecycle {
+            on_started: OnStartedMode::Fail,
+            ..FixtureLifecycle::default()
+        })
+        .with_families(FixtureFamilies::standard())
+        .with_inference(FixtureInference::standard(stub));
+    let log = MemoryComposeLog::new();
+    let probe = Arc::new(ComposeProbe::new());
+    let baseline = alive_tasks();
+    let rt = compose(
+        home.options(Arc::new(log), Arc::clone(&probe)),
+        vec![ext.arc()],
+    )
+    .await
+    .expect("compose");
+    assert!(
+        poll_until(Duration::from_secs(2), || {
+            rt.health().failed_extensions == ["fixture"]
+        })
+        .await,
+        "failed_extensions={:?}",
+        rt.health().failed_extensions
+    );
+    let ep = rt.client_api().expect("client api");
+    let tok = mint_session(&ep);
+    let items = Http::get(ep.socket_addr, "/client/fixture/items")
+        .session(&tok)
+        .send()
+        .await;
+    assert_eq!(items.status, 200, "{:?}", items.body);
+    assert!(has_data(&items.body), "{:?}", items.body);
+    drop(ep);
+    let addr = probe
+        .record()
+        .listener("post_msg")
+        .expect("POST /msg is bound");
+    let (status, body) = post_msg(addr, "llm:hi").await;
+    assert_eq!((status, body.as_str()), (200, "llm-ok:stub-pong"), "{body}");
+    rt.shutdown().await.expect("shutdown");
+    assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
 }

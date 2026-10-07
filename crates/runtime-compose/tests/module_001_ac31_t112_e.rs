@@ -141,3 +141,70 @@ async fn module_001_ac31_containment_spawned_task_panic_logged_spawner_alive() {
     rt.shutdown().await.expect("shutdown");
     assert_gone_for_home(&probe, home.home(), None).await;
 }
+
+fn alive_tasks() -> usize {
+    tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac31_t112_e4_client_families_panic_and_failure_are_typed_and_torn_down() {
+    let home = FixtureHome::new(FixtureHomeSpec {
+        capabilities: vec![CapDecl::Granted("fs"), CapDecl::Granted("llm")],
+        driver: FixtureDriver::None,
+        git: false,
+        providers_yaml: None,
+    })
+    .expect("home");
+
+    async fn refused(home: &FixtureHome, breaks: FixtureBreaks, check: impl FnOnce(&ComposeError)) {
+        let log = MemoryComposeLog::new();
+        let probe = Arc::new(ComposeProbe::new());
+        let baseline = alive_tasks();
+        let error = compose(
+            home.options(Arc::new(log.clone()), Arc::clone(&probe)),
+            vec![FixtureExtension::new("fixture").with_breaks(breaks).arc()],
+        )
+        .await
+        .expect_err("client_families refused");
+        check(&error);
+        assert_eq!(log.count(log_keys::READY), 0);
+        assert!(!home.home().join(".runtime/client-api").exists());
+        assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
+    }
+
+    refused(
+        &home,
+        FixtureBreaks {
+            panic_in: Some(ExtensionPhase::ClientFamilies),
+            ..FixtureBreaks::default()
+        },
+        |error| match error {
+            ComposeError::Extension {
+                extension: "fixture",
+                phase: ExtensionPhase::ClientFamilies,
+                failure: ExtensionFailure::Panicked(message),
+            } if message.contains("fixture panic in client_families") => {}
+            other => panic!("panic: {other:?}"),
+        },
+    )
+    .await;
+
+    refused(
+        &home,
+        FixtureBreaks {
+            fail_in: Some(ExtensionPhase::ClientFamilies),
+            ..FixtureBreaks::default()
+        },
+        |error| match error {
+            ComposeError::Extension {
+                extension: "fixture",
+                phase: ExtensionPhase::ClientFamilies,
+                failure: ExtensionFailure::Failed(message),
+            } if message == "fixture failure in client_families" => {}
+            other => panic!("fail: {other:?}"),
+        },
+    )
+    .await;
+}
