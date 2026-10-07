@@ -60,6 +60,10 @@ pub const UNKNOWN_PROVIDER_DETAIL: &str = "unknown_provider";
 /// API-key entry, or a key route on a `chatgpt-oauth` entry.
 pub const AUTH_SOURCE_MISMATCH_DETAIL: &str = "auth_source_mismatch";
 
+/// The `ClientError.details` token of a `module_unavailable` whose cause is a child process the
+/// host's `ProcessPolicy::Forbid` refused (ADR 2026-10-03 D3).
+pub const PROCESS_FORBIDDEN_DETAIL: &str = advance_shared_types::process_policy::PROCESS_FORBIDDEN;
+
 /// A client-safe provider error. Adapters map raw `RunError`/`MsgError`/`SkillError` to a
 /// `ProviderError` VARIANT (operation-scoped; the only inner-string match is
 /// `MsgError::InvalidTarget("reply_not_authorized")`), and the handler maps `ProviderError` to a
@@ -98,6 +102,10 @@ pub enum ProviderError {
     /// details `["auth_source_mismatch"]` so a client can tell it from a state that will change
     /// by itself (the inner string is log-only).
     AuthSourceMismatch(String),
+    /// The operation needs a child process the host forbids (an `agent-cli` probe or create, a
+    /// `git` pack source). → `module_unavailable` with details `["process_forbidden"]`; the inner
+    /// string is log-only.
+    ProcessForbidden(String),
 }
 
 impl ProviderError {
@@ -142,6 +150,13 @@ impl ProviderError {
                     "operation not valid for the resource's current state",
                 )
                 .with_details(vec![AUTH_SOURCE_MISMATCH_DETAIL.to_string()]);
+            }
+            ProviderError::ProcessForbidden(_) => {
+                return ClientError::new(
+                    ClientErrorCode::ModuleUnavailable,
+                    "provider unavailable",
+                )
+                .with_details(vec![PROCESS_FORBIDDEN_DETAIL.into()]);
             }
         };
         ClientError::new(code, message)
@@ -470,4 +485,19 @@ pub(crate) fn provider_or_unavailable_msg<T: ?Sized>(
         .as_ref()
         .map(Arc::clone)
         .ok_or_else(|| ClientError::new(ClientErrorCode::ModuleUnavailable, message))
+}
+
+#[cfg(test)]
+mod module_001_ac32_tests {
+    use super::*;
+
+    #[test]
+    fn module_001_ac32_process_forbidden_is_module_unavailable_with_detail() {
+        let inner = "agent-cli: process_forbidden: this host forbids child processes (agent-cli)";
+        let err = ProviderError::ProcessForbidden(inner.into()).into_client_error();
+        assert_eq!(err.code, ClientErrorCode::ModuleUnavailable);
+        assert_eq!(err.message, "provider unavailable");
+        assert_eq!(err.details, [PROCESS_FORBIDDEN_DETAIL]);
+        assert!(!err.message.contains(inner));
+    }
 }

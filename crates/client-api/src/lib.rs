@@ -105,7 +105,8 @@ pub use pagination::{Cursor, Page};
 pub use provider::{
     provider_or_unavailable, AgentAdminProvider, CostProvider, EntityProvider, MessagingProvider,
     PackAdminProvider, ProviderAdminProvider, ProviderError, RunControlProvider,
-    SecretsAdminProvider, ToolsProvider, AUTH_SOURCE_MISMATCH_DETAIL, UNKNOWN_PROVIDER_DETAIL,
+    SecretsAdminProvider, ToolsProvider, AUTH_SOURCE_MISMATCH_DETAIL, PROCESS_FORBIDDEN_DETAIL,
+    UNKNOWN_PROVIDER_DETAIL,
 };
 pub use provider_admin::{
     ClientCreateProviderRequest, ClientProviderCost, ClientProviderDeleteResult, ClientProviderKey,
