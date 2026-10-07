@@ -24,11 +24,12 @@ use advance_core::runtime_compose::{
     ExtensionGrantCheck, ExtensionHealth, ExtensionPhase, ExtensionSecrets, ExtensionState,
     GatewayHandle, GrantDecision, HostCallContext, HostCallError, HostFunctionDef,
     HostFunctionFailure, HostFunctionHandler, HostFunctionRefusal, HostFunctionRegistrar,
-    HostPlatform, HostTool, InstanceGuard, InstanceGuardKind, ListenerOptions, LockFailure,
-    LogStream, MasterKeyInput, MethodInfo, NullComposeLog, PanicAnswer, ProcessPolicy, RunInfo,
-    RunView, RuntimeHealthView, RuntimePhase, SecretViewError, ShutdownHandle, StartedCx,
-    TaskRunStatus, TaskSpawner, ToolDescription, ToolError, ToolRefusal, ToolRegistrar,
-    Unsupported, Val, ViewError, WasmEngine, Zeroizing,
+    HostPlatform, HostTool, InferenceContribution, InferenceRefusal, InferenceSubject,
+    InstanceGuard, InstanceGuardKind, ListenerOptions, LockFailure, LogStream, MasterKeyInput,
+    MethodInfo, NullComposeLog, OssBinding, PanicAnswer, ProcessPolicy, RunInfo, RunView,
+    RuntimeHealthView, RuntimePhase, SecretViewError, ShutdownHandle, StartedCx, TaskRunStatus,
+    TaskSpawner, ToolDescription, ToolError, ToolRefusal, ToolRegistrar, Unsupported, Val,
+    ViewError, WasmEngine, Zeroizing,
 };
 
 /// The CONTRACT-244 API: every name `api/mod.rs` may re-export, and must.
@@ -62,6 +63,10 @@ const ALLOWED: &[&str] = &[
     "ToolError",
     "ToolRefusal",
     "ToolRegistrar",
+    "InferenceContribution",
+    "InferenceSubject",
+    "InferenceRefusal",
+    "OssBinding",
     "BoxFuture",
     "ComposeExtension",
     "ExtensionError",
@@ -167,6 +172,10 @@ fn uses_the_api_through_the_facade(home: std::path::PathBuf) {
     let _: Option<MethodInfo> = None;
     let _: Option<ToolDescription> = None;
     let _: Option<ToolError> = None;
+    let _: Option<InferenceContribution> = None;
+    let _: Option<InferenceSubject> = None;
+    let _: Option<InferenceRefusal> = None;
+    let _: Option<OssBinding> = None;
     let _: Option<LockFailure> = None;
     let _: Option<Unsupported> = None;
     let _: Option<ExtensionPhase> = None;

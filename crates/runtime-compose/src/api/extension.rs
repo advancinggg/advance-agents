@@ -7,6 +7,7 @@ pub use futures::future::BoxFuture;
 use super::error::ExtensionFailure;
 use super::extension_cx::{ComposeCx, EmitError, SecretViewError, StartedCx, ViewError};
 use super::host_functions::HostFunctionRegistrar;
+use super::inference::InferenceContribution;
 use super::tools::ToolRegistrar;
 
 /// A product (or test) addition to the composition. Trusted in-process code: the
@@ -27,6 +28,22 @@ pub trait ComposeExtension: Send + Sync + 'static {
     /// Extra capability names a guest may declare, each `<id>.<name>`.
     fn capabilities(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// (b) Inference (CONTRACT-244 D2(b)): called inside the `llm` branch of the
+    /// composition, before the VLM extractor and the gateway are built (so
+    /// before the not-wired defaults), once per extension, in registration
+    /// order, only when the home declares `llm`. Runs on the composition's
+    /// runtime thread and must not block. Nothing recorded on `out` takes
+    /// effect until this callback returned `Ok` and the composer validated the
+    /// records.
+    fn inference(
+        &self,
+        cx: &ComposeCx,
+        out: &mut InferenceContribution,
+    ) -> Result<(), ExtensionError> {
+        let _ = (cx, out);
+        Ok(())
     }
 
     /// Host functions, after `inference` and before the host is built. Always

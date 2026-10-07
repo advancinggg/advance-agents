@@ -53,6 +53,8 @@ mod threads;
 #[doc(hidden)]
 pub mod extension;
 
+mod inference;
+
 // Test-only seams of the composition: failpoints, the turn gate, the probe, the
 // in-memory log.
 #[cfg(feature = "test-support")]

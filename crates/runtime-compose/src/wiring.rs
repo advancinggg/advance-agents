@@ -27,7 +27,7 @@
 //!
 //! See MODULE-001 §2.7 / §3.6 for the wiring posture.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -858,6 +858,9 @@ pub struct WiringHandles {
     /// The packs-dir poll task (installs made by another process), so an owner
     /// shutting down can stop it; dropped, it ends with the runtime.
     pub(crate) packs_watcher: Option<tokio::task::JoinHandle<()>>,
+    /// Extension inference holds, moved into the composition at construction
+    /// so they cannot drop inside `drop_graph`.
+    pub(crate) extension_holds: Vec<crate::inference::ExtensionHold>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1341,6 +1344,7 @@ pub(crate) struct HoldStoppers {
     pub llm_stream_reaper: Option<Arc<cap_llm::AgentStreamReaper>>,
     pub adapter_workers: Vec<Arc<dyn crate::client_api_adapters::WorkerControl>>,
     pub extension_secret_store: Option<Arc<SecretStore>>,
+    pub extension_holds: Vec<crate::inference::ExtensionHold>,
 }
 
 /// An error inside wiring: either an existing CLI wiring failure or a
@@ -2823,6 +2827,8 @@ pub(crate) async fn wire_capabilities_inner(
     // completed sign-in, a renewal and a sign-out are serialized against each other. `None`
     // when llm is not declared (no live store, no gateway).
     let mut chatgpt_sign_in: Option<Arc<advance_home::ChatGptSignIn>> = None;
+    let mut inference_claimed: BTreeSet<String> = BTreeSet::new();
+    let mut inference_marks_claimable = false;
     extensions.install_contexts(CxParts {
         config: Arc::downgrade(&builder.config_watcher()),
         event_bus: Arc::downgrade(&event_bus_dyn),
@@ -2832,6 +2838,44 @@ pub(crate) async fn wire_capabilities_inner(
         leak_detector: Arc::clone(&public_leak_detector),
     });
     if declares_llm {
+        // CONTRACT-244 D2(b): extension inference contributions — before the VLM
+        // extractor (it shares the catalog) and the gateway (claimed ports go in
+        // before the not-wired defaults).
+        let llm_boot = builder.config_watcher().current();
+        let outcome = crate::inference::run_inference_phase(
+            &extensions,
+            Arc::clone(&llm_boot),
+            &log,
+            &mut started.extension_holds,
+        );
+        let crate::inference::InferenceOutcome {
+            claims,
+            mesh_dispatch,
+            catalog,
+            snapshot,
+            claimed,
+            marks_claimable,
+        } = match outcome {
+            Ok(o) => o,
+            // Holds are already in `started` (released by the teardown, step 4);
+            // every recorded port / dispatch was dropped inside the phase, each
+            // contained by its adapter's Drop.
+            Err(error) => {
+                return Err(WiringFailure {
+                    error: WiringError::Compose(error),
+                    partial: started,
+                })
+            }
+        };
+        inference_claimed = claimed;
+        inference_marks_claimable = marks_claimable;
+        let gateway_inference = GatewayInference {
+            claims,
+            mesh_dispatch,
+            catalog,
+            snapshot,
+        };
+        let shared_catalog = Arc::clone(&gateway_inference.catalog);
         let store = secret_store
             .as_ref()
             .expect("needs_key ⇒ Some when llm declared")
@@ -2910,8 +2954,6 @@ pub(crate) async fn wire_capabilities_inner(
         // `build_live_post_processor`, which installs the `VlmDescriptionIndexer` into
         // the live post-processor Step-3. One catalog is shared with the gateway
         // (CONTRACT-244 D2(b)): empty until an extension contributes profiles.
-        let llm_boot = builder.config_watcher().current();
-        let shared_catalog = Arc::new(cap_llm::ModelProfileCatalog::new());
         let vlm_concrete = LlmGatewayVlm::new(
             builder.config_watcher(),
             chain.clone(),
@@ -2994,11 +3036,7 @@ pub(crate) async fn wire_capabilities_inner(
             ),
             // The SAME sign-in object the provider admin drives below.
             Some(sign_in as Arc<dyn cap_llm::ProviderCredentialSource>),
-            GatewayInference {
-                catalog: Arc::clone(&shared_catalog),
-                snapshot: Some(llm_boot),
-                ..GatewayInference::none()
-            },
+            gateway_inference,
         );
         // Hold an Arc clone for the composition root before registration
         // moves one into the host-fn handlers (all clones share the one gateway,
@@ -3331,6 +3369,8 @@ pub(crate) async fn wire_capabilities_inner(
     // policy source reads, so the two can never disagree about who pins what.
     // `auth-source: chatgpt-oauth` entries are served through the gateway's own sign-in object
     // (when llm is declared); without it such an entry cannot be created here.
+    // Consumed later by the provider-admin claimable mark and the claimed preflight.
+    let _ = (inference_claimed, inference_marks_claimable);
     let provider_admin: Arc<crate::client_api_providers::WiredProviderAdmin> = {
         let admin = crate::client_api_providers::WiredProviderAdmin::new(
             workspace.to_path_buf(),
@@ -3607,6 +3647,7 @@ pub(crate) async fn wire_capabilities_inner(
             pack_runtime,
             adapter_workers: std::mem::take(&mut started.adapter_workers),
             packs_watcher: started.packs_watcher.take(),
+            extension_holds: std::mem::take(&mut started.extension_holds),
         },
     ))
 }

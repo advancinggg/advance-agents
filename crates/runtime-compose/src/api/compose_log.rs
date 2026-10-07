@@ -187,6 +187,18 @@ pub mod log_keys {
     pub const EXT_HOST_FUNCTION_ANSWER_INVALID: &str = "ext.host_function_answer_invalid";
     /// stderr: an extension native tool panicked (the call failed, or in drop).
     pub const EXT_TOOL_PANICKED: &str = "ext.tool_panicked";
+    /// stderr: an extension inference port panicked (the call answered a typed error, or in drop).
+    /// Std's default panic hook still prints the panic (with its payload) to stderr;
+    /// this line never carries that payload.
+    pub const EXT_INFERENCE_PORT_PANICKED: &str = "ext.inference_port_panicked";
+    /// stderr: an extension mesh dispatch panicked (the call answered a typed error, or in drop).
+    /// Std's default panic hook still prints the panic (with its payload) to stderr;
+    /// this line never carries that payload.
+    pub const EXT_MESH_DISPATCH_PANICKED: &str = "ext.mesh_dispatch_panicked";
+    /// stderr: an extension hold panicked in drop (the shutdown continues).
+    /// Std's default panic hook still prints the panic (with its payload) to stderr;
+    /// this line never carries that payload.
+    pub const EXT_HOLD_DROP_PANICKED: &str = "ext.hold_drop_panicked";
 
     // Objects the daemon does not start, available to embedders.
     /// stdout: an agent reply preview.
@@ -274,6 +286,9 @@ pub mod log_keys {
         EXT_HOST_FUNCTION_PANICKED,
         EXT_HOST_FUNCTION_ANSWER_INVALID,
         EXT_TOOL_PANICKED,
+        EXT_INFERENCE_PORT_PANICKED,
+        EXT_MESH_DISPATCH_PANICKED,
+        EXT_HOLD_DROP_PANICKED,
         REPLY_AGENT_REPLY,
         WEBHOOK_TRIGGER_SEND_FAILED,
         ROLLBACK_MARK_PRE_TURN_FAILED,

@@ -100,8 +100,8 @@ pub const TEARDOWN_ORDER: &[&str] = &[
     "holds.git_queue",
     "holds.client_api_slots",
     "holds.event_bus",
-    "holds.extension_holds",
     "holds.drop_graph",
+    "holds.extension_holds",
     "guard",
 ];
 
@@ -261,9 +261,9 @@ pub(crate) struct Composition {
     config_watcher: Option<Arc<dyn StopConfigWatcher>>,
     wal_observer: Option<JoinHandle<()>>,
     stoppers: HoldStoppers,
-    /// What the extensions hold that must outlive the graph's holds but not the
-    /// composition.
-    extension_holds: Vec<Box<dyn std::any::Any + Send + Sync>>,
+    /// Extension holds, released after the graph is dropped (the graph still
+    /// holds the ports those engines serve).
+    extension_holds: Vec<crate::inference::ExtensionHold>,
     /// Everything else, dropped last (on the blocking pool).
     graph_rest: Option<(RuntimeHost, WiringHandles)>,
     // Step 5.
@@ -301,7 +301,9 @@ impl Composition {
             llm_stream_reaper: wiring_handles.llm_stream_reaper.take(),
             adapter_workers: std::mem::take(&mut wiring_handles.adapter_workers),
             extension_secret_store: wiring_handles.extension_secret_store.take(),
+            extension_holds: Vec::new(),
         };
+        let extension_holds = std::mem::take(&mut wiring_handles.extension_holds);
         let client_api_server = wiring_handles.client_api_server.take();
         let (root_loop, hooks, host_pump) = match agent_loop {
             Some(spawned) => (Some(spawned.handle), spawned.hooks, spawned.host_pump),
@@ -323,7 +325,7 @@ impl Composition {
             config_watcher: Some(config_watcher),
             wal_observer,
             stoppers,
-            extension_holds: Vec::new(),
+            extension_holds,
             graph_rest: Some((host, wiring_handles)),
             guard: Some(guard),
         }
@@ -337,6 +339,8 @@ impl Composition {
         guard: Option<GuardHold>,
         log: LogHandle,
     ) -> Self {
+        let mut stoppers = stoppers;
+        let extension_holds = std::mem::take(&mut stoppers.extension_holds);
         Self {
             log,
             steps: StepLog::default(),
@@ -353,7 +357,7 @@ impl Composition {
             config_watcher: config_watcher.map(|watcher| watcher as Arc<dyn StopConfigWatcher>),
             wal_observer,
             stoppers,
-            extension_holds: Vec::new(),
+            extension_holds,
             graph_rest: None,
             guard,
         }
@@ -568,11 +572,6 @@ impl Composition {
             bus.shutdown_shared().await;
             self.steps.record("holds.event_bus");
         }
-        let extension_holds = std::mem::take(&mut self.extension_holds);
-        if !extension_holds.is_empty() {
-            drop(extension_holds);
-            self.steps.record("holds.extension_holds");
-        }
         let rest = (self.graph_rest.take(), std::mem::take(&mut self.stoppers));
         if rest.0.is_some() || !rest.1.is_empty() {
             // The last references go here: the EventBus pipeline and its observation
@@ -581,6 +580,13 @@ impl Composition {
             // promptly once signalled, but they block: off the runtime threads.
             let _ = tokio::task::spawn_blocking(move || drop(rest)).await;
             self.steps.record("holds.drop_graph");
+        }
+        let holds = std::mem::take(&mut self.extension_holds);
+        if !holds.is_empty() {
+            // After the graph: ports that use these engines are gone, so a hold
+            // whose Drop joins a worker can return. Off the runtime thread.
+            let _ = tokio::task::spawn_blocking(move || drop(holds)).await;
+            self.steps.record("holds.extension_holds");
         }
 
         // ── Step 5: the instance guard, last. ─────────────────────────────────────
@@ -609,6 +615,7 @@ impl HoldStoppers {
             llm_stream_reaper,
             adapter_workers,
             extension_secret_store,
+            extension_holds,
         } = self;
         event_bus.is_none()
             && cap_grant_sweeper_handle.is_none()
@@ -621,6 +628,7 @@ impl HoldStoppers {
             && llm_stream_reaper.is_none()
             && adapter_workers.is_empty()
             && extension_secret_store.is_none()
+            && extension_holds.is_empty()
     }
 
     /// Stop what a failed wiring had started (no ingress and no loop exist yet): the

@@ -31,11 +31,11 @@ pub enum ComposeError {
         route: String,
         reason: String,
     },
-    /// An extension's claim on an inference entry was refused.
+    /// An extension's claim on an inference entry, profile, or mesh dispatch was refused.
     InferenceClaim {
         extension: &'static str,
-        entry: String,
-        reason: String,
+        subject: InferenceSubject,
+        reason: InferenceRefusal,
     },
     /// An extension's capability name was refused.
     CapabilityCollision {
@@ -62,6 +62,46 @@ pub enum ComposeError {
     /// These options ask for something this build or this home cannot compose. Nothing
     /// was started.
     Unsupported(Unsupported),
+}
+
+/// What an inference contribution named.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InferenceSubject {
+    Entry(String),
+    Profile(String),
+    MeshDispatch,
+}
+
+/// Why [`ComposeError::InferenceClaim`] refused a record.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InferenceRefusal {
+    /// No `llm-providers` entry with this id in the home's boot config.
+    AbsentEntry,
+    /// The entry already has a claimant (`by` may be the refused extension itself).
+    AlreadyClaimed { by: &'static str },
+    /// OSS binds this entry, decided by its backend class.
+    BoundByOss(OssBinding),
+    /// `local` with a sidecar under `ProcessPolicy::Forbid`: bound to a typed refusal.
+    SidecarUnderForbid,
+    /// `mesh-remote` entries are served by the (one) mesh dispatch, never claimed.
+    MeshRemoteEntry,
+    /// A profile with this id was already added (`by` may be the refused extension itself).
+    DuplicateProfile { by: &'static str },
+    /// `ModelProfileCatalog::insert` refused the profile; its text.
+    InvalidProfile(String),
+    /// A mesh dispatch was already supplied (`first` may be the refused extension itself).
+    SecondMeshDispatch { first: &'static str },
+}
+
+/// The OSS binding that refused a claim, decided by backend class.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OssBinding {
+    LocalSidecar,
+    AgentCli,
+    CloudWireAdapter,
 }
 
 /// Why [`ComposeError::CapabilityCollision`] refused a name.
@@ -182,11 +222,11 @@ impl fmt::Display for ComposeError {
             } => write!(f, "extension {extension}: route {route} refused: {reason}"),
             ComposeError::InferenceClaim {
                 extension,
-                entry,
+                subject,
                 reason,
             } => write!(
                 f,
-                "extension {extension}: inference claim on {entry} refused: {reason}"
+                "extension {extension}: inference claim on {subject} refused: {reason}"
             ),
             ComposeError::CapabilityCollision {
                 extension,
@@ -214,6 +254,58 @@ impl fmt::Display for ComposeError {
             } => write!(f, "extension {extension} panicked in {phase}: {msg}"),
             ComposeError::Unsupported(what) => write!(f, "unsupported: {what}"),
         }
+    }
+}
+
+impl fmt::Display for InferenceSubject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InferenceSubject::Entry(id) => write!(f, "entry {id:?}"),
+            InferenceSubject::Profile(id) => write!(f, "profile {id:?}"),
+            InferenceSubject::MeshDispatch => f.write_str("mesh dispatch"),
+        }
+    }
+}
+
+impl fmt::Display for InferenceRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InferenceRefusal::AbsentEntry => {
+                f.write_str("no such entry in the home's llm-providers")
+            }
+            InferenceRefusal::AlreadyClaimed { by } => {
+                write!(f, "already claimed by extension {by}")
+            }
+            InferenceRefusal::BoundByOss(binding) => write!(f, "bound by OSS ({binding})"),
+            InferenceRefusal::SidecarUnderForbid => f.write_str(
+                "a local entry with a sidecar is bound to a typed refusal under ProcessPolicy::Forbid",
+            ),
+            InferenceRefusal::MeshRemoteEntry => {
+                f.write_str("mesh-remote entries are served by the mesh dispatch")
+            }
+            InferenceRefusal::DuplicateProfile { by } => {
+                write!(f, "profile id already added by extension {by}")
+            }
+            InferenceRefusal::InvalidProfile(message) => {
+                write!(f, "the catalog refused the profile: {message}")
+            }
+            InferenceRefusal::SecondMeshDispatch { first } => {
+                write!(
+                    f,
+                    "a mesh dispatch is already supplied by extension {first}"
+                )
+            }
+        }
+    }
+}
+
+impl fmt::Display for OssBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            OssBinding::LocalSidecar => "local sidecar",
+            OssBinding::AgentCli => "agent-cli",
+            OssBinding::CloudWireAdapter => "cloud wire adapter",
+        })
     }
 }
 

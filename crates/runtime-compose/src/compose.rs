@@ -356,6 +356,11 @@ const _: () = {
         assert_send_sync::<crate::extension::host_functions::ContainedHostFunction>();
         assert_send_sync::<crate::api::ToolRegistrar>();
         assert_send_sync::<crate::extension::tools::ContainedHostTool>();
+        assert_send_sync::<crate::api::InferenceContribution>();
+        assert_send_sync::<crate::inference::ExtensionHold>();
+        assert_send_sync::<crate::inference::contained::ContainedInferencePort>();
+        assert_send_sync::<crate::inference::contained::ContainedMeshDispatch>();
+        assert_send::<crate::inference::contained::ContainedStream>();
     }
 };
 

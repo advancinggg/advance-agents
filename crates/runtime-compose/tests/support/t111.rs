@@ -375,9 +375,10 @@ pub async fn assert_ws_closed(ws: &mut ClientWs, budget: Duration) {
 /// the loops in the order the daemon has always stopped them, then the LLM stream reaper;
 /// the holds in dependency order: the selected-provider writer, the watchers, the packs
 /// poll, the cap-grant sweeper, the breaker, the ChatGPT sign-in, the git commit queue
-/// (closed and its worker joined), the Client API provider slots, the EventBus, the
-/// extensions' holds, then the rest of the graph (whose drop releases the CONTRACT-218
-/// custody).
+/// (closed and its worker joined), the Client API provider slots, the EventBus, then
+/// the rest of the graph (whose drop releases the CONTRACT-218 custody), then the
+/// extensions' holds (after the graph so a hold whose Drop joins an engine worker
+/// can return).
 pub const D1_ORDER: &[&str] = &[
     "ingress.client_api",
     "ingress.post_msg",
@@ -399,8 +400,8 @@ pub const D1_ORDER: &[&str] = &[
     "holds.git_queue",
     "holds.client_api_slots",
     "holds.event_bus",
-    "holds.extension_holds",
     "holds.drop_graph",
+    "holds.extension_holds",
     "guard",
 ];
 
