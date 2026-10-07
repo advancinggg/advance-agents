@@ -3454,38 +3454,76 @@ pub(crate) async fn wire_capabilities_inner(
             },
             Some(read),
         ) => {
-            let history_events = match (
+            use crate::client_api_adapters::{
+                BindTimeToolsProvider, Contract185EventAdapter, Contract219HistoryAdapter,
+                NoIntakePendingGrants, UnboundHistoryAdapter,
+            };
+            let history_unavailable = |error: String| {
+                log.err(
+                    log_keys::CLIENT_API_HISTORY_UNAVAILABLE,
+                    format!("advance: Client API history/events unavailable: {error}"),
+                );
+            };
+            // ADR 2026-10-03 D4: CONTRACT-219 composes the BOUND history adapter
+            // (`lifecycle` homes, exactly as today); a home without `lifecycle`
+            // gets the UNBOUND port.
+            let mut bound_history_for_api: Option<
+                Arc<dyn advance_client_api::BoundHistoryReadPort>,
+            > = None;
+            let mut unbound_history_for_api: Option<
+                Arc<dyn advance_client_api::UnboundHistoryReadPort>,
+            > = None;
+            match (
                 contract219_projector.as_ref(),
                 observation_carrier_store.as_ref(),
             ) {
                 (Some(projector), Some(carriers)) => {
-                    use crate::client_api_adapters::{
-                        Contract185EventAdapter, Contract219HistoryAdapter,
-                    };
-                    let history = Contract219HistoryAdapter::new_tracked(
+                    match Contract219HistoryAdapter::new_tracked(
                         Arc::clone(read),
                         Arc::clone(projector),
                         Arc::clone(carriers),
                         &mut started.adapter_workers,
-                    );
-                    let events = Contract185EventAdapter::new_tracked(
-                        Arc::clone(read),
-                        client_event_retention_days,
-                        &mut started.adapter_workers,
-                    );
-                    match (history, events) {
-                        (Ok(h), Ok(e)) => Some((h, e, Arc::clone(projector))),
-                        (Err(error), _) | (_, Err(error)) => {
-                            log.err(
-                                log_keys::CLIENT_API_HISTORY_UNAVAILABLE,
-                                format!("advance: Client API history/events unavailable: {error}"),
-                            );
-                            None
-                        }
+                    ) {
+                        Ok(history) => bound_history_for_api = Some(Arc::new(history)),
+                        Err(error) => history_unavailable(error),
                     }
                 }
-                _ => None,
-            };
+                (None, None) => match UnboundHistoryAdapter::new_tracked(
+                    Arc::clone(read),
+                    &mut started.adapter_workers,
+                ) {
+                    Ok(history) => unbound_history_for_api = Some(Arc::new(history)),
+                    Err(error) => history_unavailable(error),
+                },
+                // Unreachable: the projector and the carrier store both exist iff
+                // `lifecycle`. No history adapter, as v0.1.26's `_ => None`.
+                (Some(_), None) | (None, Some(_)) => {}
+            }
+            // ADR 2026-10-03 D4: the CONTRACT-185 event adapter on every home,
+            // independent of CONTRACT-219.
+            let events_for_api: Option<Arc<dyn advance_client_api::ClientEventProvider>> =
+                match Contract185EventAdapter::new_tracked(
+                    Arc::clone(read),
+                    client_event_retention_days,
+                    &mut started.adapter_workers,
+                ) {
+                    Ok(events) => Some(Arc::new(events)),
+                    Err(error) => {
+                        history_unavailable(error);
+                        None
+                    }
+                };
+            // No grant intake (no `grant`) ⇒ nothing can park ⇒ a list-only port
+            // answering `{requests: []}`; with an intake and no CONTRACT-219 the
+            // list stays unwired (never `[]`).
+            let pending_list_for_api: Option<Arc<dyn advance_client_api::PendingGrantListPort>> =
+                grant_approval_intake.is_none().then(|| {
+                    Arc::new(NoIntakePendingGrants::new())
+                        as Arc<dyn advance_client_api::PendingGrantListPort>
+                });
+            // The tools view at bind (D4); the late install replaces it.
+            let bind_time_tools: Arc<dyn advance_client_api::ToolsProvider> =
+                Arc::new(BindTimeToolsProvider::new(skills_root.clone()));
             let grant_approval_for_api = grant_approval_intake.clone();
             let projector_for_api = contract219_projector.clone();
             let leak_for_api = Arc::clone(&public_leak_detector);
@@ -3552,7 +3590,13 @@ pub(crate) async fn wire_capabilities_inner(
                     ingress: ingress_port.clone(),
                     replies: Some(replies_for_api.clone()),
                     serve_agent: Some(root_colon_for_api.clone()),
-                    tools: None,
+                    tools: Some(bind_time_tools),
+                    history: bound_history_for_api,
+                    unbound_history: unbound_history_for_api,
+                    events: events_for_api,
+                    cursor: Some(Arc::clone(&client_cursor_codec)),
+                    leak_detector: Some(Arc::clone(&leak_for_api)),
+                    pending_grants_list: pending_list_for_api,
                     llm_delta_hub: llm_delta_hub_opt.clone(),
                     agents: agent_admin_for_api
                         .clone()
@@ -3567,20 +3611,8 @@ pub(crate) async fn wire_capabilities_inner(
                     entities: entities_for_api.clone(),
                     ..Default::default()
                 };
-                if let Some((history, events, projector)) = history_events {
-                    let history: Arc<dyn advance_client_api::BoundHistoryReadPort> =
-                        Arc::new(history);
-                    let events: Arc<dyn advance_client_api::ClientEventProvider> = Arc::new(events);
-                    let cursor: Arc<dyn advance_client_api::ClientCursorCodec> =
-                        Arc::clone(&client_cursor_codec);
-                    parts.history = Some(history);
-                    parts.events = Some(events);
-                    parts.cursor = Some(cursor);
-                    let _ = projector;
-                }
                 if let Some(projector) = projector_for_api.as_ref() {
                     parts.redactor = Some(projector.redactor());
-                    parts.leak_detector = Some(Arc::clone(&leak_for_api));
                     parts.grants = grant_approval_for_api.as_ref().map(|intake| {
                         Arc::new(crate::client_api_adapters::Contract219GrantAdapter::new(
                             Arc::clone(intake),

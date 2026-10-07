@@ -132,14 +132,113 @@ struct D5Change {
 /// | tools | no deployed driver, or no `tools` | `module_unavailable` | `data` |
 /// | llm/deltas/stream | `llm` without `lifecycle` | pages without a resume cursor | pages carry a resume cursor (the cursor codec is now installed on every home) |
 ///
-/// Empty at the capture: every golden must match exactly. The step that implements D4 adds one
-/// entry per (home, line) the table changes, with the `before` text copied from the golden;
-/// [`module_001_t111_ac30_d5_overlay_only_adr_rows`] derives the allowed lines from each probe
-/// home's declarations ([`d5_targets`]) and, once this list is non-empty, requires it to cover
-/// all of them. Row 5 is witnessed by the delta WebSocket subscribe frame that presents a bogus
-/// resume cursor: without a cursor codec it is refused `module_unavailable` ("delta cursor
-/// unavailable"); with the codec it answers as on H3 (the codec's cursor rejection).
-const D5_CHANGE_MATRIX: &[D5Change] = &[];
+/// One entry per (route, homes). `before` is the captured base line; [`apply_overlay`]
+/// asserts it. Route-probe goldens are never re-captured. [`d5_targets`] also names the
+/// events WebSocket seed and the delta subscribe frame; both are in this list.
+/// [`module_001_t111_ac30_d5_overlay_only_adr_rows`] requires a non-empty overlay to cover
+/// every derived line.
+const D5_CHANGE_MATRIX: &[D5Change] = &[
+    D5Change {
+        homes: &["h1_fs_llm"],
+        method: "GET",
+        path: "/client/events",
+        before: UNWIRED_EVENTS,
+        after: EVENTS_AFTER_H1,
+    },
+    D5Change {
+        homes: &["h4_fs_llm_grant"],
+        method: "GET",
+        path: "/client/events",
+        before: UNWIRED_EVENTS,
+        after: EVENTS_AFTER_H4,
+    },
+    D5Change {
+        homes: &["h5_fs_llm_tools_no_driver"],
+        method: "GET",
+        path: "/client/events",
+        before: UNWIRED_EVENTS,
+        after: EVENTS_AFTER_H5,
+    },
+    D5Change {
+        homes: NO_LIFECYCLE,
+        method: "GET",
+        path: "/client/events/stream",
+        before: UNWIRED_EVENTS,
+        after: EVENTS_STREAM_AFTER,
+    },
+    D5Change {
+        homes: NO_LIFECYCLE,
+        method: "WS",
+        path: "/client/events/stream seed",
+        before: UNWIRED_EVENTS_WS,
+        after: EVENTS_WS_SEED_AFTER,
+    },
+    D5Change {
+        homes: NO_LIFECYCLE,
+        method: "GET",
+        path: "/client/runs/{run_id}/history",
+        before: UNWIRED,
+        after: HISTORY_EMPTY,
+    },
+    D5Change {
+        homes: NO_LIFECYCLE,
+        method: "GET",
+        path: "/client/tasks/{task_id}/history",
+        before: UNWIRED,
+        after: HISTORY_EMPTY,
+    },
+    D5Change {
+        homes: NO_GRANT_INTAKE,
+        method: "GET",
+        path: "/client/grants/pending",
+        before: UNWIRED,
+        after: GRANTS_PENDING_EMPTY,
+    },
+    D5Change {
+        homes: NO_LATE_TOOLS,
+        method: "GET",
+        path: "/client/tools",
+        before: UNWIRED,
+        after: TOOLS_EMPTY,
+    },
+    D5Change {
+        homes: NO_LIFECYCLE,
+        method: "WS",
+        path: "/client/llm/deltas/stream subscribe",
+        before: UNWIRED_DELTA,
+        after: DELTA_CURSOR_H3,
+    },
+];
+
+/// Homes without `lifecycle` (D5 row 1).
+const NO_LIFECYCLE: &[&str] = &["h1_fs_llm", "h4_fs_llm_grant", "h5_fs_llm_tools_no_driver"];
+/// Homes without a grant intake, i.e. without `grant` (D5 row 2; H3 = `lifecycle` without `grant`).
+const NO_GRANT_INTAKE: &[&str] = &[
+    "h1_fs_llm",
+    "h3_fs_llm_lifecycle",
+    "h5_fs_llm_tools_no_driver",
+];
+/// Homes with no deployed driver or no `tools` (D5 row 4).
+const NO_LATE_TOOLS: &[&str] = &[
+    "h1_fs_llm",
+    "h3_fs_llm_lifecycle",
+    "h4_fs_llm_grant",
+    "h5_fs_llm_tools_no_driver",
+];
+
+const UNWIRED_EVENTS: &str = "503 error module_unavailable \"event provider not wired\"";
+const UNWIRED_EVENTS_WS: &str =
+    "503 error module_unavailable \"event provider not wired\" (no upgrade)";
+const UNWIRED: &str = "503 error module_unavailable \"provider not wired\"";
+const UNWIRED_DELTA: &str = "error module_unavailable \"delta cursor unavailable\"";
+const HISTORY_EMPTY: &str = "200 data {\"entries\":[]}";
+const TOOLS_EMPTY: &str = "200 data {\"mcp\":[],\"skills\":[],\"wasm\":[]}";
+const DELTA_CURSOR_H3: &str = "error not_found \"event cursor not found\"";
+const EVENTS_AFTER_H1: &str = "200 data {\"dropped_count\":0,\"events\":[{\"agent_id\":\"<ROOT_AGENT_ID>\",\"data\":{},\"event_id\":\"<EVENT_ID: c1.local-k1.…>\",\"event_type\":\"run.created\",\"priority\":\"normal\",\"run_id\":\"<ROOT_RUN_ID>\",\"timestamp\":\"<EVENT_TIMESTAMP Z>\",\"trace_id\":\"<TRACE_ID>\"}],\"raw_limit_reached\":false,\"redacted_count\":0,\"rejected_count\":2,\"response_limit_reached\":false}";
+const EVENTS_AFTER_H4: &str = "200 data {\"dropped_count\":0,\"events\":[{\"agent_id\":\"<ROOT_AGENT_ID>\",\"data\":{},\"event_id\":\"<EVENT_ID: c1.local-k1.…>\",\"event_type\":\"run.created\",\"priority\":\"normal\",\"run_id\":\"<ROOT_RUN_ID>\",\"timestamp\":\"<EVENT_TIMESTAMP Z>\",\"trace_id\":\"<TRACE_ID>\"}],\"raw_limit_reached\":false,\"redacted_count\":0,\"rejected_count\":3,\"response_limit_reached\":false}";
+const EVENTS_AFTER_H5: &str = "200 data {\"dropped_count\":0,\"events\":[],\"raw_limit_reached\":false,\"redacted_count\":0,\"rejected_count\":3,\"response_limit_reached\":false}";
+const EVENTS_STREAM_AFTER: &str = "200 data {\"cursor\":{\"last_event_id\":\"<EVENT_ID: c1.local-k1.…>\",\"stream_id\":\"ces1.u6NCCap9GF2eI3P8a6a-U1FGyPjT8Nkg8vC6GjJQn6w\"},\"dropped_count\":0,\"events\":[],\"raw_limit_reached\":false,\"redacted_count\":0,\"rejected_count\":0,\"response_limit_reached\":false}";
+const EVENTS_WS_SEED_AFTER: &str = "101 protocol=advance.client.2026-09-17 data {\"cursor\":{\"last_event_id\":\"<EVENT_ID: c1.local-k1.…>\",\"stream_id\":\"ces1.u6NCCap9GF2eI3P8a6a-U1FGyPjT8Nkg8vC6GjJQn6w\"},\"dropped_count\":0,\"events\":[],\"raw_limit_reached\":false,\"redacted_count\":0,\"rejected_count\":0,\"response_limit_reached\":false}";
 
 /// The D5 rows that change a line (row 3 — `grant` without `lifecycle` — changes nothing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

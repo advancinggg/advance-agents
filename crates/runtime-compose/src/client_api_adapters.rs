@@ -12,8 +12,9 @@ use advance_client_api::{
     ClientAgentTreeNode, ClientApi, ClientCursorCodec, ClientEventProvider, ClientMcpEntry,
     ClientMessageAck, ClientMessageStatus, ClientRunMutation, ClientRunSummary, ClientSkillEntry,
     ClientToolEntry, ClientToolInventory, CostProvider, EntityProvider, LlmDeltaHub,
-    MessagingProvider, NormalizedEventFilter, PackAdminProvider, ProviderAdminProvider,
-    ProviderError, RawEventRow, RunControlProvider, SecretsAdminProvider, ToolsProvider,
+    MessagingProvider, NormalizedEventFilter, PackAdminProvider, PendingGrantListPort,
+    ProviderAdminProvider, ProviderError, RawEventRow, RunControlProvider, SecretsAdminProvider,
+    ToolsProvider, UnboundHistoryEntry, UnboundHistoryReadPort,
 };
 use advance_event_bus::{EventFilter, ObservabilityReadApi, ReadApiError, ReadCursor, ReadEvent};
 use advance_messaging::{MailboxStore, Message, MessageKind, MsgError};
@@ -22,9 +23,12 @@ use advance_shared_types::agent_tree::{AgentKind, AgentStatus};
 use advance_shared_types::run::{RunError, TaskRunStatus};
 use advance_shared_types::security_validator::LeakDetector;
 use advance_shared_types::sensitive_observation::{
-    CanonicalCapParam, ObservationNode, SensitiveObservationRedactor,
+    BoundObservationDocument, CanonicalCapParam, ObservationAssociationRoleFactory,
+    ObservationNode, RedactionBlockReason, RedactionDisposition, SensitiveObservationRedactor,
 };
 use advance_shared_types::traits::{AgentTreeSnapshot, CallableInventoryReader};
+use rand::{rngs::OsRng, RngCore};
+use zeroize::Zeroizing;
 
 pub use crate::execution_turn_ingress::ExecutionTurnIngress;
 use crate::observation_carriers::ObservationCarrierStore;
@@ -145,9 +149,11 @@ enum EventReadRequest {
     },
 }
 
-/// Production sync facade over the same C219-projected EventBus read handle.
-/// This powers the public WebSocket dashboard; it never receives the raw
-/// execution event because EventBus stores/broadcasts only the projected copy.
+/// Production sync facade over the EventBus read handle.
+/// This powers the public WebSocket dashboard. On a home with CONTRACT-219 the
+/// stored copy is the projected event; on a home without CONTRACT-219 it is the
+/// CONTRACT-217-masked event. The CONTRACT-191 projection, allowlist and
+/// CONTRACT-112 scan bound what reaches a client.
 pub struct Contract185EventAdapter {
     worker: Arc<AdapterWorker<EventReadRequest>>,
     retention_days: u32,
@@ -512,6 +518,69 @@ impl BoundHistoryReadPort for Contract219HistoryAdapter {
     }
 }
 
+/// MODULE-020-AC-18: history on a home without CONTRACT-219 — the bound adapter's
+/// read window, filters and field derivation, without carriers and without
+/// parameters.
+pub struct UnboundHistoryAdapter {
+    reader: HistoryReader,
+}
+
+impl UnboundHistoryAdapter {
+    pub fn new(read: Arc<dyn ObservabilityReadApi>) -> Result<Self, String> {
+        Self::new_tracked(read, &mut Vec::new())
+    }
+
+    /// As [`Self::new`], also registering the worker thread with `workers`.
+    pub(crate) fn new_tracked(
+        read: Arc<dyn ObservabilityReadApi>,
+        workers: &mut Vec<Arc<dyn WorkerControl>>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            reader: HistoryReader::spawn_tracked(read, workers)?,
+        })
+    }
+
+    fn history(
+        &self,
+        task_id: Option<&str>,
+        run_id: Option<&str>,
+        cursor: Option<&str>,
+    ) -> Result<Vec<UnboundHistoryEntry>, ProviderError> {
+        let events = self.reader.window(run_id)?;
+        let selected = history_window(&events, task_id, cursor)?;
+        Ok(selected
+            .into_iter()
+            .map(|event| {
+                let fields = history_fields(event);
+                UnboundHistoryEntry {
+                    event_id: fields.event_id,
+                    occurred_at: fields.occurred_at,
+                    kind: fields.kind,
+                    summary: fields.summary.to_owned(),
+                }
+            })
+            .collect())
+    }
+}
+
+impl UnboundHistoryReadPort for UnboundHistoryAdapter {
+    fn task_history_unbound(
+        &self,
+        task_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<Vec<UnboundHistoryEntry>, ProviderError> {
+        self.history(Some(task_id), None, cursor)
+    }
+
+    fn run_history_unbound(
+        &self,
+        run_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<Vec<UnboundHistoryEntry>, ProviderError> {
+        self.history(None, Some(run_id), cursor)
+    }
+}
+
 fn history_payload(event: &advance_event_bus::Event) -> ObservationNode {
     let fields = history_fields(event);
     let value = |key: &str| {
@@ -744,6 +813,10 @@ pub struct FirstPartyClientCompose {
     /// CONTRACT-190 schema + entities families (entity-data lane E3) over the production
     /// `DataStore` (the `data` host tool's store).
     pub entities: Option<Arc<dyn EntityProvider>>,
+    /// MODULE-020-AC-18: history of a home without CONTRACT-219.
+    pub unbound_history: Option<Arc<dyn UnboundHistoryReadPort>>,
+    /// MODULE-020-AC-18: the list-only pending-grant port of a home without a grant intake.
+    pub pending_grants_list: Option<Arc<dyn PendingGrantListPort>>,
 }
 
 pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCompose) -> ClientApi {
@@ -762,6 +835,9 @@ pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCom
     if let Some(history) = parts.history {
         api = api.with_bound_history_provider(history);
     }
+    if let Some(unbound) = parts.unbound_history {
+        api = api.with_unbound_history_provider(unbound);
+    }
     if let Some(events) = parts.events {
         api = api.with_event_provider(events);
     }
@@ -776,6 +852,9 @@ pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCom
     }
     if let Some(grants) = parts.grants {
         api = api.with_bound_grant_provider(grants);
+    }
+    if let Some(list) = parts.pending_grants_list {
+        api = api.with_pending_grant_list_provider(list);
     }
     if let Some(tools) = parts.tools {
         api = api.with_tools_provider(tools);
@@ -955,6 +1034,86 @@ fn list_client_skills(skill_root: &Path) -> Vec<ClientSkillEntry> {
         });
     }
     out
+}
+
+/// MODULE-020-AC-18: the tools view installed at bind. It adapts no inventory
+/// (`wasm` and `mcp` are empty); `skills` follows the late install's rule (same
+/// root, same bounded walk). `install_tools_if_real` replaces it when the agent
+/// loop spawns with a real inventory.
+pub struct BindTimeToolsProvider {
+    skill_root: Option<PathBuf>,
+}
+
+impl BindTimeToolsProvider {
+    pub fn new(skill_root: Option<PathBuf>) -> Self {
+        Self { skill_root }
+    }
+}
+
+impl ToolsProvider for BindTimeToolsProvider {
+    fn inventory(&self, _principal_id: &str) -> Result<ClientToolInventory, ProviderError> {
+        Ok(ClientToolInventory {
+            wasm: Vec::new(),
+            mcp: Vec::new(),
+            skills: self
+                .skill_root
+                .as_deref()
+                .map(list_client_skills)
+                .unwrap_or_default(),
+        })
+    }
+}
+
+/// A redactor no other component can feed: a fresh association key and boot id,
+/// and an implementation that blocks every document.
+pub fn fail_closed_redactor() -> Arc<SensitiveObservationRedactor> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(key.as_mut());
+    key[0] |= 1;
+    let mut boot = [0u8; 16];
+    OsRng.fill_bytes(&mut boot);
+    boot[0] |= 1;
+    let parts = ObservationAssociationRoleFactory::new_at_composition(key, boot, Vec::new())
+        .and_then(ObservationAssociationRoleFactory::split_once)
+        .expect("nonzero key and boot id; structural schemas only");
+    Arc::new(
+        parts
+            .provider
+            .bind_once(parts.verifier, |_| RedactionDisposition::Blocked {
+                reason: RedactionBlockReason::AuthorityUnavailable,
+            })
+            .expect("provider and verifier come from one factory"),
+    )
+}
+
+/// MODULE-020-AC-18: the pending-grant list of a home with no grant intake.
+/// Nothing can park, so the list is empty; its redactor is fail-closed.
+pub struct NoIntakePendingGrants {
+    redactor: Arc<SensitiveObservationRedactor>,
+}
+
+impl NoIntakePendingGrants {
+    pub fn new() -> Self {
+        Self {
+            redactor: fail_closed_redactor(),
+        }
+    }
+}
+
+impl Default for NoIntakePendingGrants {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PendingGrantListPort for NoIntakePendingGrants {
+    fn list_pending_bound(&self) -> Result<Vec<BoundObservationDocument>, ProviderError> {
+        Ok(Vec::new())
+    }
+
+    fn redactor(&self) -> Arc<SensitiveObservationRedactor> {
+        Arc::clone(&self.redactor)
+    }
 }
 
 pub struct InventoryToolsProvider {
@@ -1346,6 +1505,102 @@ mod tests {
         assert_eq!(fields.occurred_at, event.timestamp.to_rfc3339());
         assert_eq!(fields.kind, "run.round_completed");
         assert_eq!(fields.summary, HISTORY_SUMMARY);
+    }
+
+    #[test]
+    fn module_020_ac18_bind_time_tools_view_adapts_no_inventory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join(".agent/skills/echo-skill");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(skill_dir.join("SKILL.md"), "# Echo\n").expect("skill md");
+        std::fs::write(
+            skill_dir.join(".meta.yaml"),
+            "skill_id: echo-skill\nversion: 3\nprovenance: Imported\ntrust_level: Trusted\n",
+        )
+        .expect("meta");
+        let inventory = BindTimeToolsProvider::new(Some(tmp.path().to_path_buf()))
+            .inventory("anyone")
+            .expect("inventory");
+        assert!(inventory.wasm.is_empty());
+        assert!(inventory.mcp.is_empty());
+        assert_eq!(
+            serde_json::to_value(&inventory.skills).unwrap(),
+            serde_json::to_value(&list_client_skills(tmp.path())).unwrap()
+        );
+        let empty = BindTimeToolsProvider::new(None)
+            .inventory("anyone")
+            .expect("empty");
+        assert!(empty.wasm.is_empty());
+        assert!(empty.mcp.is_empty());
+        assert!(empty.skills.is_empty());
+    }
+
+    #[test]
+    fn module_020_ac18_no_intake_pending_list_is_empty_and_its_redactor_is_its_own() {
+        let port = NoIntakePendingGrants::new();
+        assert!(port.list_pending_bound().expect("list").is_empty());
+        let a = fail_closed_redactor();
+        let b = fail_closed_redactor();
+        assert!(!Arc::ptr_eq(&a, &b));
+    }
+
+    struct UnboundPort;
+
+    impl UnboundHistoryReadPort for UnboundPort {
+        fn task_history_unbound(
+            &self,
+            _task_id: &str,
+            _cursor: Option<&str>,
+        ) -> Result<Vec<UnboundHistoryEntry>, ProviderError> {
+            Ok(vec![UnboundHistoryEntry {
+                event_id: "e1".into(),
+                occurred_at: "2026-10-03T12:00:00+00:00".into(),
+                kind: "run.round_completed".into(),
+                summary: HISTORY_SUMMARY.to_owned(),
+            }])
+        }
+
+        fn run_history_unbound(
+            &self,
+            run_id: &str,
+            cursor: Option<&str>,
+        ) -> Result<Vec<UnboundHistoryEntry>, ProviderError> {
+            self.task_history_unbound(run_id, cursor)
+        }
+    }
+
+    #[test]
+    fn module_020_ac18_first_party_compose_installs_the_unbound_ports() {
+        use advance_client_api::{
+            ClientApiConfig, ClientRequest, ClientSession, Platform, Principal, Scope,
+        };
+        let api = compose_first_party_client(
+            ClientApi::new(ClientApiConfig::default()),
+            FirstPartyClientCompose {
+                unbound_history: Some(Arc::new(UnboundPort)),
+                pending_grants_list: Some(Arc::new(NoIntakePendingGrants::new())),
+                leak_detector: Some(Arc::new(cap_http::DefaultLeakDetector::new())),
+                ..Default::default()
+            },
+        );
+        api.sessions().insert(
+            "tok".into(),
+            ClientSession {
+                session_id: "s".into(),
+                principal: Principal::operator("operator"),
+                platform: Platform::Mac,
+                scopes: Scope::operator_default(),
+                csrf_token: None,
+                expires_at: u64::MAX,
+            },
+            0,
+        );
+        let history =
+            api.handle(ClientRequest::get("/client/runs/run-a/history").with_session("tok"));
+        assert!(history.is_ok(), "{:?}", history.error);
+        let grants = api.handle(ClientRequest::get("/client/grants/pending").with_session("tok"));
+        assert!(grants.is_ok(), "{:?}", grants.error);
+        assert_eq!(grants.data, Some(json!({"requests": []})));
     }
 
     #[test]
