@@ -529,6 +529,31 @@ pub mod provider_yaml {
         "    agent-cli: { vendor: claude, command: /nonexistent/claude }\n",
     );
 
+    pub fn cli(command: &Path) -> String {
+        let quoted = command.display().to_string().replace('\'', "''");
+        format!(
+            "  - id: cli\n    backend-class: agent-cli\n    api-key-secret: cli-key\n    model-aliases: {{ default: cli-model }}\n    cost-per-mtoken-in: 0.01\n    cost-per-mtoken-out: 0.01\n    rate-limit: {{ requests-per-minute: 100, tokens-per-minute: 100000 }}\n    agent-cli: {{ vendor: claude, command: '{quoted}' }}\n"
+        )
+    }
+
+    /// The `runtime/tests/config.rs` chatgpt-oauth entry shape (`auth-source: chatgpt-oauth`).
+    pub const CHATGPT_OAUTH: &str = concat!(
+        "  - id: openai-plan\n",
+        "    endpoint: https://api.openai.com\n",
+        "    api-key-secret: openai-plan-token\n",
+        "    backend-class: cloud-http\n",
+        "    backend: openai-responses\n",
+        "    auth-scheme: bearer\n",
+        "    auth-source: chatgpt-oauth\n",
+        "    model-aliases:\n",
+        "      gpt: gpt-5\n",
+        "    cost-per-mtoken-in: 0.001\n",
+        "    cost-per-mtoken-out: 0.001\n",
+        "    rate-limit:\n",
+        "      requests-per-minute: 6\n",
+        "      tokens-per-minute: 60000\n",
+    );
+
     pub fn side(command: &Path) -> String {
         let quoted = command.display().to_string().replace('\'', "''");
         format!(

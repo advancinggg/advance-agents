@@ -215,6 +215,8 @@ pub(crate) struct GraphOptions {
     pub listeners: ListenerOptions,
     /// The capability wiring's options.
     pub wiring: WiringOptions,
+    /// Whether the selected-provider rewrite task watches config reloads.
+    pub hot_reload: bool,
     /// Test-only failpoints and observers.
     #[cfg(feature = "test-support")]
     pub failpoints: crate::test_support::ComposeFailpoints,
@@ -285,6 +287,7 @@ pub(crate) async fn compose_graph(
         log,
         listeners,
         wiring,
+        hot_reload,
         #[cfg(feature = "test-support")]
         failpoints,
     } = opts;
@@ -326,18 +329,22 @@ pub(crate) async fn compose_graph(
             .map(|p| p.id.clone())
             .unwrap_or_default();
         let _ = advance_home::write_selected_provider(&workspace, pid, &first);
-        let mut rx = host.config_watcher().subscribe();
-        let ws = workspace.clone();
-        Some(tokio::spawn(async move {
-            while let Some(cfg) = rx.recv().await {
-                let id = cfg
-                    .llm_providers
-                    .first()
-                    .map(|p| p.id.clone())
-                    .unwrap_or_default();
-                let _ = advance_home::write_selected_provider(&ws, pid, &id);
-            }
-        }))
+        if hot_reload {
+            let mut rx = host.config_watcher().subscribe();
+            let ws = workspace.clone();
+            Some(tokio::spawn(async move {
+                while let Some(cfg) = rx.recv().await {
+                    let id = cfg
+                        .llm_providers
+                        .first()
+                        .map(|p| p.id.clone())
+                        .unwrap_or_default();
+                    let _ = advance_home::write_selected_provider(&ws, pid, &id);
+                }
+            }))
+        } else {
+            None
+        }
     };
 
     if let Err(e) = log.ready(format!(

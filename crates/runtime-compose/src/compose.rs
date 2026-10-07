@@ -48,6 +48,7 @@ pub async fn compose(
         log,
         profile,
         processes,
+        hot_reload,
         #[cfg(feature = "test-support")]
         failpoints,
         ..
@@ -75,7 +76,7 @@ pub async fn compose(
     // 2. The pid lock (its heartbeat starts now). A failure releases the reservation.
     let lock = match instance {
         InstanceGuard::PidLockFile { heartbeat } => {
-            match RuntimeLock::acquire(&plan.home, heartbeat).await {
+            match RuntimeLock::acquire_with_policy(&plan.home, heartbeat, processes).await {
                 Ok(lock) => Some(lock),
                 Err(error) => {
                     return Err(ComposeError::Lock(LockFailure::from_lock_error(&error)));
@@ -90,19 +91,24 @@ pub async fn compose(
     // 3. The runtime host builder. A failure releases the guard (heartbeat joined, lock
     //    file removed) before it is reported.
     let config_path = config_path(&plan.home);
-    let builder = match RuntimeHostBuilder::new(&config_path, &plan.home).await {
-        Ok(builder) => builder,
-        Err(BootstrapError::Config(ConfigError::IoError { source, .. }))
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            guard.release().await;
-            return Err(ComposeError::ConfigNotFound { path: config_path });
-        }
-        Err(error) => {
-            guard.release().await;
-            return Err(ComposeError::Bootstrap(error.to_string()));
-        }
-    };
+    let builder =
+        match RuntimeHostBuilder::new_with_hot_reload(&config_path, &plan.home, hot_reload).await {
+            Ok(builder) => builder,
+            Err(BootstrapError::Config(ConfigError::IoError { source, .. }))
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                guard.release().await;
+                return Err(ComposeError::ConfigNotFound { path: config_path });
+            }
+            Err(error) => {
+                guard.release().await;
+                return Err(ComposeError::Bootstrap(error.to_string()));
+            }
+        };
+    #[cfg(feature = "test-support")]
+    probe_record!(failpoints.probe, |record| {
+        record.config_watching = Some(builder.config_watcher().is_watching());
+    });
     // The config watcher and its WAL-mode observer are stopped by the teardown.
     let config_watcher = builder.config_watcher();
     let wal_observer = builder.take_wal_observer();
@@ -131,12 +137,16 @@ pub async fn compose(
             client_api,
             log: log.clone(),
             extensions: Arc::clone(&exts),
+            processes,
+            hot_reload,
+            oauth_callback: listeners.oauth_callback,
             #[cfg(feature = "test-support")]
             probe: failpoints.probe.clone(),
             #[cfg(feature = "test-support")]
             fail_after_git_queue: failpoints.wiring_after_git_queue,
             ..WiringOptions::compat()
         },
+        hot_reload,
         #[cfg(feature = "test-support")]
         failpoints: failpoints.clone(),
     };
@@ -161,6 +171,8 @@ pub async fn compose(
                 graph.client_api_endpoint(),
                 graph.agent_loop_done(),
                 instance_guard,
+                profile,
+                processes,
                 exts.board(),
             ));
             let composition =

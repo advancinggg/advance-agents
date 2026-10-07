@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::ComposeError;
 use super::extension::{ExtensionHealth, ExtensionState};
+use super::options::{ComposeProfile, ProcessPolicy};
 use crate::composition::RuntimeView;
 
 /// A running composition. It owns nothing of the runtime itself: the runtime's parts
@@ -69,6 +70,8 @@ impl ComposedRuntime {
             agent_loop_up: running && self.view.agent_loop_alive(),
             client_api_base: self.client_api().map(|endpoint| endpoint.base_url),
             instance_guard: self.view.instance_guard(),
+            profile: self.view.profile(),
+            processes: self.view.processes(),
             extensions,
             failed_extensions,
         }
@@ -143,6 +146,10 @@ pub struct RuntimeHealthView {
     pub client_api_base: Option<String>,
     /// The instance guard in use.
     pub instance_guard: InstanceGuardKind,
+    /// The composed profile (T113 (1) reads the row on the running composition).
+    pub profile: ComposeProfile,
+    /// The policy every spawn site of this composition received.
+    pub processes: ProcessPolicy,
     /// Every composed extension, in registration order.
     pub extensions: Vec<ExtensionHealth>,
     /// Extensions whose start failed.

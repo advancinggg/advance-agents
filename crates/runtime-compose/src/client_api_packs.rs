@@ -30,6 +30,7 @@ use advance_pack_manager::{
 use advance_runtime::config::PackConfig;
 use async_trait::async_trait;
 
+use crate::api::ProcessPolicy;
 use crate::capability_catalog::build_capability_catalog_with;
 use crate::pack_registry_client::HttpsRegistryClient;
 
@@ -68,6 +69,7 @@ pub struct WiredPackAdminProvider {
     workflows: Option<(Arc<DefaultMaterializer>, WorkflowContext)>,
     /// Extension capability names admitted in `required-capabilities` (empty = KNOWN only).
     extension_capabilities: Vec<String>,
+    process_policy: ProcessPolicy,
 }
 
 impl WiredPackAdminProvider {
@@ -85,7 +87,13 @@ impl WiredPackAdminProvider {
             pack_runtime: None,
             workflows: None,
             extension_capabilities: Vec::new(),
+            process_policy: ProcessPolicy::Allow,
         }
+    }
+
+    pub fn with_process_policy(mut self, policy: ProcessPolicy) -> Self {
+        self.process_policy = policy;
+        self
     }
 
     /// Admit these extension capability names in pack `required-capabilities`.
@@ -259,6 +267,7 @@ pub fn map_pack_error(error: PackError) -> ProviderError {
         | PackError::SignatureInvalid { .. }
         | PackError::InvalidWorkflow(_) => ProviderError::InvalidRequest(error.to_string()),
         PackError::WorkflowStepFailed { .. } => ProviderError::InvalidState(error.to_string()),
+        PackError::ProcessForbidden(f) => ProviderError::ProcessForbidden(f.to_string()),
         other => ProviderError::Unavailable(other.to_string()),
     }
 }
@@ -306,8 +315,10 @@ impl PackAdminProvider for WiredPackAdminProvider {
             request.accepted_capabilities.clone(),
         )))?;
         let source = request.source.clone();
-        let report = Self::block_on(async move { installer.install(&source).await })?
-            .map_err(map_pack_error)?;
+        let policy = self.process_policy;
+        let report =
+            Self::block_on(async move { installer.install_with_policy(&source, policy).await })?
+                .map_err(map_pack_error)?;
         let applied = self.apply_to_runtime()?;
         let warnings = match (&self.pack_runtime, &applied) {
             (Some(runtime), Some(applied)) => {

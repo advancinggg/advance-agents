@@ -39,6 +39,7 @@ use advance_messaging::{AgentIdBridge, DynamicRouting, MailboxStore, DEFAULT_CAP
 use advance_run_manager::{RepetitionGuard, RepetitionGuardConfig, RunConfig, RunManager};
 // await-leg B-2 (2026-06-22) — the production messaging-chain registration entry +
 // the suspend-sink port type, consumed by the `declares_messaging` block below.
+use crate::api::ProcessPolicy;
 use advance_git::{DefaultGitCommitQueue, GitCommitQueue};
 use advance_reply_tracker::{
     register_reply_tracker_host_fns_with_suspend_sink,
@@ -171,6 +172,7 @@ pub(crate) struct GatewayInference {
     pub mesh_dispatch: Option<Arc<dyn MeshInferenceDispatch>>,
     pub catalog: Arc<cap_llm::ModelProfileCatalog>,
     pub snapshot: Option<Arc<RuntimeConfig>>,
+    pub processes: ProcessPolicy,
 }
 
 impl GatewayInference {
@@ -180,6 +182,7 @@ impl GatewayInference {
             mesh_dispatch: None,
             catalog: Arc::new(cap_llm::ModelProfileCatalog::new()),
             snapshot: None,
+            processes: ProcessPolicy::Allow,
         }
     }
 }
@@ -214,6 +217,7 @@ pub(crate) fn build_llm_gateway_with(
         mesh_dispatch,
         catalog,
         snapshot,
+        processes,
     } = inference;
     let boot = snapshot.unwrap_or_else(|| config.current());
     let mut holds: Vec<Arc<cap_llm::SupervisedChild>> = Vec::new();
@@ -234,7 +238,7 @@ pub(crate) fn build_llm_gateway_with(
             command: sc.command.clone(),
             args: sc.args.clone(),
         };
-        match sup.spawn() {
+        match sup.spawn_with_policy(processes) {
             Ok((handoff, child)) => {
                 let child = Arc::new(child);
                 holds.push(Arc::clone(&child));
@@ -271,11 +275,14 @@ pub(crate) fn build_llm_gateway_with(
         };
         registry.insert(
             p.id.clone(),
-            Arc::new(cap_llm::AgentCliBackend::new(
-                spec.clone(),
-                p.id.clone(),
-                cap_llm::backend_cli::default_work_root().join(&p.id),
-            )),
+            Arc::new(
+                cap_llm::AgentCliBackend::new(
+                    spec.clone(),
+                    p.id.clone(),
+                    cap_llm::backend_cli::default_work_root().join(&p.id),
+                )
+                .with_process_policy(processes),
+            ),
         );
     }
     for p in boot.llm_providers.iter() {
@@ -1305,6 +1312,12 @@ pub(crate) struct WiringOptions {
     pub fail_after_git_queue: bool,
     /// Prepared extensions for this composition (`empty()` when none).
     pub extensions: Arc<ExtensionSet>,
+    /// Whether OSS code of this composition may start child processes.
+    pub processes: ProcessPolicy,
+    /// Whether the runtime config and installed packs are watched and applied live.
+    pub hot_reload: bool,
+    /// Whether the ChatGPT sign-in object (and its callback listener) is built.
+    pub oauth_callback: bool,
 }
 
 impl WiringOptions {
@@ -1324,6 +1337,9 @@ impl WiringOptions {
             #[cfg(feature = "test-support")]
             fail_after_git_queue: false,
             extensions: ExtensionSet::empty(),
+            processes: ProcessPolicy::Allow,
+            hot_reload: true,
+            oauth_callback: true,
         }
     }
 }
@@ -1468,6 +1484,9 @@ pub(crate) async fn wire_capabilities_inner(
         #[cfg(feature = "test-support")]
         fail_after_git_queue,
         extensions,
+        processes,
+        hot_reload,
+        oauth_callback,
     } = opts;
     let effective = extensions.effective_capabilities().clone();
     probe_record!(probe, |record| {
@@ -1578,8 +1597,10 @@ pub(crate) async fn wire_capabilities_inner(
     let mut master_key = if !needs_key {
         None
     } else if let Some(provided) = provided_master_key {
+        probe_record!(probe, |record| record.master_key_from_config = Some(false));
         Some(provided)
     } else {
+        probe_record!(probe, |record| record.master_key_from_config = Some(true));
         // keychain-sync: a home whose config moved
         // to keychain-sync while it still carries `master.key` + `secrets.json` is migrated
         // HERE, before the key is loaded, so the daemon boots on the keychain items (each
@@ -2890,6 +2911,7 @@ pub(crate) async fn wire_capabilities_inner(
             mesh_dispatch,
             catalog,
             snapshot,
+            processes,
         };
         let shared_catalog = Arc::clone(&gateway_inference.catalog);
         let store = secret_store
@@ -2899,33 +2921,36 @@ pub(crate) async fn wire_capabilities_inner(
         // Its egress chain is its own, never the LLM chain below: the same live store and
         // the same kinds of SSRF guard, rate limiter and executor (tunables sourced live off
         // the config provider), and no content scan of the credential traffic it carries.
-        let sign_in = {
-            let (_, sign_in_ssrf, sign_in_rate) = crate::channels_boot::live_security_components(
-                Some(builder.config_watcher() as Arc<dyn RuntimeConfigProvider>),
-            );
-            let sign_in_executor = crate::channels_boot::live_executor(Some(
-                builder.config_watcher() as Arc<dyn RuntimeConfigProvider>,
-            ));
-            let sign_in_chain = advance_home::sign_in_egress::sign_in_egress_chain(
-                store.clone(),
-                sign_in_ssrf,
-                sign_in_rate,
-                sign_in_executor,
-            )
-            // Host-only redacted http.*/security.*/secret.injected events, as on the LLM chain.
-            .with_event_bus(event_bus_dyn.clone());
-            Arc::new(advance_home::ChatGptSignIn::new(
-                workspace.to_path_buf(),
-                store.clone(),
-                Arc::new(sign_in_chain),
-                CHATGPT_SIGN_IN_APP_NAME,
-                advance_home::ChatGptSignInConfig::default(),
-            ))
-        };
-        chatgpt_sign_in = Some(Arc::clone(&sign_in));
-        started.chatgpt_sign_in = Some(Arc::clone(&sign_in));
-        probe_record!(probe, |record| record.chatgpt_sign_in =
-            Some(Arc::downgrade(&sign_in)));
+        if oauth_callback {
+            let sign_in = {
+                let (_, sign_in_ssrf, sign_in_rate) =
+                    crate::channels_boot::live_security_components(Some(
+                        builder.config_watcher() as Arc<dyn RuntimeConfigProvider>
+                    ));
+                let sign_in_executor = crate::channels_boot::live_executor(Some(
+                    builder.config_watcher() as Arc<dyn RuntimeConfigProvider>,
+                ));
+                let sign_in_chain = advance_home::sign_in_egress::sign_in_egress_chain(
+                    store.clone(),
+                    sign_in_ssrf,
+                    sign_in_rate,
+                    sign_in_executor,
+                )
+                // Host-only redacted http.*/security.*/secret.injected events, as on the LLM chain.
+                .with_event_bus(event_bus_dyn.clone());
+                Arc::new(advance_home::ChatGptSignIn::new(
+                    workspace.to_path_buf(),
+                    store.clone(),
+                    Arc::new(sign_in_chain),
+                    CHATGPT_SIGN_IN_APP_NAME,
+                    advance_home::ChatGptSignInConfig::default(),
+                ))
+            };
+            chatgpt_sign_in = Some(Arc::clone(&sign_in));
+            started.chatgpt_sign_in = Some(Arc::clone(&sign_in));
+            probe_record!(probe, |record| record.chatgpt_sign_in =
+                Some(Arc::downgrade(&sign_in)));
+        }
         // Wave-16 Lane-4 (MODULE-012 AC-17): build the leak/SSRF/rate components
         // with their `security.*` tunables sourced LIVE off the config provider, so
         // a hot-reload takes effect on this LLM-egress chain without restart.
@@ -3054,8 +3079,11 @@ pub(crate) async fn wire_capabilities_inner(
                     event_bus_dyn.clone(),
                 )) as Arc<dyn cap_llm::AgentLlmPolicySource>,
             ),
-            // The SAME sign-in object the provider admin drives below.
-            Some(sign_in as Arc<dyn cap_llm::ProviderCredentialSource>),
+            // The SAME sign-in object the provider admin drives below (absent when
+            // `oauth_callback` is off: credential source stays unwired).
+            chatgpt_sign_in
+                .as_ref()
+                .map(|sign_in| Arc::clone(sign_in) as Arc<dyn cap_llm::ProviderCredentialSource>),
             gateway_inference,
         );
         // Hold an Arc clone for the composition root before registration
@@ -3136,8 +3164,9 @@ pub(crate) async fn wire_capabilities_inner(
     // Installs / uninstalls made by ANOTHER process (`advance pack install` from a shell while
     // the daemon runs) reach the runtime through the packs dir's `.meta.yaml` index. The task
     // holds a weak reference; its owner stops it at shutdown.
-    started.packs_watcher =
-        Some(pack_runtime.spawn_packs_watcher(crate::pack_runtime::PACKS_POLL_INTERVAL));
+    started.packs_watcher = hot_reload
+        .then(|| pack_runtime.spawn_packs_watcher(crate::pack_runtime::PACKS_POLL_INTERVAL));
+    probe_record!(probe, |record| record.packs_poll = Some(hot_reload));
 
     // Step 7 — cap-tools, POST-build. The `LazyToolRegistry` engine handle only
     // exists once `ComponentRuntime` is built. `host.host_registry()` is the
@@ -3435,7 +3464,9 @@ pub(crate) async fn wire_capabilities_inner(
                 workspace.to_path_buf(),
                 event_bus_dyn.clone(),
             )),
-        );
+        )
+        .with_process_policy(processes)
+        .with_hot_reload(hot_reload);
         let admin = match chatgpt_sign_in.as_ref() {
             Some(sign_in) => admin.with_chatgpt_sign_in(
                 Arc::clone(sign_in) as Arc<dyn advance_home::ChatGptSignInPort>
@@ -3560,6 +3591,7 @@ pub(crate) async fn wire_capabilities_inner(
                     runtime_config.pack.clone(),
                     env!("CARGO_PKG_VERSION"),
                 )
+                .with_process_policy(processes)
                 .with_pack_runtime(Arc::clone(&pack_runtime))
                 .with_workflows(Arc::clone(&pack_wiring.materializer), root_uid.as_str())
                 .with_extension_capabilities(

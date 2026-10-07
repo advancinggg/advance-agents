@@ -41,7 +41,10 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{log_keys, BoxFuture, ClientApiEndpoint, InstanceGuardKind, RuntimePhase};
+use crate::api::{
+    log_keys, BoxFuture, ClientApiEndpoint, ComposeProfile, InstanceGuardKind, ProcessPolicy,
+    RuntimePhase,
+};
 use crate::client_api_adapters::WorkerControl;
 use crate::compose_log::LogHandle;
 use crate::daemon::{ComposedGraph, Listener};
@@ -174,6 +177,8 @@ pub(crate) struct RuntimeView {
     /// `true` once the root serve loop has ended; `None` without a deployed driver.
     agent_loop_done: Option<watch::Receiver<bool>>,
     instance_guard: InstanceGuardKind,
+    profile: ComposeProfile,
+    processes: ProcessPolicy,
     extensions: Arc<ExtensionBoard>,
 }
 
@@ -183,6 +188,8 @@ impl RuntimeView {
         client_api: Option<ClientApiEndpoint>,
         agent_loop_done: Option<watch::Receiver<bool>>,
         instance_guard: InstanceGuardKind,
+        profile: ComposeProfile,
+        processes: ProcessPolicy,
         extensions: Arc<ExtensionBoard>,
     ) -> Self {
         Self {
@@ -191,6 +198,8 @@ impl RuntimeView {
             client_api,
             agent_loop_done,
             instance_guard,
+            profile,
+            processes,
             extensions,
         }
     }
@@ -220,6 +229,14 @@ impl RuntimeView {
 
     pub(crate) fn instance_guard(&self) -> InstanceGuardKind {
         self.instance_guard
+    }
+
+    pub(crate) fn profile(&self) -> ComposeProfile {
+        self.profile
+    }
+
+    pub(crate) fn processes(&self) -> ProcessPolicy {
+        self.processes
     }
 
     pub(crate) fn extensions(&self) -> Vec<crate::api::ExtensionHealth> {
@@ -855,6 +872,8 @@ mod tests {
             None,
             None,
             guard.kind(),
+            crate::api::ComposeProfile::Daemon,
+            crate::api::ProcessPolicy::Allow,
             ExtensionSet::empty().board(),
         ));
         assert_eq!(view.phase(), RuntimePhase::Running);

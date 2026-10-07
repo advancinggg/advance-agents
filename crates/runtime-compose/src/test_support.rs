@@ -29,6 +29,19 @@ use crate::perchild_daemon::PerChildLoopManager;
 pub use crate::composition::TEARDOWN_ORDER;
 
 pub mod fixture;
+pub mod proc_self;
+
+pub use advance_shared_types::process_policy::spawn_counter;
+
+/// Process-wide count of ADMITTED spawn attempts at every `ProcessPolicy`-checked site since the
+/// process started; monotonic, never reset. An attempt counts when its site's policy admitted it,
+/// even if the spawn itself then failed (command not found). Refusals under `Forbid` — every
+/// in-process pid-lock probe call included — are counted apart (`spawn_counter::snapshot()
+/// .refused(..)`), so a `Forbid` composition never moves this. Prefer deltas
+/// (`snapshot().since(&before)`) when other tests of the binary may spawn.
+pub fn spawn_count() -> u64 {
+    spawn_counter::snapshot().admitted_total()
+}
 
 /// Process-local homes a composition currently holds, for [`fixture::assert_gone_for_home`].
 pub fn reserved_homes() -> Vec<PathBuf> {
@@ -207,6 +220,13 @@ pub struct ProbeRecord {
     /// T29 (d): wasm tool names of the inventory the late install received; `None` when no
     /// late install ran with a real inventory.
     pub late_tools: Option<Vec<String>>,
+    /// `builder.config_watcher().is_watching()` right after the builder.
+    pub config_watching: Option<bool>,
+    /// Whether the packs poll was spawned.
+    pub packs_poll: Option<bool>,
+    /// `Some(true)`: wiring entered the FromConfig branch (migration + load);
+    /// `Some(false)`: the Provided branch; `None`: no key needed.
+    pub master_key_from_config: Option<bool>,
 }
 
 impl ProbeRecord {
