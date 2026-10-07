@@ -301,15 +301,32 @@ pub struct RuntimeHostBuilder {
 }
 
 impl RuntimeHostBuilder {
+    /// Unchanged: [`Self::new_with_hot_reload`] with `hot_reload: true`.
+    pub async fn new(config_path: &Path, workspace_root: &Path) -> Result<Self, BootstrapError> {
+        Self::new_with_hot_reload(config_path, workspace_root, true).await
+    }
+
     /// Run construction steps 1–5: open and watch the config file, resolve
     /// + symlink-reject the db_path, build the SQLite handle + tunables-aware
     /// Recall/UnifiedSearch, initialize the empty `InMemoryHostRegistry`,
     /// and seed the circuit-breaker bus from `config.circuit_breakers`.
     /// Steps 6–8 (grant_check, CapabilityInjector, ComponentRuntime) run in
     /// [`Self::build`].
-    pub async fn new(config_path: &Path, workspace_root: &Path) -> Result<Self, BootstrapError> {
+    ///
+    /// `hot_reload: false` builds the watcher with
+    /// [`RuntimeConfigWatcher::new_unwatched`] and spawns no WAL-mode reload
+    /// observer (`take_wal_observer()` then answers `None`). Steps 2–5 unchanged.
+    pub async fn new_with_hot_reload(
+        config_path: &Path,
+        workspace_root: &Path,
+        hot_reload: bool,
+    ) -> Result<Self, BootstrapError> {
         // 1. Watch the config file (also performs initial parse + validate).
-        let config_watcher = Arc::new(RuntimeConfigWatcher::new(config_path).await?);
+        let config_watcher = Arc::new(if hot_reload {
+            RuntimeConfigWatcher::new(config_path).await?
+        } else {
+            RuntimeConfigWatcher::new_unwatched(config_path)?
+        });
         let config = config_watcher.current();
 
         // 2 + 3. Resolve db_path, reject leaf-symlink + ancestor-symlink swap,
@@ -394,26 +411,30 @@ impl RuntimeHostBuilder {
         // receiver sees EOF — the task exits cleanly. Same lifecycle posture
         // as the existing watcher bridge task. `RuntimeConfigWatcher::stop`
         // closes the subscriber channels directly, with the same effect.
-        let mut wal_reload_rx = config_watcher.subscribe();
-        let initial_wal_mode = config.database.wal_mode;
-        let wal_observer = tokio::spawn(async move {
-            let mut prev_wal_mode = initial_wal_mode;
-            while let Some(new_cfg) = wal_reload_rx.recv().await {
-                let new_wal_mode = new_cfg.database.wal_mode;
-                if prev_wal_mode && !new_wal_mode {
-                    eprintln!(
-                        "warn: runtime-config.yaml database.wal-mode hot-reloaded \
+        let wal_observer = if hot_reload {
+            let mut wal_reload_rx = config_watcher.subscribe();
+            let initial_wal_mode = config.database.wal_mode;
+            Some(tokio::spawn(async move {
+                let mut prev_wal_mode = initial_wal_mode;
+                while let Some(new_cfg) = wal_reload_rx.recv().await {
+                    let new_wal_mode = new_cfg.database.wal_mode;
+                    if prev_wal_mode && !new_wal_mode {
+                        eprintln!(
+                            "warn: runtime-config.yaml database.wal-mode hot-reloaded \
                          true → false. Existing pool connections retain their \
                          current journal_mode (no live PRAGMA flip is issued); \
                          the new MEMORY journal_mode applies only on next \
                          runtime restart, at which point SQLite crash-recovery \
                          is DISABLED for this workspace. Default `true` is \
                          recommended in production. (MODULE-001 §2.10)"
-                    );
+                        );
+                    }
+                    prev_wal_mode = new_wal_mode;
                 }
-                prev_wal_mode = new_wal_mode;
-            }
-        });
+            }))
+        } else {
+            None
+        };
 
         let handle = R2d2SqliteIndexHandle::with_tunables(
             &resolved_db,
@@ -461,7 +482,7 @@ impl RuntimeHostBuilder {
             host_registry,
             breaker,
             workspace_root: workspace_root.to_path_buf(),
-            wal_observer: Mutex::new(Some(wal_observer)),
+            wal_observer: Mutex::new(wal_observer),
             wasm_backend: WasmBackend::Native,
         })
     }
@@ -756,5 +777,24 @@ database:
         assert_eq!(report.tool.memory_reservation, None);
         assert_eq!(report.host.memory_reservation_for_growth, None);
         assert_eq!(report.tool.memory_reservation_for_growth, None);
+    }
+
+    #[tokio::test]
+    async fn module_001_ac32_d3_host_builder_without_hot_reload() {
+        let (_keep, workspace, config_path) = fresh_workspace();
+        let builder = RuntimeHostBuilder::new_with_hot_reload(&config_path, &workspace, false)
+            .await
+            .expect("builder without hot reload");
+        assert!(builder.take_wal_observer().is_none());
+        let host = builder.build(Arc::new(AllowAllGrantCheck)).expect("build");
+        assert!(!host.config_watcher().is_watching());
+
+        let builder = RuntimeHostBuilder::new(&config_path, &workspace)
+            .await
+            .expect("builder with hot reload");
+        assert!(builder.take_wal_observer().is_some());
+        let host = builder.build(Arc::new(AllowAllGrantCheck)).expect("build");
+        assert!(host.config_watcher().is_watching());
+        host.config_watcher().stop().await;
     }
 }

@@ -1724,8 +1724,9 @@ impl fmt::Debug for RuntimeConfigWatcher {
 }
 
 impl RuntimeConfigWatcher {
-    /// Parse the config file at `path` and start watching for changes.
-    pub async fn new(path: impl Into<PathBuf>) -> Result<Self, ConfigError> {
+    /// Parse + validate `path` exactly as [`Self::new`] does (absolute, regular file,
+    /// no ancestor symlink).
+    fn open_validated(path: impl Into<PathBuf>) -> Result<(PathBuf, RuntimeConfig), ConfigError> {
         let path = path.into();
 
         // Must be absolute — relative paths have no stable ancestor chain to audit.
@@ -1753,6 +1754,12 @@ impl RuntimeConfigWatcher {
         check_no_ancestor_symlinks_parents(&path)?;
 
         let config = load_config(&path)?;
+        Ok((path, config))
+    }
+
+    /// Parse the config file at `path` and start watching for changes.
+    pub async fn new(path: impl Into<PathBuf>) -> Result<Self, ConfigError> {
+        let (path, config) = Self::open_validated(path)?;
 
         let inner = Arc::new(WatcherInner {
             path: path.clone(),
@@ -1982,6 +1989,43 @@ impl RuntimeConfigWatcher {
             bridge: Mutex::new(Some(bridge_handle)),
             poll: Mutex::new(Some(poll_handle)),
         })
+    }
+
+    /// Parse + validate `path` exactly as [`Self::new`] does (absolute, regular file,
+    /// no ancestor symlink), without watching it: no OS watcher, no fingerprint poll,
+    /// no bridge task. `current()` answers the boot config for the watcher's life;
+    /// `subscribe()` receivers never yield a config (they yield `None` once `stop()`
+    /// closed them). (`hot_reload: false`, ADR D3.)
+    pub fn new_unwatched(path: impl Into<PathBuf>) -> Result<Self, ConfigError> {
+        let (path, config) = Self::open_validated(path)?;
+        let inner = Arc::new(WatcherInner {
+            path,
+            current: RwLock::new(Arc::new(config)),
+            subscribers: Mutex::new(Vec::new()),
+            last_error: Mutex::new(None),
+            emitter: Mutex::new(None),
+            emitter_live: AtomicBool::new(true),
+        });
+        Ok(Self {
+            inner,
+            watcher: Mutex::new(None),
+            bridge: Mutex::new(None),
+            poll: Mutex::new(None),
+        })
+    }
+
+    /// True while an OS watcher or the fingerprint poll is running (false for
+    /// [`Self::new_unwatched`] and after [`Self::stop`]).
+    pub fn is_watching(&self) -> bool {
+        self.watcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+            || self
+                .poll
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
     }
 
     /// Stop watching, while the owner still holds the watcher:
@@ -3015,4 +3059,92 @@ fn is_relevant_event(event: &Event, config_path: &Path) -> bool {
         _ => return false,
     }
     event.paths.iter().any(|p| p == config_path)
+}
+
+#[cfg(test)]
+mod module_001_ac32_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    const MINIMAL_YAML: &str = "\
+wasm:
+  max_memory_pages: 512
+  epoch_interruption_ms: 100
+  fuel_enabled: false
+
+llm-providers: []
+
+cron:
+  max_jitter_ratio: 0.1
+
+git:
+  gc_interval_hours: 24
+  max_tracked_file_mb: 10
+
+secrets:
+  master-key-source: keychain
+  env-var-name: SECRETS_MASTER_KEY
+
+post-processor:
+  llm-model: sonnet-light
+  llm-failure-cooldown-seconds: 600
+
+database:
+  db-path: \".runtime/index.db\"
+  pool-size: 4
+";
+
+    #[tokio::test]
+    async fn module_001_ac32_d3_unwatched_config_never_reloads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .join("runtime-config.yaml");
+        std::fs::write(&path, MINIMAL_YAML).expect("write config");
+
+        let unwatched = RuntimeConfigWatcher::new_unwatched(&path).expect("new_unwatched");
+        assert!(!unwatched.is_watching());
+        let boot = unwatched.current();
+        let mut rx = unwatched.subscribe();
+        std::fs::write(
+            &path,
+            MINIMAL_YAML.replace("max_memory_pages: 512", "max_memory_pages: 1024"),
+        )
+        .expect("rewrite");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            unwatched.current().wasm.max_memory_pages,
+            boot.wasm.max_memory_pages
+        );
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        unwatched.stop().await;
+        unwatched.stop().await;
+
+        std::fs::write(&path, MINIMAL_YAML).expect("reset config");
+        let watched = RuntimeConfigWatcher::new(&path).await.expect("new");
+        assert!(watched.is_watching());
+        assert_eq!(watched.current().wasm.max_memory_pages, 512);
+        std::fs::write(
+            &path,
+            MINIMAL_YAML.replace("max_memory_pages: 512", "max_memory_pages: 1024"),
+        )
+        .expect("rewrite watched");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if watched.current().wasm.max_memory_pages == 1024 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "watched config did not reload within 2s: {}",
+                    watched.current().wasm.max_memory_pages
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        watched.stop().await;
+    }
 }
