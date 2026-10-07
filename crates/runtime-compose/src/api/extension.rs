@@ -4,6 +4,8 @@ use std::fmt;
 
 pub use futures::future::BoxFuture;
 
+use advance_client_api::families::{ClientFamilyRegistrar, RouteRefusal};
+
 use super::error::ExtensionFailure;
 use super::extension_cx::{ComposeCx, EmitError, SecretViewError, StartedCx, ViewError};
 use super::host_functions::HostFunctionRegistrar;
@@ -67,6 +69,18 @@ pub trait ComposeExtension: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<(), ExtensionError>> {
         let _ = (cx, reg);
         Box::pin(async { Ok(()) })
+    }
+
+    /// (a) Called once per extension, phase-major in registration order, after
+    /// `tools` and before the Client API is bound. Routes are recorded,
+    /// validated, and replayed inside the bind factory.
+    fn client_families(
+        &self,
+        cx: &ComposeCx,
+        reg: &mut ClientFamilyRegistrar<'_>,
+    ) -> Result<(), ExtensionError> {
+        let _ = (cx, reg);
+        Ok(())
     }
 
     /// `true` asks for [`ComposeCx::secrets`](crate::api::ComposeCx::secrets), a view
@@ -133,6 +147,12 @@ impl From<SecretViewError> for ExtensionError {
 impl From<ViewError> for ExtensionError {
     fn from(error: ViewError) -> Self {
         Self::new(error.to_string())
+    }
+}
+
+impl From<RouteRefusal> for ExtensionError {
+    fn from(refusal: RouteRefusal) -> Self {
+        Self::new(refusal.to_string())
     }
 }
 

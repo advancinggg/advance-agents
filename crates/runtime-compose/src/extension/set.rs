@@ -145,6 +145,7 @@ pub struct ExtensionSet {
     plan: ExtensionPlan,
     secret_need: bool,
     capabilities: EffectiveCapabilities,
+    route_gate: advance_client_api::ExtensionRouteGate,
 }
 
 /// Home / profile / process policy captured at prepare.
@@ -239,6 +240,7 @@ impl ExtensionSet {
             },
             secret_need: false,
             capabilities: EffectiveCapabilities::default(),
+            route_gate: advance_client_api::ExtensionRouteGate::new(),
         })
     }
 
@@ -329,6 +331,7 @@ impl ExtensionSet {
             plan,
             secret_need,
             capabilities: EffectiveCapabilities::from_extension_entries(&declarations),
+            route_gate: advance_client_api::ExtensionRouteGate::new(),
         }))
     }
 
@@ -359,6 +362,10 @@ impl ExtensionSet {
 
     pub fn clock(&self) -> Arc<dyn Clock> {
         Arc::clone(&self.clock)
+    }
+
+    pub fn route_gate(&self) -> &advance_client_api::ExtensionRouteGate {
+        &self.route_gate
     }
 
     pub fn secret_plan(&self, oss_store: bool) -> Result<SecretPlan, ComposeError> {

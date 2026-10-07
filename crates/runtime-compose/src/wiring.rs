@@ -3294,6 +3294,36 @@ pub(crate) async fn wire_capabilities_inner(
         repetition_guard_handle = Some(guard);
     }
 
+    // MODULE-001 §1.4.7 (a): extension client families — after tools, before
+    // bind_runtime and the Client API bind factory.
+    let client_api_config_base = advance_client_api::ClientApiConfig::default();
+    let client_cursor_codec: Arc<dyn advance_client_api::ClientCursorCodec> =
+        Arc::new(advance_client_api::AeadClientCursorCodec::new(
+            Arc::new(advance_client_api::MemoryCursorKeyCustody::new_local()),
+            Arc::new(advance_client_api::SystemCursorClock),
+            Arc::new(advance_client_api::OsCursorEntropy),
+            client_event_retention_days,
+        ));
+    let extension_families = match crate::extension_families::run_client_families(
+        &extensions,
+        &client_api_config_base,
+        advance_client_api::families::ExtensionServiceParts {
+            leak_detector: Arc::clone(&public_leak_detector),
+            clock: extensions.clock(),
+            cursor_codec: Arc::clone(&client_cursor_codec),
+        },
+        extensions.route_gate().clone(),
+        &log,
+    ) {
+        Ok(families) => families,
+        Err(error) => {
+            return Err(WiringFailure {
+                error: WiringError::Compose(error),
+                partial: started,
+            });
+        }
+    };
+
     // Wave-23 seam (d): late-bind the post-`build()` runtime + injector into the
     // per-child manager (constructed pre-build when it was attached as the spawner's
     // observer) so a runtime spawn can load + serve the child.
@@ -3504,7 +3534,7 @@ pub(crate) async fn wire_capabilities_inner(
             > = Arc::default();
             let run_control_workers_for_api = Arc::clone(&run_control_workers);
             let factory = move |address: std::net::SocketAddr| {
-                let mut config = advance_client_api::ClientApiConfig::default();
+                let mut config = client_api_config_base;
                 config.allowed_origins = vec![format!("http://{address}")];
                 let mut api = advance_client_api::ClientApi::new(config);
                 let mut workers = run_control_workers_for_api
@@ -3542,12 +3572,7 @@ pub(crate) async fn wire_capabilities_inner(
                         Arc::new(history);
                     let events: Arc<dyn advance_client_api::ClientEventProvider> = Arc::new(events);
                     let cursor: Arc<dyn advance_client_api::ClientCursorCodec> =
-                        Arc::new(advance_client_api::AeadClientCursorCodec::new(
-                            Arc::new(advance_client_api::MemoryCursorKeyCustody::new_local()),
-                            Arc::new(advance_client_api::SystemCursorClock),
-                            Arc::new(advance_client_api::OsCursorEntropy),
-                            client_event_retention_days,
-                        ));
+                        Arc::clone(&client_cursor_codec);
                     parts.history = Some(history);
                     parts.events = Some(events);
                     parts.cursor = Some(cursor);
@@ -3566,6 +3591,7 @@ pub(crate) async fn wire_capabilities_inner(
                 }
                 drop(workers);
                 api = crate::client_api_adapters::compose_first_party_client(api, parts);
+                extension_families.install(&mut api);
                 Arc::new(api)
             };
             let bound =

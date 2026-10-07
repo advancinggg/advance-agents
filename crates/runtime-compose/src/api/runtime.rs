@@ -176,20 +176,24 @@ pub struct ShutdownHandle {
 struct ShutdownShared {
     started: AtomicBool,
     token: CancellationToken,
+    route_gate: advance_client_api::ExtensionRouteGate,
 }
 
 impl ShutdownHandle {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(route_gate: advance_client_api::ExtensionRouteGate) -> Self {
         Self {
             shared: Arc::new(ShutdownShared {
                 started: AtomicBool::new(false),
                 token: CancellationToken::new(),
+                route_gate,
             }),
         }
     }
 
     /// Start the shutdown. `true` only for the call that started it.
+    /// Closes the extension route gate first, then swaps the started flag and cancels the token.
     pub fn trigger(&self) -> bool {
+        self.shared.route_gate.close();
         let first = !self.shared.started.swap(true, Ordering::AcqRel);
         self.shared.token.cancel();
         first
@@ -221,7 +225,7 @@ mod tests {
     /// Only the first trigger, through any clone, starts the shutdown.
     #[test]
     fn module_001_ac30_shutdown_handle_trigger_is_idempotent_across_clones() {
-        let first = ShutdownHandle::new();
+        let first = ShutdownHandle::new(advance_client_api::ExtensionRouteGate::new());
         let second = first.clone();
         let token = first.token();
         assert!(!first.is_triggered() && !second.is_triggered());

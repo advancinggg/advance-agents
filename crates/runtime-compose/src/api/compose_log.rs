@@ -201,6 +201,17 @@ pub mod log_keys {
     /// Std's default panic hook still prints the panic (with its payload) to stderr;
     /// this line never carries that payload.
     pub const EXT_HOLD_DROP_PANICKED: &str = "ext.hold_drop_panicked";
+    /// stderr: an extension route handler panicked; the request answered
+    /// `module_unavailable`. This line never carries the panic payload.
+    pub const EXT_ROUTE_PANICKED: &str = "ext.route_panicked";
+    /// stderr: an extension route returned error details that are not stable tokens.
+    pub const EXT_ROUTE_DETAILS_DROPPED: &str = "ext.route_details_dropped";
+    /// stderr: an extension route returned warnings with a non-token code or a blocked message.
+    pub const EXT_ROUTE_WARNINGS_DROPPED: &str = "ext.route_warnings_dropped";
+    /// stderr: an extension route returned error code unknown; answered `module_unavailable`.
+    pub const EXT_ROUTE_CODE_REMAPPED: &str = "ext.route_code_remapped";
+    /// stderr: an extension route skips the response leak scan (the registered reason).
+    pub const EXT_ROUTE_SCAN_OPT_OUT: &str = "ext.route_scan_opt_out";
 
     // Objects the daemon does not start, available to embedders.
     /// stdout: an agent reply preview.
@@ -292,6 +303,11 @@ pub mod log_keys {
         EXT_INFERENCE_PORT_PANICKED,
         EXT_MESH_DISPATCH_PANICKED,
         EXT_HOLD_DROP_PANICKED,
+        EXT_ROUTE_PANICKED,
+        EXT_ROUTE_DETAILS_DROPPED,
+        EXT_ROUTE_WARNINGS_DROPPED,
+        EXT_ROUTE_CODE_REMAPPED,
+        EXT_ROUTE_SCAN_OPT_OUT,
         REPLY_AGENT_REPLY,
         WEBHOOK_TRIGGER_SEND_FAILED,
         ROLLBACK_MARK_PRE_TURN_FAILED,

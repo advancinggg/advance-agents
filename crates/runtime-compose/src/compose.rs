@@ -173,7 +173,7 @@ pub async fn compose(
             exts.spawn_on_started(started);
             // The one task that owns the composition: it runs the shutdown sequence once
             // the handle is triggered.
-            let shutdown = ShutdownHandle::new();
+            let shutdown = ShutdownHandle::new(exts.route_gate().clone());
             let (done_tx, done_rx) = watch::channel(false);
             let triggered = shutdown.token();
             let supervisor = tokio::spawn(async move {
@@ -363,6 +363,8 @@ const _: () = {
         assert_send::<crate::inference::contained::ContainedStream>();
         assert_send_sync::<crate::inference::ComposedClaimedPreflight>();
         assert_send_sync::<crate::inference::ClaimedPreflightStopper>();
+        assert_send::<advance_client_api::ExtensionFamilies>();
+        assert_send_sync::<advance_client_api::ExtensionRouteGate>();
     }
 };
 

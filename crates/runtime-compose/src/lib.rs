@@ -53,6 +53,7 @@ mod threads;
 #[doc(hidden)]
 pub mod extension;
 
+mod extension_families;
 mod inference;
 
 // Test-only seams of the composition: failpoints, the turn gate, the probe, the

@@ -6,6 +6,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use advance_client_api::families::RouteRefusalReason;
+
 /// A composition that did not start. Whatever had started is stopped before the
 /// error is returned.
 #[non_exhaustive]
@@ -29,7 +31,7 @@ pub enum ComposeError {
     Registration {
         extension: &'static str,
         route: String,
-        reason: String,
+        reason: RouteRefusalReason,
     },
     /// An extension's claim on an inference entry, profile, or mesh dispatch was refused.
     InferenceClaim {
@@ -219,7 +221,16 @@ impl fmt::Display for ComposeError {
                 extension,
                 route,
                 reason,
-            } => write!(f, "extension {extension}: route {route} refused: {reason}"),
+            } => {
+                if matches!(
+                    reason,
+                    RouteRefusalReason::InvalidBudget { .. } | RouteRefusalReason::BudgetAlreadySet
+                ) {
+                    write!(f, "extension {extension}: family budget refused: {reason}")
+                } else {
+                    write!(f, "extension {extension}: route {route} refused: {reason}")
+                }
+            }
             ComposeError::InferenceClaim {
                 extension,
                 subject,

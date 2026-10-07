@@ -406,6 +406,7 @@ impl Composition {
 
     /// Stop everything, in order (see the module documentation).
     pub(crate) async fn teardown(mut self, reason: TeardownReason) {
+        self.extensions.route_gate().close();
         let log = self.log.clone();
         if let Some(view) = self.view.as_ref() {
             view.set_phase(RuntimePhase::ShuttingDown);
