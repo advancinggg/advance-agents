@@ -88,14 +88,14 @@ use cap_http::{
 use cap_lifecycle::spawn::{SpawnChildConfig, SpawnerSubsetGate};
 use cap_lifecycle::{
     register_agent_component_submit, register_agent_decomposition, register_agent_spawn,
-    AgentTreeStore, BuiltinTemplateRegistry, CapGrantSubsetAdapter, ComponentSubmitGate,
-    DefaultDecompositionStore, DefaultSpawner, SpawnError, SpawnObserver, Spawner,
-    WorkspaceFileResidentPolicy,
+    AgentTreeStore, BuiltinTemplateRegistry, ComponentSubmitGate, DefaultDecompositionStore,
+    DefaultSpawner, SpawnError, SpawnObserver, Spawner, WorkspaceFileResidentPolicy,
 };
 
 use crate::api::{log_keys, ClientApiOptions, ComposeError};
 use crate::component_submit_bridge::{CapGrantSubmitSubsetGate, SchedulerSubmitBridge};
 use crate::compose_log::LogHandle;
+use crate::effective_capabilities::{EffectiveCapabilities, EffectiveSubsetGate};
 use crate::extension::{CxParts, ExtensionSet, SecretPlan};
 // Pack lane P1: the composition-root pack wiring (ONE rescanned pack
 // registry + the chained built-in ∪ pack template resolver + the evaluator resolver).
@@ -1072,15 +1072,33 @@ pub fn materialize_config_tree_with_resolver(
     decls: &[crate::agent_config::AgentDecl],
     template_resolver: Arc<dyn TemplateResolver>,
 ) -> Result<(), CliWiringError> {
+    materialize_config_tree_with_capabilities(
+        tree,
+        root_id,
+        decls,
+        template_resolver,
+        &EffectiveCapabilities::default(),
+    )
+}
+
+/// [`materialize_config_tree_with_resolver`] over an explicit effective set.
+pub(crate) fn materialize_config_tree_with_capabilities(
+    tree: &Arc<AgentTreeStore>,
+    root_id: &AgentId,
+    decls: &[crate::agent_config::AgentDecl],
+    template_resolver: Arc<dyn TemplateResolver>,
+    capabilities: &EffectiveCapabilities,
+) -> Result<(), CliWiringError> {
     if decls.is_empty() {
         return Ok(());
     }
     // One template-resolving spawner sharing THIS tree. Mirrors the
     // `register_agent_spawn` block's spawner construction so config-materialized
     // children are indistinguishable from runtime-spawned ones.
+    let gate: Arc<dyn SpawnerSubsetGate> = Arc::new(EffectiveSubsetGate::new(capabilities.clone()));
     let spawner = DefaultSpawner::with_template_resolver(
         (**tree).clone(),
-        Arc::new(CapGrantSubsetAdapter::new()),
+        Arc::clone(&gate),
         template_resolver,
     );
     let mut queue: std::collections::VecDeque<(AgentId, &[crate::agent_config::AgentDecl])> =
@@ -1091,7 +1109,7 @@ pub fn materialize_config_tree_with_resolver(
         // daemon lifetime (its target dir carries `.agent/`) is ADOPTED into the tree, because
         // `init_child_workspace` fail-fasts on an existing `.agent/` and would otherwise abort
         // every second boot of a workspace with declared (or client-created) children.
-        adopt_existing_declared(tree, &parent_id, children)?;
+        adopt_existing_declared(tree, &parent_id, children, gate.as_ref())?;
         let parent = tree.get_node(&parent_id).ok_or_else(|| {
             CliWiringError::ConfigTree(format!("declared parent {:?} not in tree", parent_id))
         })?;
@@ -1189,12 +1207,13 @@ fn materialize_declared_child(
 /// "alias present, path matches, same template → skip". Path rules are the applier's own
 /// (`resolve_under_parent` + `symlink_check`), so adoption can never widen what a decl may
 /// name. Adopted nodes carry the decl's `capabilities:` (subset-gated against the parent node
-/// with the same `CapGrantSubsetAdapter` the spawner uses), so a client-created child keeps the
+/// with the same gate the spawner uses), so a client-created child keeps the
 /// capability set it was created/updated with across daemon restarts.
 fn adopt_existing_declared(
     tree: &Arc<AgentTreeStore>,
     parent_id: &AgentId,
     decls: &[crate::agent_config::AgentDecl],
+    gate: &dyn SpawnerSubsetGate,
 ) -> Result<(), CliWiringError> {
     let Some(parent) = tree.get_node(parent_id) else {
         return Ok(()); // the applier reports ParentNotFound
@@ -1221,8 +1240,7 @@ fn adopt_existing_declared(
             CliWiringError::ConfigTree(format!("adopt declared agent {}: {e}", decl.alias))
         })?;
         let capabilities = declared_capabilities(decl);
-        CapGrantSubsetAdapter::new()
-            .check(&parent.capabilities, &capabilities)
+        gate.check(&parent.capabilities, &capabilities)
             .map_err(|e| {
                 CliWiringError::ConfigTree(format!("adopt declared agent {}: {e}", decl.alias))
             })?;
@@ -1439,6 +1457,10 @@ pub(crate) async fn wire_capabilities_inner(
         fail_after_git_queue,
         extensions,
     } = opts;
+    let effective = extensions.effective_capabilities().clone();
+    probe_record!(probe, |record| {
+        record.effective_capabilities = Some(effective.clone());
+    });
     let home_override = home_override.as_deref();
     let state_root = state_root.as_deref();
     // Step 1 — snapshot the agent config YAML ONCE.
@@ -1687,13 +1709,14 @@ pub(crate) async fn wire_capabilities_inner(
             // spawn subset gate (`spawn_child` checks child caps ⊆ parent node caps)
             // admits a child requesting any cap the root holds — e.g. a `messaging`
             // child. Was `Vec::new()`, which rejected every non-empty child request.
-            let root_caps: Vec<Capability> = crate::agent_config::active_capabilities(yaml)
-                .into_iter()
-                .map(|r| Capability {
-                    id: r.capability,
-                    params: CapParams::empty(),
-                })
-                .collect();
+            let root_caps: Vec<Capability> =
+                crate::agent_config::active_capabilities_with(yaml, &effective)
+                    .into_iter()
+                    .map(|r| Capability {
+                        id: r.capability,
+                        params: CapParams::empty(),
+                    })
+                    .collect();
             tree.insert_root_with_handle(
                 AgentNode {
                     id: AgentId(root_uid.clone()),
@@ -1720,13 +1743,14 @@ pub(crate) async fn wire_capabilities_inner(
     // (`declares_fs || declares_messaging`): a config without fs/messaging has no tree
     // and so declares no materializable territory.
     if let Some(tree) = agent_tree.as_ref() {
-        let decls = crate::agent_config::parse_agents_config(yaml)
+        let decls = crate::agent_config::parse_agents_config_with(yaml, &effective)
             .map_err(|e| CliWiringError::ConfigTree(format!("{e}")))?;
-        materialize_config_tree_with_resolver(
+        materialize_config_tree_with_capabilities(
             tree,
             &AgentId(root_uid.clone()),
             &decls,
             template_resolver.clone(),
+            &effective,
         )?;
     }
 
@@ -2283,7 +2307,7 @@ pub(crate) async fn wire_capabilities_inner(
         // may name an installed pack template by FQ ref.
         let spawner_concrete = DefaultSpawner::with_template_resolver(
             (**tree).clone(),
-            Arc::new(CapGrantSubsetAdapter::new()),
+            Arc::new(EffectiveSubsetGate::new(effective.clone())),
             template_resolver.clone(),
         );
         // Wave-23 seam (d): when messaging is wired (so the shared routing/bridge/
@@ -3242,18 +3266,21 @@ pub(crate) async fn wire_capabilities_inner(
                 if let Some(executor) = pack_executor.as_ref() {
                     let _ = executor.set_terminate_controller(Arc::clone(&terminator));
                 }
-                Some(Arc::new(crate::client_api_agents::AgentAdminAdapter::new(
-                    (**tree).clone(),
-                    Arc::clone(spawner),
-                    terminator,
-                    // Pack lane P1: the same chained resolver, so
-                    // `/client/agents/templates` lists installed pack templates too.
-                    template_resolver.clone(),
-                    AgentId(root_uid.clone()),
-                    // Lane agent-llm-policy: `llm.provider` ids validate against the LIVE config
-                    // (the builder is consumed by `build()` above; the host owns the watcher).
-                    host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
-                )))
+                Some(Arc::new(
+                    crate::client_api_agents::AgentAdminAdapter::new(
+                        (**tree).clone(),
+                        Arc::clone(spawner),
+                        terminator,
+                        // Pack lane P1: the same chained resolver, so
+                        // `/client/agents/templates` lists installed pack templates too.
+                        template_resolver.clone(),
+                        AgentId(root_uid.clone()),
+                        // Lane agent-llm-policy: `llm.provider` ids validate against the LIVE config
+                        // (the builder is consumed by `build()` above; the host owns the watcher).
+                        host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
+                    )
+                    .with_effective_capabilities(effective.clone()),
+                ))
             }
             _ => None,
         };
@@ -3355,7 +3382,10 @@ pub(crate) async fn wire_capabilities_inner(
                     env!("CARGO_PKG_VERSION"),
                 )
                 .with_pack_runtime(Arc::clone(&pack_runtime))
-                .with_workflows(Arc::clone(&pack_wiring.materializer), root_uid.as_str()),
+                .with_workflows(Arc::clone(&pack_wiring.materializer), root_uid.as_str())
+                .with_extension_capabilities(
+                    effective.extension_names().map(String::from).collect(),
+                ),
             );
             // Secrets family: the home's secrets
             // mode over the same runtime-config.yaml write chain the selected-provider

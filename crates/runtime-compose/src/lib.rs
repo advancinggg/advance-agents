@@ -64,6 +64,8 @@ pub mod test_support;
 pub mod registry;
 
 pub mod agent_config;
+#[doc(hidden)]
+pub mod effective_capabilities;
 // Lane agent-llm-policy (2026-09-16) — the production `AgentLlmPolicySource`: resolves an
 // agent's `.agent/config.yaml` `llm:` block (provider pin / default model / constraint) for the
 // cap-llm gateway, cached by file mtime.

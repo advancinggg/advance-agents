@@ -30,7 +30,7 @@ use advance_pack_manager::{
 use advance_runtime::config::PackConfig;
 use async_trait::async_trait;
 
-use crate::capability_catalog::capability_catalog;
+use crate::capability_catalog::build_capability_catalog_with;
 use crate::pack_registry_client::HttpsRegistryClient;
 
 /// Approves a manifest iff every `required-capabilities` entry was accepted by the request.
@@ -66,6 +66,8 @@ pub struct WiredPackAdminProvider {
     pack_runtime: Option<Arc<crate::pack_runtime::PackRuntime>>,
     /// Runs pack workflows (`:apply`) with the operator's identity over the workspace.
     workflows: Option<(Arc<DefaultMaterializer>, WorkflowContext)>,
+    /// Extension capability names admitted in `required-capabilities` (empty = KNOWN only).
+    extension_capabilities: Vec<String>,
 }
 
 impl WiredPackAdminProvider {
@@ -82,7 +84,14 @@ impl WiredPackAdminProvider {
             runtime_version: runtime_version.into(),
             pack_runtime: None,
             workflows: None,
+            extension_capabilities: Vec::new(),
         }
+    }
+
+    /// Admit these extension capability names in pack `required-capabilities`.
+    pub fn with_extension_capabilities(mut self, names: Vec<String>) -> Self {
+        self.extension_capabilities = names;
+        self
     }
 
     /// Let `POST /client/packs/{pack_id}:apply` run a pack's workflows through `materializer`
@@ -150,10 +159,10 @@ impl WiredPackAdminProvider {
     }
 
     fn installer(&self, approval: Arc<dyn ApprovalStrategy>) -> Result<Installer, ProviderError> {
-        let approval = Arc::new(CatalogCheckedApproval::new(
-            approval,
-            Arc::new(capability_catalog()),
-        ));
+        let catalog =
+            build_capability_catalog_with(&self.registry, &self.extension_capabilities)
+                .map_err(|e| ProviderError::Unavailable(format!("capability catalog: {e}")))?;
+        let approval = Arc::new(CatalogCheckedApproval::new(approval, Arc::new(catalog)));
         let fetch_timeout = Duration::from_secs(self.config.fetch_timeout_sec);
         let mut installer = Installer::new(
             self.packs_dir.clone(),

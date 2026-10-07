@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 
 use advance_shared_types::capability::{CapRequest, CapabilityId};
 
+use crate::effective_capabilities::EffectiveCapabilities;
+
 /// Capabilities the runtime knows how to wire, in a deterministic order. Each
 /// name is BOTH the `.agent/config.yaml` `capabilities:` key AND the
 /// registration capability string of its host-fn provider — verified against
@@ -118,16 +120,51 @@ pub fn yaml_declares_active_capability(bytes: &[u8], cap: &str) -> bool {
 /// host-fn registration string), so the requested caps and the registered host
 /// fns line up exactly.
 pub fn active_capabilities(yaml: Option<&[u8]>) -> Vec<CapRequest> {
+    active_capabilities_with(yaml, &EffectiveCapabilities::default())
+}
+
+/// [`active_capabilities`] over an explicit effective set: known names in
+/// known order, then extension names in declaration order, each filtered by
+/// the same first-matching-key / value rule as
+/// [`yaml_declares_active_capability`]. The document is parsed once.
+pub fn active_capabilities_with(
+    yaml: Option<&[u8]>,
+    capabilities: &EffectiveCapabilities,
+) -> Vec<CapRequest> {
     let Some(bytes) = yaml else {
         return Vec::new();
     };
-    KNOWN_CAPABILITIES
-        .iter()
-        .filter(|cap| yaml_declares_active_capability(bytes, cap))
+    let v: serde_yml::Value = match serde_yml::from_slice(bytes) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(caps) = v
+        .as_mapping()
+        .and_then(|m| m.get(serde_yml::Value::String("capabilities".into())))
+        .and_then(|c| c.as_mapping())
+    else {
+        return Vec::new();
+    };
+    capabilities
+        .names()
+        .filter(|cap| declares_active_in(caps, cap))
         .map(|cap| CapRequest {
-            capability: CapabilityId::from(*cap),
+            capability: CapabilityId::from(cap),
         })
         .collect()
+}
+
+/// The per-value rule of [`yaml_declares_active_capability`]: first matching
+/// key; `false` inactive, `true` / any mapping active, other inactive.
+fn declares_active_in(caps: &serde_yml::Mapping, cap: &str) -> bool {
+    let entry = caps.iter().find(|(k, _)| k.as_str() == Some(cap));
+    let Some((_, val)) = entry else { return false };
+    match val {
+        serde_yml::Value::Bool(false) => false,
+        serde_yml::Value::Bool(true) => true,
+        serde_yml::Value::Mapping(_) => true,
+        _ => false,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -295,6 +332,15 @@ fn precheck_yaml_anchors(bytes: &[u8]) -> Result<(), AgentConfigError> {
 ///   [`read_agent_yaml`] read cap; adding the precheck to the capability gate is a
 ///   pre-existing concern outside this additive lane.
 pub fn parse_agents_config(yaml: Option<&[u8]>) -> Result<Vec<AgentDecl>, AgentConfigError> {
+    parse_agents_config_with(yaml, &EffectiveCapabilities::default())
+}
+
+/// [`parse_agents_config`] over an explicit effective set, so a declared child
+/// may name an extension capability.
+pub fn parse_agents_config_with(
+    yaml: Option<&[u8]>,
+    capabilities: &EffectiveCapabilities,
+) -> Result<Vec<AgentDecl>, AgentConfigError> {
     let Some(bytes) = yaml else {
         return Ok(Vec::new());
     };
@@ -321,7 +367,7 @@ pub fn parse_agents_config(yaml: Option<&[u8]>) -> Result<Vec<AgentDecl>, AgentC
         .map_err(|e| AgentConfigError::Parse(e.to_string()))?;
     let mut seen = std::collections::HashSet::new();
     let mut count = 0usize;
-    validate_decls(&decls, 1, &mut seen, &mut count)?;
+    validate_decls(&decls, 1, &mut seen, &mut count, capabilities)?;
     Ok(decls)
 }
 
@@ -335,6 +381,7 @@ fn validate_decls(
     depth: usize,
     seen: &mut std::collections::HashSet<String>,
     count: &mut usize,
+    capabilities: &EffectiveCapabilities,
 ) -> Result<(), AgentConfigError> {
     if depth > MAX_AGENT_TREE_DEPTH {
         return Err(AgentConfigError::TooDeep(depth));
@@ -345,12 +392,12 @@ fn validate_decls(
         if !seen.insert(d.alias.clone()) {
             return Err(AgentConfigError::DuplicateAlias(d.alias.clone()));
         }
-        validate_declared_capabilities(&d.capabilities)?;
+        validate_declared_capabilities_with(&d.capabilities, capabilities)?;
         *count += 1;
         if *count > MAX_AGENT_TREE_NODES {
             return Err(AgentConfigError::TooManyNodes(*count));
         }
-        validate_decls(&d.children, depth + 1, seen, count)?;
+        validate_decls(&d.children, depth + 1, seen, count, capabilities)?;
     }
     Ok(())
 }
@@ -358,6 +405,15 @@ fn validate_decls(
 /// Validate a declaration's `capabilities:` list: bounded, each id `^[A-Za-z0-9_-]{1,64}$`
 /// (the cap-lifecycle id charset — never a `:`-scoped form), no duplicates.
 pub fn validate_declared_capabilities(capabilities: &[String]) -> Result<(), AgentConfigError> {
+    validate_declared_capabilities_with(capabilities, &EffectiveCapabilities::default())
+}
+
+/// [`validate_declared_capabilities`] over an explicit effective set: an entry
+/// passes if it is a cap-lifecycle agent id **or** an extension capability.
+pub fn validate_declared_capabilities_with(
+    capabilities: &[String],
+    effective: &EffectiveCapabilities,
+) -> Result<(), AgentConfigError> {
     if capabilities.len() > MAX_DECLARED_CAPABILITIES {
         return Err(AgentConfigError::InvalidCapability(format!(
             "{} entries > {MAX_DECLARED_CAPABILITIES}",
@@ -365,8 +421,9 @@ pub fn validate_declared_capabilities(capabilities: &[String]) -> Result<(), Age
         )));
     }
     for (i, cap) in capabilities.iter().enumerate() {
-        cap_lifecycle::validate_agent_id(cap)
-            .map_err(|_| AgentConfigError::InvalidCapability(cap.clone()))?;
+        if cap_lifecycle::validate_agent_id(cap).is_err() && !effective.is_extension(cap) {
+            return Err(AgentConfigError::InvalidCapability(cap.clone()));
+        }
         if capabilities[..i].iter().any(|c| c == cap) {
             return Err(AgentConfigError::InvalidCapability(format!(
                 "duplicate {cap}"
@@ -375,6 +432,9 @@ pub fn validate_declared_capabilities(capabilities: &[String]) -> Result<(), Age
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod effective_tests;
 
 #[cfg(test)]
 mod tests {

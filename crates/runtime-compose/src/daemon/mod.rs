@@ -288,6 +288,7 @@ pub(crate) async fn compose_graph(
         #[cfg(feature = "test-support")]
         failpoints,
     } = opts;
+    let capabilities = wiring.extensions.effective_capabilities().clone();
     let workspace = workspace.to_path_buf();
     // 5b. Wire production cap-grant + cap-secrets + EventBus. The host and the
     // handles go to the composition, which stops them in order at shutdown; the
@@ -442,6 +443,7 @@ pub(crate) async fn compose_graph(
         LoopSpawnExtras {
             log: log.clone(),
             hooks_shutdown: CancellationToken::new(),
+            capabilities,
             #[cfg(feature = "test-support")]
             turn_gate: failpoints.turn_gate.clone(),
             #[cfg(feature = "test-support")]
@@ -941,8 +943,9 @@ async fn try_spawn_agent_loop(
     // registered host fns line up exactly (via the shared `agent_config`
     // helper). No config (or none active) → empty set, consistent with wiring
     // registering no host fns in that case.
-    let caps = crate::agent_config::active_capabilities(
+    let caps = crate::agent_config::active_capabilities_with(
         crate::agent_config::read_agent_yaml(workspace).as_deref(),
+        &extras.capabilities,
     );
     // Backbone Step 2 (adversarial r9 W2): snapshot the agent's DECLARED cap names
     // here, BEFORE `caps` is moved into `WasmMessageHandler::new`, so the
@@ -952,6 +955,9 @@ async fn try_spawn_agent_loop(
         .iter()
         .map(|c| c.capability.as_str().to_string())
         .collect();
+    probe_record!(extras.probe, |record| {
+        record.root_request_set = Some(declared_cap_names.clone());
+    });
     // Phase-3 kickoff: one shared cell carries the session RunId from the
     // driver-side `RunManagerBootstrap` to the handler's `init`. Both use the
     // SAME bare `cap_agent_id`, so the bootstrap's run is exactly the run the
@@ -1357,6 +1363,8 @@ async fn try_spawn_agent_loop(
 pub(crate) struct LoopSpawnExtras {
     /// Where the loop, its observers and its listeners report.
     pub log: LogHandle,
+    /// Known ∪ extension capabilities for the root guest request set.
+    pub capabilities: crate::effective_capabilities::EffectiveCapabilities,
     /// Cancelled to stop the channel `/hooks` listener gracefully.
     pub hooks_shutdown: CancellationToken,
     /// Holds each root-loop turn before its context is assembled (test-only).

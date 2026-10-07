@@ -17,6 +17,7 @@ use cap_llm::{LlmGateway, ModelProfileCatalog};
 use tokio::sync::Notify;
 
 use crate::api::{ComposeLog, ComposeLogLine};
+use crate::effective_capabilities::EffectiveCapabilities;
 use crate::perchild_daemon::PerChildLoopManager;
 
 pub use crate::composition::TEARDOWN_ORDER;
@@ -159,6 +160,10 @@ pub struct ProbeRecord {
     /// One entry per teardown step that ran, in order: the step's name (one of
     /// [`TEARDOWN_ORDER`]) and tokio's `num_alive_tasks` right after it.
     pub teardown_steps: Vec<(&'static str, usize)>,
+    /// The composition's effective capability set (known ∪ extension names).
+    pub effective_capabilities: Option<EffectiveCapabilities>,
+    /// The root loop's declared capability names (the guest request set).
+    pub root_request_set: Option<Vec<String>>,
 }
 
 impl ProbeRecord {

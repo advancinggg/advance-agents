@@ -59,16 +59,16 @@ use cap_lifecycle::spawn::{SpawnChildConfig, Spawner, SpawnerSubsetGate};
 use cap_lifecycle::templates::TemplateResolver;
 use cap_lifecycle::terminate::{LoopCascade, MailboxCascade, TerminateController};
 use cap_lifecycle::{
-    atomic_write, AgentTreeStore, CapGrantSubsetAdapter, DefaultTerminateController,
-    FsMemoryArchiver, FsWorkspaceCleanup, GrantRevokeCascade, LifecycleError, RunManagerCascade,
-    SpawnError,
+    atomic_write, AgentTreeStore, DefaultTerminateController, FsMemoryArchiver, FsWorkspaceCleanup,
+    GrantRevokeCascade, LifecycleError, RunManagerCascade, SpawnError,
 };
 use serde_yml::{Mapping, Value};
 
 use crate::agent_config::{
-    parse_agent_llm_config, parse_agents_config, read_agent_yaml, upsert_llm_block, AgentDecl,
+    parse_agent_llm_config, parse_agents_config_with, read_agent_yaml, upsert_llm_block, AgentDecl,
     AgentLlmDecl,
 };
+use crate::effective_capabilities::{EffectiveCapabilities, EffectiveSubsetGate};
 
 const AGENT_DIR: &str = ".agent";
 const CONFIG_FILE: &str = "config.yaml";
@@ -87,6 +87,8 @@ pub struct AgentAdminAdapter {
     config: Arc<dyn RuntimeConfigProvider>,
     /// Serializes every mutation: tree edits + root-config rewrites must not interleave.
     mutation: Mutex<()>,
+    /// Known ∪ extension capabilities this composition admits.
+    capabilities: EffectiveCapabilities,
 }
 
 impl AgentAdminAdapter {
@@ -108,7 +110,15 @@ impl AgentAdminAdapter {
             workspace_root,
             config,
             mutation: Mutex::new(()),
+            capabilities: EffectiveCapabilities::default(),
         }
+    }
+
+    /// Admit this composition's effective capability set (create/update charset,
+    /// hierarchy check, subset gate).
+    pub fn with_effective_capabilities(mut self, capabilities: EffectiveCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -196,7 +206,10 @@ impl AgentAdminAdapter {
         let agent_dir = node.workspace_path.join(AGENT_DIR);
         ClientAgentDetail {
             agent: self.summary(node),
-            config: project_config(read_config_document(&node.workspace_path).as_deref()),
+            config: project_config_with(
+                read_config_document(&node.workspace_path).as_deref(),
+                &self.capabilities,
+            ),
             capabilities: node
                 .capabilities
                 .iter()
@@ -232,10 +245,10 @@ impl AgentAdminAdapter {
         let text = serde_yml::to_string(&Value::Mapping(doc.clone()))
             .map_err(|_| ProviderError::Unavailable("agent config serialize".into()))?;
         // The rewritten hierarchy must still pass the boot materializer's schema + caps.
-        parse_agents_config(Some(text.as_bytes()))
+        parse_agents_config_with(Some(text.as_bytes()), &self.capabilities)
             .map_err(|_| ProviderError::InvalidRequest("declared hierarchy".into()))?;
         if workspace == self.root_workspace()? {
-            check_hierarchy_capabilities(&text)?;
+            check_hierarchy_capabilities_with(&text, &self.capabilities)?;
         }
         self.write_config_text(workspace, &text)
     }
@@ -395,7 +408,8 @@ impl AgentAdminAdapter {
         let invalid = || ProviderError::InvalidRequest("agent config document".into());
         // Anchor/alias amplification guard + strict `agents:` schema (the lenient whole-doc parse
         // inside is followed by our own strict parse below).
-        parse_agents_config(Some(yaml.as_bytes())).map_err(|_| invalid())?;
+        parse_agents_config_with(Some(yaml.as_bytes()), &self.capabilities)
+            .map_err(|_| invalid())?;
         let doc = parse_mapping(yaml.as_bytes()).map_err(|_| invalid())?;
         if let Some(caps) = doc.get(str_value("capabilities")) {
             let caps = caps.as_mapping().ok_or_else(invalid)?;
@@ -613,7 +627,7 @@ impl AgentAdminProvider for AgentAdminAdapter {
                 if node.kind == AgentKind::Root {
                     // A root document defines the next boot's root capability set AND (when
                     // it carries `agents`) the hierarchy: keep them consistent, fail closed.
-                    check_hierarchy_capabilities(yaml)?;
+                    check_hierarchy_capabilities_with(yaml, &self.capabilities)?;
                 }
                 self.write_config_text(&node.workspace_path, yaml)?
             }
@@ -677,7 +691,7 @@ impl AgentAdminProvider for AgentAdminAdapter {
                     params: CapParams::empty(),
                 })
                 .collect();
-            CapGrantSubsetAdapter::new()
+            EffectiveSubsetGate::new(self.capabilities.clone())
                 .check(&parent.capabilities, &requested)
                 .map_err(|_| ProviderError::InvalidRequest("capability subset".into()))?;
             if !self.set_declared_capabilities(&self.handle_of(&node.id), capabilities)? {
@@ -779,6 +793,10 @@ impl AgentAdminProvider for AgentAdminAdapter {
                 }
             })
             .collect())
+    }
+
+    fn admits_capability_name(&self, name: &str) -> bool {
+        self.capabilities.is_extension(name)
     }
 }
 
@@ -939,14 +957,23 @@ fn capabilities_value(capabilities: &[String]) -> Value {
 /// capabilities). A root document whose hierarchy violates that would abort the next daemon
 /// start, so every write of the root document is checked here first (fail-closed →
 /// `invalid_request`). Whole-capability ids only, so containment is the exact gate.
+#[allow(dead_code)] // identity wrapper; tests call it, production uses `_with`
 fn check_hierarchy_capabilities(root_document: &str) -> Result<(), ProviderError> {
+    check_hierarchy_capabilities_with(root_document, &EffectiveCapabilities::default())
+}
+
+fn check_hierarchy_capabilities_with(
+    root_document: &str,
+    capabilities: &EffectiveCapabilities,
+) -> Result<(), ProviderError> {
     let bytes = root_document.as_bytes();
-    let decls = parse_agents_config(Some(bytes))
+    let decls = parse_agents_config_with(Some(bytes), capabilities)
         .map_err(|_| ProviderError::InvalidRequest("declared hierarchy".into()))?;
-    let root_caps: Vec<String> = crate::agent_config::active_capabilities(Some(bytes))
-        .into_iter()
-        .map(|c| c.capability.as_str().to_string())
-        .collect();
+    let root_caps: Vec<String> =
+        crate::agent_config::active_capabilities_with(Some(bytes), capabilities)
+            .into_iter()
+            .map(|c| c.capability.as_str().to_string())
+            .collect();
     fn covered(parent: &[String], decls: &[AgentDecl]) -> bool {
         decls.iter().all(|d| {
             d.capabilities.iter().all(|c| parent.contains(c))
@@ -1109,6 +1136,15 @@ fn declared_child(decl: &AgentDecl) -> ClientAgentDeclaredChild {
 /// that fails the boot materializer's guards projects no typed view (the verbatim text is still
 /// returned).
 pub fn project_config(yaml: Option<&str>) -> ClientAgentConfig {
+    project_config_with(yaml, &EffectiveCapabilities::default())
+}
+
+/// [`project_config`] over an explicit effective set, so declared children may
+/// name extension capabilities.
+pub fn project_config_with(
+    yaml: Option<&str>,
+    capabilities: &EffectiveCapabilities,
+) -> ClientAgentConfig {
     let Some(yaml) = yaml else {
         return ClientAgentConfig {
             config_yaml: None,
@@ -1117,7 +1153,7 @@ pub fn project_config(yaml: Option<&str>) -> ClientAgentConfig {
             llm: None,
         };
     };
-    let Ok(decls) = parse_agents_config(Some(yaml.as_bytes())) else {
+    let Ok(decls) = parse_agents_config_with(Some(yaml.as_bytes()), capabilities) else {
         return ClientAgentConfig {
             config_yaml: Some(yaml.to_string()),
             capabilities: Vec::new(),

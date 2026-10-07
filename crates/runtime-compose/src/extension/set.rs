@@ -24,6 +24,7 @@ use crate::api::{
 };
 use crate::compose_log::LogHandle;
 use crate::composition::StepLog;
+use crate::effective_capabilities::EffectiveCapabilities;
 use crate::extension::guard::{call_guarded, call_guarded_async, CallOutcome};
 use crate::extension::ids::check_extension_id;
 
@@ -142,6 +143,7 @@ pub struct ExtensionSet {
     log: LogHandle,
     plan: ExtensionPlan,
     secret_need: bool,
+    capabilities: EffectiveCapabilities,
 }
 
 /// Home / profile / process policy captured at prepare.
@@ -235,6 +237,7 @@ impl ExtensionSet {
                 processes: ProcessPolicy::Allow,
             },
             secret_need: false,
+            capabilities: EffectiveCapabilities::default(),
         })
     }
 
@@ -321,7 +324,14 @@ impl ExtensionSet {
             log,
             plan,
             secret_need,
+            capabilities: EffectiveCapabilities::default(),
         }))
+    }
+
+    /// Known ∪ the composition's extension capabilities. Default until a follow-up change
+    /// stores `from_extension_entries` after `check_names` / `check_total`.
+    pub fn effective_capabilities(&self) -> &EffectiveCapabilities {
+        &self.capabilities
     }
 
     pub fn is_empty(&self) -> bool {
