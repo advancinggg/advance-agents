@@ -95,7 +95,7 @@ use crate::execution_turn_ingress::ExecutionTurnIngress;
 
 use crate::api::{log_keys, ComposeError, ListenerOptions};
 use crate::compose_log::LogHandle;
-use crate::wiring::{HoldStoppers, WiringFailure, WiringHandles, WiringOptions};
+use crate::wiring::{HoldStoppers, WiringError, WiringFailure, WiringHandles, WiringOptions};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
@@ -307,7 +307,10 @@ pub(crate) async fn compose_graph(
             Ok(pair) => pair,
             Err(WiringFailure { error, partial }) => {
                 return Err(GraphFailure {
-                    error: ComposeError::Wiring(error.to_string()),
+                    error: match error {
+                        WiringError::Cli(error) => ComposeError::Wiring(error.to_string()),
+                        WiringError::Compose(error) => error,
+                    },
                     partial: PartialGraph::Wiring(partial),
                 })
             }

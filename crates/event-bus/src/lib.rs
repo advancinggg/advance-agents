@@ -992,7 +992,7 @@ impl EventBusEmit for EventBus {
 /// Slice C — Event-shape pre-emit gate. Extracted from `EventBus::validate_event_size`
 /// so `EmitPipeline::emit` can call it without going through `&self`. No state
 /// dependency in the body; this is mechanical.
-pub(crate) fn validate_event_size(event: &Event) -> Result<(), EventBusError> {
+pub fn validate_event_size(event: &Event) -> Result<(), EventBusError> {
     if event.event_type.len() > MAX_EVENT_TYPE_LEN {
         return Err(EventBusError::OversizeEventField {
             field: "event_type",

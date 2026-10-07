@@ -173,6 +173,14 @@ pub mod log_keys {
     pub const EXT_SHUTDOWN_ABANDONED: &str = "ext.shutdown_abandoned";
     /// stderr: an extension's shutdown hook panicked (the shutdown continues).
     pub const EXT_SHUTDOWN_PANICKED: &str = "ext.shutdown_panicked";
+    /// stderr: an extension's `on_started` returned an error (the runtime stays up).
+    pub const EXT_ON_STARTED_FAILED: &str = "ext.on_started_failed";
+    /// stderr: an extension's `on_started` panicked (the runtime stays up).
+    pub const EXT_ON_STARTED_PANICKED: &str = "ext.on_started_panicked";
+    /// stderr: a task an extension spawned panicked (the task ended).
+    pub const EXT_TASK_PANICKED: &str = "ext.task_panicked";
+    /// stderr: extension tasks were still running 5s after cancellation (abandoned).
+    pub const EXT_TASKS_ABANDONED: &str = "ext.tasks_abandoned";
 
     // Objects the daemon does not start, available to embedders.
     /// stdout: an agent reply preview.
@@ -253,6 +261,10 @@ pub mod log_keys {
         COMPOSE_THREAD_JOIN_OVERRUN,
         EXT_SHUTDOWN_ABANDONED,
         EXT_SHUTDOWN_PANICKED,
+        EXT_ON_STARTED_FAILED,
+        EXT_ON_STARTED_PANICKED,
+        EXT_TASK_PANICKED,
+        EXT_TASKS_ABANDONED,
         REPLY_AGENT_REPLY,
         WEBHOOK_TRIGGER_SEND_FAILED,
         ROLLBACK_MARK_PRE_TURN_FAILED,

@@ -50,6 +50,9 @@ mod compose;
 mod composition;
 mod threads;
 
+#[doc(hidden)]
+pub mod extension;
+
 // Test-only seams of the composition: failpoints, the turn gate, the probe, the
 // in-memory log.
 #[cfg(feature = "test-support")]

@@ -93,9 +93,10 @@ use cap_lifecycle::{
     WorkspaceFileResidentPolicy,
 };
 
-use crate::api::{log_keys, ClientApiOptions};
+use crate::api::{log_keys, ClientApiOptions, ComposeError};
 use crate::component_submit_bridge::{CapGrantSubmitSubsetGate, SchedulerSubmitBridge};
 use crate::compose_log::LogHandle;
+use crate::extension::{CxParts, ExtensionSet, SecretPlan};
 // Pack lane P1: the composition-root pack wiring (ONE rescanned pack
 // registry + the chained built-in ∪ pack template resolver + the evaluator resolver).
 use crate::pack_wiring::{build_pack_wiring, PackWiring};
@@ -793,6 +794,10 @@ pub struct WiringHandles {
     /// declared) — and the composed `WiredProviderAdmin` the Client API serves (always
     /// composed; it falls back to opening the file when no live store exists).
     pub secret_store: Option<Arc<SecretStore>>,
+    /// Extension-only store when the home declares neither `secrets` nor `llm`
+    /// but an extension asked for one (`SecretPlan::BuildForExtensions`). Views
+    /// hold this weakly; the composition drops it with the other stoppers.
+    pub extension_secret_store: Option<Arc<SecretStore>>,
     pub provider_admin: Option<Arc<crate::client_api_providers::WiredProviderAdmin>>,
     /// Sign in with ChatGPT: the ONE sign-in object the gateway (as the credential source of
     /// `auth-source: chatgpt-oauth` entries) and the provider admin (the sign-in routes) share.
@@ -1274,6 +1279,8 @@ pub(crate) struct WiringOptions {
     /// The wiring fails right after the git commit queue started (test-only).
     #[cfg(feature = "test-support")]
     pub fail_after_git_queue: bool,
+    /// Prepared extensions for this composition (`empty()` when none).
+    pub extensions: Arc<ExtensionSet>,
 }
 
 impl WiringOptions {
@@ -1292,6 +1299,7 @@ impl WiringOptions {
             probe: None,
             #[cfg(feature = "test-support")]
             fail_after_git_queue: false,
+            extensions: ExtensionSet::empty(),
         }
     }
 }
@@ -1314,11 +1322,25 @@ pub(crate) struct HoldStoppers {
     pub breaker_subscriber: Option<advance_messaging::BreakerSubscriber>,
     pub llm_stream_reaper: Option<Arc<cap_llm::AgentStreamReaper>>,
     pub adapter_workers: Vec<Arc<dyn crate::client_api_adapters::WorkerControl>>,
+    pub extension_secret_store: Option<Arc<SecretStore>>,
+}
+
+/// An error inside wiring: either an existing CLI wiring failure or a
+/// composition error from an extension callback.
+pub(crate) enum WiringError {
+    Cli(CliWiringError),
+    Compose(ComposeError),
+}
+
+impl From<CliWiringError> for WiringError {
+    fn from(error: CliWiringError) -> Self {
+        Self::Cli(error)
+    }
 }
 
 /// A wiring failure, with everything the wiring had started by then.
 pub(crate) struct WiringFailure {
-    pub error: CliWiringError,
+    pub error: WiringError,
     pub partial: HoldStoppers,
 }
 
@@ -1327,7 +1349,7 @@ pub(crate) struct WiringFailure {
 impl From<CliWiringError> for WiringFailure {
     fn from(error: CliWiringError) -> Self {
         Self {
-            error,
+            error: error.into(),
             partial: HoldStoppers::default(),
         }
     }
@@ -1390,7 +1412,10 @@ async fn wire_and_stop_on_failure(
         Ok(pair) => Ok(pair),
         Err(WiringFailure { error, partial }) => {
             partial.teardown_standalone(&LogHandle::null()).await;
-            Err(error)
+            Err(match error {
+                WiringError::Cli(error) => error,
+                WiringError::Compose(error) => CliWiringError::ConfigTree(error.to_string()),
+            })
         }
     }
 }
@@ -1412,6 +1437,7 @@ pub(crate) async fn wire_capabilities_inner(
         probe,
         #[cfg(feature = "test-support")]
         fail_after_git_queue,
+        extensions,
     } = opts;
     let home_override = home_override.as_deref();
     let state_root = state_root.as_deref();
@@ -1454,6 +1480,15 @@ pub(crate) async fn wire_capabilities_inner(
     let declares_tools = declares("tools");
     let declares_web = declares("web");
     let web_cfg_snapshot = builder.config().web.clone();
+    let secret_plan = match extensions.secret_plan(declares_secrets || declares_llm) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(WiringFailure {
+                error: WiringError::Compose(error),
+                partial: HoldStoppers::default(),
+            });
+        }
+    };
     // Pack lane P1: ONE pack registry rescanned from
     // `<workspace>/<pack.packs-dir>` (created when absent — a fresh `advance init`
     // workspace boots with an empty registry), the chained template resolver
@@ -1493,7 +1528,11 @@ pub(crate) async fn wire_capabilities_inner(
     // CONTRACT-215/216 uses the existing operator master-key path to derive its
     // journal-only integrity subkey. Messaging therefore needs the key even
     // when neither secrets nor llm is guest-visible.
-    let needs_key = declares_secrets || declares_llm || declares_messaging || declares_lifecycle;
+    let needs_key = declares_secrets
+        || declares_llm
+        || declares_messaging
+        || declares_lifecycle
+        || secret_plan == SecretPlan::BuildForExtensions;
 
     // Step 2a — load the real master key and stage the complete C216→C215
     // journal/factory graph before EventBus, host registration, listeners, or
@@ -1580,9 +1619,22 @@ pub(crate) async fn wire_capabilities_inner(
                 .map_err(CliWiringError::SecretStorage)?;
         Some(Arc::new(SecretStore::new(key, storage)))
     } else {
-        drop(master_key.take());
         None
     };
+    let extension_secret_store: Option<Arc<SecretStore>> = match secret_plan {
+        SecretPlan::ReuseOss => secret_store.clone(),
+        SecretPlan::BuildForExtensions => {
+            let key = master_key
+                .take()
+                .expect("BuildForExtensions is included in needs_key");
+            let storage: Arc<dyn SecretStorage> =
+                cap_secrets::open_storage(workspace, &builder.config().secrets, None, Some(&*key))
+                    .map_err(CliWiringError::SecretStorage)?;
+            Some(Arc::new(SecretStore::new(key, storage)))
+        }
+        SecretPlan::NotNeeded => None,
+    };
+    drop(master_key.take());
     // A provided key also backs the provider admin's key store when no live store exists,
     // so the admin never falls back to opening (and possibly minting) a key of its own.
     // The capabilities' view is unchanged: `secret_store` stays as declared.
@@ -1841,6 +1893,7 @@ pub(crate) async fn wire_capabilities_inner(
         event_bus: Some(Arc::clone(&bus_concrete)),
         ..HoldStoppers::default()
     };
+    started.extension_secret_store = extension_secret_store.clone();
     // Slice m019-readapi (CONTRACT-185): derive the host-side read surface from the
     // SAME wired bus. `read_api()` returns a handle over internal clones (pool /
     // broadcaster / clock), NOT an `Arc<EventBus>`. `Some` for the production async bus.
@@ -1867,7 +1920,7 @@ pub(crate) async fn wire_capabilities_inner(
         Ok(h) => h,
         Err(e) => {
             return Err(WiringFailure {
-                error: CliWiringError::CapGrant(e),
+                error: CliWiringError::CapGrant(e).into(),
                 partial: started,
             })
         }
@@ -1923,7 +1976,7 @@ pub(crate) async fn wire_capabilities_inner(
                 Err(e) => {
                     drop(cap_grant);
                     return Err(WiringFailure {
-                        error: CliWiringError::AutoNotify(e),
+                        error: CliWiringError::AutoNotify(e).into(),
                         partial: started,
                     });
                 }
@@ -1956,7 +2009,7 @@ pub(crate) async fn wire_capabilities_inner(
             Err(e) => {
                 drop(cap_grant);
                 return Err(WiringFailure {
-                    error: CliWiringError::AutoIntegration(e),
+                    error: CliWiringError::AutoIntegration(e).into(),
                     partial: started,
                 });
             }
@@ -1996,7 +2049,7 @@ pub(crate) async fn wire_capabilities_inner(
             drop(auto_loop_driver);
             drop(cap_grant);
             return Err(WiringFailure {
-                error: CliWiringError::ChannelRuntime(reason),
+                error: CliWiringError::ChannelRuntime(reason).into(),
                 partial: started,
             });
         }
@@ -2058,7 +2111,7 @@ pub(crate) async fn wire_capabilities_inner(
                 drop(auto_loop_driver);
                 drop(cap_grant);
                 return Err(WiringFailure {
-                    error: CliWiringError::ProgressLifecycle(error.code()),
+                    error: CliWiringError::ProgressLifecycle(error.code()).into(),
                     partial: started,
                 });
             }
@@ -2462,7 +2515,8 @@ pub(crate) async fn wire_capabilities_inner(
     {
         if fail_after_git_queue {
             return Err(WiringFailure {
-                error: CliWiringError::ConfigTree(crate::test_support::WIRING_FAILPOINT.into()),
+                error: CliWiringError::ConfigTree(crate::test_support::WIRING_FAILPOINT.into())
+                    .into(),
                 partial: started,
             });
         }
@@ -2745,6 +2799,14 @@ pub(crate) async fn wire_capabilities_inner(
     // completed sign-in, a renewal and a sign-out are serialized against each other. `None`
     // when llm is not declared (no live store, no gateway).
     let mut chatgpt_sign_in: Option<Arc<advance_home::ChatGptSignIn>> = None;
+    extensions.install_contexts(CxParts {
+        config: Arc::downgrade(&builder.config_watcher()),
+        event_bus: Arc::downgrade(&event_bus_dyn),
+        run_manager: Arc::downgrade(&run_manager),
+        grant_check: Arc::downgrade(&cap_grant.grant_check),
+        secret_store: extension_secret_store.as_ref().map(Arc::downgrade),
+        leak_detector: Arc::clone(&public_leak_detector),
+    });
     if declares_llm {
         let store = secret_store
             .as_ref()
@@ -2958,7 +3020,7 @@ pub(crate) async fn wire_capabilities_inner(
             drop(channel_runtime);
             drop(reply_registry);
             return Err(WiringFailure {
-                error: CliWiringError::Bootstrap(e),
+                error: CliWiringError::Bootstrap(e).into(),
                 partial: started,
             });
         }
@@ -3463,6 +3525,7 @@ pub(crate) async fn wire_capabilities_inner(
             agent_spawner: agent_spawner.clone(),
             agent_admin,
             secret_store: secret_store.clone(),
+            extension_secret_store,
             provider_admin: Some(provider_admin),
             chatgpt_sign_in,
             decomposition_store,

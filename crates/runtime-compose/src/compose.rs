@@ -23,6 +23,7 @@ use crate::api::{
 use crate::compose_log::LogHandle;
 use crate::composition::{Composition, GuardHold, RuntimeView, TeardownReason};
 use crate::daemon::{compose_graph, GraphFailure, GraphOptions, PartialGraph};
+use crate::extension::{ExtensionPlan, ExtensionSet, StartedParts};
 use crate::registry::{HomeReservation, ReserveError};
 use crate::wiring::WiringOptions;
 
@@ -45,11 +46,22 @@ pub async fn compose(
         client_api,
         listeners,
         log,
+        profile,
+        processes,
         #[cfg(feature = "test-support")]
         failpoints,
         ..
     } = options;
     let log = LogHandle::new(log);
+    let exts = ExtensionSet::prepare(
+        extensions,
+        ExtensionPlan {
+            home: Arc::from(plan.home.as_path()),
+            profile,
+            processes,
+        },
+        log.clone(),
+    )?;
 
     // 1. The process-local reservation, before the cross-process lock: a second
     //    composition of the home in this process is refused here.
@@ -118,6 +130,7 @@ pub async fn compose(
             event_bus_ws: listeners.event_bus_ws,
             client_api,
             log: log.clone(),
+            extensions: Arc::clone(&exts),
             #[cfg(feature = "test-support")]
             probe: failpoints.probe.clone(),
             #[cfg(feature = "test-support")]
@@ -129,18 +142,35 @@ pub async fn compose(
     };
     match compose_graph(builder, &plan.home, opts).await {
         Ok(graph) => {
+            let started = StartedParts {
+                gateway: graph
+                    .wiring_handles
+                    .llm_gateway
+                    .as_ref()
+                    .map(Arc::downgrade),
+                client_api_base: graph
+                    .client_api_endpoint()
+                    .as_ref()
+                    .map(|endpoint| endpoint.base_url.clone()),
+                client_api_addr: graph
+                    .client_api_endpoint()
+                    .map(|endpoint| endpoint.socket_addr),
+            };
             let view = Arc::new(RuntimeView::new(
                 graph.wiring_handles.root_agent_id.clone(),
                 graph.client_api_endpoint(),
                 graph.agent_loop_done(),
                 instance_guard,
+                exts.board(),
             ));
             let composition =
                 Composition::from_graph(graph, config_watcher, wal_observer, guard, log)
-                    .with_extensions(extensions)
+                    .with_extensions(Arc::clone(&exts))
                     .with_view(Arc::clone(&view));
             #[cfg(feature = "test-support")]
             let composition = composition.with_probe(failpoints.probe.clone());
+            // Spawned before the supervisor exists: no trigger can close the tracker first.
+            exts.spawn_on_started(started);
             // The one task that owns the composition: it runs the shutdown sequence once
             // the handle is triggered.
             let shutdown = ShutdownHandle::new();
@@ -166,7 +196,7 @@ pub async fn compose(
                     log,
                 ),
             };
-            let composition = composition.with_extensions(extensions);
+            let composition = composition.with_extensions(exts);
             #[cfg(feature = "test-support")]
             let composition = composition.with_probe(failpoints.probe.clone());
             composition.teardown(TeardownReason::StartupFailed).await;
@@ -297,6 +327,8 @@ const _: () = {
     fn assert_send_sync<T: Send + Sync + 'static>() {}
     fn assert_send<T: Send + 'static>() {}
     #[allow(dead_code)]
+    fn _object_safe(_: &dyn ComposeExtension) {}
+    #[allow(dead_code)]
     fn witness_types() {
         assert_send_sync::<ComposedRuntime>();
         assert_send_sync::<ShutdownHandle>();
@@ -304,6 +336,22 @@ const _: () = {
         assert_send_sync::<ComposeError>();
         assert_send::<RuntimeHealthView>();
         assert_send_sync::<crate::wiring::GatewayInference>();
+    }
+    #[allow(dead_code)]
+    fn witness_ext_types() {
+        assert_send_sync::<crate::api::ComposeCx>();
+        assert_send_sync::<crate::api::StartedCx>();
+        assert_send_sync::<crate::api::ExtensionEmitter>();
+        assert_send_sync::<crate::api::RunView>();
+        assert_send_sync::<crate::api::ExtensionGrantCheck>();
+        assert_send_sync::<crate::api::ExtensionSecrets>();
+        assert_send_sync::<crate::api::TaskSpawner>();
+        assert_send_sync::<crate::api::ConfigView>();
+        assert_send_sync::<crate::api::GatewayHandle>();
+        assert_send_sync::<crate::api::ExtensionError>();
+        assert_send_sync::<crate::api::ExtensionHealth>();
+        assert_send_sync::<ExtensionSet>();
+        assert_send_sync::<crate::extension::call::CallIdentity>();
     }
 };
 

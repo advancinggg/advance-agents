@@ -17,11 +17,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use advance_core::runtime_compose::{
-    compose, log_keys, Admission, BoxFuture, ClientApiEndpoint, ClientApiOptions, ComposeError,
-    ComposeExtension, ComposeLog, ComposeLogLine, ComposeOptions, ComposeProfile, ComposedRuntime,
-    ExtensionFailure, ExtensionPhase, HostPlatform, InstanceGuard, InstanceGuardKind,
-    ListenerOptions, LockFailure, LogStream, MasterKeyInput, NullComposeLog, ProcessPolicy,
-    RuntimeHealthView, RuntimePhase, ShutdownHandle, Unsupported, WasmEngine, Zeroizing,
+    compose, log_keys, Admission, BoxFuture, CapParams, ClientApiEndpoint, ClientApiOptions,
+    ComposeCx, ComposeError, ComposeExtension, ComposeLog, ComposeLogLine, ComposeOptions,
+    ComposeProfile, ComposedRuntime, ConfigView, EmitError, EmitReceipt, ExtensionEmitter,
+    ExtensionError, ExtensionFailure, ExtensionGrantCheck, ExtensionHealth, ExtensionPhase,
+    ExtensionSecrets, ExtensionState, GatewayHandle, GrantDecision, HostPlatform, InstanceGuard,
+    InstanceGuardKind, ListenerOptions, LockFailure, LogStream, MasterKeyInput, NullComposeLog,
+    ProcessPolicy, RunInfo, RunView, RuntimeHealthView, RuntimePhase, SecretViewError,
+    ShutdownHandle, StartedCx, TaskRunStatus, TaskSpawner, Unsupported, ViewError, WasmEngine,
+    Zeroizing,
 };
 
 /// The CONTRACT-244 API: every name `api/mod.rs` may re-export, and must.
@@ -39,6 +43,23 @@ const ALLOWED: &[&str] = &[
     "Unsupported",
     "BoxFuture",
     "ComposeExtension",
+    "ExtensionError",
+    "ExtensionHealth",
+    "ExtensionState",
+    "ComposeCx",
+    "ConfigView",
+    "EmitError",
+    "EmitReceipt",
+    "ExtensionEmitter",
+    "ExtensionGrantCheck",
+    "ExtensionSecrets",
+    "GatewayHandle",
+    "RunInfo",
+    "RunView",
+    "SecretViewError",
+    "StartedCx",
+    "TaskSpawner",
+    "ViewError",
     "Admission",
     "ClientApiOptions",
     "ComposeOptions",
@@ -56,6 +77,9 @@ const ALLOWED: &[&str] = &[
     "RuntimeHealthView",
     "RuntimePhase",
     "ShutdownHandle",
+    "CapParams",
+    "GrantDecision",
+    "TaskRunStatus",
 ];
 
 /// The one façade line.
@@ -106,6 +130,26 @@ fn uses_the_api_through_the_facade(home: std::path::PathBuf) {
     let _: Option<Unsupported> = None;
     let _: Option<ExtensionPhase> = None;
     let _: Option<ExtensionFailure> = None;
+    let _: Option<ExtensionError> = None;
+    let _: Option<ExtensionHealth> = None;
+    let _: Option<ExtensionState> = None;
+    let _: Option<ComposeCx> = None;
+    let _: Option<StartedCx> = None;
+    let _: Option<ConfigView> = None;
+    let _: Option<TaskSpawner> = None;
+    let _: Option<ExtensionEmitter> = None;
+    let _: Option<EmitReceipt> = None;
+    let _: Option<EmitError> = None;
+    let _: Option<RunView> = None;
+    let _: Option<RunInfo> = None;
+    let _: Option<ExtensionGrantCheck> = None;
+    let _: Option<ExtensionSecrets> = None;
+    let _: Option<SecretViewError> = None;
+    let _: Option<GatewayHandle> = None;
+    let _: Option<ViewError> = None;
+    let _: Option<CapParams> = None;
+    let _: Option<GrantDecision> = None;
+    let _: Option<TaskRunStatus> = None;
 }
 
 #[test]

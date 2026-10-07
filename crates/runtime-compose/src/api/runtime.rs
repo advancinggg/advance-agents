@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::error::ComposeError;
+use super::extension::{ExtensionHealth, ExtensionState};
 use crate::composition::RuntimeView;
 
 /// A running composition. It owns nothing of the runtime itself: the runtime's parts
@@ -57,12 +58,19 @@ impl ComposedRuntime {
             phase => phase,
         };
         let running = phase == RuntimePhase::Running;
+        let extensions = self.view.extensions();
+        let failed_extensions = extensions
+            .iter()
+            .filter(|health| matches!(health.state, ExtensionState::Failed(_)))
+            .map(|health| health.id)
+            .collect();
         RuntimeHealthView {
             phase,
             agent_loop_up: running && self.view.agent_loop_alive(),
             client_api_base: self.client_api().map(|endpoint| endpoint.base_url),
             instance_guard: self.view.instance_guard(),
-            failed_extensions: Vec::new(),
+            extensions,
+            failed_extensions,
         }
     }
 
@@ -135,6 +143,8 @@ pub struct RuntimeHealthView {
     pub client_api_base: Option<String>,
     /// The instance guard in use.
     pub instance_guard: InstanceGuardKind,
+    /// Every composed extension, in registration order.
+    pub extensions: Vec<ExtensionHealth>,
     /// Extensions whose start failed.
     pub failed_extensions: Vec<&'static str>,
 }
