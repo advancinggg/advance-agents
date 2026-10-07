@@ -32,11 +32,14 @@ use advance_shared_types::inference::{
     InferenceEmbedRequest, InferenceEmbedResponse, InferenceStream, InferenceStreamClass,
     InferenceStreamHead, InferenceTextDelta,
 };
+use advance_shared_types::process_policy::{ProcessPolicy, SpawnSite, PROCESS_FORBIDDEN};
 use async_trait::async_trait;
 use serde_json::Value;
 
 /// Error prefix every failure of this backend carries (client-safe, vendor-neutral).
 pub const AGENT_CLI_PREFIX: &str = "agent-cli:";
+const PROCESS_FORBIDDEN_TEXT: &str =
+    "process_forbidden: this host forbids child processes (agent-cli)";
 /// stdout is read up to this many bytes; a chattier child is cut fail-closed.
 pub const MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 /// stderr is kept up to this many bytes (diagnostics only, never returned verbatim).
@@ -112,6 +115,7 @@ const CODEX_TOOL_ITEM_TYPES: &[&str] = &[
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentCliEnv {
     vars: BTreeMap<String, String>,
+    process_policy: ProcessPolicy,
 }
 
 impl AgentCliEnv {
@@ -173,7 +177,20 @@ impl AgentCliEnv {
         vars.insert("NO_COLOR".into(), "1".into());
         vars.insert("TERM".into(), "dumb".into());
         vars.insert("CI".into(), "1".into());
-        Self { vars }
+        Self {
+            vars,
+            process_policy: ProcessPolicy::Allow,
+        }
+    }
+
+    /// The spawn policy every child run under this environment obeys (default `Allow`).
+    pub fn with_process_policy(mut self, policy: ProcessPolicy) -> Self {
+        self.process_policy = policy;
+        self
+    }
+
+    pub fn process_policy(&self) -> ProcessPolicy {
+        self.process_policy
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -1064,6 +1081,7 @@ pub enum StopReason {
     Cancelled,
     Deadline,
     Dropped,
+    ProcessForbidden,
 }
 
 fn reader_thread(
@@ -1108,6 +1126,9 @@ pub fn run_supervised(
     abort: &AtomicBool,
 ) -> Result<ChildRun, (StopReason, Duration)> {
     let started = Instant::now();
+    if env.process_policy().admit(SpawnSite::AgentCli).is_err() {
+        return Err((StopReason::ProcessForbidden, Duration::ZERO));
+    }
     let mut cmd = Command::new(command);
     cmd.args(argv)
         .current_dir(cwd)
@@ -1246,6 +1267,14 @@ impl AgentCliAuthProbe for ProcessAuthProbe {
 
 pub fn probe_auth(spec: &AgentCliSpec, env: &AgentCliEnv) -> AuthProbe {
     let command = Path::new(&spec.command);
+    let cli_present = command.is_absolute() && command.is_file();
+    if env.process_policy().check(SpawnSite::AgentCli).is_err() {
+        return AuthProbe {
+            signed_in: false,
+            cli_present,
+            detail: PROCESS_FORBIDDEN.into(),
+        };
+    }
     if !command.is_absolute() || !command.is_file() {
         return AuthProbe {
             signed_in: false,
@@ -1285,6 +1314,13 @@ pub fn probe_auth(spec: &AgentCliSpec, env: &AgentCliEnv) -> AuthProbe {
                 signed_in: false,
                 cli_present: true,
                 detail: "timeout".into(),
+            }
+        }
+        Err((StopReason::ProcessForbidden, _)) => {
+            return AuthProbe {
+                signed_in: false,
+                cli_present: true,
+                detail: PROCESS_FORBIDDEN.into(),
             }
         }
         Err(_) => {
@@ -1416,6 +1452,9 @@ impl AgentCliUsageProbe for ProcessUsageProbe {
 }
 
 pub fn probe_usage(spec: &AgentCliSpec, env: &AgentCliEnv) -> UsageProbe {
+    if env.process_policy().check(SpawnSite::AgentCli).is_err() {
+        return UsageProbe::failed(PROCESS_FORBIDDEN);
+    }
     let command = Path::new(&spec.command);
     if !command.is_absolute() || !command.is_file() {
         return UsageProbe::failed("cli-not-found");
@@ -1463,6 +1502,7 @@ fn run_once(
 fn stop_detail(stop: StopReason) -> &'static str {
     match stop {
         StopReason::Deadline => "timeout",
+        StopReason::ProcessForbidden => PROCESS_FORBIDDEN,
         _ => "cancelled",
     }
 }
@@ -1841,6 +1881,9 @@ pub fn run_jsonrpc(
     requests: &[Value],
     deadline: Instant,
 ) -> Result<Vec<Value>, StopReason> {
+    if env.process_policy().admit(SpawnSite::AgentCli).is_err() {
+        return Err(StopReason::ProcessForbidden);
+    }
     let mut cmd = Command::new(command);
     cmd.args(argv)
         .current_dir(std::env::temp_dir())
@@ -1982,6 +2025,12 @@ impl AgentCliBackend {
         self
     }
 
+    /// `self.env = self.env.with_process_policy(policy)`.
+    pub fn with_process_policy(mut self, policy: ProcessPolicy) -> Self {
+        self.env = self.env.with_process_policy(policy);
+        self
+    }
+
     fn command_path(&self) -> &Path {
         Path::new(&self.spec.command)
     }
@@ -2011,6 +2060,9 @@ impl AgentCliBackend {
     /// One supervised turn. Blocking work runs on the blocking pool; the returned future
     /// kills the child if it is dropped early.
     async fn run_turn(&self, req: InferenceChatRequest) -> Result<CliTurn, InferenceBackendError> {
+        if let Err(f) = self.env.process_policy().check(SpawnSite::AgentCli) {
+            return Err(err(f.to_string()));
+        }
         if req.tools.as_ref().is_some_and(|t| !t.is_empty()) {
             return Err(InferenceBackendError::UnsupportedCapability("tools".into()));
         }
@@ -2083,6 +2135,7 @@ impl AgentCliBackend {
             Err((StopReason::Cancelled, _)) => return Err(err("cancelled")),
             Err((StopReason::Deadline, _)) => return Err(err("deadline-exceeded")),
             Err((StopReason::Dropped, _)) => return Err(err("dropped")),
+            Err((StopReason::ProcessForbidden, _)) => return Err(err(PROCESS_FORBIDDEN_TEXT)),
         };
         if run.stdout_truncated {
             return Err(err("reply exceeded the output cap"));
@@ -2815,5 +2868,187 @@ mod tests {
         assert_eq!(sign_in_argv(AgentCliVendor::Claude), vec!["auth", "login"]);
         assert_eq!(sign_in_argv(AgentCliVendor::Codex), vec!["login"]);
         assert_eq!(auth_probe_argv(AgentCliVendor::Grok), vec!["models"]);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod module_001_ac32_tests {
+    use super::*;
+    use crate::test_marker::Marker;
+    use advance_runtime::config::{AgentCliSpec, AgentCliVendor};
+    use advance_shared_types::inference::{InferenceChatRequest, InferenceMessage};
+    use advance_shared_types::process_policy::{spawn_counter, ProcessPolicy, SpawnSite};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    static COUNTER_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        COUNTER_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn spec(command: impl Into<String>) -> AgentCliSpec {
+        AgentCliSpec {
+            vendor: AgentCliVendor::Claude,
+            command: command.into(),
+            args: vec![],
+        }
+    }
+
+    fn chat_req() -> InferenceChatRequest {
+        InferenceChatRequest {
+            provider_id: "cli".into(),
+            model: "m".into(),
+            messages: vec![InferenceMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stop_sequences: None,
+            tools: None,
+            output_schema: None,
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn forbid_env() -> AgentCliEnv {
+        AgentCliEnv::from_map(&BTreeMap::new()).with_process_policy(ProcessPolicy::Forbid)
+    }
+
+    fn work_dir() -> std::path::PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("cap-llm-ac32-work-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("work dir");
+        dir
+    }
+
+    fn has_req_dir(root: &std::path::Path) -> bool {
+        std::fs::read_dir(root)
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .any(|e| e.file_name().to_string_lossy().starts_with("req-"))
+            })
+            .unwrap_or(false)
+    }
+
+    fn assert_process_forbidden_turn(err: InferenceBackendError) {
+        match err {
+            InferenceBackendError::Provider(s) => {
+                assert!(s.starts_with("agent-cli: process_forbidden:"), "{s}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn module_001_ac32_agent_cli_turn_refused_before_any_side_effect() {
+        let _guard = serial();
+        let marker = Marker::new();
+        let tmp = work_dir();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let backend = AgentCliBackend::new(
+            spec(marker.script().display().to_string()),
+            "cli",
+            tmp.clone(),
+        )
+        .with_process_policy(ProcessPolicy::Forbid);
+        let err = rt.block_on(backend.chat(chat_req())).expect_err("forbid");
+        assert_process_forbidden_turn(err);
+        assert!(!has_req_dir(&tmp));
+        assert!(!marker.ran());
+
+        let missing = work_dir();
+        let backend = AgentCliBackend::new(
+            spec("/nonexistent/advance-ac32-cli"),
+            "cli",
+            missing.clone(),
+        )
+        .with_process_policy(ProcessPolicy::Forbid);
+        let err = rt
+            .block_on(backend.chat(chat_req()))
+            .expect_err("missing still forbid");
+        assert_process_forbidden_turn(err);
+        assert!(!has_req_dir(&missing));
+
+        let env = AgentCliEnv::from_map(&BTreeMap::new());
+        let cancel = AtomicBool::new(false);
+        let abort = AtomicBool::new(false);
+        if run_supervised(
+            marker.script(),
+            &[],
+            &env,
+            AgentCliVendor::Claude,
+            &std::env::temp_dir(),
+            None,
+            Instant::now() + Duration::from_secs(5),
+            &cancel,
+            &abort,
+        )
+        .is_err()
+        {
+            panic!("allow spawn");
+        }
+        assert!(marker.ran());
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&missing);
+    }
+
+    #[test]
+    fn module_001_ac32_agent_cli_probes_refused_under_forbid() {
+        let _guard = serial();
+        let marker = Marker::new();
+        let before = spawn_counter::snapshot();
+        let env = forbid_env();
+        let spec = spec(marker.script().display().to_string());
+
+        let auth = probe_auth(&spec, &env);
+        assert!(!auth.signed_in);
+        assert!(auth.cli_present);
+        assert_eq!(auth.detail, PROCESS_FORBIDDEN);
+
+        let usage = probe_usage(&spec, &env);
+        assert_eq!(usage.detail, PROCESS_FORBIDDEN);
+
+        let cancel = AtomicBool::new(false);
+        let abort = AtomicBool::new(false);
+        let err = run_supervised(
+            marker.script(),
+            &[],
+            &env,
+            AgentCliVendor::Claude,
+            &std::env::temp_dir(),
+            None,
+            Instant::now() + Duration::from_secs(5),
+            &cancel,
+            &abort,
+        )
+        .expect_err("forbid supervised");
+        assert_eq!(err.0, StopReason::ProcessForbidden);
+
+        let err = run_jsonrpc(
+            marker.script(),
+            &[],
+            &env,
+            AgentCliVendor::Claude,
+            &[],
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect_err("forbid jsonrpc");
+        assert_eq!(err, StopReason::ProcessForbidden);
+
+        assert!(!marker.ran());
+        let delta = spawn_counter::snapshot().since(&before);
+        assert_eq!(delta.refused(SpawnSite::AgentCli), 4);
     }
 }

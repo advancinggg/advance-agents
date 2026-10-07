@@ -83,6 +83,9 @@ mod policy_tests;
 #[cfg(test)]
 mod test_support;
 
+#[cfg(all(test, unix))]
+mod test_marker;
+
 pub use backend_cli::{
     probe_auth, probe_usage, AgentCliAuthProbe, AgentCliBackend, AgentCliEnv, AgentCliUsageProbe,
     AuthProbe, ProcessAuthProbe, ProcessUsageProbe, UsageProbe, UsageWindow,

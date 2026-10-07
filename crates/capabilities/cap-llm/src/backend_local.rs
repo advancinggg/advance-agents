@@ -17,6 +17,8 @@ use advance_shared_types::inference::{
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use advance_shared_types::process_policy::{ProcessPolicy, SpawnSite};
+
 use crate::error::LlmError;
 use crate::providers::openai::OpenAiAdapter;
 use crate::providers::sse::FrameSplitter;
@@ -213,11 +215,27 @@ impl Drop for SupervisedChild {
 const PORT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl ProcessSupervisor {
+    /// Unchanged behaviour: [`Self::spawn_with_policy`] with [`ProcessPolicy::Allow`].
     pub fn spawn(&self) -> Result<(SidecarHandoff, SupervisedChild), InferenceBackendError> {
+        self.spawn_with_policy(ProcessPolicy::Allow)
+    }
+
+    /// Under `Forbid`: `Err(InferenceBackendError::LocalTransport("process_forbidden: this host
+    /// forbids child processes (local sidecar)"))` before any other check; nothing is spawned.
+    pub fn spawn_with_policy(
+        &self,
+        policy: ProcessPolicy,
+    ) -> Result<(SidecarHandoff, SupervisedChild), InferenceBackendError> {
+        policy
+            .check(SpawnSite::LocalSidecar)
+            .map_err(|f| InferenceBackendError::local_transport(f.to_string()))?;
         if !std::path::Path::new(&self.command).is_absolute() {
             return Err(InferenceBackendError::local_transport(
                 "sidecar.command must be an absolute path",
             ));
+        }
+        if let Err(f) = policy.admit(SpawnSite::LocalSidecar) {
+            return Err(InferenceBackendError::local_transport(f.to_string()));
         }
         let mut cmd = Command::new(&self.command);
         cmd.args(&self.args)
@@ -694,5 +712,49 @@ mod spawn_tests {
         let body = oai_chat_body(&req);
         assert!(body["tools"].is_array(), "{body}");
         assert_eq!(body["tools"][0]["function"]["name"], "search");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod module_001_ac32_tests {
+    use super::*;
+    use crate::test_marker::Marker;
+    use advance_shared_types::process_policy::{spawn_counter, ProcessPolicy, SpawnSite};
+
+    #[test]
+    fn module_001_ac32_sidecar_spawn_refused_under_forbid() {
+        let marker = Marker::new();
+        let before = spawn_counter::snapshot();
+        let sup = ProcessSupervisor {
+            command: marker.script().display().to_string(),
+            args: vec![],
+        };
+        let err = match sup.spawn_with_policy(ProcessPolicy::Forbid) {
+            Err(e) => e,
+            Ok(_) => panic!("forbid"),
+        };
+        match err {
+            InferenceBackendError::LocalTransport(s) => {
+                assert!(s.starts_with("process_forbidden:"), "{s}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!marker.ran());
+        let rel = ProcessSupervisor {
+            command: "sidecar".into(),
+            args: vec![],
+        };
+        let err = match rel.spawn_with_policy(ProcessPolicy::Forbid) {
+            Err(e) => e,
+            Ok(_) => panic!("relative"),
+        };
+        match err {
+            InferenceBackendError::LocalTransport(s) => {
+                assert!(s.starts_with("process_forbidden:"), "{s}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let delta = spawn_counter::snapshot().since(&before);
+        assert_eq!(delta.refused(SpawnSite::LocalSidecar), 2);
     }
 }

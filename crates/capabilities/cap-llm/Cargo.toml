@@ -68,6 +68,8 @@ cap-secrets = { path = "../cap-secrets" }
 serde_yml = { workspace = true }
 # zeroize for tests/integration_chain.rs SecretStore::new(Zeroizing<[u8;32]> master).
 zeroize = { workspace = true }
+# spawn-counter unifies onto the production shared-types edge for the Forbid unit tests.
+advance-shared-types = { path = "../../shared-types", features = ["spawn-counter"] }
 # NO [features] block — test_support/ is #[cfg(test)] only. Sibling-crate consumption
 # of mocks is out of scope for Slice B-2.
 
