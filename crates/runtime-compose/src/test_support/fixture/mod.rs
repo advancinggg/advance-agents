@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::api::{
     BoxFuture, ComposeCx, ComposeExtension, ExtensionError, ExtensionPhase, GatewayHandle,
-    HostFunctionDef, HostFunctionRegistrar, StartedCx, ToolRegistrar,
+    HostFunctionDef, HostFunctionRegistrar, InferenceContribution, StartedCx, ToolRegistrar,
 };
 
 mod capabilities;
@@ -14,6 +14,7 @@ mod client;
 mod gone;
 mod guests;
 mod home;
+pub mod inference;
 mod lifecycle;
 
 pub use capabilities::{
@@ -24,6 +25,7 @@ pub use client::{mint_browser_session, mint_session, post_msg, Http, HttpRespons
 pub use gone::assert_gone_for_home;
 pub use guests::{ext_probe_core, hello_llm_core, llm_noerr_core, minimal_core};
 pub use home::{CapDecl, FixtureDriver, FixtureHome, FixtureHomeSpec, FIXTURE_MASTER_KEY};
+pub use inference::{DropFlag, FixtureInference, StubInferencePort, StubMeshDispatch};
 pub use lifecycle::{FixtureLifecycle, OnStartedMode, ShutdownMode};
 
 pub const FIXTURE_ID: &str = "fixture";
@@ -36,6 +38,7 @@ pub struct FixtureExtension {
     breaks: FixtureBreaks,
     record: Arc<FixtureRecord>,
     spec: Option<FixtureSpec>,
+    inference: Option<FixtureInference>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -55,11 +58,17 @@ impl FixtureExtension {
             breaks: FixtureBreaks::default(),
             record: Arc::new(FixtureRecord::default()),
             spec: None,
+            inference: None,
         }
     }
 
     pub fn with_spec(mut self, spec: FixtureSpec) -> Self {
         self.spec = Some(spec);
+        self
+    }
+
+    pub fn with_inference(mut self, inference: FixtureInference) -> Self {
+        self.inference = Some(inference);
         self
     }
 
@@ -151,6 +160,18 @@ impl ComposeExtension for FixtureExtension {
             .as_ref()
             .map(|spec| spec.capabilities)
             .unwrap_or(&[])
+    }
+
+    fn inference(
+        &self,
+        cx: &ComposeCx,
+        out: &mut InferenceContribution,
+    ) -> Result<(), ExtensionError> {
+        self.enter_phase(ExtensionPhase::Inference, Some(cx))?;
+        if let Some(part) = &self.inference {
+            part.apply(out);
+        }
+        Ok(())
     }
 
     fn host_functions(
