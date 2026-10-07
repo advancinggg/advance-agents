@@ -5,12 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::api::{
-    BoxFuture, ComposeCx, ComposeExtension, ExtensionError, ExtensionPhase, GatewayHandle,
-    HostFunctionDef, HostFunctionRegistrar, InferenceContribution, StartedCx, ToolRegistrar,
+    BoxFuture, ClientFamilyRegistrar, ComposeCx, ComposeExtension, ExtensionError, ExtensionPhase,
+    GatewayHandle, HostFunctionDef, HostFunctionRegistrar, InferenceContribution, StartedCx,
+    ToolRegistrar,
 };
 
 mod capabilities;
 mod client;
+pub mod families;
 mod gone;
 mod guests;
 mod home;
@@ -21,7 +23,10 @@ pub use capabilities::{
     EchoTool, FixtureHostFn, FixtureSpec, FixtureTool, ProbeHandler, ECHO_TOOL, PROBE_CAPABILITY,
     PROBE_FUNCTION, PROBE_NAMESPACE,
 };
-pub use client::{mint_browser_session, mint_session, post_msg, Http, HttpResponse};
+pub use client::{
+    mint_browser_session, mint_session, mint_session_with, post_msg, Http, HttpResponse,
+};
+pub use families::{FamiliesControl, FixtureFamilies, RouteRuleBreak};
 pub use gone::assert_gone_for_home;
 pub use guests::{ext_probe_core, hello_llm_core, llm_noerr_core, minimal_core};
 pub use home::{CapDecl, FixtureDriver, FixtureHome, FixtureHomeSpec, FIXTURE_MASTER_KEY};
@@ -39,6 +44,7 @@ pub struct FixtureExtension {
     record: Arc<FixtureRecord>,
     spec: Option<FixtureSpec>,
     inference: Option<FixtureInference>,
+    families: Option<FixtureFamilies>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -59,6 +65,7 @@ impl FixtureExtension {
             record: Arc::new(FixtureRecord::default()),
             spec: None,
             inference: None,
+            families: None,
         }
     }
 
@@ -69,6 +76,11 @@ impl FixtureExtension {
 
     pub fn with_inference(mut self, inference: FixtureInference) -> Self {
         self.inference = Some(inference);
+        self
+    }
+
+    pub fn with_families(mut self, families: FixtureFamilies) -> Self {
+        self.families = Some(families);
         self
     }
 
@@ -213,6 +225,18 @@ impl ComposeExtension for FixtureExtension {
             }
             Ok(())
         })
+    }
+
+    fn client_families(
+        &self,
+        cx: &ComposeCx,
+        reg: &mut ClientFamilyRegistrar<'_>,
+    ) -> Result<(), ExtensionError> {
+        self.enter_phase(ExtensionPhase::ClientFamilies, Some(cx))?;
+        match &self.families {
+            Some(families) => families.register(reg),
+            None => Ok(()),
+        }
     }
 
     fn needs_secret_store(&self) -> bool {

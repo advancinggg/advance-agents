@@ -146,16 +146,14 @@ pub async fn post_msg(addr: SocketAddr, payload: &str) -> (u16, String) {
 }
 
 pub fn mint_session(endpoint: &ClientApiEndpoint) -> String {
-    mint_session_inner(endpoint, None)
+    mint_session_with(endpoint, Scope::operator_default(), None)
 }
 
-pub fn mint_browser_session(endpoint: &ClientApiEndpoint) -> (String, String) {
-    let csrf = "fixture-csrf".to_owned();
-    let token = mint_session_inner(endpoint, Some(csrf.clone()));
-    (token, csrf)
-}
-
-fn mint_session_inner(endpoint: &ClientApiEndpoint, csrf: Option<String>) -> String {
+pub fn mint_session_with(
+    endpoint: &ClientApiEndpoint,
+    scopes: Vec<Scope>,
+    csrf: Option<&str>,
+) -> String {
     let token = "fixture-operator".to_owned();
     let api = endpoint.api.upgrade().expect("the Client API is alive");
     api.sessions().insert(
@@ -164,13 +162,19 @@ fn mint_session_inner(endpoint: &ClientApiEndpoint, csrf: Option<String>) -> Str
             session_id: "fixture-session".into(),
             principal: Principal::operator("operator"),
             platform: Platform::Mac,
-            scopes: Scope::operator_default(),
-            csrf_token: csrf,
+            scopes,
+            csrf_token: csrf.map(str::to_owned),
             expires_at: u64::MAX,
         },
         0,
     );
     token
+}
+
+pub fn mint_browser_session(endpoint: &ClientApiEndpoint) -> (String, String) {
+    let csrf = "fixture-csrf".to_owned();
+    let token = mint_session_with(endpoint, Scope::operator_default(), Some(&csrf));
+    (token, csrf)
 }
 
 fn parse_http_response(response: &[u8]) -> (u16, Vec<u8>) {
