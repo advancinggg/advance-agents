@@ -208,6 +208,13 @@ pub trait AgentAdminProvider: Send + Sync {
         request: &ClientDeleteAgentRequest,
     ) -> Result<ClientAgentDeleteResult, ProviderError>;
     fn list_templates(&self) -> Result<Vec<ClientAgentTemplate>, ProviderError>;
+    /// A capability id outside the `[A-Za-z0-9_-]` charset that this provider admits in
+    /// `capabilities` lists (the composition's extension capabilities). Default: none, so
+    /// validation is exactly the charset rule.
+    fn admits_capability_name(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
 }
 
 /// LLM spend attribution provider (MODULE-019 durable cost ledger, lane cost-attribution) behind

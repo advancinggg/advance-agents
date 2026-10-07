@@ -31,13 +31,17 @@
 //! block on the agent's next LLM call. The provider validates that `llm.provider` names a live
 //! `llm-providers[].id` and answers `invalid_request` + details `["unknown_provider"]` otherwise.
 
+use std::sync::Arc;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::api::{ClientApi, HandlerCtx, HandlerResponse, HandlerSpec};
 use crate::envelope::{ClientError, ClientErrorCode, ClientWarning};
-use crate::provider::{provider_or_unavailable, AgentProviderSlot, ProviderError};
+use crate::provider::{
+    provider_or_unavailable, AgentAdminProvider, AgentProviderSlot, ProviderError,
+};
 use crate::providers::grants::ClientCapParam;
 use crate::request::Method;
 use crate::routes;
@@ -283,7 +287,18 @@ pub fn validate_agent_id(id: &str) -> Result<(), ClientError> {
 
 /// A capability id: `^[A-Za-z0-9_-]{1,64}$` (never a `:`-carrying scoped form).
 pub fn validate_capability_name(name: &str) -> Result<(), ClientError> {
+    validate_capability_name_with(name, &|_| false)
+}
+
+/// A capability id that also accepts names the provider admits (dotted extension capabilities).
+pub fn validate_capability_name_with(
+    name: &str,
+    admits: &dyn Fn(&str) -> bool,
+) -> Result<(), ClientError> {
     if name.is_empty() || name.len() > MAX_AGENT_ID_LEN || !name.chars().all(is_id_char) {
+        if admits(name) {
+            return Ok(());
+        }
         return Err(invalid("invalid capability id"));
     }
     Ok(())
@@ -411,11 +426,19 @@ pub fn validate_agent_llm(llm: &ClientAgentLlm) -> Result<(), ClientError> {
 
 /// The requested capability list: bounded, each a valid id, no duplicates.
 pub fn validate_capabilities(capabilities: &[String]) -> Result<(), ClientError> {
+    validate_capabilities_with(capabilities, &|_| false)
+}
+
+/// The requested capability list, with names the provider admits.
+pub fn validate_capabilities_with(
+    capabilities: &[String],
+    admits: &dyn Fn(&str) -> bool,
+) -> Result<(), ClientError> {
     if capabilities.len() > MAX_REQUESTED_CAPABILITIES {
         return Err(invalid("too many capabilities requested"));
     }
     for (i, cap) in capabilities.iter().enumerate() {
-        validate_capability_name(cap)?;
+        validate_capability_name_with(cap, admits)?;
         if capabilities[..i].iter().any(|c| c == cap) {
             return Err(invalid("duplicate capability requested"));
         }
@@ -425,6 +448,14 @@ pub fn validate_capabilities(capabilities: &[String]) -> Result<(), ClientError>
 
 /// Validate a full create request (every field, in a fixed order).
 pub fn validate_create_request(req: &ClientCreateAgentRequest) -> Result<(), ClientError> {
+    validate_create_request_with(req, &|_| false)
+}
+
+/// Validate a full create request, with names the provider admits.
+pub fn validate_create_request_with(
+    req: &ClientCreateAgentRequest,
+    admits: &dyn Fn(&str) -> bool,
+) -> Result<(), ClientError> {
     match &req.agent_id {
         Some(id) => validate_agent_id(id)?,
         None if req.display_name.is_none() => {
@@ -439,7 +470,7 @@ pub fn validate_create_request(req: &ClientCreateAgentRequest) -> Result<(), Cli
         validate_workspace_path(path)?;
     }
     validate_template_ref(&req.template_ref)?;
-    validate_capabilities(&req.capabilities)?;
+    validate_capabilities_with(&req.capabilities, admits)?;
     if let Some(name) = &req.display_name {
         validate_display_name(name)?;
     }
@@ -454,6 +485,14 @@ pub fn validate_create_request(req: &ClientCreateAgentRequest) -> Result<(), Cli
 
 /// Validate an update request: at least one field, each within bounds.
 pub fn validate_update_request(req: &ClientUpdateAgentRequest) -> Result<(), ClientError> {
+    validate_update_request_with(req, &|_| false)
+}
+
+/// Validate an update request, with names the provider admits.
+pub fn validate_update_request_with(
+    req: &ClientUpdateAgentRequest,
+    admits: &dyn Fn(&str) -> bool,
+) -> Result<(), ClientError> {
     if req.display_name.is_none()
         && req.handle.is_none()
         && req.config_yaml.is_none()
@@ -472,7 +511,7 @@ pub fn validate_update_request(req: &ClientUpdateAgentRequest) -> Result<(), Cli
         validate_config_document(yaml)?;
     }
     if let Some(capabilities) = &req.capabilities {
-        validate_capabilities(capabilities)?;
+        validate_capabilities_with(capabilities, admits)?;
     }
     if let Some(llm) = &req.llm {
         validate_agent_llm(llm)?;
@@ -497,6 +536,13 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Value) -> Result<T, ClientE
 /// provider stays retryable under the same key, while any outcome the provider itself returns
 /// (success or a projected rejection) is recorded for exactly-once replay — an agent create/delete
 /// has filesystem + tree side effects, so a key is never allowed to re-enter the provider.
+fn agent_provider_snapshot(s: &AgentProviderSlot) -> Option<Arc<dyn AgentAdminProvider>> {
+    s.read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(Arc::clone)
+}
+
 fn mark_provider_entry(ctx: &HandlerCtx) -> Result<(), ClientError> {
     match ctx.mutation.as_ref() {
         Some(mutation) => mutation.mark_provider_entry(),
@@ -560,7 +606,10 @@ pub(crate) fn register(api: &mut ClientApi, slot: AgentProviderSlot) {
         routes::PATH_AGENTS,
         HandlerSpec::mutation_with_warnings(true, move |ctx| {
             let req: ClientCreateAgentRequest = parse_body(&ctx.body)?;
-            validate_create_request(&req)?;
+            let p = agent_provider_snapshot(&s);
+            validate_create_request_with(&req, &|n| {
+                p.as_ref().is_some_and(|p| p.admits_capability_name(n))
+            })?;
             let provider = provider_or_unavailable(&s)?;
             mark_provider_entry(ctx)?;
             let detail = provider
@@ -597,7 +646,10 @@ pub(crate) fn register(api: &mut ClientApi, slot: AgentProviderSlot) {
             let agent_id = ctx.path_param("agent_id")?;
             validate_agent_id(&agent_id)?;
             let req: ClientUpdateAgentRequest = parse_body(&ctx.body)?;
-            validate_update_request(&req)?;
+            let p = agent_provider_snapshot(&s);
+            validate_update_request_with(&req, &|n| {
+                p.as_ref().is_some_and(|p| p.admits_capability_name(n))
+            })?;
             let provider = provider_or_unavailable(&s)?;
             mark_provider_entry(ctx)?;
             let detail = provider
@@ -631,6 +683,9 @@ pub(crate) fn register(api: &mut ClientApi, slot: AgentProviderSlot) {
         .with_scopes(vec![Scope::ControlRuns]),
     );
 }
+
+#[cfg(test)]
+mod admits_tests;
 
 #[cfg(test)]
 mod tests {
