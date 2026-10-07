@@ -1,0 +1,28 @@
+# path	trimmed line	occurrence	class	note	[unreached=…]	[allow=…]
+crates/runtime/src/runtime_lock.rs	std::process::Command::new("kill")	1	policy-checked	admit(SpawnSite::PidLockProbe)
+crates/runtime/src/runtime_lock.rs	let lstart = std::process::Command::new("ps")	1	policy-checked	admit(SpawnSite::PidLockProbe)
+crates/capabilities/cap-llm/src/backend_local.rs	let mut cmd = Command::new(&self.command);	1	policy-checked	admit(SpawnSite::LocalSidecar)
+crates/capabilities/cap-llm/src/backend_cli.rs	let mut cmd = Command::new(command);	1	policy-checked	admit(SpawnSite::AgentCli)
+crates/capabilities/cap-llm/src/backend_cli.rs	let mut cmd = Command::new(command);	2	policy-checked	admit(SpawnSite::AgentCli)
+crates/capabilities/cap-mcp/src/stdio_transport.rs	let mut cmd = Command::new(command);	1	policy-checked	admit(SpawnSite::McpStdio)	unreached=McpClient,StdioMcpTransport	allow=crates/capabilities/cap-mcp/src/
+crates/services/pack-manager/src/fetch.rs	let mut cmd = std::process::Command::new("git");	1	policy-checked	admit(SpawnSite::PackGitSource)
+crates/services/pack-manager/src/fetch.rs	std::process::Command::new("git")	1	policy-checked	admit(SpawnSite::PackGitSource)
+crates/advance-home/src/connect.rs	let mut cmd = Command::new(bin);	1	policy-checked	admit(SpawnSite::DaemonLauncher)
+crates/capabilities/cap-skills/src/import.rs	std::process::Command::new("git")	1	unreachable-from-compose	git skill import; caller crates/cli/src/commands/skill.rs:249 (CLI command, outside the set)	unreached=import_from_git_url	allow=crates/capabilities/cap-skills/src/import.rs
+crates/capabilities/cap-skills/src/import.rs	std::process::Command::new("git")	2	unreachable-from-compose	same	unreached=import_from_git_url	allow=crates/capabilities/cap-skills/src/import.rs
+crates/client-api/src/compat.rs	Command::new("git")	1	build-tool	CONTRACT-192 compat baseline	unreached=parent_baseline,enforce_compat_gate,enforce_compat_gate_at	allow=crates/client-api/src/compat.rs,crates/client-api/src/schema.rs,crates/client-api/src/bin/
+crates/client-api/src/compat.rs	let out = Command::new("git")	1	build-tool	same	unreached=parent_baseline,enforce_compat_gate,enforce_compat_gate_at	allow=crates/client-api/src/compat.rs,crates/client-api/src/schema.rs,crates/client-api/src/bin/
+crates/client-api/src/compat.rs	let out = Command::new("git")	2	build-tool	same	unreached=parent_baseline,enforce_compat_gate,enforce_compat_gate_at	allow=crates/client-api/src/compat.rs,crates/client-api/src/schema.rs,crates/client-api/src/bin/
+crates/client-api/src/compat.rs	let out = Command::new("git")	3	build-tool	same	unreached=parent_baseline,enforce_compat_gate,enforce_compat_gate_at	allow=crates/client-api/src/compat.rs,crates/client-api/src/schema.rs,crates/client-api/src/bin/
+crates/client-api/src/compat.rs	let out = Command::new("git")	4	build-tool	same	unreached=parent_baseline,enforce_compat_gate,enforce_compat_gate_at	allow=crates/client-api/src/compat.rs,crates/client-api/src/schema.rs,crates/client-api/src/bin/
+crates/build-agent/src/main.rs	let status = Command::new(cargo)	1	separate-binary	the build-agent bin; the composition links only the build_agent lib
+crates/embedded-runtime-bridge/src/supervise.rs	let mut command = Command::new(&cmd_path);	1	v1-only	CONTRACT-210 v1 supervise mode	unreached=start_supervise	allow=crates/embedded-runtime-bridge/src/supervise.rs,crates/embedded-runtime-bridge/src/lib.rs
+crates/embedded-runtime-bridge/src/handle.rs	*	0	types-only	holds the v1 supervise tokio::process::Child
+crates/capabilities/cap-fs/src/meta_schema.rs	let status = std::process::Command::new("mkfifo")	1	test-only	unit-test fixture
+crates/capabilities/cap-fs/src/meta_schema.rs	assert!(std::process::Command::new("mkfifo")	1	test-only	unit-test fixture
+crates/capabilities/cap-lifecycle/src/producer_boundary.rs	let made = std::process::Command::new("mkfifo")	1	test-only	unit-test fixture
+crates/runtime-compose/src/vlm_indexer.rs	let made_fifo = std::process::Command::new("mkfifo")	1	test-only	unit-test fixture
+crates/runtime/src/runtime_lock.rs	let mut child = Command::new("sleep").arg("5").spawn().expect("sleep 5");	1	test-only	unit-test fixture
+crates/runtime/src/runtime_lock.rs	let mut child = Command::new("true").spawn().expect("true");	1	test-only	unit-test fixture
+crates/runtime/src/runtime_lock.rs	let mut child = Command::new("sleep").arg("5").spawn().expect("sleep 5");	2	test-only	unit-test fixture
+crates/runtime/src/runtime_lock.rs	let mut cmd = Command::new(exe);	1	test-only	platform_uid env-matrix self re-exec
