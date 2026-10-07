@@ -25,6 +25,10 @@ impl LogHandle {
         Self(Arc::new(NullComposeLog))
     }
 
+    pub(crate) fn sink(&self) -> Arc<dyn ComposeLog> {
+        Arc::clone(&self.0)
+    }
+
     /// A line `advance start` prints on stdout.
     pub fn out(&self, key: &'static str, text: impl Into<String>) {
         self.emit(LogStream::Stdout, key, text.into());

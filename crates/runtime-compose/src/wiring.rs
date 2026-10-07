@@ -3097,6 +3097,8 @@ pub(crate) async fn wire_capabilities_inner(
         // and register the `tool-invoke` host-fn over it.
         let tools_concrete: Arc<LazyToolRegistry> =
             Arc::new(LazyToolRegistry::new_with_engine(tools_cfg, engine));
+        probe_record!(probe, |record| record.lazy_tool_registry =
+            Some(Arc::downgrade(&tools_concrete)));
         // Wave-14 (SYS-AC-080) — L2 skill→tool-registry bridge. Populate the
         // registry from each materialized skill's `tool.wasm` sidecar under the
         // PRD §12.4.4 canonical id `skill::{name}`. Only when this agent ALSO has a
@@ -3152,6 +3154,19 @@ pub(crate) async fn wire_capabilities_inner(
                 );
             }
         }
+        // MODULE-001 §1.4.7 (c): extension native tools — after the OSS tools
+        // (skills, pack skill tools, data), before pack tool-exposure
+        // reconciliation and before try_spawn_agent_loop snapshots the inventory.
+        if !extensions.is_empty() {
+            if let Err(error) =
+                crate::extension::tools::run_tools(&extensions, &tools_concrete, &log).await
+            {
+                return Err(WiringFailure {
+                    error: WiringError::Compose(error),
+                    partial: started,
+                });
+            }
+        }
         let host_slots = Arc::new(HostToolRegistry::new());
         let web_family_active = declares_web && web_cfg_snapshot.mode != WebRunMode::Offline;
         let dispatcher = if web_family_active {
@@ -3183,6 +3198,8 @@ pub(crate) async fn wire_capabilities_inner(
             wasm: Arc::clone(&tools_concrete),
         });
         let tools: Arc<dyn ToolRegistry> = composite;
+        probe_record!(probe, |record| record.tool_registry =
+            Some(Arc::downgrade(&tools)));
         // Wave-11 Lane C — feed the production tool-dispatch repetition guard
         // (closes the orphan `record_tool_call`). One process-global
         // `RepetitionGuard` from the canonical defaults (window 10 / threshold

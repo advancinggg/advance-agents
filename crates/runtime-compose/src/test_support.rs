@@ -15,6 +15,7 @@ use advance_run_manager::RunManager;
 use advance_runtime::capability_injector::CapabilityInjector;
 use advance_runtime::ComponentRuntime;
 use cap_llm::{LlmGateway, ModelProfileCatalog};
+use cap_tools::{LazyToolRegistry, ToolRegistry};
 use tokio::sync::Notify;
 
 use crate::api::{ComposeLog, ComposeLogLine};
@@ -167,12 +168,16 @@ pub struct ProbeRecord {
     pub root_request_set: Option<Vec<String>>,
     /// The injector the host built (dies with the host).
     pub capability_injector: Option<Weak<CapabilityInjector>>,
+    /// The concrete host-tool registry (created when the home declares `tools`).
+    pub lazy_tool_registry: Option<Weak<LazyToolRegistry>>,
+    /// The composite tool registry guests use (created when the home declares `tools`).
+    pub tool_registry: Option<Weak<dyn ToolRegistry>>,
 }
 
 impl ProbeRecord {
     /// The names of the recorded objects that are still alive.
     pub fn alive(&self) -> Vec<&'static str> {
-        fn alive<T>(weak: &Option<Weak<T>>) -> bool {
+        fn alive<T: ?Sized>(weak: &Option<Weak<T>>) -> bool {
             weak.as_ref().is_some_and(|weak| weak.strong_count() > 0)
         }
         let mut names = Vec::new();
@@ -185,6 +190,8 @@ impl ProbeRecord {
             ("run_manager", alive(&self.run_manager)),
             ("component_runtime", alive(&self.component_runtime)),
             ("capability_injector", alive(&self.capability_injector)),
+            ("lazy_tool_registry", alive(&self.lazy_tool_registry)),
+            ("tool_registry", alive(&self.tool_registry)),
             ("chatgpt_sign_in", alive(&self.chatgpt_sign_in)),
         ] {
             if is_alive {

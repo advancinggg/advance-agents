@@ -6,6 +6,7 @@ pub mod guard;
 pub mod host_functions;
 pub mod ids;
 pub mod set;
+pub mod tools;
 
 pub use set::{
     CxParts, ExtensionBoard, ExtensionPlan, ExtensionSet, SecretNeedRule, SecretPlan, StartedParts,

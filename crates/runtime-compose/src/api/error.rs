@@ -48,6 +48,11 @@ pub enum ComposeError {
         extension: &'static str,
         refusal: super::host_functions::HostFunctionRefusal,
     },
+    /// An extension's native tool was refused.
+    Tool {
+        extension: &'static str,
+        refusal: super::tools::ToolRefusal,
+    },
     /// An extension callback failed or panicked.
     Extension {
         extension: &'static str,
@@ -193,6 +198,9 @@ impl fmt::Display for ComposeError {
             ),
             ComposeError::HostFunction { extension, refusal } => {
                 write!(f, "extension {extension}: host function refused: {refusal}")
+            }
+            ComposeError::Tool { extension, refusal } => {
+                write!(f, "extension {extension}: tool refused: {refusal}")
             }
             ComposeError::Extension {
                 extension,

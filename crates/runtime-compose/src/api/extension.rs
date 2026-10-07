@@ -7,6 +7,7 @@ pub use futures::future::BoxFuture;
 use super::error::ExtensionFailure;
 use super::extension_cx::{ComposeCx, EmitError, SecretViewError, StartedCx, ViewError};
 use super::host_functions::HostFunctionRegistrar;
+use super::tools::ToolRegistrar;
 
 /// A product (or test) addition to the composition. Trusted in-process code: the
 /// registrars stop collisions and broken invariants; they are not a sandbox (ADR D2
@@ -37,6 +38,18 @@ pub trait ComposeExtension: Send + Sync + 'static {
     ) -> Result<(), ExtensionError> {
         let _ = (cx, reg);
         Ok(())
+    }
+
+    /// Native tools, after the OSS tools (skills, pack skill tools, `data`) and
+    /// before pack tool-exposure reconciliation and the tool inventory snapshot.
+    /// Called only when the home declares `tools`.
+    fn tools<'a>(
+        &'a self,
+        cx: &'a ComposeCx,
+        reg: &'a mut ToolRegistrar,
+    ) -> BoxFuture<'a, Result<(), ExtensionError>> {
+        let _ = (cx, reg);
+        Box::pin(async { Ok(()) })
     }
 
     /// `true` asks for [`ComposeCx::secrets`](crate::api::ComposeCx::secrets), a view

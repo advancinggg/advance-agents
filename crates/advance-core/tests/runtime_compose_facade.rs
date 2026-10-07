@@ -17,17 +17,18 @@ use std::path::Path;
 use std::sync::Arc;
 
 use advance_core::runtime_compose::{
-    compose, log_keys, Admission, BoxFuture, CapParams, CapabilityRefusal, ClientApiEndpoint,
-    ClientApiOptions, ComponentFunc, ComposeCx, ComposeError, ComposeExtension, ComposeLog,
-    ComposeLogLine, ComposeOptions, ComposeProfile, ComposedRuntime, ConfigView, EmitError,
-    EmitReceipt, ExtensionEmitter, ExtensionError, ExtensionFailure, ExtensionGrantCheck,
-    ExtensionHealth, ExtensionPhase, ExtensionSecrets, ExtensionState, GatewayHandle,
-    GrantDecision, HostCallContext, HostCallError, HostFunctionDef, HostFunctionFailure,
-    HostFunctionHandler, HostFunctionRefusal, HostFunctionRegistrar, HostPlatform, InstanceGuard,
-    InstanceGuardKind, ListenerOptions, LockFailure, LogStream, MasterKeyInput, NullComposeLog,
-    PanicAnswer, ProcessPolicy, RunInfo, RunView, RuntimeHealthView, RuntimePhase, SecretViewError,
-    ShutdownHandle, StartedCx, TaskRunStatus, TaskSpawner, Unsupported, Val, ViewError, WasmEngine,
-    Zeroizing,
+    async_trait, compose, log_keys, Admission, BoxFuture, CapParams, CapabilityRefusal,
+    ClientApiEndpoint, ClientApiOptions, ComponentFunc, ComposeCx, ComposeError, ComposeExtension,
+    ComposeLog, ComposeLogLine, ComposeOptions, ComposeProfile, ComposedRuntime, ConfigView,
+    EmitError, EmitReceipt, ExtensionEmitter, ExtensionError, ExtensionFailure,
+    ExtensionGrantCheck, ExtensionHealth, ExtensionPhase, ExtensionSecrets, ExtensionState,
+    GatewayHandle, GrantDecision, HostCallContext, HostCallError, HostFunctionDef,
+    HostFunctionFailure, HostFunctionHandler, HostFunctionRefusal, HostFunctionRegistrar,
+    HostPlatform, HostTool, InstanceGuard, InstanceGuardKind, ListenerOptions, LockFailure,
+    LogStream, MasterKeyInput, MethodInfo, NullComposeLog, PanicAnswer, ProcessPolicy, RunInfo,
+    RunView, RuntimeHealthView, RuntimePhase, SecretViewError, ShutdownHandle, StartedCx,
+    TaskRunStatus, TaskSpawner, ToolDescription, ToolError, ToolRefusal, ToolRegistrar,
+    Unsupported, Val, ViewError, WasmEngine, Zeroizing,
 };
 
 /// The CONTRACT-244 API: every name `api/mod.rs` may re-export, and must.
@@ -54,6 +55,13 @@ const ALLOWED: &[&str] = &[
     "HostFunctionRegistrar",
     "PanicAnswer",
     "Val",
+    "async_trait",
+    "HostTool",
+    "MethodInfo",
+    "ToolDescription",
+    "ToolError",
+    "ToolRefusal",
+    "ToolRegistrar",
     "BoxFuture",
     "ComposeExtension",
     "ExtensionError",
@@ -97,6 +105,9 @@ const ALLOWED: &[&str] = &[
 
 /// The one façade line.
 const FACADE_LINE: &str = "pub use advance_runtime_compose::api as runtime_compose;";
+
+#[async_trait]
+trait _FacadeAsyncTraitWitness: Send {}
 
 struct Quiet;
 
@@ -150,6 +161,12 @@ fn uses_the_api_through_the_facade(home: std::path::PathBuf) {
     let _: Option<Arc<dyn HostFunctionHandler>> = None;
     let _: Option<Val> = None;
     let _: Option<ComponentFunc> = None;
+    let _: Option<ToolRegistrar> = None;
+    let _: Option<ToolRefusal> = None;
+    let _: Option<Arc<dyn HostTool>> = None;
+    let _: Option<MethodInfo> = None;
+    let _: Option<ToolDescription> = None;
+    let _: Option<ToolError> = None;
     let _: Option<LockFailure> = None;
     let _: Option<Unsupported> = None;
     let _: Option<ExtensionPhase> = None;

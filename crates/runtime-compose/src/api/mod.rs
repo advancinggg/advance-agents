@@ -8,6 +8,7 @@ mod extension_cx;
 mod host_functions;
 mod options;
 mod runtime;
+mod tools;
 
 pub use crate::compose::compose;
 pub use advance_shared_types::capability::CapParams;
@@ -70,3 +71,10 @@ pub use runtime::InstanceGuardKind;
 pub use runtime::RuntimeHealthView;
 pub use runtime::RuntimePhase;
 pub use runtime::ShutdownHandle;
+pub use tools::async_trait;
+pub use tools::HostTool;
+pub use tools::MethodInfo;
+pub use tools::ToolDescription;
+pub use tools::ToolError;
+pub use tools::ToolRefusal;
+pub use tools::ToolRegistrar;
