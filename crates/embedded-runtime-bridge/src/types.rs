@@ -34,7 +34,11 @@ pub enum CompositionMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostBackend {
+    /// Cranelift native code. Every v1 health report says `cranelift`.
     Cranelift,
+    /// Pulley bytecode run by Wasmtime's interpreter (no executable memory). Reported only by
+    /// handles started through the v2 entry points.
+    Pulley,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,4 +127,55 @@ pub trait EmbeddedRuntimeBridge: Send + Sync {
         handle: &crate::handle::BridgeHandle,
         input: BridgeLifecycleInput,
     ) -> Result<(), crate::error::BridgeError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::build_profile;
+
+    #[test]
+    fn module_001_ac32_host_backend_pulley_is_pulley_on_the_wire() {
+        assert_eq!(
+            serde_json::to_string(&HostBackend::Pulley).unwrap(),
+            "\"pulley\""
+        );
+        assert_eq!(
+            serde_json::from_str::<HostBackend>("\"pulley\"").unwrap(),
+            HostBackend::Pulley
+        );
+        assert_eq!(
+            serde_json::to_string(&HostBackend::Cranelift).unwrap(),
+            "\"cranelift\""
+        );
+        assert_eq!(
+            serde_json::from_str::<HostBackend>("\"cranelift\"").unwrap(),
+            HostBackend::Cranelift
+        );
+    }
+
+    #[test]
+    fn module_001_ac32_v1_profile_still_reports_cranelift() {
+        for platform in [
+            BridgePlatform::Mac,
+            BridgePlatform::Ios,
+            BridgePlatform::Android,
+            BridgePlatform::Windows,
+        ] {
+            for engine_mode in [EngineMode::Jit, EngineMode::Interpreter] {
+                for lifecycle in [
+                    PlatformLifecycleState::Foreground,
+                    PlatformLifecycleState::Background,
+                    PlatformLifecycleState::Suspended,
+                    PlatformLifecycleState::Restricted,
+                ] {
+                    for runtime_up in [true, false] {
+                        let p =
+                            build_profile(platform, engine_mode, lifecycle, runtime_up, None, None);
+                        assert_eq!(p.host_backend, HostBackend::Cranelift);
+                    }
+                }
+            }
+        }
+    }
 }
