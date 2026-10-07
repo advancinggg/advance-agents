@@ -12,6 +12,7 @@ use advance_client_api::ClientApi;
 use advance_event_bus::EventBus;
 use advance_git::DefaultGitCommitQueue;
 use advance_run_manager::RunManager;
+use advance_runtime::capability_injector::CapabilityInjector;
 use advance_runtime::ComponentRuntime;
 use cap_llm::{LlmGateway, ModelProfileCatalog};
 use tokio::sync::Notify;
@@ -164,6 +165,8 @@ pub struct ProbeRecord {
     pub effective_capabilities: Option<EffectiveCapabilities>,
     /// The root loop's declared capability names (the guest request set).
     pub root_request_set: Option<Vec<String>>,
+    /// The injector the host built (dies with the host).
+    pub capability_injector: Option<Weak<CapabilityInjector>>,
 }
 
 impl ProbeRecord {
@@ -181,6 +184,7 @@ impl ProbeRecord {
             ("perchild_manager", alive(&self.perchild_manager)),
             ("run_manager", alive(&self.run_manager)),
             ("component_runtime", alive(&self.component_runtime)),
+            ("capability_injector", alive(&self.capability_injector)),
             ("chatgpt_sign_in", alive(&self.chatgpt_sign_in)),
         ] {
             if is_alive {

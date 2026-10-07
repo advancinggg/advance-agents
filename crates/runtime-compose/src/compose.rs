@@ -352,6 +352,8 @@ const _: () = {
         assert_send_sync::<crate::api::ExtensionHealth>();
         assert_send_sync::<ExtensionSet>();
         assert_send_sync::<crate::extension::call::CallIdentity>();
+        assert_send_sync::<crate::api::HostFunctionRegistrar>();
+        assert_send_sync::<crate::extension::host_functions::ContainedHostFunction>();
     }
 };
 

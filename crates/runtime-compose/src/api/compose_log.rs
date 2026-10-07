@@ -181,6 +181,10 @@ pub mod log_keys {
     pub const EXT_TASK_PANICKED: &str = "ext.task_panicked";
     /// stderr: extension tasks were still running 5s after cancellation (abandoned).
     pub const EXT_TASKS_ABANDONED: &str = "ext.tasks_abandoned";
+    /// stderr: an extension host function panicked (in-band, trap, or in drop).
+    pub const EXT_HOST_FUNCTION_PANICKED: &str = "ext.host_function_panicked";
+    /// stderr: a PanicAnswer was unusable (wrong arity, wrong type, or it panicked).
+    pub const EXT_HOST_FUNCTION_ANSWER_INVALID: &str = "ext.host_function_answer_invalid";
 
     // Objects the daemon does not start, available to embedders.
     /// stdout: an agent reply preview.
@@ -265,6 +269,8 @@ pub mod log_keys {
         EXT_ON_STARTED_PANICKED,
         EXT_TASK_PANICKED,
         EXT_TASKS_ABANDONED,
+        EXT_HOST_FUNCTION_PANICKED,
+        EXT_HOST_FUNCTION_ANSWER_INVALID,
         REPLY_AGENT_REPLY,
         WEBHOOK_TRIGGER_SEND_FAILED,
         ROLLBACK_MARK_PRE_TURN_FAILED,

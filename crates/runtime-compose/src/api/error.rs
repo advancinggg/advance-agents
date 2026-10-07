@@ -43,6 +43,11 @@ pub enum ComposeError {
         capability: String,
         reason: CapabilityRefusal,
     },
+    /// An extension's host function was refused.
+    HostFunction {
+        extension: &'static str,
+        refusal: super::host_functions::HostFunctionRefusal,
+    },
     /// An extension callback failed or panicked.
     Extension {
         extension: &'static str,
@@ -186,6 +191,9 @@ impl fmt::Display for ComposeError {
                 f,
                 "extension {extension}: capability {capability} refused: {reason}"
             ),
+            ComposeError::HostFunction { extension, refusal } => {
+                write!(f, "extension {extension}: host function refused: {refusal}")
+            }
             ComposeError::Extension {
                 extension,
                 phase,

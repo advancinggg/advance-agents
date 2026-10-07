@@ -102,6 +102,7 @@ wit-component = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # The ordered-shutdown witnesses keep a Client API WebSocket open across the shutdown.
 tokio-tungstenite = { workspace = true }
+wat = { workspace = true }
 
 [lints]
 workspace = true

@@ -18,14 +18,16 @@ use std::sync::Arc;
 
 use advance_core::runtime_compose::{
     compose, log_keys, Admission, BoxFuture, CapParams, CapabilityRefusal, ClientApiEndpoint,
-    ClientApiOptions, ComposeCx, ComposeError, ComposeExtension, ComposeLog, ComposeLogLine,
-    ComposeOptions, ComposeProfile, ComposedRuntime, ConfigView, EmitError, EmitReceipt,
-    ExtensionEmitter, ExtensionError, ExtensionFailure, ExtensionGrantCheck, ExtensionHealth,
-    ExtensionPhase, ExtensionSecrets, ExtensionState, GatewayHandle, GrantDecision, HostPlatform,
-    InstanceGuard, InstanceGuardKind, ListenerOptions, LockFailure, LogStream, MasterKeyInput,
-    NullComposeLog, ProcessPolicy, RunInfo, RunView, RuntimeHealthView, RuntimePhase,
-    SecretViewError, ShutdownHandle, StartedCx, TaskRunStatus, TaskSpawner, Unsupported, ViewError,
-    WasmEngine, Zeroizing,
+    ClientApiOptions, ComponentFunc, ComposeCx, ComposeError, ComposeExtension, ComposeLog,
+    ComposeLogLine, ComposeOptions, ComposeProfile, ComposedRuntime, ConfigView, EmitError,
+    EmitReceipt, ExtensionEmitter, ExtensionError, ExtensionFailure, ExtensionGrantCheck,
+    ExtensionHealth, ExtensionPhase, ExtensionSecrets, ExtensionState, GatewayHandle,
+    GrantDecision, HostCallContext, HostCallError, HostFunctionDef, HostFunctionFailure,
+    HostFunctionHandler, HostFunctionRefusal, HostFunctionRegistrar, HostPlatform, InstanceGuard,
+    InstanceGuardKind, ListenerOptions, LockFailure, LogStream, MasterKeyInput, NullComposeLog,
+    PanicAnswer, ProcessPolicy, RunInfo, RunView, RuntimeHealthView, RuntimePhase, SecretViewError,
+    ShutdownHandle, StartedCx, TaskRunStatus, TaskSpawner, Unsupported, Val, ViewError, WasmEngine,
+    Zeroizing,
 };
 
 /// The CONTRACT-244 API: every name `api/mod.rs` may re-export, and must.
@@ -42,6 +44,16 @@ const ALLOWED: &[&str] = &[
     "LockFailure",
     "Unsupported",
     "CapabilityRefusal",
+    "ComponentFunc",
+    "HostCallContext",
+    "HostCallError",
+    "HostFunctionDef",
+    "HostFunctionFailure",
+    "HostFunctionHandler",
+    "HostFunctionRefusal",
+    "HostFunctionRegistrar",
+    "PanicAnswer",
+    "Val",
     "BoxFuture",
     "ComposeExtension",
     "ExtensionError",
@@ -128,6 +140,16 @@ fn uses_the_api_through_the_facade(home: std::path::PathBuf) {
     let _: &[&str] = log_keys::ALL;
     let _: Option<ComposeError> = None;
     let _: Option<CapabilityRefusal> = None;
+    let _: Option<HostFunctionRegistrar> = None;
+    let _: Option<HostFunctionDef> = None;
+    let _: Option<PanicAnswer> = None;
+    let _: Option<HostFunctionFailure> = None;
+    let _: Option<HostFunctionRefusal> = None;
+    let _: Option<HostCallContext> = None;
+    let _: Option<HostCallError> = None;
+    let _: Option<Arc<dyn HostFunctionHandler>> = None;
+    let _: Option<Val> = None;
+    let _: Option<ComponentFunc> = None;
     let _: Option<LockFailure> = None;
     let _: Option<Unsupported> = None;
     let _: Option<ExtensionPhase> = None;

@@ -5,7 +5,8 @@ use std::fmt;
 pub use futures::future::BoxFuture;
 
 use super::error::ExtensionFailure;
-use super::extension_cx::{EmitError, SecretViewError, StartedCx, ViewError};
+use super::extension_cx::{ComposeCx, EmitError, SecretViewError, StartedCx, ViewError};
+use super::host_functions::HostFunctionRegistrar;
 
 /// A product (or test) addition to the composition. Trusted in-process code: the
 /// registrars stop collisions and broken invariants; they are not a sandbox (ADR D2
@@ -25,6 +26,17 @@ pub trait ComposeExtension: Send + Sync + 'static {
     /// Extra capability names a guest may declare, each `<id>.<name>`.
     fn capabilities(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// Host functions, after `inference` and before the host is built. Always
+    /// called (independent of the home's declarations).
+    fn host_functions(
+        &self,
+        cx: &ComposeCx,
+        reg: &mut HostFunctionRegistrar,
+    ) -> Result<(), ExtensionError> {
+        let _ = (cx, reg);
+        Ok(())
     }
 
     /// `true` asks for [`ComposeCx::secrets`](crate::api::ComposeCx::secrets), a view

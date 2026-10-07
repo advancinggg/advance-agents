@@ -3,6 +3,7 @@
 pub mod call;
 pub mod capabilities;
 pub mod guard;
+pub mod host_functions;
 pub mod ids;
 pub mod set;
 

@@ -3022,6 +3022,19 @@ pub(crate) async fn wire_capabilities_inner(
         started.llm_stream_reaper = llm_stream_reaper.clone();
     }
 
+    // MODULE-001 §1.4.7 (c): extension host functions — after the gateway, before
+    // the host is built, on the same registry Arc the injector reads.
+    if !extensions.is_empty() {
+        if let Err(error) =
+            crate::extension::host_functions::run_host_functions(&extensions, &*registry, &log)
+        {
+            return Err(WiringFailure {
+                error: WiringError::Compose(error),
+                partial: started,
+            });
+        }
+    }
+
     // Step 6 — finalize. On failure, everything started so far (the EventBus, the
     // cap-grant sweeper, the per-child manager, the git commit queue, the sign-in
     // object, the stream reaper) is handed back with the error and stopped in
@@ -3052,6 +3065,8 @@ pub(crate) async fn wire_capabilities_inner(
 
     probe_record!(probe, |record| record.component_runtime =
         Some(Arc::downgrade(&host.component_runtime())));
+    probe_record!(probe, |record| record.capability_injector =
+        Some(Arc::downgrade(&host.capability_injector())));
 
     // Installed packs: meta-schema extensions + presets now; their skill tools join once the
     // tool registry exists (step 7). Conflicts are logged and skipped, never fatal.
