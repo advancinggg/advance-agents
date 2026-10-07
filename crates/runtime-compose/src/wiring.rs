@@ -27,6 +27,7 @@
 //!
 //! See MODULE-001 §2.7 / §3.6 for the wiring posture.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,7 +46,9 @@ use advance_reply_tracker::{
     ComponentResolutionSink, RunSuspendSink,
 };
 use advance_runtime::bootstrap::{BootstrapError, RuntimeHost, RuntimeHostBuilder};
-use advance_runtime::config::{RunBudgetConfig, RuntimeConfigProvider, SecretsConfig};
+use advance_runtime::config::{
+    RunBudgetConfig, RuntimeConfig, RuntimeConfigProvider, SecretsConfig,
+};
 use advance_runtime::register_agent_genui;
 use advance_scheduler::{ComponentSubmitApi, InMemoryComponentSubmitApi, SubmitSubsetGate};
 use advance_scheduler_auto_loop::DefaultAutoLoopDriver;
@@ -54,6 +57,7 @@ use advance_shared_types::agent_tree::{
 };
 use advance_shared_types::await_session::AwaitSessionRef;
 use advance_shared_types::capability::CapParams;
+use advance_shared_types::inference::{InferenceBackendPort, MeshInferenceDispatch};
 use advance_shared_types::repetition::{OutputHash, RepetitionDecision, ToolCallSignature};
 /// Only the `test-support` composition witness takes an injected SSRF guard; in a plain build
 /// the import would be unused, and CI compiles the production binary under `-D warnings`.
@@ -157,12 +161,35 @@ pub fn install_live_streaming(
 /// The name the user sees when this daemon first registers with Sign in with ChatGPT.
 const CHATGPT_SIGN_IN_APP_NAME: &str = "Advance Agents";
 
-/// THE production LLM-gateway constructor (S4, 2026-07-29). The composition root
-/// has no other path to a gateway, so a test that calls this with stub
-/// collaborators witnesses the real wiring: deleting `install_live_streaming` here
-/// fails that test, and deleting the CALL to this function fails to compile.
+/// What the extensions contributed to the gateway (CONTRACT-244 D2(b)), already
+/// validated and wrapped in containment adapters. [`GatewayInference::none`] is
+/// plain OSS: empty claims, no mesh dispatch, an empty catalog, and
+/// `config.current()` as the provider snapshot.
+pub(crate) struct GatewayInference {
+    pub claims: BTreeMap<String, Arc<dyn InferenceBackendPort>>,
+    pub mesh_dispatch: Option<Arc<dyn MeshInferenceDispatch>>,
+    pub catalog: Arc<cap_llm::ModelProfileCatalog>,
+    pub snapshot: Option<Arc<RuntimeConfig>>,
+}
+
+impl GatewayInference {
+    pub(crate) fn none() -> Self {
+        Self {
+            claims: BTreeMap::new(),
+            mesh_dispatch: None,
+            catalog: Arc::new(cap_llm::ModelProfileCatalog::new()),
+            snapshot: None,
+        }
+    }
+}
+
+/// THE production LLM-gateway constructor (CONTRACT-244 D2(b)). The
+/// composition root has no other path to a gateway, so a test that calls the public
+/// [`build_llm_gateway`] shim with stub collaborators witnesses the real wiring:
+/// deleting `install_live_streaming` here fails that test, and deleting the CALL to
+/// this function fails to compile.
 #[allow(clippy::too_many_arguments)]
-pub fn build_llm_gateway(
+pub(crate) fn build_llm_gateway_with(
     config: Arc<dyn RuntimeConfigProvider>,
     chain: Arc<dyn advance_shared_types::security_validator::HttpSecurityChain>,
     streaming_chain: Arc<dyn HttpStreamingChain>,
@@ -179,19 +206,27 @@ pub fn build_llm_gateway(
     // object). `None` = not wired: such an entry fails before dispatch and
     // `LlmGateway::has_credential_source()` answers false.
     credential_source: Option<Arc<dyn cap_llm::ProviderCredentialSource>>,
+    inference: GatewayInference,
 ) -> Arc<LlmGateway> {
-    let catalog = cap_llm::ModelProfileCatalog::new();
+    let GatewayInference {
+        claims,
+        mesh_dispatch,
+        catalog,
+        snapshot,
+    } = inference;
+    let boot = snapshot.unwrap_or_else(|| config.current());
     let mut holds: Vec<Arc<cap_llm::SupervisedChild>> = Vec::new();
     let mut registry = advance_shared_types::inference::InferenceBackendRegistry::new();
-    for p in config.current().llm_providers.iter() {
+    for p in boot.llm_providers.iter() {
         if p.backend_class != advance_runtime::config::InferenceBackendClass::Local {
             continue;
         }
         let Some(sc) = p.sidecar.as_ref() else {
-            registry.insert(
-                p.id.clone(),
-                Arc::new(advance_shared_types::inference::NotWiredInferenceBackend),
-            );
+            let port: Arc<dyn InferenceBackendPort> = match claims.get(&p.id) {
+                Some(c) => Arc::clone(c),
+                None => Arc::new(advance_shared_types::inference::NotWiredInferenceBackend),
+            };
+            registry.insert(p.id.clone(), port);
             continue;
         };
         let sup = cap_llm::backend_local::ProcessSupervisor {
@@ -227,7 +262,7 @@ pub fn build_llm_gateway(
     }
     // ADR 2026-09-28 `agent-cli`: one per-request vendor-CLI port per entry. The scratch root
     // is per user + daemon; each call gets its own 0700 subdirectory.
-    for p in config.current().llm_providers.iter() {
+    for p in boot.llm_providers.iter() {
         let (advance_runtime::config::InferenceBackendClass::AgentCli, Some(spec)) =
             (p.backend_class, p.agent_cli.as_ref())
         else {
@@ -242,14 +277,16 @@ pub fn build_llm_gateway(
             )),
         );
     }
-    for p in config.current().llm_providers.iter() {
+    for p in boot.llm_providers.iter() {
         if p.backend_class != advance_runtime::config::InferenceBackendClass::MeshRemote {
             continue;
         }
         registry.insert(
             p.id.clone(),
             Arc::new(cap_llm::MeshRemoteAdapter {
-                dispatch: Arc::new(advance_shared_types::inference::NotWiredMeshInferenceDispatch),
+                dispatch: mesh_dispatch.clone().unwrap_or_else(|| {
+                    Arc::new(advance_shared_types::inference::NotWiredMeshInferenceDispatch)
+                }),
                 provider_id: p.id.clone(),
                 embedding_model: p.embedding_model.clone(),
                 target_device_id: p.device_id.clone().unwrap_or_default(),
@@ -267,7 +304,7 @@ pub fn build_llm_gateway(
     .with_delta_sink(delta_sink)
     .with_inference_backends(registry)
     .with_sidecar_holds(holds)
-    .with_catalog(catalog);
+    .with_shared_catalog(catalog);
     if let Some(policy) = agent_policy {
         gateway = gateway.with_agent_policy(policy);
     }
@@ -279,6 +316,39 @@ pub fn build_llm_gateway(
         streaming_chain,
         decoded_detector,
     ))
+}
+
+/// Public shim, signature unchanged: the gateway with no extension contribution.
+/// The MODULE-009-AC-20 composition-root witness calls this; the body lives in
+/// [`build_llm_gateway_with`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_llm_gateway(
+    config: Arc<dyn RuntimeConfigProvider>,
+    chain: Arc<dyn advance_shared_types::security_validator::HttpSecurityChain>,
+    streaming_chain: Arc<dyn HttpStreamingChain>,
+    decoded_detector: Arc<dyn LeakDetector>,
+    budget: Arc<dyn RunBudget>,
+    event_bus: Arc<dyn EventBusEmit>,
+    repetition: Arc<dyn RepetitionGuardCheck>,
+    default_agent_id: String,
+    delta_sink: Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
+    agent_policy: Option<Arc<dyn cap_llm::AgentLlmPolicySource>>,
+    credential_source: Option<Arc<dyn cap_llm::ProviderCredentialSource>>,
+) -> Arc<LlmGateway> {
+    build_llm_gateway_with(
+        config,
+        chain,
+        streaming_chain,
+        decoded_detector,
+        budget,
+        event_bus,
+        repetition,
+        default_agent_id,
+        delta_sink,
+        agent_policy,
+        credential_source,
+        GatewayInference::none(),
+    )
 }
 
 pub fn build_grant_resolver_chain(
@@ -2752,16 +2822,22 @@ pub(crate) async fn wire_capabilities_inner(
         // `HttpSecurityChain` + `RuntimeConfigProvider`, so the VLM egress posture is
         // identical to the gateway's (one security chain, one config). Threaded into
         // `build_live_post_processor`, which installs the `VlmDescriptionIndexer` into
-        // the live post-processor Step-3.
-        let vlm: Arc<dyn VlmExtractor> = Arc::new(
-            LlmGatewayVlm::new(
-                builder.config_watcher(),
-                chain.clone(),
-                event_bus_dyn.clone(),
-                root_uid.clone(),
-            )
-            .with_catalog(cap_llm::ModelProfileCatalog::new()),
-        );
+        // the live post-processor Step-3. One catalog is shared with the gateway
+        // (CONTRACT-244 D2(b)): empty until an extension contributes profiles.
+        let llm_boot = builder.config_watcher().current();
+        let shared_catalog = Arc::new(cap_llm::ModelProfileCatalog::new());
+        let vlm_concrete = LlmGatewayVlm::new(
+            builder.config_watcher(),
+            chain.clone(),
+            event_bus_dyn.clone(),
+            root_uid.clone(),
+        )
+        .with_shared_catalog(Arc::clone(&shared_catalog));
+        #[cfg(feature = "test-support")]
+        if let Some(p) = probe.as_ref() {
+            p.set_vlm_catalog(Arc::downgrade(&vlm_concrete.catalog()));
+        }
+        let vlm: Arc<dyn VlmExtractor> = Arc::new(vlm_concrete);
         vlm_extractor = Some(vlm);
         // S4 final (2026-07-29, dev-task-s4-final): live streaming re-wired via
         // `install_live_streaming` below — the chain (with its stream executor
@@ -2796,12 +2872,12 @@ pub(crate) async fn wire_capabilities_inner(
         };
         llm_delta_hub_opt = Some(Arc::clone(&llm_delta_hub));
 
-        // THE single production path to a gateway (S4): `build_llm_gateway` installs
-        // the live streaming path internally, so the composition-root witness in
-        // `crates/cli/tests/s4_live_streaming_composition.rs` covers THIS code —
-        // deleting the install inside it fails that test, and deleting this call
-        // fails to compile.
-        let gateway = build_llm_gateway(
+        // THE single production path to a gateway: `build_llm_gateway_with`
+        // installs the live streaming path internally, so the composition-root
+        // witness in `crates/cli/tests/s4_live_streaming_composition.rs` (via the
+        // public `build_llm_gateway` shim) covers THIS code — deleting the install
+        // inside it fails that test, and deleting this call fails to compile.
+        let gateway = build_llm_gateway_with(
             builder.config_watcher(),
             chain,
             stream_chain,
@@ -2832,6 +2908,11 @@ pub(crate) async fn wire_capabilities_inner(
             ),
             // The SAME sign-in object the provider admin drives below.
             Some(sign_in as Arc<dyn cap_llm::ProviderCredentialSource>),
+            GatewayInference {
+                catalog: Arc::clone(&shared_catalog),
+                snapshot: Some(llm_boot),
+                ..GatewayInference::none()
+            },
         );
         // Hold an Arc clone for the composition root before registration
         // moves one into the host-fn handlers (all clones share the one gateway,
@@ -2839,6 +2920,10 @@ pub(crate) async fn wire_capabilities_inner(
         llm_gateway = Some(gateway.clone());
         probe_record!(probe, |record| record.llm_gateway =
             Some(Arc::downgrade(&gateway)));
+        #[cfg(feature = "test-support")]
+        if let Some(p) = probe.as_ref() {
+            p.set_gateway_catalog(Arc::downgrade(&gateway.catalog()));
+        }
         // Tee slice T3: RETAIN the reap handle — the composition root drives
         // turn-end reap through it on both observer paths.
         llm_stream_reaper = Some(register_agent_llm_with_turn_cost(
@@ -3542,3 +3627,6 @@ fn build_skill_turn_persistence(
         Arc::new(cap_skills::StoreDraftFlush::new(Arc::clone(&shared_store)));
     cap_skills::SkillTurnPersistenceDriver::new(shared_store, coordinator, flusher)
 }
+
+#[cfg(test)]
+mod build_llm_gateway_tests;

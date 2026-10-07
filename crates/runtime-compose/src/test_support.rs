@@ -12,7 +12,7 @@ use advance_event_bus::EventBus;
 use advance_git::DefaultGitCommitQueue;
 use advance_run_manager::RunManager;
 use advance_runtime::ComponentRuntime;
-use cap_llm::LlmGateway;
+use cap_llm::{LlmGateway, ModelProfileCatalog};
 use tokio::sync::Notify;
 
 use crate::api::{ComposeLog, ComposeLogLine};
@@ -101,6 +101,14 @@ impl ComposeProbe {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
     }
+
+    pub(crate) fn set_vlm_catalog(&self, catalog: Weak<ModelProfileCatalog>) {
+        self.update(|record| record.vlm_catalog = Some(catalog));
+    }
+
+    pub(crate) fn set_gateway_catalog(&self, catalog: Weak<ModelProfileCatalog>) {
+        self.update(|record| record.gateway_catalog = Some(catalog));
+    }
 }
 
 /// The objects a composition built (held weakly, so the record keeps nothing alive),
@@ -117,6 +125,10 @@ pub struct ProbeRecord {
     pub component_runtime: Option<Weak<ComponentRuntime>>,
     /// Only where a sign-in source is configured (a home declaring `llm`).
     pub chatgpt_sign_in: Option<Weak<advance_home::ChatGptSignIn>>,
+    /// The VLM extractor's catalog (same `Arc` as the gateway when `llm` is declared).
+    pub vlm_catalog: Option<Weak<ModelProfileCatalog>>,
+    /// The gateway's catalog (same `Arc` as the VLM extractor when `llm` is declared).
+    pub gateway_catalog: Option<Weak<ModelProfileCatalog>>,
     /// `("client_api" | "event_bus" | "post_msg" | "hooks", bound address)`, in bind order.
     pub listeners: Vec<(&'static str, SocketAddr)>,
     /// Whether the turn gate wraps the root loop's context assembler.
@@ -146,6 +158,9 @@ impl ProbeRecord {
             if is_alive {
                 names.push(name);
             }
+        }
+        if alive(&self.vlm_catalog) || alive(&self.gateway_catalog) {
+            names.push("model_catalog");
         }
         names
     }

@@ -303,6 +303,7 @@ const _: () = {
         assert_send_sync::<ComposeOptions>();
         assert_send_sync::<ComposeError>();
         assert_send::<RuntimeHealthView>();
+        assert_send_sync::<crate::wiring::GatewayInference>();
     }
 };
 
