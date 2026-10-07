@@ -1,13 +1,17 @@
-//! SYS-AC-338: a registration refusal fails compose typed, with no listener.
+//! SYS-AC-338: production-compose refusal legs (registration refusals, claims on entries
+//! OSS binds, startup panics).
 
 use std::sync::Arc;
 
 use advance_runtime_compose::test_support::fixture::{
-    assert_gone_for_home, CapDecl, FixtureDriver, FixtureExtension, FixtureFamilies, FixtureHome,
-    FixtureHomeSpec, RouteRuleBreak, FIXTURE_ID,
+    assert_gone_for_home, CapDecl, FixtureBreaks, FixtureDriver, FixtureExtension, FixtureFamilies,
+    FixtureHome, FixtureHomeSpec, RouteRuleBreak, FIXTURE_ID,
 };
 use advance_runtime_compose::test_support::{ComposeProbe, MemoryComposeLog};
-use advance_runtime_compose::{compose, log_keys, ComposeError, DuplicateOf, RouteRefusalReason};
+use advance_runtime_compose::{
+    compose, log_keys, ComposeError, DuplicateOf, ExtensionFailure, ExtensionPhase,
+    RouteRefusalReason,
+};
 
 fn alive_tasks() -> usize {
     tokio::runtime::Handle::current()
@@ -214,5 +218,51 @@ async fn sys_ac_338_j83_claim_of_oss_bound_entry_fails_typed() {
         } if id == "cloud-a" => {}
         other => panic!("cloud entry claim: {other:?}"),
     })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sys_ac_338_startup_callback_panic_is_typed_not_abort() {
+    let home = home();
+
+    async fn panicked(home: &FixtureHome, phase: ExtensionPhase, needle: &str) {
+        let log = MemoryComposeLog::new();
+        let probe = Arc::new(ComposeProbe::new());
+        let baseline = alive_tasks();
+        let error = compose(
+            home.options(Arc::new(log.clone()), Arc::clone(&probe)),
+            vec![FixtureExtension::new(FIXTURE_ID)
+                .with_breaks(FixtureBreaks {
+                    panic_in: Some(phase),
+                    ..FixtureBreaks::default()
+                })
+                .arc()],
+        )
+        .await
+        .expect_err("startup panic");
+        match &error {
+            ComposeError::Extension {
+                extension: "fixture",
+                phase: got,
+                failure: ExtensionFailure::Panicked(message),
+            } if *got == phase && message.contains(needle) => {}
+            other => panic!("startup panic in {phase:?}: {other:?}"),
+        }
+        assert_eq!(log.count(log_keys::READY), 0);
+        assert!(!home.home().join(".runtime/client-api").exists());
+        assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
+    }
+
+    panicked(
+        &home,
+        ExtensionPhase::ClientFamilies,
+        "fixture panic in client_families",
+    )
+    .await;
+    panicked(
+        &home,
+        ExtensionPhase::Capabilities,
+        "fixture panic in capabilities",
+    )
     .await;
 }
