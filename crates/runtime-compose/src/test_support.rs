@@ -5,6 +5,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
 use advance_client_api::ClientApi;
@@ -19,6 +20,28 @@ use crate::api::{ComposeLog, ComposeLogLine};
 use crate::perchild_daemon::PerChildLoopManager;
 
 pub use crate::composition::TEARDOWN_ORDER;
+
+pub mod fixture;
+
+/// Process-local homes a composition currently holds, for [`fixture::assert_gone_for_home`].
+pub fn reserved_homes() -> Vec<PathBuf> {
+    crate::registry::reserved_homes_for_test()
+}
+
+/// CONTRACT-218 custody paths a composition currently holds.
+pub fn custody_paths() -> Vec<PathBuf> {
+    crate::contract218_anchor::custody_paths_for_test()
+}
+
+/// Git commit-queue paths a composition currently holds.
+pub fn active_git_queues() -> Vec<PathBuf> {
+    advance_git::commit_queue::active_queue_paths_for_test()
+}
+
+/// Platform-directory component under `contract218/<key>/` for this home.
+pub fn contract218_platform_key(home: &Path) -> String {
+    crate::contract218_bootstrap::workspace_key(home)
+}
 
 /// The message of the error a `POST /msg` bind failpoint produces.
 pub const POST_MSG_FAILPOINT: &str = "T111 failpoint";

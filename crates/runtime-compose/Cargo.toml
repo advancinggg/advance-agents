@@ -21,7 +21,7 @@ default = []
 # turns on advance-git's (`commit_queue::active_queue_paths_for_test`), so every
 # crate that enables this one can read the git queue registrations. `advance-cli`'s
 # `test-support` forwards here.
-test-support = ["advance-git/test-support"]
+test-support = ["advance-git/test-support", "dep:tempfile"]
 
 [dependencies]
 advance-runtime = { path = "../runtime" }
@@ -83,6 +83,7 @@ uuid = { workspace = true }
 reqwest = { workspace = true }
 semver = { workspace = true }
 secrecy = { workspace = true }
+tempfile = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

@@ -285,9 +285,12 @@ fn selected_anchor_tuple(
     }
 }
 
+pub(crate) fn workspace_key(workspace: &Path) -> String {
+    hex::encode(Sha256::digest(workspace.to_string_lossy().as_bytes()))
+}
+
 fn platform_directory(workspace: &Path, state_root: Option<&Path>) -> Result<PathBuf, String> {
-    let digest = Sha256::digest(workspace.to_string_lossy().as_bytes());
-    let workspace_key = hex::encode(digest);
+    let workspace_key = workspace_key(workspace);
     let base = if let Some(root) = state_root {
         root.join("contract218")
     } else if cfg!(feature = "test-support") {
