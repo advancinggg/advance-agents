@@ -25,6 +25,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use advance_shared_types::process_policy::{ProcessPolicy, SpawnSite};
+
 use crate::{error::PackError, registry_client::RegistryClient, source::SourceRef};
 
 const MAX_COPY_DEPTH: usize = 256;
@@ -48,10 +50,19 @@ impl<'a> FetchContext<'a> {
     /// 4 source types produce a `TempPackDir` whose `path()` contains the
     /// extracted pack source tree (mirrors Local shape post-extract).
     pub async fn fetch_to_temp(&self, src: &SourceRef) -> Result<TempPackDir, PackError> {
+        self.fetch_to_temp_with_policy(src, ProcessPolicy::Allow)
+            .await
+    }
+
+    pub async fn fetch_to_temp_with_policy(
+        &self,
+        src: &SourceRef,
+        policy: ProcessPolicy,
+    ) -> Result<TempPackDir, PackError> {
         match src {
             SourceRef::Local(path) => fetch_local_to_temp(path),
             SourceRef::GitUrl { url, git_ref } => {
-                fetch_git_to_temp(url, git_ref.as_deref(), self.fetch_timeout).await
+                fetch_git_to_temp(url, git_ref.as_deref(), self.fetch_timeout, policy).await
             }
             SourceRef::Tarball(path) => fetch_tarball_to_temp(path).await,
             SourceRef::Registry { name, version } => {
@@ -153,7 +164,10 @@ fn fetch_local_to_temp(path: &Path) -> Result<TempPackDir, PackError> {
 /// (`protocol.ext.allow=never`), keep the default `protocol.allow=user`
 /// policy, and neutralise checkout hooks (`core.hooksPath=/dev/null`) for the
 /// P3 SHA-pin path's separate `checkout` step.
-fn hardened_git(host_path: &str) -> std::process::Command {
+fn hardened_git(host_path: &str, policy: ProcessPolicy) -> Result<std::process::Command, String> {
+    if let Err(f) = policy.admit(SpawnSite::PackGitSource) {
+        return Err(f.to_string());
+    }
     let mut cmd = std::process::Command::new("git");
     cmd.env_clear()
         .env("PATH", host_path)
@@ -170,7 +184,7 @@ fn hardened_git(host_path: &str) -> std::process::Command {
             "-c",
             "core.hooksPath=/dev/null",
         ]);
-    cmd
+    Ok(cmd)
 }
 
 /// Run a hardened git command to completion; the error is the diagnostic
@@ -191,8 +205,14 @@ fn run_git(mut cmd: std::process::Command) -> Result<(), String> {
 }
 
 /// `git clone --depth 1 [--branch <ref>] -- <url> <dest>` (tag / branch refs).
-fn git_clone(host_path: &str, url: &str, git_ref: Option<&str>, dest: &Path) -> Result<(), String> {
-    let mut cmd = hardened_git(host_path);
+fn git_clone(
+    host_path: &str,
+    url: &str,
+    git_ref: Option<&str>,
+    dest: &Path,
+    policy: ProcessPolicy,
+) -> Result<(), String> {
+    let mut cmd = hardened_git(host_path, policy)?;
     cmd.args(["clone", "--depth", "1"]);
     if let Some(r) = git_ref {
         cmd.arg("--branch").arg(r);
@@ -206,25 +226,31 @@ fn git_clone(host_path: &str, url: &str, git_ref: Option<&str>, dest: &Path) -> 
 /// Installs EXACTLY `sha` regardless of where any branch points. Requires
 /// `uploadpack.allowAnySHA1InWant` (or `allowReachableSHA1InWant`) on the
 /// server; the first stderr line of a refusing server surfaces as the reason.
-fn git_fetch_commit(host_path: &str, url: &str, sha: &str, dest: &Path) -> Result<(), String> {
-    let mut init = hardened_git(host_path);
+fn git_fetch_commit(
+    host_path: &str,
+    url: &str,
+    sha: &str,
+    dest: &Path,
+    policy: ProcessPolicy,
+) -> Result<(), String> {
+    let mut init = hardened_git(host_path, policy)?;
     init.arg("init").arg("--quiet").arg(dest);
     run_git(init)?;
-    let mut remote = hardened_git(host_path);
+    let mut remote = hardened_git(host_path, policy)?;
     remote
         .arg("-C")
         .arg(dest)
         .args(["remote", "add", "origin", "--"])
         .arg(url);
     run_git(remote)?;
-    let mut fetch = hardened_git(host_path);
+    let mut fetch = hardened_git(host_path, policy)?;
     fetch
         .arg("-C")
         .arg(dest)
         .args(["fetch", "--quiet", "--depth", "1", "origin"])
         .arg(sha);
     run_git(fetch)?;
-    let mut checkout = hardened_git(host_path);
+    let mut checkout = hardened_git(host_path, policy)?;
     checkout
         .arg("-C")
         .arg(dest)
@@ -242,10 +268,18 @@ async fn fetch_git_to_temp(
     url: &str,
     git_ref: Option<&str>,
     timeout: Duration,
+    policy: ProcessPolicy,
 ) -> Result<TempPackDir, PackError> {
+    policy
+        .check(SpawnSite::PackGitSource)
+        .map_err(PackError::ProcessForbidden)?;
     // Preflight: verify git is in PATH. Surfaces a clean diagnostic before the
     // clone attempt.
-    let preflight = tokio::task::spawn_blocking(|| {
+    let preflight_policy = policy;
+    let preflight = tokio::task::spawn_blocking(move || {
+        if preflight_policy.admit(SpawnSite::PackGitSource).is_err() {
+            return false;
+        }
         std::process::Command::new("git")
             .arg("--version")
             .output()
@@ -279,9 +313,9 @@ async fn fetch_git_to_temp(
         timeout,
         tokio::task::spawn_blocking(move || match git_ref_owned.as_deref() {
             Some(sha) if crate::source::is_commit_sha(sha) => {
-                git_fetch_commit(&host_path, &url_owned, sha, &dest_owned)
+                git_fetch_commit(&host_path, &url_owned, sha, &dest_owned, policy)
             }
-            other => git_clone(&host_path, &url_owned, other, &dest_owned),
+            other => git_clone(&host_path, &url_owned, other, &dest_owned, policy),
         }),
     )
     .await;

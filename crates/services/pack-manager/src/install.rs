@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use advance_shared_types::event::Event;
+use advance_shared_types::process_policy::ProcessPolicy;
 use advance_shared_types::traits::EventBusEmit;
 use async_trait::async_trait;
 use serde_json::json;
@@ -339,6 +340,17 @@ impl Installer {
     /// `pack.registry_reloaded` event on the top-level install boundary
     /// (NOT per recursive sub-install).
     pub async fn install(&self, source: &str) -> Result<PackInstallReport, PackError> {
+        self.install_with_policy(source, ProcessPolicy::Allow).await
+    }
+
+    /// A `git+…` source (top level or a resolved dependency) under `Forbid` answers
+    /// `PackError::ProcessForbidden` before any `git` child; local, tarball and registry sources
+    /// install as before (none spawns).
+    pub async fn install_with_policy(
+        &self,
+        source: &str,
+        policy: ProcessPolicy,
+    ) -> Result<PackInstallReport, PackError> {
         // Slice D: parse_source ONCE at public entry. On error, emit
         // Step1ParseSource trace BEFORE returning so AC-05 "each step emits a
         // trace event" holds even for parse-error path. On success, forward
@@ -356,7 +368,9 @@ impl Installer {
             }
         };
         let mut in_flight: Vec<(String, String)> = Vec::new();
-        let report = self.install_with_context(&src, &mut in_flight, 0).await?;
+        let report = self
+            .install_with_context(&src, &mut in_flight, 0, policy)
+            .await?;
 
         // Slice C: AC-15 single `pack.registry_reloaded` event per
         // top-level install. Emitted here (not inside install_with_context)
@@ -392,6 +406,7 @@ impl Installer {
         src: &SourceRef,
         in_flight: &mut Vec<(String, String)>,
         depth: usize,
+        policy: ProcessPolicy,
     ) -> Result<PackInstallReport, PackError> {
         let mut trace: Vec<InstallStep> = Vec::new();
 
@@ -417,7 +432,7 @@ impl Installer {
             registry_client: self.registry_client.as_deref(),
             fetch_timeout: self.fetch_timeout.unwrap_or(DEFAULT_FETCH_TIMEOUT),
         };
-        let tmp = ctx.fetch_to_temp(src).await?;
+        let tmp = ctx.fetch_to_temp_with_policy(src, policy).await?;
 
         // Pack lane P1: take the cross-process install lock ONCE, at
         // the top-level install (depth 0), AFTER the fetch (network/temp work stays
@@ -613,6 +628,7 @@ impl Installer {
                 &manifest.dependencies,
                 depth,
                 in_flight,
+                policy,
             )
             .await?;
         }
@@ -1274,6 +1290,56 @@ mod tests {
                 "expected not-a-regular-file rejection, got: {msg}"
             ),
             other => panic!("expected InvalidManifest(not-a-file), got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod module_001_ac32_tests {
+    use super::*;
+    use crate::registry::InMemoryPackRegistry;
+    use advance_shared_types::process_policy::{spawn_counter, ProcessPolicy, SpawnSite};
+
+    fn installer(packs_dir: &Path) -> Installer {
+        Installer::new(
+            packs_dir,
+            Arc::new(InMemoryPackRegistry::new(packs_dir.to_path_buf())),
+            "0.1.0",
+            Arc::new(AutoApprove),
+        )
+    }
+
+    fn packs_empty(dir: &Path) -> bool {
+        match std::fs::read_dir(dir) {
+            Ok(it) => it.filter_map(|e| e.ok()).count() == 0,
+            Err(_) => true,
+        }
+    }
+
+    #[tokio::test]
+    async fn module_001_ac32_git_pack_source_refused_under_forbid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let packs = dir.path().join("packs");
+        std::fs::create_dir_all(&packs).unwrap();
+        let inst = installer(&packs);
+        let source = "git+https://127.0.0.1:9/p.git";
+        let before = spawn_counter::snapshot();
+        match inst
+            .install_with_policy(source, ProcessPolicy::Forbid)
+            .await
+        {
+            Err(PackError::ProcessForbidden(f)) => {
+                assert_eq!(f.site, SpawnSite::PackGitSource);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(packs_empty(&packs));
+        let delta = spawn_counter::snapshot().since(&before);
+        assert_eq!(delta.refused(SpawnSite::PackGitSource), 1);
+
+        match inst.install(source).await {
+            Err(PackError::GitCloneFailed { .. }) => {}
+            other => panic!("expected GitCloneFailed, got {other:?}"),
         }
     }
 }

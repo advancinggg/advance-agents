@@ -25,6 +25,8 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 
+use advance_shared_types::process_policy::ProcessPolicy;
+
 use crate::error::PackError;
 use crate::install::Installer;
 use crate::manifest::PackDependency;
@@ -45,6 +47,7 @@ pub(crate) fn install_deps_recursive<'a>(
     deps: &'a [PackDependency],
     depth: usize,
     in_flight: &'a mut Vec<(String, String)>,
+    policy: ProcessPolicy,
 ) -> Pin<Box<dyn Future<Output = Result<(), PackError>> + Send + 'a>> {
     Box::pin(async move {
         for dep in deps {
@@ -101,7 +104,7 @@ pub(crate) fn install_deps_recursive<'a>(
             //    request — then `find_installed_satisfying` below succeeds
             //    while the unauthorized wrapper pack remains installed.
             let report = installer
-                .install_with_context(&source_ref, in_flight, depth + 1)
+                .install_with_context(&source_ref, in_flight, depth + 1, policy)
                 .await?;
             if report.name != dep.name {
                 return Err(PackError::DependencyVersionMismatch {

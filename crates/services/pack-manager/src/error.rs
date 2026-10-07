@@ -6,7 +6,8 @@
 //! for the reinstall / uninstall / capability-catalog surface; lane P3 adds 1
 //! (`SignatureInvalid`, total 25) for the signed-manifest surface and redacts
 //! URL userinfo in `GitCloneFailed`'s Display; lane P2 adds 1
-//! (`WorkflowStepFailed`, total 26) for the workflow-compensation surface.
+//! (`WorkflowStepFailed`, total 26) for the workflow-compensation surface;
+//! ADR 2026-10-03 D3 adds 1 (`ProcessForbidden`, total 27).
 
 use std::path::PathBuf;
 
@@ -199,4 +200,8 @@ pub enum PackError {
         compensated: Vec<String>,
         compensation_failures: Vec<String>,
     },
+
+    /// A `git+…` source under `ProcessPolicy::Forbid` (ADR 2026-10-03 D3): nothing was spawned.
+    #[error("{0}")]
+    ProcessForbidden(advance_shared_types::process_policy::ProcessForbidden),
 }

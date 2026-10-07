@@ -48,6 +48,7 @@ rustix = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
+advance-shared-types = { path = "../../shared-types", features = ["spawn-counter"] }
 # m017-slice-l: synthesize tool-exports / runnable Component binaries in-test
 # (no committed runnable fixture classifies per the validator's matcher).
 wit-component = { workspace = true }

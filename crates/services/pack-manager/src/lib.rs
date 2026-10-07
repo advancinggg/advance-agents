@@ -22,11 +22,12 @@
 //! - [`WorkflowApplier`] static driver for workflow templates (Slice B AC-10).
 //!   Drives 3 step types through [`WorkflowExecutor`] seam; resolves
 //!   `secret-refs` through [`SecretStore`] seam.
-//! - [`PackError`] taxonomy (26 variants — Slice D added `GitCloneFailed`,
+//! - [`PackError`] taxonomy (27 variants — Slice D added `GitCloneFailed`,
 //!   `TarballExtractFailed`, `RegistryFetchFailed` for the non-Local install
 //!   source surface; Slice C added `ConstraintViolation`; Pack lane P1
 //!   added `AlreadyInstalled`, `DependentsExist`, `UnknownRequiredCapability`;
-//!   P3 added `SignatureInvalid`; P2 added `WorkflowStepFailed`).
+//!   signing added `SignatureInvalid`; workflow compensation added `WorkflowStepFailed`; ADR
+//!   2026-10-03 D3 added `ProcessForbidden`).
 //! - Pack lane P1: [`Installer::new`]
 //!   builder + [`NoopTraceSink`]; disk-truth `AlreadyInstalled` at step ③ (before
 //!   checksum / approval); [`Installer::uninstall`] with `DependentsExist`
