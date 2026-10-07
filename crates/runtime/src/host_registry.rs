@@ -114,6 +114,21 @@ pub trait HostFunctionHandler: Send + Sync + 'static {
         params: Vec<Val>,
         results_len: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>>;
+
+    /// The dynamic (`func_new_async`) path's entry point: `CapabilityInjector`
+    /// calls this — never `call` directly — after the L1 grant check and the
+    /// circuit breaker allowed the call, passing the importing guest's view of
+    /// the function type. Default: `call` (every OSS handler; behaviour unchanged).
+    fn call_typed(
+        &self,
+        func: &wasmtime::component::types::ComponentFunc,
+        ctx: HostCallContext,
+        params: Vec<Val>,
+        results_len: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
+        let _ = func;
+        self.call(ctx, params, results_len)
+    }
 }
 
 /// Specification for a host function. Per MODULE-001 §2.3.

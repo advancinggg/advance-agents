@@ -359,7 +359,7 @@ impl CapabilityInjector {
         instance
             .func_new_async(
                 &spec.name,
-                move |store_ctx, _component_func, params, results| {
+                move |store_ctx, component_func, params, results| {
                     let handler = handler.clone();
                     let gc = gc.clone();
                     let br = br.clone();
@@ -375,7 +375,7 @@ impl CapabilityInjector {
                     Box::new(async move {
                         run_capability_gates(&*gc, &*br, &ctx_owned, &capability)?;
                         let out = handler
-                            .call(ctx_owned, params_owned, results_len)
+                            .call_typed(&component_func, ctx_owned, params_owned, results_len)
                             .await
                             .map_err(wasmtime::Error::from)?;
                         if out.len() != results.len() {
@@ -1432,3 +1432,6 @@ mod tests {
         assert!(err.to_string().contains("capability-denied: nope"));
     }
 }
+
+#[cfg(test)]
+mod call_typed_tests;
