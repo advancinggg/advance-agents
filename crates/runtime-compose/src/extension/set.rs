@@ -25,6 +25,7 @@ use crate::api::{
 use crate::compose_log::LogHandle;
 use crate::composition::StepLog;
 use crate::effective_capabilities::EffectiveCapabilities;
+use crate::extension::capabilities::{check_names, check_total, Declaration};
 use crate::extension::guard::{call_guarded, call_guarded_async, CallOutcome};
 use crate::extension::ids::check_extension_id;
 
@@ -249,6 +250,7 @@ impl ExtensionSet {
     ) -> Result<Arc<Self>, ComposeError> {
         let handle = Handle::try_current().ok();
         let mut entries = Vec::with_capacity(exts.len());
+        let mut declarations: Vec<Declaration> = Vec::with_capacity(exts.len());
         let mut seen = HashSet::new();
         let mut secret_need = false;
         for ext in exts {
@@ -292,7 +294,7 @@ impl ExtensionSet {
                     });
                 }
             };
-            // check_names lands in a follow-up change.
+            check_names(&declarations, id, capabilities)?;
             let needs_secret_store = match call_guarded(|| Ok(ext.needs_secret_store())) {
                 CallOutcome::Ok(need) => need,
                 CallOutcome::Failed(_) => unreachable!("needs_secret_store() is infallible"),
@@ -305,6 +307,7 @@ impl ExtensionSet {
                 }
             };
             secret_need |= needs_secret_store;
+            declarations.push((id, capabilities));
             entries.push(Entry {
                 ext,
                 id,
@@ -312,6 +315,7 @@ impl ExtensionSet {
                 needs_secret_store,
             });
         }
+        check_total(&declarations)?;
         let ids: Vec<&'static str> = entries.iter().map(|entry| entry.id).collect();
         let tasks = TaskShared::new(handle, log.clone());
         Ok(Arc::new(Self {
@@ -324,12 +328,11 @@ impl ExtensionSet {
             log,
             plan,
             secret_need,
-            capabilities: EffectiveCapabilities::default(),
+            capabilities: EffectiveCapabilities::from_extension_entries(&declarations),
         }))
     }
 
-    /// Known ∪ the composition's extension capabilities. Default until a follow-up change
-    /// stores `from_extension_entries` after `check_names` / `check_total`.
+    /// Known ∪ the composition's extension capabilities.
     pub fn effective_capabilities(&self) -> &EffectiveCapabilities {
         &self.capabilities
     }

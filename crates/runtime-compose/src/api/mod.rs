@@ -17,6 +17,7 @@ pub use compose_log::ComposeLog;
 pub use compose_log::ComposeLogLine;
 pub use compose_log::LogStream;
 pub use compose_log::NullComposeLog;
+pub use error::CapabilityRefusal;
 pub use error::ComposeError;
 pub use error::ExtensionFailure;
 pub use error::ExtensionPhase;

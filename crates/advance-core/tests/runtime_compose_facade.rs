@@ -17,15 +17,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use advance_core::runtime_compose::{
-    compose, log_keys, Admission, BoxFuture, CapParams, ClientApiEndpoint, ClientApiOptions,
-    ComposeCx, ComposeError, ComposeExtension, ComposeLog, ComposeLogLine, ComposeOptions,
-    ComposeProfile, ComposedRuntime, ConfigView, EmitError, EmitReceipt, ExtensionEmitter,
-    ExtensionError, ExtensionFailure, ExtensionGrantCheck, ExtensionHealth, ExtensionPhase,
-    ExtensionSecrets, ExtensionState, GatewayHandle, GrantDecision, HostPlatform, InstanceGuard,
-    InstanceGuardKind, ListenerOptions, LockFailure, LogStream, MasterKeyInput, NullComposeLog,
-    ProcessPolicy, RunInfo, RunView, RuntimeHealthView, RuntimePhase, SecretViewError,
-    ShutdownHandle, StartedCx, TaskRunStatus, TaskSpawner, Unsupported, ViewError, WasmEngine,
-    Zeroizing,
+    compose, log_keys, Admission, BoxFuture, CapParams, CapabilityRefusal, ClientApiEndpoint,
+    ClientApiOptions, ComposeCx, ComposeError, ComposeExtension, ComposeLog, ComposeLogLine,
+    ComposeOptions, ComposeProfile, ComposedRuntime, ConfigView, EmitError, EmitReceipt,
+    ExtensionEmitter, ExtensionError, ExtensionFailure, ExtensionGrantCheck, ExtensionHealth,
+    ExtensionPhase, ExtensionSecrets, ExtensionState, GatewayHandle, GrantDecision, HostPlatform,
+    InstanceGuard, InstanceGuardKind, ListenerOptions, LockFailure, LogStream, MasterKeyInput,
+    NullComposeLog, ProcessPolicy, RunInfo, RunView, RuntimeHealthView, RuntimePhase,
+    SecretViewError, ShutdownHandle, StartedCx, TaskRunStatus, TaskSpawner, Unsupported, ViewError,
+    WasmEngine, Zeroizing,
 };
 
 /// The CONTRACT-244 API: every name `api/mod.rs` may re-export, and must.
@@ -41,6 +41,7 @@ const ALLOWED: &[&str] = &[
     "ExtensionPhase",
     "LockFailure",
     "Unsupported",
+    "CapabilityRefusal",
     "BoxFuture",
     "ComposeExtension",
     "ExtensionError",
@@ -126,6 +127,7 @@ fn uses_the_api_through_the_facade(home: std::path::PathBuf) {
     let _: Option<LogStream> = None;
     let _: &[&str] = log_keys::ALL;
     let _: Option<ComposeError> = None;
+    let _: Option<CapabilityRefusal> = None;
     let _: Option<LockFailure> = None;
     let _: Option<Unsupported> = None;
     let _: Option<ExtensionPhase> = None;

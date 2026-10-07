@@ -41,7 +41,7 @@ pub enum ComposeError {
     CapabilityCollision {
         extension: &'static str,
         capability: String,
-        reason: String,
+        reason: CapabilityRefusal,
     },
     /// An extension callback failed or panicked.
     Extension {
@@ -52,6 +52,24 @@ pub enum ComposeError {
     /// These options ask for something this build or this home cannot compose. Nothing
     /// was started.
     Unsupported(Unsupported),
+}
+
+/// Why [`ComposeError::CapabilityCollision`] refused a name.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityRefusal {
+    /// The name is in `KNOWN_CAPABILITIES` or `RESERVED_CAPABILITY_NAMES`.
+    Known,
+    /// An earlier extension already declared it.
+    OtherExtension { owner: &'static str },
+    /// The same extension listed it twice.
+    Duplicate,
+    /// The name is not `<id>.<name>` (the text says why).
+    Malformed(&'static str),
+    /// The part before `.` is not this extension's id.
+    ForeignPrefix,
+    /// More than `MAX_EXTENSION_CAPABILITIES` names in this compose.
+    TooMany { limit: usize },
 }
 
 /// The composition step an extension callback belongs to.
@@ -179,6 +197,25 @@ impl fmt::Display for ComposeError {
                 failure: ExtensionFailure::Panicked(msg),
             } => write!(f, "extension {extension} panicked in {phase}: {msg}"),
             ComposeError::Unsupported(what) => write!(f, "unsupported: {what}"),
+        }
+    }
+}
+
+impl fmt::Display for CapabilityRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CapabilityRefusal::Known => f.write_str("it is an OSS capability name"),
+            CapabilityRefusal::OtherExtension { owner } => {
+                write!(f, "extension {owner} already declares it")
+            }
+            CapabilityRefusal::Duplicate => f.write_str("declared twice"),
+            CapabilityRefusal::Malformed(why) => f.write_str(why),
+            CapabilityRefusal::ForeignPrefix => {
+                f.write_str("its prefix is not this extension's id")
+            }
+            CapabilityRefusal::TooMany { limit } => {
+                write!(f, "more than {limit} extension capabilities")
+            }
         }
     }
 }

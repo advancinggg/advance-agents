@@ -1,6 +1,7 @@
 //! Shared extension machinery (not part of the CONTRACT-244 façade).
 
 pub mod call;
+pub mod capabilities;
 pub mod guard;
 pub mod ids;
 pub mod set;
