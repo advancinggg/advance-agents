@@ -94,9 +94,9 @@ pub use packs::{
 };
 pub use pagination::{Cursor, Page};
 pub use provider::{
-    AgentAdminProvider, CostProvider, EntityProvider, MessagingProvider, PackAdminProvider,
-    ProviderAdminProvider, ProviderError, RunControlProvider, SecretsAdminProvider, ToolsProvider,
-    AUTH_SOURCE_MISMATCH_DETAIL, UNKNOWN_PROVIDER_DETAIL,
+    provider_or_unavailable, AgentAdminProvider, CostProvider, EntityProvider, MessagingProvider,
+    PackAdminProvider, ProviderAdminProvider, ProviderError, RunControlProvider,
+    SecretsAdminProvider, ToolsProvider, AUTH_SOURCE_MISMATCH_DETAIL, UNKNOWN_PROVIDER_DETAIL,
 };
 pub use provider_admin::{
     ClientCreateProviderRequest, ClientProviderCost, ClientProviderDeleteResult, ClientProviderKey,
@@ -105,6 +105,7 @@ pub use provider_admin::{
     ClientSetProviderKeyRequest, ClientUpdateProviderRequest, ProviderAdminOutcome,
     ProviderAdminWarning,
 };
+pub use providers::grants::scan_client_text;
 pub use providers::grants::{
     BoundGrantApprovalPort, BoundGrantMutation, BoundMutationOutcome, ClientCapParam,
     ClientGrantApproveRequest, ClientGrantDecision, ClientGrantDenyRequest,

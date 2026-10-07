@@ -443,9 +443,7 @@ pub type BoundHistoryProviderSlot = ProviderSlot<dyn BoundHistoryReadPort>;
 pub type ObservationRedactorSlot = ProviderSlot<SensitiveObservationRedactor>;
 /// Read a provider out of its slot (cloning the `Arc` and releasing the lock before the call), or a
 /// `module_unavailable` denial when the slot is empty. This is the ONLY absence discriminator.
-pub(crate) fn provider_or_unavailable<T: ?Sized>(
-    slot: &ProviderSlot<T>,
-) -> Result<Arc<T>, ClientError> {
+pub fn provider_or_unavailable<T: ?Sized>(slot: &ProviderSlot<T>) -> Result<Arc<T>, ClientError> {
     let guard = slot.read().unwrap_or_else(|e| e.into_inner());
     guard
         .as_ref()

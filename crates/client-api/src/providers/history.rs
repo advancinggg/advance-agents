@@ -13,7 +13,7 @@ use crate::provider::{
     provider_or_unavailable, BoundHistoryProviderSlot, LeakDetectorSlot, ObservationRedactorSlot,
     ProviderError,
 };
-use crate::providers::grants::{scan_text, ClientCapParam};
+use crate::providers::grants::{scan_client_text, ClientCapParam};
 use crate::providers::Projectable;
 use crate::request::Method;
 use crate::routes;
@@ -148,7 +148,7 @@ fn handle(
         let document = Projectable::<ClientHistoryEntry>::from_bound(bound).redact(&redactor)?;
         let (_, payload) = document.event_parts().ok_or_else(projection_error)?;
         let mut entry = decode_entry(payload)?;
-        scan_text(
+        scan_client_text(
             &mut entry.summary,
             detector.as_ref(),
             "summary",
@@ -156,7 +156,7 @@ fn handle(
             &mut warnings,
         )?;
         for (index, param) in entry.params.iter_mut().enumerate() {
-            scan_text(
+            scan_client_text(
                 &mut param.value,
                 detector.as_ref(),
                 &format!("params[{index}].value"),

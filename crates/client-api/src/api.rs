@@ -53,8 +53,10 @@ pub struct HandlerCtx {
     /// Whether the underlying connection peer is loopback (copied from
     /// [`ClientRequest::is_loopback_peer`](crate::request::ClientRequest::is_loopback_peer)).
     /// Handlers that accept key material (the providers family `:set-key`) refuse a
-    /// non-loopback cleartext peer with `forbidden`. A product relay transport that
-    /// terminates an authenticated Noise session presents its requests as loopback.
+    /// non-loopback cleartext peer with `forbidden`. Trust model: only a transport that accepted
+    /// the request on a loopback socket of this host may set this flag; no transport, relay or
+    /// composition extension may mark any other request as loopback. Remote peers have no
+    /// principal of their own until one is defined.
     pub is_loopback_peer: bool,
 }
 
@@ -179,6 +181,10 @@ type HandlerFn = Arc<dyn Fn(&HandlerCtx) -> Result<HandlerResponse, ClientError>
 pub struct HandlerSpec {
     pub requires_session: bool,
     pub is_mutation: bool,
+    /// An explicit read served over POST (the body carries the query). Not gated as a mutation
+    /// (no idempotency key, no CSRF). Ignored for GET. The extension registrar requires every POST
+    /// to be a mutation or an explicit post-read.
+    pub post_read: bool,
     /// Scopes the session MUST carry. Enforced by the pipeline AFTER authentication and BEFORE the
     /// mutation gate (so a replay by an under-scoped session is denied before the idempotency
     /// replay lookup) — never inside the handler. Empty = no scope requirement.
@@ -194,6 +200,7 @@ impl HandlerSpec {
         Self {
             requires_session,
             is_mutation: false,
+            post_read: false,
             required_scopes: Vec::new(),
             func: Arc::new(move |ctx| func(ctx).map(HandlerResponse::data)),
         }
@@ -206,6 +213,7 @@ impl HandlerSpec {
         Self {
             requires_session,
             is_mutation: true,
+            post_read: false,
             required_scopes: Vec::new(),
             func: Arc::new(move |ctx| func(ctx).map(HandlerResponse::data)),
         }
@@ -218,6 +226,7 @@ impl HandlerSpec {
         Self {
             requires_session,
             is_mutation: false,
+            post_read: false,
             required_scopes: Vec::new(),
             func: Arc::new(func),
         }
@@ -230,6 +239,35 @@ impl HandlerSpec {
         Self {
             requires_session,
             is_mutation: true,
+            post_read: false,
+            required_scopes: Vec::new(),
+            func: Arc::new(func),
+        }
+    }
+
+    /// An explicit POST read: the body carries the query. Not gated as a mutation.
+    pub fn post_read<F>(requires_session: bool, func: F) -> Self
+    where
+        F: Fn(&HandlerCtx) -> Result<serde_json::Value, ClientError> + Send + Sync + 'static,
+    {
+        Self {
+            requires_session,
+            is_mutation: false,
+            post_read: true,
+            required_scopes: Vec::new(),
+            func: Arc::new(move |ctx| func(ctx).map(HandlerResponse::data)),
+        }
+    }
+
+    /// An explicit POST read that may attach warnings.
+    pub fn post_read_with_warnings<F>(requires_session: bool, func: F) -> Self
+    where
+        F: Fn(&HandlerCtx) -> Result<HandlerResponse, ClientError> + Send + Sync + 'static,
+    {
+        Self {
+            requires_session,
+            is_mutation: false,
+            post_read: true,
             required_scopes: Vec::new(),
             func: Arc::new(func),
         }
@@ -1812,5 +1850,39 @@ fn platform_from_body(body: &serde_json::Value, has_origin: bool) -> Platform {
         Platform::Web
     } else {
         Platform::Mac
+    }
+}
+
+#[cfg(test)]
+mod post_read_tests {
+    use super::*;
+    use crate::config::ClientApiConfig;
+    use crate::request::Method;
+
+    #[test]
+    fn module_001_ac31_every_oss_post_is_mutation_or_post_read() {
+        let api = ClientApi::with_parts(
+            ClientApiConfig::default(),
+            "operator",
+            Arc::new(SystemClock),
+            Arc::new(NoopSink),
+        );
+        for ((method, path), spec) in &api.handlers {
+            if *method == Method::Post {
+                assert!(
+                    spec.is_mutation || spec.post_read,
+                    "OSS POST {path} is neither a mutation nor an explicit post-read"
+                );
+            }
+        }
+        for (method, pattern, spec) in &api.routes {
+            if *method == Method::Post {
+                assert!(
+                    spec.is_mutation || spec.post_read,
+                    "OSS POST {} is neither a mutation nor an explicit post-read",
+                    pattern.template()
+                );
+            }
+        }
     }
 }

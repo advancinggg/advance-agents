@@ -566,7 +566,7 @@ pub(crate) fn project_mutation_document(
         }
         MutationResponse::Preset => {
             let mut result = decode_preset(&document)?;
-            scan_text(
+            scan_client_text(
                 &mut result.target_agent_id,
                 detector,
                 "target_agent_id",
@@ -964,11 +964,11 @@ fn scan_pending(
     warnings: &mut Vec<ClientWarning>,
 ) -> Result<(), ClientError> {
     if let Some(justification) = pending.justification.as_mut() {
-        scan_text(justification, detector, "justification", true, warnings)?;
+        scan_client_text(justification, detector, "justification", true, warnings)?;
     }
     if let Some(params) = pending.params.as_mut() {
         for (index, param) in params.iter_mut().enumerate() {
-            scan_text(
+            scan_client_text(
                 &mut param.value,
                 detector,
                 &format!("params[{index}].value"),
@@ -980,7 +980,11 @@ fn scan_pending(
     Ok(())
 }
 
-pub(crate) fn scan_text(
+/// Client projection scan of one text field: optional format-control strip (warning
+/// `unicode_format_removed`), then the leak detector under `ScanContext::LogOutput`:
+/// Redacted → replaced + `sensitive_value_redacted`; Warned → `sensitive_value_warning`;
+/// Blocked → `projection_rejected`.
+pub fn scan_client_text(
     text: &mut String,
     detector: &dyn LeakDetector,
     field: &str,

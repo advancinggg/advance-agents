@@ -612,7 +612,7 @@ pub(crate) fn register(api: &mut ClientApi, slot: EntityProviderSlot) {
     api.register(
         Method::Post,
         routes::PATH_ENTITIES_QUERY,
-        HandlerSpec::read(true, move |ctx| {
+        HandlerSpec::post_read(true, move |ctx| {
             let req: ClientEntityQueryRequest = parse_body(&ctx.body)?;
             validate_query_request(&req)?;
             let provider = provider_or_unavailable(&s)?;
