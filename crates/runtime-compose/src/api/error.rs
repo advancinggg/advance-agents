@@ -172,6 +172,8 @@ pub enum Unsupported {
     StateRootRequired { platform: HostPlatform },
     /// `ProcessLocal` binds no listener but the Client API (D3 "No daemon artefacts on mobile").
     ListenerUnderProcessLocal(&'static str),
+    /// `Embedded { .. }` with a same-user Client API admission (ADR D3).
+    EmbeddedAdmission,
 }
 
 /// Why the instance guard could not be taken.
@@ -409,6 +411,9 @@ impl fmt::Display for Unsupported {
             Unsupported::ListenerUnderProcessLocal(which) => write!(
                 f,
                 "the {which} listener is not available with the process-local instance guard"
+            ),
+            Unsupported::EmbeddedAdmission => f.write_str(
+                "the embedded profile admits only in-process Client API sessions (Admission::InProcessOnly)",
             ),
         }
     }

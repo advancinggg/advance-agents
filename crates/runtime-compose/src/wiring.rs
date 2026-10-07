@@ -93,7 +93,7 @@ use cap_lifecycle::{
     DefaultSpawner, SpawnError, SpawnObserver, Spawner, WorkspaceFileResidentPolicy,
 };
 
-use crate::api::{log_keys, ClientApiOptions, ComposeError};
+use crate::api::{log_keys, Admission, ClientApiOptions, ComposeError};
 use crate::component_submit_bridge::{CapGrantSubmitSubsetGate, SchedulerSubmitBridge};
 use crate::compose_log::LogHandle;
 use crate::effective_capabilities::{EffectiveCapabilities, EffectiveSubsetGate};
@@ -3497,7 +3497,7 @@ pub(crate) async fn wire_capabilities_inner(
             ClientApiOptions::Loopback {
                 port,
                 write_discovery,
-                ..
+                admission,
             },
             Some(read),
         ) => {
@@ -3621,7 +3621,15 @@ pub(crate) async fn wire_capabilities_inner(
             let run_control_workers_for_api = Arc::clone(&run_control_workers);
             let factory = move |address: std::net::SocketAddr| {
                 let mut config = client_api_config_base;
-                config.allowed_origins = vec![format!("http://{address}")];
+                match admission {
+                    Admission::SameUserLoopback => {
+                        config.allowed_origins = vec![format!("http://{address}")];
+                    }
+                    Admission::InProcessOnly => {
+                        config.session_admission =
+                            advance_client_api::SessionAdmission::InProcessOnly;
+                    }
+                }
                 let mut api = advance_client_api::ClientApi::new(config);
                 let mut workers = run_control_workers_for_api
                     .lock()
@@ -3687,13 +3695,22 @@ pub(crate) async fn wire_capabilities_inner(
                         record.client_api = Some(Arc::downgrade(&server.api()));
                         record.listeners.push(("client_api", server.local_addr()));
                     });
-                    log.err(
-                        log_keys::CLIENT_API_LISTENING,
-                        format!(
-                            "advance: Client API and Web Console listening at http://{}",
-                            server.local_addr()
+                    match admission {
+                        Admission::SameUserLoopback => log.err(
+                            log_keys::CLIENT_API_LISTENING,
+                            format!(
+                                "advance: Client API and Web Console listening at http://{}",
+                                server.local_addr()
+                            ),
                         ),
-                    );
+                        Admission::InProcessOnly => log.err(
+                            log_keys::CLIENT_API_LISTENING_IN_PROCESS,
+                            format!(
+                                "advance: Client API listening at http://{} (in-process sessions only)",
+                                server.local_addr()
+                            ),
+                        ),
+                    }
                     if write_discovery {
                         let _ = advance_home::write_client_api_discovery(
                             workspace,
@@ -3702,6 +3719,14 @@ pub(crate) async fn wire_capabilities_inner(
                         );
                     }
                     Some(server)
+                }
+                Err(error) if admission == Admission::InProcessOnly => {
+                    return Err(WiringFailure {
+                        error: WiringError::Compose(ComposeError::Listener(format!(
+                            "failed to bind Client API listener: {error}"
+                        ))),
+                        partial: started,
+                    });
                 }
                 Err(error) => {
                     log.err(

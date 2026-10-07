@@ -15,8 +15,7 @@ use std::sync::Arc;
 use advance_runtime_compose::registry::reserved_homes_for_test;
 use advance_runtime_compose::test_support::{ComposeFailpoints, ComposeProbe, MemoryComposeLog};
 use advance_runtime_compose::{
-    compose, Admission, ClientApiOptions, ComposeError, ComposeLog, ComposeOptions, InstanceGuard,
-    Unsupported, WasmEngine,
+    compose, ComposeError, ComposeLog, ComposeOptions, InstanceGuard, Unsupported, WasmEngine,
 };
 use t111::{serial, T111Home};
 
@@ -37,16 +36,6 @@ async fn module_001_ac30_unsupported_values_refused_before_side_effects() {
             "wasm_engine: Pulley",
             home.options(log()).with_wasm_engine(WasmEngine::Pulley),
             Unsupported::NotYetAvailable("WasmEngine::Pulley"),
-        ),
-        (
-            "admission: InProcessOnly",
-            home.options(log())
-                .with_client_api(ClientApiOptions::loopback(
-                    0,
-                    true,
-                    Admission::InProcessOnly,
-                )),
-            Unsupported::NotYetAvailable("Admission::InProcessOnly"),
         ),
         (
             "process-local guard with a discovery file",

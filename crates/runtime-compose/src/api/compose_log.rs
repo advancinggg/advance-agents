@@ -152,6 +152,8 @@ pub mod log_keys {
     pub const CLIENT_API_HISTORY_UNAVAILABLE: &str = "wiring.client_api_history_unavailable";
     /// stderr: the Client API and Web Console address.
     pub const CLIENT_API_LISTENING: &str = "wiring.client_api_listening";
+    /// stderr: the Client API address under in-process-only admission.
+    pub const CLIENT_API_LISTENING_IN_PROCESS: &str = "wiring.client_api_listening_in_process";
     /// stderr: the Client API is unavailable (loopback bind failed).
     pub const CLIENT_API_UNAVAILABLE: &str = "wiring.client_api_unavailable";
 
@@ -283,6 +285,7 @@ pub mod log_keys {
         DATA_TOOL_NOT_REGISTERED,
         CLIENT_API_HISTORY_UNAVAILABLE,
         CLIENT_API_LISTENING,
+        CLIENT_API_LISTENING_IN_PROCESS,
         CLIENT_API_UNAVAILABLE,
         COMPOSE_CLIENT_API_DRAIN_OVERRUN,
         COMPOSE_CLIENT_API_SERVE_FAILED,

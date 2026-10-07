@@ -339,15 +339,18 @@ fn validate_on(options: &ComposeOptions, host: HostFacts) -> Result<Plan, Compos
         }
     }
 
+    if matches!(options.profile, ComposeProfile::Embedded { .. }) {
+        if let ClientApiOptions::Loopback {
+            admission: Admission::SameUserLoopback,
+            ..
+        } = options.client_api
+        {
+            return refuse(Unsupported::EmbeddedAdmission);
+        }
+    }
+
     if options.wasm_engine == WasmEngine::Pulley {
         return refuse(Unsupported::NotYetAvailable("WasmEngine::Pulley"));
-    }
-    if let ClientApiOptions::Loopback {
-        admission: Admission::InProcessOnly,
-        ..
-    } = options.client_api
-    {
-        return refuse(Unsupported::NotYetAvailable("Admission::InProcessOnly"));
     }
 
     Ok(Plan { home, state_root })
@@ -556,25 +559,23 @@ mod tests {
             &daemon(&home).with_listeners(ListenerOptions::daemon().with_oauth_callback(false))
         )
         .is_ok());
+        assert!(
+            validate(&daemon(&home).with_client_api(ClientApiOptions::loopback(
+                0,
+                false,
+                Admission::InProcessOnly,
+            )))
+            .is_ok()
+        );
     }
 
     #[test]
     fn module_001_ac30_validate_refuses_each_value_this_build_does_not_compose() {
         let (_home_dir, home) = canonical_tempdir();
-        let cases = [
-            (
-                daemon(&home).with_wasm_engine(WasmEngine::Pulley),
-                "WasmEngine::Pulley",
-            ),
-            (
-                daemon(&home).with_client_api(ClientApiOptions::loopback(
-                    0,
-                    true,
-                    Admission::InProcessOnly,
-                )),
-                "Admission::InProcessOnly",
-            ),
-        ];
+        let cases = [(
+            daemon(&home).with_wasm_engine(WasmEngine::Pulley),
+            "WasmEngine::Pulley",
+        )];
         for (options, what) in cases {
             assert_eq!(refused(&options), Unsupported::NotYetAvailable(what));
         }
