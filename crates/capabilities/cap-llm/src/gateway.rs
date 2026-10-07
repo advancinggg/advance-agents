@@ -17,7 +17,7 @@
 //!   `build_http_cap`, `map_http_err_to_llm`.
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -2175,6 +2175,42 @@ impl LlmGateway {
         .await
     }
 
+    /// CONTRACT-244 D2(b): the providers family's `:preflight` of an entry a runtime
+    /// extension serves runs through THIS gateway — placement over that one entry, its
+    /// port, and the `llm.request` / `llm.response` / `llm.error` events of a turn on
+    /// that entry. Pinned to `provider_id`: the default agent's `llm:` policy does not
+    /// apply. No run: no budget check or commit (as `crate::preflight::chat_preflight`).
+    /// Sends a 16-token "ping" as the default agent.
+    pub async fn preflight_provider(
+        &self,
+        provider_id: &str,
+        is_cancelled: &AtomicBool,
+    ) -> Result<(), LlmError> {
+        if is_cancelled.load(Ordering::SeqCst) {
+            return Err(LlmError::ProviderError("cancelled".into()));
+        }
+        let ctx = LlmRequestContext {
+            agent_id: self.default_agent_id.clone(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "ping".into(),
+            }],
+            params: ChatParams {
+                model: None,
+                temperature: None,
+                max_tokens: Some(16),
+                stop_sequences: None,
+                tools: None,
+            },
+            ..Default::default()
+        };
+        self.generate_pinned(ctx, Some(provider_id)).await?;
+        if is_cancelled.load(Ordering::SeqCst) {
+            return Err(LlmError::ProviderError("cancelled".into()));
+        }
+        Ok(())
+    }
+
     /// Internal entry point used by `chat()`, `chat_for_run()`, and by the
     /// host_fn `AgentLlmGenerateHandler` (Slice C will pass `run_id` through
     /// `HostCallContext`). Hosts MODULE-009 §1.4.2's full generate flow.
@@ -2260,16 +2296,38 @@ impl LlmGateway {
     /// Internal entry point used by `chat()`, `chat_for_run()`, and by the
     /// host_fn `AgentLlmGenerateHandler` (Slice C will pass `run_id` through
     /// `HostCallContext`). Hosts MODULE-009 §1.4.2's full generate flow.
-    pub(crate) async fn generate(
+    pub(crate) async fn generate(&self, ctx: LlmRequestContext) -> Result<ChatResponse, LlmError> {
+        self.generate_pinned(ctx, None).await
+    }
+
+    async fn generate_pinned(
         &self,
         mut ctx: LlmRequestContext,
+        pin: Option<&str>,
     ) -> Result<ChatResponse, LlmError> {
         let start = Instant::now();
         let deadline = start + self.generate_timeout.unwrap_or(cap_http::DEFAULT_TIMEOUT);
         let cfg = self.config_provider.current();
         // Lane agent-llm-policy: the agent's pin / default model / constraint shape the
         // request BEFORE placement; a pinned provider absent from config fails closed here.
-        let providers = self.apply_agent_policy(&mut ctx, &cfg.llm_providers)?;
+        // A `pin` (providers `:preflight`) skips the agent policy and uses that one entry.
+        let providers = match pin {
+            None => self.apply_agent_policy(&mut ctx, &cfg.llm_providers)?,
+            Some(id) => {
+                let only: Vec<LlmProviderConfig> = cfg
+                    .llm_providers
+                    .iter()
+                    .filter(|p| p.id == id)
+                    .cloned()
+                    .collect();
+                if only.is_empty() {
+                    return Err(LlmError::ModelNotAvailable(format!(
+                        "provider {id} not configured"
+                    )));
+                }
+                std::borrow::Cow::Owned(only)
+            }
+        };
         let need = crate::capability::CapabilityNeed {
             tools: ctx.params.tools.as_ref().is_some_and(|t| !t.is_empty()),
             output_schema: ctx.output_schema.is_some(),
@@ -6317,3 +6375,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod preflight_provider_tests;

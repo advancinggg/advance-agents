@@ -100,6 +100,11 @@ impl LlmGatewayVlm {
         self.catalog = catalog;
         self
     }
+
+    /// The catalog this extractor resolves `profile-id` entries against (composition witness).
+    pub fn catalog(&self) -> Arc<crate::catalog::ModelProfileCatalog> {
+        Arc::clone(&self.catalog)
+    }
 }
 
 #[async_trait]
@@ -880,3 +885,6 @@ mod tests {
         assert_eq!(vlm.calls(), vec!["Image"], "vlm called once for image");
     }
 }
+
+#[cfg(test)]
+mod catalog_tests;
