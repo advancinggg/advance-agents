@@ -126,6 +126,8 @@ r2d2_sqlite = { workspace = true }
 # resolved in Cargo.lock via the event-bus crate's own usage (same workspace pins) —
 # zero new package versions, root Cargo.toml untouched.
 tokio-tungstenite = { workspace = true }
+# FixtureHome / compose / assert_gone_for_home for SYS-AC-338.
+advance-runtime-compose = { path = "../runtime-compose", features = ["test-support"] }
 
 [lints]
 workspace = true
