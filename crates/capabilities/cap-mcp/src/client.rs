@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use advance_shared_types::process_policy::ProcessPolicy;
 use advance_shared_types::security_validator::LeakDetector;
 use async_trait::async_trait;
 
@@ -73,6 +74,7 @@ pub struct McpClient {
     transports: RwLock<HashMap<String, Arc<dyn McpTransport>>>,
     leak_detector: Arc<dyn LeakDetector>,
     http_chain: Option<Arc<dyn advance_shared_types::security_validator::HttpSecurityChain>>,
+    process_policy: ProcessPolicy,
 }
 
 impl McpClient {
@@ -91,7 +93,14 @@ impl McpClient {
             transports: RwLock::new(HashMap::new()),
             leak_detector,
             http_chain,
+            process_policy: ProcessPolicy::Allow,
         }
+    }
+
+    /// Stdio transports obey `policy` (default `Allow` from both constructors).
+    pub fn with_process_policy(mut self, policy: ProcessPolicy) -> Self {
+        self.process_policy = policy;
+        self
     }
 
     /// Construct a test-only client where transports are pre-injected (no lazy
@@ -108,6 +117,7 @@ impl McpClient {
             transports: RwLock::new(injected),
             leak_detector,
             http_chain: None,
+            process_policy: ProcessPolicy::Allow,
         }
     }
 
@@ -371,12 +381,14 @@ impl McpClient {
                 )))
             }
             McpTransportSpec::Stdio { command, args, env } => {
-                let t = StdioMcpTransport::spawn(
+                let t = StdioMcpTransport::spawn_with_policy(
                     entry.server_id.clone(),
                     command,
                     args,
                     env,
                     Arc::clone(&self.leak_detector),
+                    crate::stdio_transport::MAX_STDIO_WALL_CLOCK,
+                    self.process_policy,
                 )?;
                 Ok(Arc::new(t))
             }
@@ -392,5 +404,67 @@ mod tests {
     where
         McpClient: Send + Sync,
     {
+    }
+}
+
+#[cfg(all(test, unix))]
+mod module_001_ac32_tests {
+    use super::*;
+    use crate::test_marker::Marker;
+    use crate::whitelist::McpServerEntry;
+    use advance_shared_types::process_policy::{spawn_counter, ProcessPolicy, SpawnSite};
+    use advance_shared_types::security_validator::{LeakDetector, ScanContext, ScanResult};
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    struct NoOpDetector;
+    impl LeakDetector for NoOpDetector {
+        fn scan(&self, _text: &str, _ctx: ScanContext) -> ScanResult {
+            ScanResult::Clean
+        }
+        fn scan_headers(&self, _headers: &[(String, String)]) -> ScanResult {
+            ScanResult::Clean
+        }
+    }
+
+    fn stdio_cfg(command: &Path) -> Arc<McpServersConfig> {
+        let entry = McpServerEntry {
+            server_id: "srv".into(),
+            description: "test".into(),
+            transport: McpTransportSpec::Stdio {
+                command: command.display().to_string(),
+                args: vec![],
+                env: BTreeMap::new(),
+            },
+            tool_patterns: None,
+            tool_schemas: BTreeMap::new(),
+        };
+        Arc::new(
+            McpServersConfig::builder()
+                .add_server(entry)
+                .unwrap()
+                .build(),
+        )
+    }
+
+    #[tokio::test]
+    async fn module_001_ac32_t113_3_mcp_stdio_refused_under_forbid() {
+        let marker = Marker::new();
+        let cfg = stdio_cfg(marker.script());
+        let before = spawn_counter::snapshot();
+        let err = McpClient::new(Arc::clone(&cfg), Arc::new(NoOpDetector), None)
+            .with_process_policy(ProcessPolicy::Forbid)
+            .list_tools("srv")
+            .await
+            .expect_err("forbid");
+        assert!(err.to_string().contains("process_forbidden"), "{err}");
+        assert!(!marker.ran());
+        let delta = spawn_counter::snapshot().since(&before);
+        assert_eq!(delta.refused(SpawnSite::McpStdio), 1);
+
+        let _ = McpClient::new(cfg, Arc::new(NoOpDetector), None)
+            .list_tools("srv")
+            .await;
+        assert!(marker.ran());
     }
 }

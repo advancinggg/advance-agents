@@ -41,5 +41,7 @@ mod inventory;
 mod jsonrpc;
 mod schema_validator;
 mod stdio_transport;
+#[cfg(all(test, unix))]
+mod test_marker;
 mod web_provider;
 mod whitelist;

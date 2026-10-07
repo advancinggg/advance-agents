@@ -28,6 +28,7 @@ jsonschema = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "process", "io-util"] }
 tempfile = { workspace = true }
+advance-shared-types = { path = "../../shared-types", features = ["spawn-counter"] }
 
 [lints]
 workspace = true

@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use advance_shared_types::process_policy::{ProcessPolicy, SpawnSite};
 use advance_shared_types::security_validator::{LeakDetector, ScanContext, ScanResult};
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -111,8 +112,34 @@ impl StdioMcpTransport {
         leak_detector: Arc<dyn LeakDetector>,
         wall_clock: Duration,
     ) -> Result<Self, McpError> {
+        Self::spawn_with_policy(
+            server_id,
+            command,
+            args,
+            env,
+            leak_detector,
+            wall_clock,
+            ProcessPolicy::Allow,
+        )
+    }
+
+    /// Under `Forbid`: `Err(McpError::transport("stdio: process_forbidden: … (MCP stdio server)"))`,
+    /// nothing spawned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_policy(
+        server_id: impl Into<String>,
+        command: &str,
+        args: &[String],
+        env: &std::collections::BTreeMap<String, String>,
+        leak_detector: Arc<dyn LeakDetector>,
+        wall_clock: Duration,
+        policy: ProcessPolicy,
+    ) -> Result<Self, McpError> {
         if command.is_empty() {
             return Err(McpError::transport("stdio: empty command"));
+        }
+        if let Err(f) = policy.admit(SpawnSite::McpStdio) {
+            return Err(McpError::transport(format!("stdio: {f}")));
         }
         let server_id = server_id.into();
 
