@@ -73,6 +73,56 @@ impl ComposeOptions {
         }
     }
 
+    /// The ADR D3 embedded profile for `platform`. The single definition of the
+    /// embedded defaults: the CONTRACT-210 bridge builds every v2 `full`
+    /// composition as `embedded(..)` followed by its options_json overrides
+    /// (processes, engine, state_root, client_api port or `Off`, master key).
+    ///
+    /// | field        | iOS / Android                         | macOS / Windows / Linux                                   |
+    /// |--------------|---------------------------------------|-----------------------------------------------------------|
+    /// | profile      | `Embedded { platform }`               | `Embedded { platform }`                                   |
+    /// | instance     | `ProcessLocal`                        | `InstanceGuard::pid_lock()` (30 s)                        |
+    /// | processes    | `Forbid`                              | `Allow`                                                   |
+    /// | wasm_engine  | `Pulley`                              | `Native`                                                  |
+    /// | listeners    | `ListenerOptions::none()`             | `ListenerOptions::daemon().with_post_msg(false).with_event_bus_ws(false)` |
+    /// | client_api   | `loopback(0, false, InProcessOnly)`   | `loopback(0, false, InProcessOnly)`                       |
+    /// | hot_reload   | `true`                                | `true`                                                    |
+    /// | state_root   | `None` (required: `compose` refuses `None` here) | `None` (optional)                              |
+    /// | master_key   | `FromConfig`                          | `FromConfig`                                              |
+    /// | log          | the caller's                          | the caller's                                              |
+    pub fn embedded(
+        home: impl Into<PathBuf>,
+        platform: HostPlatform,
+        log: Arc<dyn ComposeLog>,
+    ) -> Self {
+        let mobile = platform.is_mobile();
+        Self {
+            home: home.into(),
+            profile: ComposeProfile::Embedded { platform },
+            instance: if mobile {
+                InstanceGuard::ProcessLocal
+            } else {
+                InstanceGuard::pid_lock()
+            },
+            state_root: None,
+            master_key: MasterKeyInput::FromConfig,
+            client_api: ClientApiOptions::loopback(0, false, Admission::InProcessOnly),
+            listeners: if mobile {
+                ListenerOptions::none()
+            } else {
+                ListenerOptions::daemon()
+                    .with_post_msg(false)
+                    .with_event_bus_ws(false)
+            },
+            processes: platform.default_processes(),
+            wasm_engine: platform.default_engine(),
+            hot_reload: true,
+            log,
+            #[cfg(feature = "test-support")]
+            failpoints: crate::test_support::ComposeFailpoints::default(),
+        }
+    }
+
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn with_failpoints(mut self, failpoints: crate::test_support::ComposeFailpoints) -> Self {
@@ -163,6 +213,117 @@ pub enum HostPlatform {
     Android,
     Windows,
     Linux,
+}
+
+impl HostPlatform {
+    /// The table row this binary is compiled for; `None` outside the table (e.g. FreeBSD).
+    pub const fn compiled() -> Option<HostPlatform> {
+        if cfg!(target_os = "macos") {
+            Some(HostPlatform::MacOs)
+        } else if cfg!(target_os = "ios") {
+            Some(HostPlatform::Ios)
+        } else if cfg!(target_os = "android") {
+            Some(HostPlatform::Android)
+        } else if cfg!(target_os = "windows") {
+            Some(HostPlatform::Windows)
+        } else if cfg!(target_os = "linux") {
+            Some(HostPlatform::Linux)
+        } else {
+            None
+        }
+    }
+
+    /// `Ios | Android`.
+    pub const fn is_mobile(self) -> bool {
+        matches!(self, HostPlatform::Ios | HostPlatform::Android)
+    }
+
+    /// The options_json spelling: "mac" | "ios" | "android" | "windows" | "linux"
+    /// (Display uses it).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            HostPlatform::MacOs => "mac",
+            HostPlatform::Ios => "ios",
+            HostPlatform::Android => "android",
+            HostPlatform::Windows => "windows",
+            HostPlatform::Linux => "linux",
+        }
+    }
+
+    /// `Forbid` on iOS / Android, else `Allow` (ADR D3 table / options_json defaults).
+    pub const fn default_processes(self) -> ProcessPolicy {
+        if self.is_mobile() {
+            ProcessPolicy::Forbid
+        } else {
+            ProcessPolicy::Allow
+        }
+    }
+
+    /// `Pulley` on iOS / Android, else `Native`.
+    pub const fn default_engine(self) -> WasmEngine {
+        if self.is_mobile() {
+            WasmEngine::Pulley
+        } else {
+            WasmEngine::Native
+        }
+    }
+}
+
+impl fmt::Display for HostPlatform {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for HostPlatform {
+    type Err = UnknownPlatform;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "mac" => Ok(HostPlatform::MacOs),
+            "ios" => Ok(HostPlatform::Ios),
+            "android" => Ok(HostPlatform::Android),
+            "windows" => Ok(HostPlatform::Windows),
+            "linux" => Ok(HostPlatform::Linux),
+            _ => Err(UnknownPlatform {
+                input: s.to_owned(),
+            }),
+        }
+    }
+}
+
+/// An options_json `platform` value outside the five spellings (the bridge maps it to 3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownPlatform {
+    input: String,
+}
+
+impl UnknownPlatform {
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+}
+
+/// `unknown platform "{input}" (expected mac, ios, android, windows or linux)`
+impl fmt::Display for UnknownPlatform {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unknown platform \"{}\" (expected mac, ios, android, windows or linux)",
+            self.input
+        )
+    }
+}
+
+impl std::error::Error for UnknownPlatform {}
+
+/// Which column of the ADR D3 platform table an option broke.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlatformRule {
+    Instance,
+    Processes,
+    Engine,
 }
 
 /// How the composition makes sure it is the only runtime of its home.
@@ -394,6 +555,94 @@ mod tests {
         assert!(rendered.contains("<ComposeLog>"), "{rendered}");
         for needle in [hex::encode(key), "167".to_owned(), "a7".to_owned()] {
             assert!(!rendered.contains(&needle), "{needle} in {rendered}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod module_001_ac32_tests {
+    use super::*;
+    use crate::api::NullComposeLog;
+
+    #[test]
+    fn module_001_ac32_host_platform_spellings_and_compiled_row() {
+        for (spelling, platform) in [
+            ("mac", HostPlatform::MacOs),
+            ("ios", HostPlatform::Ios),
+            ("android", HostPlatform::Android),
+            ("windows", HostPlatform::Windows),
+            ("linux", HostPlatform::Linux),
+        ] {
+            assert_eq!(platform.as_str(), spelling);
+            assert_eq!(platform.to_string(), spelling);
+            assert_eq!(spelling.parse::<HostPlatform>().unwrap(), platform);
+            assert_eq!(
+                platform.is_mobile(),
+                matches!(platform, HostPlatform::Ios | HostPlatform::Android)
+            );
+            if platform.is_mobile() {
+                assert_eq!(platform.default_processes(), ProcessPolicy::Forbid);
+                assert_eq!(platform.default_engine(), WasmEngine::Pulley);
+            } else {
+                assert_eq!(platform.default_processes(), ProcessPolicy::Allow);
+                assert_eq!(platform.default_engine(), WasmEngine::Native);
+            }
+        }
+        let unknown: UnknownPlatform = "Mac".parse::<HostPlatform>().unwrap_err();
+        assert_eq!(unknown.input(), "Mac");
+        assert_eq!(
+            unknown.to_string(),
+            "unknown platform \"Mac\" (expected mac, ios, android, windows or linux)"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(HostPlatform::compiled(), Some(HostPlatform::MacOs));
+        #[cfg(target_os = "ios")]
+        assert_eq!(HostPlatform::compiled(), Some(HostPlatform::Ios));
+        #[cfg(target_os = "android")]
+        assert_eq!(HostPlatform::compiled(), Some(HostPlatform::Android));
+        #[cfg(target_os = "windows")]
+        assert_eq!(HostPlatform::compiled(), Some(HostPlatform::Windows));
+        #[cfg(target_os = "linux")]
+        assert_eq!(HostPlatform::compiled(), Some(HostPlatform::Linux));
+    }
+
+    #[test]
+    fn module_001_ac32_embedded_constructor_matches_the_d3_table() {
+        let log = Arc::new(NullComposeLog);
+        for platform in [
+            HostPlatform::MacOs,
+            HostPlatform::Ios,
+            HostPlatform::Android,
+            HostPlatform::Windows,
+            HostPlatform::Linux,
+        ] {
+            let options = ComposeOptions::embedded(
+                "/home",
+                platform,
+                Arc::clone(&log) as Arc<dyn ComposeLog>,
+            );
+            assert_eq!(options.profile, ComposeProfile::Embedded { platform });
+            assert_eq!(options.processes, platform.default_processes());
+            assert_eq!(options.wasm_engine, platform.default_engine());
+            assert!(options.hot_reload);
+            assert!(options.state_root.is_none());
+            assert!(matches!(options.master_key, MasterKeyInput::FromConfig));
+            assert_eq!(
+                options.client_api,
+                ClientApiOptions::loopback(0, false, Admission::InProcessOnly)
+            );
+            if platform.is_mobile() {
+                assert_eq!(options.instance, InstanceGuard::ProcessLocal);
+                assert_eq!(options.listeners, ListenerOptions::none());
+            } else {
+                assert_eq!(options.instance, InstanceGuard::pid_lock());
+                assert_eq!(
+                    options.listeners,
+                    ListenerOptions::daemon()
+                        .with_post_msg(false)
+                        .with_event_bus_ws(false)
+                );
+            }
         }
     }
 }

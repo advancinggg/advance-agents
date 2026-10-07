@@ -15,8 +15,8 @@ use std::sync::Arc;
 use advance_runtime_compose::registry::reserved_homes_for_test;
 use advance_runtime_compose::test_support::{ComposeFailpoints, ComposeProbe, MemoryComposeLog};
 use advance_runtime_compose::{
-    compose, Admission, ClientApiOptions, ComposeError, ComposeLog, ComposeOptions, ComposeProfile,
-    HostPlatform, InstanceGuard, ListenerOptions, ProcessPolicy, Unsupported, WasmEngine,
+    compose, Admission, ClientApiOptions, ComposeError, ComposeLog, ComposeOptions, InstanceGuard,
+    Unsupported, WasmEngine,
 };
 use t111::{serial, T111Home};
 
@@ -34,32 +34,9 @@ async fn module_001_ac30_unsupported_values_refused_before_side_effects() {
 
     let rows: Vec<(&str, ComposeOptions, Unsupported)> = vec![
         (
-            "profile: Embedded",
-            home.options(log()).with_profile(ComposeProfile::Embedded {
-                platform: HostPlatform::Ios,
-            }),
-            Unsupported::NotYetAvailable("ComposeProfile::Embedded"),
-        ),
-        (
-            "processes: Forbid",
-            home.options(log()).with_processes(ProcessPolicy::Forbid),
-            Unsupported::NotYetAvailable("ProcessPolicy::Forbid"),
-        ),
-        (
             "wasm_engine: Pulley",
             home.options(log()).with_wasm_engine(WasmEngine::Pulley),
             Unsupported::NotYetAvailable("WasmEngine::Pulley"),
-        ),
-        (
-            "hot_reload: false",
-            home.options(log()).with_hot_reload(false),
-            Unsupported::NotYetAvailable("hot_reload: false"),
-        ),
-        (
-            "listeners.oauth_callback: false",
-            home.options(log())
-                .with_listeners(ListenerOptions::daemon().with_oauth_callback(false)),
-            Unsupported::NotYetAvailable("listeners.oauth_callback: false"),
         ),
         (
             "admission: InProcessOnly",

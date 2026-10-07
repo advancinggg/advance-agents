@@ -14,12 +14,14 @@ use advance_runtime_compose::registry::reserved_homes_for_test;
 use advance_runtime_compose::test_support::MemoryComposeLog;
 use advance_runtime_compose::{
     compose, Admission, ClientApiOptions, ComposeOptions, InstanceGuard, InstanceGuardKind,
+    ListenerOptions,
 };
 use t111::{serial, T111Home};
 
 fn process_local(home: &T111Home) -> ComposeOptions {
     home.options(Arc::new(MemoryComposeLog::new()))
         .with_instance(InstanceGuard::ProcessLocal)
+        .with_listeners(ListenerOptions::none())
         .with_client_api(ClientApiOptions::loopback(
             0,
             false,

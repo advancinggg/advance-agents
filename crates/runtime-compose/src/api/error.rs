@@ -8,6 +8,8 @@ use std::path::PathBuf;
 
 use advance_client_api::families::RouteRefusalReason;
 
+use super::options::{HostPlatform, PlatformRule};
+
 /// A composition that did not start. Whatever had started is stopped before the
 /// error is returned.
 #[non_exhaustive]
@@ -159,6 +161,17 @@ pub enum Unsupported {
     DiscoveryRequiresPidLock,
     /// The home's config needs a listener these options disable (its name).
     ListenerRequired(&'static str),
+    /// `Embedded { platform }` with an option the D3 table does not allow on that row.
+    PlatformTable {
+        platform: HostPlatform,
+        rule: PlatformRule,
+    },
+    /// A binary compiled for iOS / Android composes only `Embedded { platform: <that os> }`.
+    PlatformMismatch { compiled: HostPlatform },
+    /// iOS / Android need a `state_root` (outside the home).
+    StateRootRequired { platform: HostPlatform },
+    /// `ProcessLocal` binds no listener but the Client API (D3 "No daemon artefacts on mobile").
+    ListenerUnderProcessLocal(&'static str),
 }
 
 /// Why the instance guard could not be taken.
@@ -367,6 +380,35 @@ impl fmt::Display for Unsupported {
             Unsupported::ListenerRequired(which) => write!(
                 f,
                 "the home's config needs the {which} listener, which these options disable"
+            ),
+            Unsupported::PlatformTable { platform, rule } => match rule {
+                PlatformRule::Instance if platform.is_mobile() => write!(
+                    f,
+                    "the {platform} embedded profile requires the process-local instance guard"
+                ),
+                PlatformRule::Instance => write!(
+                    f,
+                    "the {platform} embedded profile requires the pid-lock instance guard"
+                ),
+                PlatformRule::Processes => {
+                    write!(f, "the {platform} embedded profile requires processes forbid")
+                }
+                PlatformRule::Engine => write!(
+                    f,
+                    "the {platform} embedded profile requires the pulley engine"
+                ),
+            },
+            Unsupported::PlatformMismatch { compiled } => write!(
+                f,
+                "this build targets {compiled}; only the {compiled} embedded profile can compose here"
+            ),
+            Unsupported::StateRootRequired { platform } => write!(
+                f,
+                "the {platform} embedded profile requires a state_root outside the home"
+            ),
+            Unsupported::ListenerUnderProcessLocal(which) => write!(
+                f,
+                "the {which} listener is not available with the process-local instance guard"
             ),
         }
     }

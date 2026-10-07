@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::api::{ComposeLog, ComposeOptions, MasterKeyInput, Zeroizing};
+use crate::api::{ComposeLog, ComposeOptions, HostPlatform, MasterKeyInput, Zeroizing};
 use crate::test_support::{ComposeFailpoints, ComposeProbe};
 
 use super::guests::{hello_llm_core, llm_noerr_core, minimal_core};
@@ -85,6 +85,24 @@ impl FixtureHome {
 
     pub fn options(&self, log: Arc<dyn ComposeLog>, probe: Arc<ComposeProbe>) -> ComposeOptions {
         ComposeOptions::daemon(self.home.clone(), log)
+            .with_state_root(self.state_root.clone())
+            .with_master_key(MasterKeyInput::Provided(Zeroizing::new(FIXTURE_MASTER_KEY)))
+            .with_failpoints(ComposeFailpoints {
+                probe: Some(probe),
+                ..ComposeFailpoints::default()
+            })
+    }
+
+    /// `ComposeOptions::embedded(home, platform, log)` (the ADR D3 table row) plus exactly
+    /// what `options()` adds to `ComposeOptions::daemon`: this fixture's state root, the
+    /// `Provided` fixture master key and the probe.
+    pub fn embedded_options(
+        &self,
+        platform: HostPlatform,
+        log: Arc<dyn ComposeLog>,
+        probe: Arc<ComposeProbe>,
+    ) -> ComposeOptions {
+        ComposeOptions::embedded(self.home.clone(), platform, log)
             .with_state_root(self.state_root.clone())
             .with_master_key(MasterKeyInput::Provided(Zeroizing::new(FIXTURE_MASTER_KEY)))
             .with_failpoints(ComposeFailpoints {

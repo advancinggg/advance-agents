@@ -17,8 +17,8 @@ use tokio::sync::watch;
 
 use crate::api::{
     Admission, ClientApiOptions, ComposeError, ComposeExtension, ComposeOptions, ComposeProfile,
-    ComposedRuntime, InstanceGuard, LockFailure, MasterKeyInput, ProcessPolicy, RuntimeHealthView,
-    ShutdownHandle, Unsupported, WasmEngine,
+    ComposedRuntime, HostPlatform, InstanceGuard, LockFailure, MasterKeyInput, PlatformRule,
+    ProcessPolicy, RuntimeHealthView, ShutdownHandle, Unsupported, WasmEngine,
 };
 use crate::compose_log::LogHandle;
 use crate::composition::{Composition, GuardHold, RuntimeView, TeardownReason};
@@ -119,6 +119,21 @@ pub async fn compose(
         composition.teardown(TeardownReason::StartupFailed).await;
         return Err(ComposeError::Unsupported(Unsupported::ListenerRequired(
             "channel /hooks",
+        )));
+    }
+    if !listeners.oauth_callback
+        && builder
+            .config()
+            .llm_providers
+            .iter()
+            .any(|provider| provider.uses_chatgpt_sign_in())
+    {
+        let composition = Composition::early(config_watcher, wal_observer, guard, log);
+        #[cfg(feature = "test-support")]
+        let composition = composition.with_probe(failpoints.probe.clone());
+        composition.teardown(TeardownReason::StartupFailed).await;
+        return Err(ComposeError::Unsupported(Unsupported::ListenerRequired(
+            "OAuth callback",
         )));
     }
 
@@ -231,9 +246,43 @@ pub(crate) struct Plan {
     pub state_root: Option<PathBuf>,
 }
 
+/// Host facts `validate` consults.
+#[derive(Clone, Copy, Debug)]
+struct HostFacts {
+    compiled: Option<HostPlatform>,
+}
+
+impl HostFacts {
+    fn current() -> Self {
+        Self {
+            compiled: HostPlatform::compiled(),
+        }
+    }
+}
+
 /// Check every option value before anything starts. Reads the file system only to
 /// canonicalize paths already known to be absolute (never the current directory).
 pub(crate) fn validate(options: &ComposeOptions) -> Result<Plan, ComposeError> {
+    validate_on(options, HostFacts::current())
+}
+
+/// Test seam, kept as a wrapper: `validate_on(o, HostFacts { compiled, ..HostFacts::current() })`.
+#[cfg(test)]
+#[allow(clippy::needless_update)] // `pulley_supported` joins `HostFacts` later; keep the shape.
+fn validate_with_compiled(
+    options: &ComposeOptions,
+    compiled: Option<HostPlatform>,
+) -> Result<Plan, ComposeError> {
+    validate_on(
+        options,
+        HostFacts {
+            compiled,
+            ..HostFacts::current()
+        },
+    )
+}
+
+fn validate_on(options: &ComposeOptions, host: HostFacts) -> Result<Plan, ComposeError> {
     let refuse = |what: Unsupported| Err(ComposeError::Unsupported(what));
 
     let home = match canonical_directory(&options.home) {
@@ -241,30 +290,20 @@ pub(crate) fn validate(options: &ComposeOptions) -> Result<Plan, ComposeError> {
         _ => return refuse(Unsupported::HomeNotCanonical(options.home.clone())),
     };
 
-    // Option values this build does not compose.
-    if matches!(options.profile, ComposeProfile::Embedded { .. }) {
-        return refuse(Unsupported::NotYetAvailable("ComposeProfile::Embedded"));
-    }
-    if options.processes == ProcessPolicy::Forbid {
-        return refuse(Unsupported::NotYetAvailable("ProcessPolicy::Forbid"));
-    }
-    if options.wasm_engine == WasmEngine::Pulley {
-        return refuse(Unsupported::NotYetAvailable("WasmEngine::Pulley"));
-    }
-    if !options.hot_reload {
-        return refuse(Unsupported::NotYetAvailable("hot_reload: false"));
-    }
-    if !options.listeners.oauth_callback {
-        return refuse(Unsupported::NotYetAvailable(
-            "listeners.oauth_callback: false",
-        ));
-    }
-    if let ClientApiOptions::Loopback {
-        admission: Admission::InProcessOnly,
-        ..
-    } = options.client_api
-    {
-        return refuse(Unsupported::NotYetAvailable("Admission::InProcessOnly"));
+    compiled_target_rule(options, host.compiled).map_err(ComposeError::Unsupported)?;
+
+    if let ComposeProfile::Embedded { platform } = options.profile {
+        if let Err(rule) = row_allows(
+            platform,
+            options.instance,
+            options.processes,
+            options.wasm_engine,
+        ) {
+            return refuse(Unsupported::PlatformTable { platform, rule });
+        }
+        if platform.is_mobile() && options.state_root.is_none() {
+            return refuse(Unsupported::StateRootRequired { platform });
+        }
     }
 
     let state_root = match &options.state_root {
@@ -284,7 +323,75 @@ pub(crate) fn validate(options: &ComposeOptions) -> Result<Plan, ComposeError> {
         return refuse(Unsupported::DiscoveryRequiresPidLock);
     }
 
+    if options.instance == InstanceGuard::ProcessLocal {
+        let listeners = options.listeners;
+        if listeners.post_msg {
+            return refuse(Unsupported::ListenerUnderProcessLocal("POST /msg"));
+        }
+        if listeners.event_bus_ws {
+            return refuse(Unsupported::ListenerUnderProcessLocal("EventBus WebSocket"));
+        }
+        if listeners.channel_hooks {
+            return refuse(Unsupported::ListenerUnderProcessLocal("channel /hooks"));
+        }
+        if listeners.oauth_callback {
+            return refuse(Unsupported::ListenerUnderProcessLocal("OAuth callback"));
+        }
+    }
+
+    if options.wasm_engine == WasmEngine::Pulley {
+        return refuse(Unsupported::NotYetAvailable("WasmEngine::Pulley"));
+    }
+    if let ClientApiOptions::Loopback {
+        admission: Admission::InProcessOnly,
+        ..
+    } = options.client_api
+    {
+        return refuse(Unsupported::NotYetAvailable("Admission::InProcessOnly"));
+    }
+
     Ok(Plan { home, state_root })
+}
+
+/// A compiled iOS / Android binary composes only `Embedded { platform: that }`.
+fn compiled_target_rule(
+    options: &ComposeOptions,
+    compiled: Option<HostPlatform>,
+) -> Result<(), Unsupported> {
+    let Some(compiled) = compiled else {
+        return Ok(());
+    };
+    if !compiled.is_mobile() {
+        return Ok(());
+    }
+    match options.profile {
+        ComposeProfile::Embedded { platform } if platform == compiled => Ok(()),
+        _ => Err(Unsupported::PlatformMismatch { compiled }),
+    }
+}
+
+/// Allowed combinations of the ADR D3 platform table. First broken column wins:
+/// instance, then processes, then engine.
+fn row_allows(
+    platform: HostPlatform,
+    instance: InstanceGuard,
+    processes: ProcessPolicy,
+    engine: WasmEngine,
+) -> Result<(), PlatformRule> {
+    if platform.is_mobile() {
+        if instance != InstanceGuard::ProcessLocal {
+            return Err(PlatformRule::Instance);
+        }
+        if !processes.is_forbid() {
+            return Err(PlatformRule::Processes);
+        }
+        if engine != WasmEngine::Pulley {
+            return Err(PlatformRule::Engine);
+        }
+    } else if !matches!(instance, InstanceGuard::PidLockFile { .. }) {
+        return Err(PlatformRule::Instance);
+    }
+    Ok(())
 }
 
 /// `path` canonicalized, when it is an absolute path to an existing directory.
@@ -430,12 +537,7 @@ mod tests {
             ))
             .with_state_root(&root)
             .with_master_key(MasterKeyInput::Provided(Zeroizing::new([1; 32])))
-            .with_listeners(
-                ListenerOptions::daemon()
-                    .with_post_msg(false)
-                    .with_event_bus_ws(false)
-                    .with_channel_hooks(false),
-            );
+            .with_listeners(ListenerOptions::none());
         assert_eq!(
             validate(&options).unwrap(),
             Plan {
@@ -445,8 +547,15 @@ mod tests {
         );
         let off = daemon(&home)
             .with_instance(InstanceGuard::ProcessLocal)
-            .with_client_api(ClientApiOptions::Off);
+            .with_client_api(ClientApiOptions::Off)
+            .with_listeners(ListenerOptions::none());
         assert!(validate(&off).is_ok());
+        assert!(validate(&daemon(&home).with_processes(ProcessPolicy::Forbid)).is_ok());
+        assert!(validate(&daemon(&home).with_hot_reload(false)).is_ok());
+        assert!(validate(
+            &daemon(&home).with_listeners(ListenerOptions::daemon().with_oauth_callback(false))
+        )
+        .is_ok());
     }
 
     #[test]
@@ -454,23 +563,8 @@ mod tests {
         let (_home_dir, home) = canonical_tempdir();
         let cases = [
             (
-                daemon(&home).with_profile(ComposeProfile::Embedded {
-                    platform: crate::api::HostPlatform::Ios,
-                }),
-                "ComposeProfile::Embedded",
-            ),
-            (
-                daemon(&home).with_processes(ProcessPolicy::Forbid),
-                "ProcessPolicy::Forbid",
-            ),
-            (
                 daemon(&home).with_wasm_engine(WasmEngine::Pulley),
                 "WasmEngine::Pulley",
-            ),
-            (daemon(&home).with_hot_reload(false), "hot_reload: false"),
-            (
-                daemon(&home).with_listeners(ListenerOptions::daemon().with_oauth_callback(false)),
-                "listeners.oauth_callback: false",
             ),
             (
                 daemon(&home).with_client_api(ClientApiOptions::loopback(
@@ -540,12 +634,15 @@ mod tests {
     #[tokio::test]
     async fn module_001_ac30_compose_refusals_leave_no_guard_behind() {
         let (_home_dir, home) = canonical_tempdir();
-        let error = compose(daemon(&home).with_hot_reload(false), Vec::new())
-            .await
-            .unwrap_err();
+        let error = compose(
+            daemon(&home).with_wasm_engine(WasmEngine::Pulley),
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             error,
-            ComposeError::Unsupported(Unsupported::NotYetAvailable("hot_reload: false"))
+            ComposeError::Unsupported(Unsupported::NotYetAvailable("WasmEngine::Pulley"))
         ));
         assert!(!home.join(".runtime").exists(), "nothing was written");
         assert!(!crate::registry::reserved_homes_for_test().contains(&home));
@@ -582,5 +679,164 @@ mod tests {
         );
         assert!(!home.join(".runtime").exists(), "no lock was tried");
         drop(held);
+    }
+}
+
+#[cfg(test)]
+mod module_001_ac32_platform_tests {
+    use super::*;
+    use crate::api::NullComposeLog;
+
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = std::fs::canonicalize(dir.path()).expect("canonical tempdir");
+        (dir, path)
+    }
+
+    #[test]
+    fn module_001_ac32_platform_table_matrix() {
+        let platforms = [
+            HostPlatform::MacOs,
+            HostPlatform::Ios,
+            HostPlatform::Android,
+            HostPlatform::Windows,
+            HostPlatform::Linux,
+        ];
+        let instances = [InstanceGuard::ProcessLocal, InstanceGuard::pid_lock()];
+        let processes = [ProcessPolicy::Allow, ProcessPolicy::Forbid];
+        let engines = [WasmEngine::Native, WasmEngine::Pulley];
+        for platform in platforms {
+            for instance in instances {
+                for process in processes {
+                    for engine in engines {
+                        let got = row_allows(platform, instance, process, engine);
+                        let expected = expected_row(platform, instance, process, engine);
+                        assert_eq!(
+                            got, expected,
+                            "{platform:?} instance={instance:?} processes={process:?} engine={engine:?}"
+                        );
+                        if let Err(rule) = got {
+                            let text = Unsupported::PlatformTable { platform, rule }.to_string();
+                            match rule {
+                                PlatformRule::Instance if platform.is_mobile() => {
+                                    assert_eq!(
+                                        text,
+                                        format!(
+                                            "the {platform} embedded profile requires the process-local instance guard"
+                                        )
+                                    );
+                                }
+                                PlatformRule::Instance => {
+                                    assert_eq!(
+                                        text,
+                                        format!(
+                                            "the {platform} embedded profile requires the pid-lock instance guard"
+                                        )
+                                    );
+                                }
+                                PlatformRule::Processes => {
+                                    assert_eq!(
+                                        text,
+                                        format!(
+                                            "the {platform} embedded profile requires processes forbid"
+                                        )
+                                    );
+                                }
+                                PlatformRule::Engine => {
+                                    assert_eq!(
+                                        text,
+                                        format!(
+                                            "the {platform} embedded profile requires the pulley engine"
+                                        )
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn expected_row(
+        platform: HostPlatform,
+        instance: InstanceGuard,
+        processes: ProcessPolicy,
+        engine: WasmEngine,
+    ) -> Result<(), PlatformRule> {
+        if platform.is_mobile() {
+            if instance != InstanceGuard::ProcessLocal {
+                return Err(PlatformRule::Instance);
+            }
+            if !processes.is_forbid() {
+                return Err(PlatformRule::Processes);
+            }
+            if engine != WasmEngine::Pulley {
+                return Err(PlatformRule::Engine);
+            }
+            Ok(())
+        } else if matches!(instance, InstanceGuard::PidLockFile { .. }) {
+            Ok(())
+        } else {
+            Err(PlatformRule::Instance)
+        }
+    }
+
+    #[test]
+    fn module_001_ac32_d3_compiled_mobile_target_composes_only_its_embedded_row() {
+        let (_home_dir, home) = canonical_tempdir();
+        let log = Arc::new(NullComposeLog);
+        let daemon =
+            ComposeOptions::daemon(&home, Arc::clone(&log) as Arc<dyn crate::api::ComposeLog>);
+        let android = ComposeOptions::embedded(
+            &home,
+            HostPlatform::Android,
+            Arc::clone(&log) as Arc<dyn crate::api::ComposeLog>,
+        );
+        let ios = ComposeOptions::embedded(
+            &home,
+            HostPlatform::Ios,
+            log as Arc<dyn crate::api::ComposeLog>,
+        );
+
+        assert_eq!(
+            compiled_target_rule(&daemon, Some(HostPlatform::Ios)),
+            Err(Unsupported::PlatformMismatch {
+                compiled: HostPlatform::Ios
+            })
+        );
+        assert_eq!(
+            compiled_target_rule(&android, Some(HostPlatform::Ios)),
+            Err(Unsupported::PlatformMismatch {
+                compiled: HostPlatform::Ios
+            })
+        );
+        assert_eq!(compiled_target_rule(&ios, Some(HostPlatform::Ios)), Ok(()));
+        assert_eq!(
+            compiled_target_rule(&ios, Some(HostPlatform::Linux)),
+            Ok(())
+        );
+        assert_eq!(
+            compiled_target_rule(&daemon, Some(HostPlatform::Linux)),
+            Ok(())
+        );
+        assert_eq!(compiled_target_rule(&ios, None), Ok(()));
+
+        assert_eq!(
+            match validate_with_compiled(&daemon, Some(HostPlatform::Ios)) {
+                Err(ComposeError::Unsupported(what)) => what,
+                other => panic!("expected PlatformMismatch, got {other:?}"),
+            },
+            Unsupported::PlatformMismatch {
+                compiled: HostPlatform::Ios
+            }
+        );
+        assert_eq!(
+            Unsupported::PlatformMismatch {
+                compiled: HostPlatform::Ios
+            }
+            .to_string(),
+            "this build targets ios; only the ios embedded profile can compose here"
+        );
     }
 }

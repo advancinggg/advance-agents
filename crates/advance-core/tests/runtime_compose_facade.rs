@@ -29,10 +29,10 @@ use advance_core::runtime_compose::{
     HostFunctionRegistrar, HostPlatform, HostTool, InferenceContribution, InferenceRefusal,
     InferenceSubject, InstanceGuard, InstanceGuardKind, ListenerOptions, LockFailure, LogStream,
     MasterKeyInput, Method, MethodInfo, NullComposeLog, OssBinding, PanicAnswer, PathDefect,
-    ProcessPolicy, ProviderSlot, ResponseScan, RouteOptions, RouteRefusal, RouteRefusalReason,
-    RunInfo, RunView, RuntimeHealthView, RuntimePhase, Scope, SecretViewError, ShutdownHandle,
-    StartedCx, TaskRunStatus, TaskSpawner, ToolDescription, ToolError, ToolRefusal, ToolRegistrar,
-    Unsupported, Val, ViewError, WasmEngine, Zeroizing,
+    PlatformRule, ProcessPolicy, ProviderSlot, ResponseScan, RouteOptions, RouteRefusal,
+    RouteRefusalReason, RunInfo, RunView, RuntimeHealthView, RuntimePhase, Scope, SecretViewError,
+    ShutdownHandle, StartedCx, TaskRunStatus, TaskSpawner, ToolDescription, ToolError, ToolRefusal,
+    ToolRegistrar, UnknownPlatform, Unsupported, Val, ViewError, WasmEngine, Zeroizing,
 };
 
 /// The CONTRACT-244 API: every name `api/mod.rs` may re-export, and must.
@@ -116,6 +116,8 @@ const ALLOWED: &[&str] = &[
     "ComposeOptions",
     "ComposeProfile",
     "HostPlatform",
+    "PlatformRule",
+    "UnknownPlatform",
     "InstanceGuard",
     "ListenerOptions",
     "MasterKeyInput",
@@ -247,6 +249,8 @@ fn uses_the_api_through_the_facade(home: std::path::PathBuf) {
     let _: Option<CapParams> = None;
     let _: Option<GrantDecision> = None;
     let _: Option<TaskRunStatus> = None;
+    let _: Option<PlatformRule> = None;
+    let _: Result<HostPlatform, UnknownPlatform> = "mac".parse();
 }
 
 #[test]
