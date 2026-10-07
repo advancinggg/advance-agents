@@ -8,7 +8,11 @@ use crate::cancel::CancelToken;
 use crate::contract::{AdoptError, ConnectError, ConnectedRuntime, RuntimeState};
 use crate::discovery::read_client_api_discovery;
 use crate::ports::{AdoptPort, RuntimeLauncher};
-use crate::runtime_state::{committed_provider_id, read_selected_provider, runtime_state};
+use crate::runtime_state::{
+    committed_provider_id, read_selected_provider, runtime_state_with_policy,
+};
+use advance_runtime::runtime_lock::inspect_lock_with_policy;
+use advance_shared_types::process_policy::{ProcessPolicy, SpawnSite, PROCESS_FORBIDDEN};
 
 pub struct FileAdoptPort {
     pub timeout: Duration,
@@ -29,69 +33,147 @@ impl AdoptPort for FileAdoptPort {
         expected_provider: &str,
         cancel: &CancelToken,
     ) -> Result<(), AdoptError> {
-        if runtime_state(home) != RuntimeState::Running {
-            return Err(AdoptError::NotRunning);
+        wait_adopted_with(
+            home,
+            expected_provider,
+            cancel,
+            self.timeout,
+            ProcessPolicy::Allow,
+        )
+    }
+}
+
+pub(crate) fn wait_adopted_with(
+    home: &Path,
+    expected_provider: &str,
+    cancel: &CancelToken,
+    timeout: Duration,
+    policy: ProcessPolicy,
+) -> Result<(), AdoptError> {
+    if runtime_state_with_policy(home, policy) != RuntimeState::Running {
+        return Err(AdoptError::NotRunning);
+    }
+    let start = Instant::now();
+    loop {
+        if cancel.is_cancelled() {
+            return Err(AdoptError::Cancelled);
         }
-        let start = Instant::now();
-        loop {
-            if cancel.is_cancelled() {
-                return Err(AdoptError::Cancelled);
+        if let Some(sel) = read_selected_provider(home) {
+            let lock_ok = matches!(
+                inspect_lock_with_policy(home, policy),
+                advance_runtime::runtime_lock::LockInspection::Live { pid } if pid == sel.pid
+            );
+            if lock_ok && sel.provider_id == expected_provider {
+                return Ok(());
             }
-            if let Some(sel) = read_selected_provider(home) {
-                let lock_ok = matches!(
-                    advance_runtime::runtime_lock::inspect_lock(home),
-                    advance_runtime::runtime_lock::LockInspection::Live { pid } if pid == sel.pid
-                );
-                if lock_ok && sel.provider_id == expected_provider {
-                    return Ok(());
-                }
-            }
-            if start.elapsed() >= self.timeout {
-                return Err(AdoptError::ProviderNotAdopted {
-                    reason: "timeout".into(),
-                });
-            }
-            std::thread::sleep(Duration::from_millis(20));
         }
+        if start.elapsed() >= timeout {
+            return Err(AdoptError::ProviderNotAdopted {
+                reason: "timeout".into(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+pub(crate) struct PolicyFileAdoptPort {
+    pub timeout: Duration,
+    policy: ProcessPolicy,
+}
+
+impl PolicyFileAdoptPort {
+    pub(crate) fn new(policy: ProcessPolicy) -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            policy,
+        }
+    }
+}
+
+impl AdoptPort for PolicyFileAdoptPort {
+    fn wait_adopted(
+        &self,
+        home: &Path,
+        expected_provider: &str,
+        cancel: &CancelToken,
+    ) -> Result<(), AdoptError> {
+        wait_adopted_with(home, expected_provider, cancel, self.timeout, self.policy)
     }
 }
 
 pub struct ProcessLauncher;
 
+/// CONTRACT-243 launcher that obeys a `ProcessPolicy`: under `Forbid`
+/// `Err(ConnectError::LaunchFailed { reason: "process_forbidden" })`, nothing spawned and
+/// no key or config read; under `Allow` exactly [`ProcessLauncher`].
+pub struct GuardedProcessLauncher {
+    policy: ProcessPolicy,
+}
+
+impl GuardedProcessLauncher {
+    pub fn new(policy: ProcessPolicy) -> Self {
+        Self { policy }
+    }
+}
+
 impl RuntimeLauncher for ProcessLauncher {
     fn start(&self, home: &Path, cancel: &CancelToken) -> Result<(), ConnectError> {
-        if cancel.is_cancelled() {
-            return Err(ConnectError::Cancelled);
-        }
-        let bin = resolve_advance_bin().ok_or(ConnectError::LaunchFailed {
-            reason: "advance-bin-not-found".into(),
-        })?;
-        let mut cmd = Command::new(bin);
-        cmd.arg("start")
-            .arg("--workspace")
-            .arg(home)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        if let Ok(Some(key)) = cap_secrets::read_workspace_master_key(home) {
-            let rendered = zeroize::Zeroizing::new(hex::encode(*key));
-            let env_name = advance_runtime::config::load_config(
-                &home.join(".advance").join("runtime-config.yaml"),
-            )
-            .map(|c| c.secrets.env_var_name)
-            .unwrap_or_else(|_| "SECRETS_MASTER_KEY".into());
-            cmd.env(env_name, rendered.as_str());
-        }
-        cmd.spawn().map_err(|_| ConnectError::LaunchFailed {
-            reason: "spawn-failed".into(),
-        })?;
-        Ok(())
+        launch_daemon(home, cancel, ProcessPolicy::Allow)
     }
+}
+
+impl RuntimeLauncher for GuardedProcessLauncher {
+    fn start(&self, home: &Path, cancel: &CancelToken) -> Result<(), ConnectError> {
+        launch_daemon(home, cancel, self.policy)
+    }
+}
+
+pub(crate) fn launch_daemon(
+    home: &Path,
+    cancel: &CancelToken,
+    policy: ProcessPolicy,
+) -> Result<(), ConnectError> {
+    if cancel.is_cancelled() {
+        return Err(ConnectError::Cancelled);
+    }
+    if policy.check(SpawnSite::DaemonLauncher).is_err() {
+        return Err(ConnectError::LaunchFailed {
+            reason: PROCESS_FORBIDDEN.into(),
+        });
+    }
+    let bin = resolve_advance_bin().ok_or(ConnectError::LaunchFailed {
+        reason: "advance-bin-not-found".into(),
+    })?;
+    if policy.admit(SpawnSite::DaemonLauncher).is_err() {
+        return Err(ConnectError::LaunchFailed {
+            reason: PROCESS_FORBIDDEN.into(),
+        });
+    }
+    let mut cmd = Command::new(bin);
+    cmd.arg("start")
+        .arg("--workspace")
+        .arg(home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    if let Ok(Some(key)) = cap_secrets::read_workspace_master_key(home) {
+        let rendered = zeroize::Zeroizing::new(hex::encode(*key));
+        let env_name = advance_runtime::config::load_config(
+            &home.join(".advance").join("runtime-config.yaml"),
+        )
+        .map(|c| c.secrets.env_var_name)
+        .unwrap_or_else(|_| "SECRETS_MASTER_KEY".into());
+        cmd.env(env_name, rendered.as_str());
+    }
+    cmd.spawn().map_err(|_| ConnectError::LaunchFailed {
+        reason: "spawn-failed".into(),
+    })?;
+    Ok(())
 }
 
 fn launch_claim_path(home: &Path) -> std::path::PathBuf {
@@ -167,41 +249,60 @@ pub fn start_or_attach(
     adopt: &dyn AdoptPort,
     wait_bound: Duration,
 ) -> Result<ConnectedRuntime, ConnectError> {
+    start_or_attach_with_policy(
+        home,
+        cancel,
+        launcher,
+        adopt,
+        wait_bound,
+        ProcessPolicy::Allow,
+    )
+}
+
+pub(crate) fn start_or_attach_with_policy(
+    home: &Path,
+    cancel: &CancelToken,
+    launcher: &dyn RuntimeLauncher,
+    adopt: &dyn AdoptPort,
+    wait_bound: Duration,
+    policy: ProcessPolicy,
+) -> Result<ConnectedRuntime, ConnectError> {
     if cancel.is_cancelled() {
         return Err(ConnectError::Cancelled);
     }
-    match runtime_state(home) {
+    match runtime_state_with_policy(home, policy) {
         RuntimeState::Starting => {
-            wait_until_running(home, cancel, false, wait_bound)?;
-            adopt_if_needed(home, cancel, adopt)?;
+            wait_until_running(home, cancel, false, wait_bound, policy)?;
+            adopt_if_needed(home, cancel, adopt, policy)?;
         }
-        RuntimeState::Running => adopt_if_needed(home, cancel, adopt)?,
+        RuntimeState::Running => adopt_if_needed(home, cancel, adopt, policy)?,
         RuntimeState::Idle => {
             if !claim_launch(home) {
-                wait_until_running(home, cancel, false, wait_bound)?;
+                wait_until_running(home, cancel, false, wait_bound, policy)?;
             } else {
                 let started = launcher.start(home, cancel);
                 if started.is_err() {
                     release_launch(home);
                     started?;
                 }
-                let waited = wait_until_running(home, cancel, true, wait_bound);
+                let waited = wait_until_running(home, cancel, true, wait_bound, policy);
                 release_launch(home);
                 waited?;
             }
-            adopt_if_needed(home, cancel, adopt)?;
+            adopt_if_needed(home, cancel, adopt, policy)?;
         }
     }
-    attach(home, cancel)
+    attach(home, cancel, policy)
 }
 
 fn adopt_if_needed(
     home: &Path,
     cancel: &CancelToken,
     adopt: &dyn AdoptPort,
+    policy: ProcessPolicy,
 ) -> Result<(), ConnectError> {
     if let Some(committed) = committed_provider_id(home) {
-        let lock_pid = match advance_runtime::runtime_lock::inspect_lock(home) {
+        let lock_pid = match inspect_lock_with_policy(home, policy) {
             advance_runtime::runtime_lock::LockInspection::Live { pid } => Some(pid),
             _ => None,
         };
@@ -230,13 +331,14 @@ fn wait_until_running(
     cancel: &CancelToken,
     after_launch: bool,
     bound: Duration,
+    policy: ProcessPolicy,
 ) -> Result<(), ConnectError> {
     let start = Instant::now();
     loop {
         if cancel.is_cancelled() {
             return Err(ConnectError::Cancelled);
         }
-        if runtime_state(home) == RuntimeState::Running {
+        if runtime_state_with_policy(home, policy) == RuntimeState::Running {
             return Ok(());
         }
         if start.elapsed() >= bound {
@@ -252,14 +354,18 @@ fn wait_until_running(
     }
 }
 
-fn attach(home: &Path, cancel: &CancelToken) -> Result<ConnectedRuntime, ConnectError> {
+fn attach(
+    home: &Path,
+    cancel: &CancelToken,
+    policy: ProcessPolicy,
+) -> Result<ConnectedRuntime, ConnectError> {
     if cancel.is_cancelled() {
         return Err(ConnectError::Cancelled);
     }
     // Always re-bind pid + health so a swapped discovery file cannot redirect attach.
     if let Some(d) = read_client_api_discovery(home) {
         let pid_ok = matches!(
-            advance_runtime::runtime_lock::inspect_lock(home),
+            inspect_lock_with_policy(home, policy),
             advance_runtime::runtime_lock::LockInspection::Live { pid } if pid == d.pid
         );
         if pid_ok && crate::discovery::client_api_accepts(&d.client_api_base) {
@@ -286,4 +392,76 @@ pub fn adopt_on_running(
         reason: "no-committed-provider".into(),
     })?;
     adopt.wait_adopted(home, &expected, cancel)
+}
+
+#[cfg(test)]
+mod module_001_ac32_tests {
+    use super::*;
+    use crate::contract::WorkspaceHomeHandle;
+    use crate::impls::HostWorkspaceHome;
+    use crate::runtime_state::runtime_state;
+    use crate::WorkspaceHomeFirstOpen;
+    use advance_runtime::runtime_lock::RuntimeLock;
+    use advance_shared_types::process_policy::spawn_counter;
+    use std::sync::Mutex;
+
+    static COUNTER_SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        COUNTER_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn module_001_ac32_t113_3_process_launcher_refused_under_forbid() {
+        let _guard = serial();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path();
+        let cancel = CancelToken::new();
+        let w0 = spawn_counter::snapshot();
+        let err = GuardedProcessLauncher::new(ProcessPolicy::Forbid)
+            .start(home, &cancel)
+            .expect_err("forbid start");
+        assert!(
+            matches!(err, ConnectError::LaunchFailed { reason } if reason == PROCESS_FORBIDDEN)
+        );
+        let handle = WorkspaceHomeHandle {
+            path: home.to_path_buf(),
+        };
+        let err = HostWorkspaceHome::production_with_policy(ProcessPolicy::Forbid)
+            .start_or_attach(&handle, &cancel)
+            .expect_err("forbid attach");
+        assert!(
+            matches!(err, ConnectError::LaunchFailed { reason } if reason == PROCESS_FORBIDDEN)
+        );
+        let delta = spawn_counter::snapshot().since(&w0);
+        assert_eq!(delta.refused(SpawnSite::DaemonLauncher), 2);
+        assert_eq!(delta.admitted(SpawnSite::DaemonLauncher), 0);
+        assert!(!home.join(".runtime").join("launch.lock").exists());
+    }
+
+    #[test]
+    fn module_001_ac32_host_home_lock_reads_use_the_in_process_probe_under_forbid() {
+        let _guard = serial();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let home = dir.path();
+            let lock = RuntimeLock::acquire(home, Duration::from_secs(30))
+                .await
+                .expect("acquire");
+            let w0 = spawn_counter::snapshot();
+            assert_eq!(
+                runtime_state_with_policy(home, ProcessPolicy::Forbid),
+                RuntimeState::Starting
+            );
+            let delta = spawn_counter::snapshot().since(&w0);
+            assert_eq!(delta.admitted(SpawnSite::PidLockProbe), 0);
+            assert_eq!(delta.refused(SpawnSite::PidLockProbe), 2);
+            assert_eq!(runtime_state(home), RuntimeState::Starting);
+            drop(lock);
+        });
+    }
 }

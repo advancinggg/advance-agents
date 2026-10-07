@@ -63,13 +63,15 @@ use advance_client_api::provider_admin::{
     ClientProviderSidecar, ClientProviderSignIn, ClientProviderSignInModel,
     ClientProviderSignInStart, ClientProviderSignOut, ClientProviderSummary, ClientProviderUsage,
     ClientProviderUsageWindow, ClientUpdateProviderRequest, ProviderAdminOutcome,
-    ProviderAdminWarning, CHATGPT_OAUTH_AUTH_SOURCE, CHATGPT_OAUTH_BACKEND, DEFAULT_BACKEND_CLASS,
+    ProviderAdminWarning, AGENT_CLI_BACKEND_CLASS, CHATGPT_OAUTH_AUTH_SOURCE,
+    CHATGPT_OAUTH_BACKEND, DEFAULT_BACKEND_CLASS,
 };
 use advance_client_api::{ClientApi, ProviderAdminProvider, ProviderError};
 use advance_runtime::config::{
     AgentCliSpec, AuthScheme, InferenceBackendClass, LlmProviderConfig, ProviderAuthSource,
     ProviderBackend, RuntimeConfig, RuntimeConfigProvider, CHATGPT_OAUTH_RECORD_SUFFIX,
 };
+use advance_shared_types::process_policy::{ProcessPolicy, SpawnSite};
 use cap_llm::backend_cli::{
     AgentCliAuthProbe, AgentCliUsageProbe, ProcessAuthProbe, ProcessUsageProbe,
 };
@@ -162,6 +164,8 @@ pub struct WiredProviderAdmin {
     /// entries without a sidecar are claimable and the backend registry is fixed at boot.
     claimable_local: bool,
     claimed_preflight: Option<Arc<dyn ClaimedEntryPreflight>>,
+    process_policy: ProcessPolicy,
+    hot_reload: bool,
 }
 
 impl WiredProviderAdmin {
@@ -188,6 +192,8 @@ impl WiredProviderAdmin {
             preflight_timeout: PREFLIGHT_TIMEOUT,
             claimable_local: false,
             claimed_preflight: None,
+            process_policy: ProcessPolicy::Allow,
+            hot_reload: true,
         }
     }
 
@@ -260,6 +266,21 @@ impl WiredProviderAdmin {
 
     pub fn has_claimed_preflight(&self) -> bool {
         self.claimed_preflight.is_some()
+    }
+
+    /// Under `Forbid`: `create_provider` of an `agent-cli` entry, and `preflight` / `usage` of an
+    /// `agent-cli` entry, answer `ProviderError::ProcessForbidden` before any write or probe.
+    pub fn with_process_policy(mut self, process_policy: ProcessPolicy) -> Self {
+        self.process_policy = process_policy;
+        self
+    }
+
+    /// `false`: create / update / delete / select do not wait for the config watcher; each
+    /// answers `ProviderAdminWarning::RestartRequired` (deduplicated), and select does not rewrite
+    /// `.runtime/selected-provider` (the runtime has not adopted the change).
+    pub fn with_hot_reload(mut self, hot_reload: bool) -> Self {
+        self.hot_reload = hot_reload;
+        self
     }
 
     pub fn home(&self) -> &Path {
@@ -519,6 +540,43 @@ impl WiredProviderAdmin {
         observed || pred(&self.config.current())
     }
 
+    fn subscribe_if_watching(&self) -> Option<tokio::sync::mpsc::Receiver<Arc<RuntimeConfig>>> {
+        self.hot_reload.then(|| self.config.subscribe())
+    }
+
+    fn after_yaml_write<T, F>(
+        &self,
+        mut outcome: ProviderAdminOutcome<T>,
+        rx: Option<tokio::sync::mpsc::Receiver<Arc<RuntimeConfig>>>,
+        pred: F,
+    ) -> ProviderAdminOutcome<T>
+    where
+        F: Fn(&RuntimeConfig) -> bool + Send + Sync,
+    {
+        match rx {
+            Some(rx) => {
+                if !self.wait_reload(rx, pred) {
+                    outcome = outcome.with_warning(ProviderAdminWarning::ReloadPending);
+                }
+            }
+            None => {
+                if !outcome
+                    .warnings
+                    .contains(&ProviderAdminWarning::RestartRequired)
+                {
+                    outcome = outcome.with_warning(ProviderAdminWarning::RestartRequired);
+                }
+            }
+        }
+        outcome
+    }
+
+    fn refuse_forbidden_agent_cli(&self) -> Result<(), ProviderError> {
+        self.process_policy
+            .check(SpawnSite::AgentCli)
+            .map_err(|_| ProviderError::ProcessForbidden("agent-cli".into()))
+    }
+
     // ── preflight ────────────────────────────────────────────────────────────────────────────
 
     /// Run the overlay preflight for `entry` with `key`, bounded by `preflight_timeout`.
@@ -702,6 +760,9 @@ impl ProviderAdminProvider for WiredProviderAdmin {
         request: &ClientCreateProviderRequest,
     ) -> Result<ProviderAdminOutcome<ClientProviderSummary>, ProviderError> {
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if request.backend_class.as_deref() == Some(AGENT_CLI_BACKEND_CLASS) {
+            self.refuse_forbidden_agent_cli()?;
+        }
         if is_sign_in_request(request) {
             // Nothing could ever sign the entry in: refuse before the document changes.
             self.sign_in_port()?;
@@ -710,7 +771,7 @@ impl ProviderAdminProvider for WiredProviderAdmin {
             }
         }
         let secret = self.create_secret_name(request)?;
-        let rx = self.config.subscribe();
+        let rx = self.subscribe_if_watching();
         crate::upsert_provider_entry(
             &self.home,
             create_mapping(request, &secret),
@@ -718,13 +779,12 @@ impl ProviderAdminProvider for WiredProviderAdmin {
         )
         .map_err(write_error)?;
         let (idx, entry) = self.find(&request.provider_id)?;
-        let mut outcome = ProviderAdminOutcome::new(self.summary(&entry, idx == 0));
         let applied = entry.clone();
-        if !self.wait_reload(rx, move |cfg| {
-            cfg.llm_providers.iter().any(|p| *p == applied)
-        }) {
-            outcome = outcome.with_warning(ProviderAdminWarning::ReloadPending);
-        }
+        let mut outcome = self.after_yaml_write(
+            ProviderAdminOutcome::new(self.summary(&entry, idx == 0)),
+            rx,
+            move |cfg| cfg.llm_providers.iter().any(|p| *p == applied),
+        );
         if outcome.value.sidecar_present && outcome.value.backend_class == "local" {
             outcome = outcome.with_warning(ProviderAdminWarning::RestartRequired);
         }
@@ -769,7 +829,7 @@ impl ProviderAdminProvider for WiredProviderAdmin {
                 "sign-in secret name is fixed".into(),
             ));
         }
-        let rx = self.config.subscribe();
+        let rx = self.subscribe_if_watching();
         crate::upsert_provider_entry(
             &self.home,
             update_mapping(provider_id, request),
@@ -777,13 +837,12 @@ impl ProviderAdminProvider for WiredProviderAdmin {
         )
         .map_err(write_error)?;
         let (idx, entry) = self.find(provider_id)?;
-        let mut outcome = ProviderAdminOutcome::new(self.summary(&entry, idx == 0));
         let applied = entry.clone();
-        if !self.wait_reload(rx, move |cfg| {
-            cfg.llm_providers.iter().any(|p| *p == applied)
-        }) {
-            outcome = outcome.with_warning(ProviderAdminWarning::ReloadPending);
-        }
+        let mut outcome = self.after_yaml_write(
+            ProviderAdminOutcome::new(self.summary(&entry, idx == 0)),
+            rx,
+            move |cfg| cfg.llm_providers.iter().any(|p| *p == applied),
+        );
         if request.sidecar.is_some() && outcome.value.backend_class == "local" {
             outcome = outcome.with_warning(ProviderAdminWarning::RestartRequired);
         }
@@ -817,7 +876,7 @@ impl ProviderAdminProvider for WiredProviderAdmin {
             return Err(ProviderError::InvalidState("referenced-by-agent".into()));
         }
         let removed = entries.iter().find(|p| p.id == provider_id).cloned();
-        let rx = self.config.subscribe();
+        let rx = self.subscribe_if_watching();
         crate::remove_provider_entry(&self.home, provider_id).map_err(write_error)?;
         // A sign-in entry's session goes with it, once nothing names it any more (revoked
         // best-effort, both secret names removed).
@@ -845,12 +904,9 @@ impl ProviderAdminProvider for WiredProviderAdmin {
             selected_provider_id: remaining.first().map(|p| p.id.clone()),
         };
         let gone = provider_id.to_string();
-        let mut outcome = ProviderAdminOutcome::new(result);
-        if !self.wait_reload(rx, move |cfg| {
+        let outcome = self.after_yaml_write(ProviderAdminOutcome::new(result), rx, move |cfg| {
             !cfg.llm_providers.iter().any(|p| p.id == gone)
-        }) {
-            outcome = outcome.with_warning(ProviderAdminWarning::ReloadPending);
-        }
+        });
         Ok(outcome)
     }
 
@@ -909,6 +965,9 @@ impl ProviderAdminProvider for WiredProviderAdmin {
 
     fn usage(&self, provider_id: &str) -> Result<ClientProviderUsage, ProviderError> {
         let (_, entry) = self.find(provider_id)?;
+        if entry.backend_class == InferenceBackendClass::AgentCli {
+            self.refuse_forbidden_agent_cli()?;
+        }
         let usage = match (entry.backend_class, &entry.agent_cli) {
             (InferenceBackendClass::AgentCli, Some(spec)) => self.run_agent_cli_usage(spec),
             _ if entry.uses_chatgpt_sign_in() => ClientProviderUsage {
@@ -930,6 +989,9 @@ impl ProviderAdminProvider for WiredProviderAdmin {
 
     fn preflight(&self, provider_id: &str) -> Result<ClientProviderPreflightResult, ProviderError> {
         let (_, entry) = self.find(provider_id)?;
+        if entry.backend_class == InferenceBackendClass::AgentCli {
+            self.refuse_forbidden_agent_cli()?;
+        }
         if let (InferenceBackendClass::AgentCli, Some(spec)) =
             (entry.backend_class, &entry.agent_cli)
         {
@@ -972,19 +1034,20 @@ impl ProviderAdminProvider for WiredProviderAdmin {
     ) -> Result<ProviderAdminOutcome<ClientProviderSummary>, ProviderError> {
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.find(provider_id)?;
-        let rx = self.config.subscribe();
+        let rx = self.subscribe_if_watching();
         crate::select_provider(&self.home, provider_id).map_err(write_error)?;
         // Keep the Landing adopt file consistent with the document even before the daemon's
         // own reload subscriber (start.rs) rewrites it.
-        let _ = crate::write_selected_provider(&self.home, std::process::id(), provider_id);
-        let (_, entry) = self.find(provider_id)?;
-        let mut outcome = ProviderAdminOutcome::new(self.summary(&entry, true));
-        let id = provider_id.to_string();
-        if !self.wait_reload(rx, move |cfg| {
-            cfg.llm_providers.first().map(|p| p.id.as_str()) == Some(id.as_str())
-        }) {
-            outcome = outcome.with_warning(ProviderAdminWarning::ReloadPending);
+        if self.hot_reload {
+            let _ = crate::write_selected_provider(&self.home, std::process::id(), provider_id);
         }
+        let (_, entry) = self.find(provider_id)?;
+        let id = provider_id.to_string();
+        let outcome = self.after_yaml_write(
+            ProviderAdminOutcome::new(self.summary(&entry, true)),
+            rx,
+            move |cfg| cfg.llm_providers.first().map(|p| p.id.as_str()) == Some(id.as_str()),
+        );
         Ok(outcome)
     }
 
@@ -2434,5 +2497,279 @@ database:
             admin.get_provider("local-a").unwrap().last_preflight,
             Some(verdict)
         );
+    }
+}
+
+#[cfg(test)]
+mod module_001_ac32_tests {
+    use super::*;
+    use advance_shared_types::process_policy::spawn_counter;
+    use cap_secrets::InMemorySecretStorage;
+    use std::time::Instant;
+    use zeroize::Zeroizing;
+
+    const HOME_YAML: &str = "\
+wasm:
+  max_memory_pages: 1024
+  epoch_interruption_ms: 100
+  fuel_enabled: false
+
+llm-providers:
+  - id: openai
+    endpoint: https://api.openai.com
+    api-key-secret: openai-api-key
+    model-aliases:
+      gpt: gpt-4o
+    cost-per-mtoken-in: 2.50
+    cost-per-mtoken-out: 10.00
+    rate-limit:
+      requests-per-minute: 1000
+      tokens-per-minute: 400000
+  - id: claude-sub
+    api-key-secret: claude-sub-api-key
+    backend-class: agent-cli
+    agent-cli:
+      vendor: claude
+      command: /nonexistent/claude
+    model-aliases:
+      sonnet: sonnet
+    cost-per-mtoken-in: 0.001
+    cost-per-mtoken-out: 0.001
+    rate-limit:
+      requests-per-minute: 6
+      tokens-per-minute: 60000
+
+cron:
+  max_jitter_ratio: 0.1
+
+git:
+  gc_interval_hours: 24
+  max_tracked_file_mb: 10
+
+secrets:
+  master-key-source: env-var
+  env-var-name: ADV_HOME_AC32_MK
+
+post-processor:
+  llm-model: sonnet-light
+  llm-failure-cooldown-seconds: 600
+
+database:
+  db-path: \".runtime/index.db\"
+  pool-size: 4
+";
+
+    struct PanicAuth;
+    impl AgentCliAuthProbe for PanicAuth {
+        fn probe(&self, _spec: &AgentCliSpec) -> cap_llm::backend_cli::AuthProbe {
+            panic!("agent-cli auth probe must not run under Forbid");
+        }
+    }
+
+    struct PanicUsage;
+    impl AgentCliUsageProbe for PanicUsage {
+        fn probe_usage(&self, _spec: &AgentCliSpec) -> cap_llm::backend_cli::UsageProbe {
+            panic!("agent-cli usage probe must not run under Forbid");
+        }
+    }
+
+    struct PassPreflight;
+    impl PreflightPort for PassPreflight {
+        fn preflight(
+            &self,
+            _home: &Path,
+            _provider: &LlmProviderConfig,
+            _key: &SecretBytes,
+            _cancel: &CancelToken,
+        ) -> Result<(), crate::PreflightFail> {
+            Ok(())
+        }
+    }
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        home: PathBuf,
+        store: Arc<SecretStore>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let home = dir.path().to_path_buf();
+            std::fs::create_dir_all(home.join(".advance")).unwrap();
+            std::fs::write(home.join(".advance/runtime-config.yaml"), HOME_YAML).unwrap();
+            let store = Arc::new(SecretStore::new(
+                Zeroizing::new([7u8; 32]),
+                Arc::new(InMemorySecretStorage::default()),
+            ));
+            Self {
+                _dir: dir,
+                home,
+                store,
+            }
+        }
+
+        fn admin(&self) -> WiredProviderAdmin {
+            let cfg = advance_runtime::config::load_config(
+                &self.home.join(".advance/runtime-config.yaml"),
+            )
+            .expect("fixture parses");
+            WiredProviderAdmin::new(
+                self.home.clone(),
+                Arc::new(cap_llm::StaticConfig(Arc::new(cfg))),
+                Some(Arc::clone(&self.store)),
+                Arc::new(PassPreflight),
+                Arc::new(NoReferences),
+            )
+        }
+
+        fn yaml_bytes(&self) -> Vec<u8> {
+            std::fs::read(self.home.join(".advance/runtime-config.yaml")).expect("yaml")
+        }
+    }
+
+    fn cloud_http(id: &str) -> ClientCreateProviderRequest {
+        ClientCreateProviderRequest {
+            provider_id: id.into(),
+            backend_class: Some("cloud-http".into()),
+            endpoint: Some("https://api.example.com".into()),
+            model_aliases: [("m".to_string(), "m".to_string())].into_iter().collect(),
+            cost: ClientProviderCost {
+                input_per_mtoken: 1.0,
+                output_per_mtoken: 1.0,
+                ..Default::default()
+            },
+            rate_limit: ClientProviderRateLimit {
+                requests_per_minute: 10,
+                tokens_per_minute: 1000,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn agent_cli(id: &str) -> ClientCreateProviderRequest {
+        ClientCreateProviderRequest {
+            provider_id: id.into(),
+            backend_class: Some(AGENT_CLI_BACKEND_CLASS.into()),
+            agent_cli: Some(ClientProviderAgentCli {
+                vendor: "claude".into(),
+                command: "/nonexistent/claude".into(),
+                args: Vec::new(),
+            }),
+            model_aliases: [("sonnet".to_string(), "sonnet".to_string())]
+                .into_iter()
+                .collect(),
+            cost: ClientProviderCost {
+                input_per_mtoken: 0.001,
+                output_per_mtoken: 0.001,
+                ..Default::default()
+            },
+            rate_limit: ClientProviderRateLimit {
+                requests_per_minute: 6,
+                tokens_per_minute: 60_000,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn is_process_forbidden(err: ProviderError) -> bool {
+        matches!(err, ProviderError::ProcessForbidden(inner) if inner == "agent-cli")
+    }
+
+    #[test]
+    fn module_001_ac32_provider_admin_refuses_agent_cli_under_forbid() {
+        let f = Fixture::new();
+        f.store.store("keep", "v").unwrap();
+        let admin = f
+            .admin()
+            .with_process_policy(ProcessPolicy::Forbid)
+            .with_agent_cli_probe(Arc::new(PanicAuth))
+            .with_agent_cli_usage_probe(Arc::new(PanicUsage))
+            .with_reload_wait(Duration::from_millis(1));
+        let yaml_before = f.yaml_bytes();
+        let names_before = f.store.names();
+        let w0 = spawn_counter::snapshot();
+
+        assert!(is_process_forbidden(
+            admin.create_provider(&agent_cli("cli-b")).unwrap_err()
+        ));
+        assert!(is_process_forbidden(
+            admin.preflight("claude-sub").unwrap_err()
+        ));
+        assert!(is_process_forbidden(admin.usage("claude-sub").unwrap_err()));
+
+        assert_eq!(f.yaml_bytes(), yaml_before);
+        assert_eq!(f.store.names(), names_before);
+        let delta = spawn_counter::snapshot().since(&w0);
+        assert_eq!(delta.refused(SpawnSite::AgentCli), 3);
+
+        admin
+            .create_provider(&cloud_http("cloud-b"))
+            .expect("cloud-http create under Forbid");
+        assert!(crate::list_provider_entries(&f.home)
+            .unwrap()
+            .iter()
+            .any(|e| e.id == "cloud-b"));
+    }
+
+    #[test]
+    fn module_001_ac32_d3_provider_admin_without_hot_reload_answers_restart_required() {
+        let f = Fixture::new();
+        let admin = f
+            .admin()
+            .with_hot_reload(false)
+            .with_reload_wait(Duration::from_secs(2));
+        let selected = f.home.join(".runtime").join("selected-provider");
+        assert!(!selected.exists());
+
+        let started = Instant::now();
+        let created = admin
+            .create_provider(&cloud_http("cloud-b"))
+            .expect("create");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(created.warnings, [ProviderAdminWarning::RestartRequired]);
+
+        let started = Instant::now();
+        let updated = admin
+            .update_provider(
+                "cloud-b",
+                &ClientUpdateProviderRequest {
+                    endpoint: Some("https://api.example.com/v2".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("update");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(updated.warnings, [ProviderAdminWarning::RestartRequired]);
+
+        let started = Instant::now();
+        let selected_out = admin.select_provider("cloud-b").expect("select");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            selected_out.warnings,
+            [ProviderAdminWarning::RestartRequired]
+        );
+        assert!(!selected.exists());
+
+        let started = Instant::now();
+        let deleted = admin.delete_provider("cloud-b").expect("delete");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(deleted.warnings, [ProviderAdminWarning::RestartRequired]);
     }
 }

@@ -30,7 +30,7 @@ pub use chatgpt_sign_in::{
     ChatGptSignIn, ChatGptSignInConfig, ChatGptSignInPort, SignInClock, SignInModel, SignInRefusal,
     SignInStarted, SignInStatus, SignOutOutcome, SystemSignInClock, VerifyOutcome,
 };
-pub use connect::ProcessLauncher;
+pub use connect::{GuardedProcessLauncher, ProcessLauncher};
 pub use contract::{
     AdoptError, ConnectError, ConnectedRuntime, CreateError, DisplayNameError, PreflightFail,
     PreflightPass, ProviderStatus, RecognizeClass, RuntimeState, WorkspaceHomeFirstOpen,

@@ -4,7 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cancel::CancelToken;
-use crate::connect::{adopt_on_running, start_or_attach, FileAdoptPort, ProcessLauncher};
+use crate::connect::{
+    adopt_on_running, start_or_attach_with_policy, FileAdoptPort, GuardedProcessLauncher,
+    PolicyFileAdoptPort, ProcessLauncher,
+};
 use crate::contract::{
     AdoptError, ConnectError, ConnectedRuntime, CreateError, DisplayNameError, PreflightFail,
     PreflightPass, ProviderStatus, RecognizeClass, RuntimeState, WorkspaceHomeFirstOpen,
@@ -13,12 +16,14 @@ use crate::contract::{
 use crate::display_name::TopLevelDisplayName;
 use crate::ports::{AdoptPort, GeneratePathPreflight, PreflightPort, RuntimeLauncher};
 use crate::secret_bytes::SecretBytes;
+use advance_shared_types::process_policy::ProcessPolicy;
 
 pub struct HostWorkspaceHome {
     preflight: Arc<dyn PreflightPort>,
     launcher: Arc<dyn RuntimeLauncher>,
     adopt: Arc<dyn AdoptPort>,
     wait_bound: Duration,
+    process_policy: ProcessPolicy,
 }
 
 impl HostWorkspaceHome {
@@ -28,6 +33,19 @@ impl HostWorkspaceHome {
             launcher: Arc::new(ProcessLauncher),
             adopt: Arc::new(FileAdoptPort::default()),
             wait_bound: Duration::from_secs(30),
+            process_policy: ProcessPolicy::Allow,
+        }
+    }
+
+    /// `production()` with `GuardedProcessLauncher::new(policy)`, an adopt port whose lock reads use
+    /// `policy`'s probe, and every lock read of `runtime_state` / `start_or_attach` through it.
+    pub fn production_with_policy(policy: ProcessPolicy) -> Self {
+        Self {
+            preflight: Arc::new(GeneratePathPreflight::default()),
+            launcher: Arc::new(GuardedProcessLauncher::new(policy)),
+            adopt: Arc::new(PolicyFileAdoptPort::new(policy)),
+            wait_bound: Duration::from_secs(30),
+            process_policy: policy,
         }
     }
 
@@ -50,7 +68,14 @@ impl HostWorkspaceHome {
             launcher,
             adopt,
             wait_bound,
+            process_policy: ProcessPolicy::Allow,
         }
+    }
+
+    /// Set only the lock-read policy (hosts that inject their own launcher / adopt ports).
+    pub fn with_process_policy(mut self, policy: ProcessPolicy) -> Self {
+        self.process_policy = policy;
+        self
     }
 }
 
@@ -82,7 +107,7 @@ impl WorkspaceHomeFirstOpen for HostWorkspaceHome {
     }
 
     fn runtime_state(&self, home: &WorkspaceHomeHandle) -> RuntimeState {
-        crate::runtime_state::runtime_state(&home.path)
+        crate::runtime_state::runtime_state_with_policy(&home.path, self.process_policy)
     }
 
     fn store_and_preflight(
@@ -126,12 +151,13 @@ impl WorkspaceHomeFirstOpen for HostWorkspaceHome {
         home: &WorkspaceHomeHandle,
         cancel: &CancelToken,
     ) -> Result<ConnectedRuntime, ConnectError> {
-        start_or_attach(
+        start_or_attach_with_policy(
             &home.path,
             cancel,
             self.launcher.as_ref(),
             self.adopt.as_ref(),
             self.wait_bound,
+            self.process_policy,
         )
     }
 

@@ -3,7 +3,8 @@
 use std::fs;
 use std::path::Path;
 
-use advance_runtime::runtime_lock::{inspect_lock, LockInspection};
+use advance_runtime::runtime_lock::{inspect_lock_with_policy, LockInspection};
+use advance_shared_types::process_policy::ProcessPolicy;
 
 use crate::contract::RuntimeState;
 use crate::discovery::{client_api_accepts, read_client_api_discovery};
@@ -58,7 +59,11 @@ pub fn read_selected_provider(home: &Path) -> Option<SelectedProvider> {
 }
 
 pub fn runtime_state(home: &Path) -> RuntimeState {
-    match inspect_lock(home) {
+    runtime_state_with_policy(home, ProcessPolicy::Allow)
+}
+
+pub(crate) fn runtime_state_with_policy(home: &Path, policy: ProcessPolicy) -> RuntimeState {
+    match inspect_lock_with_policy(home, policy) {
         LockInspection::Absent | LockInspection::Stale { .. } => RuntimeState::Idle,
         LockInspection::Live { pid } => {
             let Some(disc) = read_client_api_discovery(home) else {
