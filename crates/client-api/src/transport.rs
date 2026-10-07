@@ -160,6 +160,21 @@ pub struct ShutdownIngress {
     pub serve_overran: bool,
 }
 
+/// What [`ClientApiServer::retire`] observed. The `Arc<ClientApi>` is handed back for the next
+/// listener.
+pub struct RetiredClientApiServer {
+    pub api: Arc<ClientApi>,
+    pub local_addr: SocketAddr,
+    /// The serve task's own result; `Ok(())` when it overran the budget and was aborted.
+    pub serve: io::Result<()>,
+    /// Every upgraded WebSocket task of this listener ended within the budget.
+    pub ws_joined: bool,
+    /// Every dispatch this listener admitted returned its permit within the budget.
+    pub drained: bool,
+    /// The serve task did not finish within the budget and was aborted.
+    pub serve_overran: bool,
+}
+
 impl ClientApiServer {
     /// Bind the configured IP and caller-selected port.  A non-loopback bind is rejected before
     /// touching the socket unless `remote_bind_enabled` is explicitly true.
@@ -287,14 +302,7 @@ impl ClientApiServer {
         )
         .await;
         let mut drained = matches!(drain, Ok(Ok(_)));
-        for (sem, n) in self.api.extension_dispatch_pools() {
-            let ext_drain =
-                tokio::time::timeout_at(deadline, Arc::clone(&sem).acquire_many_owned(n)).await;
-            drained &= matches!(ext_drain, Ok(Ok(_)));
-            // Closed while the drained permits are still held, so no dispatch can slip in between.
-            sem.close();
-            drop(ext_drain);
-        }
+        drained &= drain_extension_pools(&self.api, deadline).await;
         // Closed while the drained permits are still held, so no dispatch can slip in between.
         self.dispatch.close();
         drop(drain);
@@ -306,6 +314,85 @@ impl ClientApiServer {
             serve_overran,
         }
     }
+
+    /// Stop this listener — not the API — within `budget`, so the same `ClientApi` can be served by a
+    /// new listener: the socket stops accepting, this listener's WebSocket tasks are cancelled and
+    /// awaited, the serve task is awaited (aborted past the deadline, which drops the socket), and this
+    /// listener's dispatch permits are drained and its semaphore closed. Unlike
+    /// [`shutdown_ingress`](Self::shutdown_ingress) it does not drain or close the extension dispatch
+    /// pools the `ClientApi` holds (the next listener shares them).
+    pub async fn retire(mut self, budget: Duration) -> RetiredClientApiServer {
+        let local_addr = self.local_addr;
+        let deadline = tokio::time::Instant::now() + budget;
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        self.ws.cancel.cancel();
+        let (serve, serve_overran) = match tokio::time::timeout_at(deadline, &mut self.task).await {
+            Ok(Ok(result)) => (result, false),
+            Ok(Err(join)) => (
+                Err(io::Error::other(format!("client API task join: {join}"))),
+                false,
+            ),
+            Err(_) => {
+                self.task.abort();
+                let _ = (&mut self.task).await;
+                (Ok(()), true)
+            }
+        };
+        self.ws.tasks.close();
+        let ws_joined = tokio::time::timeout_at(deadline, self.ws.tasks.wait())
+            .await
+            .is_ok();
+        let drain = tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.dispatch).acquire_many_owned(self.permits),
+        )
+        .await;
+        let drained = matches!(drain, Ok(Ok(_)));
+        // Closed while the drained permits are still held, so no dispatch can slip in between.
+        self.dispatch.close();
+        drop(drain);
+        RetiredClientApiServer {
+            api: self.api,
+            local_addr,
+            serve,
+            ws_joined,
+            drained,
+            serve_overran,
+        }
+    }
+
+    /// The ingress shutdown of an API that has no listener any more (its last listener was retired
+    /// and none could be bound again): drains and closes the extension dispatch pools within `budget`
+    /// exactly as `shutdown_ingress` does, and hands the API back.
+    /// `serve: Ok(())`, `ws_joined: true`, `serve_overran: false`, `drained`: the pools drained.
+    pub async fn shutdown_unbound(api: Arc<ClientApi>, budget: Duration) -> ShutdownIngress {
+        let deadline = tokio::time::Instant::now() + budget;
+        let drained = drain_extension_pools(&api, deadline).await;
+        ShutdownIngress {
+            api,
+            serve: Ok(()),
+            ws_joined: true,
+            drained,
+            serve_overran: false,
+        }
+    }
+}
+
+/// Drain and close every extension dispatch pool. `true` when every pool returned its permits
+/// within `deadline`. Closed while any drained permits are still held, so no dispatch can slip
+/// in between.
+async fn drain_extension_pools(api: &ClientApi, deadline: tokio::time::Instant) -> bool {
+    let mut drained = true;
+    for (sem, n) in api.extension_dispatch_pools() {
+        let ext_drain =
+            tokio::time::timeout_at(deadline, Arc::clone(&sem).acquire_many_owned(n)).await;
+        drained &= matches!(ext_drain, Ok(Ok(_)));
+        sem.close();
+        drop(ext_drain);
+    }
+    drained
 }
 
 async fn index() -> Response {

@@ -133,4 +133,6 @@ pub use runs::{ClientAgentTreeNode, ClientRunMutation, ClientRunSummary};
 pub use secrets_admin::{ClientSecretsMode, ClientSetSecretsModeRequest};
 pub use session::{ClientSession, Platform, Principal, Scope};
 pub use tools::{ClientMcpEntry, ClientSkillEntry, ClientToolEntry, ClientToolInventory};
-pub use transport::{client_api_router, ClientApiServer, ShutdownIngress, CLIENT_WS_PROTOCOL};
+pub use transport::{
+    client_api_router, ClientApiServer, RetiredClientApiServer, ShutdownIngress, CLIENT_WS_PROTOCOL,
+};
