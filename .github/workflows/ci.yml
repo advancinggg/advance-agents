@@ -27,6 +27,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 # Least privilege: the gate only needs to read the checked-out tree.
 permissions:
@@ -164,6 +165,80 @@ jobs:
       # witnesses are guaranteed to execute regardless of unification.
       - name: cargo test -p advance-reply-tracker --features test-helpers --locked
         run: cargo test -p advance-reply-tracker --features test-helpers --locked
+
+  # ---------------------------------------------------------------------------
+  # iOS bridge build — MODULE-001-T113 (8), ADR 2026-10-03 D3.
+  # Builds the CONTRACT-210 bridge (rlib + cdylib + staticlib, so the iOS link step runs)
+  # for aarch64-apple-ios. The bridge depends on advance-runtime-compose, so this
+  # cross-compiles the whole composition graph and its C code: ring (C + pregenerated
+  # aarch64 asm), libsqlite3-sys (bundled SQLite), sqlite-vec, libgit2-sys (vendored
+  # libgit2; links iconv, Security, CoreFoundation), libz-sys (links the SDK's libz) and
+  # wasmtime's helpers.c. The cc crate finds the iPhoneOS SDK through xcrun; no cmake,
+  # bindgen or OpenSSL is involved. The `pulley` wasmtime feature is what lets the
+  # embedded profile run guests on iOS: Pulley bytecode, no executable memory.
+  # ---------------------------------------------------------------------------
+  ios-bridge:
+    name: bridge (aarch64-apple-ios)
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      # A deployment floor that current Xcode releases accept (the job prints the SDK and the
+      # artefact's minos). Raise it here if a runner's Xcode rejects it.
+      IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - name: Add the iOS device target to the pinned toolchain
+        run: rustup target add aarch64-apple-ios
+      - name: Xcode and the iPhoneOS SDK in use
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-ios
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo build -p advance-embedded-runtime-bridge --target aarch64-apple-ios --locked
+        run: |
+          set -euo pipefail
+          SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+          export SDKROOT
+          cargo build -p advance-embedded-runtime-bridge --target aarch64-apple-ios --locked
+      - name: The artefacts are device arm64 and export the C ABI
+        run: |
+          set -euo pipefail
+          dir=target/aarch64-apple-ios/debug
+          lib="$dir/libadvance_embedded_runtime_bridge.a"
+          dylib="$dir/libadvance_embedded_runtime_bridge.dylib"
+          ls -l "$lib" "$dylib"
+          archs="$(lipo -archs "$dylib")" || { echo "lipo failed on $dylib"; exit 1; }
+          [ "$archs" = "arm64" ] || { echo "dylib architectures: '$archs' (want arm64)"; exit 1; }
+          load_cmds="$(otool -l "$dylib")" || { echo "otool failed on $dylib"; exit 1; }
+          build_version="$(grep -A4 LC_BUILD_VERSION <<<"$load_cmds")" || { echo "$dylib has no LC_BUILD_VERSION"; exit 1; }
+          echo "$build_version"
+          grep -Eq '^ *platform 2$' <<<"$build_version" || { echo "platform is not 2 (iOS device)"; exit 1; }
+          dylib_syms="$(nm -gU "$dylib")" || { echo "nm failed on $dylib"; exit 1; }
+          lib_syms="$(nm -gU "$lib")" || { echo "nm failed on $lib"; exit 1; }
+          for sym in advance_bridge_start advance_bridge_stop advance_bridge_health \
+                     advance_bridge_on_lifecycle advance_bridge_last_error \
+                     advance_bridge_free_handle advance_bridge_abi_version; do
+            grep -q " _${sym}\$" <<<"$dylib_syms" || { echo "dylib lacks _${sym}"; exit 1; }
+            grep -q " _${sym}\$" <<<"$lib_syms" || { echo "staticlib lacks _${sym}"; exit 1; }
+          done
+      - name: Release build and artefact sizes (pushes and manual runs)
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+          export SDKROOT
+          cargo build -p advance-embedded-runtime-bridge --target aarch64-apple-ios --locked --release
+          ls -l target/aarch64-apple-ios/release/libadvance_embedded_runtime_bridge.a \
+                target/aarch64-apple-ios/release/libadvance_embedded_runtime_bridge.dylib
 
   # ---------------------------------------------------------------------------
   # cargo-deny — the hard supply-chain gate.
