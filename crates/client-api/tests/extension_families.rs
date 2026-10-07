@@ -661,3 +661,65 @@ async fn module_001_ac31_extension_dispatch_pool_isolated_over_transport() {
     assert_eq!(h.join().unwrap(), 200);
     drop(server);
 }
+
+async fn bind_ext_hold_server(
+    hold: impl Fn(&HandlerCtx) -> Result<serde_json::Value, advance_client_api::ClientError>
+        + Send
+        + Sync
+        + 'static,
+) -> (ClientApiServer, SocketAddr) {
+    let cfg = ClientApiConfig::default();
+    let mut book = book_with(
+        &cfg,
+        ExtensionRouteGate::new(),
+        Arc::new(NoExtensionRouteHooks),
+    );
+    {
+        let mut r = book.registrar("ext");
+        r.set_budget(FamilyBudget::new(1, 8)).unwrap();
+        r.route(
+            Method::Get,
+            "/client/ext/hold",
+            HandlerSpec::read(true, hold).with_scopes(vec![Scope::ReadInventory]),
+        )
+        .unwrap();
+    }
+    let families = book.finish().unwrap();
+    let mut api = ClientApi::with_parts(cfg, "operator", Arc::new(SystemClock), Arc::new(NoopSink));
+    families.install(&mut api);
+    mint(&api, "tok", vec![Scope::ReadInventory], None, 0);
+    let server = ClientApiServer::bind(Arc::new(api), 0).await.expect("bind");
+    let addr = server.local_addr();
+    (server, addr)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac31_shutdown_ingress_drains_extension_pools() {
+    let released = Arc::new((Mutex::new(false), Condvar::new()));
+    let holding = Arc::new(AtomicUsize::new(0));
+    let (server, addr) =
+        bind_ext_hold_server(hold_handler(Arc::clone(&released), Arc::clone(&holding))).await;
+    let h = std::thread::spawn(move || http_get(addr, "/client/ext/hold", Some("tok")));
+    wait_holding(&holding, "ext-drain");
+    let ingress = server.shutdown_ingress(Duration::from_millis(200)).await;
+    assert!(
+        !ingress.drained,
+        "a held extension dispatch must miss the 200 ms drain"
+    );
+    release(&released);
+    let _ = h.join();
+
+    let released = Arc::new((Mutex::new(false), Condvar::new()));
+    let holding = Arc::new(AtomicUsize::new(0));
+    let (server, addr) =
+        bind_ext_hold_server(hold_handler(Arc::clone(&released), Arc::clone(&holding))).await;
+    let h = std::thread::spawn(move || http_get(addr, "/client/ext/hold", Some("tok")));
+    wait_holding(&holding, "ext-drain-release");
+    release(&released);
+    assert_eq!(h.join().unwrap(), 200);
+    let ingress = server.shutdown_ingress(Duration::from_millis(200)).await;
+    assert!(
+        ingress.drained,
+        "the extension pool drains when no request is in flight"
+    );
+}

@@ -1057,6 +1057,23 @@ impl ClientApi {
             .map(|b| Arc::clone(&b.dispatch))
     }
 
+    /// One `(semaphore, permit_count)` per installed extension, in report order.
+    /// `shutdown_ingress` drains these after the OSS pool and before it closes that pool.
+    pub(crate) fn extension_dispatch_pools(&self) -> Vec<(Arc<tokio::sync::Semaphore>, u32)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for info in &self.extension_routes {
+            if !seen.insert(info.extension) {
+                continue;
+            }
+            let Some(budget) = self.extension_budgets.get(&routes::family_of(&info.path)) else {
+                continue;
+            };
+            out.push((Arc::clone(&budget.dispatch), budget.dispatch_permits));
+        }
+        out
+    }
+
     fn idempotency_for(&self, family: &str) -> &IdempotencyStore {
         self.extension_budgets
             .get(family)

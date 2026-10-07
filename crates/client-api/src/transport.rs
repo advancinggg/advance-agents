@@ -248,9 +248,9 @@ impl ClientApiServer {
     /// 2. The serve task is awaited; it waits for every open HTTP connection. Past the deadline it
     ///    is aborted (`serve_overran`).
     /// 3. The WebSocket tasks are awaited (`ws_joined`).
-    /// 4. The dispatch permits are drained, i.e. every `handle()` still running on the blocking
-    ///    pool has returned (`drained`); then the dispatch semaphore is closed, so any straggling
-    ///    request fails closed with `module_unavailable`.
+    /// 4. The dispatch permits are drained (OSS pool, then each extension pool), i.e. every
+    ///    `handle()` still running on the blocking pool has returned (`drained`); then each
+    ///    semaphore is closed, so any straggling request fails closed with `module_unavailable`.
     ///
     /// Never fails: every abnormal outcome is reported in [`ShutdownIngress`].
     pub async fn shutdown_ingress(mut self, budget: Duration) -> ShutdownIngress {
@@ -280,9 +280,17 @@ impl ClientApiServer {
             Arc::clone(&self.dispatch).acquire_many_owned(self.permits),
         )
         .await;
+        let mut drained = matches!(drain, Ok(Ok(_)));
+        for (sem, n) in self.api.extension_dispatch_pools() {
+            let ext_drain =
+                tokio::time::timeout_at(deadline, Arc::clone(&sem).acquire_many_owned(n)).await;
+            drained &= matches!(ext_drain, Ok(Ok(_)));
+            // Closed while the drained permits are still held, so no dispatch can slip in between.
+            sem.close();
+            drop(ext_drain);
+        }
         // Closed while the drained permits are still held, so no dispatch can slip in between.
         self.dispatch.close();
-        let drained = matches!(drain, Ok(Ok(_)));
         drop(drain);
         ShutdownIngress {
             api: self.api,
