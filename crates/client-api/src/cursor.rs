@@ -3,6 +3,7 @@
 //! `last_event_id` / delivered `event_id` are AES-256-GCM sealed tokens (never raw Event ids).
 //! Typed seal payloads: tag `0x01` empty-join watermark, tag `0x02` raw id body.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -48,6 +49,30 @@ pub enum SealPurpose {
     EventId,
     /// Tee T2 LLM delta reconnect cursor (`{stream_key, seq}`, both-or-neither).
     DeltaCursor,
+    /// Internal: an extension-scoped raw id. AAD domain `advance/ext/<id>`; only the raw-id tag
+    /// seals or opens. Constructed only inside client-api (`ExtensionSealDomain` has a
+    /// crate-private constructor), so outside code cannot mint another extension's tokens even
+    /// with a raw codec.
+    Extension(ExtensionSealDomain),
+}
+
+/// AAD domain fragment for [`SealPurpose::Extension`]. The constructor is crate-private so a
+/// caller holding the codec cannot pick another extension's domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtensionSealDomain {
+    extension: &'static str,
+}
+
+impl ExtensionSealDomain {
+    /// The id is used as given (composer-validated); the AAD length-prefixes the domain.
+    #[cfg_attr(not(test), allow(dead_code))] // used by families (next commit)
+    pub(crate) fn new(extension: &'static str) -> Self {
+        Self { extension }
+    }
+
+    pub fn extension(&self) -> &'static str {
+        self.extension
+    }
 }
 
 /// Opened seal body after AEAD auth.
@@ -186,12 +211,20 @@ impl AeadClientCursorCodec {
         )
     }
 
-    fn aad_domain(purpose: SealPurpose) -> &'static str {
+    fn aad_domain(purpose: SealPurpose) -> Cow<'static, str> {
         match purpose {
-            SealPurpose::Cursor => AAD_DOMAIN_CURSOR,
-            SealPurpose::EventId => AAD_DOMAIN_EVENT_ID,
-            SealPurpose::DeltaCursor => AAD_DOMAIN_DELTA_CURSOR,
+            SealPurpose::Cursor => Cow::Borrowed(AAD_DOMAIN_CURSOR),
+            SealPurpose::EventId => Cow::Borrowed(AAD_DOMAIN_EVENT_ID),
+            SealPurpose::DeltaCursor => Cow::Borrowed(AAD_DOMAIN_DELTA_CURSOR),
+            SealPurpose::Extension(domain) => {
+                Cow::Owned(format!("advance/ext/{}", domain.extension()))
+            }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn aad_domain_for_test(purpose: SealPurpose) -> Cow<'static, str> {
+        Self::aad_domain(purpose)
     }
 
     fn build_aad(
@@ -259,20 +292,19 @@ impl AeadClientCursorCodec {
     }
 }
 
-impl ClientCursorCodec for AeadClientCursorCodec {
-    fn seal(
+impl AeadClientCursorCodec {
+    fn seal_after_purpose_tag(
         &self,
         purpose: SealPurpose,
         stream_id: &str,
         tag: u8,
         body: &[u8],
+        enforce_extension_raw_id: bool,
     ) -> Result<String, ClientError> {
-        if tag != SEAL_TAG_EMPTY_JOIN && tag != SEAL_TAG_RAW_ID && tag != SEAL_TAG_DELTA_CURSOR {
-            return Err(Self::err_unavailable());
-        }
-        // Purpose↔tag consistency: the delta tag seals ONLY under the delta purpose and vice
-        // versa (belt-and-braces on top of the AAD domain split).
-        if (tag == SEAL_TAG_DELTA_CURSOR) != (purpose == SealPurpose::DeltaCursor) {
+        if enforce_extension_raw_id
+            && matches!(purpose, SealPurpose::Extension(_))
+            && tag != SEAL_TAG_RAW_ID
+        {
             return Err(Self::err_unavailable());
         }
         if tag == SEAL_TAG_RAW_ID && body.len() > MAX_RAW_ID_LEN {
@@ -340,6 +372,43 @@ impl ClientCursorCodec for AeadClientCursorCodec {
         Ok(format!("{TOKEN_VERSION}.{key_id}.{b64}"))
     }
 
+    #[cfg(test)]
+    pub(crate) fn seal_bypassing_extension_tag(
+        &self,
+        purpose: SealPurpose,
+        stream_id: &str,
+        tag: u8,
+        body: &[u8],
+    ) -> Result<String, ClientError> {
+        if tag != SEAL_TAG_EMPTY_JOIN && tag != SEAL_TAG_RAW_ID && tag != SEAL_TAG_DELTA_CURSOR {
+            return Err(Self::err_unavailable());
+        }
+        if (tag == SEAL_TAG_DELTA_CURSOR) != (purpose == SealPurpose::DeltaCursor) {
+            return Err(Self::err_unavailable());
+        }
+        self.seal_after_purpose_tag(purpose, stream_id, tag, body, false)
+    }
+}
+
+impl ClientCursorCodec for AeadClientCursorCodec {
+    fn seal(
+        &self,
+        purpose: SealPurpose,
+        stream_id: &str,
+        tag: u8,
+        body: &[u8],
+    ) -> Result<String, ClientError> {
+        if tag != SEAL_TAG_EMPTY_JOIN && tag != SEAL_TAG_RAW_ID && tag != SEAL_TAG_DELTA_CURSOR {
+            return Err(Self::err_unavailable());
+        }
+        // Purpose↔tag consistency: the delta tag seals ONLY under the delta purpose and vice
+        // versa (belt-and-braces on top of the AAD domain split).
+        if (tag == SEAL_TAG_DELTA_CURSOR) != (purpose == SealPurpose::DeltaCursor) {
+            return Err(Self::err_unavailable());
+        }
+        self.seal_after_purpose_tag(purpose, stream_id, tag, body, true)
+    }
+
     fn open(
         &self,
         purpose: SealPurpose,
@@ -402,7 +471,9 @@ impl ClientCursorCodec for AeadClientCursorCodec {
         let body = &plaintext[1..];
         match tag {
             SEAL_TAG_EMPTY_JOIN => {
-                if purpose == SealPurpose::DeltaCursor {
+                if purpose == SealPurpose::DeltaCursor
+                    || matches!(purpose, SealPurpose::Extension(_))
+                {
                     return Err(Self::err_not_found());
                 }
                 if body != EMPTY_JOIN_WATERMARK_BODY.as_bytes() {
@@ -782,5 +853,93 @@ mod delta_cursor_tests {
         // Empty / oversized stream keys never encode.
         assert!(encode_delta_cursor_body("", 1).is_none());
         assert!(encode_delta_cursor_body(&"x".repeat(257), 1).is_none());
+    }
+
+    #[test]
+    fn module_001_ac31_extension_seal_purpose_matrix() {
+        let codec = codec();
+        let fixture = SealPurpose::Extension(ExtensionSealDomain::new("fixture"));
+        let other = SealPurpose::Extension(ExtensionSealDomain::new("other"));
+        let token = codec
+            .seal(fixture, "stream-1", SEAL_TAG_RAW_ID, b"r1")
+            .expect("extension seal");
+        assert!(matches!(
+            codec.open(fixture, "stream-1", &token),
+            Ok(OpenedSeal::RawId(id)) if id == "r1"
+        ));
+        assert!(codec.open(other, "stream-1", &token).is_err());
+        assert!(codec.open(SealPurpose::Cursor, "stream-1", &token).is_err());
+        assert!(codec
+            .open(SealPurpose::EventId, "stream-1", &token)
+            .is_err());
+        assert!(codec
+            .open(SealPurpose::DeltaCursor, "stream-1", &token)
+            .is_err());
+
+        let ev = codec
+            .seal(SealPurpose::Cursor, "stream-1", SEAL_TAG_RAW_ID, b"ev-9")
+            .expect("event seal");
+        assert!(codec.open(fixture, "stream-1", &ev).is_err());
+        let evid = codec
+            .seal(
+                SealPurpose::EventId,
+                "stream-1",
+                SEAL_TAG_EMPTY_JOIN,
+                EMPTY_JOIN_WATERMARK_BODY.as_bytes(),
+            )
+            .expect("event-id empty join");
+        assert!(codec.open(fixture, "stream-1", &evid).is_err());
+        let delta = seal_delta_cursor(&codec, "stream-abc", 42).expect("delta seal");
+        assert!(codec
+            .open(fixture, DELTA_CURSOR_STREAM_DOMAIN, &delta)
+            .is_err());
+
+        assert!(codec
+            .seal(
+                fixture,
+                "stream-1",
+                SEAL_TAG_EMPTY_JOIN,
+                EMPTY_JOIN_WATERMARK_BODY.as_bytes(),
+            )
+            .is_err());
+        let body = encode_delta_cursor_body("stream-abc", 42).unwrap();
+        assert!(codec
+            .seal(fixture, "stream-1", SEAL_TAG_DELTA_CURSOR, &body)
+            .is_err());
+
+        assert_eq!(
+            AeadClientCursorCodec::aad_domain_for_test(fixture).as_ref(),
+            "advance/ext/fixture"
+        );
+        assert_eq!(
+            AeadClientCursorCodec::aad_domain_for_test(SealPurpose::Cursor).as_ref(),
+            AAD_DOMAIN_CURSOR
+        );
+        assert_eq!(
+            AeadClientCursorCodec::aad_domain_for_test(SealPurpose::EventId).as_ref(),
+            AAD_DOMAIN_EVENT_ID
+        );
+        assert_eq!(
+            AeadClientCursorCodec::aad_domain_for_test(SealPurpose::DeltaCursor).as_ref(),
+            AAD_DOMAIN_DELTA_CURSOR
+        );
+
+        let smuggled = codec
+            .seal_bypassing_extension_tag(
+                fixture,
+                "stream-1",
+                SEAL_TAG_EMPTY_JOIN,
+                EMPTY_JOIN_WATERMARK_BODY.as_bytes(),
+            )
+            .expect("test bypass");
+        assert!(codec.open(fixture, "stream-1", &smuggled).is_err());
+
+        let a = AeadClientCursorCodec::aad_domain_for_test(SealPurpose::Extension(
+            ExtensionSealDomain::new("a"),
+        ));
+        let ab = AeadClientCursorCodec::aad_domain_for_test(SealPurpose::Extension(
+            ExtensionSealDomain::new("a-b"),
+        ));
+        assert_ne!(a.as_ref(), ab.as_ref());
     }
 }

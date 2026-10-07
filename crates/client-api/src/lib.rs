@@ -63,7 +63,8 @@ pub use costs::{
 };
 pub use cursor::{
     AeadClientCursorCodec, ClientCursorCodec, CursorClock, CursorEntropy, CursorKeyCustody,
-    MemoryCursorKeyCustody, OpenedSeal, OsCursorEntropy, SealPurpose, SystemCursorClock,
+    ExtensionSealDomain, MemoryCursorKeyCustody, OpenedSeal, OsCursorEntropy, SealPurpose,
+    SystemCursorClock,
 };
 pub use deltas::{
     open_delta_cursor, resolve_stream_request, seal_delta_cursor, DeltaHoldSplit, DeltaObserver,
