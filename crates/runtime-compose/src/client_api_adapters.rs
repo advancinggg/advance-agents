@@ -32,6 +32,8 @@ use crate::observation_projection::Contract219EventProjector;
 use crate::reply::ReplyRegistry;
 
 const HISTORY_LIMIT: usize = 100;
+/// The summary every CONTRACT-190 history entry carries (bound and unbound).
+pub(crate) const HISTORY_SUMMARY: &str = "observability event";
 const REDACTED: &str = "[REDACTED]";
 
 /// One adapter's worker thread and its job queue. The adapter submits through it; an
@@ -325,28 +327,15 @@ struct HistoryQuery {
     reply: mpsc::Sender<Result<Vec<ReadEvent>, ProviderError>>,
 }
 
-/// Synchronous CONTRACT-190 adapter over CONTRACT-185's async read port. A
-/// dedicated runtime thread avoids nested-runtime blocking in Axum handlers.
-pub struct Contract219HistoryAdapter {
+/// The history read on a dedicated thread (today's body of Contract219HistoryAdapter::new_tracked
+/// and the query half of history()). Thread name `advance-client-history`.
+struct HistoryReader {
     worker: Arc<AdapterWorker<HistoryQuery>>,
-    projector: Arc<Contract219EventProjector>,
-    carriers: Arc<ObservationCarrierStore>,
 }
 
-impl Contract219HistoryAdapter {
-    pub fn new(
+impl HistoryReader {
+    fn spawn_tracked(
         read: Arc<dyn ObservabilityReadApi>,
-        projector: Arc<Contract219EventProjector>,
-        carriers: Arc<ObservationCarrierStore>,
-    ) -> Result<Self, String> {
-        Self::new_tracked(read, projector, carriers, &mut Vec::new())
-    }
-
-    /// As [`Self::new`], also registering the worker thread with `workers`.
-    pub(crate) fn new_tracked(
-        read: Arc<dyn ObservabilityReadApi>,
-        projector: Arc<Contract219EventProjector>,
-        carriers: Arc<ObservationCarrierStore>,
         workers: &mut Vec<Arc<dyn WorkerControl>>,
     ) -> Result<Self, String> {
         let worker = AdapterWorker::spawn(
@@ -369,8 +358,108 @@ impl Contract219HistoryAdapter {
         )
         .map_err(|error| format!("spawn client history bridge: {error}"))?;
         track(&worker, workers);
+        Ok(Self { worker })
+    }
+
+    /// `read.query(&EventFilter { run_id, ..Default::default() }, HISTORY_LIMIT)`: newest first,
+    /// run filter in the read (run history), whole home (task history). Errors as today:
+    /// worker gone → Unavailable("history worker stopped"); read error → Unavailable(e.to_string()).
+    fn window(&self, run_id: Option<&str>) -> Result<Vec<ReadEvent>, ProviderError> {
+        let (reply, response) = mpsc::channel();
+        self.worker
+            .submit(HistoryQuery {
+                filter: EventFilter {
+                    run_id: run_id.map(str::to_owned),
+                    ..EventFilter::default()
+                },
+                reply,
+            })
+            .map_err(|_| ProviderError::Unavailable("history worker stopped".to_owned()))?;
+        response
+            .recv()
+            .map_err(|_| ProviderError::Unavailable("history worker stopped".to_owned()))?
+    }
+}
+
+impl Drop for HistoryReader {
+    fn drop(&mut self) {
+        self.worker.close();
+    }
+}
+
+/// Task filter in memory, then the cursor: every row up to and including the row whose raw id
+/// equals the cursor is skipped; a cursor matching no row of the filtered window is
+/// NotFound("history cursor").
+fn history_window<'a>(
+    rows: &'a [ReadEvent],
+    task_id: Option<&str>,
+    cursor: Option<&str>,
+) -> Result<Vec<&'a advance_event_bus::Event>, ProviderError> {
+    let mut selected = Vec::new();
+    let mut cursor_seen = cursor.is_none();
+    for read in rows {
+        let event = read.event.as_ref();
+        if task_id.is_some_and(|expected| event.task_id.as_deref() != Some(expected)) {
+            continue;
+        }
+        if !cursor_seen {
+            if cursor == Some(event.id.as_str()) {
+                cursor_seen = true;
+            }
+            continue;
+        }
+        selected.push(event);
+    }
+    if !cursor_seen {
+        return Err(ProviderError::NotFound("history cursor".to_owned()));
+    }
+    Ok(selected)
+}
+
+struct HistoryFields {
+    event_id: String,
+    occurred_at: String,
+    kind: String,
+    summary: &'static str,
+}
+
+/// event_id = event.id, occurred_at = event.timestamp.to_rfc3339(), kind = event.event_type,
+/// summary = HISTORY_SUMMARY. history_payload builds its first four nodes from it.
+fn history_fields(event: &advance_event_bus::Event) -> HistoryFields {
+    HistoryFields {
+        event_id: event.id.clone(),
+        occurred_at: event.timestamp.to_rfc3339(),
+        kind: event.event_type.clone(),
+        summary: HISTORY_SUMMARY,
+    }
+}
+
+/// Synchronous CONTRACT-190 adapter over CONTRACT-185's async read port. A
+/// dedicated runtime thread avoids nested-runtime blocking in Axum handlers.
+pub struct Contract219HistoryAdapter {
+    reader: HistoryReader,
+    projector: Arc<Contract219EventProjector>,
+    carriers: Arc<ObservationCarrierStore>,
+}
+
+impl Contract219HistoryAdapter {
+    pub fn new(
+        read: Arc<dyn ObservabilityReadApi>,
+        projector: Arc<Contract219EventProjector>,
+        carriers: Arc<ObservationCarrierStore>,
+    ) -> Result<Self, String> {
+        Self::new_tracked(read, projector, carriers, &mut Vec::new())
+    }
+
+    /// As [`Self::new`], also registering the worker thread with `workers`.
+    pub(crate) fn new_tracked(
+        read: Arc<dyn ObservabilityReadApi>,
+        projector: Arc<Contract219EventProjector>,
+        carriers: Arc<ObservationCarrierStore>,
+        workers: &mut Vec<Arc<dyn WorkerControl>>,
+    ) -> Result<Self, String> {
         Ok(Self {
-            worker,
+            reader: HistoryReader::spawn_tracked(read, workers)?,
             projector,
             carriers,
         })
@@ -382,32 +471,10 @@ impl Contract219HistoryAdapter {
         run_id: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<BoundHistoryPage, ProviderError> {
-        let (reply, response) = mpsc::channel();
-        self.worker
-            .submit(HistoryQuery {
-                filter: EventFilter {
-                    run_id: run_id.map(str::to_owned),
-                    ..EventFilter::default()
-                },
-                reply,
-            })
-            .map_err(|_| ProviderError::Unavailable("history worker stopped".to_owned()))?;
-        let events = response
-            .recv()
-            .map_err(|_| ProviderError::Unavailable("history worker stopped".to_owned()))??;
+        let events = self.reader.window(run_id)?;
+        let selected = history_window(&events, task_id, cursor)?;
         let mut documents = Vec::new();
-        let mut cursor_seen = cursor.is_none();
-        for read in events {
-            let event = read.event.as_ref();
-            if task_id.is_some_and(|expected| event.task_id.as_deref() != Some(expected)) {
-                continue;
-            }
-            if !cursor_seen {
-                if cursor == Some(event.id.as_str()) {
-                    cursor_seen = true;
-                }
-                continue;
-            }
+        for event in selected {
             let carrier = match self
                 .carriers
                 .get(&event.id)
@@ -423,17 +490,7 @@ impl Contract219HistoryAdapter {
                 .map_err(ProviderError::Unavailable)?;
             documents.push(bound);
         }
-        if !cursor_seen {
-            return Err(ProviderError::NotFound("history cursor".to_owned()));
-        }
         Ok(BoundHistoryPage::from_bound_documents(documents, None))
-    }
-}
-
-impl Drop for Contract219HistoryAdapter {
-    /// Only closes the queue (the thread then exits on its own): never blocks on a join.
-    fn drop(&mut self) {
-        self.worker.close();
     }
 }
 
@@ -456,6 +513,7 @@ impl BoundHistoryReadPort for Contract219HistoryAdapter {
 }
 
 fn history_payload(event: &advance_event_bus::Event) -> ObservationNode {
+    let fields = history_fields(event);
     let value = |key: &str| {
         event
             .payload
@@ -469,19 +527,16 @@ fn history_payload(event: &advance_event_bus::Event) -> ObservationNode {
     ObservationNode::Object(vec![
         (
             "event_id".to_owned(),
-            ObservationNode::String(event.id.clone()),
+            ObservationNode::String(fields.event_id),
         ),
         (
             "occurred_at".to_owned(),
-            ObservationNode::String(event.timestamp.to_rfc3339()),
+            ObservationNode::String(fields.occurred_at),
         ),
-        (
-            "kind".to_owned(),
-            ObservationNode::String(event.event_type.clone()),
-        ),
+        ("kind".to_owned(), ObservationNode::String(fields.kind)),
         (
             "summary".to_owned(),
-            ObservationNode::String("observability event".to_owned()),
+            ObservationNode::String(fields.summary.to_owned()),
         ),
         (
             "params".to_owned(),
@@ -1173,6 +1228,125 @@ fn agent_status_name(status: &AgentStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+
+    fn sample_read(id: &str, task_id: Option<&str>) -> ReadEvent {
+        ReadEvent {
+            cursor: ReadCursor(id.to_owned()),
+            event: Arc::new(advance_event_bus::Event {
+                id: id.to_owned(),
+                timestamp: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap(),
+                agent_id: "agent".into(),
+                task_id: task_id.map(str::to_owned),
+                run_id: Some("run-a".into()),
+                execution_id: None,
+                trace_id: String::new(),
+                span_id: String::new(),
+                parent_span_id: None,
+                event_type: "run.round_completed".into(),
+                payload: json!({}),
+                duration_ms: None,
+            }),
+        }
+    }
+
+    fn ids(events: &[&advance_event_bus::Event]) -> Vec<String> {
+        events.iter().map(|event| event.id.clone()).collect()
+    }
+
+    #[test]
+    fn module_020_ac18_history_window_matches_the_bound_rules() {
+        let rows = [
+            sample_read("e0", Some("t-1")),
+            sample_read("e1", Some("t-2")),
+            sample_read("e2", Some("t-1")),
+            sample_read("e3", Some("t-2")),
+        ];
+        assert_eq!(
+            ids(&history_window(&rows, Some("t-1"), None).unwrap()),
+            ["e0", "e2"]
+        );
+        assert_eq!(
+            ids(&history_window(&rows, None, Some("e0")).unwrap()),
+            ["e1", "e2", "e3"]
+        );
+        assert_eq!(
+            ids(&history_window(&rows, Some("t-1"), Some("e0")).unwrap()),
+            ["e2"]
+        );
+        assert!(matches!(
+            history_window(&rows, Some("t-1"), Some("e1")),
+            Err(ProviderError::NotFound(msg)) if msg == "history cursor"
+        ));
+        assert!(matches!(
+            history_window(&rows, None, Some("no-such")),
+            Err(ProviderError::NotFound(msg)) if msg == "history cursor"
+        ));
+    }
+
+    #[test]
+    fn module_020_ac18_history_fields_are_the_bound_payload_fields() {
+        let event = advance_event_bus::Event {
+            id: "e-bound".into(),
+            timestamp: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap(),
+            agent_id: "agent".into(),
+            task_id: Some("t-1".into()),
+            run_id: Some("run-a".into()),
+            execution_id: None,
+            trace_id: String::new(),
+            span_id: String::new(),
+            parent_span_id: None,
+            event_type: "run.round_completed".into(),
+            payload: json!({
+                "result": {
+                    "named_params": {
+                        "api_key": "sentinel-key",
+                        "event_type": "sentinel-type",
+                        "id": "sentinel-id",
+                        "run_id": "sentinel-run"
+                    }
+                }
+            }),
+            duration_ms: None,
+        };
+        let fields = history_fields(&event);
+        let ObservationNode::Object(nodes) = history_payload(&event) else {
+            panic!("history payload is an object");
+        };
+        assert_eq!(
+            &nodes[0],
+            &(
+                "event_id".to_owned(),
+                ObservationNode::String(fields.event_id.clone())
+            )
+        );
+        assert_eq!(
+            &nodes[1],
+            &(
+                "occurred_at".to_owned(),
+                ObservationNode::String(fields.occurred_at.clone())
+            )
+        );
+        assert_eq!(
+            &nodes[2],
+            &(
+                "kind".to_owned(),
+                ObservationNode::String(fields.kind.clone())
+            )
+        );
+        assert_eq!(
+            &nodes[3],
+            &(
+                "summary".to_owned(),
+                ObservationNode::String(fields.summary.to_owned())
+            )
+        );
+        assert_eq!(fields.event_id, "e-bound");
+        assert_eq!(fields.occurred_at, event.timestamp.to_rfc3339());
+        assert_eq!(fields.kind, "run.round_completed");
+        assert_eq!(fields.summary, HISTORY_SUMMARY);
+    }
 
     #[test]
     fn parse_skill_meta_rejects_yaml_aliases() {
