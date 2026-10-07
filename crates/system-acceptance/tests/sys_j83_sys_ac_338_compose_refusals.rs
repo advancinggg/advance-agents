@@ -138,3 +138,81 @@ async fn sys_j83_sys_ac_338_registration_refusal_fails_compose_typed_with_no_lis
     rt.shutdown().await.expect("shutdown");
     assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sys_ac_338_j83_claim_of_oss_bound_entry_fails_typed() {
+    use advance_runtime_compose::test_support::fixture::inference::{
+        provider_yaml, FixtureInference, SidecarMarker, StubInferencePort,
+    };
+    use advance_runtime_compose::{InferenceRefusal, InferenceSubject, OssBinding};
+
+    async fn refused(claim: &str, check: impl FnOnce(&ComposeError)) {
+        let marker = SidecarMarker::new().expect("marker");
+        let side = provider_yaml::side(marker.command());
+        let home = FixtureHome::new(FixtureHomeSpec {
+            capabilities: vec![CapDecl::Granted("fs"), CapDecl::Granted("llm")],
+            driver: FixtureDriver::LlmNoErr,
+            git: false,
+            providers_yaml: Some(provider_yaml::llm_providers_block(&[
+                provider_yaml::LOCAL_STUB_PLAIN,
+                side.as_str(),
+                provider_yaml::CLI,
+                provider_yaml::CLOUD_A,
+            ])),
+        })
+        .expect("home");
+        let log = MemoryComposeLog::new();
+        let probe = Arc::new(ComposeProbe::new());
+        let baseline = alive_tasks();
+        let error = compose(
+            home.options(Arc::new(log.clone()), Arc::clone(&probe)),
+            vec![FixtureExtension::new(FIXTURE_ID)
+                .with_inference(
+                    FixtureInference::new().claim(claim, StubInferencePort::new("x", 1, 1)),
+                )
+                .arc()],
+        )
+        .await
+        .expect_err("claim refused");
+        check(&error);
+        assert!(
+            matches!(error, ComposeError::InferenceClaim { .. }),
+            "{error:?}"
+        );
+        assert_eq!(log.count(log_keys::READY), 0);
+        assert!(!home.home().join(".runtime/client-api").exists());
+        assert!(!marker.ran(), "sidecar ran on a refused compose");
+        assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
+    }
+
+    refused("side", |error| match error {
+        ComposeError::InferenceClaim {
+            extension: "fixture",
+            subject: InferenceSubject::Entry(id),
+            reason: InferenceRefusal::BoundByOss(OssBinding::LocalSidecar),
+        } if id == "side" => {}
+        other => panic!("sidecar entry claim: {other:?}"),
+    })
+    .await;
+
+    refused("cli", |error| match error {
+        ComposeError::InferenceClaim {
+            extension: "fixture",
+            subject: InferenceSubject::Entry(id),
+            reason: InferenceRefusal::BoundByOss(OssBinding::AgentCli),
+        } if id == "cli" => {}
+        other => panic!("agent-cli entry claim: {other:?}"),
+    })
+    .await;
+
+    refused("cloud-a", |error| match error {
+        ComposeError::InferenceClaim {
+            extension: "fixture",
+            subject: InferenceSubject::Entry(id),
+            reason: InferenceRefusal::BoundByOss(OssBinding::CloudWireAdapter),
+        } if id == "cloud-a" => {}
+        other => panic!("cloud entry claim: {other:?}"),
+    })
+    .await;
+}
