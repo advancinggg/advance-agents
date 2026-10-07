@@ -146,6 +146,7 @@ pub mod mailbox;
 pub mod memory;
 pub mod observation_identity;
 pub mod outbound;
+pub mod process_policy;
 pub mod producer_boundary;
 pub mod progress_card;
 pub mod progress_lifecycle_recovery;

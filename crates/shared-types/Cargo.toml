@@ -13,6 +13,9 @@ default = []
 # Integration fixtures that need to mint otherwise provider-only opaque values.
 # Production dependants must never enable this feature.
 test-support = []
+# Tests only: count the spawn attempts `ProcessPolicy::{check, admit}` see (ADR 2026-10-03 D3 spawn counter).
+# Production dependants never enable it.
+spawn-counter = []
 
 [dependencies]
 async-trait = { workspace = true }
@@ -46,7 +49,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 # Cargo builds integration tests as ordinary dependants.  A self dev-dependency
 # enables the fixture-only surface for tests without exposing it in production.
-advance-shared-types = { path = ".", features = ["test-support"] }
+advance-shared-types = { path = ".", features = ["test-support", "spawn-counter"] }
 tempfile = { workspace = true }
 
 [lints]

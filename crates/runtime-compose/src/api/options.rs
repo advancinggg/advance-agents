@@ -314,13 +314,9 @@ impl Default for ListenerOptions {
 }
 
 /// Whether the runtime may start child processes.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ProcessPolicy {
-    #[default]
-    Allow,
-    Forbid,
-}
+///
+/// One type for every spawn site (runtime, capabilities, pack-manager, advance-home).
+pub use advance_shared_types::process_policy::ProcessPolicy;
 
 /// How WebAssembly components are executed.
 #[non_exhaustive]
