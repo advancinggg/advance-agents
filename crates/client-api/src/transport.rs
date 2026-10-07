@@ -118,7 +118,7 @@ fn router_with(api: Arc<ClientApi>, ws: WsTracking, dispatch: Arc<Semaphore>) ->
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
         .route("/styles.css", get(styles_css))
-        .route("/client/events/stream", get(event_stream_transport))
+        .route(routes::PATH_EVENTS_STREAM, get(event_stream_transport))
         .route(routes::PATH_LLM_DELTAS_STREAM, get(delta_stream_transport))
         .route(
             "/client/{*path}",
@@ -483,6 +483,10 @@ async fn handle_http(
             }
         }
     };
+    let pool = state
+        .api
+        .extension_dispatch_for(&path)
+        .unwrap_or_else(|| state.dispatch.clone());
     let req = ClientRequest {
         api_version: header_string(&parts.headers, VERSION_HEADER)
             .unwrap_or_else(|| API_VERSION.to_string()),
@@ -500,7 +504,8 @@ async fn handle_http(
     // error (a panic escaping `handle()`, e.g. from an out-of-`run_handler` site) maps to a stable 503.
     // A dispatch permit bounds concurrent blocking-pool submissions so a caller cannot pin the pool /
     // grow an unbounded queue on the uncapped provider families; excess fails closed with 503.
-    let permit = match state.dispatch.clone().try_acquire_owned() {
+    // An extension request takes only its own permit, never the shared OSS pool.
+    let permit = match pool.try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             return envelope_response(transport_error(

@@ -174,7 +174,8 @@ impl HandlerResponse {
     }
 }
 
-type HandlerFn = Arc<dyn Fn(&HandlerCtx) -> Result<HandlerResponse, ClientError> + Send + Sync>;
+pub(crate) type HandlerFn =
+    Arc<dyn Fn(&HandlerCtx) -> Result<HandlerResponse, ClientError> + Send + Sync>;
 
 /// Registration for a non-session route (health, and — in later slices — provider families).
 #[derive(Clone)]
@@ -278,6 +279,12 @@ impl HandlerSpec {
         self.required_scopes = scopes;
         self
     }
+
+    /// Invoke the registered function (extension-wrapper tests of the race-window gate).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn invoke_for_test(&self, ctx: &HandlerCtx) -> Result<HandlerResponse, ClientError> {
+        (self.func)(ctx)
+    }
 }
 
 /// The public Client API gateway (CONTRACT-190) + session/auth (CONTRACT-193).
@@ -326,6 +333,10 @@ pub struct ClientApi {
     durable_idempotency: Option<Arc<DurableIdempotencyRepository>>,
     /// Per-instance event-read concurrency limiter.
     event_concurrency: Arc<EventConcurrency>,
+    /// Family label → the extension budget that owns it (empty without extensions).
+    extension_budgets: HashMap<String, Arc<crate::families::ExtensionBudget>>,
+    extension_routes: Vec<crate::families::ExtensionRouteInfo>,
+    extension_gate: Option<crate::families::ExtensionRouteGate>,
 }
 
 impl ClientApi {
@@ -386,6 +397,9 @@ impl ClientApi {
             delta_pump_observer: Arc::new(RwLock::new(None)),
             durable_idempotency: None,
             event_concurrency: Arc::new(EventConcurrency::new(max_reads)),
+            extension_budgets: HashMap::new(),
+            extension_routes: Vec::new(),
+            extension_gate: None,
         };
         api.register_builtin_handlers();
         api.register_provider_families();
@@ -922,7 +936,9 @@ impl ClientApi {
     /// Not listed: the session operations (`POST /client/session/{login,refresh,logout}`), which
     /// `handle` dispatches before route lookup, and the transport-only routes (the WebSocket
     /// upgrades of the two stream paths and the Web Console assets), which live in
-    /// [`client_api_router`](crate::transport::client_api_router).
+    /// [`client_api_router`](crate::transport::client_api_router). Extension routes installed
+    /// through [`ExtensionFamilies::install`](crate::families::ExtensionFamilies::install) are
+    /// listed too.
     pub fn route_table(&self) -> Vec<routes::RouteTableEntry> {
         fn entry(
             method: Method,
@@ -976,6 +992,76 @@ impl ClientApi {
     }
     pub fn config(&self) -> &ClientApiConfig {
         &self.config
+    }
+
+    /// Every installed extension route, in registration order (empty without extensions).
+    pub fn extension_route_report(&self) -> Vec<crate::families::ExtensionRouteInfo> {
+        self.extension_routes.clone()
+    }
+
+    /// One entry per extension budget (current permits available, records held).
+    pub fn extension_budget_stats(&self) -> Vec<crate::families::ExtensionBudgetStats> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for info in &self.extension_routes {
+            if !seen.insert(info.extension) {
+                continue;
+            }
+            let Some(budget) = self.extension_budgets.get(&routes::family_of(&info.path)) else {
+                continue;
+            };
+            out.push(crate::families::ExtensionBudgetStats {
+                extension: budget.extension,
+                labels: budget.labels.clone(),
+                dispatch_permits: budget.dispatch_permits,
+                dispatch_available: budget.dispatch.available_permits(),
+                idempotency_cap: budget.idempotency.cap(),
+                idempotency_records: budget.idempotency.len(),
+            });
+        }
+        out
+    }
+
+    /// Called only by `ExtensionFamilies::install`. Registers exact routes (skipping, with a
+    /// `debug_assert!`, a key `handlers` already holds), then templated routes in the given
+    /// order, then stores budgets, report and `Some(gate)` (gate only when at least one route
+    /// is installed).
+    pub(crate) fn install_extension_parts(
+        &mut self,
+        parts: crate::families::InstalledExtensionParts,
+    ) {
+        for (method, path, spec) in parts.exact {
+            if self.handlers.contains_key(&(method, path.clone())) {
+                debug_assert!(
+                    false,
+                    "extension exact route {method:?} {path} collides with an existing handler"
+                );
+                continue;
+            }
+            self.register(method, path, spec);
+        }
+        for (method, template, spec) in parts.templated {
+            self.register_templated(method, &template, spec);
+        }
+        let installed = !parts.report.is_empty();
+        self.extension_budgets = parts.budgets;
+        self.extension_routes = parts.report;
+        if installed {
+            self.extension_gate = Some(parts.gate);
+        }
+    }
+
+    pub(crate) fn extension_dispatch_for(&self, path: &str) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.extension_budgets
+            .get(&routes::family_of(path))
+            .map(|b| Arc::clone(&b.dispatch))
+    }
+
+    fn idempotency_for(&self, family: &str) -> &IdempotencyStore {
+        self.extension_budgets
+            .get(family)
+            .map(|b| &b.idempotency)
+            .unwrap_or(&self.idempotency)
     }
 
     // ── Request handling ────────────────────────────────────────────────────────────────
@@ -1056,6 +1142,19 @@ impl ClientApi {
                 }
             },
         };
+        // 6.5 Extension route gate (ADR D2 containment): once the composition began shutting down,
+        //     an extension route answers module_unavailable before auth, CSRF and idempotency.
+        if let Some(gate) = &self.extension_gate {
+            if gate.is_closed() && self.extension_budgets.contains_key(&family) {
+                return self.denied(
+                    &request_id,
+                    &family,
+                    &method_str,
+                    ClientErrorCode::ModuleUnavailable,
+                    crate::families::fixed_error_message(&ClientErrorCode::ModuleUnavailable),
+                );
+            }
+        }
         // 7. Auth.
         let session = if spec.requires_session {
             match req.session_token.as_deref() {
@@ -1182,10 +1281,11 @@ impl ClientApi {
                     now,
                 );
             }
-            match self
-                .idempotency
-                .begin_fingerprinted(&scope, request_fingerprint, now)
-            {
+            match self.idempotency_for(&family).begin_fingerprinted(
+                &scope,
+                request_fingerprint,
+                now,
+            ) {
                 Begin::Replay(record) => {
                     let mut warnings = record.warnings;
                     warnings.push(ClientWarning::new(

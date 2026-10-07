@@ -66,6 +66,8 @@ pub const PATH_EVENTS_STREAM: &str = "/client/events/stream";
 pub const PATH_GRANTS_PENDING: &str = "/client/grants/pending";
 /// Tee T2 (CONTRACT-235) LLM token-delta WebSocket subscription route.
 pub const PATH_LLM_DELTAS_STREAM: &str = "/client/llm/deltas/stream";
+/// Transport-only stream paths. An extension registrar may not claim these exact paths.
+pub const TRANSPORT_STREAM_PATHS: &[&str] = &[PATH_EVENTS_STREAM, PATH_LLM_DELTAS_STREAM];
 /// Agents family (CONTRACT-190): list (GET) / create (POST).
 pub const PATH_AGENTS: &str = "/client/agents";
 /// Agents family: the templates a create may reference (GET). Its own family so an agent literally

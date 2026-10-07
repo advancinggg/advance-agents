@@ -189,6 +189,11 @@ impl IdempotencyStore {
         self.inner.map.lock().expect("idempotency map lock").len()
     }
 
+    /// Configured record cap (extension budget stats).
+    pub fn cap(&self) -> usize {
+        self.inner.cap
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

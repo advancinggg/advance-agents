@@ -29,6 +29,7 @@ pub mod durable_idempotency;
 pub mod entities;
 pub mod envelope;
 pub mod events;
+pub mod families;
 pub mod idempotency;
 pub mod messages;
 pub mod packs;
@@ -86,6 +87,13 @@ pub use events::{
     stream_id_for_filter, ClientEvent, ClientEventCursor, ClientEventFilter, ClientEventPage,
     ClientEventPriority, ClientEventProvider, ClientEventStreamRequest, ClientEventsRequest,
     ClientScalar, EventConcurrency, NormalizedEventFilter, RawEventRow,
+};
+pub use families::{
+    ClientFamilyRegistrar, DuplicateOf, ExtensionBudgetStats, ExtensionCursorCodec,
+    ExtensionFamilies, ExtensionRouteEvent, ExtensionRouteGate, ExtensionRouteHooks,
+    ExtensionRouteInfo, ExtensionServiceParts, ExtensionServices, FamilyBudget,
+    NoExtensionRouteHooks, PathDefect, ResponseScan, RouteBook, RouteOptions, RouteRefusal,
+    RouteRefusalReason,
 };
 pub use messages::{ClientMessageAck, ClientMessageStatus, ClientSendMessageRequest};
 pub use packs::{

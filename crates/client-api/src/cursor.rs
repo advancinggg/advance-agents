@@ -65,7 +65,6 @@ pub struct ExtensionSealDomain {
 
 impl ExtensionSealDomain {
     /// The id is used as given (composer-validated); the AAD length-prefixes the domain.
-    #[cfg_attr(not(test), allow(dead_code))] // used by families (next commit)
     pub(crate) fn new(extension: &'static str) -> Self {
         Self { extension }
     }
