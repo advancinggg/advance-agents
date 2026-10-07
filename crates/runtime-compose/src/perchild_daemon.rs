@@ -540,18 +540,15 @@ impl PerChildLoopManager {
                 }
             });
             if !delegated {
-                let key = if refused_restricted_fs && refusals.len() == 1 {
-                    log_keys::PERCHILD_NO_FS_GRANT
-                } else {
-                    log_keys::PERCHILD_NO_GRANT
-                };
-                self.log.err(
-                    key,
-                    format!(
-                        "advance: WARN child {child_bare} gets no `{cap_name}` grant: {}",
-                        refusals.join("; ")
-                    ),
+                let msg = format!(
+                    "advance: WARN child {child_bare} gets no `{cap_name}` grant: {}",
+                    refusals.join("; ")
                 );
+                if refused_restricted_fs && refusals.len() == 1 {
+                    self.log.err(log_keys::PERCHILD_NO_FS_GRANT, msg);
+                } else {
+                    self.log.err(log_keys::PERCHILD_NO_GRANT, msg);
+                }
             }
         }
     }
