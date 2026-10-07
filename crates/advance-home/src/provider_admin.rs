@@ -38,6 +38,12 @@
 //!   other entry. Without a port such an entry cannot be created and the sign-in routes answer
 //!   `Unavailable`. The port's sync methods may wait on the network; they run on the Client
 //!   API's blocking-pool thread like every handler here.
+//! - **Claimed entries.** With [`WiredProviderAdmin::with_claimable_local_entries`], creating a
+//!   `local` entry without a sidecar (or changing an entry's backend class or sidecar) answers
+//!   `restart_required`: some runtime extension may claim it, and the backend registry is
+//!   fixed at boot. [`WiredProviderAdmin::with_claimed_preflight`] serves `:preflight` of those
+//!   claimed entries through the composed gateway; without it they keep
+//!   `unsupported-backend-class`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -111,6 +117,26 @@ impl ProviderReferenceCheck for NoReferences {
     }
 }
 
+/// A composer-supplied view of the `local` entries a runtime extension serves (CONTRACT-244
+/// D2(b)). Implemented by runtime-compose over its composed gateway.
+pub trait ClaimedEntryPreflight: Send + Sync {
+    /// Whether `provider_id` was claimed at boot (fixed for the runtime's life).
+    fn is_claimed(&self, provider_id: &str) -> bool;
+    /// One preflight of `provider_id` through the composed gateway. `cancel` fires at the
+    /// admin's deadline. Returns within `budget` plus a one-second grace even when the runtime
+    /// cannot make progress. Must not be called on a worker thread of the composition's
+    /// runtime: on a current-thread runtime that blocks the only worker (every loop stalls)
+    /// until the bound, then answers `Cancelled`. The Client API transport calls it under
+    /// `spawn_blocking`; in-process callers (the CONTRACT-210 bridge, tests calling
+    /// `ClientApi::handle` directly) must do the same.
+    fn preflight(
+        &self,
+        provider_id: &str,
+        cancel: &CancelToken,
+        budget: Duration,
+    ) -> Result<(), PreflightFail>;
+}
+
 /// The production `ProviderAdminProvider`.
 pub struct WiredProviderAdmin {
     home: PathBuf,
@@ -132,6 +158,10 @@ pub struct WiredProviderAdmin {
     last_usage: Mutex<HashMap<String, ClientProviderUsage>>,
     reload_wait: Duration,
     preflight_timeout: Duration,
+    /// CONTRACT-244 D2(b): some runtime extension contributes inference, so `local`
+    /// entries without a sidecar are claimable and the backend registry is fixed at boot.
+    claimable_local: bool,
+    claimed_preflight: Option<Arc<dyn ClaimedEntryPreflight>>,
 }
 
 impl WiredProviderAdmin {
@@ -156,6 +186,8 @@ impl WiredProviderAdmin {
             last_usage: Mutex::new(HashMap::new()),
             reload_wait: RELOAD_WAIT,
             preflight_timeout: PREFLIGHT_TIMEOUT,
+            claimable_local: false,
+            claimed_preflight: None,
         }
     }
 
@@ -202,6 +234,32 @@ impl WiredProviderAdmin {
     pub fn with_preflight_timeout(mut self, timeout: Duration) -> Self {
         self.preflight_timeout = timeout;
         self
+    }
+
+    /// CONTRACT-244 D2(b): some runtime extension contributes inference, so `local` entries
+    /// without a sidecar are claimable and the backend registry is fixed at boot. With it,
+    /// creating such an entry, or changing an entry's backend class or sidecar, also answers
+    /// `restart_required`. Default `false` (the v0.1.26 behaviour).
+    pub fn with_claimable_local_entries(mut self, on: bool) -> Self {
+        self.claimable_local = on;
+        self
+    }
+
+    /// Serve `:preflight` of claimed entries through `port` (the composed gateway). Default none:
+    /// such an entry answers `unsupported-backend-class`, as at v0.1.26. See
+    /// [`ClaimedEntryPreflight::preflight`] for the thread rule.
+    pub fn with_claimed_preflight(mut self, port: Arc<dyn ClaimedEntryPreflight>) -> Self {
+        self.claimed_preflight = Some(port);
+        self
+    }
+
+    /// Composition witnesses.
+    pub fn marks_local_entries_claimable(&self) -> bool {
+        self.claimable_local
+    }
+
+    pub fn has_claimed_preflight(&self) -> bool {
+        self.claimed_preflight.is_some()
     }
 
     pub fn home(&self) -> &Path {
@@ -496,6 +554,54 @@ impl WiredProviderAdmin {
         }
     }
 
+    fn claimed_port_for(
+        &self,
+        entry: &LlmProviderConfig,
+    ) -> Option<Arc<dyn ClaimedEntryPreflight>> {
+        self.claimed_preflight
+            .as_ref()
+            .filter(|p| {
+                entry.backend_class == InferenceBackendClass::Local
+                    && entry.sidecar.is_none()
+                    && p.is_claimed(&entry.id)
+            })
+            .cloned()
+    }
+
+    fn run_claimed_preflight(
+        &self,
+        port: &dyn ClaimedEntryPreflight,
+        entry: &LlmProviderConfig,
+    ) -> ClientProviderPreflightResult {
+        let cancel = CancelToken::new();
+        let deadline_cancel = cancel.clone();
+        let deadline = self.preflight_timeout;
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let timer = std::thread::spawn(move || {
+            if done_rx.recv_timeout(deadline).is_err() {
+                deadline_cancel.cancel();
+                true
+            } else {
+                false
+            }
+        });
+        let outcome = port.preflight(&entry.id, &cancel, self.preflight_timeout);
+        let _ = done_tx.send(());
+        let timed_out = timer.join().unwrap_or(false);
+        let reason = match outcome {
+            Ok(()) => None,
+            Err(PreflightFail::Cancelled) if timed_out => Some(REASON_TIMEOUT.to_string()),
+            Err(PreflightFail::Cancelled) => Some(REASON_CANCELLED.to_string()),
+            Err(PreflightFail::MissingProvider) => Some(REASON_MISSING_PROVIDER.to_string()),
+            Err(PreflightFail::ProviderRejected { reason }) => Some(reason),
+        };
+        ClientProviderPreflightResult {
+            ok: reason.is_none(),
+            checked_at_ms: now_ms(),
+            reason,
+        }
+    }
+
     /// `agent-cli`: the verdict is the vendor CLI's own sign-in status (no key involved).
     fn run_agent_cli_preflight(&self, spec: &AgentCliSpec) -> ClientProviderPreflightResult {
         let probe = self.agent_cli_probe.probe(spec);
@@ -632,6 +738,16 @@ impl ProviderAdminProvider for WiredProviderAdmin {
             outcome.value = self.summary(&entry, idx == 0);
             outcome = outcome.with_warning(ProviderAdminWarning::RestartRequired);
         }
+        if self.claimable_local
+            && entry.backend_class == InferenceBackendClass::Local
+            && entry.sidecar.is_none()
+            && !outcome
+                .warnings
+                .contains(&ProviderAdminWarning::RestartRequired)
+        {
+            // CONTRACT-244 D2(b): an extension may claim this entry, but the registry is fixed at boot.
+            outcome = outcome.with_warning(ProviderAdminWarning::RestartRequired);
+        }
         Ok(outcome)
     }
 
@@ -672,6 +788,14 @@ impl ProviderAdminProvider for WiredProviderAdmin {
             outcome = outcome.with_warning(ProviderAdminWarning::RestartRequired);
         }
         if request.agent_cli.is_some() && entry.backend_class == InferenceBackendClass::AgentCli {
+            outcome = outcome.with_warning(ProviderAdminWarning::RestartRequired);
+        }
+        if self.claimable_local
+            && (current.backend_class != entry.backend_class || current.sidecar != entry.sidecar)
+            && !outcome
+                .warnings
+                .contains(&ProviderAdminWarning::RestartRequired)
+        {
             outcome = outcome.with_warning(ProviderAdminWarning::RestartRequired);
         }
         Ok(outcome)
@@ -815,6 +939,9 @@ impl ProviderAdminProvider for WiredProviderAdmin {
         }
         let verdict = if entry.uses_chatgpt_sign_in() {
             self.run_sign_in_preflight(&entry)
+        } else if let Some(port) = self.claimed_port_for(&entry) {
+            // CONTRACT-244 D2(b): an extension serves this entry — through the composed gateway.
+            self.run_claimed_preflight(port.as_ref(), &entry)
         } else if entry.backend_class != InferenceBackendClass::CloudHttp {
             ClientProviderPreflightResult {
                 ok: false,
@@ -2066,5 +2193,246 @@ database:
             );
             assert!(!f.port.calls_of(call).is_empty(), "{call}");
         }
+    }
+
+    fn local_create(id: &str) -> ClientCreateProviderRequest {
+        ClientCreateProviderRequest {
+            provider_id: id.into(),
+            backend_class: Some("local".into()),
+            backend: None,
+            endpoint: None,
+            model_aliases: [("llama".to_string(), "llama".to_string())]
+                .into_iter()
+                .collect(),
+            embedding_model: None,
+            auth_scheme: None,
+            api_key_secret: None,
+            auth_source: None,
+            cost: ClientProviderCost {
+                input_per_mtoken: 0.001,
+                output_per_mtoken: 0.001,
+                ..Default::default()
+            },
+            rate_limit: ClientProviderRateLimit {
+                requests_per_minute: 100,
+                tokens_per_minute: 1000,
+            },
+            retry_default: None,
+            sidecar: None,
+            profile_id: None,
+            device_id: None,
+            agent_cli: None,
+        }
+    }
+
+    fn restart_count(outcome: &ProviderAdminOutcome<ClientProviderSummary>) -> usize {
+        outcome
+            .warnings
+            .iter()
+            .filter(|w| **w == ProviderAdminWarning::RestartRequired)
+            .count()
+    }
+
+    struct FakeClaimed {
+        claimed: Vec<String>,
+        outcome: Mutex<Result<(), PreflightFail>>,
+        stall: Mutex<Duration>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeClaimed {
+        fn new(claimed: &[&str], outcome: Result<(), PreflightFail>) -> Arc<Self> {
+            Arc::new(Self {
+                claimed: claimed.iter().map(|s| (*s).to_string()).collect(),
+                outcome: Mutex::new(outcome),
+                stall: Mutex::new(Duration::ZERO),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl ClaimedEntryPreflight for FakeClaimed {
+        fn is_claimed(&self, provider_id: &str) -> bool {
+            self.claimed.iter().any(|id| id == provider_id)
+        }
+        fn preflight(
+            &self,
+            provider_id: &str,
+            cancel: &CancelToken,
+            _budget: Duration,
+        ) -> Result<(), PreflightFail> {
+            self.calls.lock().unwrap().push(provider_id.to_string());
+            let stall = *self.stall.lock().unwrap();
+            if !stall.is_zero() {
+                let start = std::time::Instant::now();
+                while start.elapsed() < stall {
+                    if cancel.is_cancelled() {
+                        return Err(PreflightFail::Cancelled);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            self.outcome.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn claimable_off_keeps_v0_1_26_warnings() {
+        let f = Fixture::new();
+        let admin = f.admin();
+        assert!(!admin.marks_local_entries_claimable());
+        assert!(!admin.has_claimed_preflight());
+        let created = admin.create_provider(&local_create("local-a")).unwrap();
+        assert_eq!(restart_count(&created), 0);
+        let updated = admin
+            .update_provider(
+                "local-a",
+                &ClientUpdateProviderRequest {
+                    backend_class: Some("cloud-http".into()),
+                    endpoint: Some("https://api.example".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(restart_count(&updated), 0);
+    }
+
+    #[test]
+    fn claimable_on_warns_create_local_without_sidecar() {
+        let f = Fixture::new();
+        let admin = f.admin().with_claimable_local_entries(true);
+        assert!(admin.marks_local_entries_claimable());
+        let created = admin.create_provider(&local_create("local-a")).unwrap();
+        assert_eq!(restart_count(&created), 1);
+    }
+
+    #[test]
+    fn claimable_on_warns_backend_class_or_sidecar_change_once() {
+        let f = Fixture::new();
+        let admin = f.admin().with_claimable_local_entries(true);
+        admin.create_provider(&local_create("local-a")).unwrap();
+        let sidecar = admin
+            .update_provider(
+                "local-a",
+                &ClientUpdateProviderRequest {
+                    sidecar: Some(ClientProviderSidecar {
+                        command: "/bin/true".into(),
+                        args: vec![],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(restart_count(&sidecar), 1);
+
+        let f2 = Fixture::new();
+        let admin = f2.admin().with_claimable_local_entries(true);
+        admin.create_provider(&local_create("local-b")).unwrap();
+        let class = admin
+            .update_provider(
+                "local-b",
+                &ClientUpdateProviderRequest {
+                    backend_class: Some("cloud-http".into()),
+                    endpoint: Some("https://api.example".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(restart_count(&class), 1);
+    }
+
+    #[test]
+    fn claimed_preflight_routes_only_claimed_local_entries() {
+        let f = Fixture::new();
+        let port = FakeClaimed::new(&["local-a"], Ok(()));
+        let admin = f
+            .admin()
+            .with_claimed_preflight(port.clone() as Arc<dyn ClaimedEntryPreflight>);
+        admin.create_provider(&local_create("local-a")).unwrap();
+        admin.create_provider(&local_create("local-b")).unwrap();
+
+        let unclaimed = admin.preflight("local-b").unwrap();
+        assert!(!unclaimed.ok);
+        assert_eq!(unclaimed.reason.as_deref(), Some(REASON_UNSUPPORTED_CLASS));
+        assert!(port.calls.lock().unwrap().is_empty());
+
+        let claimed = admin.preflight("local-a").unwrap();
+        assert!(claimed.ok && claimed.reason.is_none(), "{claimed:?}");
+        assert_eq!(*port.calls.lock().unwrap(), vec!["local-a".to_string()]);
+
+        admin
+            .update_provider(
+                "local-a",
+                &ClientUpdateProviderRequest {
+                    backend_class: Some("cloud-http".into()),
+                    endpoint: Some("https://api.openai.com".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        f.store.store("local-a-api-key", "k").unwrap();
+        let cloud = admin.preflight("local-a").unwrap();
+        assert!(cloud.ok, "{cloud:?}");
+        assert_eq!(*port.calls.lock().unwrap(), vec!["local-a".to_string()]);
+        assert_eq!(f.chat_preflights(), 1);
+
+        let none = f.admin();
+        let without = none.preflight("local-b").unwrap();
+        assert_eq!(without.reason.as_deref(), Some(REASON_UNSUPPORTED_CLASS));
+    }
+
+    #[test]
+    fn claimed_preflight_verdict_mapping() {
+        let f = Fixture::new();
+        let port = FakeClaimed::new(&["local-a"], Ok(()));
+        let admin = f
+            .admin()
+            .with_claimed_preflight(port.clone() as Arc<dyn ClaimedEntryPreflight>);
+        admin.create_provider(&local_create("local-a")).unwrap();
+        let ok = admin.preflight("local-a").unwrap();
+        assert!(ok.ok && ok.reason.is_none());
+
+        *port.outcome.lock().unwrap() = Err(PreflightFail::ProviderRejected {
+            reason: "provider-error".into(),
+        });
+        let rejected = admin.preflight("local-a").unwrap();
+        assert!(!rejected.ok);
+        assert_eq!(rejected.reason.as_deref(), Some("provider-error"));
+
+        *port.outcome.lock().unwrap() = Err(PreflightFail::Cancelled);
+        let cancelled = admin.preflight("local-a").unwrap();
+        assert!(!cancelled.ok);
+        assert_eq!(cancelled.reason.as_deref(), Some(REASON_CANCELLED));
+
+        *port.stall.lock().unwrap() = Duration::from_secs(3);
+        *port.outcome.lock().unwrap() = Ok(());
+        let admin = admin.with_preflight_timeout(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let timed = admin.preflight("local-a").unwrap();
+        let waited = started.elapsed();
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        assert!(!timed.ok);
+        assert_eq!(timed.reason.as_deref(), Some(REASON_TIMEOUT));
+    }
+
+    #[test]
+    fn claimed_preflight_verdict_is_recorded_in_the_summary() {
+        let f = Fixture::new();
+        let port = FakeClaimed::new(
+            &["local-a"],
+            Err(PreflightFail::ProviderRejected {
+                reason: "provider-error".into(),
+            }),
+        );
+        let admin = f
+            .admin()
+            .with_claimed_preflight(port as Arc<dyn ClaimedEntryPreflight>);
+        admin.create_provider(&local_create("local-a")).unwrap();
+        let verdict = admin.preflight("local-a").unwrap();
+        assert_eq!(verdict.reason.as_deref(), Some("provider-error"));
+        assert_eq!(
+            admin.get_provider("local-a").unwrap().last_preflight,
+            Some(verdict)
+        );
     }
 }
