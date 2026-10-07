@@ -8,12 +8,14 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
-use advance_client_api::ClientApi;
+use advance_client_api::{ClientApi, LlmDeltaHub};
 use advance_event_bus::EventBus;
 use advance_git::DefaultGitCommitQueue;
 use advance_run_manager::RunManager;
 use advance_runtime::capability_injector::{CapabilityInjector, ComponentCtx};
+use advance_runtime::host_registry::HostRegistry;
 use advance_runtime::ComponentRuntime;
+use cap_grant::{GrantApprovalIntake, GrantStore};
 use cap_llm::{LlmGateway, ModelProfileCatalog};
 use cap_tools::{LazyToolRegistry, ToolRegistry};
 use tokio::sync::Notify;
@@ -137,6 +139,26 @@ impl ComposeProbe {
     pub(crate) fn set_gateway_catalog(&self, catalog: Weak<ModelProfileCatalog>) {
         self.update(|record| record.gateway_catalog = Some(catalog));
     }
+
+    pub(crate) fn set_host_registry(&self, registry: &Arc<dyn HostRegistry>) {
+        self.update(|record| record.host_registry = Some(Arc::downgrade(registry)));
+    }
+
+    pub(crate) fn set_grant_store(&self, store: &Arc<GrantStore>) {
+        self.update(|record| record.grant_store = Some(Arc::downgrade(store)));
+    }
+
+    pub(crate) fn set_grant_approval_intake(&self, intake: &Arc<GrantApprovalIntake>) {
+        self.update(|record| record.grant_approval_intake = Some(Arc::downgrade(intake)));
+    }
+
+    pub(crate) fn set_llm_delta_hub(&self, hub: &Arc<LlmDeltaHub>) {
+        self.update(|record| record.llm_delta_hub = Some(Arc::downgrade(hub)));
+    }
+
+    pub(crate) fn set_late_tools(&self, names: Option<Vec<String>>) {
+        self.update(|record| record.late_tools = names);
+    }
 }
 
 /// The objects a composition built (held weakly, so the record keeps nothing alive),
@@ -174,6 +196,17 @@ pub struct ProbeRecord {
     pub lazy_tool_registry: Option<Weak<LazyToolRegistry>>,
     /// The composite tool registry guests use (created when the home declares `tools`).
     pub tool_registry: Option<Weak<dyn ToolRegistry>>,
+    /// T29 (a): the L0 host-function registry (`RuntimeHost::host_registry()`).
+    pub host_registry: Option<Weak<dyn HostRegistry>>,
+    /// T29 (a): the grant store, read before and after the mutations.
+    pub grant_store: Option<Weak<GrantStore>>,
+    /// T29 (c)/(d): the CONTRACT-123 intake (exists iff `grant`), to park a request.
+    pub grant_approval_intake: Option<Weak<GrantApprovalIntake>>,
+    /// D5 row 5: the tee hub (exists iff `llm`), to publish frames.
+    pub llm_delta_hub: Option<Weak<LlmDeltaHub>>,
+    /// T29 (d): wasm tool names of the inventory the late install received; `None` when no
+    /// late install ran with a real inventory.
+    pub late_tools: Option<Vec<String>>,
 }
 
 impl ProbeRecord {

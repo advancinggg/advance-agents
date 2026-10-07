@@ -470,6 +470,15 @@ pub(crate) async fn compose_graph(
     };
     if let Some(spawned) = agent_loop.as_ref() {
         if let Some(server) = wiring_handles.client_api_server.as_ref() {
+            #[cfg(feature = "test-support")]
+            if let Some(p) = failpoints.probe.as_ref() {
+                p.set_late_tools(spawned.tools_inventory.as_ref().map(|inv| {
+                    inv.list_wasm_tools(&wiring_handles.root_mailbox_id)
+                        .into_iter()
+                        .map(|t| t.name)
+                        .collect()
+                }));
+            }
             crate::client_api_adapters::install_tools_if_real(
                 server.api().as_ref(),
                 spawned.tools_inventory.clone(),

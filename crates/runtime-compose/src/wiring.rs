@@ -1964,6 +1964,10 @@ pub(crate) async fn wire_capabilities_inner(
     // The sweeper task is stopped through `started` until the handles are returned.
     started.cap_grant_sweeper_handle = cap_grant.sweeper_handle.take();
     started.cap_grant_sweeper_arc = cap_grant.sweeper.clone();
+    #[cfg(feature = "test-support")]
+    if let Some(p) = probe.as_ref() {
+        p.set_grant_store(&cap_grant.store);
+    }
 
     // Step 4b (Phase-3 kickoff) — construct the live per-session RunManager,
     // wired to the EventBus's baked-in CostTracker so the cost gate reads the
@@ -2811,6 +2815,10 @@ pub(crate) async fn wire_capabilities_inner(
                 event_bus: event_bus_dyn.clone(),
             },
         );
+        #[cfg(feature = "test-support")]
+        if let Some(p) = probe.as_ref() {
+            p.set_grant_approval_intake(&intake);
+        }
         grant_approval_intake = Some(intake);
     }
 
@@ -3007,6 +3015,10 @@ pub(crate) async fn wire_capabilities_inner(
             ))
         };
         llm_delta_hub_opt = Some(Arc::clone(&llm_delta_hub));
+        #[cfg(feature = "test-support")]
+        if let Some(p) = probe.as_ref() {
+            p.set_llm_delta_hub(&llm_delta_hub);
+        }
 
         // THE single production path to a gateway: `build_llm_gateway_with`
         // installs the live streaming path internally, so the composition-root
@@ -3113,6 +3125,10 @@ pub(crate) async fn wire_capabilities_inner(
         Some(Arc::downgrade(&host.component_runtime())));
     probe_record!(probe, |record| record.capability_injector =
         Some(Arc::downgrade(&host.capability_injector())));
+    #[cfg(feature = "test-support")]
+    if let Some(p) = probe.as_ref() {
+        p.set_host_registry(&host.host_registry());
+    }
 
     // Installed packs: meta-schema extensions + presets now; their skill tools join once the
     // tool registry exists (step 7). Conflicts are logged and skipped, never fatal.
