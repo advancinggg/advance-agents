@@ -17,7 +17,7 @@ mod lifecycle;
 
 pub use client::{mint_browser_session, mint_session, post_msg, Http, HttpResponse};
 pub use gone::assert_gone_for_home;
-pub use guests::{hello_llm_core, minimal_core};
+pub use guests::{hello_llm_core, llm_noerr_core, minimal_core};
 pub use home::{CapDecl, FixtureDriver, FixtureHome, FixtureHomeSpec, FIXTURE_MASTER_KEY};
 pub use lifecycle::{FixtureLifecycle, OnStartedMode, ShutdownMode};
 

@@ -7,3 +7,7 @@ pub fn minimal_core() -> &'static [u8] {
 pub fn hello_llm_core() -> &'static [u8] {
     include_bytes!("../../../../runtime/tests/fixtures/guest-rust-hello-llm.core.wasm")
 }
+
+pub fn llm_noerr_core() -> &'static [u8] {
+    include_bytes!("../../../tests/fixtures/guest-rust-llm-noerr.core.wasm")
+}

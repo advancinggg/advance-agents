@@ -1,0 +1,27 @@
+[package]
+name = "guest-rust-llm-noerr"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Never-Err copy of guest-rust-hello-llm. Same WIT world (import
+# agent-llm, export message-driven + runnable). handle-message never returns
+# Err: LLM success becomes action `llm-ok:<text>`, LLM failure `llm-err:<e:?>`.
+# Excluded from the workspace (built for wasm32-unknown-unknown). The committed
+# `../guest-rust-llm-noerr.core.wasm` is wrapped to a Component at test time.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

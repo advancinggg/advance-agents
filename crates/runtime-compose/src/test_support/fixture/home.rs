@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::api::{ComposeLog, ComposeOptions, MasterKeyInput, Zeroizing};
 use crate::test_support::{ComposeFailpoints, ComposeProbe};
 
-use super::guests::{hello_llm_core, minimal_core};
+use super::guests::{hello_llm_core, llm_noerr_core, minimal_core};
 
 pub const FIXTURE_MASTER_KEY: [u8; 32] = [7u8; 32];
 
@@ -21,6 +21,7 @@ pub enum FixtureDriver {
     None,
     Minimal,
     HelloLlm,
+    LlmNoErr,
     Core(&'static [u8]),
 }
 
@@ -108,6 +109,7 @@ fn driver_bytes(driver: &FixtureDriver) -> Option<&'static [u8]> {
         FixtureDriver::None => None,
         FixtureDriver::Minimal => Some(minimal_core()),
         FixtureDriver::HelloLlm => Some(hello_llm_core()),
+        FixtureDriver::LlmNoErr => Some(llm_noerr_core()),
         FixtureDriver::Core(bytes) => Some(*bytes),
     }
 }
