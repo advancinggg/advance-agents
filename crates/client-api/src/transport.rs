@@ -17,7 +17,7 @@ use axum::http::header::{
     AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ORIGIN,
     SEC_WEBSOCKET_PROTOCOL, X_CONTENT_TYPE_OPTIONS,
 };
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -36,9 +36,10 @@ use crate::deltas::{
 use crate::envelope::{ClientEnvelope, ClientError, ClientErrorCode, API_VERSION};
 use crate::events::{ClientEventPage, ClientEventStreamRequest};
 use crate::families::{PollEmit, PollStreamEntry};
+use crate::listener_proof::ListenerKey;
 use crate::request::{ClientRequest, Method};
 use crate::routes;
-use crate::ClientApi;
+use crate::{ClientApi, SessionAdmission};
 
 const INDEX_HTML: &str = include_str!("../../../clients/web-console/index.html");
 const APP_JS: &str = include_str!("../../../clients/web-console/app.js");
@@ -62,6 +63,17 @@ const WS_CLOSE_GRACE: Duration = Duration::from_secs(1);
 /// `advance.bearer.<hex>` protocol so it does not enter the URL, browser history, or proxy logs.
 pub const CLIENT_WS_PROTOCOL: &str = "advance.client.2026-09-17";
 
+/// The request header of the foreground re-verification challenge (ADR 2026-10-03 D3): a fresh
+/// 32-byte random nonce in hex. A listener whose API admits only in-process sessions
+/// ([`SessionAdmission::InProcessOnly`]) answers it on `GET /client/health` itself, before any
+/// dispatch: `204 No Content` carrying [`LISTENER_PROOF_HEADER`]. Every other listener ignores it.
+pub const LISTENER_CHALLENGE_HEADER: &str = "x-advance-listener-challenge";
+
+/// The response header carrying a listener's answer to [`LISTENER_CHALLENGE_HEADER`]: the hex
+/// HMAC-SHA256 of the nonce under the listener's in-process key, which
+/// [`ClientApiServer::answers_challenge`] checks.
+pub const LISTENER_PROOF_HEADER: &str = "x-advance-listener-proof";
+
 #[derive(Clone)]
 struct TransportState {
     api: Arc<ClientApi>,
@@ -71,6 +83,9 @@ struct TransportState {
     dispatch: Arc<Semaphore>,
     /// The upgraded WebSocket tasks of this router (axum spawns them detached).
     ws: WsTracking,
+    /// The listener's re-verification key: only a router a [`ClientApiServer`] serves under
+    /// [`SessionAdmission::InProcessOnly`] has one (and answers [`LISTENER_CHALLENGE_HEADER`]).
+    listener_key: Option<Arc<ListenerKey>>,
 }
 
 /// Cancellation and tracking of a router's upgraded WebSocket tasks: every `on_upgrade` task
@@ -104,10 +119,15 @@ fn dispatch_permits(api: &ClientApi) -> u32 {
 /// ConnectInfo is required so the core can enforce loopback admission from the real peer address.
 pub fn client_api_router(api: Arc<ClientApi>) -> Router {
     let dispatch = Arc::new(Semaphore::new(dispatch_permits(&api) as usize));
-    router_with(api, WsTracking::new(), dispatch)
+    router_with(api, WsTracking::new(), dispatch, None)
 }
 
-fn router_with(api: Arc<ClientApi>, ws: WsTracking, dispatch: Arc<Semaphore>) -> Router {
+fn router_with(
+    api: Arc<ClientApi>,
+    ws: WsTracking,
+    dispatch: Arc<Semaphore>,
+    listener_key: Option<Arc<ListenerKey>>,
+) -> Router {
     let console = api.config().serves_web_console();
     let max_body_bytes = api.config().max_body_bytes;
     let state = TransportState {
@@ -115,6 +135,7 @@ fn router_with(api: Arc<ClientApi>, ws: WsTracking, dispatch: Arc<Semaphore>) ->
         max_body_bytes,
         dispatch,
         ws,
+        listener_key,
     };
     let mut router = Router::new();
     if console {
@@ -143,6 +164,16 @@ pub struct ClientApiServer {
     ws: WsTracking,
     dispatch: Arc<Semaphore>,
     permits: u32,
+    /// Drawn at bind time under [`SessionAdmission::InProcessOnly`] only; it never leaves this
+    /// listener and its router.
+    listener_key: Option<Arc<ListenerKey>>,
+}
+
+/// A fresh re-verification key for a listener serving `api`: only under
+/// [`SessionAdmission::InProcessOnly`]; every other admission keeps its router unchanged.
+fn listener_key_for(api: &ClientApi) -> Option<Arc<ListenerKey>> {
+    (api.config().session_admission == SessionAdmission::InProcessOnly)
+        .then(|| Arc::new(ListenerKey::generate()))
 }
 
 /// What [`ClientApiServer::shutdown_ingress`] observed. The `Arc<ClientApi>` is always handed
@@ -222,7 +253,13 @@ impl ClientApiServer {
         let permits = dispatch_permits(&api);
         let dispatch = Arc::new(Semaphore::new(permits as usize));
         let ws = WsTracking::new();
-        let router = router_with(Arc::clone(&api), ws.clone(), Arc::clone(&dispatch));
+        let listener_key = listener_key_for(&api);
+        let router = router_with(
+            Arc::clone(&api),
+            ws.clone(),
+            Arc::clone(&dispatch),
+            listener_key.clone(),
+        );
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             axum::serve(
@@ -243,7 +280,33 @@ impl ClientApiServer {
             ws,
             dispatch,
             permits,
+            listener_key,
         })
+    }
+
+    /// A listener as its owner still holds it after the OS reclaimed its socket (a suspended
+    /// mobile app): the serve task keeps running until shutdown, but nothing of this listener
+    /// accepts anywhere, and [`local_addr`](Self::local_addr) names `claimed`, which any other
+    /// socket may now bind.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn reclaimed_for_test(api: Arc<ClientApi>, claimed: SocketAddr) -> Self {
+        let permits = dispatch_permits(&api);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _ = shutdown_rx.await;
+            Ok(())
+        });
+        Self {
+            local_addr: claimed,
+            listener_key: listener_key_for(&api),
+            api,
+            shutdown: Some(shutdown_tx),
+            task,
+            ws: WsTracking::new(),
+            dispatch: Arc::new(Semaphore::new(permits as usize)),
+            permits,
+        }
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -252,6 +315,34 @@ impl ClientApiServer {
 
     pub fn api(&self) -> Arc<ClientApi> {
         Arc::clone(&self.api)
+    }
+
+    /// Whether this listener's serve task is still running. Necessary but not sufficient for
+    /// the socket to be this listener's: the serve task keeps retrying after its socket fails
+    /// (an OS that reclaimed it, for one), so only [`answers_challenge`](Self::answers_challenge)
+    /// tells whether [`local_addr`](Self::local_addr) is still this listener.
+    pub fn is_serving(&self) -> bool {
+        !self.task.is_finished()
+    }
+
+    /// ADR 2026-10-03 D3 foreground re-verification: whether the socket at
+    /// [`local_addr`](Self::local_addr) is still this listener. It is when the serve task runs and
+    /// that socket answers a fresh random challenge ([`LISTENER_CHALLENGE_HEADER`] on
+    /// `GET /client/health`, with no session, cookie or other credential) with the HMAC of the
+    /// challenge under this listener's key, drawn at bind time, which never leaves the process.
+    /// Any other responder on that port (another app that bound it after the OS reclaimed this
+    /// listener's socket) cannot answer, however it speaks HTTP. Bounded by `budget`.
+    ///
+    /// Only a listener whose API admits [`SessionAdmission::InProcessOnly`] answers the
+    /// challenge; under any other admission this is `false` without connecting.
+    pub async fn answers_challenge(&self, budget: Duration) -> bool {
+        let Some(key) = self.listener_key.as_deref() else {
+            return false;
+        };
+        if !self.is_serving() {
+            return false;
+        }
+        crate::listener_proof::verify(self.local_addr, key, budget).await
     }
 
     pub async fn shutdown(mut self) -> io::Result<()> {
@@ -442,12 +533,41 @@ async fn http_client_request(
     request: Request<Body>,
 ) -> Response {
     let path = format!("/client/{path}");
+    if let Some(key) = state.listener_key.as_deref() {
+        if let Some(answer) = listener_challenge_answer(key, &path, &request) {
+            return answer;
+        }
+    }
     if is_websocket_upgrade(request.headers()) {
         if let Some(entry) = state.api.poll_stream_for(&path) {
             return poll_stream_transport(state, peer, path, entry, request).await;
         }
     }
     handle_http(state, peer.ip(), path, request).await
+}
+
+/// The transport's own answer to a listener challenge (see [`LISTENER_CHALLENGE_HEADER`]): a
+/// `GET /client/health` without an `Origin` that carries a well-formed challenge gets
+/// `204 No Content` with the proof, before any dispatch. Any other request is not one (`None`)
+/// and goes through the gate chain as usual.
+fn listener_challenge_answer(
+    key: &ListenerKey,
+    path: &str,
+    request: &Request<Body>,
+) -> Option<Response> {
+    if request.method() != axum::http::Method::GET
+        || path != routes::PATH_HEALTH
+        || request.headers().contains_key(ORIGIN)
+    {
+        return None;
+    }
+    let challenge = header_string(request.headers(), LISTENER_CHALLENGE_HEADER)?;
+    let proof = HeaderValue::from_str(&key.answer(&challenge)?).ok()?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    let headers = response.headers_mut();
+    headers.insert(LISTENER_PROOF_HEADER, proof);
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Some(response)
 }
 
 /// Incident (grok-housekeeping clippy stage 1): blessed client-api
@@ -1727,6 +1847,7 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Notify;
 
     async fn idle_server() -> ClientApiServer {
@@ -1799,6 +1920,253 @@ mod tests {
         assert!(!done.load(Ordering::SeqCst));
         assert_eq!(ws.tasks.len(), 1);
         release.notify_one();
+    }
+
+    async fn in_process_server() -> ClientApiServer {
+        let config = crate::ClientApiConfig {
+            session_admission: SessionAdmission::InProcessOnly,
+            ..crate::ClientApiConfig::default()
+        };
+        ClientApiServer::bind(Arc::new(ClientApi::new(config)), 0)
+            .await
+            .expect("bind an in-process listener")
+    }
+
+    /// `GET /client/health` with `headers`; the raw response.
+    async fn raw_health(addr: SocketAddr, headers: &[(&str, &str)]) -> String {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut request =
+            format!("GET /client/health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write the request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read the response");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    fn header_in(head: &str, name: &str) -> Option<String> {
+        head.split("\r\n").skip(1).find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_owned())
+        })
+    }
+
+    /// Serve `listener` until aborted: record each request head and answer it with
+    /// `respond(head)`.
+    fn respond_with(
+        listener: TcpListener,
+        respond: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (Arc<std::sync::Mutex<Vec<String>>>, JoinHandle<()>) {
+        let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&heads);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let response = respond(&head);
+                seen.lock().unwrap().push(head);
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (heads, task)
+    }
+
+    fn proof_response(proof: &str) -> String {
+        format!("HTTP/1.1 204 No Content\r\n{LISTENER_PROOF_HEADER}: {proof}\r\nconnection: close\r\n\r\n")
+    }
+
+    /// MODULE-001-AC-32 (ADR 2026-10-03 D3): a live in-process listener passes its own
+    /// re-verification. The transport answers a well-formed challenge on `GET /client/health`
+    /// with `204` and the key's proof; with an `Origin`, or with a malformed challenge, the
+    /// request is not a challenge and the gate chain answers it as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn module_001_ac32_an_in_process_listener_answers_its_own_challenge() {
+        let server = in_process_server().await;
+        let addr = server.local_addr();
+        assert!(server.is_serving());
+        assert!(server.answers_challenge(Duration::from_secs(5)).await);
+
+        let key = server
+            .listener_key
+            .clone()
+            .expect("an in-process listener has a key");
+        let nonce = "5a".repeat(32);
+        let answered = raw_health(addr, &[(LISTENER_CHALLENGE_HEADER, &nonce)]).await;
+        assert!(answered.starts_with("HTTP/1.1 204 "), "{answered}");
+        assert_eq!(
+            header_in(&answered, LISTENER_PROOF_HEADER),
+            key.answer(&nonce),
+            "{answered}"
+        );
+
+        let with_origin = raw_health(
+            addr,
+            &[
+                (LISTENER_CHALLENGE_HEADER, &nonce),
+                ("Origin", &format!("http://{addr}")),
+            ],
+        )
+        .await;
+        assert!(with_origin.starts_with("HTTP/1.1 403 "), "{with_origin}");
+        assert!(with_origin.contains("origin_not_allowed"), "{with_origin}");
+        assert_eq!(header_in(&with_origin, LISTENER_PROOF_HEADER), None);
+
+        let malformed = raw_health(addr, &[(LISTENER_CHALLENGE_HEADER, "5a5a")]).await;
+        assert!(malformed.starts_with("HTTP/1.1 200 "), "{malformed}");
+        assert_eq!(header_in(&malformed, LISTENER_PROOF_HEADER), None);
+
+        server.shutdown().await.expect("shutdown");
+    }
+
+    /// MODULE-001-AC-32: the daemon's same-user listener is unchanged. It has no key, never
+    /// passes a re-verification, and answers a challenge-carrying health request with the
+    /// health envelope and no proof.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn module_001_ac32_a_same_user_listener_ignores_the_challenge() {
+        let server = idle_server().await;
+        assert!(server.listener_key.is_none());
+        assert!(!server.answers_challenge(Duration::from_secs(5)).await);
+        let response = raw_health(
+            server.local_addr(),
+            &[(LISTENER_CHALLENGE_HEADER, &"5a".repeat(32))],
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        assert_eq!(header_in(&response, LISTENER_PROOF_HEADER), None);
+        let body: Value =
+            serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap_or_default())
+                .expect("a JSON envelope");
+        assert!(
+            body.get("data").is_some_and(|data| !data.is_null()),
+            "{body}"
+        );
+        server.shutdown().await.expect("shutdown");
+    }
+
+    /// MODULE-001-AC-32 (ADR 2026-10-03 D3): when the socket at the listener's address belongs to
+    /// someone else (an app that bound the port after the OS reclaimed ours), the
+    /// re-verification fails, however that responder answers: plain HTTP, the challenge echoed
+    /// as the proof, or a proof under a key of its own. What reached each responder is the
+    /// challenge alone, with no credential.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn module_001_ac32_a_responder_without_the_listener_key_fails_the_challenge() {
+        let mut server = in_process_server().await;
+        let own = server.local_addr();
+
+        let plain = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let plain_addr = plain.local_addr().expect("addr");
+        let (plain_heads, plain_task) = respond_with(plain, |_| {
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}".to_owned()
+        });
+        let echo = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let echo_addr = echo.local_addr().expect("addr");
+        let (echo_heads, echo_task) = respond_with(echo, |head| {
+            proof_response(&header_in(head, LISTENER_CHALLENGE_HEADER).unwrap_or_default())
+        });
+        let other_key = ListenerKey::generate();
+        let forged = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let forged_addr = forged.local_addr().expect("addr");
+        let (forged_heads, forged_task) = respond_with(forged, move |head| {
+            let challenge = header_in(head, LISTENER_CHALLENGE_HEADER).unwrap_or_default();
+            proof_response(&other_key.answer(&challenge).unwrap_or_default())
+        });
+
+        for (squatter, heads) in [
+            (plain_addr, &plain_heads),
+            (echo_addr, &echo_heads),
+            (forged_addr, &forged_heads),
+        ] {
+            // The address this listener names now leads to the responder.
+            server.local_addr = squatter;
+            assert!(server.is_serving());
+            assert!(
+                !server.answers_challenge(Duration::from_secs(5)).await,
+                "{squatter} passed the re-verification without the listener's key"
+            );
+            let heads = heads.lock().unwrap().clone();
+            assert_eq!(
+                heads.len(),
+                1,
+                "the challenge reached {squatter}: {heads:?}"
+            );
+            let head = &heads[0];
+            assert!(
+                head.starts_with("GET /client/health HTTP/1.1\r\n"),
+                "{head}"
+            );
+            let challenge = header_in(head, LISTENER_CHALLENGE_HEADER).expect("a challenge");
+            assert!(
+                challenge.len() == 64 && challenge.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{head}"
+            );
+            let lower = head.to_ascii_lowercase();
+            for credential in [
+                "authorization",
+                "bearer",
+                "cookie",
+                "x-csrf-token",
+                "sec-websocket-protocol",
+            ] {
+                assert!(!lower.contains(credential), "{credential} in {head}");
+            }
+        }
+
+        server.local_addr = own;
+        assert!(server.answers_challenge(Duration::from_secs(5)).await);
+        for task in [plain_task, echo_task, forged_task] {
+            task.abort();
+        }
+        server.shutdown().await.expect("shutdown");
+    }
+
+    /// MODULE-001-AC-32: a listener whose serve task has ended fails its re-verification without
+    /// sending a challenge, even when the port now answers with this listener's own proof.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn module_001_ac32_a_listener_whose_serve_task_ended_is_not_probed() {
+        let mut server = in_process_server().await;
+        let addr = server.local_addr();
+        let key = server.listener_key.clone().expect("key");
+        let _ = server
+            .shutdown
+            .take()
+            .expect("the shutdown sender")
+            .send(());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while server.is_serving() {
+            assert!(std::time::Instant::now() < deadline, "the serve task ended");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let rebound = TcpListener::bind(addr).await.expect("the freed port");
+        let (heads, task) = respond_with(rebound, move |head| {
+            let challenge = header_in(head, LISTENER_CHALLENGE_HEADER).unwrap_or_default();
+            proof_response(&key.answer(&challenge).unwrap_or_default())
+        });
+        assert!(!server.answers_challenge(Duration::from_secs(5)).await);
+        assert!(
+            heads.lock().unwrap().is_empty(),
+            "no challenge is sent once the serve task ended"
+        );
+        task.abort();
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub mod envelope;
 pub mod events;
 pub mod families;
 pub mod idempotency;
+// The foreground re-verification proof of an in-process listener (transport-internal).
+mod listener_proof;
 pub mod messages;
 pub mod packs;
 pub mod pagination;

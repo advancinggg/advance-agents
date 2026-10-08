@@ -18,6 +18,7 @@ mod guests;
 mod home;
 pub mod inference;
 mod lifecycle;
+mod squatter;
 
 pub use capabilities::{
     EchoTool, FixtureHostFn, FixtureSpec, FixtureTool, ProbeHandler, ECHO_TOOL, PROBE_CAPABILITY,
@@ -33,6 +34,7 @@ pub use guests::{ext_probe_core, hello_llm_core, llm_noerr_core, minimal_core};
 pub use home::{CapDecl, FixtureDriver, FixtureHome, FixtureHomeSpec, FIXTURE_MASTER_KEY};
 pub use inference::{DropFlag, FixtureInference, StubInferencePort, StubMeshDispatch};
 pub use lifecycle::{FixtureLifecycle, OnStartedMode, ShutdownMode};
+pub use squatter::{header_value, PortSquatter};
 
 pub const FIXTURE_ID: &str = "fixture";
 pub const FIXTURE_TWO_ID: &str = "fixture-two";

@@ -7,8 +7,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use advance_client_api::{ClientApi, ClientApiServer, ShutdownIngress};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{timeout_at, Instant};
+use tokio::time::Instant;
 
 use crate::api::{log_keys, Admission, ClientApiCheck, ClientApiEndpoint, ClientApiRebindError};
 use crate::compose_log::LogHandle;
@@ -157,7 +156,6 @@ impl ClientIngress {
         }
         let api = st.api.clone().ok_or(ClientApiRebindError::ShuttingDown)?;
         if let Some(server) = st.server.as_ref() {
-            let addr = server.local_addr();
             let fail_probe = {
                 #[cfg(feature = "test-support")]
                 {
@@ -169,7 +167,7 @@ impl ClientIngress {
                     false
                 }
             };
-            if !fail_probe && self.listener_answers(addr).await {
+            if !fail_probe && self.listener_answers(server).await {
                 return Ok(ClientApiCheck::Healthy);
             }
             let retired = st
@@ -256,7 +254,16 @@ impl ClientIngress {
         let _ = addr;
     }
 
-    async fn listener_answers(&self, addr: SocketAddr) -> bool {
+    /// Whether the listener is still this composition's: its serve task runs and the socket at
+    /// its address answers a fresh challenge with the listener's in-process key
+    /// (`ClientApiServer::answers_challenge`; the challenge carries no credential). Any other
+    /// responder on that port, such as an app that bound it after the OS reclaimed the
+    /// listener's socket, fails however it speaks HTTP, so the listener is rebound and no
+    /// request of the host's ever reaches that responder.
+    async fn listener_answers(&self, server: &ClientApiServer) -> bool {
+        if !server.is_serving() {
+            return false;
+        }
         for attempt in 0..PROBE_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(PROBE_PAUSE).await;
@@ -266,9 +273,7 @@ impl ClientIngress {
                 self.probes_sent
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            let deadline = Instant::now() + PROBE_BUDGET;
-            let answered = timeout_at(deadline, probe_once(addr)).await;
-            if matches!(answered, Ok(true)) {
+            if server.answers_challenge(PROBE_BUDGET).await {
                 return true;
             }
         }
@@ -285,6 +290,24 @@ impl ClientIngress {
         let addr = server.local_addr();
         let retired = server.retire(RETIRE_BUDGET).await;
         st.last_addr = retired.local_addr;
+        Some(addr)
+    }
+
+    /// The OS reclaims the listener's socket while the host app is suspended: the listener is
+    /// retired (its port is free for any other socket) and replaced by one that still names the
+    /// old address and whose serve task keeps running while accepting nothing, as a reclaimed
+    /// socket's does. The endpoint keeps naming the old base.
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn reclaim_for_test(&self) -> Option<SocketAddr> {
+        let mut st = self.state.lock().await;
+        if st.closed {
+            return None;
+        }
+        let server = st.server.take()?;
+        let retired = server.retire(RETIRE_BUDGET).await;
+        let addr = retired.local_addr;
+        st.last_addr = addr;
+        st.server = Some(ClientApiServer::reclaimed_for_test(retired.api, addr));
         Some(addr)
     }
 
@@ -325,22 +348,6 @@ fn endpoint_of(addr: SocketAddr, api: &std::sync::Arc<ClientApi>) -> ClientApiEn
         socket_addr: addr,
         api: std::sync::Arc::downgrade(api),
     }
-}
-
-async fn probe_once(addr: SocketAddr) -> bool {
-    let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await else {
-        return false;
-    };
-    let request =
-        format!("GET /client/health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    if stream.write_all(request.as_bytes()).await.is_err() {
-        return false;
-    }
-    let mut buf = [0u8; 64];
-    let Ok(n) = stream.read(&mut buf).await else {
-        return false;
-    };
-    buf[..n].starts_with(b"HTTP/1.")
 }
 
 #[cfg(test)]

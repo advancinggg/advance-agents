@@ -9,11 +9,12 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use advance_client_api::CLIENT_WS_PROTOCOL;
+use advance_client_api::transport::LISTENER_CHALLENGE_HEADER;
+use advance_client_api::{Platform, CLIENT_WS_PROTOCOL};
 use advance_runtime_compose::registry::reserved_homes_for_test;
 use advance_runtime_compose::test_support::fixture::{
-    assert_gone_for_home, mint_session, CapDecl, FixtureDriver, FixtureExtension, FixtureFamilies,
-    FixtureHome, FixtureHomeSpec, Http, FIXTURE_ID,
+    assert_gone_for_home, header_value, mint_session, CapDecl, FixtureDriver, FixtureExtension,
+    FixtureFamilies, FixtureHome, FixtureHomeSpec, Http, PortSquatter, FIXTURE_ID,
 };
 use advance_runtime_compose::test_support::{ComposeProbe, MemoryComposeLog};
 use advance_runtime_compose::{
@@ -280,6 +281,134 @@ async fn module_001_ac32_reverify_moves_when_the_previous_port_is_taken() {
     assert_eq!(token_answers(current, &token).await, 200);
 
     drop(squat);
+    rt.shutdown().await.expect("shutdown");
+    assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
+}
+
+/// MODULE-001-AC-32 / MODULE-001-T113 (5), ADR 2026-10-03 D3: while the app was suspended the
+/// OS reclaimed the listener's socket and another app bound the port with a server that answers
+/// HTTP, echoing the re-verification challenge as its proof. Re-verification does not take that
+/// server for the listener: the same `ClientApi` moves to a new port, and the host, which
+/// re-reads the base before any request, never sends that server its session token. All the
+/// server ever received is the challenge, with no credential.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac32_t113_5_reverify_moves_off_a_reclaimed_port_another_server_answers() {
+    let _serial = SERIAL.lock().await;
+    let home = home(&["fs"]);
+    let log = MemoryComposeLog::new();
+    let probe = Arc::new(ComposeProbe::new());
+    let baseline = alive_tasks();
+    let rt = compose(
+        in_process(&home, Arc::new(log.clone()), Arc::clone(&probe), false),
+        Vec::new(),
+    )
+    .await
+    .expect("compose");
+    let ep = rt.client_api().expect("client api");
+    let previous = ep.socket_addr;
+    let api = ep.api.clone();
+    let token = api
+        .upgrade()
+        .expect("the Client API is alive")
+        .mint_in_process_session(Platform::Mac)
+        .token;
+    assert_eq!(token_answers(previous, &token).await, 200);
+
+    let reclaimed = rt
+        .reclaim_client_api_listener_for_test()
+        .await
+        .expect("the listener's socket is reclaimed");
+    assert_eq!(reclaimed, previous);
+    let squatter = PortSquatter::bind(previous).expect("another app binds the reclaimed port");
+
+    let check = rt.reverify_client_api().await;
+    // The host re-reads the base after the foreground re-verification and sends its session
+    // there.
+    let base = rt.client_api().expect("a listener is bound").socket_addr;
+    let status = token_answers(base, &token).await;
+    let received = squatter.stop();
+
+    for head in &received {
+        assert!(
+            !head.contains(&token),
+            "the other app's server received the session token:\n{head}"
+        );
+        let lower = head.to_ascii_lowercase();
+        for credential in ["authorization", "bearer", "cookie"] {
+            assert!(
+                !lower.contains(credential),
+                "{credential} reached it:\n{head}"
+            );
+        }
+    }
+    assert!(
+        !received.is_empty(),
+        "the re-verification challenged the reclaimed port"
+    );
+    for head in &received {
+        assert!(
+            head.starts_with("GET /client/health HTTP/1.1\r\n"),
+            "only the challenge reached it:\n{head}"
+        );
+        let challenge = header_value(head, LISTENER_CHALLENGE_HEADER).expect("a challenge");
+        assert_eq!(challenge.len(), 64, "{head}");
+    }
+    match check {
+        Ok(ClientApiCheck::Moved {
+            previous: moved_from,
+            current,
+        }) => {
+            assert_eq!(moved_from, previous);
+            assert_ne!(current, previous);
+            assert_eq!(base, current);
+        }
+        other => panic!("expected Moved off the port another server answers, got {other:?}"),
+    }
+    assert_eq!(status, 200, "the session answers on the moved listener");
+    let after = rt.client_api().expect("moved");
+    assert!(same_api(&after, &api));
+    assert!(
+        log.count(log_keys::CLIENT_API_MOVED) >= 1,
+        "{:?}",
+        log.lines()
+    );
+
+    rt.shutdown().await.expect("shutdown");
+    assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
+}
+
+/// MODULE-001-AC-32 / MODULE-001-T113 (5): a reclaimed socket whose port nobody took fails the
+/// re-verification, and the same `ClientApi` is bound again on the previous port (base and
+/// session unchanged).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac32_t113_5_reverify_rebinds_a_reclaimed_port_left_free() {
+    let _serial = SERIAL.lock().await;
+    let home = home(&["fs"]);
+    let log = MemoryComposeLog::new();
+    let probe = Arc::new(ComposeProbe::new());
+    let baseline = alive_tasks();
+    let rt = compose(
+        in_process(&home, Arc::new(log), Arc::clone(&probe), false),
+        Vec::new(),
+    )
+    .await
+    .expect("compose");
+    let ep = rt.client_api().expect("client api");
+    let previous = ep.socket_addr;
+    let api = ep.api.clone();
+    let token = mint_session(&ep);
+
+    let reclaimed = rt
+        .reclaim_client_api_listener_for_test()
+        .await
+        .expect("the listener's socket is reclaimed");
+    assert_eq!(reclaimed, previous);
+    let addr = expect_rebound(&rt, previous).await;
+    let after = rt.client_api().expect("rebound");
+    assert_eq!(after.socket_addr, previous);
+    assert!(same_api(&after, &api));
+    assert_eq!(token_answers(addr, &token).await, 200);
+
     rt.shutdown().await.expect("shutdown");
     assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
 }

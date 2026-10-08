@@ -19,9 +19,10 @@ default = []
 # constructors, `daemon::{TestServeLoop, spawn_test_agent_loop}`, the `test_support`
 # module) and the test-only CONTRACT-218 platform root under the temp dir. It also
 # turns on advance-git's (`commit_queue::active_queue_paths_for_test`), so every
-# crate that enables this one can read the git queue registrations. `advance-cli`'s
+# crate that enables this one can read the git queue registrations, and advance-client-api's
+# (`ClientApiServer::reclaimed_for_test`, behind the listener-reclaim seam). `advance-cli`'s
 # `test-support` forwards here.
-test-support = ["advance-git/test-support", "dep:tempfile", "advance-shared-types/spawn-counter"]
+test-support = ["advance-git/test-support", "dep:tempfile", "advance-shared-types/spawn-counter", "advance-client-api/test-support"]
 
 [dependencies]
 advance-runtime = { path = "../runtime" }

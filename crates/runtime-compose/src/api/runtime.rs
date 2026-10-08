@@ -49,11 +49,15 @@ impl ComposedRuntime {
         self.view.client_api_endpoint()
     }
 
-    /// ADR 2026-10-03 D3: probe the Client API listener (a host calls this when its
-    /// app returns to the foreground) and, when it does not answer, rebind the same
-    /// `ClientApi`, previous port first. Bounded (about 2 s). Runs on the runtime
-    /// that composed, whatever runtime polls this future; serialised with shutdown
-    /// step 1.
+    /// ADR 2026-10-03 D3: re-verify the Client API listener (a host calls this when
+    /// its app returns to the foreground) and, when it fails, rebind the same
+    /// `ClientApi`, previous port first. The listener passes only while its serve
+    /// task runs and the socket at its address answers a fresh challenge with the
+    /// listener's in-process key; the challenge carries no credential, and any other
+    /// server on that port (an app that bound it after the OS reclaimed the
+    /// listener's socket) fails however it answers. Bounded (about 2 s). Runs on the
+    /// runtime that composed, whatever runtime polls this future; serialised with
+    /// shutdown step 1.
     pub async fn reverify_client_api(&self) -> Result<ClientApiCheck, ClientApiRebindError> {
         let ing = self
             .view
@@ -83,6 +87,23 @@ impl ComposedRuntime {
     pub async fn sever_client_api_listener_for_test(&self) -> Option<SocketAddr> {
         let ing = self.view.client_ingress()?;
         ing.sever_for_test().await
+    }
+
+    /// The OS reclaims the listener's socket while the host app is suspended: the port
+    /// is free for any other socket to bind, while the listener the composition holds
+    /// still names it and its serve task keeps running (accepting nothing). The endpoint
+    /// keeps naming the old base until the next re-verification. Runs on the runtime
+    /// that composed. `None` without a listener or once shutdown step 1 ran.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn reclaim_client_api_listener_for_test(&self) -> Option<SocketAddr> {
+        let ing = std::sync::Arc::clone(self.view.client_ingress()?);
+        let runtime = ing.runtime();
+        runtime
+            .spawn(async move { ing.reclaim_for_test().await })
+            .await
+            .ok()
+            .flatten()
     }
 
     /// The next probe reports "no answer" although the listener is up.
@@ -195,10 +216,11 @@ impl fmt::Debug for ComposedRuntime {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientApiCheck {
-    /// The listener answered its own probe; nothing changed.
+    /// The listener proved it is still this composition's (it answered a fresh
+    /// challenge with its in-process key); nothing changed.
     Healthy,
-    /// The listener did not answer and was bound again on its previous port, on the
-    /// same `ClientApi`: the base and every session are unchanged.
+    /// The listener failed the re-verification and was bound again on its previous
+    /// port, on the same `ClientApi`: the base and every session are unchanged.
     Rebound { addr: SocketAddr },
     /// The previous port could not be bound again; the same `ClientApi` now listens
     /// on a new port. The base changed. The caller mints a new session and revokes

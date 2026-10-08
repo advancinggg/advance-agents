@@ -15,7 +15,7 @@ use advance_embedded_runtime_bridge::ffi::{
 };
 use advance_embedded_runtime_bridge::{start_with_extensions, BridgeOptions};
 use advance_runtime_compose::log_keys;
-use advance_runtime_compose::test_support::fixture::FixtureDriver;
+use advance_runtime_compose::test_support::fixture::{FixtureDriver, PortSquatter};
 use advance_runtime_compose::test_support::MemoryComposeLog;
 use common::{
     block_on_local, c_base, c_session, c_stop_free, fixture_home, http, last_error, walk_contains,
@@ -343,6 +343,99 @@ fn module_001_ac32_t113_5_embedded_admission_and_foreground_rebind() {
     );
     drop(squat);
     drop(old_base);
+
+    c_stop_free(raw);
+}
+
+/// MODULE-001-T113 (5), ADR 2026-10-03 D3: while the app was suspended the OS reclaimed the
+/// listener's socket and another app bound the port with a server that answers HTTP (echoing
+/// the re-verification challenge as its proof). After `Foreground` the shell re-reads the base
+/// and the session from the bridge and sends its request there: that server never receives a
+/// session token; the base moves, a new session is minted and the old one is revoked.
+#[test]
+fn module_001_ac32_t113_5_foreground_does_not_trust_a_server_on_the_reclaimed_port() {
+    let _g = SERIAL.blocking_lock();
+    let fixture = fixture_home(&["fs"], FixtureDriver::None);
+    let mem = MemoryComposeLog::new();
+    let handle = start_with_extensions(
+        fixture.home(),
+        BridgeOptions::default()
+            .with_log(Arc::new(mem.clone()))
+            .with_state_root(fixture.state_root()),
+        vec![],
+    )
+    .expect("compose");
+    let raw = into_raw_handle(handle.clone());
+    let base_g = c_base(raw);
+    assert_eq!(base_g.code, 0, "{}", base_g.last_error);
+    let base = base_g.value.expect("client api base");
+    let addr = parse_base(&base);
+    let sess = c_session(raw);
+    assert_eq!(sess.code, 0, "{}", sess.last_error);
+    let tok = sess.value.expect("session");
+    let (ok, body) = get_runs(addr, Some(&tok), None);
+    assert_eq!(ok, 200, "{body}");
+    let rust = unsafe { handle_from_raw(raw) }.expect("handle");
+    let rt = rust.composed_runtime().expect("composed");
+    let w0 = rt.client_api().expect("endpoint").api;
+
+    let reclaimed = block_on_local(rt.reclaim_client_api_listener_for_test())
+        .expect("the listener's socket is reclaimed");
+    assert_eq!(reclaimed, addr);
+    let squatter = PortSquatter::bind(reclaimed).expect("another app binds the reclaimed port");
+
+    let rc = unsafe { advance_bridge_on_lifecycle(raw, 0, -1, ptr::null()) };
+    assert_eq!(rc, 0, "FG: {}", last_error());
+    // The shell re-reads the base and the session after Foreground, before any request.
+    let base_g = c_base(raw);
+    assert_eq!(base_g.code, 0, "{}", base_g.last_error);
+    let base_after = base_g.value.expect("base after foreground");
+    let sess_g = c_session(raw);
+    assert_eq!(sess_g.code, 0, "{}", sess_g.last_error);
+    let tok_after = sess_g.value.expect("session after foreground");
+    let (status, status_body) = get_runs(parse_base(&base_after), Some(&tok_after), None);
+    let received = squatter.stop();
+
+    for head in &received {
+        assert!(
+            !head.contains(&tok) && !head.contains(&tok_after),
+            "the other app's server received a session token:\n{head}"
+        );
+        let lower = head.to_ascii_lowercase();
+        for credential in ["authorization", "bearer", "cookie"] {
+            assert!(
+                !lower.contains(credential),
+                "{credential} reached it:\n{head}"
+            );
+        }
+    }
+    assert!(
+        !received.is_empty(),
+        "the re-verification challenged the reclaimed port"
+    );
+    assert_ne!(base_after, base, "the base moved off the reclaimed port");
+    assert_eq!(status, 200, "{status_body}");
+    assert_ne!(tok_after, tok, "the move minted a new session");
+    let (old_st, old_body) = get_runs(parse_base(&base_after), Some(&tok), None);
+    assert_eq!(old_st, 401, "{old_body}");
+    assert_eq!(json_error_code(&old_body), "unauthenticated");
+    let ep = rt.client_api().expect("endpoint after the move");
+    assert!(
+        std::sync::Weak::ptr_eq(&w0, &ep.api),
+        "ClientApi must be the same Arc after the move"
+    );
+    assert!(
+        mem.count(log_keys::CLIENT_API_MOVED) >= 1,
+        "expected compose.client_api_moved: {:?}",
+        mem.lines()
+    );
+    token_absent_from_disk_log_url(
+        fixture.home(),
+        fixture.state_root(),
+        &mem,
+        &base_after,
+        &tok_after,
+    );
 
     c_stop_free(raw);
 }
