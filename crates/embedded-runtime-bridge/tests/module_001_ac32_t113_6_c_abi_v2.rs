@@ -316,6 +316,116 @@ fn module_001_ac32_t113_6_forced_composition_failure_answers_15_redacted() {
     c_stop_free(recovered.handle);
 }
 
+#[test]
+fn module_001_ac32_t113_6_v2_health_of_a_pulley_full_handle() {
+    let _g = SERIAL.blocking_lock();
+    let fixture = fixture_home(&["fs"], FixtureDriver::Minimal);
+    let json = json_with_state_root(json!({ "engine": "pulley" }), fixture.state_root());
+    let started = c_start_v2(fixture.home(), Some(&json));
+    assert_eq!(started.code, 0, "{}", started.last_error);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let health_json = loop {
+        let h = c_health(started.handle);
+        assert_eq!(h.code, 0, "{}", h.last_error);
+        let text = h.value.expect("health json");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if v["agent_loop_up"] == true || Instant::now() > deadline {
+            break (text, v);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let (text, v) = health_json;
+    assert_eq!(v["schema_version"], 2);
+    assert_eq!(v["composition_profile"], "full");
+    assert_eq!(v["agent_loop_up"], true, "{text}");
+    assert_eq!(v["profile"]["host_backend"], "pulley");
+    assert_eq!(v["profile"]["engine_mode"], "interpreter");
+    assert_eq!(v["lock_exclusivity"], "runtime_lock");
+    assert!(v["supervise_readiness"].is_null());
+
+    let rust = unsafe { handle_from_raw(started.handle) }.expect("handle");
+    let v2 = rust.health_v2().expect("health v2");
+    let expected = serde_json::to_string(&v2).expect("serialize health v2");
+    assert_eq!(
+        text, expected,
+        "C ABI JSON is field order of BridgeHealthV2"
+    );
+
+    let rt = rust.composed_runtime().expect("composed");
+    let rh = rt.health();
+    assert_eq!(rh.wasm_engine, WasmEngine::Pulley);
+    assert_eq!(rh.instance_guard, InstanceGuardKind::PidLockFile);
+    assert_eq!(
+        v["profile"]["host_backend"] == "pulley",
+        rh.wasm_engine == WasmEngine::Pulley
+    );
+    let base = c_base(started.handle);
+    assert_eq!(base.code, 0, "{}", base.last_error);
+    let expected_base = rt.client_api().expect("endpoint").base_url;
+    assert_eq!(base.value.as_deref(), Some(expected_base.as_str()));
+    assert_eq!(v["client_api_base"], expected_base);
+
+    c_stop_free(started.handle);
+}
+
+#[test]
+fn module_001_ac32_t113_6_mobile_agent_host_available_only_in_foreground() {
+    let _g = SERIAL.blocking_lock();
+
+    let fixture = fixture_home(&["fs"], FixtureDriver::Minimal);
+    let json = json_with_state_root(json!({ "platform": "ios" }), fixture.state_root());
+    let started = c_start_v2(fixture.home(), Some(&json));
+    assert_eq!(started.code, 0, "{}", started.last_error);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let loop_up = loop {
+        let h = c_health(started.handle);
+        assert_eq!(h.code, 0, "{}", h.last_error);
+        let text = h.value.expect("health json");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if v["agent_loop_up"] == true || Instant::now() > deadline {
+            break v;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(loop_up["agent_loop_up"], true, "{loop_up}");
+    assert_eq!(loop_up["profile"]["agent_host_available"], true);
+    assert_eq!(loop_up["profile"]["max_concurrent_runs"], 2);
+
+    let rc = unsafe { advance_bridge_on_lifecycle(started.handle, 1, -1, ptr::null()) };
+    assert_eq!(rc, 0, "BG: {}", last_error());
+    let bg = c_health(started.handle);
+    assert_eq!(bg.code, 0, "{}", bg.last_error);
+    let bg_v: serde_json::Value =
+        serde_json::from_str(bg.value.as_deref().expect("health json")).unwrap();
+    assert_eq!(bg_v["profile"]["agent_host_available"], false);
+    assert_eq!(bg_v["profile"]["max_concurrent_runs"], 0);
+
+    let rc = unsafe { advance_bridge_on_lifecycle(started.handle, 0, -1, ptr::null()) };
+    assert_eq!(rc, 0, "FG: {}", last_error());
+    let fg = c_health(started.handle);
+    assert_eq!(fg.code, 0, "{}", fg.last_error);
+    let fg_v: serde_json::Value =
+        serde_json::from_str(fg.value.as_deref().expect("health json")).unwrap();
+    assert_eq!(fg_v["profile"]["agent_host_available"], true);
+    assert_eq!(fg_v["profile"]["max_concurrent_runs"], 2);
+
+    c_stop_free(started.handle);
+
+    let no_driver = fixture_home(&["fs"], FixtureDriver::None);
+    let json = json_with_state_root(json!({ "platform": "ios" }), no_driver.state_root());
+    let started = c_start_v2(no_driver.home(), Some(&json));
+    assert_eq!(started.code, 0, "{}", started.last_error);
+    let h = c_health(started.handle);
+    assert_eq!(h.code, 0, "{}", h.last_error);
+    let v: serde_json::Value =
+        serde_json::from_str(h.value.as_deref().expect("health json")).unwrap();
+    assert_eq!(v["agent_loop_up"], false);
+    assert_eq!(v["profile"]["agent_host_available"], false);
+    c_stop_free(started.handle);
+}
+
 fn assert_getter_14(handle: *mut AdvanceBridgeHandle, text: &str) {
     let mut buf = vec![0xAAu8; 64];
     let (code, _, err) = c_getter_into(handle, advance_bridge_client_api_base, &mut buf);
