@@ -26,6 +26,7 @@ dependencies = [
  "advance-context-engine",
  "advance-cost-tracker",
  "advance-database",
+ "advance-embedded-runtime-bridge",
  "advance-event-bus",
  "advance-git",
  "advance-home",

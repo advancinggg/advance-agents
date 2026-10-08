@@ -205,6 +205,8 @@ advance-git = { path = "../git", features = ["test-support"] }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
+# MODULE-001-T113 (7) drives `advance_bridge_start_v2` against a live `advance start`.
+advance-embedded-runtime-bridge = { path = "../embedded-runtime-bridge" }
 # SAT-B (slice satB-postproc): the memory_extractor T51/T52 fake implements the
 # `LlmGatewayInternal::stream()` trait method, whose return type names
 # `futures_core::Stream`. Workspace-pinned (already cap-llm's prod dep).

@@ -1,17 +1,19 @@
 //! SYS-AC-338: production-compose refusal legs (registration refusals, claims on entries
-//! OSS binds, startup panics).
+//! OSS binds, startup panics, an embedded login without the in-process credential).
 
 use std::sync::Arc;
 
+use advance_client_api::Platform;
 use advance_runtime_compose::test_support::fixture::{
     assert_gone_for_home, CapDecl, FixtureBreaks, FixtureDriver, FixtureExtension, FixtureFamilies,
-    FixtureHome, FixtureHomeSpec, RouteRuleBreak, FIXTURE_ID,
+    FixtureHome, FixtureHomeSpec, Http, RouteRuleBreak, FIXTURE_ID,
 };
 use advance_runtime_compose::test_support::{ComposeProbe, MemoryComposeLog};
 use advance_runtime_compose::{
-    compose, log_keys, ComposeError, DuplicateOf, ExtensionFailure, ExtensionPhase,
+    compose, log_keys, ComposeError, DuplicateOf, ExtensionFailure, ExtensionPhase, HostPlatform,
     RouteRefusalReason,
 };
+use serde_json::{json, Value};
 
 fn alive_tasks() -> usize {
     tokio::runtime::Handle::current()
@@ -265,4 +267,77 @@ async fn sys_ac_338_startup_callback_panic_is_typed_not_abort() {
         "fixture panic in capabilities",
     )
     .await;
+}
+
+fn error_code(body: &Value) -> &str {
+    body.pointer("/error/code")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn embedded_home() -> FixtureHome {
+    FixtureHome::new(FixtureHomeSpec {
+        capabilities: vec![CapDecl::Granted("fs")],
+        driver: FixtureDriver::None,
+        git: false,
+        providers_yaml: None,
+    })
+    .expect("home")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sys_ac_338_j83_embedded_login_without_credential_refused() {
+    let home = embedded_home();
+    let log = MemoryComposeLog::new();
+    let probe = Arc::new(ComposeProbe::new());
+    let baseline = alive_tasks();
+    let platform = HostPlatform::compiled().unwrap();
+    let rt = compose(
+        home.embedded_options(platform, Arc::new(log), Arc::clone(&probe)),
+        Vec::new(),
+    )
+    .await
+    .expect("embedded compose");
+    let ep = rt.client_api().expect("client api");
+    let addr = ep.socket_addr;
+
+    let empty = Http::post(addr, "/client/session/login")
+        .json(json!({}))
+        .await;
+    assert_eq!(empty.status, 401, "{:?}", empty.body);
+    assert_eq!(error_code(&empty.body), "invalid_bootstrap_code");
+    assert!(
+        !empty.body.to_string().contains("\"token\""),
+        "{:?}",
+        empty.body
+    );
+
+    let mac = Http::post(addr, "/client/session/login")
+        .json(json!({ "platform": "mac" }))
+        .await;
+    assert_eq!(mac.status, 401, "{:?}", mac.body);
+    assert_eq!(error_code(&mac.body), "invalid_bootstrap_code");
+    assert!(
+        !mac.body.to_string().contains("\"token\""),
+        "{:?}",
+        mac.body
+    );
+
+    let runs = Http::get(addr, "/client/runs").send().await;
+    assert_eq!(runs.status, 401, "{:?}", runs.body);
+
+    let console = Http::get(addr, "/").send().await;
+    assert_eq!(console.status, 404, "{:?}", console.body);
+
+    let token = ep
+        .api
+        .upgrade()
+        .expect("ClientApi alive")
+        .mint_in_process_session(Platform::Mac)
+        .token;
+    let ok = Http::get(addr, "/client/runs").session(&token).send().await;
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+
+    rt.shutdown().await.expect("shutdown");
+    assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
 }
