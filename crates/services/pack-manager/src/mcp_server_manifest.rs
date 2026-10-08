@@ -8,7 +8,7 @@
 //! (which turns the manifest into a `cap_mcp::McpServerEntry`).
 //!
 //! ```yaml
-//! server-id: local-tools            # [A-Za-z0-9._-]{1,128}; the whitelist key
+//! server-id: local-tools            # [A-Za-z0-9._-]{1,128}, no leading '.'; the whitelist key
 //! description: optional free text   # ≤ 1 KiB, no control bytes
 //! transport:
 //!   kind: stdio                     # subprocess — arbitrary code execution
@@ -43,6 +43,10 @@
 //!
 //! Trust (§3.2 rule 2) is NOT decided here — the manifest carries no trust; the
 //! bridge refuses `stdio` from a pack whose `.meta.yaml` trust is `untrusted`.
+//!
+//! [`parse_mcp_server_origin_str`] reads a document's `origin` block alone, ignoring
+//! every other key and their rules: what decides whether a materialized file still
+//! belongs to an installed pack, whatever else the file says.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -130,6 +134,14 @@ struct RawOrigin {
     pack: String,
     #[serde(rename = "config-ref")]
     config_ref: String,
+}
+
+/// A document read for its `origin` block only ([`parse_mcp_server_origin_str`]): every other
+/// key is ignored, whatever it holds.
+#[derive(Deserialize)]
+struct RawOriginOnly {
+    #[serde(default)]
+    origin: Option<RawOrigin>,
 }
 
 #[derive(Deserialize)]
@@ -259,31 +271,7 @@ pub fn parse_mcp_server_manifest_str(yaml: &str) -> Result<McpServerManifest, Pa
         });
     }
 
-    let origin = match raw.origin {
-        None => None,
-        Some(origin) => {
-            if origin.pack.trim().is_empty()
-                || origin.pack.contains('\0')
-                || origin.pack.len() > MAX_SECRET_REF_LEN
-            {
-                return Err(PackError::InvalidManifest(
-                    "origin.pack must be a non-empty pack id (name@version)".into(),
-                ));
-            }
-            if origin.config_ref.trim().is_empty()
-                || origin.config_ref.contains('\0')
-                || origin.config_ref.len() > MAX_COMMAND_LEN
-            {
-                return Err(PackError::InvalidManifest(
-                    "origin.config-ref must be a non-empty pack FQ ref".into(),
-                ));
-            }
-            Some(McpServerOrigin {
-                pack: origin.pack,
-                config_ref: origin.config_ref,
-            })
-        }
-    };
+    let origin = validate_origin(raw.origin)?;
 
     Ok(McpServerManifest {
         server_id: raw.server_id,
@@ -292,6 +280,58 @@ pub fn parse_mcp_server_manifest_str(yaml: &str) -> Result<McpServerManifest, Pa
         secret_refs: raw.secret_refs,
         origin,
     })
+}
+
+/// The `origin` block of an in-memory server-file document, and nothing else: `Ok(None)` for a
+/// document without one (an operator's file), `Ok(Some(..))` for a pack's. The other keys are
+/// not read, so a file the full parser refuses (an unknown key, a transport the loader will
+/// not accept, an oversize description) still tells which pack wrote it. The document itself
+/// must be YAML within the same alias and nesting bounds, and an `origin` block that is present
+/// must be well-formed.
+pub fn parse_mcp_server_origin_str(yaml: &str) -> Result<Option<McpServerOrigin>, PackError> {
+    if yaml_has_alias_refs(yaml) {
+        return Err(PackError::InvalidManifest(
+            "contains alias references (`*name`) — rejected to prevent billion-laughs \
+             amplification"
+                .into(),
+        ));
+    }
+    if !yaml_nesting_within_bound(yaml) {
+        return Err(PackError::InvalidManifest(
+            "nesting/indentation is too deep — rejected to prevent parse-time resource \
+             exhaustion"
+                .into(),
+        ));
+    }
+    let raw: RawOriginOnly = serde_yml::from_str(yaml)
+        .map_err(|e| PackError::InvalidManifest(format!("yaml parse: {e}")))?;
+    validate_origin(raw.origin)
+}
+
+fn validate_origin(origin: Option<RawOrigin>) -> Result<Option<McpServerOrigin>, PackError> {
+    let Some(origin) = origin else {
+        return Ok(None);
+    };
+    if origin.pack.trim().is_empty()
+        || origin.pack.contains('\0')
+        || origin.pack.len() > MAX_SECRET_REF_LEN
+    {
+        return Err(PackError::InvalidManifest(
+            "origin.pack must be a non-empty pack id (name@version)".into(),
+        ));
+    }
+    if origin.config_ref.trim().is_empty()
+        || origin.config_ref.contains('\0')
+        || origin.config_ref.len() > MAX_COMMAND_LEN
+    {
+        return Err(PackError::InvalidManifest(
+            "origin.config-ref must be a non-empty pack FQ ref".into(),
+        ));
+    }
+    Ok(Some(McpServerOrigin {
+        pack: origin.pack,
+        config_ref: origin.config_ref,
+    }))
 }
 
 /// The shared server-id grammar (`advance_shared_types::mcp::is_valid_server_id`), which
@@ -307,7 +347,7 @@ fn validate_server_id(id: &str) -> Result<(), PackError> {
         )));
     }
     Err(PackError::InvalidManifest(format!(
-        "server-id {id:?} must match [A-Za-z0-9._-]+"
+        "server-id {id:?} must match [A-Za-z0-9._-]+ and not start with '.'"
     )))
 }
 
@@ -468,12 +508,58 @@ mod tests {
             "srv:1",
             "ü",
             too_long.as_str(),
+            ".",
+            ".hidden",
         ] {
             let doc = format!(
                 "server-id: {id:?}\ntransport:\n  kind: http\n  endpoint-url: https://h/\n"
             );
             let parsed = parse_mcp_server_manifest_str(&doc);
             assert_eq!(parsed.is_ok(), is_valid_server_id(id), "{id:?}: {parsed:?}");
+        }
+        match parse_mcp_server_manifest_str(
+            "server-id: .hidden\ntransport:\n  kind: http\n  endpoint-url: https://h/\n",
+        ) {
+            Err(PackError::InvalidManifest(reason)) => {
+                assert!(reason.contains("not start with '.'"), "{reason}")
+            }
+            other => panic!("expected InvalidManifest, got {other:?}"),
+        }
+    }
+
+    // The origin block is read on its own: whatever the rest of the document holds, and
+    // whether or not the full parser would accept it.
+    #[test]
+    fn the_origin_block_is_read_whatever_the_rest_of_the_document_says() {
+        let origin = |doc: &str| parse_mcp_server_origin_str(doc).unwrap();
+        assert_eq!(origin(HTTP), None, "an operator file has no origin");
+        let expected = Some(McpServerOrigin {
+            pack: "p@1.0.0".into(),
+            config_ref: "p@1.0.0/mcp-servers/srv".into(),
+        });
+        let block = "origin:\n  pack: p@1.0.0\n  config-ref: p@1.0.0/mcp-servers/srv\n";
+        assert_eq!(origin(&format!("{STDIO}{block}")), expected);
+        for rest in [
+            // An unknown key, a transport the full parser refuses, an oversize description,
+            // an id outside the grammar, a document that is not even a server file.
+            "server-id: x\nextra: 1\ntransport:\n  kind: http\n  endpoint-url: https://h/\n",
+            "server-id: x\ntransport:\n  kind: ssh\n  host: h\n",
+            &format!("server-id: x\ndescription: {}\n", "d".repeat(4096)),
+            "server-id: .hidden\ntransport: 5\n",
+            "whatever: [1, 2, 3]\n",
+        ] {
+            assert!(parse_mcp_server_manifest_str(rest).is_err(), "{rest}");
+            assert_eq!(origin(&format!("{rest}{block}")), expected, "{rest}");
+        }
+        // The block itself must be well-formed, and the document must be YAML within bounds.
+        for bad in [
+            "server-id: x\norigin:\n  pack: p@1.0.0\n",
+            "server-id: x\norigin:\n  pack: \"\"\n  config-ref: r\n",
+            "server-id: x\norigin: 5\n",
+            "server-id: [unclosed\n",
+            "a: &x [1]\norigin: *x\n",
+        ] {
+            assert!(parse_mcp_server_origin_str(bad).is_err(), "{bad}");
         }
     }
 

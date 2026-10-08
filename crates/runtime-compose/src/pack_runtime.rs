@@ -45,6 +45,7 @@ use sha2::{Digest, Sha256};
 
 use crate::api::log_keys;
 use crate::compose_log::LogHandle;
+use crate::mcp_wiring::McpSweep;
 
 /// How often the packs dir's `.meta.yaml` index is polled for installs made by another
 /// process (`advance pack install` while the daemon runs).
@@ -417,11 +418,16 @@ impl PackRuntime {
                 .await;
         }
         let installed: BTreeSet<String> = report.packs.iter().cloned().collect();
-        if let Some(mcp) = self.mcp.get().and_then(std::sync::Weak::upgrade) {
-            mcp.drop_uninstalled_origins(&installed);
+        let sweep = if let Some(mcp) = self.mcp.get().and_then(std::sync::Weak::upgrade) {
+            mcp.drop_uninstalled_origins(&installed)
         } else if let Some(plane) = self.mcp_plane.get() {
-            plane.remove_origins_not_in(&installed);
-        }
+            plane.remove_origins_not_in(&installed)
+        } else {
+            McpSweep::default()
+        };
+        report
+            .warnings
+            .extend(sweep.warnings.into_iter().map(|w| format!("mcp: {w}")));
         report.presets = state.presets.keys().cloned().collect();
         report.tools = state.tools.keys().cloned().collect();
 
@@ -447,6 +453,40 @@ impl PackRuntime {
         }
         state.warned = current;
         report
+    }
+
+    /// Delete the pack-origin MCP server files whose origin pack is not installed, as
+    /// [`apply`](Self::apply) does on every apply: through the attached MCP runtime
+    /// ([`McpRuntime::start`](crate::mcp_wiring::McpRuntime::start), which reloads the client
+    /// when a file went and then runs its warm-up), or through the attached plane when the root
+    /// does not declare `mcp`. The daemon runs this once at start, after attaching both (the
+    /// boot applies run before they exist), so a pack uninstalled while the daemon was down
+    /// (`advance pack uninstall` touches no server file) loses its server files, and its
+    /// servers, before an agent runs. A file whose origin could not be read is reported like an
+    /// apply warning, once.
+    pub async fn sweep_mcp_origins(&self) -> McpSweep {
+        let mut state = self.state.lock().await;
+        let mut shadowed = Vec::new();
+        let installed: BTreeSet<String> =
+            effective_packs(self.registry.list_installed(), &mut shadowed)
+                .iter()
+                .map(label)
+                .collect();
+        let sweep = if let Some(mcp) = self.mcp.get().and_then(std::sync::Weak::upgrade) {
+            mcp.start(&installed)
+        } else if let Some(plane) = self.mcp_plane.get() {
+            plane.remove_origins_not_in(&installed)
+        } else {
+            McpSweep::default()
+        };
+        for warning in &sweep.warnings {
+            let warning = format!("mcp: {warning}");
+            if state.warned.insert(warning.clone()) {
+                self.log
+                    .err(log_keys::PACKS_WARN, format!("advance: WARN {warning}"));
+            }
+        }
+        sweep
     }
 
     /// Re-read the packs dir into the registry, then [`apply`](Self::apply).

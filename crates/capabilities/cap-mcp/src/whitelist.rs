@@ -314,7 +314,8 @@ impl McpServersConfigBuilder {
     pub fn add_server(mut self, entry: McpServerEntry) -> Result<Self, McpError> {
         if !shared::is_valid_server_id(&entry.server_id) {
             return Err(McpError::invalid_response(format!(
-                "server_id {:?} must be 1..={} characters from [A-Za-z0-9._-]",
+                "server_id {:?} must be 1..={} characters from [A-Za-z0-9._-], not starting \
+                 with '.'",
                 entry.server_id,
                 shared::MAX_SERVER_ID_BYTES
             )));

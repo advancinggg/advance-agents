@@ -3093,6 +3093,10 @@ pub(crate) async fn wire_capabilities_inner(
         mcp_sink.bind_runtime(Arc::clone(runtime));
         pack_runtime.attach_mcp(Arc::clone(runtime));
     }
+    // A pack uninstalled while the daemon was down left its server files behind (the CLI
+    // touches none): swept now that the runtime that would serve them is attached, before
+    // its warm-up.
+    let _ = pack_runtime.sweep_mcp_origins().await;
 
     // Wave-23 seam (d): late-bind the post-`build()` runtime + injector into the
     // per-child manager (constructed pre-build when it was attached as the spawner's

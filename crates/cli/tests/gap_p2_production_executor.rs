@@ -208,9 +208,12 @@ async fn pe_01_success_path_spawns_submits_and_registers() {
     // register-mcp-server: the http entry is a server file with origin.
     let file = r.servers_dir.join("remote-tools.yaml");
     let body = std::fs::read_to_string(&file).expect("server file");
-    assert!(body.contains("server-id: remote-tools"), "{body}");
-    assert!(body.contains("origin:"), "{body}");
-    assert!(body.contains("p@1.0.0"), "{body}");
+    let manifest = advance_pack_manager::parse_mcp_server_manifest_str(&body)
+        .unwrap_or_else(|e| panic!("the loader reads the file back: {e}\n{body}"));
+    assert_eq!(manifest.server_id, "remote-tools", "{body}");
+    let origin = manifest.origin.expect("the file names its pack");
+    assert_eq!(origin.pack, "p@1.0.0", "{body}");
+    assert_eq!(origin.config_ref, "p@1.0.0/mcp-servers/remote", "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

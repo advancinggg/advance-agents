@@ -357,6 +357,8 @@ fn builder_admits_only_server_ids_from_the_charset() {
         "a\u{200B}b",
         "a\nb",
         too_long.as_str(),
+        ".",
+        ".hidden",
     ] {
         assert!(!is_valid_server_id(id), "{id:?}");
         let err = McpServersConfig::builder()

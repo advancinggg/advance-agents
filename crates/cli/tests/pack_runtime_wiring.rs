@@ -157,11 +157,17 @@ async fn boot(ws: &Ws) -> (advance_runtime::bootstrap::RuntimeHost, WiringHandle
 }
 
 fn operator_api(handles: &WiringHandles) -> Arc<ClientApi> {
-    let api = handles
-        .client_api_server
-        .as_ref()
-        .expect("EventBus up ⇒ Client API bound")
-        .api();
+    with_operator_session(
+        handles
+            .client_api_server
+            .as_ref()
+            .expect("EventBus up ⇒ Client API bound")
+            .api(),
+    )
+}
+
+/// `api` with the operator session `tok` inserted.
+fn with_operator_session(api: Arc<ClientApi>) -> Arc<ClientApi> {
     api.sessions().insert(
         "tok".to_string(),
         ClientSession {
@@ -1208,7 +1214,8 @@ done
     }
 
     // Without `mcp` in the root's config nothing MCP exists: no host function, no runtime,
-    // no server process, although a server file is there and the warm-up is on.
+    // no server process, although a server file is there and the warm-up is on. The start
+    // still removes the file of a pack that is not installed, and nothing else.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_root_that_does_not_declare_mcp_gets_nothing_mcp() {
         let home = home(
@@ -1217,9 +1224,21 @@ done
             "\nmcp:\n  warm-tool-cache: true\n",
         );
         stdio_server(&home, "srv", "", "");
-        // A file that would be refused is not even read.
+        // A file that would be refused is not loaded either.
         server_file(&home, "broken", "server-id: [unclosed\n");
+        let dir = home.root.join(".advance/mcp-servers");
+        server_file(
+            &home,
+            "stale",
+            "server-id: stale\ntransport:\n  kind: stdio\n  command: /bin/true\norigin:\n  \
+             pack: gone@1.0.0\n  config-ref: gone@1.0.0/mcp-servers/stale\n",
+        );
         let (host, handles) = boot(&home).await;
+        assert!(
+            !dir.join("stale.yaml").exists(),
+            "the start removes the file of a pack that is not installed"
+        );
+        assert!(dir.join("srv.yaml").is_file() && dir.join("broken.yaml").is_file());
 
         assert!(registered(&host).is_empty());
         assert!(handles.mcp.is_none());
@@ -1256,45 +1275,66 @@ done
 
     // A pack workflow's register-mcp-server writes the operator file and makes the
     // server callable; applying it again succeeds; uninstalling the pack removes the file.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_pack_workflow_registers_an_mcp_server_and_uninstall_removes_it() {
-        use ed25519_dalek::{Signer, SigningKey};
+    /// The signing key whose public key the pack homes below trust.
+    fn trusted_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[42u8; 32])
+    }
 
-        with_master_key();
-        let key = SigningKey::from_bytes(&[42u8; 32]);
-        let pk = hex::encode(key.verifying_key().to_bytes());
-        let home = home(
+    /// A home declaring `mcp` and `lifecycle` whose `pack.trust-roots` names [`trusted_key`],
+    /// with `tail` appended to its runtime config.
+    fn pack_home(tail: &str) -> Home {
+        let pk = hex::encode(trusted_key().verifying_key().to_bytes());
+        home(
             "capabilities:\n  mcp: true\n  lifecycle: true\n",
             KEY_ENV,
-            &format!("\npack:\n  trust-roots:\n    - {pk}\n"),
-        );
-        let script = home.marks.join("srv.sh");
+            &format!("\npack:\n  trust-roots:\n    - {pk}\n{tail}"),
+        )
+    }
+
+    /// Write, outside `home`'s workspace, the signed trusted pack `p@1.0.0` whose
+    /// `mcp-servers/<name>.yaml` declares the stdio server `server_id` (a [`SERVER_SCRIPT`]
+    /// recording under `server_id`) and whose workflow `mcp` registers it. Returns the pack's
+    /// source directory.
+    fn signed_mcp_pack(home: &Home, name: &str, server_id: &str) -> PathBuf {
+        use ed25519_dalek::Signer;
+
+        let key = trusted_key();
+        let pk = hex::encode(key.verifying_key().to_bytes());
+        let script = home.marks.join(format!("{server_id}.sh"));
         std::fs::write(
             &script,
             SERVER_SCRIPT
                 .replace("@EXTRA@", "")
                 .replace("@MARKS@", home.marks.to_str().unwrap())
-                .replace("@ID@", "srv"),
+                .replace("@ID@", server_id),
         )
         .unwrap();
         let src = home.root.parent().unwrap().join("src/p");
         std::fs::create_dir_all(src.join("mcp-servers")).unwrap();
         std::fs::create_dir_all(src.join("workflows")).unwrap();
         std::fs::write(
-            src.join("mcp-servers/srv.yaml"),
+            src.join(format!("mcp-servers/{name}.yaml")),
             format!(
-                "server-id: srv\ntransport:\n  kind: stdio\n  command: /bin/bash\n  args: [\"{}\"]\n",
+                "server-id: {server_id}\ntransport:\n  kind: stdio\n  command: /bin/bash\n  \
+                 args: [\"{}\"]\n",
                 script.display()
             ),
         )
         .unwrap();
         std::fs::write(
             src.join("workflows/mcp.yaml"),
-            "name: mcp\nsteps:\n  - type: register-mcp-server\n    config-ref: p@1.0.0/mcp-servers/srv\n",
+            format!(
+                "name: mcp\nsteps:\n  - type: register-mcp-server\n    config-ref: \
+                 p@1.0.0/mcp-servers/{name}\n"
+            ),
         )
         .unwrap();
-        let pack_yaml = "name: p\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\ntrust-level: trusted\nprovides:\n  mcp-servers:\n    - srv\n  workflows:\n    - mcp\nchecksums:\n  algo: sha256\n  files: {}\n";
-        std::fs::write(src.join("pack.yaml"), pack_yaml).unwrap();
+        let pack_yaml = format!(
+            "name: p\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\ntrust-level: trusted\n\
+             provides:\n  mcp-servers:\n    - {name}\n  workflows:\n    - mcp\nchecksums:\n  \
+             algo: sha256\n  files: {{}}\n"
+        );
+        std::fs::write(src.join("pack.yaml"), &pack_yaml).unwrap();
         let sig = key.sign(pack_yaml.as_bytes());
         std::fs::write(
             src.join("pack.sig"),
@@ -1305,23 +1345,55 @@ done
             ),
         )
         .unwrap();
+        src
+    }
+
+    /// `POST /client/packs:install` of the pack at `src`, accepting `mcp`.
+    fn install_pack(api: &ClientApi, src: &std::path::Path, key: &str) {
+        let env = super::post(
+            api,
+            "/client/packs:install",
+            json!({ "source": src.to_str().unwrap(), "accepted_capabilities": ["mcp"] }),
+            key,
+        );
+        assert!(env.is_ok(), "{:?}", env.error);
+    }
+
+    /// `POST /client/packs/p@1.0.0:apply` of the workflow `mcp`.
+    fn apply_mcp_workflow(api: &ClientApi, key: &str) -> advance_client_api::ClientEnvelope<Value> {
+        super::post(
+            api,
+            "/client/packs/p@1.0.0:apply",
+            json!({ "workflow": "mcp" }),
+            key,
+        )
+    }
+
+    /// The installer `advance pack uninstall` builds over `home`'s packs dir: its own
+    /// registry, the CLI's approval strategy (inert for an uninstall).
+    fn cli_installer(home: &Home) -> advance_pack_manager::Installer {
+        let packs_dir = home.root.join(".advance/packs");
+        advance_pack_manager::Installer::new(
+            &packs_dir,
+            Arc::new(advance_pack_manager::InMemoryPackRegistry::new(
+                packs_dir.clone(),
+            )),
+            env!("CARGO_PKG_VERSION"),
+            Arc::new(advance_pack_manager::AutoReject),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pack_workflow_registers_an_mcp_server_and_uninstall_removes_it() {
+        with_master_key();
+        let home = pack_home("");
+        let src = signed_mcp_pack(&home, "srv", "srv");
 
         let (host, handles) = boot(&home).await;
         let api = super::operator_api(&handles);
-        let env = super::post(
-            &api,
-            "/client/packs:install",
-            json!({ "source": src.to_str().unwrap(), "accepted_capabilities": ["mcp"] }),
-            "install-mcp-pack",
-        );
-        assert!(env.is_ok(), "{:?}", env.error);
+        install_pack(&api, &src, "install-mcp-pack");
 
-        let env = super::post(
-            &api,
-            "/client/packs/p@1.0.0:apply",
-            json!({ "workflow": "mcp" }),
-            "apply-mcp",
-        );
+        let env = apply_mcp_workflow(&api, "apply-mcp");
         assert!(env.is_ok(), "{:?}", env.error);
         assert_eq!(
             env.data.unwrap()["steps_executed"],
@@ -1337,12 +1409,7 @@ done
             .await
             .expect("the pack's server is callable");
 
-        let env = super::post(
-            &api,
-            "/client/packs/p@1.0.0:apply",
-            json!({ "workflow": "mcp" }),
-            "apply-mcp-again",
-        );
+        let env = apply_mcp_workflow(&api, "apply-mcp-again");
         assert!(env.is_ok(), "re-applying is idempotent: {:?}", env.error);
 
         let env = super::post(
@@ -1360,6 +1427,242 @@ done
             .await
             .expect_err("the server is gone");
         assert_eq!(arm, "not-found");
+    }
+
+    // `advance pack uninstall` touches no server file, so a pack uninstalled while the daemon
+    // is down leaves its materialized server file behind. The next boot sweeps it before an
+    // agent runs: the server is not configured, its file is gone and no process starts, not
+    // even by the warm-up, which runs after the sweep.
+    //
+    // The first daemon is composed and stopped as `advance start` composes and stops it: its
+    // shutdown has let go of everything when it returns, so the home boots again in this
+    // process (a new process cannot boot again a home that declares `lifecycle`, which a pack
+    // workflow needs to register a server: see `module_001_t111_exit_codes.rs`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pack_uninstalled_while_the_daemon_was_down_loses_its_server_at_the_next_boot() {
+        with_master_key();
+        let home = pack_home("\nmcp:\n  warm-tool-cache: true\n");
+        let src = signed_mcp_pack(&home, "srv", "srv");
+        let file = home.root.join(".advance/mcp-servers/srv.yaml");
+
+        let first = advance_runtime_compose::compose(
+            advance_runtime_compose::ComposeOptions::daemon(
+                &home.root,
+                Arc::new(advance_runtime_compose::NullComposeLog),
+            ),
+            Vec::new(),
+        )
+        .await
+        .expect("the first daemon");
+        let api = super::with_operator_session(
+            first
+                .client_api()
+                .and_then(|endpoint| endpoint.api.upgrade())
+                .expect("the first daemon's Client API"),
+        );
+        install_pack(&api, &src, "install-mcp-pack");
+        let env = apply_mcp_workflow(&api, "apply-mcp");
+        assert!(env.is_ok(), "{:?}", env.error);
+        assert!(file.is_file(), "the first daemon registered the server");
+        drop(api);
+        first.shutdown().await.expect("the first daemon stops");
+        let started = marks(&home, "srv.starts");
+        let children = marks(&home, "srv.children");
+        let pids: Vec<&String> = started.iter().chain(children.iter()).collect();
+        assert_stopped(&pids, "the stopped daemon stopped its servers").await;
+
+        // The uninstall of a shell session while no daemon runs.
+        cli_installer(&home)
+            .uninstall("p", "1.0.0")
+            .await
+            .expect("uninstall through the CLI's installer");
+        assert!(
+            file.is_file(),
+            "the CLI uninstall leaves the server file where it is"
+        );
+
+        let (host, handles) = boot(&home).await;
+        assert!(
+            !file.exists(),
+            "the boot sweeps the uninstalled pack's file"
+        );
+        let root = handles.root_agent_id.clone();
+        assert!(
+            servers(&host, &root).await.is_empty(),
+            "the server is not configured"
+        );
+        let configured: Vec<String> = handles
+            .mcp
+            .as_ref()
+            .expect("mcp")
+            .client()
+            .list_servers()
+            .await
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert!(configured.is_empty(), "{configured:?}");
+        let (arm, _) = invoke(&host, &root, "srv", "echo")
+            .await
+            .expect_err("the server is gone");
+        assert_eq!(arm, "not-found");
+        // Time for a warm-up to have started the server, had it run before the sweep.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            marks(&home, "srv.starts"),
+            started,
+            "the second boot started no server process"
+        );
+    }
+
+    // A pack's stdio server file, registered while stdio was allowed, is skipped by the loader
+    // once `mcp.allow-stdio` is `false`: it is kept while its pack is installed, a pack may not
+    // register a stdio server while stdio is disabled, and uninstalling the pack still removes
+    // the file the loader skipped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pack_server_file_the_loader_skips_still_goes_with_its_pack() {
+        with_master_key();
+        let home = pack_home("\nmcp:\n  allow-stdio: false\n");
+        let src = signed_mcp_pack(&home, "srv", "srv");
+        // Installed, and its server registered, by an earlier daemon that allowed stdio.
+        let packs_dir = home.root.join(".advance/packs");
+        advance_pack_manager::Installer::new(
+            &packs_dir,
+            Arc::new(advance_pack_manager::InMemoryPackRegistry::new(
+                packs_dir.clone(),
+            )),
+            env!("CARGO_PKG_VERSION"),
+            Arc::new(advance_pack_manager::AutoApprove),
+        )
+        .with_trust_roots(vec![hex::encode(trusted_key().verifying_key().to_bytes())])
+        .install(src.to_str().unwrap())
+        .await
+        .expect("install before boot");
+        server_file(
+            &home,
+            "srv",
+            &format!(
+                "server-id: \"srv\"\ntransport:\n  kind: stdio\n  command: \"/bin/bash\"\n  \
+                 args:\n    - \"{}\"\norigin:\n  pack: \"p@1.0.0\"\n  config-ref: \
+                 \"p@1.0.0/mcp-servers/srv\"\n",
+                home.marks.join("srv.sh").display()
+            ),
+        );
+        let file = home.root.join(".advance/mcp-servers/srv.yaml");
+
+        let (host, handles) = boot(&home).await;
+        let warnings = handles.mcp.as_ref().expect("mcp").warnings().to_vec();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("\"srv.yaml\"") && warnings[0].contains("mcp.allow-stdio: false"),
+            "{warnings:?}"
+        );
+        assert!(file.is_file(), "the pack is installed: its file stays");
+        let root = handles.root_agent_id.clone();
+        assert!(servers(&host, &root).await.is_empty());
+
+        // The Client API answers a refused step with the `InvalidRequest` code and a fixed
+        // message; the reason (stdio servers are disabled) is the sink's, pinned by its unit
+        // tests.
+        let api = super::operator_api(&handles);
+        let env = apply_mcp_workflow(&api, "apply-mcp-disabled");
+        assert!(
+            !env.is_ok(),
+            "a stdio registration is refused while stdio is disabled"
+        );
+        let error = format!("{:?}", env.error);
+        assert!(error.contains("InvalidRequest"), "{error}");
+        assert!(file.is_file(), "a refused registration touches no file");
+
+        let env = super::post(
+            &api,
+            "/client/packs/p@1.0.0:uninstall",
+            json!({}),
+            "uninstall-mcp-pack",
+        );
+        assert!(env.is_ok(), "{:?}", env.error);
+        assert!(
+            !file.exists(),
+            "uninstalling the pack removes the file the loader skipped"
+        );
+        assert!(
+            marks(&home, "srv.starts").is_empty(),
+            "a disabled stdio server never starts"
+        );
+    }
+
+    // A server id starting with a dot would be a hidden file no loader reads: the pack
+    // installs, but applying the workflow that registers the server is refused and nothing is
+    // written to the servers directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pack_server_id_the_loader_would_hide_is_refused_at_apply() {
+        with_master_key();
+        let home = pack_home("");
+        let src = signed_mcp_pack(&home, "hidden", ".hidden");
+        let dir = home.root.join(".advance/mcp-servers");
+
+        let (_host, handles) = boot(&home).await;
+        let api = super::operator_api(&handles);
+        install_pack(&api, &src, "install-hidden-pack");
+        // Refused with the `InvalidRequest` code (the Client API's fixed message hides the
+        // reason, which the manifest parser's unit test pins: the id must not start with '.').
+        let env = apply_mcp_workflow(&api, "apply-hidden");
+        assert!(!env.is_ok(), "a hidden server id is refused");
+        let error = format!("{:?}", env.error);
+        assert!(error.contains("InvalidRequest"), "{error}");
+        let written: Vec<String> = std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .map(|e| e.unwrap().file_name().into_string().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(written.is_empty(), "{written:?}");
+        assert!(marks(&home, ".hidden.starts").is_empty());
+    }
+
+    // A reload (what a pack event or a sink write triggers) lists a server that appears only
+    // when one of the root's `mcp` grants reaches it, like the warm-up; a server outside the
+    // grant waits for its first use.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_lists_only_the_servers_the_root_grant_reaches() {
+        let home = home(
+            "capabilities:\n  mcp:\n    servers: [srv]\n",
+            NO_KEY_ENV,
+            "",
+        );
+        let (_host, handles) = boot(&home).await;
+        let mcp = Arc::clone(handles.mcp.as_ref().expect("mcp"));
+        assert!(mcp.client().list_servers().await.is_empty());
+
+        stdio_server(&home, "srv", "", "");
+        stdio_server(&home, "other", "", "");
+        mcp.reload();
+        let configured: Vec<String> = mcp
+            .client()
+            .list_servers()
+            .await
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(configured, ["other", "srv"]);
+        assert!(
+            wait_until(
+                || !mcp.client().cached_tools().is_empty(),
+                Duration::from_secs(10)
+            )
+            .await,
+            "the reload lists the granted server's tools"
+        );
+        let cached = mcp.client().cached_tools();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].server_id, "srv");
+        assert_eq!(marks(&home, "srv.starts").len(), 1);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            marks(&home, "other.starts").is_empty(),
+            "a server no grant reaches is not listed on reload"
+        );
     }
 
     // Server files that cannot serve do not stop the daemon: each is skipped with a warning
