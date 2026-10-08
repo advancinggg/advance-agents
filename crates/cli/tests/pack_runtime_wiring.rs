@@ -648,12 +648,17 @@ mod mcp_client {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use advance_cli::client_api_adapters::install_tools_if_real;
+    use advance_cli::commands::start::{spawn_test_agent_loop, TestServeLoop};
     use advance_cli::wiring::{wire_capabilities, WiringHandles};
+    use advance_client_api::{ClientApi, ClientRequest, ClientToolInventory};
+    use advance_context_engine::{assemble_unified, format_available_tools_section};
     use advance_event_bus::{EventFilter, ReadNext};
     use advance_runtime::bootstrap::{RuntimeHost, RuntimeHostBuilder};
     use advance_runtime::host_registry::HostCallContext;
     use advance_runtime::ComponentCtx;
     use advance_shared_types::capability::{CapParams, CapRequest, CapabilityId, GrantDecision};
+    use advance_shared_types::traits::CallableInventoryReader;
     use cap_grant::data::GrantStatus;
     use serde_json::{json, Value};
     use wasmtime::component::Val;
@@ -1556,6 +1561,218 @@ done
             marks(&home, "other.starts").is_empty(),
             "a server no grant reaches is not warmed up"
         );
+    }
+
+    // ── The callable inventory of the served root ───────────────────────────────────────
+
+    /// The driver the root's serve loop runs: the J01 skeleton guest, which imports
+    /// `agent-fs`, so a home that deploys it declares `fs`.
+    const DRIVER: &[u8] =
+        include_bytes!("../../runtime/tests/fixtures/guest-rust-j01-skeleton.core.wasm");
+
+    /// Deploy [`DRIVER`] where the daemon looks for the root's behavior.
+    fn deploy_driver(home: &Home) {
+        std::fs::write(home.root.join(".agent/behavior.wasm"), DRIVER).unwrap();
+    }
+
+    /// Serve the root as the daemon does, and install the callable inventory the loop was
+    /// spawned with as the Client API tools provider, under the root's mailbox key, as the
+    /// daemon does. Returns the loop and that inventory.
+    async fn serve_root(
+        host: &RuntimeHost,
+        handles: &WiringHandles,
+        home: &Home,
+        api: &ClientApi,
+    ) -> (TestServeLoop, Arc<dyn CallableInventoryReader>) {
+        let serve = spawn_test_agent_loop(
+            host,
+            &home.root,
+            handles,
+            handles.client_ingress_store.clone(),
+        )
+        .await
+        .expect("spawn the serve loop")
+        .expect("the deployed driver starts the serve loop");
+        assert_eq!(
+            serve.agent_id(),
+            handles.root_mailbox_id,
+            "the root is served under its mailbox key"
+        );
+        let inventory = serve
+            .tools_inventory()
+            .expect("a root that declares mcp has a callable inventory");
+        install_tools_if_real(
+            api,
+            Some(Arc::clone(&inventory)),
+            &handles.root_mailbox_id,
+            handles.skills_root.clone(),
+        );
+        (serve, inventory)
+    }
+
+    /// `GET /client/tools` as the operator.
+    fn client_tools(api: &ClientApi) -> ClientToolInventory {
+        super::data(&api.handle(ClientRequest::get("/client/tools").with_session("tok")))
+    }
+
+    /// `(server_id, name)` of each MCP entry of a Client API listing.
+    fn mcp_listed(inventory: &ClientToolInventory) -> Vec<(&str, &str)> {
+        inventory
+            .mcp
+            .iter()
+            .map(|entry| (entry.server_id.as_str(), entry.name.as_str()))
+            .collect()
+    }
+
+    // The root's serve loop and the Client API tools provider read the callable inventory
+    // under the root's mailbox key, `agent:<handle>`, while the root's `mcp` grant is stored
+    // under its id. Both reads list the tools the grant covers: the first read answers from
+    // the empty cache and starts the granted server in the background; once its listing is
+    // cached, the inventory holds each tool as `<server>__<tool>` with its server id, the
+    // prompt renders that name once (never doubled), and the Client API lists the same name
+    // beside `server_id`. The read under the id itself is the same read; a server the grant
+    // does not reach is never started.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_served_root_lists_its_mcp_tools_under_the_mailbox_key() {
+        with_master_key();
+        let home = home(
+            "capabilities:\n  fs: true\n  llm: true\n  mcp:\n    servers: [srv]\n    \
+             tool-patterns: [\"echo*\"]\n",
+            KEY_ENV,
+            "",
+        );
+        deploy_driver(&home);
+        stdio_server(&home, "srv", "", "");
+        stdio_server(&home, "other", "", "");
+        let (host, handles) = boot(&home).await;
+        assert!(
+            handles.llm_gateway.is_some(),
+            "llm declared: the loop assembles its context from this inventory"
+        );
+        let api = super::operator_api(&handles);
+        let (serve, inventory) = serve_root(&host, &handles, &home, &api).await;
+        let mailbox = handles.root_mailbox_id.clone();
+
+        // Nothing has started a server. The first read answers from the empty cache and
+        // starts the granted server in the background.
+        assert!(marks(&home, "srv.starts").is_empty());
+        assert!(
+            client_tools(&api).mcp.is_empty(),
+            "the first read is empty: the cache is filled in the background"
+        );
+        assert!(
+            wait_until(
+                || !inventory.list_mcp_tools(&mailbox).is_empty(),
+                Duration::from_secs(10)
+            )
+            .await,
+            "the listing the first read started fills the inventory"
+        );
+
+        let shown = inventory.list_mcp_tools(&mailbox);
+        let names: Vec<(&str, &str)> = shown
+            .iter()
+            .map(|entry| (entry.server_id.as_str(), entry.name.as_str()))
+            .collect();
+        assert_eq!(names, [("srv", "srv__echo"), ("srv", "srv__echo_twice")]);
+        assert_eq!(
+            inventory.list_mcp_tools(&handles.root_agent_id),
+            shown,
+            "the id the grant is stored under reads the same"
+        );
+        assert!(inventory.list_mcp_tools("agent:nobody").is_empty());
+
+        // What the model is shown, rendered by the prompt's formatter.
+        let section = format_available_tools_section(&assemble_unified(
+            vec![],
+            inventory.list_wasm_tools(&mailbox),
+            shown,
+        ));
+        let lines: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(
+            lines,
+            ["- srv__echo() — Echo", "- srv__echo_twice() — Echo twice"],
+            "{section}"
+        );
+
+        // What a client is shown: the same names, beside their server.
+        let listed = client_tools(&api);
+        assert_eq!(
+            mcp_listed(&listed),
+            [("srv", "srv__echo"), ("srv", "srv__echo_twice")]
+        );
+        assert_eq!(listed.mcp[0].description, "Echo");
+
+        assert_eq!(marks(&home, "srv.starts").len(), 1, "one server process");
+        assert!(
+            marks(&home, "other.starts").is_empty(),
+            "a server the grant does not reach is never started"
+        );
+        drop(serve);
+    }
+
+    // Without `llm` the loop assembles no context, and the daemon builds the callable
+    // inventory for the Client API alone; it follows the root's `mcp` grant the same way. A
+    // grant naming a server and no tool patterns lists every tool of that server once the
+    // listing is cached; a grant that reaches none of the home's servers lists nothing and
+    // starts nothing, however long one waits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_client_api_tools_follow_the_root_grant_without_a_context_assembler() {
+        let home = home(
+            "capabilities:\n  fs: true\n  mcp:\n    servers: [srv]\n",
+            NO_KEY_ENV,
+            "",
+        );
+        deploy_driver(&home);
+        stdio_server(&home, "srv", "", "");
+        let (host, handles) = boot(&home).await;
+        assert!(handles.llm_gateway.is_none());
+        let api = super::operator_api(&handles);
+        let (serve, inventory) = serve_root(&host, &handles, &home, &api).await;
+        assert!(client_tools(&api).mcp.is_empty(), "the first read is empty");
+        assert!(
+            wait_until(
+                || !client_tools(&api).mcp.is_empty(),
+                Duration::from_secs(10)
+            )
+            .await,
+            "a later read lists the server's tools"
+        );
+        let listed = client_tools(&api);
+        assert_eq!(
+            mcp_listed(&listed),
+            [
+                ("srv", "srv__echo"),
+                ("srv", "srv__echo_twice"),
+                ("srv", "srv__rm")
+            ]
+        );
+        assert_eq!(marks(&home, "srv.starts").len(), 1);
+        drop((serve, inventory, api, host, handles));
+
+        // The grant names only a server this home has no file for: it reaches none.
+        let none = self::home(
+            "capabilities:\n  fs: true\n  mcp:\n    servers: [absent]\n",
+            NO_KEY_ENV,
+            "",
+        );
+        deploy_driver(&none);
+        stdio_server(&none, "srv", "", "");
+        let (host, handles) = boot(&none).await;
+        let api = super::operator_api(&handles);
+        let (serve, inventory) = serve_root(&host, &handles, &none, &api).await;
+        assert!(client_tools(&api).mcp.is_empty());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(client_tools(&api).mcp.is_empty());
+        assert!(inventory
+            .list_mcp_tools(&handles.root_mailbox_id)
+            .is_empty());
+        assert!(inventory.list_mcp_tools(&handles.root_agent_id).is_empty());
+        assert!(
+            !none.marks.join("srv.starts").exists(),
+            "a server no grant reaches is never started"
+        );
+        drop(serve);
     }
 
     // ── An operator http server on loopback ─────────────────────────────────────────────

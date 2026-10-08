@@ -904,19 +904,68 @@ fn append_pack_origin(description: &mut String, origin: &str) {
 /// Live MCP half of the callable inventory: listings are filtered per agent
 /// through the gate, filled from the client's tool cache, and a first read
 /// starts a background refresh on the daemon runtime.
+///
+/// A read names its agent by one of the agent's ids. The grants are stored under the
+/// agent's immutable id, while the context assembler and the Client API tools provider read
+/// under the mailbox key `agent:<handle>` the agent is served under. An inventory built with
+/// [`for_agent`](Self::for_agent) maps each of those aliases to the stored id before it
+/// reads the grants, so both readers list what the agent's own calls are decided by.
+///
+/// An entry's name is the model-facing `<server>__<tool>`, the one callable name the prompt
+/// and the Client API share; `server_id` names the server beside it.
 pub struct LiveCallableInventory {
     wasm: Vec<ToolEntry>,
     tools_grant: Option<Arc<dyn advance_shared_types::traits::ToolsGrantReader>>,
     mcp: Arc<McpRuntime>,
+    grantee: Option<Grantee>,
+}
+
+/// The id an agent's grants are stored under, and the other ids a read may name it by.
+struct Grantee {
+    agent_id: String,
+    aliases: Vec<String>,
 }
 
 impl LiveCallableInventory {
-    /// The WASM snapshot plus the live MCP client of `mcp`.
+    /// The WASM snapshot plus the live MCP client of `mcp`; a read looks the grants up under
+    /// the id it names.
     pub fn new(wasm: Vec<ToolEntry>, mcp: Arc<McpRuntime>) -> Self {
         Self {
             wasm,
             tools_grant: None,
             mcp,
+            grantee: None,
+        }
+    }
+
+    /// As [`new`](Self::new), for the agent whose grants are stored under `agent_id`: a read
+    /// under `agent_id` or under any id in `aliases` (its mailbox key `agent:<handle>`) reads
+    /// that agent's grants. A read under any other id looks the grants up as named.
+    pub fn for_agent(
+        wasm: Vec<ToolEntry>,
+        mcp: Arc<McpRuntime>,
+        agent_id: &str,
+        aliases: &[String],
+    ) -> Self {
+        Self {
+            grantee: Some(Grantee {
+                agent_id: agent_id.to_string(),
+                aliases: aliases.to_vec(),
+            }),
+            ..Self::new(wasm, mcp)
+        }
+    }
+
+    /// The id whose grants a read naming `agent_id` reads.
+    fn grantee<'a>(&'a self, agent_id: &'a str) -> &'a str {
+        match &self.grantee {
+            Some(grantee)
+                if grantee.agent_id == agent_id
+                    || grantee.aliases.iter().any(|alias| alias == agent_id) =>
+            {
+                &grantee.agent_id
+            }
+            _ => agent_id,
         }
     }
 
@@ -928,9 +977,9 @@ impl LiveCallableInventory {
         self
     }
 
-    /// List tools of servers `agent_id` can reach that are not in the cache yet.
-    /// A failed listing is not cached, so a later read tries again. A caller
-    /// who reaches no server starts none.
+    /// List tools of servers `agent_id` (the id its grants are stored under) can reach
+    /// that are not in the cache yet. A failed listing is not cached, so a later read
+    /// tries again. An agent who reaches no server starts none.
     fn kick_refresh(&self, agent_id: &str) {
         let scopes = self.mcp.gate().scopes(agent_id);
         let mcp = Arc::clone(&self.mcp);
@@ -968,6 +1017,7 @@ impl LiveCallableInventory {
 
 impl CallableInventoryReader for LiveCallableInventory {
     fn list_wasm_tools(&self, agent_id: &str) -> Vec<ToolEntry> {
+        let agent_id = self.grantee(agent_id);
         match &self.tools_grant {
             None => self.wasm.clone(),
             Some(reader) => match reader.tool_allowlist(agent_id) {
@@ -983,6 +1033,7 @@ impl CallableInventoryReader for LiveCallableInventory {
     }
 
     fn list_mcp_tools(&self, agent_id: &str) -> Vec<McpToolEntry> {
+        let agent_id = self.grantee(agent_id);
         self.kick_refresh(agent_id);
         let scopes = self.mcp.gate().scopes(agent_id);
         let mut out = Vec::new();
@@ -1970,6 +2021,70 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["editor.format"]
         );
+    }
+
+    // The daemon reads the inventory under the root's mailbox key `agent:<handle>` while the
+    // root's grants are stored under its id. An inventory built for the agent maps the key
+    // to the id, so a read under either lists the same tools and reads the same `web` grant;
+    // the handle on its own, or any other id, holds nothing. Without the mapping the mailbox
+    // key is looked up as named, and nothing is stored under it.
+    #[tokio::test]
+    async fn a_read_under_an_alias_reads_the_grants_stored_under_the_agent_id() {
+        const ROOT_ID: &str = "0b1f6c4e-root-id";
+        let store = grant_store();
+        grant_params(&store, ROOT_ID, "mcp", &[("servers", "scholar")]);
+        grant(&store, ROOT_ID, "web");
+        let client = Arc::new(McpClient::new(
+            Arc::new(McpServersConfig::builder().build()),
+            Arc::new(CleanLeak),
+            None,
+        ));
+        client.store_cached_tools(
+            "scholar",
+            vec![
+                cached_tool("scholar", "search_papers", "Search papers"),
+                cached_tool("scholar", "web.search", "Search the web"),
+            ],
+        );
+        let runtime = McpRuntime::for_test(
+            client,
+            mcp_gate(
+                Arc::new(RecordingCheck::default()),
+                store,
+                WebRunMode::Standard,
+            ),
+            BTreeMap::new(),
+        );
+        let aliases = [ROOT_ID.to_string(), "agent:root".to_string()];
+        let inv = LiveCallableInventory::for_agent(vec![], Arc::clone(&runtime), ROOT_ID, &aliases);
+        let names = |agent: &str| -> Vec<String> {
+            inv.list_mcp_tools(agent)
+                .into_iter()
+                .map(|e| e.name)
+                .collect()
+        };
+        assert_eq!(
+            names("agent:root"),
+            ["scholar__search_papers", "scholar__web.search"]
+        );
+        assert_eq!(names(ROOT_ID), names("agent:root"));
+        assert!(
+            names("root").is_empty(),
+            "the handle alone names no grantee"
+        );
+        assert!(names("agent:someone-else").is_empty());
+        assert!(names("someone-else").is_empty());
+
+        let as_named = LiveCallableInventory::new(vec![], runtime);
+        assert_eq!(
+            as_named
+                .list_mcp_tools(ROOT_ID)
+                .into_iter()
+                .map(|e| e.name)
+                .collect::<Vec<_>>(),
+            ["scholar__search_papers", "scholar__web.search"]
+        );
+        assert!(as_named.list_mcp_tools("agent:root").is_empty());
     }
 
     fn registration(id: &str, pack: &str) -> McpRegistration {
