@@ -213,16 +213,19 @@ pub async fn compose(
                 wasm_engine,
                 exts.board(),
             ));
+            // Spawned before the supervisor exists: no trigger can close the tracker first.
+            exts.spawn_on_started(started);
+            let shutdown = ShutdownHandle::new(exts.route_gate().clone());
+            // The composition takes `compose`'s own reference to the extensions: once the
+            // supervisor can run, only the composition holds them, and its teardown lets
+            // go of them at the end of shutdown step 3.
             let composition = composition
-                .with_extensions(Arc::clone(&exts))
+                .with_extensions(exts)
                 .with_view(Arc::clone(&view));
             #[cfg(feature = "test-support")]
             let composition = composition.with_probe(failpoints.probe.clone());
-            // Spawned before the supervisor exists: no trigger can close the tracker first.
-            exts.spawn_on_started(started);
             // The one task that owns the composition: it runs the shutdown sequence once
             // the handle is triggered.
-            let shutdown = ShutdownHandle::new(exts.route_gate().clone());
             let (done_tx, done_rx) = watch::channel(false);
             let triggered = shutdown.token();
             let supervisor = tokio::spawn(async move {

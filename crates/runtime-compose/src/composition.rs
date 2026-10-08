@@ -12,14 +12,17 @@
 //!    `advance: shutting down`;
 //! 3. **extension hooks** — each extension's shutdown hook, in reverse registration
 //!    order, each bounded and isolated from the others' panics; then the composition
-//!    cancels and joins the extension tasks;
+//!    cancels and joins the extension tasks, revokes the extensions' views and lets go
+//!    of the extensions, so no extension is dropped after the holds or the instance
+//!    guard;
 //! 4. **holds**, in dependency order — the selected-provider writer, the config
 //!    watcher and its WAL-mode observer, the packs poll, the cap-grant sweeper, the
 //!    breaker subscriber, the ChatGPT sign-in (a renewal already started is awaited,
 //!    never cut off), the git commit queue (closed and its worker joined while the
 //!    EventBus still records its commits), the Client API provider slots and adapter
 //!    threads, the EventBus; then the rest of the graph is dropped on the blocking
-//!    pool (that drop joins the CONTRACT-218 custody threads and the epoch ticker);
+//!    pool (that drop joins the CONTRACT-218 custody threads and the epoch ticker),
+//!    then the holds the extensions attached;
 //! 5. **the instance guard** — the runtime lock is released last.
 //!
 //! Each step runs only for the parts that exist, so a composition that failed
@@ -284,7 +287,8 @@ pub(crate) struct Composition {
     host_pump: Option<JoinHandle<()>>,
     auto_tick: Option<(CancellationToken, JoinHandle<()>)>,
     readiness_walk: Option<ContinuousReadinessWalk>,
-    // Step 3: the extensions, in registration order, and the tasks started for them.
+    // Step 3: the extensions, in registration order, and the tasks started for them;
+    // the composition's only reference to each extension.
     extensions: Arc<ExtensionSet>,
     // Step 4: holds.
     selected_provider_task: Option<JoinHandle<()>>,
@@ -419,7 +423,8 @@ impl Composition {
         )
     }
 
-    /// The extensions composed with the runtime (their shutdown hooks run in step 3).
+    /// The extensions composed with the runtime: their shutdown hooks run in step 3, at
+    /// whose end the composition lets go of them.
     pub(crate) fn with_extensions(mut self, extensions: Arc<ExtensionSet>) -> Self {
         self.extensions = extensions;
         self
@@ -567,11 +572,22 @@ impl Composition {
         }
 
         // ── Step 3: extension hooks. ─────────────────────────────────────────────
-        self.extensions.run_shutdown_hooks(&self.steps).await;
-        self.extensions.cancel_and_join_tasks(&self.steps).await;
+        let extensions = std::mem::replace(&mut self.extensions, ExtensionSet::empty());
+        extensions.run_shutdown_hooks(&self.steps).await;
+        extensions.cancel_and_join_tasks(&self.steps).await;
+        // The composition lets go of its extensions here: no extension is dropped after
+        // the holds or the instance guard. Their views answer `ShutDown` from now on.
+        // The set holds the composition's only reference to each extension; an
+        // extension's `Drop` may join a thread of its own, so it runs off the runtime
+        // threads.
+        extensions.revoke();
+        if extensions.is_empty() {
+            drop(extensions);
+        } else {
+            let _ = tokio::task::spawn_blocking(move || drop(extensions)).await;
+        }
 
         // ── Step 4: holds, in dependency order. ───────────────────────────────────
-        self.extensions.revoke();
         if let Some(task) = self.selected_provider_task.take() {
             abort_and_join(task).await;
             self.steps.record("holds.selected_provider");
@@ -1068,8 +1084,10 @@ mod tests {
         }
     }
 
-    /// The composition drops an extension with the composition itself, after the
-    /// instance guard: hooks have run, the lock is already released.
+    /// The composition lets go of an extension right after the shutdown hooks: before
+    /// any hold is released and while the instance guard is still held. (The full
+    /// composition's legs, with a client family route, a host function, an inference
+    /// claim and spawned tasks, are in `tests/module_001_ac30_extensions_let_go.rs`.)
     #[tokio::test]
     async fn module_001_ac30_extensions_are_let_go_after_their_hooks() {
         let dir = tempfile::tempdir().unwrap();
@@ -1107,10 +1125,10 @@ mod tests {
             .expect("the extension was dropped");
         assert_eq!(
             steps,
-            vec!["extensions.hooks", "guard"],
-            "dropped with the composition after the guard"
+            vec!["extensions.hooks"],
+            "dropped right after its hook"
         );
-        assert!(!lock_held, "dropped after the instance guard was released");
+        assert!(lock_held, "dropped while the instance guard was still held");
         assert_eq!(
             probe.record().step_names(),
             vec!["extensions.hooks", "guard"]

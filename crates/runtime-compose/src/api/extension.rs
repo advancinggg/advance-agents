@@ -22,7 +22,9 @@ use super::tools::ToolRegistrar;
 /// once before any side effect. `shutdown` runs in shutdown step 3, reverse
 /// registration order, for every extension of a composition whose wiring started —
 /// also when its other callbacks never ran (a startup failure); it must then be a
-/// no-op.
+/// no-op. At the end of step 3, once the hooks ran and the extension tasks were
+/// joined, the composition drops its reference to each extension: before any hold
+/// is released and while the instance guard is still held.
 pub trait ComposeExtension: Send + Sync + 'static {
     /// `[a-z][a-z0-9-]{0,31}`, not reserved, unique per compose.
     fn id(&self) -> &'static str;
