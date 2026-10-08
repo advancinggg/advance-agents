@@ -1,4 +1,5 @@
-//! MODULE-001-T113 — spawn-site CI gate and composing (1)(3)(4)(7) legs.
+//! MODULE-001-T113 — spawn-site CI gate and composing (1)(3)(4)(7) legs
+//! (desktop / Forbid / ProcessLocal; iOS / Android rows).
 
 #[path = "support/sockets.rs"]
 mod sockets;
@@ -309,6 +310,36 @@ async fn module_001_ac32_t113_1_platform_table_desktop_rows_compose_with_their_d
         assert!(
             home.home().join(".runtime/runtime.lock").exists(),
             "runtime.lock while running"
+        );
+        rt.shutdown().await.expect("shutdown");
+        assert!(!home.home().join(".runtime/runtime.lock").exists());
+        assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac32_t113_1_platform_table_mobile_rows_compose_with_their_defaults() {
+    let _serial = SERIAL.lock().await;
+    for platform in [HostPlatform::Ios, HostPlatform::Android] {
+        let home = fixture_home(&["fs"], FixtureDriver::None, None);
+        let log = MemoryComposeLog::new();
+        let probe = Arc::new(ComposeProbe::new());
+        let baseline = alive_tasks();
+        let rt = compose(
+            home.embedded_options(platform, Arc::new(log), Arc::clone(&probe))
+                .with_client_api(ClientApiOptions::Off),
+            Vec::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{platform:?} composes: {e}"));
+        let health = rt.health();
+        assert_eq!(health.profile, ComposeProfile::Embedded { platform });
+        assert_eq!(health.instance_guard, InstanceGuardKind::ProcessLocal);
+        assert_eq!(health.processes, ProcessPolicy::Forbid);
+        assert_eq!(health.wasm_engine, WasmEngine::Pulley);
+        assert!(
+            !home.home().join(".runtime/runtime.lock").exists(),
+            "{platform:?}: no runtime.lock"
         );
         rt.shutdown().await.expect("shutdown");
         assert!(!home.home().join(".runtime/runtime.lock").exists());
@@ -664,10 +695,12 @@ async fn module_001_ac32_t113_3_pid_lock_probe_in_process_judges_a_live_lock_liv
     assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn module_001_ac32_t113_4_process_local_artefacts_and_sockets_daemon_profile() {
-    let _serial = SERIAL.lock().await;
-    let home = fixture_home(&["fs", "messaging", "lifecycle"], FixtureDriver::None, None);
+async fn assert_process_local_artefacts_and_sockets(
+    home: FixtureHome,
+    options: ComposeOptions,
+    probe: Arc<ComposeProbe>,
+    baseline: usize,
+) {
     let home_progress = std::env::var_os("HOME")
         .map(|h| PathBuf::from(h).join(".advance/platform-state/progress-lifecycle"));
     let home_before = home_progress.as_ref().map(|p| listing(p));
@@ -680,15 +713,9 @@ async fn module_001_ac32_t113_4_process_local_artefacts_and_sockets_daemon_profi
         fallback.display()
     );
 
-    let log = MemoryComposeLog::new();
-    let probe = Arc::new(ComposeProbe::new());
-    let baseline = alive_tasks();
-    let rt = compose(
-        process_local_options(&home, Arc::new(log), Arc::clone(&probe)),
-        Vec::new(),
-    )
-    .await
-    .expect("ProcessLocal daemon profile");
+    let rt = compose(options, Vec::new())
+        .await
+        .expect("ProcessLocal composition");
     let ep = rt.client_api().expect("client api");
     let addr = ep.socket_addr;
     let rec = probe.record();
@@ -728,9 +755,34 @@ async fn module_001_ac32_t113_4_process_local_artefacts_and_sockets_daemon_profi
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn module_001_ac32_t113_4_channels_or_oauth_sign_in_home_is_unsupported_under_process_local()
-{
+async fn module_001_ac32_t113_4_process_local_artefacts_and_sockets_daemon_profile() {
     let _serial = SERIAL.lock().await;
+    let home = fixture_home(&["fs", "messaging", "lifecycle"], FixtureDriver::None, None);
+    let log = MemoryComposeLog::new();
+    let probe = Arc::new(ComposeProbe::new());
+    let baseline = alive_tasks();
+    let options = process_local_options(&home, Arc::new(log), Arc::clone(&probe));
+    assert_process_local_artefacts_and_sockets(home, options, probe, baseline).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac32_t113_4_process_local_artefacts_and_sockets_ios_row() {
+    let _serial = SERIAL.lock().await;
+    let home = fixture_home(&["fs", "messaging", "lifecycle"], FixtureDriver::None, None);
+    let log = MemoryComposeLog::new();
+    let probe = Arc::new(ComposeProbe::new());
+    let baseline = alive_tasks();
+    let options = home.embedded_options(HostPlatform::Ios, Arc::new(log), Arc::clone(&probe));
+    assert_process_local_artefacts_and_sockets(home, options, probe, baseline).await;
+}
+
+async fn refuse_channels_or_oauth_under(
+    make_options: impl Fn(
+        &FixtureHome,
+        Arc<dyn advance_runtime_compose::ComposeLog>,
+        Arc<ComposeProbe>,
+    ) -> ComposeOptions,
+) {
     {
         let home = fixture_home(&["fs", "messaging"], FixtureDriver::None, None);
         append_runtime_config(&home, CHANNELS_BLOCK);
@@ -739,7 +791,7 @@ async fn module_001_ac32_t113_4_channels_or_oauth_sign_in_home_is_unsupported_un
         let baseline = alive_tasks();
         let what = refuse_unsupported(
             compose(
-                process_local_options(&home, Arc::new(log), Arc::clone(&probe)),
+                make_options(&home, Arc::new(log), Arc::clone(&probe)),
                 Vec::new(),
             )
             .await,
@@ -760,7 +812,7 @@ async fn module_001_ac32_t113_4_channels_or_oauth_sign_in_home_is_unsupported_un
         let baseline = alive_tasks();
         let what = refuse_unsupported(
             compose(
-                process_local_options(&home, Arc::new(log), Arc::clone(&probe)),
+                make_options(&home, Arc::new(log), Arc::clone(&probe)),
                 Vec::new(),
             )
             .await,
@@ -768,6 +820,23 @@ async fn module_001_ac32_t113_4_channels_or_oauth_sign_in_home_is_unsupported_un
         assert_eq!(what, Unsupported::ListenerRequired("OAuth callback"));
         assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac32_t113_4_channels_or_oauth_sign_in_home_is_unsupported_under_process_local()
+{
+    let _serial = SERIAL.lock().await;
+    refuse_channels_or_oauth_under(process_local_options).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac32_t113_4_channels_or_oauth_sign_in_home_is_unsupported_under_process_local_ios_row(
+) {
+    let _serial = SERIAL.lock().await;
+    refuse_channels_or_oauth_under(|home, log, probe| {
+        home.embedded_options(HostPlatform::Ios, log, probe)
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -840,6 +909,46 @@ async fn module_001_ac32_t113_7_registry_refuses_a_second_profile_on_the_same_ho
     let baseline3 = alive_tasks();
     let embedded = compose(
         home.embedded_options(platform, Arc::new(log3), Arc::clone(&probe3))
+            .with_client_api(ClientApiOptions::Off),
+        Vec::new(),
+    )
+    .await
+    .expect("embedded after daemon shutdown");
+    embedded.shutdown().await.expect("shutdown embedded");
+    assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
+    assert_gone_for_home(&probe3, home.home(), Some(baseline3)).await;
+    assert!(!reserved_homes().iter().any(|p| p == home.home()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac32_t113_7_registry_refuses_a_second_profile_on_the_same_home_ios_row() {
+    let _serial = SERIAL.lock().await;
+    let home = fixture_home(&["fs"], FixtureDriver::None, None);
+    let log = MemoryComposeLog::new();
+    let probe = Arc::new(ComposeProbe::new());
+    let baseline = alive_tasks();
+    let rt = compose(home.options(Arc::new(log), Arc::clone(&probe)), Vec::new())
+        .await
+        .expect("daemon compose");
+    let log2 = MemoryComposeLog::new();
+    let probe2 = Arc::new(ComposeProbe::new());
+    let error = compose(
+        home.embedded_options(HostPlatform::Ios, Arc::new(log2), Arc::clone(&probe2))
+            .with_client_api(ClientApiOptions::Off),
+        Vec::new(),
+    )
+    .await
+    .expect_err("second profile");
+    match error {
+        ComposeError::Lock(LockFailure::HeldInProcess) => {}
+        other => panic!("expected HeldInProcess, got {other:?}"),
+    }
+    rt.shutdown().await.expect("shutdown");
+    let log3 = MemoryComposeLog::new();
+    let probe3 = Arc::new(ComposeProbe::new());
+    let baseline3 = alive_tasks();
+    let embedded = compose(
+        home.embedded_options(HostPlatform::Ios, Arc::new(log3), Arc::clone(&probe3))
             .with_client_api(ClientApiOptions::Off),
         Vec::new(),
     )

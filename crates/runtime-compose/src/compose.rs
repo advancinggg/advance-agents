@@ -999,4 +999,24 @@ mod module_001_ac32_platform_tests {
             "this build targets ios; only the ios embedded profile can compose here"
         );
     }
+
+    #[test]
+    fn module_001_ac32_d3_compiled_ios_target_validates_the_ios_row() {
+        let (_home_dir, home) = canonical_tempdir();
+        let (_root_dir, root) = canonical_tempdir();
+        let log = Arc::new(NullComposeLog);
+        let options = ComposeOptions::embedded(
+            &home,
+            HostPlatform::Ios,
+            log as Arc<dyn crate::api::ComposeLog>,
+        )
+        .with_state_root(&root);
+        assert_eq!(
+            validate_with_compiled(&options, Some(HostPlatform::Ios)).unwrap(),
+            Plan {
+                home,
+                state_root: Some(root)
+            }
+        );
+    }
 }
