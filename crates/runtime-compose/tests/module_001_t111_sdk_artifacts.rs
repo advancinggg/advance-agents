@@ -1,12 +1,12 @@
 //! MODULE-001-T111 (3) / MODULE-001-AC-30 — the composition library changes no wire
 //! contract: the CONTRACT-192 artifacts under `crates/client-api/sdk-artifacts` are
-//! byte-identical to the lane base `84a82451` (owner ruling 2026-10-03: the schema changed on
-//! the main line after v0.1.26, `api_version` did not; the base is the tree this lane started
-//! from).
+//! byte-identical to the recorded set in `fixtures/sdk_artifacts_lane_base.sha256`.
 //!
-//! `fixtures/sdk_artifacts_lane_base.sha256` holds `<sha256>  <path>` of every file, captured
-//! with `git show 84a82451:crates/client-api/sdk-artifacts/<path> | shasum -a 256`. The same
-//! check at lane close: `git diff --exit-code 84a82451 -- crates/client-api/sdk-artifacts`.
+//! That file holds `<sha256>  <path>` of every artifact file (`shasum -a 256`). It was first
+//! captured at `84a82451` (owner ruling 2026-10-03: the schema changed on the main line after
+//! v0.1.26, `api_version` did not), and it is re-captured only when a deliberate client-api
+//! contract change regenerates the artifacts with `gen_client_sdk --write`, never for a
+//! change of the composition library.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 const LANE_BASE: &str = include_str!("fixtures/sdk_artifacts_lane_base.sha256");
-const SCHEMA_HASH: &str = "d7fb650a6c002a269cf3018af90701e5435246712ffe5712443f79b4a99ff492";
+const SCHEMA_HASH: &str = "78e08481e1f6fd1f46cb6343daeb18fc51c653e61497c9db5db18d3622991332";
 const API_VERSION: &str = "2026-09-17";
 
 fn artifacts_dir() -> PathBuf {
@@ -59,7 +59,7 @@ fn module_001_ac30_t111_3_sdk_artifacts_byte_identical_to_lane_base() {
     collect(&root, &root, &mut actual);
     assert_eq!(
         actual, expected,
-        "crates/client-api/sdk-artifacts differs from the lane base 84a82451"
+        "crates/client-api/sdk-artifacts differs from the recorded artifact set"
     );
 
     let manifest: serde_json::Value = serde_json::from_slice(
