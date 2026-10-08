@@ -15,7 +15,7 @@ use std::sync::Arc;
 use advance_runtime_compose::registry::reserved_homes_for_test;
 use advance_runtime_compose::test_support::{ComposeFailpoints, ComposeProbe, MemoryComposeLog};
 use advance_runtime_compose::{
-    compose, ComposeError, ComposeLog, ComposeOptions, InstanceGuard, Unsupported, WasmEngine,
+    compose, ComposeError, ComposeLog, ComposeOptions, InstanceGuard, Unsupported,
 };
 use t111::{serial, T111Home};
 
@@ -32,11 +32,6 @@ async fn module_001_ac30_unsupported_values_refused_before_side_effects() {
     let inside = home.home.join(".runtime");
 
     let rows: Vec<(&str, ComposeOptions, Unsupported)> = vec![
-        (
-            "wasm_engine: Pulley",
-            home.options(log()).with_wasm_engine(WasmEngine::Pulley),
-            Unsupported::NotYetAvailable("WasmEngine::Pulley"),
-        ),
         (
             "process-local guard with a discovery file",
             home.options(log())

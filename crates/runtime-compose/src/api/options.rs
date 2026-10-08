@@ -483,10 +483,12 @@ pub use advance_shared_types::process_policy::ProcessPolicy;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WasmEngine {
-    /// Native code generation.
+    /// Cranelift native code (today's engines).
     #[default]
     Native,
-    /// The portable interpreter.
+    /// Pulley bytecode on both engines (`pulley64`): no executable memory, no signal handler;
+    /// each engine reserves the configured maximum memory (`max_memory_pages × 64 KiB`, at most
+    /// 4 GiB). Needs a 64-bit little-endian host.
     Pulley,
 }
 

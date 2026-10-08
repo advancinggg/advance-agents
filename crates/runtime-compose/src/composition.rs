@@ -44,7 +44,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::{
     log_keys, BoxFuture, ClientApiEndpoint, ComposeProfile, InstanceGuardKind, ProcessPolicy,
-    RuntimePhase,
+    RuntimePhase, WasmEngine,
 };
 use crate::client_api_adapters::WorkerControl;
 use crate::compose_log::LogHandle;
@@ -180,6 +180,7 @@ pub(crate) struct RuntimeView {
     instance_guard: InstanceGuardKind,
     profile: ComposeProfile,
     processes: ProcessPolicy,
+    wasm_engine: WasmEngine,
     extensions: Arc<ExtensionBoard>,
 }
 
@@ -191,6 +192,7 @@ impl RuntimeView {
         instance_guard: InstanceGuardKind,
         profile: ComposeProfile,
         processes: ProcessPolicy,
+        wasm_engine: WasmEngine,
         extensions: Arc<ExtensionBoard>,
     ) -> Self {
         Self {
@@ -201,6 +203,7 @@ impl RuntimeView {
             instance_guard,
             profile,
             processes,
+            wasm_engine,
             extensions,
         }
     }
@@ -242,6 +245,10 @@ impl RuntimeView {
 
     pub(crate) fn processes(&self) -> ProcessPolicy {
         self.processes
+    }
+
+    pub(crate) fn wasm_engine(&self) -> WasmEngine {
+        self.wasm_engine
     }
 
     pub(crate) fn extensions(&self) -> Vec<crate::api::ExtensionHealth> {
@@ -891,6 +898,7 @@ mod tests {
             guard.kind(),
             crate::api::ComposeProfile::Daemon,
             crate::api::ProcessPolicy::Allow,
+            crate::api::WasmEngine::Native,
             ExtensionSet::empty().board(),
         ));
         assert_eq!(view.phase(), RuntimePhase::Running);

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use advance_client_api::families::RouteRefusalReason;
 
-use super::options::{HostPlatform, PlatformRule};
+use super::options::{HostPlatform, PlatformRule, WasmEngine};
 
 /// A composition that did not start. Whatever had started is stopped before the
 /// error is returned.
@@ -174,6 +174,11 @@ pub enum Unsupported {
     ListenerUnderProcessLocal(&'static str),
     /// `Embedded { .. }` with a same-user Client API admission (ADR D3).
     EmbeddedAdmission,
+    /// The requested wasm engine cannot run on this host (Pulley needs a 64-bit little-endian host).
+    WasmEngineUnavailable {
+        engine: WasmEngine,
+        reason: &'static str,
+    },
 }
 
 /// Why the instance guard could not be taken.
@@ -414,6 +419,10 @@ impl fmt::Display for Unsupported {
             ),
             Unsupported::EmbeddedAdmission => f.write_str(
                 "the embedded profile admits only in-process Client API sessions (Admission::InProcessOnly)",
+            ),
+            Unsupported::WasmEngineUnavailable { engine, reason } => write!(
+                f,
+                "the {engine:?} wasm engine is not available on this host: {reason}"
             ),
         }
     }

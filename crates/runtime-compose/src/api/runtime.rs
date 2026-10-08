@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::ComposeError;
 use super::extension::{ExtensionHealth, ExtensionState};
-use super::options::{ComposeProfile, ProcessPolicy};
+use super::options::{ComposeProfile, ProcessPolicy, WasmEngine};
 use crate::composition::RuntimeView;
 
 /// A running composition. It owns nothing of the runtime itself: the runtime's parts
@@ -137,6 +137,7 @@ impl ComposedRuntime {
             instance_guard: self.view.instance_guard(),
             profile: self.view.profile(),
             processes: self.view.processes(),
+            wasm_engine: self.view.wasm_engine(),
             extensions,
             failed_extensions,
         }
@@ -283,6 +284,8 @@ pub struct RuntimeHealthView {
     pub profile: ComposeProfile,
     /// The policy every spawn site of this composition received.
     pub processes: ProcessPolicy,
+    /// The code both Wasmtime engines emit, read back from them: `Pulley` iff both target pulley64.
+    pub wasm_engine: WasmEngine,
     /// Every composed extension, in registration order.
     pub extensions: Vec<ExtensionHealth>,
     /// Extensions whose start failed.

@@ -49,6 +49,7 @@ pub async fn compose(
         log,
         profile,
         processes,
+        wasm_engine,
         hot_reload,
         #[cfg(feature = "test-support")]
         failpoints,
@@ -94,7 +95,7 @@ pub async fn compose(
     let config_path = config_path(&plan.home);
     let builder =
         match RuntimeHostBuilder::new_with_hot_reload(&config_path, &plan.home, hot_reload).await {
-            Ok(builder) => builder,
+            Ok(builder) => builder.with_wasm_backend(wasm_backend(wasm_engine)),
             Err(BootstrapError::Config(ConfigError::IoError { source, .. }))
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
@@ -183,6 +184,7 @@ pub async fn compose(
     };
     match compose_graph(builder, &plan.home, opts).await {
         Ok(graph) => {
+            let wasm_engine = engine_of(&graph.host.component_runtime().engine_report());
             let started = StartedParts {
                 gateway: graph
                     .wiring_handles
@@ -208,6 +210,7 @@ pub async fn compose(
                 instance_guard,
                 profile,
                 processes,
+                wasm_engine,
                 exts.board(),
             ));
             let composition = composition
@@ -274,12 +277,14 @@ pub(crate) struct Plan {
 #[derive(Clone, Copy, Debug)]
 struct HostFacts {
     compiled: Option<HostPlatform>,
+    pulley_supported: bool,
 }
 
 impl HostFacts {
     fn current() -> Self {
         Self {
             compiled: HostPlatform::compiled(),
+            pulley_supported: advance_runtime::component_loader::PULLEY_HOST_SUPPORTED,
         }
     }
 }
@@ -292,7 +297,6 @@ pub(crate) fn validate(options: &ComposeOptions) -> Result<Plan, ComposeError> {
 
 /// Test seam, kept as a wrapper: `validate_on(o, HostFacts { compiled, ..HostFacts::current() })`.
 #[cfg(test)]
-#[allow(clippy::needless_update)] // `pulley_supported` joins `HostFacts` later; keep the shape.
 fn validate_with_compiled(
     options: &ComposeOptions,
     compiled: Option<HostPlatform>,
@@ -373,9 +377,8 @@ fn validate_on(options: &ComposeOptions, host: HostFacts) -> Result<Plan, Compos
         }
     }
 
-    if options.wasm_engine == WasmEngine::Pulley {
-        return refuse(Unsupported::NotYetAvailable("WasmEngine::Pulley"));
-    }
+    check_wasm_engine(options.wasm_engine, host.pulley_supported)
+        .map_err(ComposeError::Unsupported)?;
 
     Ok(Plan { home, state_root })
 }
@@ -419,6 +422,32 @@ fn row_allows(
         return Err(PlatformRule::Instance);
     }
     Ok(())
+}
+
+fn check_wasm_engine(engine: WasmEngine, pulley_supported: bool) -> Result<(), Unsupported> {
+    match engine {
+        WasmEngine::Native => Ok(()),
+        WasmEngine::Pulley if pulley_supported => Ok(()),
+        WasmEngine::Pulley => Err(Unsupported::WasmEngineUnavailable {
+            engine: WasmEngine::Pulley,
+            reason: "pulley64 needs a 64-bit little-endian host",
+        }),
+    }
+}
+
+fn wasm_backend(engine: WasmEngine) -> advance_runtime::WasmBackend {
+    match engine {
+        WasmEngine::Native => advance_runtime::WasmBackend::Native,
+        WasmEngine::Pulley => advance_runtime::WasmBackend::Pulley,
+    }
+}
+
+fn engine_of(report: &advance_runtime::EngineReport) -> WasmEngine {
+    if report.host.is_pulley && report.tool.is_pulley {
+        WasmEngine::Pulley
+    } else {
+        WasmEngine::Native
+    }
 }
 
 /// `path` canonicalized, when it is an absolute path to an existing directory.
@@ -597,18 +626,7 @@ mod tests {
             )))
             .is_ok()
         );
-    }
-
-    #[test]
-    fn module_001_ac30_validate_refuses_each_value_this_build_does_not_compose() {
-        let (_home_dir, home) = canonical_tempdir();
-        let cases = [(
-            daemon(&home).with_wasm_engine(WasmEngine::Pulley),
-            "WasmEngine::Pulley",
-        )];
-        for (options, what) in cases {
-            assert_eq!(refused(&options), Unsupported::NotYetAvailable(what));
-        }
+        assert!(validate(&daemon(&home).with_wasm_engine(WasmEngine::Pulley)).is_ok());
     }
 
     #[test]
@@ -666,14 +684,14 @@ mod tests {
     async fn module_001_ac30_compose_refusals_leave_no_guard_behind() {
         let (_home_dir, home) = canonical_tempdir();
         let error = compose(
-            daemon(&home).with_wasm_engine(WasmEngine::Pulley),
+            daemon(&home).with_instance(InstanceGuard::ProcessLocal),
             Vec::new(),
         )
         .await
         .unwrap_err();
         assert!(matches!(
             error,
-            ComposeError::Unsupported(Unsupported::NotYetAvailable("WasmEngine::Pulley"))
+            ComposeError::Unsupported(Unsupported::DiscoveryRequiresPidLock)
         ));
         assert!(!home.join(".runtime").exists(), "nothing was written");
         assert!(!crate::registry::reserved_homes_for_test().contains(&home));
@@ -710,6 +728,117 @@ mod tests {
         );
         assert!(!home.join(".runtime").exists(), "no lock was tried");
         drop(held);
+    }
+
+    #[test]
+    fn module_001_ac32_pulley_needs_a_64_bit_little_endian_host() {
+        let (_home_dir, home) = canonical_tempdir();
+        assert!(matches!(
+            check_wasm_engine(WasmEngine::Pulley, false),
+            Err(Unsupported::WasmEngineUnavailable {
+                engine: WasmEngine::Pulley,
+                reason: "pulley64 needs a 64-bit little-endian host",
+            })
+        ));
+        assert_eq!(
+            ComposeError::Unsupported(Unsupported::WasmEngineUnavailable {
+                engine: WasmEngine::Pulley,
+                reason: "pulley64 needs a 64-bit little-endian host",
+            })
+            .to_string(),
+            "unsupported: the Pulley wasm engine is not available on this host: pulley64 needs a 64-bit little-endian host"
+        );
+        assert!(check_wasm_engine(WasmEngine::Pulley, true).is_ok());
+        assert!(check_wasm_engine(WasmEngine::Native, false).is_ok());
+
+        let pulley = daemon(&home).with_wasm_engine(WasmEngine::Pulley);
+        match validate_on(
+            &pulley,
+            HostFacts {
+                compiled: None,
+                pulley_supported: false,
+            },
+        ) {
+            Err(ComposeError::Unsupported(Unsupported::WasmEngineUnavailable {
+                engine: WasmEngine::Pulley,
+                reason: "pulley64 needs a 64-bit little-endian host",
+            })) => {}
+            other => panic!("expected WasmEngineUnavailable, got {other:?}"),
+        }
+        assert!(validate_on(
+            &pulley,
+            HostFacts {
+                compiled: None,
+                pulley_supported: true,
+            },
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn module_001_ac32_wasm_engine_check_runs_after_the_platform_table_rows() {
+        let (_home_dir, home) = canonical_tempdir();
+        let (_root_dir, state_root) = canonical_tempdir();
+        let log = Arc::new(NullComposeLog);
+
+        let ios_native = ComposeOptions::embedded(
+            &home,
+            HostPlatform::Ios,
+            Arc::clone(&log) as Arc<dyn crate::api::ComposeLog>,
+        )
+        .with_state_root(&state_root)
+        .with_wasm_engine(WasmEngine::Native);
+        match validate_on(
+            &ios_native,
+            HostFacts {
+                compiled: None,
+                pulley_supported: true,
+            },
+        ) {
+            Err(ComposeError::Unsupported(Unsupported::PlatformTable {
+                platform: HostPlatform::Ios,
+                rule: PlatformRule::Engine,
+            })) => {}
+            other => panic!("expected PlatformTable Engine, got {other:?}"),
+        }
+
+        let ios_default = ComposeOptions::embedded(
+            &home,
+            HostPlatform::Ios,
+            Arc::clone(&log) as Arc<dyn crate::api::ComposeLog>,
+        )
+        .with_state_root(&state_root);
+        match validate_on(
+            &ios_default,
+            HostFacts {
+                compiled: None,
+                pulley_supported: false,
+            },
+        ) {
+            Err(ComposeError::Unsupported(Unsupported::WasmEngineUnavailable {
+                engine: WasmEngine::Pulley,
+                ..
+            })) => {}
+            other => panic!("expected WasmEngineUnavailable, got {other:?}"),
+        }
+
+        let ios_no_root = ComposeOptions::embedded(
+            &home,
+            HostPlatform::Ios,
+            log as Arc<dyn crate::api::ComposeLog>,
+        );
+        match validate_on(
+            &ios_no_root,
+            HostFacts {
+                compiled: None,
+                pulley_supported: false,
+            },
+        ) {
+            Err(ComposeError::Unsupported(Unsupported::StateRootRequired {
+                platform: HostPlatform::Ios,
+            })) => {}
+            other => panic!("expected StateRootRequired, got {other:?}"),
+        }
     }
 }
 
