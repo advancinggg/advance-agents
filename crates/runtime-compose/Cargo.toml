@@ -30,7 +30,7 @@ advance-home = { path = "../advance-home" }
 build-agent = { path = "../build-agent" }
 # Same feature set as `advance-cli` declared before the move, so the `advance`
 # binary's unified tokio feature set is unchanged.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "net", "io-util"] }
 # `rt`: `TaskTracker` (the composition's extension tasks).
 tokio-util = { workspace = true, features = ["rt"] }
 axum = { workspace = true }

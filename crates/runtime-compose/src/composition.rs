@@ -32,7 +32,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use advance_client_api::{ClientApi, ClientApiServer, ShutdownIngress};
+use crate::client_ingress::{ClientIngress, IngressFromGraph};
+use advance_client_api::{ClientApi, ShutdownIngress};
 use advance_runtime::config::RuntimeConfigWatcher;
 use advance_runtime::runtime_lock::RuntimeLock;
 use advance_runtime::RuntimeHost;
@@ -173,7 +174,7 @@ impl GuardHold {
 pub(crate) struct RuntimeView {
     phase: Mutex<RuntimePhase>,
     root_agent_id: String,
-    client_api: Option<ClientApiEndpoint>,
+    client_ingress: Option<Arc<ClientIngress>>,
     /// `true` once the root serve loop has ended; `None` without a deployed driver.
     agent_loop_done: Option<watch::Receiver<bool>>,
     instance_guard: InstanceGuardKind,
@@ -185,7 +186,7 @@ pub(crate) struct RuntimeView {
 impl RuntimeView {
     pub(crate) fn new(
         root_agent_id: String,
-        client_api: Option<ClientApiEndpoint>,
+        client_ingress: Option<Arc<ClientIngress>>,
         agent_loop_done: Option<watch::Receiver<bool>>,
         instance_guard: InstanceGuardKind,
         profile: ComposeProfile,
@@ -195,7 +196,7 @@ impl RuntimeView {
         Self {
             phase: Mutex::new(RuntimePhase::Running),
             root_agent_id,
-            client_api,
+            client_ingress,
             agent_loop_done,
             instance_guard,
             profile,
@@ -216,8 +217,12 @@ impl RuntimeView {
         &self.root_agent_id
     }
 
-    pub(crate) fn client_api(&self) -> Option<&ClientApiEndpoint> {
-        self.client_api.as_ref()
+    pub(crate) fn client_api_endpoint(&self) -> Option<ClientApiEndpoint> {
+        self.client_ingress.as_ref().and_then(|ing| ing.endpoint())
+    }
+
+    pub(crate) fn client_ingress(&self) -> Option<&Arc<ClientIngress>> {
+        self.client_ingress.as_ref()
     }
 
     /// Whether the root serve loop is still running.
@@ -264,7 +269,7 @@ pub(crate) struct Composition {
     /// The state a composed runtime reports (none for a composition that failed to start).
     view: Option<Arc<RuntimeView>>,
     // Step 1: ingress.
-    client_api_server: Option<ClientApiServer>,
+    client_ingress: Option<Arc<ClientIngress>>,
     msg_listener: Option<Listener>,
     hooks: Option<(CancellationToken, JoinHandle<()>)>,
     // Step 2: loops (the per-child manager and the stream reaper are in `stoppers`).
@@ -297,6 +302,7 @@ impl Composition {
         wal_observer: Option<JoinHandle<()>>,
         guard: GuardHold,
         log: LogHandle,
+        ingress: IngressFromGraph,
     ) -> Self {
         let ComposedGraph {
             host,
@@ -323,7 +329,14 @@ impl Composition {
             claimed_preflight: wiring_handles.claimed_preflight.take(),
         };
         let extension_holds = std::mem::take(&mut wiring_handles.extension_holds);
-        let client_api_server = wiring_handles.client_api_server.take();
+        let client_ingress = wiring_handles.client_api_server.take().map(|server| {
+            ClientIngress::new(
+                server,
+                ingress,
+                log.clone(),
+                tokio::runtime::Handle::current(),
+            )
+        });
         let (root_loop, hooks, host_pump) = match agent_loop {
             Some(spawned) => (Some(spawned.handle), spawned.hooks, spawned.host_pump),
             None => (None, None, None),
@@ -332,7 +345,7 @@ impl Composition {
             log,
             steps: StepLog::default(),
             view: None,
-            client_api_server,
+            client_ingress,
             msg_listener,
             hooks,
             root_loop,
@@ -364,7 +377,7 @@ impl Composition {
             log,
             steps: StepLog::default(),
             view: None,
-            client_api_server: None,
+            client_ingress: None,
             msg_listener: None,
             hooks: None,
             root_loop: None,
@@ -411,6 +424,10 @@ impl Composition {
         self
     }
 
+    pub(crate) fn client_ingress(&self) -> Option<Arc<ClientIngress>> {
+        self.client_ingress.clone()
+    }
+
     /// Record every teardown step into `probe`.
     #[cfg(feature = "test-support")]
     pub(crate) fn with_probe(
@@ -430,14 +447,14 @@ impl Composition {
         }
 
         // ── Step 1: ingress, the four drains concurrently. ───────────────────────
-        let client_api_server = self.client_api_server.take();
+        let client_ingress = self.client_ingress.take();
         let msg_listener = self.msg_listener.take();
         let hooks = self.hooks.take();
         let claimed_preflight = self.stoppers.claimed_preflight.take();
         let (client_api, msg_overran, hooks_overran, preflight_ran) = tokio::join!(
             async {
-                match client_api_server {
-                    Some(server) => Some(server.shutdown_ingress(CLIENT_API_DRAIN).await),
+                match client_ingress {
+                    Some(ing) => Some(ing.shutdown(CLIENT_API_DRAIN).await),
                     None => None,
                 }
             },

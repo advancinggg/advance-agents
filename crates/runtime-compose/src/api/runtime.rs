@@ -40,12 +40,77 @@ impl ComposedRuntime {
     }
 
     /// The Client API this composition serves: `None` when none is bound, and from the
-    /// moment the shutdown is triggered. It holds the API only weakly.
+    /// moment the shutdown is triggered. It holds the API only weakly. After a rebind
+    /// the endpoint follows the listener (`RuntimeView::client_api_endpoint`).
     pub fn client_api(&self) -> Option<ClientApiEndpoint> {
         if self.shutdown.is_triggered() {
             return None;
         }
-        self.view.client_api().cloned()
+        self.view.client_api_endpoint()
+    }
+
+    /// ADR 2026-10-03 D3: probe the Client API listener (a host calls this when its
+    /// app returns to the foreground) and, when it does not answer, rebind the same
+    /// `ClientApi`, previous port first. Bounded (about 2 s). Runs on the runtime
+    /// that composed, whatever runtime polls this future; serialised with shutdown
+    /// step 1.
+    pub async fn reverify_client_api(&self) -> Result<ClientApiCheck, ClientApiRebindError> {
+        let ing = self
+            .view
+            .client_ingress()
+            .ok_or(ClientApiRebindError::NotComposed)?;
+        if ing.admission() != crate::api::Admission::InProcessOnly {
+            return Err(ClientApiRebindError::NotInProcessAdmission);
+        }
+        if self.shutdown.is_triggered() {
+            return Err(ClientApiRebindError::ShuttingDown);
+        }
+        let join = ing
+            .runtime()
+            .spawn(std::sync::Arc::clone(ing).reverify_body());
+        match join.await {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(_) => Err(ClientApiRebindError::ShuttingDown),
+        }
+    }
+
+    /// Close the listener as if the OS had reclaimed its socket (the endpoint keeps
+    /// naming the old base until the next re-verification). `None` without a listener
+    /// or once shutdown step 1 ran.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn sever_client_api_listener_for_test(&self) -> Option<SocketAddr> {
+        let ing = self.view.client_ingress()?;
+        ing.sever_for_test().await
+    }
+
+    /// The next probe reports "no answer" although the listener is up.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn fail_next_client_api_probe_for_test(&self) {
+        if let Some(ing) = self.view.client_ingress() {
+            ing.fail_next_probe();
+        }
+    }
+
+    /// The next rebind fails both binds.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn fail_next_client_api_rebind_for_test(&self) {
+        if let Some(ing) = self.view.client_ingress() {
+            ing.fail_next_rebind();
+        }
+    }
+
+    /// The next re-verification parks after its shutdown pre-check and before it
+    /// takes the ingress lock (`reached` is notified, then it awaits `resume`).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn pause_next_client_api_reverify_for_test(
+        &self,
+    ) -> Option<crate::test_support::ReverifyPause> {
+        self.view.client_ingress().map(|ing| ing.arm_pause())
     }
 
     /// The root agent's immutable id.
@@ -121,6 +186,74 @@ impl fmt::Debug for ComposedRuntime {
             .field("phase", &self.view.phase())
             .field("shutdown", &self.shutdown)
             .finish_non_exhaustive()
+    }
+}
+
+/// What [`ComposedRuntime::reverify_client_api`] found (ADR 2026-10-03 D3 foreground
+/// re-verification).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientApiCheck {
+    /// The listener answered its own probe; nothing changed.
+    Healthy,
+    /// The listener did not answer and was bound again on its previous port, on the
+    /// same `ClientApi`: the base and every session are unchanged.
+    Rebound { addr: SocketAddr },
+    /// The previous port could not be bound again; the same `ClientApi` now listens
+    /// on a new port. The base changed. The caller mints a new session and revokes
+    /// the old ones (`api.sessions().revoke_all()`); the CONTRACT-210 bridge does
+    /// this itself.
+    Moved {
+        previous: SocketAddr,
+        current: SocketAddr,
+    },
+}
+
+/// Why [`ComposedRuntime::reverify_client_api`] did not complete a check or rebind.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum ClientApiRebindError {
+    /// No Client API was composed (`ClientApiOptions::Off`, or a same-user bind that
+    /// failed at boot).
+    NotComposed,
+    /// Re-verification is offered for `Admission::InProcessOnly` only: a same-user
+    /// daemon's discovery file and console origin name its port, so its listener is
+    /// never moved.
+    NotInProcessAdmission,
+    /// Shutdown has started (checked again after the ingress lock is taken).
+    ShuttingDown,
+    /// Neither the previous port nor a new one could be bound. The Client API stays
+    /// unbound until a later `reverify_client_api` succeeds; `client_api()` answers
+    /// `None` meanwhile.
+    Bind {
+        previous: SocketAddr,
+        error: std::io::Error,
+    },
+}
+
+impl fmt::Display for ClientApiRebindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotComposed => write!(f, "no Client API was composed"),
+            Self::NotInProcessAdmission => write!(
+                f,
+                "the Client API listener is rebound only under in-process admission"
+            ),
+            Self::ShuttingDown => write!(f, "the runtime is shutting down"),
+            Self::Bind { previous, error } => write!(
+                f,
+                "Client API listener could not be bound again (previous {previous}): {error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClientApiRebindError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Bind { error, .. } => Some(error),
+            _ => None,
+        }
     }
 }
 

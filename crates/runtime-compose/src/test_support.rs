@@ -28,6 +28,14 @@ use crate::perchild_daemon::PerChildLoopManager;
 
 pub use crate::composition::TEARDOWN_ORDER;
 
+/// Parks the next `reverify_client_api` after its shutdown pre-check and before it
+/// takes the ingress lock: `reached` is notified, then the body awaits `resume`.
+#[derive(Clone)]
+pub struct ReverifyPause {
+    pub reached: Arc<tokio::sync::Notify>,
+    pub resume: Arc<tokio::sync::Notify>,
+}
+
 pub mod fixture;
 pub mod proc_self;
 

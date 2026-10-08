@@ -156,6 +156,12 @@ pub mod log_keys {
     pub const CLIENT_API_LISTENING_IN_PROCESS: &str = "wiring.client_api_listening_in_process";
     /// stderr: the Client API is unavailable (loopback bind failed).
     pub const CLIENT_API_UNAVAILABLE: &str = "wiring.client_api_unavailable";
+    /// stderr: the Client API listener was bound again on its previous port.
+    pub const CLIENT_API_REBOUND: &str = "compose.client_api_rebound";
+    /// stderr: the Client API listener moved to a new port.
+    pub const CLIENT_API_MOVED: &str = "compose.client_api_moved";
+    /// stderr: neither the previous port nor a new one could be bound.
+    pub const CLIENT_API_REBIND_FAILED: &str = "compose.client_api_rebind_failed";
 
     // The ordered shutdown (each only when a bound elapses, a listener fails or a hook
     // panics).
@@ -287,6 +293,9 @@ pub mod log_keys {
         CLIENT_API_LISTENING,
         CLIENT_API_LISTENING_IN_PROCESS,
         CLIENT_API_UNAVAILABLE,
+        CLIENT_API_REBOUND,
+        CLIENT_API_MOVED,
+        CLIENT_API_REBIND_FAILED,
         COMPOSE_CLIENT_API_DRAIN_OVERRUN,
         COMPOSE_CLIENT_API_SERVE_FAILED,
         COMPOSE_MSG_LISTENER_DRAIN_OVERRUN,

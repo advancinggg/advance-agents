@@ -20,6 +20,7 @@ use crate::api::{
     ComposedRuntime, HostPlatform, InstanceGuard, LockFailure, MasterKeyInput, PlatformRule,
     ProcessPolicy, RuntimeHealthView, ShutdownHandle, Unsupported, WasmEngine,
 };
+use crate::client_ingress::IngressFromGraph;
 use crate::compose_log::LogHandle;
 use crate::composition::{Composition, GuardHold, RuntimeView, TeardownReason};
 use crate::daemon::{compose_graph, GraphFailure, GraphOptions, PartialGraph};
@@ -165,6 +166,21 @@ pub async fn compose(
         #[cfg(feature = "test-support")]
         failpoints: failpoints.clone(),
     };
+    let (admission, write_discovery) = match &client_api {
+        ClientApiOptions::Loopback {
+            admission,
+            write_discovery,
+            ..
+        } => (*admission, *write_discovery),
+        ClientApiOptions::Off => (Admission::SameUserLoopback, false),
+    };
+    let ingress = IngressFromGraph {
+        admission,
+        write_discovery,
+        home: plan.home.clone(),
+        #[cfg(feature = "test-support")]
+        probe: failpoints.probe.clone(),
+    };
     match compose_graph(builder, &plan.home, opts).await {
         Ok(graph) => {
             let started = StartedParts {
@@ -181,19 +197,22 @@ pub async fn compose(
                     .client_api_endpoint()
                     .map(|endpoint| endpoint.socket_addr),
             };
+            let root_agent_id = graph.wiring_handles.root_agent_id.clone();
+            let agent_loop_done = graph.agent_loop_done();
+            let composition =
+                Composition::from_graph(graph, config_watcher, wal_observer, guard, log, ingress);
             let view = Arc::new(RuntimeView::new(
-                graph.wiring_handles.root_agent_id.clone(),
-                graph.client_api_endpoint(),
-                graph.agent_loop_done(),
+                root_agent_id,
+                composition.client_ingress(),
+                agent_loop_done,
                 instance_guard,
                 profile,
                 processes,
                 exts.board(),
             ));
-            let composition =
-                Composition::from_graph(graph, config_watcher, wal_observer, guard, log)
-                    .with_extensions(Arc::clone(&exts))
-                    .with_view(Arc::clone(&view));
+            let composition = composition
+                .with_extensions(Arc::clone(&exts))
+                .with_view(Arc::clone(&view));
             #[cfg(feature = "test-support")]
             let composition = composition.with_probe(failpoints.probe.clone());
             // Spawned before the supervisor exists: no trigger can close the tracker first.
@@ -212,9 +231,14 @@ pub async fn compose(
         }
         Err(GraphFailure { error, partial }) => {
             let composition = match partial {
-                PartialGraph::Graph(graph) => {
-                    Composition::from_graph(*graph, config_watcher, wal_observer, guard, log)
-                }
+                PartialGraph::Graph(graph) => Composition::from_graph(
+                    *graph,
+                    config_watcher,
+                    wal_observer,
+                    guard,
+                    log,
+                    ingress,
+                ),
                 PartialGraph::Wiring(stoppers) => Composition::from_stoppers(
                     stoppers,
                     Some(config_watcher),
@@ -487,6 +511,12 @@ const _: () = {
         assert_send_sync::<crate::inference::ClaimedPreflightStopper>();
         assert_send::<advance_client_api::ExtensionFamilies>();
         assert_send_sync::<advance_client_api::ExtensionRouteGate>();
+        assert_send_sync::<crate::api::ClientApiCheck>();
+        assert_send_sync::<crate::api::ClientApiRebindError>();
+        fn _reverify_future_is_send(rt: &ComposedRuntime) {
+            fn assert_send<T: Send>(_: T) {}
+            assert_send(rt.reverify_client_api());
+        }
     }
 };
 

@@ -46,6 +46,7 @@ pub mod compose_log;
 
 // `compose()` itself, the composition's ordered teardown, and the one place it starts
 // OS threads.
+mod client_ingress;
 mod compose;
 mod composition;
 mod threads;
