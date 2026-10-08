@@ -2,7 +2,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use advance_client_api::{ClientSession, Platform, Principal, Scope, API_VERSION};
 use serde_json::Value;
@@ -10,6 +10,27 @@ use serde_json::Value;
 use crate::api::ClientApiEndpoint;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The root's serve key on a fixture home: `agent:<handle>` (`RootIdentity::mailbox_id`)
+/// with the handle `root` that `resolve_root_identity` falls back to when `.agent/config.yaml`
+/// names neither `handle` nor `display-name`. FixtureHome writes neither.
+pub const ROOT_MAILBOX: &str = "agent:root";
+
+#[derive(Clone, Debug)]
+pub struct ClientTurn {
+    pub message_id: String,
+    pub delivery_state: String,
+    pub reply_state: String,
+    pub polls: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CostTotals {
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost_usd: f64,
+    pub request_count: u64,
+}
 
 pub struct Http {
     addr: SocketAddr,
@@ -175,6 +196,127 @@ pub fn mint_browser_session(endpoint: &ClientApiEndpoint) -> (String, String) {
     let csrf = "fixture-csrf".to_owned();
     let token = mint_session_with(endpoint, Scope::operator_default(), Some(&csrf));
     (token, csrf)
+}
+
+/// `POST /client/messages` `{to, payload}` with the session and an idempotency key (no Origin);
+/// then `GET /client/messages/{id}` every 100 ms until `reply_state == "replied"` or `within`
+/// elapses (the last status is returned then). Every HTTP call runs in `spawn_blocking`.
+pub async fn client_message_turn(
+    ep: &ClientApiEndpoint,
+    token: &str,
+    to: &str,
+    payload: &str,
+    within: Duration,
+) -> Result<ClientTurn, String> {
+    let key = format!(
+        "fixture-turn-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let sent = Http::post(ep.socket_addr, "/client/messages")
+        .session(token)
+        .idempotency_key(key)
+        .json(serde_json::json!({ "to": to, "payload": payload }))
+        .await;
+    let data = envelope_data(&sent)?;
+    let message_id = data
+        .get("message_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("message_id missing: {:?}", sent.body))?
+        .to_owned();
+    let mut polls = 0u32;
+    let deadline = Instant::now() + within;
+    loop {
+        let status = Http::get(ep.socket_addr, format!("/client/messages/{message_id}"))
+            .session(token)
+            .send()
+            .await;
+        polls += 1;
+        let data = envelope_data(&status)?;
+        let delivery_state = data
+            .get("delivery_state")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let reply_state = data
+            .get("reply_state")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if reply_state == "replied" || Instant::now() >= deadline {
+            return Ok(ClientTurn {
+                message_id,
+                delivery_state,
+                reply_state,
+                polls,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// `GET /client/costs/providers/{provider_id}` with the session and no body (all history);
+/// `data.totals`.
+pub async fn provider_cost(
+    ep: &ClientApiEndpoint,
+    token: &str,
+    provider_id: &str,
+) -> Result<CostTotals, String> {
+    let resp = Http::get(
+        ep.socket_addr,
+        format!("/client/costs/providers/{provider_id}"),
+    )
+    .session(token)
+    .send()
+    .await;
+    let data = envelope_data(&resp)?;
+    let totals = data
+        .get("totals")
+        .ok_or_else(|| format!("totals missing: {:?}", resp.body))?;
+    Ok(CostTotals {
+        tokens_in: totals.get("tokens_in").and_then(Value::as_u64).unwrap_or(0),
+        tokens_out: totals
+            .get("tokens_out")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cost_usd: totals
+            .get("cost_usd")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        request_count: totals
+            .get("request_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+/// `GET /client/health` with the session header → 200, in `spawn_blocking`: runs the listener,
+/// gate and blocking-pool paths once before a `/proc/self/maps` snapshot.
+pub async fn warm_up(ep: &ClientApiEndpoint, token: &str) -> Result<(), String> {
+    let resp = Http::get(ep.socket_addr, "/client/health")
+        .session(token)
+        .send()
+        .await;
+    if resp.status == 200 {
+        Ok(())
+    } else {
+        Err(format!(
+            "health status {} body {:?}",
+            resp.status, resp.body
+        ))
+    }
+}
+
+fn envelope_data(resp: &HttpResponse) -> Result<&Value, String> {
+    if resp.status != 200 {
+        return Err(format!("status {} body {:?}", resp.status, resp.body));
+    }
+    match resp.body.get("data") {
+        Some(data) if !data.is_null() => Ok(data),
+        _ => Err(format!("missing data in {:?}", resp.body)),
+    }
 }
 
 fn parse_http_response(response: &[u8]) -> (u16, Vec<u8>) {

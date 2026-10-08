@@ -24,7 +24,8 @@ pub use capabilities::{
     PROBE_FUNCTION, PROBE_NAMESPACE,
 };
 pub use client::{
-    mint_browser_session, mint_session, mint_session_with, post_msg, Http, HttpResponse,
+    client_message_turn, mint_browser_session, mint_session, mint_session_with, post_msg,
+    provider_cost, warm_up, ClientTurn, CostTotals, Http, HttpResponse, ROOT_MAILBOX,
 };
 pub use families::{FamiliesControl, FixtureFamilies, RouteRuleBreak};
 pub use gone::assert_gone_for_home;

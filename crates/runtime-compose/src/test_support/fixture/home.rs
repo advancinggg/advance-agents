@@ -111,6 +111,36 @@ impl FixtureHome {
             })
     }
 
+    /// Rewrites the single `max_memory_pages:` line of `.advance/runtime-config.yaml`
+    /// (`io::ErrorKind::InvalidData` unless exactly one line matched).
+    pub fn set_max_memory_pages(&self, pages: u32) -> io::Result<()> {
+        let path = self.home.join(".advance/runtime-config.yaml");
+        let yaml = std::fs::read_to_string(&path)?;
+        let trailing_newline = yaml.ends_with('\n');
+        let mut matched = 0usize;
+        let mut lines = Vec::new();
+        for line in yaml.lines() {
+            if line.trim_start().starts_with("max_memory_pages:") {
+                matched += 1;
+                let indent = line.len() - line.trim_start().len();
+                lines.push(format!("{:indent$}max_memory_pages: {pages}", ""));
+            } else {
+                lines.push(line.to_owned());
+            }
+        }
+        if matched != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected exactly one max_memory_pages line, found {matched}"),
+            ));
+        }
+        let mut out = lines.join("\n");
+        if trailing_newline {
+            out.push('\n');
+        }
+        std::fs::write(path, out)
+    }
+
     pub fn rewrite_agent_config(&self, caps: &[CapDecl]) -> io::Result<()> {
         std::fs::write(self.home.join(".agent/config.yaml"), agent_yaml(caps))
     }
