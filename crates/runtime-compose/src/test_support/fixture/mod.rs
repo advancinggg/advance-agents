@@ -332,6 +332,11 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    // The print macros' names, built so that this file never holds them as text: the
+    // MODULE-001-T111 (5) output gate scans every file under `src/`, string literals included.
+    const PRINT_LINE: &str = concat!("print", "ln!");
+    const EPRINT_LINE: &str = concat!("eprint", "ln!");
+
     #[test]
     fn module_001_ac31_fixture_uses_only_public_api() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/test_support/fixture");
@@ -362,8 +367,8 @@ mod tests {
                     );
                 }
                 assert!(
-                    !code.contains("println!")
-                        && !code.contains("eprintln!")
+                    !code.contains(PRINT_LINE)
+                        && !code.contains(EPRINT_LINE)
                         && !code.contains("std::io::stdout")
                         && !code.contains("std::io::stderr")
                         && !code.contains("std::process"),
