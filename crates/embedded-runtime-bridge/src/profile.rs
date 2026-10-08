@@ -1,8 +1,10 @@
 //! Platform honesty map (sim-aligned FG capacity).
 
+use advance_runtime_compose::HostPlatform;
+
 use crate::types::{
-    BridgePlatform, EngineMode, HostBackend, PlatformLifecycleState, RuntimeHostProfileView,
-    StorageProfile,
+    BridgePlatform, CompositionProfile, EngineMode, HostBackend, PlatformLifecycleState,
+    RuntimeHostProfileView, StorageProfile,
 };
 
 const WIT: &str = "0.1.0";
@@ -96,6 +98,90 @@ pub fn uses_runtime_lock() -> bool {
     cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
+/// Desktop Linux shares macOS's honesty class (capacity 8, persistent, no presence).
+pub(crate) fn honesty_class(platform: HostPlatform) -> BridgePlatform {
+    match platform {
+        HostPlatform::MacOs | HostPlatform::Linux => BridgePlatform::Mac,
+        HostPlatform::Windows => BridgePlatform::Windows,
+        HostPlatform::Ios => BridgePlatform::Ios,
+        HostPlatform::Android => BridgePlatform::Android,
+        _ => BridgePlatform::Mac,
+    }
+}
+
+pub(crate) struct ProfileV2 {
+    pub platform: HostPlatform,
+    pub backend: HostBackend,
+    pub lifecycle: PlatformLifecycleState,
+    pub runtime_up: bool,
+    pub agent_loop_up: bool,
+    pub composition: CompositionProfile,
+    pub battery_pct: Option<u8>,
+    pub network_class: Option<String>,
+}
+
+/// Honesty profile for a v2 handle. `build_profile` stays the v1 path.
+pub(crate) fn build_profile_v2(input: ProfileV2) -> RuntimeHostProfileView {
+    let platform = {
+        #[cfg(target_os = "ios")]
+        {
+            let _ = input.platform;
+            BridgePlatform::Ios
+        }
+        #[cfg(target_os = "android")]
+        {
+            let _ = input.platform;
+            BridgePlatform::Android
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            honesty_class(input.platform)
+        }
+    };
+
+    let non_fg = !matches!(input.lifecycle, PlatformLifecycleState::Foreground);
+    let mobile = matches!(platform, BridgePlatform::Ios | BridgePlatform::Android);
+    let max = if non_fg {
+        0
+    } else {
+        fg_max_concurrent(platform)
+    };
+    let mut available = input.runtime_up && !non_fg && max >= 1;
+    match input.composition {
+        CompositionProfile::Full => {
+            available = available
+                && input.agent_loop_up
+                && (!mobile || input.backend == HostBackend::Pulley);
+        }
+        CompositionProfile::HostOnly => {
+            if mobile {
+                available = false;
+            }
+        }
+    }
+    let engine_mode = if input.backend == HostBackend::Pulley {
+        EngineMode::Interpreter
+    } else {
+        EngineMode::Jit
+    };
+    RuntimeHostProfileView {
+        agent_host_available: available,
+        supported_wit_versions: if input.runtime_up {
+            vec![WIT.to_string()]
+        } else {
+            vec![]
+        },
+        max_concurrent_runs: max,
+        platform_lifecycle_state: input.lifecycle,
+        storage_profile: storage_profile(platform),
+        requires_human_presence: requires_human_presence(platform),
+        engine_mode,
+        host_backend: input.backend,
+        battery_pct: input.battery_pct,
+        network_class: input.network_class,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +229,97 @@ mod tests {
             None,
         );
         assert!(!p.agent_host_available);
+    }
+
+    #[test]
+    fn module_001_ac32_profile_v2_engine_mode_follows_the_backend() {
+        for backend in [HostBackend::Cranelift, HostBackend::Pulley] {
+            let p = build_profile_v2(ProfileV2 {
+                platform: HostPlatform::MacOs,
+                backend,
+                lifecycle: PlatformLifecycleState::Foreground,
+                runtime_up: true,
+                agent_loop_up: true,
+                composition: CompositionProfile::Full,
+                battery_pct: None,
+                network_class: None,
+            });
+            assert_eq!(p.host_backend, backend);
+            assert_eq!(
+                p.engine_mode,
+                if backend == HostBackend::Pulley {
+                    EngineMode::Interpreter
+                } else {
+                    EngineMode::Jit
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn module_001_ac32_profile_v2_availability_table() {
+        let platforms = [
+            HostPlatform::MacOs,
+            HostPlatform::Ios,
+            HostPlatform::Android,
+            HostPlatform::Windows,
+            HostPlatform::Linux,
+        ];
+        let backends = [HostBackend::Cranelift, HostBackend::Pulley];
+        let lifecycles = [
+            PlatformLifecycleState::Foreground,
+            PlatformLifecycleState::Background,
+            PlatformLifecycleState::Suspended,
+            PlatformLifecycleState::Restricted,
+        ];
+        for platform in platforms {
+            for backend in backends {
+                for lifecycle in lifecycles {
+                    for runtime_up in [true, false] {
+                        for agent_loop_up in [true, false] {
+                            for composition in
+                                [CompositionProfile::Full, CompositionProfile::HostOnly]
+                            {
+                                let p = build_profile_v2(ProfileV2 {
+                                    platform,
+                                    backend,
+                                    lifecycle,
+                                    runtime_up,
+                                    agent_loop_up,
+                                    composition,
+                                    battery_pct: None,
+                                    network_class: None,
+                                });
+                                let class = honesty_class(platform);
+                                let mobile =
+                                    matches!(class, BridgePlatform::Ios | BridgePlatform::Android);
+                                let non_fg = lifecycle != PlatformLifecycleState::Foreground;
+                                let expected_max =
+                                    if non_fg { 0 } else { fg_max_concurrent(class) };
+                                assert_eq!(p.max_concurrent_runs, expected_max);
+                                let mut expected = runtime_up && !non_fg && expected_max >= 1;
+                                match composition {
+                                    CompositionProfile::Full => {
+                                        expected = expected
+                                            && agent_loop_up
+                                            && (!mobile || backend == HostBackend::Pulley);
+                                    }
+                                    CompositionProfile::HostOnly => {
+                                        if mobile {
+                                            expected = false;
+                                        }
+                                    }
+                                }
+                                assert_eq!(
+                                    p.agent_host_available, expected,
+                                    "{platform:?} {backend:?} {lifecycle:?} up={runtime_up} loop={agent_loop_up} {composition:?}"
+                                );
+                                assert_eq!(p.supported_wit_versions.is_empty(), !runtime_up);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

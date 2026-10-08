@@ -13,6 +13,11 @@ pub fn global_rt() -> &'static Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("advance-bridge")
+            .worker_threads(
+                std::thread::available_parallelism()
+                    .map(|n| n.get().max(2))
+                    .unwrap_or(2),
+            )
             .build()
             .expect("failed to build GLOBAL_RT")
     })

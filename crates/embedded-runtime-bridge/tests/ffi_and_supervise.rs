@@ -88,7 +88,7 @@ exec sleep 60
 fn t13_ffi_abi_version() {
     let v = advance_embedded_runtime_bridge::advance_bridge_abi_version();
     assert_eq!(v, ADVANCE_BRIDGE_ABI_VERSION);
-    assert_eq!(v, 1);
+    assert_eq!(v, 2);
 }
 
 #[cfg(unix)]

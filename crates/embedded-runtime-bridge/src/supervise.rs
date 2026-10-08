@@ -273,6 +273,7 @@ async fn start_supervise_inner(
         }),
         stopped: AtomicBool::new(false),
         reserved: AtomicBool::new(true),
+        v2: None,
     });
     Ok(BridgeHandle::new(inner))
 }

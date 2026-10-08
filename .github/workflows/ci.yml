@@ -230,7 +230,9 @@ jobs:
           lib_syms="$(nm -gU "$lib")" || { echo "nm failed on $lib"; exit 1; }
           for sym in advance_bridge_start advance_bridge_stop advance_bridge_health \
                      advance_bridge_on_lifecycle advance_bridge_last_error \
-                     advance_bridge_free_handle advance_bridge_abi_version; do
+                     advance_bridge_free_handle advance_bridge_abi_version \
+                     advance_bridge_start_v2 advance_bridge_client_api_base \
+                     advance_bridge_client_api_session; do
             grep -q " _${sym}\$" <<<"$dylib_syms" || { echo "dylib lacks _${sym}"; exit 1; }
             grep -q " _${sym}\$" <<<"$lib_syms" || { echo "staticlib lacks _${sym}"; exit 1; }
           done

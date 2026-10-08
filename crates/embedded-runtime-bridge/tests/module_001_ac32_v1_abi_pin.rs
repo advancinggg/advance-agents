@@ -89,10 +89,8 @@ void advance_bridge_free_handle(AdvanceBridgeHandle *handle);
 
 uint32_t advance_bridge_abi_version(void);";
 
-/// v0.1.26 `#define`s 0–13 (and the ABI version).
+/// v0.1.26 `#define`s 0–13 (ABI version is now 2; codes 0–13 stay).
 const V1_DEFINES: &str = "\
-#define ADVANCE_BRIDGE_ABI_VERSION 1
-
 #define ADVANCE_BRIDGE_OK                 0
 #define ADVANCE_BRIDGE_ERR_INVALID_ARG    1
 #define ADVANCE_BRIDGE_ERR_INVALID_UTF8   2

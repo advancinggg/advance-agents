@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// C ABI version.
-pub const ADVANCE_BRIDGE_ABI_VERSION: u32 = 1;
+pub const ADVANCE_BRIDGE_ABI_VERSION: u32 = 2;
 
 /// Health JSON schema version.
 pub const HEALTH_SCHEMA_VERSION: u32 = 1;

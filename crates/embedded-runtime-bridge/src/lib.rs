@@ -24,8 +24,13 @@ pub(crate) mod registry;
 pub(crate) mod runtime_rt;
 pub(crate) mod supervise;
 pub mod types;
+pub(crate) mod v2;
 pub(crate) mod workspace;
 
+pub use advance_runtime_compose::{
+    ClientApiCheck, ComposeExtension, ComposeLog, ComposedRuntime, HostPlatform, MasterKeyInput,
+    NullComposeLog, ProcessPolicy, WasmEngine, Zeroizing,
+};
 pub use config::BridgeConfig;
 pub use error::BridgeError;
 pub use handle::BridgeHandle;
@@ -38,6 +43,7 @@ pub use types::{
 };
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::types::CompositionMode as CM;
 
@@ -140,4 +146,55 @@ pub async fn stop_async(handle: BridgeHandle) -> Result<(), BridgeError> {
         .spawn(async move { handle.stop_async_inner().await })
         .await
         .map_err(|e| BridgeError::Internal(format!("join: {e}")))?
+}
+
+/// CONTRACT-210 v2 Rust entry: compose `workspace` per `options` with `extensions` on the bridge's
+/// global runtime. Sync; inside a Tokio runtime it answers `BridgeError::NestedRuntime` (11) — use
+/// [`start_with_extensions_async`].
+pub fn start_with_extensions(
+    workspace: impl AsRef<Path>,
+    options: BridgeOptions,
+    extensions: Vec<Arc<dyn ComposeExtension>>,
+) -> Result<BridgeHandle, BridgeError> {
+    if runtime_rt::in_tokio() {
+        return Err(BridgeError::NestedRuntime);
+    }
+    let root = workspace.as_ref().to_path_buf();
+    runtime_rt::block_on_global(async move {
+        start_with_extensions_async(&root, options, extensions).await
+    })
+}
+
+/// Async variant: always composes on the global runtime, callable from any runtime. If the caller
+/// drops this future, the composition still finishes and is then shut down (no task outlives it).
+pub async fn start_with_extensions_async(
+    workspace: &Path,
+    options: BridgeOptions,
+    extensions: Vec<Arc<dyn ComposeExtension>>,
+) -> Result<BridgeHandle, BridgeError> {
+    let root = workspace.to_path_buf();
+    runtime_rt::global_rt()
+        .spawn(v2::start(root, options, extensions))
+        .await
+        .map_err(|e| BridgeError::Internal(format!("join: {e}")))?
+}
+
+pub fn client_api_base(handle: &BridgeHandle) -> Result<String, BridgeError> {
+    handle.client_api_base()
+}
+
+pub fn client_api_session(handle: &BridgeHandle) -> Result<Zeroizing<String>, BridgeError> {
+    handle.client_api_session()
+}
+
+pub fn health_v2(handle: &BridgeHandle) -> Result<BridgeHealthV2, BridgeError> {
+    handle.health_v2()
+}
+
+/// As `on_lifecycle`, but awaits the Foreground re-verification instead of blocking.
+pub async fn on_lifecycle_async(
+    handle: &BridgeHandle,
+    input: BridgeLifecycleInput,
+) -> Result<(), BridgeError> {
+    handle.on_lifecycle_async(input).await
 }

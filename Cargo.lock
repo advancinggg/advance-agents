@@ -215,6 +215,7 @@ dependencies = [
 name = "advance-embedded-runtime-bridge"
 version = "0.1.29"
 dependencies = [
+ "advance-client-api",
  "advance-runtime",
  "advance-runtime-compose",
  "advance-shared-types",
@@ -226,6 +227,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

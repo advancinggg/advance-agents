@@ -9,11 +9,12 @@ use std::slice;
 use crate::config::BridgeConfig;
 use crate::error::BridgeError;
 use crate::handle::BridgeHandle;
+use crate::options::BridgeOptions;
 use crate::types::{
     BridgeLifecycleInput, BridgePlatform, CompositionMode, EngineMode, PlatformLifecycleState,
     ADVANCE_BRIDGE_ABI_VERSION,
 };
-use crate::{health, on_lifecycle, start, stop};
+use crate::{health, on_lifecycle, start, start_with_extensions, stop};
 
 thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").unwrap());
@@ -194,9 +195,13 @@ pub unsafe extern "C" fn advance_bridge_health(
             return Err(BridgeError::InvalidArg);
         }
         let h = unsafe { &*handle };
-        let health = health(&h.handle)?;
-        let json =
-            serde_json::to_string(&health).map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let json = if h.handle.is_v2() {
+            serde_json::to_string(&h.handle.health_v2()?)
+                .map_err(|e| BridgeError::Internal(e.to_string()))?
+        } else {
+            let health = health(&h.handle)?;
+            serde_json::to_string(&health).map_err(|e| BridgeError::Internal(e.to_string()))?
+        };
         let needed = json.len() + 1;
         if !required_len_or_null.is_null() {
             unsafe { *required_len_or_null = needed };
@@ -303,6 +308,137 @@ pub unsafe extern "C" fn advance_bridge_free_handle(handle: *mut AdvanceBridgeHa
 #[no_mangle]
 pub extern "C" fn advance_bridge_abi_version() -> u32 {
     ADVANCE_BRIDGE_ABI_VERSION
+}
+
+/// Box `handle` as a C handle for every `advance_bridge_*` function; free it with
+/// `advance_bridge_free_handle`.
+pub fn into_raw_handle(handle: BridgeHandle) -> *mut AdvanceBridgeHandle {
+    Box::into_raw(Box::new(AdvanceBridgeHandle { handle }))
+}
+
+/// # Safety
+/// `handle` is NULL or a live pointer from `advance_bridge_start*` / [`into_raw_handle`].
+pub unsafe fn handle_from_raw<'a>(handle: *const AdvanceBridgeHandle) -> Option<&'a BridgeHandle> {
+    if handle.is_null() {
+        None
+    } else {
+        Some(&unsafe { &*handle }.handle)
+    }
+}
+
+unsafe fn copy_out(
+    bytes: &[u8],
+    out: *mut c_char,
+    out_len: usize,
+    required: *mut usize,
+) -> Result<(), BridgeError> {
+    let needed = bytes.len() + 1;
+    if !required.is_null() {
+        unsafe { *required = needed };
+    }
+    if out.is_null() || out_len < needed {
+        return Err(BridgeError::BufferTooSmall { required: needed });
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len());
+        *out.add(bytes.len()) = 0;
+    }
+    Ok(())
+}
+
+fn map_result(result: std::thread::Result<Result<(), BridgeError>>) -> i32 {
+    match result {
+        Ok(Ok(())) => {
+            set_last_error("");
+            0
+        }
+        Ok(Err(e)) => {
+            let msg = std::panic::catch_unwind(|| e.redacted_message())
+                .unwrap_or_else(|_| "error".into());
+            set_last_error(&msg);
+            e.c_code()
+        }
+        Err(_) => {
+            set_last_error("panic");
+            13
+        }
+    }
+}
+
+/// # Safety
+/// `out_handle` must be non-null when the caller wants a handle back.
+#[no_mangle]
+pub unsafe extern "C" fn advance_bridge_start_v2(
+    workspace_root_utf8: *const c_char,
+    options_json_utf8_or_null: *const c_char,
+    out_handle: *mut *mut AdvanceBridgeHandle,
+) -> i32 {
+    let result = std::panic::catch_unwind(|| {
+        if out_handle.is_null() {
+            return Err(BridgeError::InvalidArg);
+        }
+        unsafe { *out_handle = ptr::null_mut() };
+        if workspace_root_utf8.is_null() {
+            return Err(BridgeError::InvalidArg);
+        }
+        let ws = unsafe { CStr::from_ptr(workspace_root_utf8) }
+            .to_str()
+            .map_err(|_| BridgeError::InvalidUtf8)?;
+        let json = if options_json_utf8_or_null.is_null() {
+            None
+        } else {
+            Some(
+                unsafe { CStr::from_ptr(options_json_utf8_or_null) }
+                    .to_str()
+                    .map_err(|_| BridgeError::InvalidUtf8)?,
+            )
+        };
+        let options = BridgeOptions::from_json(json)?;
+        let handle = start_with_extensions(PathBuf::from(ws), options, Vec::new())?;
+        unsafe { *out_handle = into_raw_handle(handle) };
+        Ok(())
+    });
+    map_result(result)
+}
+
+/// # Safety
+/// `handle` live; `out` may be null only for a size query.
+#[no_mangle]
+pub unsafe extern "C" fn advance_bridge_client_api_base(
+    handle: *const AdvanceBridgeHandle,
+    out: *mut c_char,
+    out_len: usize,
+    required_len_or_null: *mut usize,
+) -> i32 {
+    let result = std::panic::catch_unwind(|| {
+        if handle.is_null() {
+            return Err(BridgeError::InvalidArg);
+        }
+        let h = unsafe { &*handle };
+        let base = h.handle.client_api_base()?;
+        unsafe { copy_out(base.as_bytes(), out, out_len, required_len_or_null) }
+    });
+    map_result(result)
+}
+
+/// # Safety
+/// `handle` live; `out` may be null only for a size query. The token is a credential.
+#[no_mangle]
+pub unsafe extern "C" fn advance_bridge_client_api_session(
+    handle: *const AdvanceBridgeHandle,
+    out: *mut c_char,
+    out_len: usize,
+    required_len_or_null: *mut usize,
+) -> i32 {
+    let result = std::panic::catch_unwind(|| {
+        if handle.is_null() {
+            return Err(BridgeError::InvalidArg);
+        }
+        let h = unsafe { &*handle };
+        let token = h.handle.client_api_session()?;
+        unsafe { copy_out(token.as_bytes(), out, out_len, required_len_or_null) }
+    });
+    map_result(result)
 }
 
 // silence unused import warning for slice

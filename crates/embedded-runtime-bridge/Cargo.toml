@@ -14,6 +14,7 @@ path = "src/lib.rs"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
+advance-client-api = { path = "../client-api", version = "0.1.29" }
 advance-runtime = { path = "../runtime", version = "0.1.29" }
 # The process-local home registry is the composition's (shared with `compose`).
 advance-runtime-compose = { path = "../runtime-compose", version = "0.1.29" }
@@ -25,8 +26,10 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util"] }
+zeroize = { workspace = true }
 
 [dev-dependencies]
+advance-runtime-compose = { path = "../runtime-compose", version = "0.1.29", features = ["test-support"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "test-util"] }
 
