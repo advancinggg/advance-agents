@@ -14,6 +14,8 @@ use advance_runtime_compose::test_support::fixture::{
 };
 use advance_runtime_compose::test_support::{MemoryComposeLog, TEARDOWN_ORDER};
 use advance_runtime_compose::{log_keys, ComposeLogLine, LogStream};
+#[cfg(unix)]
+use advance_runtime_compose::{RunInfo, RunView};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
@@ -21,9 +23,13 @@ use tokio_tungstenite::tungstenite::Message;
 #[path = "support/t112b.rs"]
 mod t112b;
 use t112b::{
-    all_events, api, append_runtime_config, compose_with, deltas_ws, events, home, jsonl_contains,
-    msg, provider, provider_id, restart_required_count, run_id, subsequence, wait_events,
-    CREATE_LOCAL_TWO, POLL, WAIT,
+    all_events, api, compose_with, deltas_ws, events, home, jsonl_contains, msg, provider,
+    provider_id, restart_required_count, run_id, subsequence, wait_events, CREATE_LOCAL_TWO, POLL,
+    WAIT,
+};
+#[cfg(unix)]
+use t112b::{
+    append_runtime_config, local_side_entry, pin_root_provider, LoopbackSidecar, LOCAL_SIDE,
 };
 
 fn inference_once(phases: &[&str]) {
@@ -56,7 +62,7 @@ fn no_ext_keys(log: &MemoryComposeLog) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn module_001_ac31_t112b_claimed_entry_turn_profile_hold_budget_preflight_and_admin() {
+async fn module_001_ac31_t112b_claimed_entry_turn_profile_hold_preflight_and_admin() {
     let home = home(
         &["fs", "llm"],
         &[
@@ -65,7 +71,6 @@ async fn module_001_ac31_t112b_claimed_entry_turn_profile_hold_budget_preflight_
             provider_yaml::CLOUD_A,
         ],
     );
-    append_runtime_config(&home, "run-budget:\n  default-cost-limit-usd: 0.00001\n");
     let stub = StubInferencePort::new("stub-pong", 7, 5);
     let mesh = StubMeshDispatch::new("mesh-pong");
     let flag = DropFlag::default();
@@ -127,17 +132,6 @@ async fn module_001_ac31_t112b_claimed_entry_turn_profile_hold_budget_preflight_
         expected_stub_cost()
     );
     assert_eq!(run_id(&responses[0]), Some(run.as_str()));
-
-    let (status, body) = msg(&probe, "llm:hi").await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.starts_with("llm-err:"), "{body}");
-    assert!(body.contains("BudgetExceeded"), "{body}");
-    assert_eq!(stub.calls(), 1);
-    let with_run: Vec<_> = events(home.home(), "llm.request")
-        .into_iter()
-        .filter(|event| provider_id(event) == Some("local-stub") && run_id(event).is_some())
-        .collect();
-    assert_eq!(with_run.len(), 1, "{with_run:?}");
 
     let (addr, tok) = api(&rt);
     let preflight = Http::post(addr, "/client/providers/local-stub:preflight")
@@ -210,6 +204,182 @@ async fn module_001_ac31_t112b_claimed_entry_turn_profile_hold_budget_preflight_
     assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
     no_ext_keys(&log);
     assert_eq!(log.count(log_keys::COMPOSE_CLAIMED_PREFLIGHT_OVERRUN), 0);
+}
+
+/// The root's session run, once the run view lists it.
+#[cfg(unix)]
+async fn session_run(runs: &RunView, root: &str) -> RunInfo {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let listed = runs.runs().expect("run view");
+        if let Some(run) = listed.iter().find(|run| run.controller_agent == root) {
+            return run.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no session run for {root} within {WAIT:?}: {listed:?}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// `run_id` as the run view reads it once the run's iteration reached `iteration` (the
+/// turn's round completed).
+#[cfg(unix)]
+async fn run_at_iteration(runs: &RunView, run_id: &str, iteration: u32) -> RunInfo {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let run = runs
+            .run(run_id)
+            .expect("run view")
+            .expect("the session run");
+        if run.iteration >= iteration {
+            return run;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run {run_id} did not reach iteration {iteration} within {WAIT:?}: {run:?}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// What one turn added to its run, as the extension's run view reads it.
+#[cfg(unix)]
+#[derive(Debug)]
+struct TurnUsage {
+    rounds: u32,
+    tokens: u64,
+    cost_usd: f64,
+}
+
+#[cfg(unix)]
+impl TurnUsage {
+    fn between(before: &RunInfo, after: &RunInfo) -> Self {
+        Self {
+            rounds: after.iteration - before.iteration,
+            tokens: after.token_used - before.token_used,
+            cost_usd: after.cost_usd - before.cost_usd,
+        }
+    }
+
+    fn assert_same_as(&self, oss: &TurnUsage) {
+        assert_eq!(
+            (self.rounds, self.tokens),
+            (oss.rounds, oss.tokens),
+            "claimed turn {self:?} vs OSS turn {oss:?}"
+        );
+        assert!(
+            (self.cost_usd - oss.cost_usd).abs() < 1e-12,
+            "claimed turn {self:?} vs OSS turn {oss:?}"
+        );
+    }
+}
+
+/// A turn routed to the claimed entry is accounted as a turn routed to an OSS entry of the
+/// same class on the same path (the session run's non-streaming generate), in one
+/// composition: the run view adds the same round, tokens and cost for both; both entries'
+/// turns count against one run cost limit, so the claimed turn's cost is what makes the
+/// gateway's preflight refuse the last turn before its port is called; and each turn
+/// carries the same `llm.*` events.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac31_t112b_claimed_turn_is_budgeted_as_an_oss_entry_turn() {
+    let sidecar = LoopbackSidecar::start("side-pong", 7, 5);
+    let oss_entry = local_side_entry(sidecar.command());
+    let home = home(
+        &["fs", "llm"],
+        &[provider_yaml::LOCAL_STUB_PLAIN, oss_entry.as_str()],
+    );
+    // A turn on either entry costs `expected_stub_cost()`, 3.4e-5 USD: after two turns the
+    // run is under this limit and after three it is over.
+    append_runtime_config(&home, "run-budget:\n  default-cost-limit-usd: 0.000085\n");
+    pin_root_provider(&home, LOCAL_SIDE);
+    let stub = StubInferencePort::new("stub-pong", 7, 5);
+    let ext = FixtureExtension::new("fixture")
+        .with_inference(FixtureInference::new().claim("local-stub", stub.clone()));
+    let rec = ext.record();
+    let (result, _log, probe, baseline) = compose_with(&home, vec![ext.arc()]).await;
+    let rt = result.expect("compose");
+    let started = rec.started(WAIT).await.expect("on_started");
+    let runs = started.cx.runs();
+    let start = session_run(runs, rt.root_agent_id()).await;
+    let run = start.run_id.clone();
+
+    let (status, body) = msg(&probe, "llm:hi").await;
+    assert_eq!((status, body.as_str()), (200, "llm-ok:side-pong"), "{body}");
+    assert_eq!((sidecar.chats(), stub.calls()), (1, 0));
+    let after_oss = run_at_iteration(runs, &run, start.iteration + 1).await;
+
+    pin_root_provider(&home, "local-stub");
+    let (status, body) = msg(&probe, "llm:hi").await;
+    assert_eq!((status, body.as_str()), (200, "llm-ok:stub-pong"), "{body}");
+    assert_eq!((sidecar.chats(), stub.calls()), (1, 1));
+    let after_claimed = run_at_iteration(runs, &run, after_oss.iteration + 1).await;
+    TurnUsage::between(&after_oss, &after_claimed)
+        .assert_same_as(&TurnUsage::between(&start, &after_oss));
+
+    pin_root_provider(&home, LOCAL_SIDE);
+    let (status, body) = msg(&probe, "llm:hi").await;
+    assert_eq!((status, body.as_str()), (200, "llm-ok:side-pong"), "{body}");
+    pin_root_provider(&home, "local-stub");
+    let (status, body) = msg(&probe, "llm:hi").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.starts_with("llm-err:") && body.contains("BudgetExceeded"),
+        "the gateway's preflight must refuse the claimed turn over the run's cost limit, \
+         which the three turns crossed with the claimed turn's cost: {body}"
+    );
+    assert_eq!((sidecar.chats(), stub.calls()), (2, 1));
+
+    for (entry, turns) in [(LOCAL_SIDE, 2), ("local-stub", 1)] {
+        let requests = wait_events(
+            home.home(),
+            "llm.request",
+            |event| provider_id(event) == Some(entry),
+            turns,
+            WAIT,
+        )
+        .await;
+        assert_eq!(requests.len(), turns, "{entry}: {requests:?}");
+        let responses = wait_events(
+            home.home(),
+            "llm.response",
+            |event| provider(event) == Some(entry),
+            turns,
+            WAIT,
+        )
+        .await;
+        assert_eq!(responses.len(), turns, "{entry}: {responses:?}");
+        for event in requests.iter().chain(&responses) {
+            assert_eq!(run_id(event), Some(run.as_str()), "{entry}: {event}");
+        }
+        for request in &requests {
+            assert_eq!(
+                request["payload"]["policy_source"], "agent",
+                "{entry}: {request}"
+            );
+        }
+        for response in &responses {
+            assert_eq!(
+                response["payload"]["input_tokens"], 7,
+                "{entry}: {response}"
+            );
+            assert_eq!(
+                response["payload"]["output_tokens"], 5,
+                "{entry}: {response}"
+            );
+            let cost = response["payload"]["cost_usd"].as_f64().expect("cost_usd");
+            assert!(
+                (cost - expected_stub_cost()).abs() < 1e-12,
+                "{entry}: {cost} vs {}",
+                expected_stub_cost()
+            );
+        }
+    }
+
+    rt.shutdown().await.expect("shutdown");
+    assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

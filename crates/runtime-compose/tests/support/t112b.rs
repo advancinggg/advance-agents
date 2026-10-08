@@ -22,6 +22,9 @@ use tokio_tungstenite::tungstenite::Message;
 pub const POLL: Duration = Duration::from_millis(10);
 pub const WAIT: Duration = Duration::from_secs(5);
 
+/// The OSS-bound `local` entry of [`local_side_entry`].
+pub const LOCAL_SIDE: &str = "local-side";
+
 pub const CREATE_LOCAL_TWO: &str = r#"{"provider_id":"local-two","backend_class":"local","model_aliases":{"default":"m2"},"cost":{"input_per_mtoken":0.01,"output_per_mtoken":0.01},"rate_limit":{"requests_per_minute":100,"tokens_per_minute":100000}}"#;
 
 pub type WsClient = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
@@ -244,4 +247,179 @@ pub fn provider_id(event: &Value) -> Option<&str> {
 
 pub fn provider(event: &Value) -> Option<&str> {
     event.pointer("/payload/provider").and_then(Value::as_str)
+}
+
+/// `local-side`: a `local` entry that OSS binds (it has a sidecar), priced as the fixture's
+/// `local-stub` (2.0 / 4.0 USD per million input / output tokens) and served by `command`.
+pub fn local_side_entry(command: &Path) -> String {
+    let quoted = command.display().to_string().replace('\'', "''");
+    format!(
+        concat!(
+            "  - id: local-side\n",
+            "    backend-class: local\n",
+            "    endpoint: \"\"\n",
+            "    api-key-secret: local-side-key\n",
+            "    model-aliases: {{ default: side-model }}\n",
+            "    cost-per-mtoken-in: 2.0\n",
+            "    cost-per-mtoken-out: 4.0\n",
+            "    rate-limit: {{ requests-per-minute: 100, tokens-per-minute: 100000 }}\n",
+            "    sidecar: {{ command: '{}' }}\n",
+        ),
+        quoted
+    )
+}
+
+/// Pins the root agent's LLM calls to `provider`: the `llm:` block of the home's
+/// `.agent/config.yaml`, which the gateway reads again at the agent's next call.
+pub fn pin_root_provider(home: &FixtureHome, provider: &str) {
+    let path = home.home().join(".agent/config.yaml");
+    let text = std::fs::read_to_string(&path).expect("read the agent config");
+    let kept = text.split("\nllm:\n").next().unwrap_or_default().trim_end();
+    std::fs::write(&path, format!("{kept}\nllm:\n  provider: {provider}\n"))
+        .expect("pin the root agent's provider");
+}
+
+/// The sidecar of an OSS-bound `local` entry, played by the test: an executable
+/// `#!/bin/sh` script that prints `PORT=<n>` and stays alive (what OSS reads from the
+/// entry's `sidecar.command` at boot), and an OpenAI-compatible
+/// `POST /v1/chat/completions` responder on `127.0.0.1:<n>`, on its own thread, that
+/// answers every chat with `reply` and the given usage.
+#[cfg(unix)]
+pub struct LoopbackSidecar {
+    _dir: tempfile::TempDir,
+    script: std::path::PathBuf,
+    addr: SocketAddr,
+    chats: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl LoopbackSidecar {
+    pub fn start(reply: &str, prompt_tokens: u64, completion_tokens: u64) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the sidecar's port");
+        let addr = listener.local_addr().expect("the sidecar's address");
+        let dir = tempfile::tempdir().expect("sidecar dir");
+        let script = dir.path().join("sidecar.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho PORT={}\nexec /bin/sleep 300\n",
+                addr.port()
+            ),
+        )
+        .expect("write the sidecar script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("sidecar script metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("make the sidecar script executable");
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": reply}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
+            "model": "side-model",
+        })
+        .to_string();
+        let chats = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let chats = Arc::clone(&chats);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if let Ok(stream) = stream {
+                        answer_chat(stream, &body, &chats);
+                    }
+                }
+            })
+        };
+        Self {
+            _dir: dir,
+            script,
+            addr,
+            chats,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn command(&self) -> &Path {
+        &self.script
+    }
+
+    /// The chats answered so far.
+    pub fn chats(&self) -> usize {
+        self.chats.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LoopbackSidecar {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wakes the accept loop so it sees the flag.
+        let _ = std::net::TcpStream::connect(self.addr);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Reads one request (head and `Content-Length` body) and answers it: `body` for
+/// `POST /v1/chat/completions` (counted in `chats`), 404 otherwise. A failed read or
+/// write fails the caller's turn, which the test asserts on.
+#[cfg(unix)]
+fn answer_chat(
+    mut stream: std::net::TcpStream,
+    body: &str,
+    chats: &std::sync::atomic::AtomicUsize,
+) {
+    use std::io::{Read, Write};
+
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => request.extend_from_slice(&chunk[..n]),
+        }
+    };
+    let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
+    let length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    while request.len() < head_end + length {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => request.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let (status, payload) = if head.starts_with("POST /v1/chat/completions ") {
+        chats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ("200 OK", body)
+    } else {
+        ("404 Not Found", "{}")
+    };
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
 }

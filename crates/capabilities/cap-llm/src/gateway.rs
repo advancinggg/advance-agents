@@ -2222,16 +2222,6 @@ impl LlmGateway {
         tee: &mut crate::stream::GenerateTee,
     ) -> Result<ChatResponse, LlmError> {
         if let Some(rid) = &ctx.run_id {
-            // Generate preflight is `check(rid, 0, 0.0)` (MODULE-008 §2.11): it
-            // gates rounds, terminal runs and trailing cost without holding
-            // usage. `RunBudget::commit` clamps to the reservation, so the
-            // actual tokens/cost have to be reserved here or `token_used`
-            // stays 0 and RunView cannot reflect the turn.
-            if outcome.commit_tokens > 0 || outcome.commit_cost > 0.0 {
-                let _ = self
-                    .run_budget
-                    .check(rid, outcome.commit_tokens, outcome.commit_cost);
-            }
             self.run_budget
                 .commit(rid, outcome.commit_tokens, outcome.commit_cost);
         }

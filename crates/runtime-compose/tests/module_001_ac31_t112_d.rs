@@ -16,12 +16,15 @@ use advance_runtime_compose::test_support::fixture::{
 use advance_runtime_compose::test_support::{ComposeProbe, MemoryComposeLog};
 use advance_runtime_compose::{
     compose, log_keys, ComposeError, ComposeProfile, EmitError, ExtensionFailure, ExtensionPhase,
-    ProcessPolicy, RuntimePhase, ViewError,
+    ProcessPolicy, RuntimePhase, TaskRunStatus, ViewError,
 };
 use advance_shared_types::security_validator::{ScanContext, ScanResult};
 use chrono::Utc;
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
+
+#[path = "support/t112b.rs"]
+mod t112b;
 
 const POLL: Duration = Duration::from_millis(10);
 
@@ -883,8 +886,11 @@ async fn module_001_ac31_t112_d1_ext_events_absent_from_cost_ledger_after_a_turn
     assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
 }
 
+/// Through the run view, read the run a turn ran under: the run the gateway stamped on
+/// the turn's `llm.response`, read live (the turn's round is in it) and field for field as
+/// the operator's `GET /client/runs` reads it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn module_001_ac31_t112_d2_run_view_reflects_turn_tokens() {
+async fn module_001_ac31_t112_d2_run_view_reads_the_turn_run_as_the_operator_view() {
     let home = turn_home();
     let stub = StubInferencePort::new("stub-pong", 7, 3);
     let ext = FixtureExtension::new("fixture").with_inference(FixtureInference::standard(stub));
@@ -908,20 +914,64 @@ async fn module_001_ac31_t112_d2_run_view_reflects_turn_tokens() {
         .expect("POST /msg is bound");
     let (status, body) = post_msg(addr, "llm:hi").await;
     assert_eq!((status, body.as_str()), (200, "llm-ok:stub-pong"), "{body}");
+    let responses = t112b::wait_events(
+        home.home(),
+        "llm.response",
+        |event| t112b::provider(event) == Some("local-stub") && t112b::run_id(event).is_some(),
+        1,
+        Duration::from_secs(5),
+    )
+    .await;
+    let run = t112b::run_id(&responses[0]).expect("run_id").to_owned();
+    let mut view = None;
     assert!(
         poll_until(Duration::from_secs(5), || {
-            snap.cx
+            view = snap
+                .cx
                 .runs()
-                .runs()
-                .ok()
-                .and_then(|runs| runs.into_iter().map(|run| run.token_used).max())
-                .unwrap_or(0)
-                >= 10
+                .run(&run)
+                .expect("run view")
+                .filter(|info| info.iteration >= 1);
+            view.is_some()
         })
         .await,
-        "session run token_used stayed below 10: {:?}",
+        "the run view never read the turn's round in run {run}: {:?}",
         snap.cx.runs().runs()
     );
+    let view = view.expect("read");
+    assert_eq!(view.run_id, run);
+    assert_eq!(view.controller_agent, rt.root_agent_id());
+    assert_eq!(view.status, TaskRunStatus::Active);
+
+    let ep = rt.client_api().expect("client api");
+    let tok = mint_session(&ep);
+    let api_addr = ep.socket_addr;
+    drop(ep);
+    let resp = Http::get(api_addr, "/client/runs")
+        .session(&tok)
+        .send()
+        .await;
+    assert_eq!(resp.status, 200, "{:?}", resp.body);
+    let rows = resp
+        .body
+        .pointer("/data/runs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let row = rows
+        .iter()
+        .find(|row| row.get("run_id").and_then(Value::as_str) == Some(run.as_str()))
+        .unwrap_or_else(|| panic!("run {run} missing from GET /client/runs: {rows:?}"));
+    assert_eq!(row["task_id"], json!(view.task_id), "{row}");
+    assert_eq!(
+        row["controller_agent"],
+        json!(view.controller_agent),
+        "{row}"
+    );
+    assert_eq!(row["status"], "active", "{row}");
+    assert_eq!(row["iteration"], json!(view.iteration), "{row}");
+    assert_eq!(row["token_used"], json!(view.token_used), "{row}");
+    assert_eq!(row["cost_usd"].as_f64(), Some(view.cost_usd), "{row}");
     rt.shutdown().await.expect("shutdown");
     assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
 }
