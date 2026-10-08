@@ -107,6 +107,32 @@ pub struct BridgeHealth {
     pub supervise_readiness: Option<SuperviseReadiness>,
 }
 
+/// Health JSON schema version for handles started through v2.
+pub const HEALTH_SCHEMA_VERSION_V2: u32 = 2;
+
+/// How a v2 handle is composed (`options_json` `"composition"` and health `"composition_profile"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompositionProfile {
+    Full,
+    HostOnly,
+}
+
+/// Health of a handle started through v2: every v1 key, then three more (ADR D3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeHealthV2 {
+    pub schema_version: u32,
+    pub runtime_up: bool,
+    pub profile: RuntimeHostProfileView,
+    pub last_heartbeat_ok: bool,
+    pub composition_mode: CompositionMode,
+    pub lock_exclusivity: LockExclusivity,
+    pub supervise_readiness: Option<SuperviseReadiness>,
+    pub composition_profile: CompositionProfile,
+    pub agent_loop_up: bool,
+    pub client_api_base: Option<String>,
+}
+
 /// CONTRACT-210 trait (searchable type name for pin probes).
 pub trait EmbeddedRuntimeBridge: Send + Sync {
     fn start(

@@ -35,6 +35,10 @@ pub enum BridgeError {
     Internal(String),
     #[error("path error: {0}")]
     Path(PathBuf),
+    #[error("{0}")]
+    Unsupported(String),
+    #[error("{0}")]
+    Compose(String),
 }
 
 impl BridgeError {
@@ -54,6 +58,8 @@ impl BridgeError {
             Self::NestedRuntime => 11,
             Self::BufferTooSmall { .. } => 12,
             Self::Internal(_) | Self::Path(_) => 13,
+            Self::Unsupported(_) => 14,
+            Self::Compose(_) => 15,
         }
     }
 
@@ -93,6 +99,12 @@ mod tests {
             redact("missing runtime-config.yaml"),
             "missing runtime-config.yaml"
         );
+    }
+
+    #[test]
+    fn module_001_ac32_unsupported_and_compose_codes_are_14_and_15() {
+        assert_eq!(BridgeError::Unsupported("x".into()).c_code(), 14);
+        assert_eq!(BridgeError::Compose("y".into()).c_code(), 15);
     }
 }
 

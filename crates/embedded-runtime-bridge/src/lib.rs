@@ -12,6 +12,7 @@ pub(crate) mod embed;
 pub mod error;
 #[allow(unsafe_code)]
 pub mod ffi;
+pub mod options;
 
 // Re-export safe C ABI version for tests without needing unsafe in callers.
 pub use ffi::advance_bridge_abi_version;
@@ -28,10 +29,12 @@ pub(crate) mod workspace;
 pub use config::BridgeConfig;
 pub use error::BridgeError;
 pub use handle::BridgeHandle;
+pub use options::{BridgeClientApi, BridgeOptions};
 pub use types::{
-    BridgeHealth, BridgeLifecycleInput, BridgePlatform, CompositionMode, EmbeddedRuntimeBridge,
-    EngineMode, HostBackend, LockExclusivity, PlatformLifecycleState, RuntimeHostProfileView,
-    StorageProfile, SuperviseReadiness, ADVANCE_BRIDGE_ABI_VERSION, HEALTH_SCHEMA_VERSION,
+    BridgeHealth, BridgeHealthV2, BridgeLifecycleInput, BridgePlatform, CompositionMode,
+    CompositionProfile, EmbeddedRuntimeBridge, EngineMode, HostBackend, LockExclusivity,
+    PlatformLifecycleState, RuntimeHostProfileView, StorageProfile, SuperviseReadiness,
+    ADVANCE_BRIDGE_ABI_VERSION, HEALTH_SCHEMA_VERSION, HEALTH_SCHEMA_VERSION_V2,
 };
 
 use std::path::Path;
