@@ -35,6 +35,7 @@ use crate::deltas::{
 };
 use crate::envelope::{ClientEnvelope, ClientError, ClientErrorCode, API_VERSION};
 use crate::events::{ClientEventPage, ClientEventStreamRequest};
+use crate::families::{PollEmit, PollStreamEntry};
 use crate::request::{ClientRequest, Method};
 use crate::routes;
 use crate::ClientApi;
@@ -440,7 +441,13 @@ async fn http_client_request(
     Path(path): Path<String>,
     request: Request<Body>,
 ) -> Response {
-    handle_http(state, peer.ip(), format!("/client/{path}"), request).await
+    let path = format!("/client/{path}");
+    if is_websocket_upgrade(request.headers()) {
+        if let Some(entry) = state.api.poll_stream_for(&path) {
+            return poll_stream_transport(state, peer, path, entry, request).await;
+        }
+    }
+    handle_http(state, peer.ip(), path, request).await
 }
 
 /// Incident (grok-housekeeping clippy stage 1): blessed client-api
@@ -535,6 +542,292 @@ async fn event_stream_transport(
             )
             .await
         })
+}
+
+/// Incident (grok-housekeeping clippy stage 1): blessed client-api
+/// poll-stream transport site. Same spawn_blocking rule as
+/// [`event_stream_transport`] — never `Handle::block_on` on this
+/// async worker.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "blessed transport: spawn_blocking around sync handle(); never Handle::block_on on the async worker"
+)]
+async fn poll_stream_transport(
+    state: TransportState,
+    peer: SocketAddr,
+    path: String,
+    entry: Arc<PollStreamEntry>,
+    request: Request<Body>,
+) -> Response {
+    let (mut parts, _body) = request.into_parts();
+    let headers = parts.headers.clone();
+    let token = websocket_bearer(&headers);
+    let origin = header_string(&headers, ORIGIN.as_str());
+    let api_version = websocket_version(&headers);
+    let seed_request = ClientRequest {
+        api_version,
+        method: Method::Get,
+        path: path.clone(),
+        session_token: token.clone(),
+        origin: origin.clone(),
+        csrf_token: None,
+        idempotency_key: None,
+        is_loopback_peer: peer.ip().is_loopback(),
+        body: Value::Null,
+    };
+    let seed = match entry.dispatch.clone().try_acquire_owned() {
+        Ok(permit) => {
+            let seed_api = Arc::clone(&state.api);
+            match tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                seed_api.handle(seed_request)
+            })
+            .await
+            {
+                Ok(envelope) => envelope,
+                Err(_) => transport_error(
+                    ClientErrorCode::ModuleUnavailable,
+                    "poll stream unavailable",
+                ),
+            }
+        }
+        Err(_) => transport_error(
+            ClientErrorCode::ModuleUnavailable,
+            "server at dispatch capacity",
+        ),
+    };
+    if seed.is_err() {
+        return envelope_response(seed);
+    }
+
+    let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+        Ok(ws) => ws,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let api = Arc::clone(&state.api);
+    let max_body_bytes = state.max_body_bytes;
+    let tracked = state.ws.tasks.token();
+    let cancel = state.ws.cancel.clone();
+    ws.protocols([CLIENT_WS_PROTOCOL])
+        .on_upgrade(move |socket| async move {
+            let _tracked = tracked;
+            poll_stream_socket(
+                socket,
+                api,
+                entry,
+                path,
+                peer.ip(),
+                token,
+                origin,
+                seed,
+                max_body_bytes,
+                cancel,
+            )
+            .await
+        })
+}
+
+/// The poll-stream WebSocket task. Shutdown preempts the loop wherever it waits (a send to a
+/// peer that stopped reading included); the courtesy `Close` is then bounded.
+#[allow(clippy::too_many_arguments)]
+async fn poll_stream_socket(
+    mut socket: WebSocket,
+    api: Arc<ClientApi>,
+    entry: Arc<PollStreamEntry>,
+    path: String,
+    peer_ip: IpAddr,
+    token: Option<String>,
+    origin: Option<String>,
+    seed: ClientEnvelope<Value>,
+    max_body_bytes: usize,
+    cancel: CancellationToken,
+) {
+    let cancelled = tokio::select! {
+        biased;
+        () = cancel.cancelled() => true,
+        () = poll_stream_loop(
+            &mut socket,
+            api,
+            entry,
+            path,
+            peer_ip,
+            token,
+            origin,
+            seed,
+            max_body_bytes,
+        ) => false,
+    };
+    if cancelled {
+        let _ = tokio::time::timeout(WS_CLOSE_GRACE, socket.send(Message::Close(None))).await;
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::disallowed_methods,
+    reason = "blessed transport: spawn_blocking around sync handle(); never Handle::block_on on the async worker"
+)]
+async fn poll_stream_loop(
+    socket: &mut WebSocket,
+    api: Arc<ClientApi>,
+    entry: Arc<PollStreamEntry>,
+    path: String,
+    peer_ip: IpAddr,
+    token: Option<String>,
+    origin: Option<String>,
+    seed: ClientEnvelope<Value>,
+    max_body_bytes: usize,
+) {
+    let mut cursor = seed
+        .data
+        .as_ref()
+        .and_then(|data| data.pointer(entry.cursor).cloned());
+    if send_envelope(socket, &seed).await.is_err() {
+        return;
+    }
+    let mut poll = tokio::time::interval(Duration::from_millis(POLL_INTERVAL_MS));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    poll.tick().await;
+    heartbeat.tick().await;
+    let mut base = Value::Null;
+
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        if text.len() > max_body_bytes {
+                            let envelope = transport_error(
+                                ClientErrorCode::RequestTooLarge,
+                                "body exceeds max",
+                            );
+                            let _ = send_envelope(socket, &envelope).await;
+                            break;
+                        }
+                        match serde_json::from_str::<Value>(text.as_str()) {
+                            Ok(Value::Object(map)) => base = Value::Object(map),
+                            _ => {
+                                let envelope = transport_error(
+                                    ClientErrorCode::InvalidState,
+                                    "invalid JSON request body",
+                                );
+                                let _ = send_envelope(socket, &envelope).await;
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(bytes))) => {
+                        if socket.send(Message::Pong(bytes)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Binary(_))) => {}
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                }
+            }
+            _ = poll.tick() => {
+                let permit = match entry.dispatch.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => continue,
+                };
+                let mut body = base.clone();
+                if let Some(cursor) = cursor.as_ref() {
+                    write_json_pointer(&mut body, entry.cursor, cursor.clone());
+                }
+                let request = ClientRequest {
+                    api_version: API_VERSION.to_string(),
+                    method: Method::Get,
+                    path: path.clone(),
+                    session_token: token.clone(),
+                    origin: origin.clone(),
+                    csrf_token: None,
+                    idempotency_key: None,
+                    is_loopback_peer: peer_ip.is_loopback(),
+                    body,
+                };
+                let worker_api = Arc::clone(&api);
+                let envelope = match tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    worker_api.handle(request)
+                })
+                .await
+                {
+                    Ok(envelope) => envelope,
+                    Err(_) => transport_error(
+                        ClientErrorCode::ModuleUnavailable,
+                        "poll stream unavailable",
+                    ),
+                };
+                if let Some(data) = envelope.data.as_ref() {
+                    if let Some(next) = data.pointer(entry.cursor) {
+                        cursor = Some(next.clone());
+                    }
+                    if poll_emit_holds(data, entry.emit)
+                        && send_envelope(socket, &envelope).await.is_err()
+                    {
+                        break;
+                    }
+                } else {
+                    let _ = send_envelope(socket, &envelope).await;
+                    break;
+                }
+            }
+            _ = heartbeat.tick() => {
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn poll_emit_holds(data: &Value, emit: PollEmit) -> bool {
+    match emit {
+        PollEmit::NonEmptyArrayAt(pointer) => data
+            .pointer(pointer)
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty()),
+    }
+}
+
+fn write_json_pointer(doc: &mut Value, pointer: &str, value: Value) {
+    let mut tokens = pointer[1..]
+        .split('/')
+        .map(|token| token.replace("~1", "/").replace("~0", "~"));
+    let Some(first) = tokens.next() else {
+        *doc = value;
+        return;
+    };
+    if !doc.is_object() {
+        *doc = Value::Object(Map::new());
+    }
+    let mut current = doc;
+    let mut token = first;
+    loop {
+        match tokens.next() {
+            None => {
+                if let Value::Object(map) = current {
+                    map.insert(token, value);
+                }
+                return;
+            }
+            Some(next) => {
+                let Value::Object(map) = current else {
+                    return;
+                };
+                let entry = map
+                    .entry(token)
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if !entry.is_object() {
+                    *entry = Value::Object(Map::new());
+                }
+                current = entry;
+                token = next;
+            }
+        }
+    }
 }
 
 /// Incident (grok-housekeeping clippy stage 1): blessed client-api

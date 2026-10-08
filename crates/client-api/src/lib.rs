@@ -92,8 +92,8 @@ pub use families::{
     ClientFamilyRegistrar, DuplicateOf, ExtensionBudgetStats, ExtensionCursorCodec,
     ExtensionFamilies, ExtensionRouteEvent, ExtensionRouteGate, ExtensionRouteHooks,
     ExtensionRouteInfo, ExtensionServiceParts, ExtensionServices, FamilyBudget,
-    NoExtensionRouteHooks, PathDefect, ResponseScan, RouteBook, RouteOptions, RouteRefusal,
-    RouteRefusalReason,
+    NoExtensionRouteHooks, PathDefect, PollEmit, PollStreamDefect, PollStreamSpec, ResponseScan,
+    RouteBook, RouteOptions, RouteRefusal, RouteRefusalReason,
 };
 pub use messages::{ClientMessageAck, ClientMessageStatus, ClientSendMessageRequest};
 pub use packs::{

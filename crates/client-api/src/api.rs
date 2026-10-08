@@ -340,6 +340,7 @@ pub struct ClientApi {
     extension_budgets: HashMap<String, Arc<crate::families::ExtensionBudget>>,
     extension_routes: Vec<crate::families::ExtensionRouteInfo>,
     extension_gate: Option<crate::families::ExtensionRouteGate>,
+    poll_streams: HashMap<String, Arc<crate::families::PollStreamEntry>>,
 }
 
 impl ClientApi {
@@ -405,6 +406,7 @@ impl ClientApi {
             extension_budgets: HashMap::new(),
             extension_routes: Vec::new(),
             extension_gate: None,
+            poll_streams: HashMap::new(),
         };
         api.register_builtin_handlers();
         api.register_provider_families();
@@ -1098,9 +1100,17 @@ impl ClientApi {
         let installed = !parts.report.is_empty();
         self.extension_budgets = parts.budgets;
         self.extension_routes = parts.report;
+        self.poll_streams = parts.poll_streams;
         if installed {
             self.extension_gate = Some(parts.gate);
         }
+    }
+
+    pub(crate) fn poll_stream_for(
+        &self,
+        path: &str,
+    ) -> Option<Arc<crate::families::PollStreamEntry>> {
+        self.poll_streams.get(path).cloned()
     }
 
     pub(crate) fn extension_dispatch_for(&self, path: &str) -> Option<Arc<tokio::sync::Semaphore>> {

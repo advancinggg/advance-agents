@@ -67,6 +67,94 @@ pub const DEFAULT_DISPATCH_PERMITS: u32 = 16;
 pub const DEFAULT_IDEMPOTENCY_RECORDS: usize = 1_000;
 
 const POINTER_FIELD_MAX: usize = 256;
+const POLL_POINTER_MAX: usize = 128;
+
+/// GET read + WebSocket poll adapter at one exact path (MODULE-001-AC-33).
+#[non_exhaustive]
+pub struct PollStreamSpec {
+    /// The GET read registered at the same path (session + scope rules apply).
+    pub handler: HandlerSpec,
+    /// RFC 6901 pointer of the cursor inside a success `data`; the adapter writes the same pointer
+    /// into the next poll's request body (creating objects along the way).
+    pub cursor: &'static str,
+    pub emit: PollEmit,
+}
+
+impl PollStreamSpec {
+    pub fn new(handler: HandlerSpec, cursor: &'static str, emit: PollEmit) -> Self {
+        Self {
+            handler,
+            cursor,
+            emit,
+        }
+    }
+}
+
+/// When a poll frame is sent after the seed (the seed is always sent).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollEmit {
+    /// Send a poll frame only when `data[pointer]` is a non-empty array.
+    NonEmptyArrayAt(&'static str),
+}
+
+/// Why [`ClientFamilyRegistrar::poll_stream`] refused a registration.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PollStreamDefect {
+    TemplatedPath,
+    InvalidCursorPointer,
+    InvalidEmitPointer,
+    HandlerNotRead,
+}
+
+impl std::fmt::Display for PollStreamDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PollStreamDefect::TemplatedPath => write!(f, "templated path"),
+            PollStreamDefect::InvalidCursorPointer => write!(f, "invalid cursor pointer"),
+            PollStreamDefect::InvalidEmitPointer => write!(f, "invalid emit pointer"),
+            PollStreamDefect::HandlerNotRead => write!(f, "handler is not a GET read"),
+        }
+    }
+}
+
+/// One accepted poll stream, keyed by exact path on [`ClientApi`].
+pub(crate) struct PollStreamEntry {
+    #[allow(dead_code)]
+    pub(crate) extension: &'static str,
+    pub(crate) cursor: &'static str,
+    pub(crate) emit: PollEmit,
+    pub(crate) dispatch: Arc<Semaphore>,
+}
+
+fn check_poll_pointer(pointer: &str) -> bool {
+    if pointer.len() > POLL_POINTER_MAX || !pointer.starts_with('/') {
+        return false;
+    }
+    let rest = &pointer[1..];
+    if rest.is_empty() {
+        return false;
+    }
+    for token in rest.split('/') {
+        if token.is_empty() {
+            return false;
+        }
+        let bytes = token.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'~' {
+                if i + 1 >= bytes.len() || (bytes[i + 1] != b'0' && bytes[i + 1] != b'1') {
+                    return false;
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    true
+}
 
 /// Every OSS route, read from a scratch `ClientApi` built with `with_parts` (no environment read).
 pub fn oss_route_table() -> Vec<RouteTableEntry> {
@@ -733,6 +821,7 @@ pub enum RouteRefusalReason {
         max: u64,
     },
     BudgetAlreadySet,
+    PollStream(PollStreamDefect),
 }
 
 impl std::fmt::Display for RouteRefusalReason {
@@ -791,6 +880,7 @@ impl std::fmt::Display for RouteRefusalReason {
                 write!(f, "{field}={value} outside 1..={max}")
             }
             RouteRefusalReason::BudgetAlreadySet => write!(f, "the family budget is already set"),
+            RouteRefusalReason::PollStream(d) => write!(f, "poll stream: {d}"),
         }
     }
 }
@@ -848,12 +938,20 @@ struct RecordedRoute {
     templated: bool,
     spec: HandlerSpec,
     options: RouteOptions,
+    poll_stream: bool,
+}
+
+struct PendingPollStream {
+    path: String,
+    cursor: &'static str,
+    emit: PollEmit,
 }
 
 struct ExtensionRecord {
     extension: &'static str,
     services: ExtensionServices,
     routes: Vec<RecordedRoute>,
+    poll_streams: Vec<PendingPollStream>,
     budget: Option<FamilyBudget>,
     refusal: Option<RouteRefusal>,
 }
@@ -949,6 +1047,7 @@ impl RouteBook {
             extension,
             services,
             routes: Vec::new(),
+            poll_streams: Vec::new(),
             budget: None,
             refusal: None,
         });
@@ -974,6 +1073,7 @@ impl RouteBook {
         let mut report = Vec::new();
         let mut scan_opt_outs = Vec::new();
         let mut budgets = Vec::new();
+        let mut poll_streams = HashMap::new();
         for rec in &self.extensions {
             let mut labels: BTreeMap<String, ()> = BTreeMap::new();
             for route in &rec.routes {
@@ -994,6 +1094,7 @@ impl RouteBook {
                     path: route.path.clone(),
                     templated: route.templated,
                     response_scan: route.options.response_scan,
+                    poll_stream: route.poll_stream,
                 });
                 if let ResponseScan::OptOut { reason } = route.options.response_scan {
                     scan_opt_outs.push(ExtensionRouteEvent::ScanOptOut {
@@ -1022,13 +1123,25 @@ impl RouteBook {
                 .map_or(DEFAULT_IDEMPOTENCY_RECORDS.min(self.max_records), |b| {
                     b.idempotency_records
                 });
+            let dispatch = Arc::new(Semaphore::new(permits as usize));
             budgets.push(Arc::new(ExtensionBudget {
                 extension: rec.extension,
                 labels: labels.into_keys().collect(),
-                dispatch: Arc::new(Semaphore::new(permits as usize)),
+                dispatch: Arc::clone(&dispatch),
                 dispatch_permits: permits,
                 idempotency: IdempotencyStore::new(self.ttl_ms, records),
             }));
+            for pending in &rec.poll_streams {
+                poll_streams.insert(
+                    pending.path.clone(),
+                    Arc::new(PollStreamEntry {
+                        extension: rec.extension,
+                        cursor: pending.cursor,
+                        emit: pending.emit,
+                        dispatch: Arc::clone(&dispatch),
+                    }),
+                );
+            }
         }
         templated.sort_by(|a, b| specificity_rank(&a.1).cmp(&specificity_rank(&b.1)));
         Ok(ExtensionFamilies {
@@ -1037,6 +1150,7 @@ impl RouteBook {
             budgets,
             report,
             scan_opt_outs,
+            poll_streams,
             gate: self.gate,
             hooks: self.hooks,
         })
@@ -1107,6 +1221,116 @@ impl<'a> ClientFamilyRegistrar<'a> {
         options: RouteOptions,
     ) -> Result<(), RouteRefusal> {
         self.record(method, template, spec, options, true)
+    }
+
+    /// GET + WebSocket poll adapter at an exact path (MODULE-001-AC-33).
+    pub fn poll_stream(&mut self, path: &str, spec: PollStreamSpec) -> Result<(), RouteRefusal> {
+        if let Some(r) = self.book.extensions[self.index].refusal.clone() {
+            return Err(r);
+        }
+        let ext = self.book.extensions[self.index].extension;
+        let text = route_text(Method::Get, path);
+        let fail =
+            |this: &mut Self, reason: RouteRefusalReason| Err(this.refuse(text.clone(), reason));
+
+        if let Err(d) = check_path_grammar(path, self.book.max_path_len) {
+            return fail(self, RouteRefusalReason::InvalidPath(d));
+        }
+        if path.contains('{') {
+            return fail(
+                self,
+                RouteRefusalReason::PollStream(PollStreamDefect::TemplatedPath),
+            );
+        }
+        if first_segment_is_param(path) {
+            return fail(self, RouteRefusalReason::ParameterisedFirstSegment);
+        }
+        if self.book.reserved_paths.contains(path) {
+            return fail(self, RouteRefusalReason::ReservedPath);
+        }
+        let label = family_of(path);
+        if self.book.check_reserved_labels && self.book.reserved_labels.contains(&label) {
+            return fail(self, RouteRefusalReason::ReservedLabel { label });
+        }
+        if self.book.check_label_ownership {
+            if let Some(owner) = self.book.label_owner.get(&label) {
+                if *owner != ext {
+                    return fail(
+                        self,
+                        RouteRefusalReason::LabelOwnedByOtherExtension {
+                            label,
+                            owner: *owner,
+                        },
+                    );
+                }
+            }
+        }
+        let shaped = shape(path);
+        let key = (Method::Get, shaped.clone());
+        if self.book.oss_shapes.contains(&key) {
+            return fail(
+                self,
+                RouteRefusalReason::DuplicateRoute {
+                    shape: shaped,
+                    of: DuplicateOf::Oss,
+                },
+            );
+        }
+        if let Some(owner) = self.book.ext_shapes.get(&key) {
+            return fail(
+                self,
+                RouteRefusalReason::DuplicateRoute {
+                    shape: shaped,
+                    of: DuplicateOf::Extension(*owner),
+                },
+            );
+        }
+        if !check_poll_pointer(spec.cursor) {
+            return fail(
+                self,
+                RouteRefusalReason::PollStream(PollStreamDefect::InvalidCursorPointer),
+            );
+        }
+        match spec.emit {
+            PollEmit::NonEmptyArrayAt(pointer) if !check_poll_pointer(pointer) => {
+                return fail(
+                    self,
+                    RouteRefusalReason::PollStream(PollStreamDefect::InvalidEmitPointer),
+                );
+            }
+            PollEmit::NonEmptyArrayAt(_) => {}
+        }
+        if spec.handler.is_mutation || spec.handler.post_read {
+            return fail(
+                self,
+                RouteRefusalReason::PollStream(PollStreamDefect::HandlerNotRead),
+            );
+        }
+        if !spec.handler.requires_session {
+            return fail(self, RouteRefusalReason::NoSession);
+        }
+        if spec.handler.required_scopes.is_empty() {
+            return fail(self, RouteRefusalReason::NoScope);
+        }
+
+        self.book.label_owner.insert(label, ext);
+        self.book.ext_shapes.insert(key, ext);
+        self.book.extensions[self.index].routes.push(RecordedRoute {
+            method: Method::Get,
+            path: path.to_string(),
+            templated: false,
+            spec: spec.handler,
+            options: RouteOptions::scanned(),
+            poll_stream: true,
+        });
+        self.book.extensions[self.index]
+            .poll_streams
+            .push(PendingPollStream {
+                path: path.to_string(),
+                cursor: spec.cursor,
+                emit: spec.emit,
+            });
+        Ok(())
     }
 
     /// At most once per extension; without it the effective default applies.
@@ -1259,6 +1483,7 @@ impl<'a> ClientFamilyRegistrar<'a> {
             templated,
             spec,
             options,
+            poll_stream: false,
         });
         Ok(())
     }
@@ -1271,6 +1496,7 @@ pub struct ExtensionFamilies {
     budgets: Vec<Arc<ExtensionBudget>>,
     report: Vec<ExtensionRouteInfo>,
     scan_opt_outs: Vec<ExtensionRouteEvent>,
+    poll_streams: HashMap<String, Arc<PollStreamEntry>>,
     gate: ExtensionRouteGate,
     hooks: Arc<dyn ExtensionRouteHooks>,
 }
@@ -1283,6 +1509,7 @@ impl ExtensionFamilies {
             budgets: Vec::new(),
             report: Vec::new(),
             scan_opt_outs: Vec::new(),
+            poll_streams: HashMap::new(),
             gate: ExtensionRouteGate::new(),
             hooks: Arc::new(NoExtensionRouteHooks),
         }
@@ -1316,6 +1543,7 @@ impl ExtensionFamilies {
             templated: self.templated,
             budgets,
             report: self.report,
+            poll_streams: self.poll_streams,
             gate: self.gate,
         });
     }
@@ -1339,6 +1567,7 @@ pub struct ExtensionRouteInfo {
     pub path: String,
     pub templated: bool,
     pub response_scan: ResponseScan,
+    pub poll_stream: bool,
 }
 
 /// Read-only budget state (`ClientApi::extension_budget_stats`).
@@ -1366,6 +1595,7 @@ pub(crate) struct InstalledExtensionParts {
     pub(crate) templated: Vec<(Method, String, HandlerSpec)>,
     pub(crate) budgets: HashMap<String, Arc<ExtensionBudget>>,
     pub(crate) report: Vec<ExtensionRouteInfo>,
+    pub(crate) poll_streams: HashMap<String, Arc<PollStreamEntry>>,
     pub(crate) gate: ExtensionRouteGate,
 }
 
