@@ -242,6 +242,8 @@ pub mod log_keys {
     pub const ROLLBACK_SIDECAR_REMOVE_FAILED: &str = "rollback.sidecar_remove_failed";
     /// stderr: the compensating rollback commit failed.
     pub const ROLLBACK_COMPENSATING_COMMIT_FAILED: &str = "rollback.compensating_commit_failed";
+    /// stderr: an in-process launch through `InProcessLauncher` failed.
+    pub const ATTACH_LAUNCH_FAILED: &str = "attach.launch_failed";
 
     /// Every key above, in catalogue order.
     pub const ALL: &[&str] = &[
@@ -330,6 +332,7 @@ pub mod log_keys {
         ROLLBACK_SIDECAR_KEPT,
         ROLLBACK_SIDECAR_REMOVE_FAILED,
         ROLLBACK_COMPENSATING_COMMIT_FAILED,
+        ATTACH_LAUNCH_FAILED,
     ];
 }
 

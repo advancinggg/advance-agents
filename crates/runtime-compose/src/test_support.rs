@@ -56,6 +56,11 @@ pub fn reserved_homes() -> Vec<PathBuf> {
     crate::registry::reserved_homes_for_test()
 }
 
+/// In-memory launch claims currently held (MODULE-001-AC-34).
+pub fn launch_claims() -> Vec<PathBuf> {
+    crate::registry::launch_claims_for_test()
+}
+
 /// CONTRACT-218 custody paths a composition currently holds.
 pub fn custody_paths() -> Vec<PathBuf> {
     crate::contract218_anchor::custody_paths_for_test()

@@ -1,6 +1,7 @@
 //! The composition API: the types an embedder names to compose the runtime, receive
 //! its output and stop it.
 
+mod attach;
 mod compose_log;
 mod error;
 mod extension;
@@ -39,6 +40,12 @@ pub use advance_client_api::Scope;
 pub use advance_shared_types::capability::CapParams;
 pub use advance_shared_types::capability::GrantDecision;
 pub use advance_shared_types::run::TaskRunStatus;
+pub use attach::launch_reasons;
+pub use attach::InProcessLauncher;
+pub use attach::InProcessLauncherError;
+pub use attach::InProcessStopError;
+pub use attach::LaunchPlan;
+pub use attach::ProcessLocalAttachSource;
 pub use compose_log::log_keys;
 pub use compose_log::ComposeLog;
 pub use compose_log::ComposeLogLine;

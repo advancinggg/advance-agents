@@ -203,7 +203,7 @@ impl WebhookSource for BootNoopWebhookSource {
 /// pulled from a tampered config file) may carry ANSI escapes, terminal
 /// control sequences, or newlines. `Path::display()` does NOT escape these;
 /// `{:?}` formatting routes through Debug → `escape_debug` and DOES.
-fn safe_path(p: &Path) -> String {
+pub(crate) fn safe_path(p: &Path) -> String {
     format!("{p:?}")
 }
 

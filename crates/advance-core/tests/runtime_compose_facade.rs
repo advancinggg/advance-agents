@@ -17,20 +17,21 @@ use std::path::Path;
 use std::sync::Arc;
 
 use advance_core::runtime_compose::{
-    async_trait, compose, log_keys, method_label, provider_or_unavailable, scan_client_text,
-    Admission, BoxFuture, CapParams, CapabilityRefusal, ClientApiCheck, ClientApiEndpoint,
-    ClientApiOptions, ClientApiRebindError, ClientError, ClientErrorCode, ClientFamilyRegistrar,
-    ClientWarning, ComponentFunc, ComposeCx, ComposeError, ComposeExtension, ComposeLog,
-    ComposeLogLine, ComposeOptions, ComposeProfile, ComposedRuntime, ConfigView, DuplicateOf,
-    EmitError, EmitReceipt, ExtensionCursorCodec, ExtensionEmitter, ExtensionError,
+    async_trait, compose, launch_reasons, log_keys, method_label, provider_or_unavailable,
+    scan_client_text, Admission, BoxFuture, CapParams, CapabilityRefusal, ClientApiCheck,
+    ClientApiEndpoint, ClientApiOptions, ClientApiRebindError, ClientError, ClientErrorCode,
+    ClientFamilyRegistrar, ClientWarning, ComponentFunc, ComposeCx, ComposeError, ComposeExtension,
+    ComposeLog, ComposeLogLine, ComposeOptions, ComposeProfile, ComposedRuntime, ConfigView,
+    DuplicateOf, EmitError, EmitReceipt, ExtensionCursorCodec, ExtensionEmitter, ExtensionError,
     ExtensionFailure, ExtensionGrantCheck, ExtensionHealth, ExtensionPhase, ExtensionSecrets,
     ExtensionServices, ExtensionState, FamilyBudget, GatewayHandle, GrantDecision, HandlerCtx,
     HandlerResponse, HandlerSpec, HostCallContext, HostCallError, HostFunctionDef,
     HostFunctionFailure, HostFunctionHandler, HostFunctionRefusal, HostFunctionRegistrar,
-    HostPlatform, HostTool, InferenceContribution, InferenceRefusal, InferenceSubject,
-    InstanceGuard, InstanceGuardKind, ListenerOptions, LockFailure, LogStream, MasterKeyInput,
-    Method, MethodInfo, NullComposeLog, OssBinding, PanicAnswer, PathDefect, PlatformRule,
-    PollEmit, PollStreamSpec, ProcessPolicy, ProviderSlot, ResponseScan, RouteOptions,
+    HostPlatform, HostTool, InProcessLauncher, InProcessLauncherError, InProcessStopError,
+    InferenceContribution, InferenceRefusal, InferenceSubject, InstanceGuard, InstanceGuardKind,
+    LaunchPlan, ListenerOptions, LockFailure, LogStream, MasterKeyInput, Method, MethodInfo,
+    NullComposeLog, OssBinding, PanicAnswer, PathDefect, PlatformRule, PollEmit, PollStreamSpec,
+    ProcessLocalAttachSource, ProcessPolicy, ProviderSlot, ResponseScan, RouteOptions,
     RouteRefusal, RouteRefusalReason, RunInfo, RunView, RuntimeHealthView, RuntimePhase, Scope,
     SecretViewError, ShutdownHandle, StartedCx, TaskRunStatus, TaskSpawner, ToolDescription,
     ToolError, ToolRefusal, ToolRegistrar, UnknownPlatform, Unsupported, Val, ViewError,
@@ -139,6 +140,12 @@ const ALLOWED: &[&str] = &[
     "CapParams",
     "GrantDecision",
     "TaskRunStatus",
+    "launch_reasons",
+    "InProcessLauncher",
+    "InProcessLauncherError",
+    "InProcessStopError",
+    "LaunchPlan",
+    "ProcessLocalAttachSource",
 ];
 
 /// The one façade line.
@@ -261,6 +268,12 @@ fn uses_the_api_through_the_facade(home: std::path::PathBuf) {
     let _: Option<TaskRunStatus> = None;
     let _: Option<PlatformRule> = None;
     let _: Result<HostPlatform, UnknownPlatform> = "mac".parse();
+    let _: &[&str] = launch_reasons::ALL;
+    let _: Option<InProcessLauncher> = None;
+    let _: Option<InProcessLauncherError> = None;
+    let _: Option<InProcessStopError> = None;
+    let _: Option<LaunchPlan> = None;
+    let _: ProcessLocalAttachSource = ProcessLocalAttachSource::new();
 }
 
 #[test]

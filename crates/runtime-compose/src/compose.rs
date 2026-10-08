@@ -230,6 +230,14 @@ pub async fn compose(
                 composition.teardown(TeardownReason::Requested).await;
                 let _ = done_tx.send(true);
             });
+            let _published = crate::registry::publish_attach(
+                &plan.home,
+                crate::registry::AttachInfo {
+                    view: Arc::downgrade(&view),
+                    shutdown: shutdown.clone(),
+                    platform: client_platform(profile),
+                },
+            );
             Ok(ComposedRuntime::new(view, shutdown, done_rx, supervisor))
         }
         Err(GraphFailure { error, partial }) => {
@@ -262,6 +270,25 @@ pub async fn compose(
 /// `<home>/.advance/runtime-config.yaml`: the one place the config path is derived.
 pub(crate) fn config_path(home: &Path) -> PathBuf {
     home.join(".advance").join("runtime-config.yaml")
+}
+
+/// The CONTRACT-192 platform an in-process attach mints for (exhaustive over this crate's enums).
+fn client_platform(profile: ComposeProfile) -> advance_client_api::Platform {
+    match profile {
+        ComposeProfile::Embedded {
+            platform: HostPlatform::Ios,
+        } => advance_client_api::Platform::Ios,
+        ComposeProfile::Embedded {
+            platform: HostPlatform::Android,
+        } => advance_client_api::Platform::Android,
+        ComposeProfile::Embedded {
+            platform: HostPlatform::Windows,
+        } => advance_client_api::Platform::Windows,
+        ComposeProfile::Embedded {
+            platform: HostPlatform::MacOs | HostPlatform::Linux,
+        }
+        | ComposeProfile::Daemon => advance_client_api::Platform::Mac,
+    }
 }
 
 /// What [`validate`] established about the options.
