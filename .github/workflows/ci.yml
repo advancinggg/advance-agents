@@ -247,6 +247,57 @@ jobs:
                 target/aarch64-apple-ios/release/libadvance_embedded_runtime_bridge.dylib
 
   # ---------------------------------------------------------------------------
+  # The MODULE-001-T113 (2) Pulley turn on an iOS simulator (ADR 2026-10-03 D3 "may also
+  # run the Pulley turn on the iOS simulator"). Informational: never blocks a merge.
+  # ---------------------------------------------------------------------------
+  ios-sim-pulley-turn:
+    name: Pulley turn on the iOS simulator (informational)
+    if: github.event_name != 'pull_request'
+    needs: ios-bridge
+    runs-on: macos-15
+    timeout-minutes: 90
+    continue-on-error: true
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - run: rustup target add aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-ios-sim
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the T113 (2) test binary for the simulator
+        run: |
+          set -euo pipefail
+          SDKROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          export SDKROOT
+          cargo test -p advance-runtime-compose --test module_001_ac32_t113_2_pulley_turn \
+            --target aarch64-apple-ios-sim --locked --no-run --message-format=json > build.jsonl
+          bin="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "module_001_ac32_t113_2_pulley_turn" and .executable != null) | .executable' build.jsonl | tail -n1)" \
+            || { echo "could not read the test executable from build.jsonl"; exit 1; }
+          { [ -n "$bin" ] && [ -x "$bin" ]; } || { echo "no executable test binary: '$bin'"; exit 1; }
+          echo "T113_BIN=$bin" >> "$GITHUB_ENV"
+      - name: Boot an iPhone simulator and run the turn inside it
+        run: |
+          set -euo pipefail
+          runtime="$(xcrun simctl list runtimes --json | jq -r '[.runtimes[] | select(.platform == "iOS" and .isAvailable)] | last | .identifier // empty')" \
+            || { echo "simctl list runtimes failed"; exit 1; }
+          [ -n "$runtime" ] || { echo "no available iOS simulator runtime"; exit 1; }
+          devtype="$(xcrun simctl list devicetypes --json | jq -r '[.devicetypes[] | select(.productFamily == "iPhone")] | last | .identifier // empty')" \
+            || { echo "simctl list devicetypes failed"; exit 1; }
+          [ -n "$devtype" ] || { echo "no iPhone device type"; exit 1; }
+          udid="$(xcrun simctl create t113-pulley "$devtype" "$runtime")" || { echo "simctl create failed"; exit 1; }
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+          SIMCTL_CHILD_RUST_BACKTRACE=1 xcrun simctl spawn "$udid" "$T113_BIN" \
+            --exact module_001_ac32_t113_2_embedded_pulley_turn_no_exec_memory_no_child \
+            --nocapture --test-threads 1
+
+  # ---------------------------------------------------------------------------
   # cargo-deny — the hard supply-chain gate.
   # Policy (see deny.toml): `bans`, `licenses`, and `sources` are POSTURE
   # INVARIANTS and hard-block the merge. `advisories` are EXPECTED to fire against
