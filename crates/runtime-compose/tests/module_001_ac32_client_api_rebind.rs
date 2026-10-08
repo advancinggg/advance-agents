@@ -76,13 +76,17 @@ fn same_api(left: &ClientApiEndpoint, right: &Weak<advance_client_api::ClientApi
     Weak::ptr_eq(&left.api, right)
 }
 
-/// Open `/client/events/stream` without an `Origin` (InProcessOnly refuses browser origins).
-async fn open_events_ws(endpoint: &ClientApiEndpoint, token: &str) -> t111::ClientWs {
+/// Open a Client API WebSocket without an `Origin` (InProcessOnly refuses browser origins).
+async fn open_ws_in_process(
+    endpoint: &ClientApiEndpoint,
+    token: &str,
+    path: &str,
+) -> t111::ClientWs {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
 
     let addr = endpoint.socket_addr;
-    let mut request = format!("ws://{addr}/client/events/stream")
+    let mut request = format!("ws://{addr}{path}")
         .into_client_request()
         .expect("WebSocket request");
     request.headers_mut().insert(
@@ -111,6 +115,11 @@ async fn open_events_ws(endpoint: &ClientApiEndpoint, token: &str) -> t111::Clie
     .await
     .expect("the seed frame arrives");
     ws
+}
+
+/// Open `/client/events/stream` without an `Origin` (InProcessOnly refuses browser origins).
+async fn open_events_ws(endpoint: &ClientApiEndpoint, token: &str) -> t111::ClientWs {
+    open_ws_in_process(endpoint, token, "/client/events/stream").await
 }
 
 async fn expect_rebound(rt: &ComposedRuntime, previous: SocketAddr) -> SocketAddr {
@@ -282,7 +291,8 @@ async fn module_001_ac32_rebind_keeps_extension_families_serving() {
     let log = MemoryComposeLog::new();
     let probe = Arc::new(ComposeProbe::new());
     let baseline = alive_tasks();
-    let ext = FixtureExtension::new(FIXTURE_ID).with_families(FixtureFamilies::standard());
+    let ext =
+        FixtureExtension::new(FIXTURE_ID).with_families(FixtureFamilies::standard().with_feed());
     let rt = compose(
         in_process(&home, Arc::new(log), Arc::clone(&probe), false),
         vec![ext.arc()],
@@ -292,6 +302,7 @@ async fn module_001_ac32_rebind_keeps_extension_families_serving() {
     let ep = rt.client_api().expect("client api");
     let previous = ep.socket_addr;
     let token = mint_session(&ep);
+    let mut feed = open_ws_in_process(&ep, &token, "/client/fixture/feed").await;
 
     async fn fixture_status(addr: SocketAddr, token: Option<&str>) -> u16 {
         let req = Http::get(addr, "/client/fixture/status");
@@ -304,6 +315,10 @@ async fn module_001_ac32_rebind_keeps_extension_families_serving() {
 
     rt.fail_next_client_api_probe_for_test();
     let rebound = expect_rebound(&rt, previous).await;
+    t111::assert_ws_closed(&mut feed, Duration::from_secs(2)).await;
+    let rebound_ep = rt.client_api().expect("rebound client api");
+    assert_eq!(rebound_ep.socket_addr, rebound);
+    let _feed = open_ws_in_process(&rebound_ep, &token, "/client/fixture/feed").await;
     assert_eq!(fixture_status(rebound, Some(&token)).await, 200);
     assert_eq!(fixture_status(rebound, None).await, 401);
 
