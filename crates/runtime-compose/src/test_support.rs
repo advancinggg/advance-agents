@@ -235,6 +235,8 @@ pub struct ProbeRecord {
     /// `Some(true)`: wiring entered the FromConfig branch (migration + load);
     /// `Some(false)`: the Provided branch; `None`: no key needed.
     pub master_key_from_config: Option<bool>,
+    /// `ShutdownIngress.ws_joined` from teardown step 1; `None` when that drain did not run.
+    pub client_api_ws_joined: Option<bool>,
 }
 
 impl ProbeRecord {

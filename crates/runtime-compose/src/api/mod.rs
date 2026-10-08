@@ -19,6 +19,8 @@ pub use advance_client_api::families::ExtensionCursorCodec;
 pub use advance_client_api::families::ExtensionServices;
 pub use advance_client_api::families::FamilyBudget;
 pub use advance_client_api::families::PathDefect;
+pub use advance_client_api::families::PollEmit;
+pub use advance_client_api::families::PollStreamSpec;
 pub use advance_client_api::families::ResponseScan;
 pub use advance_client_api::families::RouteOptions;
 pub use advance_client_api::families::RouteRefusal;

@@ -1,14 +1,14 @@
 //! The fixture's (a) client-families part.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::api::{
     provider_or_unavailable, ClientError, ClientErrorCode, ClientFamilyRegistrar, ExtensionError,
-    FamilyBudget, HandlerSpec, Method, ProviderSlot, RouteOptions, Scope,
+    FamilyBudget, HandlerSpec, Method, PollEmit, PollStreamSpec, ProviderSlot, RouteOptions, Scope,
 };
 
 use super::FIXTURE_ID;
@@ -22,6 +22,7 @@ pub struct FixtureFamilies {
     label: &'static str,
     budget: Option<FamilyBudget>,
     rule_break: Option<RouteRuleBreak>,
+    feed: bool,
     control: Arc<FamiliesControl>,
 }
 
@@ -35,6 +36,7 @@ impl FixtureFamilies {
             label,
             budget: None,
             rule_break: None,
+            feed: false,
             control: Arc::new(FamiliesControl::default()),
         }
     }
@@ -49,6 +51,12 @@ impl FixtureFamilies {
         self
     }
 
+    /// GET + WebSocket poll stream at `/client/<label>/feed` (MODULE-001-AC-33).
+    pub fn with_feed(mut self) -> Self {
+        self.feed = true;
+        self
+    }
+
     pub fn control(&self) -> Arc<FamiliesControl> {
         Arc::clone(&self.control)
     }
@@ -59,6 +67,9 @@ impl FixtureFamilies {
         reg: &mut ClientFamilyRegistrar<'_>,
     ) -> Result<(), ExtensionError> {
         self.register_standard(reg)?;
+        if self.feed {
+            self.register_feed(reg)?;
+        }
         if let Some(budget) = self.budget {
             reg.set_budget(budget)?;
         }
@@ -275,6 +286,43 @@ impl FixtureFamilies {
         Ok(())
     }
 
+    fn register_feed(&self, reg: &mut ClientFamilyRegistrar<'_>) -> Result<(), ExtensionError> {
+        let l = self.label;
+        let control = Arc::clone(&self.control);
+        let path = format!("/client/{l}/feed");
+        reg.poll_stream(
+            &path,
+            PollStreamSpec::new(
+                HandlerSpec::read(true, move |ctx| {
+                    if control.panic_next.swap(false, Ordering::AcqRel) {
+                        panic!("fixture feed panic");
+                    }
+                    control
+                        .polls
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push((Instant::now(), ctx.body.clone()));
+                    let items: Vec<Value> = std::mem::take(
+                        &mut *control
+                            .feed
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    );
+                    let n = if items.is_empty() {
+                        control.pages.load(Ordering::SeqCst)
+                    } else {
+                        control.pages.fetch_add(1, Ordering::SeqCst) + 1
+                    };
+                    Ok(json!({ "items": items, "cursor": format!("c{n}") }))
+                })
+                .with_scopes(vec![Scope::ReadInventory]),
+                "/cursor",
+                PollEmit::NonEmptyArrayAt("/items"),
+            ),
+        )?;
+        Ok(())
+    }
+
     fn register_break(
         &self,
         reg: &mut ClientFamilyRegistrar<'_>,
@@ -397,6 +445,10 @@ pub struct FamiliesControl {
     note: Mutex<String>,
     holding: AtomicUsize,
     slow: (Mutex<bool>, Condvar),
+    feed: Mutex<Vec<Value>>,
+    polls: Mutex<Vec<(Instant, Value)>>,
+    pages: AtomicU64,
+    panic_next: AtomicBool,
 }
 
 impl Default for FamiliesControl {
@@ -406,6 +458,10 @@ impl Default for FamiliesControl {
             note: Mutex::new("key AKIAABCDEFGHIJKLMNOP".into()),
             holding: AtomicUsize::new(0),
             slow: (Mutex::new(false), Condvar::new()),
+            feed: Mutex::new(Vec::new()),
+            polls: Mutex::new(Vec::new()),
+            pages: AtomicU64::new(0),
+            panic_next: AtomicBool::new(false),
         }
     }
 }
@@ -433,6 +489,25 @@ impl FamiliesControl {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
         self.slow.1.notify_all();
+    }
+
+    pub fn push_feed(&self, item: Value) {
+        self.feed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(item);
+    }
+
+    pub fn polls(&self) -> Vec<(Instant, Value)> {
+        self.polls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// One-shot: the next feed poll panics inside the wrapped handler.
+    pub fn panic_next_poll(&self) {
+        self.panic_next.store(true, Ordering::Release);
     }
 }
 

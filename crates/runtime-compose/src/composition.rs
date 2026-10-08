@@ -498,6 +498,9 @@ impl Composition {
         );
         let client_api = client_api.map(|ingress| {
             report_client_api_ingress(&ingress, &log);
+            probe_record!(self.steps.probe, |record| {
+                record.client_api_ws_joined = Some(ingress.ws_joined)
+            });
             self.steps.record("ingress.client_api");
             ingress.api
         });

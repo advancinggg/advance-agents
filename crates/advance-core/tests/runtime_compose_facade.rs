@@ -30,10 +30,11 @@ use advance_core::runtime_compose::{
     HostPlatform, HostTool, InferenceContribution, InferenceRefusal, InferenceSubject,
     InstanceGuard, InstanceGuardKind, ListenerOptions, LockFailure, LogStream, MasterKeyInput,
     Method, MethodInfo, NullComposeLog, OssBinding, PanicAnswer, PathDefect, PlatformRule,
-    ProcessPolicy, ProviderSlot, ResponseScan, RouteOptions, RouteRefusal, RouteRefusalReason,
-    RunInfo, RunView, RuntimeHealthView, RuntimePhase, Scope, SecretViewError, ShutdownHandle,
-    StartedCx, TaskRunStatus, TaskSpawner, ToolDescription, ToolError, ToolRefusal, ToolRegistrar,
-    UnknownPlatform, Unsupported, Val, ViewError, WasmEngine, Zeroizing,
+    PollEmit, PollStreamSpec, ProcessPolicy, ProviderSlot, ResponseScan, RouteOptions,
+    RouteRefusal, RouteRefusalReason, RunInfo, RunView, RuntimeHealthView, RuntimePhase, Scope,
+    SecretViewError, ShutdownHandle, StartedCx, TaskRunStatus, TaskSpawner, ToolDescription,
+    ToolError, ToolRefusal, ToolRegistrar, UnknownPlatform, Unsupported, Val, ViewError,
+    WasmEngine, Zeroizing,
 };
 
 /// The CONTRACT-244 API: every name `api/mod.rs` may re-export, and must.
@@ -78,6 +79,8 @@ const ALLOWED: &[&str] = &[
     "ExtensionServices",
     "FamilyBudget",
     "PathDefect",
+    "PollEmit",
+    "PollStreamSpec",
     "ResponseScan",
     "RouteOptions",
     "RouteRefusal",
@@ -215,6 +218,8 @@ fn uses_the_api_through_the_facade(home: std::path::PathBuf) {
     let _: Option<ExtensionServices> = None;
     let _: Option<FamilyBudget> = None;
     let _: Option<PathDefect> = None;
+    let _: Option<PollEmit> = None;
+    let _: Option<PollStreamSpec> = None;
     let _: Option<ResponseScan> = None;
     let _: Option<RouteOptions> = None;
     let _: Option<RouteRefusal> = None;
