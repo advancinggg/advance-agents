@@ -2,14 +2,15 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::cancel::CancelToken;
 use crate::contract::{AdoptError, ConnectError, ConnectedRuntime, RuntimeState};
 use crate::discovery::read_client_api_discovery;
-use crate::ports::{AdoptPort, RuntimeLauncher};
+use crate::ports::{AdoptPort, AttachTarget, RuntimeAttachSource, RuntimeLauncher};
 use crate::runtime_state::{
-    committed_provider_id, read_selected_provider, runtime_state_with_policy,
+    committed_provider_id, read_selected_provider, runtime_state_with_policy, SelectedProvider,
 };
 use advance_runtime::runtime_lock::inspect_lock_with_policy;
 use advance_shared_types::process_policy::{ProcessPolicy, SpawnSite, PROCESS_FORBIDDEN};
@@ -33,24 +34,24 @@ impl AdoptPort for FileAdoptPort {
         expected_provider: &str,
         cancel: &CancelToken,
     ) -> Result<(), AdoptError> {
-        wait_adopted_with(
+        wait_adopted_via(
+            &FileAttachSource::new(),
+            self.timeout,
             home,
             expected_provider,
             cancel,
-            self.timeout,
-            ProcessPolicy::Allow,
         )
     }
 }
 
-pub(crate) fn wait_adopted_with(
+fn wait_adopted_via(
+    source: &dyn RuntimeAttachSource,
+    timeout: Duration,
     home: &Path,
     expected_provider: &str,
     cancel: &CancelToken,
-    timeout: Duration,
-    policy: ProcessPolicy,
 ) -> Result<(), AdoptError> {
-    if runtime_state_with_policy(home, policy) != RuntimeState::Running {
+    if source.runtime_state(home) != RuntimeState::Running {
         return Err(AdoptError::NotRunning);
     }
     let start = Instant::now();
@@ -58,11 +59,8 @@ pub(crate) fn wait_adopted_with(
         if cancel.is_cancelled() {
             return Err(AdoptError::Cancelled);
         }
-        if let Some(sel) = read_selected_provider(home) {
-            let lock_ok = matches!(
-                inspect_lock_with_policy(home, policy),
-                advance_runtime::runtime_lock::LockInspection::Live { pid } if pid == sel.pid
-            );
+        if let Some(sel) = source.selected_provider(home) {
+            let lock_ok = source.live_pid(home) == Some(sel.pid);
             if lock_ok && sel.provider_id == expected_provider {
                 return Ok(());
             }
@@ -76,13 +74,46 @@ pub(crate) fn wait_adopted_with(
     }
 }
 
-pub(crate) struct PolicyFileAdoptPort {
+/// [`AdoptPort`] over an attach source: [`FileAdoptPort`]'s wait, reading `source`.
+pub struct SourceAdoptPort {
+    source: Arc<dyn RuntimeAttachSource>,
     pub timeout: Duration,
-    policy: ProcessPolicy,
 }
 
-impl PolicyFileAdoptPort {
-    pub(crate) fn new(policy: ProcessPolicy) -> Self {
+impl SourceAdoptPort {
+    pub fn new(source: Arc<dyn RuntimeAttachSource>) -> Self {
+        Self {
+            source,
+            timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl AdoptPort for SourceAdoptPort {
+    fn wait_adopted(
+        &self,
+        home: &Path,
+        expected_provider: &str,
+        cancel: &CancelToken,
+    ) -> Result<(), AdoptError> {
+        wait_adopted_via(
+            self.source.as_ref(),
+            self.timeout,
+            home,
+            expected_provider,
+            cancel,
+        )
+    }
+}
+
+/// The policy-aware adopt port: [`FileAdoptPort`]'s wait, with lock reads under `policy`.
+pub struct GuardedFileAdoptPort {
+    pub timeout: Duration,
+    pub policy: ProcessPolicy,
+}
+
+impl GuardedFileAdoptPort {
+    pub fn new(policy: ProcessPolicy) -> Self {
         Self {
             timeout: Duration::from_secs(30),
             policy,
@@ -90,14 +121,20 @@ impl PolicyFileAdoptPort {
     }
 }
 
-impl AdoptPort for PolicyFileAdoptPort {
+impl AdoptPort for GuardedFileAdoptPort {
     fn wait_adopted(
         &self,
         home: &Path,
         expected_provider: &str,
         cancel: &CancelToken,
     ) -> Result<(), AdoptError> {
-        wait_adopted_with(home, expected_provider, cancel, self.timeout, self.policy)
+        wait_adopted_via(
+            &FileAttachSource::with_policy(self.policy),
+            self.timeout,
+            home,
+            expected_provider,
+            cancel,
+        )
     }
 }
 
@@ -214,6 +251,71 @@ fn release_launch(home: &Path) {
     let _ = std::fs::remove_file(launch_claim_path(home));
 }
 
+/// The default attach source: the AC-06 pid lock, `.runtime/client-api`, `.runtime/selected-provider`
+/// and `.runtime/launch.lock`, exactly as OSS v0.1.28 reads and writes them. Lock reads use
+/// `policy`'s liveness probe (the spawned `kill -0` / `ps` under `Allow`, the in-process probe under
+/// `Forbid`); nothing else depends on the policy.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileAttachSource {
+    policy: ProcessPolicy,
+}
+
+impl FileAttachSource {
+    /// `ProcessPolicy::Allow`: the reads and writes `start_or_attach` makes.
+    pub const fn new() -> Self {
+        Self {
+            policy: ProcessPolicy::Allow,
+        }
+    }
+
+    /// The reads and writes `start_or_attach_with_policy(.., policy)` makes.
+    pub const fn with_policy(policy: ProcessPolicy) -> Self {
+        Self { policy }
+    }
+
+    pub const fn policy(&self) -> ProcessPolicy {
+        self.policy
+    }
+}
+
+impl RuntimeAttachSource for FileAttachSource {
+    fn runtime_state(&self, home: &Path) -> RuntimeState {
+        runtime_state_with_policy(home, self.policy)
+    }
+
+    fn live_pid(&self, home: &Path) -> Option<u32> {
+        match inspect_lock_with_policy(home, self.policy) {
+            advance_runtime::runtime_lock::LockInspection::Live { pid } => Some(pid),
+            _ => None,
+        }
+    }
+
+    fn selected_provider(&self, home: &Path) -> Option<SelectedProvider> {
+        read_selected_provider(home)
+    }
+
+    fn attach(&self, home: &Path) -> Option<AttachTarget> {
+        let d = read_client_api_discovery(home)?;
+        let pid_ok = self.live_pid(home) == Some(d.pid);
+        if pid_ok && crate::discovery::client_api_accepts(&d.client_api_base) {
+            Some(AttachTarget {
+                client_api_base: d.client_api_base,
+                session: None,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn claim_launch(&self, home: &Path) -> bool {
+        claim_launch(home)
+    }
+
+    fn release_launch(&self, home: &Path) {
+        release_launch(home)
+    }
+}
+
 fn resolve_advance_bin() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("ADVANCE_BIN") {
         let candidate = std::path::PathBuf::from(p);
@@ -249,17 +351,17 @@ pub fn start_or_attach(
     adopt: &dyn AdoptPort,
     wait_bound: Duration,
 ) -> Result<ConnectedRuntime, ConnectError> {
-    start_or_attach_with_policy(
+    start_or_attach_via(
         home,
         cancel,
         launcher,
         adopt,
+        &FileAttachSource::new(),
         wait_bound,
-        ProcessPolicy::Allow,
     )
 }
 
-pub(crate) fn start_or_attach_with_policy(
+pub fn start_or_attach_with_policy(
     home: &Path,
     cancel: &CancelToken,
     launcher: &dyn RuntimeLauncher,
@@ -267,46 +369,64 @@ pub(crate) fn start_or_attach_with_policy(
     wait_bound: Duration,
     policy: ProcessPolicy,
 ) -> Result<ConnectedRuntime, ConnectError> {
+    start_or_attach_via(
+        home,
+        cancel,
+        launcher,
+        adopt,
+        &FileAttachSource::with_policy(policy),
+        wait_bound,
+    )
+}
+
+/// `start_or_attach` over an injected attach source (MODULE-001-AC-34). Synchronous: it sleeps and
+/// probes on the calling thread (see `InProcessLauncher` for the in-process calling rule).
+pub fn start_or_attach_via(
+    home: &Path,
+    cancel: &CancelToken,
+    launcher: &dyn RuntimeLauncher,
+    adopt: &dyn AdoptPort,
+    source: &dyn RuntimeAttachSource,
+    wait_bound: Duration,
+) -> Result<ConnectedRuntime, ConnectError> {
     if cancel.is_cancelled() {
         return Err(ConnectError::Cancelled);
     }
-    match runtime_state_with_policy(home, policy) {
+    match source.runtime_state(home) {
         RuntimeState::Starting => {
-            wait_until_running(home, cancel, false, wait_bound, policy)?;
-            adopt_if_needed(home, cancel, adopt, policy)?;
+            wait_until_running(home, cancel, false, wait_bound, source)?;
+            adopt_if_needed(home, cancel, adopt, source)?;
         }
-        RuntimeState::Running => adopt_if_needed(home, cancel, adopt, policy)?,
+        RuntimeState::Running => adopt_if_needed(home, cancel, adopt, source)?,
         RuntimeState::Idle => {
-            if !claim_launch(home) {
-                wait_until_running(home, cancel, false, wait_bound, policy)?;
+            if !source.claim_launch(home) {
+                wait_until_running(home, cancel, false, wait_bound, source)?;
             } else {
                 let started = launcher.start(home, cancel);
                 if started.is_err() {
-                    release_launch(home);
+                    source.release_launch(home);
                     started?;
                 }
-                let waited = wait_until_running(home, cancel, true, wait_bound, policy);
-                release_launch(home);
+                let waited = wait_until_running(home, cancel, true, wait_bound, source);
+                source.release_launch(home);
                 waited?;
             }
-            adopt_if_needed(home, cancel, adopt, policy)?;
+            adopt_if_needed(home, cancel, adopt, source)?;
         }
     }
-    attach(home, cancel, policy)
+    attach_via(home, cancel, source)
 }
 
 fn adopt_if_needed(
     home: &Path,
     cancel: &CancelToken,
     adopt: &dyn AdoptPort,
-    policy: ProcessPolicy,
+    source: &dyn RuntimeAttachSource,
 ) -> Result<(), ConnectError> {
     if let Some(committed) = committed_provider_id(home) {
-        let lock_pid = match inspect_lock_with_policy(home, policy) {
-            advance_runtime::runtime_lock::LockInspection::Live { pid } => Some(pid),
-            _ => None,
-        };
-        let already = read_selected_provider(home)
+        let lock_pid = source.live_pid(home);
+        let already = source
+            .selected_provider(home)
             .zip(lock_pid)
             .map(|(s, pid)| s.provider_id == committed && s.pid == pid)
             .unwrap_or(false);
@@ -331,14 +451,14 @@ fn wait_until_running(
     cancel: &CancelToken,
     after_launch: bool,
     bound: Duration,
-    policy: ProcessPolicy,
+    source: &dyn RuntimeAttachSource,
 ) -> Result<(), ConnectError> {
     let start = Instant::now();
     loop {
         if cancel.is_cancelled() {
             return Err(ConnectError::Cancelled);
         }
-        if runtime_state_with_policy(home, policy) == RuntimeState::Running {
+        if source.runtime_state(home) == RuntimeState::Running {
             return Ok(());
         }
         if start.elapsed() >= bound {
@@ -354,30 +474,24 @@ fn wait_until_running(
     }
 }
 
-fn attach(
+fn attach_via(
     home: &Path,
     cancel: &CancelToken,
-    policy: ProcessPolicy,
+    source: &dyn RuntimeAttachSource,
 ) -> Result<ConnectedRuntime, ConnectError> {
     if cancel.is_cancelled() {
         return Err(ConnectError::Cancelled);
     }
-    // Always re-bind pid + health so a swapped discovery file cannot redirect attach.
-    if let Some(d) = read_client_api_discovery(home) {
-        let pid_ok = matches!(
-            inspect_lock_with_policy(home, policy),
-            advance_runtime::runtime_lock::LockInspection::Live { pid } if pid == d.pid
-        );
-        if pid_ok && crate::discovery::client_api_accepts(&d.client_api_base) {
-            return Ok(ConnectedRuntime {
-                home: home.to_path_buf(),
-                client_api_base: d.client_api_base,
-            });
-        }
-    }
-    Err(ConnectError::UnattachableThenFailed {
-        reason: "unattachable".into(),
-    })
+    source
+        .attach(home)
+        .map(|t| ConnectedRuntime {
+            home: home.to_path_buf(),
+            client_api_base: t.client_api_base,
+            session: t.session,
+        })
+        .ok_or(ConnectError::UnattachableThenFailed {
+            reason: "unattachable".into(),
+        })
 }
 
 pub fn adopt_on_running(

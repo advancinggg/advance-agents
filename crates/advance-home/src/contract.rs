@@ -43,6 +43,8 @@ pub struct PreflightPass {
 pub struct ConnectedRuntime {
     pub home: PathBuf,
     pub client_api_base: String,
+    /// In-process attach only (MODULE-001-AC-34): the session minted for this caller. Never on disk.
+    pub session: Option<AttachSession>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,4 +139,48 @@ pub trait WorkspaceHomeFirstOpen: Send + Sync {
         home: &WorkspaceHomeHandle,
         cancel: &CancelToken,
     ) -> Result<(), AdoptError>;
+}
+
+/// A Client API session minted inside the host process for the attaching host (ADR 2026-10-03 D3).
+/// It exists only in memory: it is never written to disk, logged or put in a URL. `Debug` redacts
+/// the bearer token.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AttachSession {
+    session_id: String,
+    bearer: zeroize::Zeroizing<String>,
+    expires_at_ms: u64,
+}
+
+impl AttachSession {
+    pub fn new(session_id: impl Into<String>, bearer_token: String, expires_at_ms: u64) -> Self {
+        Self {
+            session_id: session_id.into(),
+            bearer: zeroize::Zeroizing::new(bearer_token),
+            expires_at_ms,
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// For `Authorization: Bearer …` and the `advance.bearer.<token>` WebSocket subprotocol.
+    pub fn bearer_token(&self) -> &str {
+        self.bearer.as_str()
+    }
+
+    /// Expiry, Unix milliseconds on the Client API clock.
+    pub fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+}
+
+impl std::fmt::Debug for AttachSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachSession")
+            .field("session_id", &self.session_id)
+            .field("bearer_token", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
 }

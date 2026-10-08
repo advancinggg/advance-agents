@@ -30,17 +30,23 @@ pub use chatgpt_sign_in::{
     ChatGptSignIn, ChatGptSignInConfig, ChatGptSignInPort, SignInClock, SignInModel, SignInRefusal,
     SignInStarted, SignInStatus, SignOutOutcome, SystemSignInClock, VerifyOutcome,
 };
-pub use connect::{GuardedProcessLauncher, ProcessLauncher};
+pub use connect::{
+    FileAttachSource, GuardedFileAdoptPort, GuardedProcessLauncher, ProcessLauncher,
+    SourceAdoptPort,
+};
 pub use contract::{
-    AdoptError, ConnectError, ConnectedRuntime, CreateError, DisplayNameError, PreflightFail,
-    PreflightPass, ProviderStatus, RecognizeClass, RuntimeState, WorkspaceHomeFirstOpen,
-    WorkspaceHomeHandle,
+    AdoptError, AttachSession, ConnectError, ConnectedRuntime, CreateError, DisplayNameError,
+    PreflightFail, PreflightPass, ProviderStatus, RecognizeClass, RuntimeState,
+    WorkspaceHomeFirstOpen, WorkspaceHomeHandle,
 };
 pub use create::create_with_secrets_mode;
 pub use discovery::{write_client_api_discovery, ClientApiDiscovery};
 pub use display_name::{TopLevelDisplayName, DISPLAY_NAME_KEY};
 pub use impls::HostWorkspaceHome;
-pub use ports::{AdoptPort, GeneratePathPreflight, PreflightPort, RuntimeLauncher};
+pub use ports::{
+    AdoptPort, AttachTarget, GeneratePathPreflight, PreflightPort, RuntimeAttachSource,
+    RuntimeLauncher,
+};
 pub use provider::{
     list_provider_entries, open_home_secret_store, remove_provider_entry, select_provider,
     upsert_provider_entry, ProviderWriteError, UpsertMode,
