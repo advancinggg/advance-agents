@@ -1,4 +1,5 @@
-//! MODULE-001-T114 — poll_stream GET+WebSocket, refusals, shutdown, stall, containment.
+//! MODULE-001-T114 — poll_stream GET+WebSocket, refusals, shutdown, stall, containment, the
+//! cursor carried from page to page and the extension's dispatch budget.
 
 use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc;
@@ -7,16 +8,17 @@ use std::time::{Duration, Instant};
 
 use advance_client_api::CLIENT_WS_PROTOCOL;
 use advance_runtime_compose::test_support::fixture::{
-    assert_gone_for_home, mint_session, CapDecl, FamiliesControl, FixtureDriver, FixtureExtension,
-    FixtureFamilies, FixtureHome, FixtureHomeSpec, Http, FIXTURE_ID,
+    assert_gone_for_home, mint_session, CapDecl, FamiliesControl, Feed, FeedCall, FixtureDriver,
+    FixtureExtension, FixtureFamilies, FixtureHome, FixtureHomeSpec, Http, HttpResponse,
+    FIXTURE_ID,
 };
 use advance_runtime_compose::test_support::{
     ComposeProbe, MemoryComposeLog, ProbeRecord, TEARDOWN_ORDER,
 };
 use advance_runtime_compose::{
     compose, log_keys, ClientFamilyRegistrar, ComposeCx, ComposeError, ComposeExtension,
-    DuplicateOf, ExtensionError, HandlerSpec, Method, PathDefect, PollEmit, PollStreamSpec,
-    RouteRefusalReason, Scope,
+    DuplicateOf, ExtensionError, FamilyBudget, HandlerSpec, Method, PathDefect, PollEmit,
+    PollStreamSpec, RouteRefusalReason, Scope,
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -660,6 +662,328 @@ async fn module_001_ac33_poll_stream_handler_panic_is_contained() {
     assert_eq!(page["data"]["items"], json!([item]), "{page}");
 
     drop(again);
+    rt.shutdown().await.expect("shutdown");
+    assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
+}
+
+/// How long a leg waits for the feed reads it needs (four poll intervals take one second).
+const READS_WAIT: Duration = Duration::from_secs(10);
+
+/// Every read of `feed` once at least `n` ran.
+async fn wait_reads(control: &FamiliesControl, feed: Feed, n: usize) -> Vec<FeedCall> {
+    let deadline = Instant::now() + READS_WAIT;
+    loop {
+        let reads = control.feed_calls(feed);
+        if reads.len() >= n {
+            return reads;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{feed:?}: {} reads, waited for {n}: {reads:?}",
+            reads.len()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The reads after the one that answered the page `cursor` (the first read to answer it), once
+/// at least two ran.
+async fn reads_after_page(control: &FamiliesControl, feed: Feed, cursor: &str) -> Vec<FeedCall> {
+    let deadline = Instant::now() + READS_WAIT;
+    loop {
+        let reads = control.feed_calls(feed);
+        let page = reads
+            .iter()
+            .position(|read| read.cursor == cursor)
+            .unwrap_or_else(|| panic!("{feed:?}: no read answered {cursor}: {reads:?}"));
+        if reads.len() >= page + 3 {
+            return reads[page + 1..].to_vec();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{feed:?}: fewer than two reads after the {cursor} page: {reads:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The reads of one stream, seed first: the seed read has no body, and every later read carries
+/// at `pointer` the cursor the read before it answered.
+fn assert_cursor_chain(reads: &[FeedCall], pointer: &str) {
+    assert!(reads.len() >= 2, "{reads:?}");
+    assert!(reads[0].body.is_null(), "seed read: {:?}", reads[0]);
+    for pair in reads.windows(2) {
+        assert_eq!(
+            pair[1].body.pointer(pointer),
+            Some(&json!(pair[0].cursor)),
+            "{pointer} of {:?} after {:?}",
+            pair[1],
+            pair[0]
+        );
+    }
+}
+
+async fn next_page(ws: &mut WsClient) -> Value {
+    let text = next_text(ws, Duration::from_secs(2)).await;
+    serde_json::from_str(&text).expect("page json")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac33_t114_each_poll_carries_the_previous_page_cursor() {
+    let _serial = SERIAL.lock().await;
+    let home = home();
+    let families = FixtureFamilies::standard().with_feed().with_nested_feed();
+    let control = families.control();
+    let ext = FixtureExtension::new(FIXTURE_ID).with_families(families);
+    let log = MemoryComposeLog::new();
+    let probe = Arc::new(ComposeProbe::new());
+    let baseline = alive_tasks();
+    let rt = compose(
+        home.options(Arc::new(log), Arc::clone(&probe)),
+        vec![ext.arc()],
+    )
+    .await
+    .expect("compose");
+    let ep = rt.client_api().expect("client api");
+    let addr = ep.socket_addr;
+    let origin = format!("http://{addr}");
+    let token = mint_session(&ep);
+
+    // Cursor pointer `/cursor`; no client body, so each poll body is the cursor alone.
+    let (mut flat, seed) = open_ws(addr, "/client/fixture/feed", &token, Some(&origin)).await;
+    assert_eq!(seed["data"]["cursor"], json!("c0"), "{seed}");
+    for (cursor, item) in [("c1", json!({"id": "a"})), ("c2", json!({"id": "b"}))] {
+        control.push_feed(item.clone());
+        let page = next_page(&mut flat).await;
+        assert_eq!(page["data"]["items"], json!([item]), "{page}");
+        assert_eq!(page["data"]["cursor"], json!(cursor), "{page}");
+        for read in reads_after_page(&control, Feed::Flat, cursor).await {
+            assert_eq!(read.body, json!({ "cursor": cursor }), "{read:?}");
+        }
+    }
+    drop(flat);
+    assert_cursor_chain(&control.feed_calls(Feed::Flat), "/cursor");
+
+    // Cursor pointer `/page/cursor`: the adapter creates `page` in an empty body.
+    let (mut nested, seed) =
+        open_ws(addr, "/client/fixture/nested-feed", &token, Some(&origin)).await;
+    assert_eq!(
+        seed.pointer("/data/page/cursor"),
+        Some(&json!("c0")),
+        "{seed}"
+    );
+    assert_eq!(seed["data"]["items"], json!([]), "{seed}");
+    let reads = wait_reads(&control, Feed::Nested, 3).await;
+    for read in &reads[1..] {
+        assert_eq!(read.body, json!({ "page": { "cursor": "c0" } }), "{read:?}");
+    }
+
+    // A body the client sends replaces the base body: its other fields stay in every poll and
+    // the cursor goes into its own `page` object.
+    let base = json!({ "filter": "fixture", "page": { "size": 2 } });
+    nested
+        .send(Message::Text(base.to_string().into()))
+        .await
+        .expect("send the base body");
+    let deadline = Instant::now() + READS_WAIT;
+    while !control
+        .feed_calls(Feed::Nested)
+        .iter()
+        .any(|read| read.body.get("filter").is_some())
+    {
+        assert!(
+            Instant::now() < deadline,
+            "no poll carried the client body: {:?}",
+            control.feed_calls(Feed::Nested)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for (cursor, item) in [("c1", json!({"id": "c"})), ("c2", json!({"id": "d"}))] {
+        control.push_to(Feed::Nested, item.clone());
+        let page = next_page(&mut nested).await;
+        assert_eq!(page["data"]["items"], json!([item]), "{page}");
+        assert_eq!(
+            page.pointer("/data/page/cursor"),
+            Some(&json!(cursor)),
+            "{page}"
+        );
+        for read in reads_after_page(&control, Feed::Nested, cursor).await {
+            assert_eq!(
+                read.body,
+                json!({ "filter": "fixture", "page": { "size": 2, "cursor": cursor } }),
+                "{read:?}"
+            );
+        }
+    }
+    drop(nested);
+    let reads = control.feed_calls(Feed::Nested);
+    assert_cursor_chain(&reads, "/page/cursor");
+    let first = reads
+        .iter()
+        .position(|read| read.body.get("filter").is_some())
+        .expect("a poll with the client body");
+    for read in &reads[1..first] {
+        assert_eq!(read.body, json!({ "page": { "cursor": "c0" } }), "{read:?}");
+    }
+    for pair in reads[first - 1..].windows(2) {
+        assert_eq!(
+            pair[1].body,
+            json!({ "filter": "fixture", "page": { "size": 2, "cursor": pair[0].cursor } }),
+            "{:?} after {:?}",
+            pair[1],
+            pair[0]
+        );
+    }
+
+    rt.shutdown().await.expect("shutdown");
+    assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
+}
+
+/// Holds the extension's only dispatch permit with its slow route. A poll may hold the permit at
+/// the moment the slow GET arrives; that GET is then refused at capacity and sent again.
+async fn hold_extension_permit(
+    addr: SocketAddr,
+    token: &str,
+    control: &FamiliesControl,
+) -> tokio::task::JoinHandle<HttpResponse> {
+    let deadline = Instant::now() + READS_WAIT;
+    loop {
+        let session = token.to_owned();
+        let slow = tokio::spawn(async move {
+            Http::get(addr, "/client/fixture/slow")
+                .session(session)
+                .send()
+                .await
+        });
+        loop {
+            if control.holding() == 1 {
+                return slow;
+            }
+            if slow.is_finished() {
+                let refused = slow.await.expect("slow route");
+                assert_eq!(refused.status, 503, "{:?}", refused.body);
+                assert_eq!(
+                    error_message(&refused.body),
+                    "server at dispatch capacity",
+                    "{:?}",
+                    refused.body
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the slow route never held the extension's permit"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+/// The seed and every poll take a permit of the extension's own dispatch pool, as its other
+/// routes do: while that pool is saturated a new stream is refused like an extension route and an
+/// open stream skips its polls (no read, no frame), and OSS routes keep answering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac33_poll_stream_runs_under_the_extension_dispatch_budget() {
+    let _serial = SERIAL.lock().await;
+    let home = home_with(&["fs", "llm"]);
+    let families = FixtureFamilies::standard()
+        .with_feed()
+        .with_budget(FamilyBudget::new(1, 4));
+    let control = families.control();
+    let ext = FixtureExtension::new(FIXTURE_ID).with_families(families);
+    let log = MemoryComposeLog::new();
+    let probe = Arc::new(ComposeProbe::new());
+    let baseline = alive_tasks();
+    let rt = compose(
+        home.options(Arc::new(log), Arc::clone(&probe)),
+        vec![ext.arc()],
+    )
+    .await
+    .expect("compose");
+    let ep = rt.client_api().expect("client api");
+    let addr = ep.socket_addr;
+    let origin = format!("http://{addr}");
+    let token = mint_session(&ep);
+
+    let (mut feed, seed) = open_ws(addr, "/client/fixture/feed", &token, Some(&origin)).await;
+    assert_eq!(seed["data"]["cursor"], json!("c0"), "{seed}");
+    wait_reads(&control, Feed::Flat, 3).await;
+
+    let slow = hold_extension_permit(addr, &token, &control).await;
+    {
+        let api = ep.api.upgrade().expect("client api alive");
+        let stats = api.extension_budget_stats();
+        assert_eq!(stats.len(), 1, "{stats:?}");
+        assert_eq!(stats[0].dispatch_available, 0, "{stats:?}");
+    }
+    let reads = control.polls().len();
+    let item = json!({"id": "after-the-hold"});
+    control.push_feed(item.clone());
+    let quiet_until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < quiet_until {
+        let left = quiet_until.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, feed.next()).await {
+            Err(_) => break,
+            Ok(Some(Ok(Message::Text(text)))) => {
+                panic!("poll frame while the extension's pool is saturated: {text}")
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(None) | Ok(Some(Err(_))) => panic!("feed closed while the pool is saturated"),
+        }
+    }
+    assert_eq!(
+        control.polls().len(),
+        reads,
+        "a poll read ran while the extension's pool was saturated"
+    );
+
+    let seed_refused = try_ws(addr, "/client/fixture/feed", Some(&token), Some(&origin))
+        .await
+        .expect_err("a seed while the extension's pool is saturated");
+    let route = Http::get(addr, "/client/fixture/status")
+        .session(&token)
+        .send()
+        .await;
+    for (status, body) in [
+        (seed_refused.0, &seed_refused.1),
+        (route.status, &route.body),
+    ] {
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(error_code(body), "module_unavailable", "{body}");
+        assert_eq!(error_message(body), "server at dispatch capacity", "{body}");
+    }
+    let health = Http::get(addr, "/client/health").send().await;
+    assert_eq!(health.status, 200, "{:?}", health.body);
+    let runs = Http::get(addr, "/client/runs").session(&token).send().await;
+    assert_eq!(runs.status, 200, "{:?}", runs.body);
+    assert!(
+        runs.body.get("data").is_some_and(|data| !data.is_null()),
+        "{:?}",
+        runs.body
+    );
+    {
+        let (_events, events_seed) =
+            open_ws(addr, "/client/events/stream", &token, Some(&origin)).await;
+        assert!(
+            events_seed.get("data").is_some_and(|data| !data.is_null()),
+            "{events_seed}"
+        );
+    }
+    assert_eq!(
+        control.polls().len(),
+        reads,
+        "a read ran while the extension's pool was saturated"
+    );
+
+    control.release_slow_route();
+    let held = slow.await.expect("slow route");
+    assert_eq!(held.status, 200, "{:?}", held.body);
+    assert_eq!(held.body["data"], json!({"held": true}));
+    let page = next_page(&mut feed).await;
+    assert_eq!(page["data"]["items"], json!([item]), "{page}");
+    assert_eq!(page["data"]["cursor"], json!("c1"), "{page}");
+
+    drop(feed);
     rt.shutdown().await.expect("shutdown");
     assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
 }

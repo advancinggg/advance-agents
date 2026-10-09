@@ -23,6 +23,7 @@ pub struct FixtureFamilies {
     budget: Option<FamilyBudget>,
     rule_break: Option<RouteRuleBreak>,
     feed: bool,
+    nested_feed: bool,
     control: Arc<FamiliesControl>,
 }
 
@@ -37,6 +38,7 @@ impl FixtureFamilies {
             budget: None,
             rule_break: None,
             feed: false,
+            nested_feed: false,
             control: Arc::new(FamiliesControl::default()),
         }
     }
@@ -51,9 +53,16 @@ impl FixtureFamilies {
         self
     }
 
-    /// GET + WebSocket poll stream at `/client/<label>/feed` (MODULE-001-AC-33).
+    /// GET + WebSocket poll stream [`Feed::Flat`] at `/client/<label>/feed` (MODULE-001-AC-33).
     pub fn with_feed(mut self) -> Self {
         self.feed = true;
+        self
+    }
+
+    /// GET + WebSocket poll stream [`Feed::Nested`] at `/client/<label>/nested-feed`, whose cursor
+    /// sits at a nested JSON pointer (MODULE-001-AC-33).
+    pub fn with_nested_feed(mut self) -> Self {
+        self.nested_feed = true;
         self
     }
 
@@ -68,7 +77,10 @@ impl FixtureFamilies {
     ) -> Result<(), ExtensionError> {
         self.register_standard(reg)?;
         if self.feed {
-            self.register_feed(reg)?;
+            self.register_feed(reg, Feed::Flat)?;
+        }
+        if self.nested_feed {
+            self.register_feed(reg, Feed::Nested)?;
         }
         if let Some(budget) = self.budget {
             reg.set_budget(budget)?;
@@ -286,37 +298,29 @@ impl FixtureFamilies {
         Ok(())
     }
 
-    fn register_feed(&self, reg: &mut ClientFamilyRegistrar<'_>) -> Result<(), ExtensionError> {
-        let l = self.label;
+    /// The feed's read records every call (request body and answered cursor), hands out the
+    /// queued items and answers the cursor `c<n>`, `n` = the feed's non-empty pages so far.
+    fn register_feed(
+        &self,
+        reg: &mut ClientFamilyRegistrar<'_>,
+        feed: Feed,
+    ) -> Result<(), ExtensionError> {
         let control = Arc::clone(&self.control);
-        let path = format!("/client/{l}/feed");
         reg.poll_stream(
-            &path,
+            &feed.path(self.label),
             PollStreamSpec::new(
                 HandlerSpec::read(true, move |ctx| {
                     if control.panic_next.swap(false, Ordering::AcqRel) {
                         panic!("fixture feed panic");
                     }
-                    control
-                        .polls
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .push((Instant::now(), ctx.body.clone()));
-                    let items: Vec<Value> = std::mem::take(
-                        &mut *control
-                            .feed
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                    );
-                    let n = if items.is_empty() {
-                        control.pages.load(Ordering::SeqCst)
-                    } else {
-                        control.pages.fetch_add(1, Ordering::SeqCst) + 1
-                    };
-                    Ok(json!({ "items": items, "cursor": format!("c{n}") }))
+                    let (items, cursor) = control.next_page(feed, &ctx.body);
+                    Ok(match feed {
+                        Feed::Flat => json!({ "items": items, "cursor": cursor }),
+                        Feed::Nested => json!({ "items": items, "page": { "cursor": cursor } }),
+                    })
                 })
                 .with_scopes(vec![Scope::ReadInventory]),
-                "/cursor",
+                feed.cursor_pointer(),
                 PollEmit::NonEmptyArrayAt("/items"),
             ),
         )?;
@@ -440,14 +444,63 @@ impl FixtureFamilies {
     }
 }
 
+/// A fixture poll stream (MODULE-001-AC-33).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Feed {
+    /// `/client/<label>/feed`, cursor pointer `/cursor`: data `{"items": [..], "cursor": "c<n>"}`.
+    Flat,
+    /// `/client/<label>/nested-feed`, cursor pointer `/page/cursor`:
+    /// data `{"items": [..], "page": {"cursor": "c<n>"}}`.
+    Nested,
+}
+
+impl Feed {
+    pub fn path(self, label: &str) -> String {
+        match self {
+            Feed::Flat => format!("/client/{label}/feed"),
+            Feed::Nested => format!("/client/{label}/nested-feed"),
+        }
+    }
+
+    /// The JSON pointer the feed registers as its `PollStreamSpec` cursor.
+    pub fn cursor_pointer(self) -> &'static str {
+        match self {
+            Feed::Flat => "/cursor",
+            Feed::Nested => "/page/cursor",
+        }
+    }
+
+    fn slot(self) -> usize {
+        match self {
+            Feed::Flat => 0,
+            Feed::Nested => 1,
+        }
+    }
+}
+
+/// One call of a feed's read: the HTTP GET, a stream's seed or one of its polls.
+#[derive(Clone, Debug)]
+pub struct FeedCall {
+    pub at: Instant,
+    /// The request body the read was handed.
+    pub body: Value,
+    /// The cursor the read answered.
+    pub cursor: String,
+}
+
+#[derive(Default)]
+struct FeedQueue {
+    items: Vec<Value>,
+    pages: u64,
+    calls: Vec<FeedCall>,
+}
+
 pub struct FamiliesControl {
     created: AtomicU64,
     note: Mutex<String>,
     holding: AtomicUsize,
     slow: (Mutex<bool>, Condvar),
-    feed: Mutex<Vec<Value>>,
-    polls: Mutex<Vec<(Instant, Value)>>,
-    pages: AtomicU64,
+    feeds: [Mutex<FeedQueue>; 2],
     panic_next: AtomicBool,
 }
 
@@ -458,9 +511,7 @@ impl Default for FamiliesControl {
             note: Mutex::new("key AKIAABCDEFGHIJKLMNOP".into()),
             holding: AtomicUsize::new(0),
             slow: (Mutex::new(false), Condvar::new()),
-            feed: Mutex::new(Vec::new()),
-            polls: Mutex::new(Vec::new()),
-            pages: AtomicU64::new(0),
+            feeds: Default::default(),
             panic_next: AtomicBool::new(false),
         }
     }
@@ -491,18 +542,49 @@ impl FamiliesControl {
         self.slow.1.notify_all();
     }
 
+    /// Queue an item for the next read of [`Feed::Flat`].
     pub fn push_feed(&self, item: Value) {
-        self.feed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(item);
+        self.push_to(Feed::Flat, item);
     }
 
+    /// Queue an item for the next read of `feed`.
+    pub fn push_to(&self, feed: Feed, item: Value) {
+        self.queue(feed).items.push(item);
+    }
+
+    /// Every read of [`Feed::Flat`], in call order: when it ran and the request body it was handed.
     pub fn polls(&self) -> Vec<(Instant, Value)> {
-        self.polls
+        self.feed_calls(Feed::Flat)
+            .into_iter()
+            .map(|call| (call.at, call.body))
+            .collect()
+    }
+
+    /// Every read of `feed`, in call order.
+    pub fn feed_calls(&self, feed: Feed) -> Vec<FeedCall> {
+        self.queue(feed).calls.clone()
+    }
+
+    fn queue(&self, feed: Feed) -> std::sync::MutexGuard<'_, FeedQueue> {
+        self.feeds[feed.slot()]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+    }
+
+    /// One read of `feed`: take the queued items, count a non-empty page, record the call.
+    fn next_page(&self, feed: Feed, body: &Value) -> (Vec<Value>, String) {
+        let mut queue = self.queue(feed);
+        let items = std::mem::take(&mut queue.items);
+        if !items.is_empty() {
+            queue.pages += 1;
+        }
+        let cursor = format!("c{}", queue.pages);
+        queue.calls.push(FeedCall {
+            at: Instant::now(),
+            body: body.clone(),
+            cursor: cursor.clone(),
+        });
+        (items, cursor)
     }
 
     /// One-shot: the next feed poll panics inside the wrapped handler.

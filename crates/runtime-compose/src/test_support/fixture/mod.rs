@@ -28,7 +28,7 @@ pub use client::{
     client_message_turn, mint_browser_session, mint_session, mint_session_with, post_msg,
     provider_cost, warm_up, ClientTurn, CostTotals, Http, HttpResponse, ROOT_MAILBOX,
 };
-pub use families::{FamiliesControl, FixtureFamilies, RouteRuleBreak};
+pub use families::{FamiliesControl, Feed, FeedCall, FixtureFamilies, RouteRuleBreak};
 pub use gone::assert_gone_for_home;
 pub use guests::{ext_probe_core, hello_llm_core, llm_noerr_core, minimal_core};
 pub use home::{CapDecl, FixtureDriver, FixtureHome, FixtureHomeSpec, FIXTURE_MASTER_KEY};
