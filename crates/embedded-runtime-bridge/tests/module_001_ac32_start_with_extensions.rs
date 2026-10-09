@@ -4,7 +4,10 @@
 mod common;
 
 use std::fs;
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use advance_client_api::API_VERSION;
@@ -19,7 +22,8 @@ use advance_embedded_runtime_bridge::{
 };
 use advance_runtime_compose::log_keys;
 use advance_runtime_compose::test_support::fixture::{
-    FixtureDriver, FixtureExtension, FixtureFamilies, FIXTURE_ID, FIXTURE_MASTER_KEY,
+    FixtureDriver, FixtureExtension, FixtureFamilies, FixtureLifecycle, ShutdownMode, FIXTURE_ID,
+    FIXTURE_MASTER_KEY,
 };
 use advance_runtime_compose::test_support::{reserved_homes, MemoryComposeLog};
 use common::{c_start_v2, c_stop_free, fixture_home, http, json_with_state_root, last_error};
@@ -308,6 +312,79 @@ fn module_001_ac32_dropped_async_start_still_shuts_its_composition_down() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    let handle = start_with_extensions(
+        fixture.home(),
+        default_options(fixture.state_root()),
+        vec![],
+    )
+    .expect("a fresh start on the released home");
+    stop(handle).expect("stop");
+}
+
+/// Records that the start future was woken: the start task has handed its result over.
+#[derive(Default)]
+struct Woken(AtomicBool);
+
+impl Wake for Woken {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn module_001_ac32_async_start_dropped_after_the_handoff_stops_off_the_dropping_thread() {
+    let _g = SERIAL.blocking_lock();
+    let fixture = fixture_home(&["fs"], FixtureDriver::None);
+    let home = std::fs::canonicalize(fixture.home()).expect("canonical home");
+    // A shutdown hook that never returns: every shutdown of this composition waits out the
+    // hook's 5 s bound.
+    let hanging = FixtureExtension::new(FIXTURE_ID).with_lifecycle(FixtureLifecycle {
+        shutdown: ShutdownMode::Hang,
+        ..FixtureLifecycle::default()
+    });
+    let woken = Arc::new(Woken::default());
+    let waker = Waker::from(Arc::clone(&woken));
+    let mut start = Box::pin(start_with_extensions_async(
+        fixture.home(),
+        default_options(fixture.state_root()),
+        vec![hanging.arc()],
+    ));
+    // The first poll spawns the start task and waits on its channel; the task wakes the
+    // future once the started handle is in the channel.
+    assert!(start
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    let polled = Instant::now();
+    while !woken.0.load(Ordering::SeqCst) {
+        assert!(
+            polled.elapsed() < Duration::from_secs(120),
+            "the start never handed its result over"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        reserved_homes().iter().any(|p| p == &home),
+        "the start must have composed (and reserved the home) before its future is dropped"
+    );
+
+    // Dropped before it took the handle out of the channel.
+    let dropped = Instant::now();
+    drop(start);
+    let blocked = dropped.elapsed();
+    assert!(
+        blocked < Duration::from_secs(2),
+        "dropping the start future blocked for {blocked:?}: the composition's shutdown ran on \
+         the dropping thread"
+    );
+    // The composition is still shut down, which releases the home.
+    while reserved_homes().iter().any(|p| p == &home) {
+        assert!(
+            dropped.elapsed() < Duration::from_secs(120),
+            "the home is still reserved 120 s after the start future was dropped"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let handle = start_with_extensions(
         fixture.home(),
         default_options(fixture.state_root()),

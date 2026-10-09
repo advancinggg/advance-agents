@@ -167,7 +167,10 @@ pub fn start_with_extensions(
 
 /// Async variant: always composes on the global runtime, callable from any runtime. If the caller
 /// drops this future, the composition still finishes and is then shut down (no task outlives it):
-/// the start task stops it on the global runtime.
+/// a handle the future never returned is stopped with the async stop on the global runtime,
+/// whether the future was dropped before the start finished or after the start handed the handle
+/// over and before the future took it. Dropping the future never runs a stop on the caller's
+/// thread.
 pub async fn start_with_extensions_async(
     workspace: &Path,
     options: BridgeOptions,
@@ -176,20 +179,44 @@ pub async fn start_with_extensions_async(
     let root = workspace.to_path_buf();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let task = runtime_rt::global_rt().spawn(async move {
-        let started = v2::start(root, options, extensions).await;
-        if let Err(Ok(orphan)) = tx.send(started) {
-            // Nobody waits for the handle. Stop it here with the async stop: left to the
-            // handle's Drop on this worker, the stop would block the worker while the
-            // shutdown it waits for may need a task queued on that same worker.
-            let _ = orphan.stop_async_inner().await;
-        }
+        let started = v2::start(root, options, extensions)
+            .await
+            .map(|handle| Handoff(Some(handle)));
+        // Nobody waits any more: `send` hands the value back and the handoff's drop stops it.
+        let _ = tx.send(started);
     });
     match rx.await {
-        Ok(started) => started,
+        Ok(started) => started.and_then(Handoff::take),
         Err(_) => Err(BridgeError::Internal(match task.await {
             Err(e) => format!("join: {e}"),
             Ok(()) => "join: the start task ended without a result".into(),
         })),
+    }
+}
+
+/// A started handle on its way from the start task to the caller of
+/// [`start_with_extensions_async`]. Until [`Handoff::take`] claims it, dropping it stops the
+/// composition with the async stop, spawned on the global runtime. The handle's own `Drop` would
+/// instead block the dropping thread until the shutdown finishes, and the start future may be
+/// dropped on any thread (a worker of the global runtime included) after the start task sent the
+/// handle and before the future took it out of the channel.
+struct Handoff(Option<BridgeHandle>);
+
+impl Handoff {
+    fn take(mut self) -> Result<BridgeHandle, BridgeError> {
+        self.0
+            .take()
+            .ok_or_else(|| BridgeError::Internal("the started handle was already taken".into()))
+    }
+}
+
+impl Drop for Handoff {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            drop(runtime_rt::global_rt().spawn(async move {
+                let _ = handle.stop_async_inner().await;
+            }));
+        }
     }
 }
 
