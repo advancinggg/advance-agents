@@ -381,12 +381,17 @@ fn escape_pointer_token(s: &str) -> String {
     s.replace('~', "~0").replace('/', "~1")
 }
 
+/// `pointer`, cut to at most [`POINTER_FIELD_MAX`] bytes with a trailing `…`. The cut backs off
+/// to a character boundary: object keys are extension text and may be non-ASCII.
 fn cap_pointer(pointer: &str) -> String {
     if pointer.len() <= POINTER_FIELD_MAX {
         return pointer.to_string();
     }
     let ellipsis = "…";
-    let keep = POINTER_FIELD_MAX.saturating_sub(ellipsis.len());
+    let mut keep = POINTER_FIELD_MAX.saturating_sub(ellipsis.len());
+    while !pointer.is_char_boundary(keep) {
+        keep -= 1;
+    }
     format!("{}{ellipsis}", &pointer[..keep])
 }
 
@@ -2177,6 +2182,59 @@ mod tests {
 
         let env = api.handle(ClientRequest::get("/client/ext/raw").with_session("tok"));
         assert_eq!(env.data.unwrap()["note"], json!("BLOCK"));
+    }
+
+    #[test]
+    fn module_001_ac31_success_scan_caps_a_long_multibyte_pointer_at_a_char_boundary() {
+        // `/a` then two-byte characters: the cut for the ellipsis (byte 253) falls inside one.
+        let key = format!("a{}", "é".repeat(200));
+        let pointer = format!("/{key}");
+        let cut = POINTER_FIELD_MAX - "…".len();
+        assert!(pointer.len() > POINTER_FIELD_MAX && !pointer.is_char_boundary(cut));
+        let capped = cap_pointer(&pointer);
+        assert!(capped.len() <= POINTER_FIELD_MAX, "{} bytes", capped.len());
+        let kept = capped.strip_suffix('…').expect("ellipsis");
+        assert_eq!(kept.len(), cut - 1);
+        assert!(pointer.starts_with(kept));
+        assert_eq!(cap_pointer("/short"), "/short");
+
+        let (mut book, hooks, _) = book();
+        {
+            let mut r = book.registrar("ext");
+            let body = json!({ key.clone(): "REDACT" });
+            r.route(
+                Method::Get,
+                "/client/ext/long",
+                HandlerSpec::read(true, move |_| Ok(body.clone()))
+                    .with_scopes(vec![Scope::ReadInventory]),
+            )
+            .unwrap();
+        }
+        let families = book.finish().unwrap();
+        let mut api = ClientApi::with_parts(
+            ClientApiConfig::default(),
+            "operator",
+            Arc::new(SystemClock),
+            Arc::new(NoopSink),
+        );
+        families.install(&mut api);
+        mint(&api, "tok", vec![Scope::ReadInventory], None);
+        let env = api.handle(ClientRequest::get("/client/ext/long").with_session("tok"));
+        assert!(env.error.is_none(), "{:?}", env.error);
+        assert_eq!(
+            env.data.as_ref().unwrap()[key.as_str()],
+            json!("[REDACTED]")
+        );
+        let warning = env
+            .warnings
+            .iter()
+            .find(|w| w.code == "sensitive_value_redacted")
+            .expect("redaction warning");
+        assert_eq!(
+            warning.message,
+            format!("sensitive value redacted at {capped}")
+        );
+        assert!(hooks.events.lock().unwrap().is_empty());
     }
 
     #[test]
