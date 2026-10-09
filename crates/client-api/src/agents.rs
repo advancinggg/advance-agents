@@ -531,11 +531,7 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Value) -> Result<T, ClientE
     serde_json::from_value(body.clone()).map_err(|_| invalid("invalid agent request body"))
 }
 
-/// Mark the irreversible provider-entry boundary (CONTRACT-190 reserve-before-execute). Called only
-/// after validation AND after the provider slot resolved, so a validation failure or an absent
-/// provider stays retryable under the same key, while any outcome the provider itself returns
-/// (success or a projected rejection) is recorded for exactly-once replay — an agent create/delete
-/// has filesystem + tree side effects, so a key is never allowed to re-enter the provider.
+/// The provider installed in the agents slot now, released from the slot's lock.
 fn agent_provider_snapshot(s: &AgentProviderSlot) -> Option<Arc<dyn AgentAdminProvider>> {
     s.read()
         .unwrap_or_else(|e| e.into_inner())
@@ -543,6 +539,11 @@ fn agent_provider_snapshot(s: &AgentProviderSlot) -> Option<Arc<dyn AgentAdminPr
         .map(Arc::clone)
 }
 
+/// Mark the irreversible provider-entry boundary (CONTRACT-190 reserve-before-execute). Called only
+/// after validation AND after the provider slot resolved, so a validation failure or an absent
+/// provider stays retryable under the same key, while any outcome the provider itself returns
+/// (success or a projected rejection) is recorded for exactly-once replay — an agent create/delete
+/// has filesystem + tree side effects, so a key is never allowed to re-enter the provider.
 fn mark_provider_entry(ctx: &HandlerCtx) -> Result<(), ClientError> {
     match ctx.mutation.as_ref() {
         Some(mutation) => mutation.mark_provider_entry(),

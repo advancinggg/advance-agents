@@ -72,7 +72,10 @@ const POLL_POINTER_MAX: usize = 128;
 /// GET read + WebSocket poll adapter at one exact path (MODULE-001-AC-33).
 #[non_exhaustive]
 pub struct PollStreamSpec {
-    /// The GET read registered at the same path (session + scope rules apply).
+    /// The GET read registered at the same path (session + scope rules apply). Over HTTP its
+    /// body comes from the query string (scalar values only); over the poll stream a client
+    /// Text frame replaces the body of the polls that follow with any JSON object, nested values
+    /// included (bounded by `max_body_bytes`). Validate that body as a POST body.
     pub handler: HandlerSpec,
     /// RFC 6901 pointer of the cursor inside a success `data`; the adapter writes the same pointer
     /// into the next poll's request body (creating objects along the way).
@@ -121,8 +124,6 @@ impl std::fmt::Display for PollStreamDefect {
 
 /// One accepted poll stream, keyed by exact path on [`ClientApi`].
 pub(crate) struct PollStreamEntry {
-    #[allow(dead_code)]
-    pub(crate) extension: &'static str,
     pub(crate) cursor: &'static str,
     pub(crate) emit: PollEmit,
     pub(crate) dispatch: Arc<Semaphore>,
@@ -1140,7 +1141,6 @@ impl RouteBook {
                 poll_streams.insert(
                     pending.path.clone(),
                     Arc::new(PollStreamEntry {
-                        extension: rec.extension,
                         cursor: pending.cursor,
                         emit: pending.emit,
                         dispatch: Arc::clone(&dispatch),
@@ -1238,58 +1238,16 @@ impl<'a> ClientFamilyRegistrar<'a> {
         let fail =
             |this: &mut Self, reason: RouteRefusalReason| Err(this.refuse(text.clone(), reason));
 
-        if let Err(d) = check_path_grammar(path, self.book.max_path_len) {
-            return fail(self, RouteRefusalReason::InvalidPath(d));
-        }
-        if path.contains('{') {
-            return fail(
-                self,
-                RouteRefusalReason::PollStream(PollStreamDefect::TemplatedPath),
-            );
-        }
-        if first_segment_is_param(path) {
-            return fail(self, RouteRefusalReason::ParameterisedFirstSegment);
-        }
-        if self.book.reserved_paths.contains(path) {
-            return fail(self, RouteRefusalReason::ReservedPath);
-        }
-        let label = family_of(path);
-        if self.book.check_reserved_labels && self.book.reserved_labels.contains(&label) {
-            return fail(self, RouteRefusalReason::ReservedLabel { label });
-        }
-        if self.book.check_label_ownership {
-            if let Some(owner) = self.book.label_owner.get(&label) {
-                if *owner != ext {
-                    return fail(
-                        self,
-                        RouteRefusalReason::LabelOwnedByOtherExtension {
-                            label,
-                            owner: *owner,
-                        },
-                    );
-                }
-            }
-        }
-        let shaped = shape(path);
-        let key = (Method::Get, shaped.clone());
-        if self.book.oss_shapes.contains(&key) {
-            return fail(
-                self,
-                RouteRefusalReason::DuplicateRoute {
-                    shape: shaped,
-                    of: DuplicateOf::Oss,
-                },
-            );
-        }
-        if let Some(owner) = self.book.ext_shapes.get(&key) {
-            return fail(
-                self,
-                RouteRefusalReason::DuplicateRoute {
-                    shape: shaped,
-                    of: DuplicateOf::Extension(*owner),
-                },
-            );
-        }
+        let (label, key) = match self.check_path_rules(
+            Method::Get,
+            path,
+            Some(RouteRefusalReason::PollStream(
+                PollStreamDefect::TemplatedPath,
+            )),
+        ) {
+            Ok(checked) => checked,
+            Err(reason) => return fail(self, reason),
+        };
         if !check_poll_pointer(spec.cursor) {
             return fail(
                 self,
@@ -1384,6 +1342,63 @@ impl<'a> ClientFamilyRegistrar<'a> {
         r
     }
 
+    /// The path rules a route and a poll stream share, in check order: the path grammar; a
+    /// parameter where the path must be exact (`param_refusal`, `None` for a template); a
+    /// parameterised first segment; a reserved path; a reserved label or another extension's
+    /// label; a duplicate by shape against OSS, then against the other extensions. Returns the
+    /// route's label and its `(method, shape)` key.
+    fn check_path_rules(
+        &self,
+        method: Method,
+        path: &str,
+        param_refusal: Option<RouteRefusalReason>,
+    ) -> Result<(String, (Method, String)), RouteRefusalReason> {
+        let ext = self.book.extensions[self.index].extension;
+        if let Err(d) = check_path_grammar(path, self.book.max_path_len) {
+            return Err(RouteRefusalReason::InvalidPath(d));
+        }
+        if let Some(reason) = param_refusal {
+            if path.contains('{') {
+                return Err(reason);
+            }
+        }
+        if first_segment_is_param(path) {
+            return Err(RouteRefusalReason::ParameterisedFirstSegment);
+        }
+        if self.book.reserved_paths.contains(path) {
+            return Err(RouteRefusalReason::ReservedPath);
+        }
+        let label = family_of(path);
+        if self.book.check_reserved_labels && self.book.reserved_labels.contains(&label) {
+            return Err(RouteRefusalReason::ReservedLabel { label });
+        }
+        if self.book.check_label_ownership {
+            if let Some(owner) = self.book.label_owner.get(&label) {
+                if *owner != ext {
+                    return Err(RouteRefusalReason::LabelOwnedByOtherExtension {
+                        label,
+                        owner: *owner,
+                    });
+                }
+            }
+        }
+        let shaped = shape(path);
+        let key = (method, shaped.clone());
+        if self.book.oss_shapes.contains(&key) {
+            return Err(RouteRefusalReason::DuplicateRoute {
+                shape: shaped,
+                of: DuplicateOf::Oss,
+            });
+        }
+        if let Some(owner) = self.book.ext_shapes.get(&key) {
+            return Err(RouteRefusalReason::DuplicateRoute {
+                shape: shaped,
+                of: DuplicateOf::Extension(*owner),
+            });
+        }
+        Ok((label, key))
+    }
+
     fn record(
         &mut self,
         method: Method,
@@ -1400,55 +1415,14 @@ impl<'a> ClientFamilyRegistrar<'a> {
         let fail =
             |this: &mut Self, reason: RouteRefusalReason| Err(this.refuse(text.clone(), reason));
 
-        if let Err(d) = check_path_grammar(path, self.book.max_path_len) {
-            return fail(self, RouteRefusalReason::InvalidPath(d));
-        }
-        if !templated && path.contains('{') {
-            return fail(self, RouteRefusalReason::ParamInExactPath);
-        }
-        if first_segment_is_param(path) {
-            return fail(self, RouteRefusalReason::ParameterisedFirstSegment);
-        }
-        if self.book.reserved_paths.contains(path) {
-            return fail(self, RouteRefusalReason::ReservedPath);
-        }
-        let label = family_of(path);
-        if self.book.check_reserved_labels && self.book.reserved_labels.contains(&label) {
-            return fail(self, RouteRefusalReason::ReservedLabel { label });
-        }
-        if self.book.check_label_ownership {
-            if let Some(owner) = self.book.label_owner.get(&label) {
-                if *owner != ext {
-                    return fail(
-                        self,
-                        RouteRefusalReason::LabelOwnedByOtherExtension {
-                            label,
-                            owner: *owner,
-                        },
-                    );
-                }
-            }
-        }
-        let shaped = shape(path);
-        let key = (method, shaped.clone());
-        if self.book.oss_shapes.contains(&key) {
-            return fail(
-                self,
-                RouteRefusalReason::DuplicateRoute {
-                    shape: shaped,
-                    of: DuplicateOf::Oss,
-                },
-            );
-        }
-        if let Some(owner) = self.book.ext_shapes.get(&key) {
-            return fail(
-                self,
-                RouteRefusalReason::DuplicateRoute {
-                    shape: shaped,
-                    of: DuplicateOf::Extension(*owner),
-                },
-            );
-        }
+        let (label, key) = match self.check_path_rules(
+            method,
+            path,
+            (!templated).then_some(RouteRefusalReason::ParamInExactPath),
+        ) {
+            Ok(checked) => checked,
+            Err(reason) => return fail(self, reason),
+        };
         if spec.is_mutation && spec.post_read {
             return fail(self, RouteRefusalReason::MutationAndPostRead);
         }
