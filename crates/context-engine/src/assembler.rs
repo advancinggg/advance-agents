@@ -52,8 +52,8 @@ use crate::recall_section::format_recall_section;
 use crate::task_router::{TaskRouter, TaskRoutingDecision};
 use crate::tier1::{build_tier1a, build_tier1b};
 use crate::tier2::{
-    assemble_unified, format_available_tools_section, neutralize_cache_breakpoint_markers,
-    sanitize_description,
+    assemble_unified, format_available_tools_section_with_not_shown,
+    neutralize_cache_breakpoint_markers, sanitize_description, UnifiedToolRecord,
 };
 use crate::tier2_decomposition::format_active_decomposition_section;
 use crate::tier2_delegates::format_available_delegates_section_with_aliases;
@@ -282,9 +282,12 @@ impl ContextAssembler for ContextAssemblerImpl {
         // unchanged — only a new ⑩ section is prepended.)
         let host_fns = self.host_fn_inventory.list_host_fns(&ctx.agent_id);
         let wasm_tools = self.callable_inventory.list_wasm_tools(&ctx.agent_id);
-        let mcp_tools = self.callable_inventory.list_mcp_tools(&ctx.agent_id);
-        let unified = assemble_unified(host_fns, wasm_tools, mcp_tools);
-        let tier2_tools = format_available_tools_section(&unified);
+        // The MCP tools the inventory shows, and how many it leaves out (the section's
+        // closing line counts them).
+        let mcp = self.callable_inventory.mcp_tools_shown(&ctx.agent_id);
+        let mcp_entries = mcp.tools.len();
+        let unified = assemble_unified(host_fns, wasm_tools, mcp.tools);
+        let tier2_tools = format_available_tools_section_with_not_shown(&unified, mcp.not_shown);
         // Wave-12: match the ⑬ delegates `node.parent` against the agent's full
         // id-alias set ({ctx.agent_id} ∪ agent_id_aliases) so a Sub recorded
         // under the BARE cap-id surfaces for this COLON-keyed assemble turn.
@@ -303,6 +306,7 @@ impl ContextAssembler for ContextAssemblerImpl {
                 content: skills_content,
             });
         }
+        let tools_at = tier2.len();
         tier2.push(LlmMessage {
             role: "system".into(),
             content: tier2_tools,
@@ -450,17 +454,43 @@ impl ContextAssembler for ContextAssemblerImpl {
         // digest/Tier-2). 0 tokens when the recall section is omitted.
         let recall_tokens = approx_tokens(&recall_messages);
 
-        let used: u32 = approx_tokens(&tier1a)
+        // Everything `used` counts but Tier-2 (saturating sums of non-negative
+        // terms, so the order of the additions does not change the total).
+        let used_but_tier2: u32 = approx_tokens(&tier1a)
             .saturating_add(approx_tokens(&tier1b))
             .saturating_add(breakpoint_1_tokens)
-            .saturating_add(approx_tokens(&tier2))
             .saturating_add(breakpoint_2_tokens)
             .saturating_add(prompt_tokens)
             .saturating_add(warnings_tokens)
             .saturating_add(digest_tokens)
             .saturating_add(recall_tokens);
+        let mut used: u32 = used_but_tier2.saturating_add(approx_tokens(&tier2));
         // `model_limit` / `budget` are computed once above the Tier-2 build
         // (hoisted for the Slice-V1-c skill cap) and reused here.
+
+        // MCP tools give way first. When the content does not fit and the tools
+        // section lists MCP tools, its last MCP entries (the inventory orders them
+        // by priority) are left out, and counted by the section's closing line,
+        // until it fits; the host functions, WASM tools, skills, delegates and the
+        // decomposition stay. Only content that does not fit without any MCP entry
+        // takes the degraded branch below. A section without MCP entries is never
+        // re-rendered.
+        if (used as usize) > budget && mcp_entries > 0 {
+            let rest: usize = tier2
+                .iter()
+                .enumerate()
+                .map(|(at, m)| m.role.len() + if at == tools_at { 0 } else { m.content.len() })
+                .sum();
+            let used_with = |section: &str| {
+                used_but_tier2.saturating_add(chars_to_tokens(rest.saturating_add(section.len())))
+            };
+            if let Some(section) = fit_mcp_entries(&unified, mcp_entries, mcp.not_shown, |s| {
+                (used_with(s) as usize) <= budget
+            }) {
+                used = used_with(&section);
+                tier2[tools_at].content = section;
+            }
+        }
 
         // ── Stage-C SAT-A budget-overflow guard (192 / §2.8; aligns with
         // SYS-AC-192). When the non-droppable fixed content `used` (which
@@ -473,8 +503,10 @@ impl ContextAssembler for ContextAssemblerImpl {
         // identity + drained warnings + the current prompt (truncated against
         // the budget remaining after identity + warnings); it DROPS the Tier-2
         // session sections (tools/skills/delegates) + the L0-L6 digest + all
-        // history. `messages`/`tier_token_counts` are computed per-branch and
-        // shared below (so the AC-12 `context.assembled` event still fires once).
+        // history. MCP entries have already given way above, so the MCP tools
+        // alone never lead here. `messages`/`tier_token_counts` are computed
+        // per-branch and shared below (so the AC-12 `context.assembled` event
+        // still fires once).
         let (messages, tier_token_counts) = if (used as usize) > budget {
             let identity_tokens = approx_tokens(&tier1a);
             let prompt_budget = budget
@@ -669,6 +701,45 @@ impl ContextAssembler for ContextAssemblerImpl {
     fn inject_tier3_warning(&self, agent_id: &str, msg: &str) {
         self.warnings.push(agent_id, msg);
     }
+}
+
+/// The `# Available Tools` section of `records` with as many of its MCP entries as `fits`
+/// takes, or `None` when it does not take the section even without any of them.
+///
+/// `records` ends in its `mcp_entries` MCP entries, in the order the inventory gave them,
+/// and does not fit with all of them. The last ones are left out first; the section's
+/// closing line counts them with the `not_shown` the inventory left out itself. The kept
+/// count is found by bisection, a handful of renders.
+fn fit_mcp_entries(
+    records: &[UnifiedToolRecord],
+    mcp_entries: usize,
+    not_shown: usize,
+    fits: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let others = records.len() - mcp_entries;
+    let render = |kept: usize| {
+        format_available_tools_section_with_not_shown(
+            &records[..others + kept],
+            not_shown.saturating_add(mcp_entries - kept),
+        )
+    };
+    let mut best = render(0);
+    if !fits(&best) {
+        return None;
+    }
+    // `fit` MCP entries fit; `over` do not.
+    let (mut fit, mut over) = (0, mcp_entries);
+    while over - fit > 1 {
+        let kept = fit + (over - fit) / 2;
+        let section = render(kept);
+        if fits(&section) {
+            fit = kept;
+            best = section;
+        } else {
+            over = kept;
+        }
+    }
+    Some(best)
 }
 
 /// Slice-A placeholder token estimator: chars/4 OpenAI-rule-of-thumb.

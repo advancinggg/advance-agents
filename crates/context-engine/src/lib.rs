@@ -123,7 +123,10 @@ pub use task_router::{
     ContextError, TaskRouter, TaskRoutingDecision, AMBIGUITY_GAP, TASK_MATCH_THRESHOLD,
 };
 pub use tier1::{build_tier1a, build_tier1b};
-pub use tier2::{assemble_unified, format_available_tools_section, UnifiedToolRecord};
+pub use tier2::{
+    assemble_unified, format_available_tools_section,
+    format_available_tools_section_with_not_shown, UnifiedToolRecord,
+};
 pub use tier2_decomposition::format_active_decomposition_section;
 pub use tier2_delegates::{
     format_available_delegates_section, format_available_delegates_section_with_aliases,

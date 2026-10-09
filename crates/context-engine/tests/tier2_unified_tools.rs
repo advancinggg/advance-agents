@@ -10,7 +10,13 @@
 #[path = "common/mod.rs"]
 mod common;
 
+use std::sync::{Arc, Mutex};
+
+use advance_context_engine::{SkillSummaryEntry, SkillSummaryReader};
+use advance_shared_types::capability::{McpToolEntry, McpToolsShown, ToolEntry};
 use advance_shared_types::context::ContextAssembler;
+use advance_shared_types::traits::CallableInventoryReader;
+use async_trait::async_trait;
 use common::*;
 use serde_json::json;
 
@@ -351,4 +357,160 @@ async fn unicode_dash_lookalikes_and_zero_width_chars_are_sanitized() {
     // (4) Line shape preserved.
     assert_eq!(entry.matches(" — ").count(), 1);
     assert!(entry.contains(") — "));
+}
+
+/// A callable inventory that shows `tools` and says it left `not_shown` more MCP tools out.
+struct ShownMcp {
+    tools: Vec<McpToolEntry>,
+    not_shown: usize,
+}
+
+impl CallableInventoryReader for ShownMcp {
+    fn list_wasm_tools(&self, _agent_id: &str) -> Vec<ToolEntry> {
+        Vec::new()
+    }
+    fn list_mcp_tools(&self, _agent_id: &str) -> Vec<McpToolEntry> {
+        self.tools.clone()
+    }
+    fn mcp_tools_shown(&self, _agent_id: &str) -> McpToolsShown {
+        McpToolsShown {
+            tools: self.tools.clone(),
+            not_shown: self.not_shown,
+        }
+    }
+}
+
+/// One visible skill.
+struct OneSkill;
+
+#[async_trait]
+impl SkillSummaryReader for OneSkill {
+    async fn list_skill_summaries(&self, _agent_id: &str) -> Vec<SkillSummaryEntry> {
+        vec![SkillSummaryEntry {
+            name: "triage".into(),
+            summary: "Sort the inbox".into(),
+            score: 1.0,
+        }]
+    }
+}
+
+// The MCP tools an inventory leaves out are counted by one line that closes the section.
+#[tokio::test]
+async fn the_mcp_tools_an_inventory_leaves_out_close_the_section_in_one_line() {
+    for (not_shown, closing) in [
+        (3, "… 3 more MCP tools not shown"),
+        (1, "… 1 more MCP tool not shown"),
+    ] {
+        let asm = build_assembler_with_inventory(
+            Arc::new(ShownMcp {
+                tools: vec![mcp("search", "Search", json!({}), "scholar")],
+                not_shown,
+            }),
+            vec![],
+            Arc::new(NullSkillSummary),
+        );
+        let r = asm.assemble(stub_ctx()).await.unwrap();
+        assert_eq!(
+            find_tier2_section(&r.messages),
+            format!("# Available Tools\n\n- scholar__search() — Search\n{closing}\n")
+        );
+    }
+}
+
+// A section without MCP tools is rendered byte for byte as before: no closing line, and
+// nothing given way.
+#[tokio::test]
+async fn a_tools_section_without_mcp_tools_is_unchanged_byte_for_byte() {
+    let asm = build_assembler_with(
+        vec![host(
+            "fs.read",
+            "Read a file",
+            json!({"properties": {"path": {}}}),
+        )],
+        vec![tool(
+            "editor.format",
+            "Format source code",
+            json!({"properties": {"lang": {}}}),
+        )],
+        vec![],
+    );
+    let r = asm.assemble(stub_ctx()).await.unwrap();
+    assert_eq!(
+        find_tier2_section(&r.messages),
+        "# Available Tools\n\n- fs.read(path) — Read a file\n- editor.format(lang) — Format source code\n"
+    );
+}
+
+// An MCP half far over the prompt's budget never costs the agent its host functions, WASM
+// tools, skills or delegates: the last MCP entries give way, one closing line counts them,
+// and the rest of Tier-2 stays.
+#[tokio::test]
+async fn an_over_budget_mcp_half_never_removes_host_functions_wasm_tools_skills_or_delegates() {
+    // The stub model has the fail-safe small window: 100 lines of 2 KiB are far over it.
+    let text = "x".repeat(2000);
+    let mcp_tools: Vec<McpToolEntry> = (0..100)
+        .map(|i| mcp(&format!("tool{i:03}"), &text, json!({}), "big"))
+        .collect();
+    let inventory = MockCallableInventory {
+        wasm: Mutex::new(vec![tool(
+            "editor.format",
+            "Format source code",
+            json!({"properties": {"lang": {}}}),
+        )]),
+        mcp: Mutex::new(mcp_tools),
+    };
+    let asm = build_assembler_with_inventory(
+        Arc::new(inventory),
+        vec![host(
+            "fs.read",
+            "Read a file",
+            json!({"properties": {"path": {}}}),
+        )],
+        Arc::new(OneSkill),
+    );
+    let r = asm.assemble(stub_ctx()).await.unwrap();
+    assert!(r.tier_token_counts.tier2 > 0, "Tier-2 is kept");
+    let section = find_tier2_section(&r.messages);
+    let entries: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(entries[0], "- fs.read(path) — Read a file");
+    assert_eq!(entries[1], "- editor.format(lang) — Format source code");
+    let kept = &entries[2..];
+    assert!(
+        !kept.is_empty() && kept.len() < 100,
+        "{} MCP entries kept",
+        kept.len()
+    );
+    for (i, line) in kept.iter().enumerate() {
+        assert!(
+            line.starts_with(&format!("- big__tool{i:03}() — x")),
+            "the first ones, in order: {line:.40}"
+        );
+    }
+    let closing = format!("… {} more MCP tools not shown", 100 - kept.len());
+    assert_eq!(section.lines().last(), Some(closing.as_str()));
+    assert!(r
+        .messages
+        .iter()
+        .any(|m| m.content.starts_with("# Available Skills")));
+    assert!(r
+        .messages
+        .iter()
+        .any(|m| m.content.starts_with("# Available Delegates")));
+}
+
+// Content that does not fit even without its MCP entries still takes the degraded branch.
+#[tokio::test]
+async fn content_over_budget_without_its_mcp_entries_still_drops_tier2() {
+    let text = "h".repeat(40_000);
+    let asm = build_assembler_with(
+        vec![host("fs.read", &text, json!({}))],
+        vec![],
+        vec![mcp("search", "Search", json!({}), "scholar")],
+    );
+    let r = asm.assemble(stub_ctx()).await.unwrap();
+    assert_eq!(r.tier_token_counts.tier2, 0);
+    assert!(!r
+        .messages
+        .iter()
+        .any(|m| m.content.starts_with("# Available Tools")));
 }

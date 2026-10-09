@@ -665,6 +665,25 @@ impl McpClient {
         lock(&self.tool_cache).listings()
     }
 
+    /// The configured servers a [`list_tools`](Self::list_tools) would add
+    /// tools to the cache for, in id order, read without contacting any
+    /// server: a server the cache holds no listing of (not listed yet, or every
+    /// listing of it failed), and one whose cached listing is cut
+    /// ([`CachedToolListing::is_truncated`]) to fewer tools than the cache now
+    /// has room for it, room another server's listing took and has since given
+    /// back. A listing cut to its share of a full cache is not among them:
+    /// listing it again would cut it the same way.
+    pub fn servers_to_list(&self) -> Vec<String> {
+        let servers = self.servers();
+        let cache = lock(&self.tool_cache);
+        let growable = cache.growable();
+        servers
+            .list_servers()
+            .filter(|entry| !cache.holds(&entry.server_id) || growable.contains(&entry.server_id))
+            .map(|entry| entry.server_id.clone())
+            .collect()
+    }
+
     /// Put `tools` in the cache as the listing of `server_id`, without contacting
     /// the server.
     #[doc(hidden)]

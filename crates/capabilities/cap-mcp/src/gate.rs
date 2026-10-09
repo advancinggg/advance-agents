@@ -177,16 +177,45 @@ impl McpGate {
         mut tools: Vec<McpToolInfo>,
     ) -> Vec<McpToolInfo> {
         let mut web_visible: Option<bool> = None;
-        tools.retain(|tool| {
-            if !scopes.reaches_tool(&tool.server_id, &tool.name) {
-                return false;
-            }
-            if !is_web_tool_id(&tool.name) {
-                return true;
-            }
-            !server_refuses_web && *web_visible.get_or_insert_with(|| self.web_visible(agent))
-        });
+        tools.retain(|tool| self.shows(agent, scopes, server_refuses_web, &mut web_visible, tool));
         tools
+    }
+
+    /// The tools of one server's listing that `agent` may see, as
+    /// [`visible_tools`](Self::visible_tools) chooses them, borrowed from
+    /// `tools` in listing order: a listing kept elsewhere (the client's tool
+    /// cache) is filtered without cloning any tool.
+    pub fn visible_tool_refs<'a>(
+        &self,
+        agent: &str,
+        scopes: &McpScopes,
+        server_refuses_web: bool,
+        tools: &'a [McpToolInfo],
+    ) -> Vec<&'a McpToolInfo> {
+        let mut web_visible: Option<bool> = None;
+        tools
+            .iter()
+            .filter(|tool| self.shows(agent, scopes, server_refuses_web, &mut web_visible, tool))
+            .collect()
+    }
+
+    /// Whether `agent` may see `tool` (see [`visible_tools`](Self::visible_tools));
+    /// `web_visible` keeps the web grant reader's answer once it was asked.
+    fn shows(
+        &self,
+        agent: &str,
+        scopes: &McpScopes,
+        server_refuses_web: bool,
+        web_visible: &mut Option<bool>,
+        tool: &McpToolInfo,
+    ) -> bool {
+        if !scopes.reaches_tool(&tool.server_id, &tool.name) {
+            return false;
+        }
+        if !is_web_tool_id(&tool.name) {
+            return true;
+        }
+        !server_refuses_web && *web_visible.get_or_insert_with(|| self.web_visible(agent))
     }
 
     /// Whether a listing may show `agent` the web family tools, read through
@@ -463,5 +492,43 @@ mod tests {
         let no_grant = McpGate::new(Recording::new(true), Arc::new(Scopes(vec![])), None);
         let shown = no_grant.visible_tools("a", &scopes, false, listing());
         assert_eq!(names(&shown), ["get_a"]);
+    }
+
+    // The borrowing filter chooses what the owning one does, reads the web grant as rarely,
+    // and hands back the listing's own tools.
+    #[test]
+    fn visible_tool_refs_choose_as_visible_tools_does() {
+        let listing = vec![
+            tool("srv", "get_a"),
+            tool("srv", "web.search"),
+            tool("srv", "web.extract"),
+            tool("srv", "delete"),
+        ];
+        let scopes = McpScopes(vec![scope(Some(&["srv"]), Some(&["get_*", "web.*"]))]);
+        for (held, refuses_web) in [(true, false), (true, true), (false, false)] {
+            let reader = WebHeld::new(held);
+            let gate = web_gate(Recording::new(true), reader.clone());
+            let owned = gate.visible_tools("a", &scopes, refuses_web, listing.clone());
+            let reads = reader.reads();
+            let borrowed = gate.visible_tool_refs("a", &scopes, refuses_web, &listing);
+            assert_eq!(
+                borrowed.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+                names(&owned),
+                "held {held}, refuses {refuses_web}"
+            );
+            assert_eq!(
+                reader.reads(),
+                2 * reads,
+                "held {held}, refuses {refuses_web}"
+            );
+            assert!(borrowed
+                .iter()
+                .all(|t| listing.iter().any(|l| std::ptr::eq(*t, l))));
+        }
+        let none = McpScopes(vec![scope(Some(&["other"]), None)]);
+        let gate = web_gate(Recording::new(true), WebHeld::new(true));
+        assert!(gate
+            .visible_tool_refs("a", &none, false, &listing)
+            .is_empty());
     }
 }

@@ -395,6 +395,38 @@ pub fn build_assembler_with_empty_inventories() -> ContextAssemblerImpl {
     build_assembler_with(Vec::new(), Vec::new(), Vec::new())
 }
 
+/// Build an assembler over the caller's callable inventory (the WASM and MCP halves), host
+/// functions and visible skills, with `Null*` doubles for every other port.
+pub fn build_assembler_with_inventory(
+    callable: Arc<dyn CallableInventoryReader>,
+    host_fns: Vec<HostFnEntry>,
+    skills: Arc<dyn SkillSummaryReader>,
+) -> ContextAssemblerImpl {
+    ContextAssemblerImpl::new(
+        callable,
+        Arc::new(MockHostFnInventory {
+            host: Mutex::new(host_fns),
+        }),
+        Arc::new(NullAgentIdentity),
+        Arc::new(NullKnowledgeMap),
+        Arc::new(NullAgentTreeSnapshot),
+        Arc::new(NullEmbedding),
+        Arc::new(NullTaskIndex),
+        Arc::new(NullLightLlm),
+        Arc::new(NullUnifiedSearch),
+        Arc::new(NullEventBus),
+        skills,
+        Arc::new(NullVectorIndex),
+        Arc::new(NullL2Digest),
+        Arc::new(NullL3Epoch),
+        Arc::new(NullL4TaskSummary),
+        Arc::new(NullL5Synthesis),
+        Arc::new(NullL6Consolidation),
+        Arc::new(NullPromptInjectionHelpers),
+        Arc::new(NullDecomposition),
+    )
+}
+
 /// Build an assembler with empty inventories + Null doubles for every port
 /// EXCEPT the Wave-12 Lane C `DecompositionReader`, which is the caller-supplied
 /// double. Lets a test drive the Tier-2 ⑭ "Active Task Decomposition" section from

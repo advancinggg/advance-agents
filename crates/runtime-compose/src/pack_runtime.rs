@@ -35,7 +35,9 @@ use std::time::Duration;
 
 use advance_pack_manager::meta_schema_merge::merge_documents;
 use advance_pack_manager::registry::path_for_kind;
-use advance_pack_manager::{ComponentKind, InMemoryPackRegistry, PackMetadata, PackRegistry};
+use advance_pack_manager::{
+    ComponentKind, InMemoryPackRegistry, PackMetadata, PackRegistry, TrustLevel,
+};
 use advance_shared_types::entity::EntityIndex;
 use cap_fs::meta_schema::{MetaSchemaLoader, DEFAULT_META_SCHEMA_YAML};
 use cap_fs::SchemaEntityProjector;
@@ -121,6 +123,15 @@ pub fn compose_schema(base: &str, packs: &[PackSchemaExtensions]) -> ComposedSch
 
 fn label(pack: &PackMetadata) -> String {
     format!("{}@{}", pack.name, pack.version)
+}
+
+/// The labels of the trusted packs among `packs`.
+fn trusted_labels(packs: &[PackMetadata]) -> BTreeSet<String> {
+    packs
+        .iter()
+        .filter(|pack| pack.trust_level == TrustLevel::Trusted)
+        .map(label)
+        .collect()
 }
 
 fn version_newer(a: &str, b: &str) -> bool {
@@ -322,8 +333,8 @@ impl PackRuntime {
         let _ = self.tools.set(tools);
     }
 
-    /// The MCP runtime: every apply reloads its servers and drops files whose
-    /// origin pack is no longer installed.
+    /// The MCP runtime: every apply tells it which applied packs are trusted,
+    /// reloads its servers and drops files whose origin pack is no longer installed.
     pub fn attach_mcp(&self, mcp: Arc<crate::mcp_wiring::McpRuntime>) {
         let _ = self.mcp.set(Arc::downgrade(&mcp));
     }
@@ -419,6 +430,7 @@ impl PackRuntime {
         }
         let installed: BTreeSet<String> = report.packs.iter().cloned().collect();
         let sweep = if let Some(mcp) = self.mcp.get().and_then(std::sync::Weak::upgrade) {
+            mcp.set_trusted_packs(trusted_labels(&packs));
             mcp.drop_uninstalled_origins(&installed)
         } else if let Some(plane) = self.mcp_plane.get() {
             plane.remove_origins_not_in(&installed)
@@ -467,12 +479,10 @@ impl PackRuntime {
     pub async fn sweep_mcp_origins(&self) -> McpSweep {
         let mut state = self.state.lock().await;
         let mut shadowed = Vec::new();
-        let installed: BTreeSet<String> =
-            effective_packs(self.registry.list_installed(), &mut shadowed)
-                .iter()
-                .map(label)
-                .collect();
+        let packs = effective_packs(self.registry.list_installed(), &mut shadowed);
+        let installed: BTreeSet<String> = packs.iter().map(label).collect();
         let sweep = if let Some(mcp) = self.mcp.get().and_then(std::sync::Weak::upgrade) {
+            mcp.set_trusted_packs(trusted_labels(&packs));
             mcp.start(&installed)
         } else if let Some(plane) = self.mcp_plane.get() {
             plane.remove_origins_not_in(&installed)
@@ -932,5 +942,28 @@ mod tests {
         );
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("agenda@0.9.1"), "{warnings:?}");
+    }
+
+    // The MCP runtime is told which applied packs are trusted, by their labels.
+    #[test]
+    fn the_trusted_packs_are_those_whose_effective_trust_is_trusted() {
+        let meta = |name: &str, trust_level| PackMetadata {
+            name: name.into(),
+            version: "1.0.0".into(),
+            install_path: PathBuf::from(format!("/p/{name}@1.0.0")),
+            trust_level,
+            required_capabilities: vec![],
+            signed_by: None,
+        };
+        let packs = [
+            meta("signed", TrustLevel::Trusted),
+            meta("plain", TrustLevel::Untrusted),
+            meta("also-signed", TrustLevel::Trusted),
+        ];
+        assert_eq!(
+            trusted_labels(&packs),
+            BTreeSet::from(["signed@1.0.0".to_string(), "also-signed@1.0.0".to_string()])
+        );
+        assert!(trusted_labels(&[]).is_empty());
     }
 }

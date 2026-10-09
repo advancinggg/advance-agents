@@ -122,6 +122,8 @@ pub mod log_keys {
     pub const MCP_LISTING_FAILED: &str = "mcp.listing_failed";
     /// stderr: a pack-origin MCP server file was removed because its pack is not installed.
     pub const MCP_STALE_FILE_REMOVED: &str = "mcp.stale_file_removed";
+    /// stderr: an agent's MCP tools do not all fit what one read of its tools shows.
+    pub const MCP_TOOLS_NOT_SHOWN: &str = "mcp.tools_not_shown";
     /// stderr: a turn-end stream settlement panicked off the serve loop.
     pub const REAP_DEFERRED_SETTLE_PANICKED: &str = "reap.deferred_settle_panicked";
     /// stderr: a turn-end stream reap panicked.
@@ -237,6 +239,7 @@ pub mod log_keys {
         MCP_WARN,
         MCP_LISTING_FAILED,
         MCP_STALE_FILE_REMOVED,
+        MCP_TOOLS_NOT_SHOWN,
         REAP_DEFERRED_SETTLE_PANICKED,
         REAP_TURN_END_PANICKED,
         VLM_META_ENSURE_FAILED,

@@ -80,6 +80,17 @@
 //! grant; in the `offline` web mode the gate holds no web grant and withholds them from
 //! every agent.
 //!
+//! ## What an agent is shown
+//!
+//! The root agent's prompt and the Client API's `GET /client/tools` read the MCP tools from
+//! the client's tool cache through a [`LiveCallableInventory`], filtered by the same grant
+//! readers. One read shows at most [`MCP_PROMPT_BUDGET_BYTES`] of tool text: the tools of the
+//! operator's servers first, then those of trusted packs' servers, then the others, each
+//! group by server id and tool name. The tools past it are counted, the prompt's tools
+//! section closes with a line saying how many, and stderr says so once for each number. A
+//! read lists in the background the servers the cache lacks, so the first read after the
+//! daemon starts shows no MCP tools unless `mcp.warm-tool-cache` filled the cache.
+//!
 //! ## Shutdown
 //!
 //! A stdio server leads its own process group and would outlive the daemon.
@@ -100,7 +111,7 @@ use advance_pack_manager::{
 };
 use advance_runtime::config::{McpConfig, RuntimeConfigProvider};
 use advance_runtime::host_registry::HostRegistry;
-use advance_shared_types::capability::{McpToolEntry, ToolEntry};
+use advance_shared_types::capability::{McpToolEntry, McpToolsShown, ToolEntry};
 use advance_shared_types::mcp::{is_valid_server_id, MAX_SERVER_ID_BYTES};
 use advance_shared_types::security_validator::{
     Allowlist, HttpCapability, HttpSecurityChain, LeakDetector, SsrfGuard,
@@ -114,8 +125,9 @@ use cap_http::{
     ReqwestHttpExecutor,
 };
 use cap_mcp::{
-    mcp_tool_entries_from_infos, register_mcp_client, McpClient, McpClientLimits, McpGate,
-    McpServerEntry, McpServersConfig, McpTransportSpec, McpWebGrant,
+    cut_description_to, register_mcp_client, McpClient, McpClientLimits, McpGate, McpScopes,
+    McpServerEntry, McpServersConfig, McpToolInfo, McpTransportSpec, McpWebGrant,
+    MAX_TOOL_DESCRIPTION_BYTES,
 };
 use cap_secrets::{InMemorySecretStorage, SecretStore};
 use zeroize::Zeroizing;
@@ -148,6 +160,19 @@ const MAX_WARNING_BYTES: usize = 512;
 
 /// Servers whose tools the warm-up lists at the same time.
 const WARM_UP_CONCURRENCY: usize = 4;
+
+/// Most bytes of MCP tool text one read of a [`LiveCallableInventory`] hands an agent:
+/// what Tier-2 renders, at most, of the MCP tools it shows (for each, the line
+/// `- <server>__<tool>(<arguments>) — <description>`). The tools past it are left out
+/// and counted, and the prompt's tools section closes with a line saying how many.
+pub const MCP_PROMPT_BUDGET_BYTES: usize = 32 * 1024;
+
+/// What a Tier-2 line adds around a tool's name, argument names and description: `- `,
+/// `(`, `) — ` and the line end.
+const PROMPT_LINE_FRAMING_BYTES: usize = "- ".len() + "(".len() + ") — ".len() + "\n".len();
+
+/// What Tier-2 puts between two argument names.
+const PROMPT_ARG_SEPARATOR_BYTES: usize = ", ".len();
 
 /// The warnings of one load, bounded: the first [`MAX_WARNINGS`] are kept, each made safe to
 /// print, and the rest are counted.
@@ -827,6 +852,7 @@ pub fn compose_mcp(parts: McpComposition<'_>) -> Arc<McpRuntime> {
         plane: parts.plane,
         secret_store: live_secrets,
         origins: Mutex::new(origins),
+        trusted_packs: Mutex::new(BTreeSet::new()),
         root_agent_id: parts.root_agent_id.to_string(),
         loopback,
         listings_in_flight: Arc::new(Mutex::new(BTreeSet::new())),
@@ -851,6 +877,9 @@ pub struct McpRuntime {
     plane: McpControlPlane,
     secret_store: Option<Arc<SecretStore>>,
     origins: Mutex<BTreeMap<String, String>>,
+    /// The installed packs (`name@version`) that are trusted, as the pack runtime last
+    /// applied them ([`set_trusted_packs`](Self::set_trusted_packs)).
+    trusted_packs: Mutex<BTreeSet<String>>,
     /// The root agent's id: whose `mcp` grants say which servers a reload lists.
     root_agent_id: String,
     /// The loopback endpoints the http chain exempts, fixed when the daemon started.
@@ -990,25 +1019,65 @@ impl McpRuntime {
     /// List the tools of `server_id` on the daemon runtime, as the root agent, unless a
     /// listing of it is running. A failed listing is not cached, so a later read tries again.
     fn spawn_listing(&self, server_id: &str) {
-        if !self
-            .listings_in_flight
+        let Some(claim) = self.claim_listing(server_id) else {
+            return;
+        };
+        let client = Arc::clone(&self.client);
+        let caller = self.root_agent_id.clone();
+        self.runtime.spawn(async move {
+            let _ = client.list_tools(Some(&caller), &claim.server_id).await;
+            drop(claim);
+        });
+    }
+
+    /// Mark a listing of `server_id` as running, unless one is. The mark goes when the
+    /// returned claim is dropped, however the listing ends (a failed one, or one whose task
+    /// stopped with the runtime), so a later read or reload can list the server again.
+    fn claim_listing(&self, server_id: &str) -> Option<ListingClaim> {
+        self.listings_in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(server_id.to_string())
-        {
-            return;
-        }
-        let client = Arc::clone(&self.client);
-        let in_flight = Arc::clone(&self.listings_in_flight);
-        let caller = self.root_agent_id.clone();
-        let server_id = server_id.to_string();
-        self.runtime.spawn(async move {
-            let _ = client.list_tools(Some(&caller), &server_id).await;
-            in_flight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&server_id);
-        });
+            .then(|| ListingClaim {
+                in_flight: Arc::clone(&self.listings_in_flight),
+                server_id: server_id.to_string(),
+            })
+    }
+
+    /// Whether a listing of `server_id` is running.
+    fn is_listing(&self, server_id: &str) -> bool {
+        self.listings_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(server_id)
+    }
+
+    /// Record which of the installed packs (`name@version`) are trusted, as the pack runtime
+    /// applies them: an agent's prompt shows the MCP tools of the operator's servers first,
+    /// then those of trusted packs' servers, then the others ([`LiveCallableInventory`]). A
+    /// pack-origin server whose pack is not among them counts as an untrusted pack's.
+    pub fn set_trusted_packs(&self, trusted: BTreeSet<String>) {
+        *self.trusted_packs.lock().unwrap_or_else(|e| e.into_inner()) = trusted;
+    }
+
+    /// Where `server_id` comes from, and its origin pack (`name@version`) when a pack
+    /// registered it.
+    fn source_of(&self, server_id: &str) -> (ServerSource, Option<String>) {
+        let origin = self.pack_origin(server_id);
+        let source = match &origin {
+            None => ServerSource::Operator,
+            Some(pack)
+                if self
+                    .trusted_packs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(pack) =>
+            {
+                ServerSource::TrustedPack
+            }
+            Some(_) => ServerSource::UntrustedPack,
+        };
+        (source, origin)
     }
 
     /// Delete the pack-origin files whose origin pack is not installed
@@ -1084,6 +1153,7 @@ impl McpRuntime {
             plane,
             secret_store: None,
             origins: Mutex::new(origins),
+            trusted_packs: Mutex::new(BTreeSet::new()),
             root_agent_id: "root".into(),
             loopback,
             listings_in_flight: Arc::new(Mutex::new(BTreeSet::new())),
@@ -1093,26 +1163,94 @@ impl McpRuntime {
     }
 }
 
-/// Append `[pack {origin}]` to a tool description, replacing `[]` and controls
-/// so the marker cannot be spoofed from the origin string.
-fn append_pack_origin(description: &mut String, origin: &str) {
-    if !description.is_empty() {
-        description.push(' ');
+/// Who a server comes from, in the order an agent is shown MCP tools: the operator's
+/// servers first, then trusted packs' servers, then the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ServerSource {
+    /// A server file the operator wrote (it has no `origin` block).
+    Operator,
+    /// A server a trusted pack registered.
+    TrustedPack,
+    /// A server a pack registered that is not trusted, or whose pack's trust is not known.
+    UntrustedPack,
+}
+
+/// A running listing of one server ([`McpRuntime::claim_listing`]); dropping it lets a later
+/// read or reload list the server again.
+struct ListingClaim {
+    in_flight: Arc<Mutex<BTreeSet<String>>>,
+    server_id: String,
+}
+
+impl Drop for ListingClaim {
+    fn drop(&mut self) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.server_id);
     }
-    description.push_str("[pack ");
-    for c in origin.chars() {
-        description.push(if c == '[' || c == ']' || c.is_control() {
+}
+
+/// `[pack {origin}]`, with `[`, `]` and controls in `origin` replaced by `_` so the marker
+/// cannot be spoofed from the origin string.
+fn pack_marker(origin: &str) -> String {
+    let mut marker = String::from("[pack ");
+    marker.extend(origin.chars().map(|c| {
+        if c == '[' || c == ']' || c.is_control() {
             '_'
         } else {
             c
-        });
-    }
-    description.push(']');
+        }
+    }));
+    marker.push(']');
+    marker
 }
 
-/// Live MCP half of the callable inventory: listings are filtered per agent
-/// through the gate, filled from the client's tool cache, and a first read
-/// starts a background refresh on the daemon runtime.
+/// A tool's description as an agent is shown it. The description of a pack's server's tool
+/// ends in the pack's marker ([`pack_marker`]): the text before it is cut, as a listing cuts
+/// a description (ending in `…`), so that both fit [`MAX_TOOL_DESCRIPTION_BYTES`], and the
+/// marker itself is never cut.
+fn shown_description(description: &str, origin: Option<&str>) -> String {
+    let Some(origin) = origin else {
+        return description.to_string();
+    };
+    let marker = pack_marker(origin);
+    let room = MAX_TOOL_DESCRIPTION_BYTES.saturating_sub(marker.len() + " ".len());
+    let body = cut_description_to(description.to_string(), room);
+    if body.is_empty() {
+        marker
+    } else {
+        format!("{body} {marker}")
+    }
+}
+
+/// A tool's model-facing name: `<server>__<tool>`, or the tool's own name when it already
+/// reads so.
+fn model_facing_name(tool: &McpToolInfo) -> String {
+    let prefix = format!("{}__", tool.server_id);
+    if tool.name.starts_with(&prefix) {
+        tool.name.clone()
+    } else {
+        format!("{prefix}{}", tool.name)
+    }
+}
+
+/// What Tier-2 renders for one tool at most, in bytes: the line `- name(arguments) —
+/// description`, whose arguments are the top-level `properties` of the input schema, `, `
+/// between two. Tier-2's sanitizing never lengthens a name, an argument or a description.
+fn prompt_line_bytes(name: &str, description: &str, schema: Option<&serde_json::Value>) -> usize {
+    let arguments = schema
+        .and_then(|schema| schema.get("properties"))
+        .and_then(serde_json::Value::as_object)
+        .map_or(0, |properties| {
+            properties.keys().map(String::len).sum::<usize>()
+                + PROMPT_ARG_SEPARATOR_BYTES * properties.len().saturating_sub(1)
+        });
+    PROMPT_LINE_FRAMING_BYTES + name.len() + arguments + description.len()
+}
+
+/// Live MCP half of the callable inventory: what an agent is shown of the client's tool
+/// cache, read without contacting any server.
 ///
 /// A read names its agent by one of the agent's ids. The grants are stored under the
 /// agent's immutable id, while the context assembler and the Client API tools provider read
@@ -1120,13 +1258,33 @@ fn append_pack_origin(description: &mut String, origin: &str) {
 /// [`for_agent`](Self::for_agent) maps each of those aliases to the stored id before it
 /// reads the grants, so both readers list what the agent's own calls are decided by.
 ///
+/// A read shows the cached tools the agent's `mcp` grants cover (the web family tools only
+/// as the gate allows them), chosen before any tool is copied, within
+/// [`MCP_PROMPT_BUDGET_BYTES`]: the tools of the operator's servers first, then those of
+/// trusted packs' servers, then the others, each group by server id and then by name, as
+/// many as fit in that order. The rest are left out and counted
+/// ([`McpToolsShown::not_shown`]; the prompt's tools section closes with a line saying how
+/// many), and a read that leaves tools out is logged, again only when the number changes.
+/// The prompt and the Client API read the same entries.
+///
 /// An entry's name is the model-facing `<server>__<tool>`, the one callable name the prompt
-/// and the Client API share; `server_id` names the server beside it.
+/// and the Client API share; `server_id` names the server beside it. The description of a
+/// pack's server's tool ends in `[pack name@version]`, within the description cap.
+///
+/// A read also lists, in the background on the daemon runtime, each server the agent's
+/// grants reach whose tools the cache does not hold as far as it could
+/// ([`McpClient::servers_to_list`]: not listed yet, listed in vain, or cut to less than the
+/// room the cache now has for it) and that no listing is running for. The read does not
+/// wait: the first read after the daemon starts shows no MCP tools unless
+/// `mcp.warm-tool-cache` filled the cache. A read of a cache that holds every such server as
+/// far as it can starts nothing.
 pub struct LiveCallableInventory {
     wasm: Vec<ToolEntry>,
     tools_grant: Option<Arc<dyn advance_shared_types::traits::ToolsGrantReader>>,
     mcp: Arc<McpRuntime>,
     grantee: Option<Grantee>,
+    /// The agent and the number of MCP tools the latest logged read left out.
+    reported: Mutex<Option<(String, usize)>>,
 }
 
 /// The id an agent's grants are stored under, and the other ids a read may name it by.
@@ -1144,6 +1302,7 @@ impl LiveCallableInventory {
             tools_grant: None,
             mcp,
             grantee: None,
+            reported: Mutex::new(None),
         }
     }
 
@@ -1186,41 +1345,127 @@ impl LiveCallableInventory {
         self
     }
 
-    /// List tools of servers `agent_id` (the id its grants are stored under) can reach
-    /// that are not in the cache yet. A failed listing is not cached, so a later read
-    /// tries again. An agent who reaches no server starts none.
-    fn kick_refresh(&self, agent_id: &str) {
-        let scopes = self.mcp.gate().scopes(agent_id);
+    /// List, in the background, the tools of each server `scopes` reach that a listing would
+    /// add tools to the cache for ([`McpClient::servers_to_list`]) and that no listing is
+    /// running for: one after another, each for no agent. A failed listing is not cached, so
+    /// a later read tries again. Starts nothing when there is no such server, or once the
+    /// client is shut down.
+    fn kick_refresh(&self, scopes: &McpScopes) {
+        if self.mcp.client().is_shut_down() {
+            return;
+        }
+        let pending: Vec<String> = self
+            .mcp
+            .client()
+            .servers_to_list()
+            .into_iter()
+            .filter(|server_id| scopes.reaches_server(server_id) && !self.mcp.is_listing(server_id))
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
         let mcp = Arc::clone(&self.mcp);
         self.mcp.runtime.spawn(async move {
-            let client = mcp.client();
-            for server in client.list_servers().await {
-                if !scopes.reaches_server(&server.id) {
+            for server_id in pending {
+                let Some(_claim) = mcp.claim_listing(&server_id) else {
+                    continue;
+                };
+                // Another read, or a reload, may have listed it meanwhile.
+                if !mcp.client().servers_to_list().contains(&server_id) {
                     continue;
                 }
-                if client
-                    .cached_tools()
-                    .iter()
-                    .any(|listing| listing.server_id == server.id)
-                {
-                    continue;
-                }
-                {
-                    let mut guard = mcp
-                        .listings_in_flight
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if !guard.insert(server.id.clone()) {
-                        continue;
-                    }
-                }
-                let _ = client.list_tools(None, &server.id).await;
-                mcp.listings_in_flight
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&server.id);
+                let _ = mcp.client().list_tools(None, &server_id).await;
             }
         });
+    }
+
+    /// What a read naming `agent_id` is shown (see the type docs).
+    fn shown(&self, agent_id: &str) -> McpToolsShown {
+        let agent_id = self.grantee(agent_id);
+        let gate = self.mcp.gate();
+        let client = self.mcp.client();
+        let scopes = gate.scopes(agent_id);
+        self.kick_refresh(&scopes);
+
+        let listings = client.cached_tools();
+        // The visible tools of each server the grants reach, by name, with where the server
+        // comes from.
+        type Tools<'a> = Vec<(String, &'a McpToolInfo)>;
+        let mut servers: Vec<(ServerSource, Option<String>, Tools<'_>)> = Vec::new();
+        for listing in &listings {
+            if !scopes.reaches_server(&listing.server_id) {
+                continue;
+            }
+            let refuses_web = client.refuses_web_tools(&listing.server_id);
+            let mut tools: Tools<'_> = gate
+                .visible_tool_refs(agent_id, &scopes, refuses_web, &listing.tools)
+                .into_iter()
+                .map(|tool| (model_facing_name(tool), tool))
+                .collect();
+            if tools.is_empty() {
+                continue;
+            }
+            tools.sort_by(|a, b| a.0.cmp(&b.0));
+            let (source, origin) = self.mcp.source_of(&listing.server_id);
+            servers.push((source, origin, tools));
+        }
+        // The cache holds its listings in server-id order, which a stable sort keeps within
+        // each source.
+        servers.sort_by_key(|(source, _, _)| *source);
+
+        let visible: usize = servers.iter().map(|(_, _, tools)| tools.len()).sum();
+        let mut shown = Vec::new();
+        let mut spent = 0;
+        'servers: for (_, origin, tools) in &servers {
+            for (name, tool) in tools {
+                let description = shown_description(&tool.description, origin.as_deref());
+                let bytes = prompt_line_bytes(name, &description, tool.input_schema.as_ref());
+                if spent + bytes > MCP_PROMPT_BUDGET_BYTES {
+                    break 'servers;
+                }
+                spent += bytes;
+                shown.push(McpToolEntry {
+                    name: name.clone(),
+                    description,
+                    params_schema: tool
+                        .input_schema
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                    server_id: tool.server_id.clone(),
+                });
+            }
+        }
+        let not_shown = visible - shown.len();
+        self.report_not_shown(agent_id, visible, not_shown);
+        McpToolsShown {
+            tools: shown,
+            not_shown,
+        }
+    }
+
+    /// Log that a read left `not_shown` of the `visible` MCP tools of `agent_id` out: a read
+    /// that leaves out as many tools of the same agent as the latest logged one says nothing,
+    /// and one that leaves none out lets the next that does log again.
+    fn report_not_shown(&self, agent_id: &str, visible: usize, not_shown: usize) {
+        let now = (not_shown > 0).then(|| (agent_id.to_string(), not_shown));
+        {
+            let mut reported = self.reported.lock().unwrap_or_else(|e| e.into_inner());
+            if *reported == now {
+                return;
+            }
+            *reported = now;
+        }
+        if not_shown > 0 {
+            self.mcp.log.err(
+                log_keys::MCP_TOOLS_NOT_SHOWN,
+                format!(
+                    "advance: WARN mcp: {not_shown} of the {visible} MCP tools agent {} may \
+                     call are left out of its prompt and its /client/tools listing: they do \
+                     not fit the {MCP_PROMPT_BUDGET_BYTES}-byte budget for MCP tool text",
+                    printable(agent_id)
+                ),
+            );
+        }
     }
 }
 
@@ -1242,33 +1487,11 @@ impl CallableInventoryReader for LiveCallableInventory {
     }
 
     fn list_mcp_tools(&self, agent_id: &str) -> Vec<McpToolEntry> {
-        let agent_id = self.grantee(agent_id);
-        self.kick_refresh(agent_id);
-        let scopes = self.mcp.gate().scopes(agent_id);
-        let mut out = Vec::new();
-        for listing in self.mcp.client().cached_tools() {
-            let visible = self.mcp.gate().visible_tools(
-                agent_id,
-                &scopes,
-                self.mcp.client().refuses_web_tools(&listing.server_id),
-                listing.tools.clone(),
-            );
-            let pack = self.mcp.pack_origin(&listing.server_id);
-            for mut entry in mcp_tool_entries_from_infos(visible) {
-                if let Some(origin) = &pack {
-                    append_pack_origin(&mut entry.description, origin);
-                }
-                let prefix = format!("{}__", entry.server_id);
-                if !entry.name.starts_with(&prefix) {
-                    entry.name = format!("{}{}", prefix, entry.name);
-                }
-                out.push(entry);
-                if out.len() >= cap_mcp::MAX_CACHED_TOOLS {
-                    return out;
-                }
-            }
-        }
-        out
+        self.shown(agent_id).tools
+    }
+
+    fn mcp_tools_shown(&self, agent_id: &str) -> McpToolsShown {
+        self.shown(agent_id)
     }
 }
 
@@ -2381,7 +2604,8 @@ mod tests {
     }
 
     // A grant-filtered cache listing is what the model sees: `<server>__<tool>`,
-    // pack origin in the description, web-family tools only with the `web` grant.
+    // pack origin in the description, web-family tools only with the `web` grant; the
+    // operator's servers come first, each server's tools by name.
     #[tokio::test]
     async fn a_grant_filtered_cache_listing_is_shown_as_server_tool() {
         let store = grant_store();
@@ -2451,9 +2675,9 @@ mod tests {
             [
                 "local-tools__echo",
                 "private__secret",
-                "scholar__search_papers",
+                "scholar__already",
                 "scholar__fetch_pdf",
-                "scholar__already"
+                "scholar__search_papers"
             ]
         );
         assert!(names("carol").is_empty());
@@ -2533,6 +2757,435 @@ mod tests {
             ["scholar__search_papers", "scholar__web.search"]
         );
         assert!(as_named.list_mcp_tools("agent:root").is_empty());
+    }
+
+    fn mcp_names(inventory: &LiveCallableInventory, agent: &str) -> Vec<String> {
+        inventory
+            .list_mcp_tools(agent)
+            .into_iter()
+            .map(|e| e.name)
+            .collect()
+    }
+
+    // An agent is shown, within the MCP budget, the tools of the operator's servers first,
+    // then those of trusted packs' servers, then the other packs', each group by server id
+    // and each server's tools by name. The tools past the budget are left out and counted,
+    // the prompt's tools section closes with a line saying how many, and the first read that
+    // leaves tools out is logged, a later read leaving out as many is not.
+    #[tokio::test]
+    async fn the_mcp_budget_goes_to_operator_then_trusted_then_untrusted_servers() {
+        let ws = tempfile::tempdir().unwrap();
+        let store = grant_store();
+        grant(&store, "root", "mcp");
+        let client = Arc::new(McpClient::new(
+            Arc::new(McpServersConfig::builder().build()),
+            Arc::new(CleanLeak),
+            None,
+        ));
+        // Six tools a server, listed out of name order; each line about 1.5 KiB.
+        let text = "d".repeat(1500);
+        for server in ["zeta", "alpha", "beta", "gamma", "aaa"] {
+            client.store_cached_tools(
+                server,
+                (0..6)
+                    .rev()
+                    .map(|i| cached_tool(server, &format!("t{i}"), &text))
+                    .collect(),
+            );
+        }
+        let mut origins = BTreeMap::new();
+        origins.insert("beta".to_string(), "trusted@1.0.0".to_string());
+        origins.insert("gamma".to_string(), "other@1.0.0".to_string());
+        origins.insert("aaa".to_string(), "third@1.0.0".to_string());
+        let log = Arc::new(RecordingLog::default());
+        let runtime = McpRuntime::for_test_over(
+            client,
+            mcp_gate(
+                Arc::new(RecordingCheck::default()),
+                store,
+                WebRunMode::Standard,
+            ),
+            origins,
+            plane(ws.path()).with_log(LogHandle::new(log.clone())),
+            LoopbackExemptions::none(),
+        );
+        runtime.set_trusted_packs(BTreeSet::from(["trusted@1.0.0".to_string()]));
+        let inv = LiveCallableInventory::new(vec![], runtime);
+
+        let order: Vec<String> = ["alpha", "zeta", "beta", "aaa", "gamma"]
+            .iter()
+            .flat_map(|server| (0..6).map(move |i| format!("{server}__t{i}")))
+            .collect();
+        let shown = inv.mcp_tools_shown("root");
+        let names: Vec<&str> = shown.tools.iter().map(|e| e.name.as_str()).collect();
+        // The operator's 12 lines and the trusted pack's 6 fit; 3 of the next untrusted
+        // pack's fit before the budget is spent.
+        assert_eq!(names.len(), 21, "{names:?}");
+        assert_eq!(names, order[..21]);
+        assert_eq!(shown.not_shown, 9);
+        assert_eq!(
+            mcp_names(&inv, "root"),
+            names,
+            "the Client API reads the same entries"
+        );
+
+        // What the model is shown: the lines within the budget, closed by the count.
+        let section = advance_context_engine::format_available_tools_section_with_not_shown(
+            &advance_context_engine::assemble_unified(vec![], vec![], shown.tools.clone()),
+            shown.not_shown,
+        );
+        let line_bytes: Vec<usize> = section
+            .lines()
+            .filter(|l| l.starts_with("- "))
+            .map(|l| l.len() + 1)
+            .collect();
+        assert_eq!(line_bytes.len(), 21);
+        let spent: usize = line_bytes.iter().sum();
+        assert!(spent <= MCP_PROMPT_BUDGET_BYTES, "{spent}");
+        assert!(
+            spent + line_bytes[line_bytes.len() - 1] > MCP_PROMPT_BUDGET_BYTES,
+            "the next line would not fit: {spent}"
+        );
+        assert_eq!(
+            section.lines().last(),
+            Some("… 9 more MCP tools not shown"),
+            "{section}"
+        );
+
+        let lines = log.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("9 of the 30 MCP tools agent root may call are left out"),
+            "{lines:?}"
+        );
+        inv.mcp_tools_shown("root");
+        assert_eq!(log.lines().len(), 1, "the same cut is logged once");
+        assert!(inv.mcp_tools_shown("someone-else").tools.is_empty());
+        assert_eq!(
+            log.lines().len(),
+            1,
+            "a read that leaves nothing out logs nothing"
+        );
+        inv.mcp_tools_shown("root");
+        assert_eq!(log.lines().len(), 2, "after one, a cut is logged again");
+    }
+
+    // The description of a pack's server's tool ends in the pack's marker within the
+    // description cap: the text before the marker is cut, never the marker. An operator's
+    // tool keeps its description as listed.
+    #[tokio::test]
+    async fn the_pack_marker_is_kept_within_the_description_cap() {
+        let store = grant_store();
+        grant(&store, "root", "mcp");
+        let client = Arc::new(McpClient::new(
+            Arc::new(McpServersConfig::builder().build()),
+            Arc::new(CleanLeak),
+            None,
+        ));
+        // A description at the cap, of two-byte characters.
+        let full = "é".repeat(MAX_TOOL_DESCRIPTION_BYTES / 2);
+        client.store_cached_tools(
+            "pk",
+            vec![
+                cached_tool("pk", "long", &full),
+                cached_tool("pk", "short", "Short"),
+                cached_tool("pk", "none", ""),
+            ],
+        );
+        client.store_cached_tools("op", vec![cached_tool("op", "long", &full)]);
+        let mut origins = BTreeMap::new();
+        origins.insert("pk".to_string(), "p@1.0.0".to_string());
+        let runtime = McpRuntime::for_test(
+            client,
+            mcp_gate(
+                Arc::new(RecordingCheck::default()),
+                store,
+                WebRunMode::Standard,
+            ),
+            origins,
+        );
+        let inv = LiveCallableInventory::new(vec![], runtime);
+        let shown = inv.list_mcp_tools("root");
+        let description = |name: &str| -> String {
+            shown
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} shown: {shown:?}"))
+                .description
+                .clone()
+        };
+
+        let long = description("pk__long");
+        assert!(long.len() <= MAX_TOOL_DESCRIPTION_BYTES, "{}", long.len());
+        let body = long
+            .strip_suffix(" [pack p@1.0.0]")
+            .unwrap_or_else(|| panic!("the marker ends the description: {long}"));
+        assert!(body.ends_with('…'), "the text before it is cut");
+        assert!(body.trim_end_matches('…').chars().all(|c| c == 'é'));
+        assert_eq!(description("pk__short"), "Short [pack p@1.0.0]");
+        assert_eq!(description("pk__none"), "[pack p@1.0.0]");
+        assert_eq!(
+            description("op__long"),
+            full,
+            "an operator's tool is as listed"
+        );
+    }
+
+    /// An MCP server double that answers every `tools/list` with the tools it is given and
+    /// counts the listings: fails each while it is given none, and holds each while it is
+    /// held, until released.
+    struct ListingServer {
+        server_id: String,
+        tools: std::sync::Mutex<Option<Vec<String>>>,
+        hold: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
+        listings: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ListingServer {
+        fn new(server_id: &str, tools: Option<Vec<String>>) -> Arc<Self> {
+            Arc::new(Self {
+                server_id: server_id.to_string(),
+                tools: std::sync::Mutex::new(tools),
+                hold: std::sync::Mutex::new(None),
+                listings: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn answer(&self, tools: Option<Vec<String>>) {
+            *self.tools.lock().unwrap() = tools;
+        }
+
+        /// Hold each listing until the returned notify is notified.
+        fn hold(&self) -> Arc<tokio::sync::Notify> {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            *self.hold.lock().unwrap() = Some(Arc::clone(&notify));
+            notify
+        }
+
+        fn listings(&self) -> usize {
+            self.listings.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cap_mcp::McpTransport for ListingServer {
+        async fn invoke(
+            &self,
+            _caller: Option<&str>,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<Vec<u8>, cap_mcp::McpError> {
+            assert_eq!(method, "tools/list");
+            self.listings.fetch_add(1, Ordering::SeqCst);
+            let hold = self.hold.lock().unwrap().clone();
+            if let Some(hold) = hold {
+                hold.notified().await;
+            }
+            let tools = self.tools.lock().unwrap().clone();
+            match tools {
+                Some(names) => {
+                    let tools: Vec<serde_json::Value> = names
+                        .iter()
+                        .map(|name| serde_json::json!({ "name": name }))
+                        .collect();
+                    Ok(serde_json::to_vec(&serde_json::json!({ "tools": tools })).unwrap())
+                }
+                None => Err(cap_mcp::McpError::transport("the server is down")),
+            }
+        }
+
+        async fn notify(
+            &self,
+            _method: &str,
+            _params: Option<serde_json::Value>,
+        ) -> Result<(), cap_mcp::McpError> {
+            Ok(())
+        }
+
+        fn server_id(&self) -> &str {
+            &self.server_id
+        }
+    }
+
+    /// A client whose configured servers are `servers`, each already connected.
+    fn listing_client(servers: &[Arc<ListingServer>]) -> Arc<McpClient> {
+        let mut config = McpServersConfig::builder();
+        let mut injected: std::collections::HashMap<String, Arc<dyn cap_mcp::McpTransport>> =
+            std::collections::HashMap::new();
+        for server in servers {
+            config = config
+                .add_server(McpServerEntry {
+                    server_id: server.server_id.clone(),
+                    description: String::new(),
+                    transport: McpTransportSpec::Stdio {
+                        command: "/bin/true".into(),
+                        args: vec![],
+                        env: BTreeMap::new(),
+                    },
+                    tool_patterns: None,
+                    tool_schemas: BTreeMap::new(),
+                })
+                .unwrap();
+            injected.insert(
+                server.server_id.clone(),
+                Arc::clone(server) as Arc<dyn cap_mcp::McpTransport>,
+            );
+        }
+        Arc::new(McpClient::new_with_transports(
+            Arc::new(config.build()),
+            Arc::new(CleanLeak),
+            injected,
+        ))
+    }
+
+    /// A runtime whose root may reach `servers` alone, over `client`.
+    fn root_reaching(client: Arc<McpClient>, servers: &str) -> Arc<McpRuntime> {
+        let store = grant_store();
+        grant_params(&store, "root", "mcp", &[("servers", servers)]);
+        McpRuntime::for_test(
+            client,
+            mcp_gate(
+                Arc::new(RecordingCheck::default()),
+                store,
+                WebRunMode::Standard,
+            ),
+            BTreeMap::new(),
+        )
+    }
+
+    /// The tasks alive on the test's runtime.
+    fn alive_tasks() -> usize {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    }
+
+    /// Let the tasks a read started run to their end.
+    async fn settle() {
+        for _ in 0..64 {
+            if alive_tasks() == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("background listings did not settle");
+    }
+
+    fn names_of(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("t{i}")).collect()
+    }
+
+    // The first read answers from the empty cache and lists the server the grant reaches in
+    // the background. Once that listing is cached, a read starts no task at all; a server no
+    // grant reaches is never listed.
+    #[tokio::test]
+    async fn a_read_of_a_cached_inventory_starts_no_listing() {
+        let srv = ListingServer::new("srv", Some(vec!["echo".into()]));
+        let other = ListingServer::new("other", Some(vec!["x".into()]));
+        let inv = LiveCallableInventory::new(
+            vec![],
+            root_reaching(listing_client(&[srv.clone(), other.clone()]), "srv"),
+        );
+
+        assert!(mcp_names(&inv, "root").is_empty(), "the cache is empty");
+        assert_eq!(alive_tasks(), 1, "the read starts one listing");
+        settle().await;
+        assert_eq!(srv.listings(), 1);
+
+        assert_eq!(mcp_names(&inv, "root"), ["srv__echo"]);
+        assert_eq!(
+            alive_tasks(),
+            0,
+            "a read of a cached inventory starts nothing"
+        );
+        assert_eq!(mcp_names(&inv, "root"), ["srv__echo"]);
+        assert_eq!(alive_tasks(), 0);
+        settle().await;
+        assert_eq!(srv.listings(), 1);
+        assert_eq!(
+            other.listings(),
+            0,
+            "a server no grant reaches is never listed"
+        );
+    }
+
+    // A failed listing is not cached, so the next read lists the server again; while a
+    // listing runs, a read starts no other.
+    #[tokio::test]
+    async fn a_failed_listing_is_tried_again_and_a_running_one_is_not_doubled() {
+        let srv = ListingServer::new("srv", None);
+        let inv = LiveCallableInventory::new(
+            vec![],
+            root_reaching(listing_client(&[srv.clone()]), "srv"),
+        );
+        mcp_names(&inv, "root");
+        settle().await;
+        assert_eq!(srv.listings(), 1);
+        mcp_names(&inv, "root");
+        settle().await;
+        assert_eq!(srv.listings(), 2, "the failed listing is tried again");
+
+        srv.answer(Some(vec!["echo".into()]));
+        let release = srv.hold();
+        mcp_names(&inv, "root");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(srv.listings(), 3, "the listing runs, held");
+        assert!(mcp_names(&inv, "root").is_empty());
+        assert_eq!(alive_tasks(), 1, "a read while it runs starts no other");
+        release.notify_one();
+        settle().await;
+        assert_eq!(srv.listings(), 3);
+        assert_eq!(mcp_names(&inv, "root"), ["srv__echo"]);
+        assert_eq!(alive_tasks(), 0);
+    }
+
+    // A listing the tool cache cut is listed again once the cache has room for more of it,
+    // and not before: one cut to its share of a full cache would be cut the same way.
+    #[tokio::test]
+    async fn a_cut_listing_is_listed_again_once_the_cache_has_room_for_it() {
+        let srv = ListingServer::new("srv", Some(names_of(cap_mcp::MAX_TOOLS_PER_SERVER)));
+        let client = listing_client(&[srv.clone()]);
+        let full = |server: &str| -> Vec<cap_mcp::McpToolInfo> {
+            names_of(cap_mcp::MAX_TOOLS_PER_SERVER)
+                .iter()
+                .map(|name| cached_tool(server, name, ""))
+                .collect()
+        };
+        // Four other servers' listings, cached, crowd `srv` to its share of a full cache.
+        client.store_cached_tools("srv", full("srv"));
+        for hog in ["hog1", "hog2", "hog3", "hog4"] {
+            client.store_cached_tools(hog, full(hog));
+        }
+        let cached_srv = {
+            let client = Arc::clone(&client);
+            move || {
+                client
+                    .cached_tools()
+                    .into_iter()
+                    .find(|listing| listing.server_id == "srv")
+                    .expect("srv is cached")
+            }
+        };
+        assert!(cached_srv().is_truncated());
+        let inv = LiveCallableInventory::new(vec![], root_reaching(Arc::clone(&client), "srv"));
+        assert_eq!(mcp_names(&inv, "root").len(), cached_srv().tools.len());
+        assert_eq!(
+            alive_tasks(),
+            0,
+            "a listing cut to its share is not listed again"
+        );
+
+        // One of them lists nothing now: the room it held is back.
+        client.store_cached_tools("hog4", vec![]);
+        mcp_names(&inv, "root");
+        assert_eq!(alive_tasks(), 1, "the cut listing is listed again");
+        settle().await;
+        assert_eq!(srv.listings(), 1);
+        assert!(!cached_srv().is_truncated());
+        assert_eq!(mcp_names(&inv, "root").len(), cap_mcp::MAX_TOOLS_PER_SERVER);
+        assert_eq!(alive_tasks(), 0);
     }
 
     fn registration(id: &str, pack: &str) -> McpRegistration {

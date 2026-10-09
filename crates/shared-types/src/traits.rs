@@ -17,7 +17,9 @@
 //! 1 Slice m012-B + 3 Slice m012-C + CostTrackerQuery + ToolsGrantReader +
 //! McpGrantReader + WebGrantReader + RememberContentPolicy) `Box<dyn>`-constructible.
 
-use crate::capability::{BudgetDecision, CapParams, GrantDecision, McpToolEntry, ToolEntry};
+use crate::capability::{
+    BudgetDecision, CapParams, GrantDecision, McpToolEntry, McpToolsShown, ToolEntry,
+};
 use crate::cost::{AttributedCost, CostLedgerError, CostWindow, RunCost};
 use crate::event::Event;
 use crate::mcp::McpGrantScope;
@@ -86,6 +88,17 @@ pub trait RunBudget: Send + Sync {
 pub trait CallableInventoryReader: Send + Sync {
     fn list_wasm_tools(&self, agent_id: &str) -> Vec<ToolEntry>;
     fn list_mcp_tools(&self, agent_id: &str) -> Vec<McpToolEntry>;
+
+    /// The MCP tools `agent_id`'s prompt shows: the entries of
+    /// [`list_mcp_tools`](Self::list_mcp_tools), and how many more MCP tools the agent
+    /// may call that they leave out. An inventory that bounds what it shows reports
+    /// here what it left out; by default every entry is shown and none is left out.
+    fn mcp_tools_shown(&self, agent_id: &str) -> McpToolsShown {
+        McpToolsShown {
+            tools: self.list_mcp_tools(agent_id),
+            not_shown: 0,
+        }
+    }
 }
 
 /// CONTRACT-180 — runtime observability emit hook. See Slice B' rustdoc for full

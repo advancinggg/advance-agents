@@ -419,6 +419,7 @@ async fn the_tool_cache_shares_the_total_cap_fairly_and_marks_cut_listings() {
     let first_names =
         |count: usize| -> Vec<String> { (0..count).map(|i| format!("t{i}")).collect() };
     assert!(client.cached_tools().is_empty());
+    assert_eq!(client.servers_to_list(), ids, "none is listed yet");
 
     // As many full listings as fit are cached whole.
     for (id, mock) in ids.iter().zip(&mocks).take(fitting) {
@@ -426,6 +427,7 @@ async fn the_tool_cache_shares_the_total_cap_fairly_and_marks_cut_listings() {
         client.list_tools(None, id).await.expect("listed");
     }
     assert!(client.cached_tools().iter().all(|l| !l.is_truncated()));
+    assert_eq!(client.servers_to_list(), [ids[fitting].clone()]);
 
     // One more: every listing is cut to its share and marked.
     mocks[fitting].push_ok(full_page(MAX_TOOLS_PER_SERVER));
@@ -450,14 +452,19 @@ async fn the_tool_cache_shares_the_total_cap_fairly_and_marks_cut_listings() {
         assert!((share..=share + 1).contains(&listing.tools.len()));
         assert_eq!(names(&listing.tools), first_names(listing.tools.len()));
     }
+    assert!(
+        client.servers_to_list().is_empty(),
+        "each listing holds its share of the full cache: listing it again changes nothing"
+    );
 
-    // A server listing no tools keeps an empty entry, and the last server's
-    // next listing takes the room it left.
+    // A server listing no tools keeps an empty entry, and the room it left is there for
+    // each cut listing's next listing.
     mocks[0].push_ok(full_page(0));
     client.list_tools(None, &ids[0]).await.expect("listed");
     let empty = cached_of(&client, &ids[0]);
     assert_eq!((empty.tools.len(), empty.listed), (0, 0));
     assert!(!empty.is_truncated());
+    assert_eq!(client.servers_to_list(), ids[1..]);
     mocks[fitting].push_ok(full_page(MAX_TOOLS_PER_SERVER));
     client
         .list_tools(None, &ids[fitting])
@@ -466,6 +473,7 @@ async fn the_tool_cache_shares_the_total_cap_fairly_and_marks_cut_listings() {
     let last = cached_of(&client, &ids[fitting]);
     assert_eq!(last.tools.len(), MAX_TOOLS_PER_SERVER);
     assert!(!last.is_truncated());
+    assert_eq!(client.servers_to_list(), ids[1..fitting]);
     assert!(
         client
             .cached_tools()
