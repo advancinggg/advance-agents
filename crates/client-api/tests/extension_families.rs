@@ -722,4 +722,18 @@ async fn module_001_ac31_shutdown_ingress_drains_extension_pools() {
         ingress.drained,
         "the extension pool drains when no request is in flight"
     );
+
+    // The drained pool stays closed: the same API behind a new listener answers 503 for the
+    // extension route, where `retire` leaves the pool open for the next listener
+    // (`module_001_ac32_retire_keeps_extension_pools_open`).
+    let server = ClientApiServer::bind(Arc::clone(&ingress.api), 0)
+        .await
+        .expect("bind the drained API again");
+    assert_eq!(
+        http_get(server.local_addr(), "/client/ext/hold", Some("tok")),
+        503,
+        "a straggler on a drained extension pool fails closed"
+    );
+    assert_eq!(http_get(server.local_addr(), "/client/health", None), 200);
+    server.shutdown().await.expect("shutdown");
 }

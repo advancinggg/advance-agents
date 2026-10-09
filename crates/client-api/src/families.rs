@@ -1740,12 +1740,31 @@ mod tests {
 
     #[test]
     fn module_001_ac31_scratch_and_live_route_tables_match() {
+        // The reserved floor comes from a default-config scratch `ClientApi`; the composition
+        // builds the live one with allowed origins or in-process admission, and either value of
+        // the deltas flag. The two tables must agree under each.
+        let mut configs = Vec::new();
         let mut cfg = ClientApiConfig::default();
         cfg.allowed_origins = vec!["http://127.0.0.1:1".into()];
-        let live =
-            ClientApi::with_parts(cfg, "operator", Arc::new(SystemClock), Arc::new(NoopSink))
-                .route_table();
-        assert_eq!(oss_route_table(), live);
+        configs.push(cfg);
+        let mut cfg = ClientApiConfig::default();
+        cfg.session_admission = crate::config::SessionAdmission::InProcessOnly;
+        configs.push(cfg);
+        for llm_deltas_enabled in [false, true] {
+            let mut cfg = ClientApiConfig::default();
+            cfg.llm_deltas_enabled = llm_deltas_enabled;
+            configs.push(cfg);
+        }
+        for cfg in configs {
+            let label = format!(
+                "{:?}, origins {:?}, deltas {}",
+                cfg.session_admission, cfg.allowed_origins, cfg.llm_deltas_enabled
+            );
+            let live =
+                ClientApi::with_parts(cfg, "operator", Arc::new(SystemClock), Arc::new(NoopSink))
+                    .route_table();
+            assert_eq!(oss_route_table(), live, "{label}");
+        }
     }
 
     #[test]
