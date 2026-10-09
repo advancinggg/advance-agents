@@ -167,9 +167,7 @@ impl WiredPackAdminProvider {
     }
 
     fn installer(&self, approval: Arc<dyn ApprovalStrategy>) -> Result<Installer, ProviderError> {
-        let catalog =
-            build_capability_catalog_with(&self.registry, &self.extension_capabilities)
-                .map_err(|e| ProviderError::Unavailable(format!("capability catalog: {e}")))?;
+        let catalog = build_capability_catalog_with(&self.extension_capabilities);
         let approval = Arc::new(CatalogCheckedApproval::new(approval, Arc::new(catalog)));
         let fetch_timeout = Duration::from_secs(self.config.fetch_timeout_sec);
         let mut installer = Installer::new(

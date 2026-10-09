@@ -952,16 +952,18 @@ fn capabilities_value(capabilities: &[String]) -> Value {
     Value::Sequence(capabilities.iter().map(|c| str_value(c)).collect())
 }
 
+/// [`check_hierarchy_capabilities_with`] under the KNOWN capability names only.
+#[cfg(test)]
+fn check_hierarchy_capabilities(root_document: &str) -> Result<(), ProviderError> {
+    check_hierarchy_capabilities_with(root_document, &EffectiveCapabilities::default())
+}
+
 /// The next boot materializes every declared child with its `capabilities:` and subset-gates
 /// them against the parent node (the root's node set is the root document's active
 /// capabilities). A root document whose hierarchy violates that would abort the next daemon
 /// start, so every write of the root document is checked here first (fail-closed →
 /// `invalid_request`). Whole-capability ids only, so containment is the exact gate.
-#[allow(dead_code)] // identity wrapper; tests call it, production uses `_with`
-fn check_hierarchy_capabilities(root_document: &str) -> Result<(), ProviderError> {
-    check_hierarchy_capabilities_with(root_document, &EffectiveCapabilities::default())
-}
-
+/// `capabilities` adds the extension capability names this composition admits.
 fn check_hierarchy_capabilities_with(
     root_document: &str,
     capabilities: &EffectiveCapabilities,
