@@ -182,9 +182,13 @@ pub(crate) fn is_unsafe_for_tier2_line(c: char) -> bool {
         ','
             | '('
             | ')'
-            // Unicode dashes that look like the ASCII hyphen / ` — ` delimiter
-            // to operator audit text. ASCII '-' is kept so MCP server ids
-            // (`[A-Za-z0-9._-]`) round-trip in the prompt.
+            // Unicode dashes that look like the ASCII hyphen or the ` — `
+            // delimiter in operator audit text. ASCII '-' itself is not in the
+            // set, so callable and argument names keep their hyphens: host
+            // functions (`read-slug`), WASM tools (`editor-x.format`), MCP
+            // tools shown as `<server>__<tool>` (`my-server__do-thing`) and
+            // arguments (`peer-id`). The one exception is the cache-breakpoint
+            // marker, which `sanitize_tool_name` rewrites in a tool name.
             | '\u{2010}'
             | '\u{2011}'
             | '\u{2012}'

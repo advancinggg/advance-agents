@@ -359,6 +359,65 @@ async fn unicode_dash_lookalikes_and_zero_width_chars_are_sanitized() {
     assert!(entry.contains(") — "));
 }
 
+// A callable's name and its arguments' names keep their ASCII hyphens, whatever the kind: host
+// function, WASM tool, or MCP tool shown as `<server>__<tool>`. A Unicode dash that looks like a
+// hyphen is still mapped to `_`.
+#[tokio::test]
+async fn hyphenated_callable_and_argument_names_keep_their_ascii_hyphens() {
+    let asm = build_assembler_with(
+        vec![
+            host(
+                "read-slug",
+                "Read a slug",
+                json!({"properties": {"peer-id": {"type": "string"}}}),
+            ),
+            // U+2011 NON-BREAKING HYPHEN and U+2010 HYPHEN look like `-`.
+            host(
+                "write\u{2011}record",
+                "Write a record",
+                json!({"properties": {"entry\u{2010}key": {}}}),
+            ),
+        ],
+        vec![tool(
+            "editor-x.format",
+            "Format source code",
+            json!({"properties": {"lang": {}}}),
+        )],
+        vec![mcp(
+            "do-thing",
+            "Do a thing",
+            json!({"properties": {"dry-run": {}}}),
+            "my-server",
+        )],
+    );
+    let r = asm.assemble(stub_ctx()).await.unwrap();
+    let section = find_tier2_section(&r.messages);
+    let entries: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(
+        entries,
+        [
+            "- read-slug(peer-id) — Read a slug",
+            "- write_record(entry_key) — Write a record",
+            "- editor-x.format(lang) — Format source code",
+            "- my-server__do-thing(dry-run) — Do a thing",
+        ],
+        "{section}"
+    );
+    for mapped in [
+        "read_slug",
+        "peer_id",
+        "editor_x",
+        "my_server",
+        "do_thing",
+        "dry_run",
+    ] {
+        assert!(!section.contains(mapped), "{mapped:?} in {section:?}");
+    }
+    for dash in ['\u{2010}', '\u{2011}'] {
+        assert!(!section.contains(dash), "{dash:?} in {section:?}");
+    }
+}
+
 /// A callable inventory that shows `tools` and says it left `not_shown` more MCP tools out.
 struct ShownMcp {
     tools: Vec<McpToolEntry>,
