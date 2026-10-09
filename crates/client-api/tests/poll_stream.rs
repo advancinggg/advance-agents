@@ -1,6 +1,7 @@
-//! MODULE-001-AC-33: registrar rules for `poll_stream` and the OSS WebSocket routes
-//! unchanged when a poll stream is installed.
+//! MODULE-001-AC-33: registrar rules for `poll_stream`, the OSS WebSocket routes unchanged when
+//! a poll stream is installed, and a POST to a poll-stream path.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use cap_http::canonical_facade::decoded_hold_split;
 use cap_http::DefaultLeakDetector;
 use futures::StreamExt;
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{ORIGIN, SEC_WEBSOCKET_PROTOCOL};
 use tokio_tungstenite::tungstenite::Error as WsError;
@@ -403,4 +405,132 @@ async fn next_text(socket: &mut Sock) -> String {
             other => panic!("expected a text frame, got {other:?}"),
         }
     }
+}
+
+/// One raw HTTP/1.1 request with an empty body; `(status, JSON body or Null)`. Reads exactly the
+/// response's `Content-Length`, so a kept-alive connection does not hold the test.
+async fn raw_http(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, String)],
+) -> (u16, Value) {
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let mut response = Vec::new();
+    let (head_end, body_len) = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&response[..end]).to_ascii_lowercase();
+                let len = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map(|v| v.trim().parse::<usize>().expect("content-length"))
+                    .unwrap_or(0);
+                if response.len() >= end + 4 + len {
+                    return (end, len);
+                }
+            }
+            let n = stream.read(&mut chunk).await.expect("read response");
+            assert!(n > 0, "connection closed mid-response: {response:?}");
+            response.extend_from_slice(&chunk[..n]);
+        }
+    })
+    .await
+    .expect("response within 10s");
+    let status_line = String::from_utf8_lossy(&response[..head_end]).into_owned();
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .expect("status code");
+    let body = &response[head_end + 4..head_end + 4 + body_len];
+    (status, serde_json::from_slice(body).unwrap_or(Value::Null))
+}
+
+/// A POST that carries the WebSocket upgrade headers is not a poll-stream request: the stream's
+/// read never runs for it and it is answered as the same POST without those headers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac33_post_with_upgrade_headers_never_runs_the_poll_read() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&reads);
+    let server = ClientApiServer::bind_local_factory(0, move |addr| {
+        let mut cfg = ClientApiConfig::default();
+        cfg.allowed_origins = vec![format!("http://{addr}")];
+        let mut book = RouteBook::new(
+            &cfg,
+            parts(),
+            advance_client_api::ExtensionRouteGate::new(),
+            Arc::new(NoExtensionRouteHooks),
+        );
+        {
+            let mut r = book.registrar("ext");
+            let read = HandlerSpec::read(true, move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({ "items": [], "cursor": "c0" }))
+            })
+            .with_scopes(vec![Scope::ReadInventory]);
+            r.poll_stream("/client/ext/feed", spec(read)).unwrap();
+        }
+        let families = book.finish().unwrap();
+        let mut api =
+            ClientApi::with_parts(cfg, "operator", Arc::new(SystemClock), Arc::new(NoopSink));
+        families.install(&mut api);
+        mint(&api);
+        Arc::new(api)
+    })
+    .await
+    .expect("bind");
+    let addr = server.local_addr();
+    let origin = format!("http://{addr}");
+    let session = [
+        ("Origin", origin.clone()),
+        ("Authorization", format!("Bearer {TOKEN}")),
+    ];
+    let upgrade = [
+        ("Origin", origin.clone()),
+        ("Authorization", format!("Bearer {TOKEN}")),
+        ("Upgrade", "websocket".to_string()),
+        ("Connection", "Upgrade".to_string()),
+        ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==".to_string()),
+        ("Sec-WebSocket-Version", "13".to_string()),
+        (
+            "Sec-WebSocket-Protocol",
+            format!("{CLIENT_WS_PROTOCOL}, advance.bearer.{TOKEN}"),
+        ),
+    ];
+
+    let (plain_status, plain) = raw_http(addr, "POST", "/client/ext/feed", &session).await;
+    let (status, body) = raw_http(addr, "POST", "/client/ext/feed", &upgrade).await;
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "the poll read ran for a POST (answered {status}: {body})"
+    );
+    assert_eq!(plain_status, 404, "{plain}");
+    assert_eq!(
+        plain.pointer("/error/code"),
+        Some(&json!("unknown_route")),
+        "{plain}"
+    );
+    assert_eq!(status, plain_status, "{body}");
+    assert_eq!(body.pointer("/error"), plain.pointer("/error"), "{body}");
+
+    // The GET upgrade on the same path still seeds the stream with one read.
+    let (mut feed, switched) = connect_ws(addr, &origin, "/client/ext/feed")
+        .await
+        .expect("poll stream ws");
+    assert_eq!(switched, 101);
+    let seed: Value = serde_json::from_str(&next_text(&mut feed).await).expect("seed json");
+    assert_eq!(seed.pointer("/data/cursor"), Some(&json!("c0")), "{seed}");
+    assert!(reads.load(Ordering::SeqCst) >= 1);
 }

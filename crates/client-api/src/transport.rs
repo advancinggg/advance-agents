@@ -538,7 +538,9 @@ async fn http_client_request(
             return answer;
         }
     }
-    if is_websocket_upgrade(request.headers()) {
+    // A poll stream is a GET upgrade. Any other request to its path is plain HTTP: a POST that
+    // carries the upgrade headers never runs the stream's read.
+    if request.method() == axum::http::Method::GET && is_websocket_upgrade(request.headers()) {
         if let Some(entry) = state.api.poll_stream_for(&path) {
             return poll_stream_transport(state, peer, path, entry, request).await;
         }
