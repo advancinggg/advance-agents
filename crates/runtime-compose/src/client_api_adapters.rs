@@ -30,6 +30,8 @@ use advance_shared_types::traits::{AgentTreeSnapshot, CallableInventoryReader};
 use rand::{rngs::OsRng, RngCore};
 use zeroize::Zeroizing;
 
+use crate::api::log_keys;
+use crate::compose_log::LogHandle;
 pub use crate::execution_turn_ingress::ExecutionTurnIngress;
 use crate::observation_carriers::ObservationCarrierStore;
 use crate::observation_projection::Contract219EventProjector;
@@ -1102,6 +1104,25 @@ impl NoIntakePendingGrants {
     }
 }
 
+/// The pending-grant list a home without a grant intake answers with: `built`, or, when it
+/// could not be built, no list (the route answers `module_unavailable`) and the reason logged
+/// under [`log_keys::PENDING_GRANTS_UNAVAILABLE`].
+pub(crate) fn no_intake_pending_list(
+    built: Result<NoIntakePendingGrants, String>,
+    log: &LogHandle,
+) -> Option<Arc<dyn PendingGrantListPort>> {
+    match built {
+        Ok(list) => Some(Arc::new(list)),
+        Err(error) => {
+            log.err(
+                log_keys::PENDING_GRANTS_UNAVAILABLE,
+                format!("advance: Client API pending-grant list unavailable: {error}"),
+            );
+            None
+        }
+    }
+}
+
 impl PendingGrantListPort for NoIntakePendingGrants {
     fn list_pending_bound(&self) -> Result<Vec<BoundObservationDocument>, ProviderError> {
         Ok(Vec::new())
@@ -1529,6 +1550,24 @@ mod tests {
         assert!(empty.wasm.is_empty());
         assert!(empty.mcp.is_empty());
         assert!(empty.skills.is_empty());
+    }
+
+    #[test]
+    fn module_020_ac18_no_intake_pending_list_failure_is_logged_under_its_own_key() {
+        let sink = crate::test_support::MemoryComposeLog::new();
+        let log = LogHandle::new(Arc::new(sink.clone()));
+        assert!(no_intake_pending_list(Err("role factory refused".into()), &log).is_none());
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].key, log_keys::PENDING_GRANTS_UNAVAILABLE);
+        assert_eq!(
+            lines[0].text,
+            "advance: Client API pending-grant list unavailable: role factory refused"
+        );
+
+        let built = no_intake_pending_list(NoIntakePendingGrants::new(), &log).expect("built");
+        assert!(built.list_pending_bound().expect("list").is_empty());
+        assert_eq!(sink.lines().len(), 1, "a built list logs nothing");
     }
 
     #[test]

@@ -151,9 +151,11 @@ pub mod log_keys {
     pub const ROLLBACK_MEMORY_UNAVAILABLE: &str = "wiring.rollback_memory_unavailable";
     /// stderr: the `data` tool is not registered.
     pub const DATA_TOOL_NOT_REGISTERED: &str = "wiring.data_tool_not_registered";
-    /// stderr: a Client API read-view adapter is unavailable (history, events, or the
-    /// pending-grant list of a home without a grant intake).
+    /// stderr: the Client API history / events adapters are unavailable.
     pub const CLIENT_API_HISTORY_UNAVAILABLE: &str = "wiring.client_api_history_unavailable";
+    /// stderr: the pending-grant list of a home without a grant intake is unavailable (the
+    /// list stays unwired).
+    pub const PENDING_GRANTS_UNAVAILABLE: &str = "wiring.client_api_pending_grants_unavailable";
     /// stderr: the Client API and Web Console address.
     pub const CLIENT_API_LISTENING: &str = "wiring.client_api_listening";
     /// stderr: the Client API address under in-process-only admission.
@@ -297,6 +299,7 @@ pub mod log_keys {
         ROLLBACK_MEMORY_UNAVAILABLE,
         DATA_TOOL_NOT_REGISTERED,
         CLIENT_API_HISTORY_UNAVAILABLE,
+        PENDING_GRANTS_UNAVAILABLE,
         CLIENT_API_LISTENING,
         CLIENT_API_LISTENING_IN_PROCESS,
         CLIENT_API_UNAVAILABLE,

@@ -3504,8 +3504,8 @@ pub(crate) async fn wire_capabilities_inner(
             Some(read),
         ) => {
             use crate::client_api_adapters::{
-                BindTimeToolsProvider, Contract185EventAdapter, Contract219HistoryAdapter,
-                NoIntakePendingGrants, UnboundHistoryAdapter,
+                no_intake_pending_list, BindTimeToolsProvider, Contract185EventAdapter,
+                Contract219HistoryAdapter, NoIntakePendingGrants, UnboundHistoryAdapter,
             };
             let history_unavailable = |error: String| {
                 log.err(
@@ -3571,18 +3571,7 @@ pub(crate) async fn wire_capabilities_inner(
             // list stays unwired (never `[]`).
             let pending_list_for_api: Option<Arc<dyn advance_client_api::PendingGrantListPort>> =
                 if grant_approval_intake.is_none() {
-                    match NoIntakePendingGrants::new() {
-                        Ok(list) => Some(Arc::new(list)),
-                        Err(error) => {
-                            log.err(
-                                log_keys::CLIENT_API_HISTORY_UNAVAILABLE,
-                                format!(
-                                    "advance: Client API pending-grant list unavailable: {error}"
-                                ),
-                            );
-                            None
-                        }
-                    }
+                    no_intake_pending_list(NoIntakePendingGrants::new(), &log)
                 } else {
                     None
                 };
