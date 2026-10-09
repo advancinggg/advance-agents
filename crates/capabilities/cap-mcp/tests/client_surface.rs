@@ -609,3 +609,62 @@ async fn replace_config_drops_removed_and_changed_servers_and_their_cache() {
     assert!(client.cached_tools().is_empty());
     assert!(client.list_servers().await.is_empty());
 }
+
+// A server whose entry changes (here its tool patterns, so its fingerprint) is
+// reported as changed, beside a server added: its connection is closed and its
+// cached tools are dropped, and the next call connects the new entry instead of
+// reusing the old connection.
+#[tokio::test]
+async fn replace_config_closes_the_connection_of_a_changed_server() {
+    let mock = Arc::new(CountingMockTransport::new("srv"));
+    mock.push_ok(json!({"tools": [{"name": "echo"}]}));
+    let client = build_client_with_mock("srv", Arc::clone(&mock), None);
+    client.list_tools(None, "srv").await.unwrap();
+    assert_eq!(client.cached_tools().len(), 1);
+
+    let next = McpServersConfig::builder()
+        .add_server(entry_with_patterns("srv", Some(vec!["echo"])))
+        .unwrap()
+        .add_server(entry_with_patterns("fresh", None))
+        .unwrap()
+        .build();
+    let reconfig = client.replace_config(next);
+    assert_eq!(
+        reconfig,
+        McpReconfig {
+            added: vec!["fresh".to_string()],
+            removed: vec![],
+            changed: vec!["srv".to_string()],
+        }
+    );
+    assert!(
+        client.cached_tools().is_empty(),
+        "the changed server's tools are dropped"
+    );
+    assert_eq!(
+        Arc::strong_count(&mock),
+        1,
+        "the client let go of the old connection"
+    );
+
+    // Connecting the new entry needs a runtime for stdio servers, which this
+    // client lacks: the call fails instead of reaching the old connection.
+    let err = client
+        .invoke_tool(None, "srv", "echo", b"{}")
+        .await
+        .expect_err("the new entry is not connected");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert!(err.message.contains("with_runtime"), "msg={}", err.message);
+    assert_eq!(
+        mock.call_count(),
+        1,
+        "only the listing reached the old connection"
+    );
+    let ids: Vec<String> = client
+        .list_servers()
+        .await
+        .into_iter()
+        .map(|server| server.id)
+        .collect();
+    assert_eq!(ids, ["fresh", "srv"]);
+}

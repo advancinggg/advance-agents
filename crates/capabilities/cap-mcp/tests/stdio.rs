@@ -1,5 +1,6 @@
 //! MODULE-017 AC-17 — stdio transport (SD-01..SD-10d), plus the stdio server
-//! lifecycle through `McpClient` (initialize, eviction, backoff, runtime).
+//! lifecycle through `McpClient` (initialize, eviction, backoff, runtime, calls
+//! under way when the configuration changes).
 //!
 //! Strategy: use shell-pipeline fixtures so each test scripts the subprocess
 //! response inline. `bash -c "..."` snippets read stdin lines and emit
@@ -15,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use advance_shared_types::security_validator::{Finding, LeakDetector, ScanContext, ScanResult};
 use cap_mcp::{
-    McpClient, McpClientLimits, McpErrorKind, McpServerEntry, McpServersConfig, McpTransportSpec,
-    StdioMcpTransport, StdioOptions, SUPPORTED_PROTOCOL_VERSIONS,
+    McpClient, McpClientLimits, McpError, McpErrorKind, McpServerEntry, McpServersConfig,
+    McpToolInfo, McpTransportSpec, StdioMcpTransport, StdioOptions, SUPPORTED_PROTOCOL_VERSIONS,
 };
 
 mod support;
@@ -1080,6 +1081,304 @@ sleep 1
         .expect("a fresh connection");
     assert_eq!(lines(&starts).len(), 2);
     assert_eq!(json_of(&out)["pid"].to_string(), lines(&starts)[1]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Calls under way when the configuration changes
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Records the server's pid and the tool it serves (`$TOOL`, which its entry
+/// sets), one line per start.
+const LOG_START_TOOL: &str = r#"
+echo "$$ $TOOL" >> '@DIR@/starts'
+"#;
+
+/// The first server started waits, before it reads anything, until the test
+/// creates `@DIR@/go`; later servers go on at once.
+const FIRST_WAITS: &str = r#"
+if mkdir '@DIR@/first' 2>/dev/null; then
+  while [ ! -e '@DIR@/go' ]; do sleep 0.02; done
+fi
+"#;
+
+/// On the first server started, the first request after the handshake is
+/// recorded in `@DIR@/held` and answered like [`SERVE_TOOL`] only once the test
+/// creates `@DIR@/go`; later servers answer at once.
+const FIRST_ANSWER_WAITS: &str = r#"
+if mkdir '@DIR@/first' 2>/dev/null; then
+  read -r line
+  echo held >> '@DIR@/held'
+  while [ ! -e '@DIR@/go' ]; do sleep 0.02; done
+  id=${line##*\"id\":}; id=${id%%[!0-9]*}
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"%s"}],"pid":%s}}\n' "$id" "$TOOL" "$$"
+fi
+"#;
+
+/// Answers every further request with a `tools/list` result: one tool, named
+/// `$TOOL`, and the server's pid, echoing the request's id.
+const SERVE_TOOL: &str = r#"
+while read -r line; do
+  id=${line##*\"id\":}; id=${id%%[!0-9]*}
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"%s"}],"pid":%s}}\n' "$id" "$TOOL" "$$"
+done
+"#;
+
+/// A listing running in a task of its own.
+type Listing = tokio::task::JoinHandle<Result<Vec<McpToolInfo>, McpError>>;
+
+/// The stdio server `srv` running `bash -c <script>` and serving the tool
+/// `tool`: entries serving different tools differ in their fingerprint.
+fn tool_entry(script: &str, tool: &str) -> McpServerEntry {
+    let mut env = path_env();
+    env.insert("TOOL".to_string(), tool.to_string());
+    McpServerEntry {
+        server_id: "srv".into(),
+        description: "stdio".into(),
+        transport: McpTransportSpec::Stdio {
+            command: "bash".into(),
+            args: vec!["-c".into(), script.to_string()],
+            env,
+        },
+        tool_patterns: None,
+        tool_schemas: BTreeMap::new(),
+    }
+}
+
+/// A configuration holding `entries`.
+fn config_of(entries: impl IntoIterator<Item = McpServerEntry>) -> McpServersConfig {
+    entries
+        .into_iter()
+        .fold(McpServersConfig::builder(), |builder, entry| {
+            builder.add_server(entry).expect("add server")
+        })
+        .build()
+}
+
+/// A client configured with `srv` serving `tool`, whose stdio servers run on
+/// the test's runtime.
+fn tool_client(script: &str, tool: &str) -> Arc<McpClient> {
+    Arc::new(
+        McpClient::new(
+            Arc::new(config_of([tool_entry(script, tool)])),
+            Arc::new(NoOpDetector),
+            None,
+        )
+        .with_runtime(tokio::runtime::Handle::current()),
+    )
+}
+
+/// List the tools of `srv` in a task of its own.
+fn spawn_listing(client: &Arc<McpClient>) -> Listing {
+    let client = Arc::clone(client);
+    tokio::spawn(async move { client.list_tools(None, "srv").await })
+}
+
+/// The names of the tools the cache holds for `srv`; `None` when it holds no
+/// listing of it.
+fn cached_names(client: &McpClient) -> Option<Vec<String>> {
+    client
+        .cached_tools()
+        .into_iter()
+        .find(|listing| listing.server_id == "srv")
+        .map(|listing| listing.tools.iter().map(|t| t.name.clone()).collect())
+}
+
+/// Start two listings of `srv`. The first connects the server, whose first
+/// start waits for the test ([`FIRST_WAITS`]), so it holds the connection
+/// attempt; the second runs up to that attempt's lock and waits there. Both
+/// have taken `srv`'s entry from the configuration current now.
+async fn calls_waiting_to_connect(client: &Arc<McpClient>, dir: &Path) -> Vec<Listing> {
+    let connecting = spawn_listing(client);
+    assert!(
+        wait_until(
+            || lines(&dir.join("starts")).len() == 1,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the first call started the server"
+    );
+    let waiting = spawn_listing(client);
+    // On this current-thread runtime, the yield runs `waiting` until it waits
+    // for the attempt lock `connecting` holds.
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+    vec![connecting, waiting]
+}
+
+/// Start a listing of `srv` and wait until its server holds the `tools/list`
+/// request ([`FIRST_ANSWER_WAITS`]).
+async fn listing_held_by_the_server(client: &Arc<McpClient>, dir: &Path) -> Listing {
+    let listing = spawn_listing(client);
+    assert!(
+        wait_until(
+            || !lines(&dir.join("held")).is_empty(),
+            Duration::from_secs(5)
+        )
+        .await,
+        "the server holds the listing's request"
+    );
+    listing
+}
+
+/// Let the first server go on, and return the error each listing ends with.
+async fn release(dir: &Path, listings: Vec<Listing>) -> Vec<McpError> {
+    std::fs::write(dir.join("go"), "").expect("go");
+    let mut errors = Vec::new();
+    for listing in listings {
+        let result = tokio::time::timeout(Duration::from_secs(10), listing)
+            .await
+            .expect("the listing ends")
+            .expect("join");
+        errors.push(result.expect_err("the configuration no longer holds the entry it targets"));
+    }
+    errors
+}
+
+/// Only the first server started, and it is stopped: nothing keeps a
+/// connection, or any cached tools, for the entry the configuration dropped.
+async fn assert_nothing_kept(client: &McpClient, dir: &Path) {
+    let starts = lines(&dir.join("starts"));
+    assert_eq!(
+        starts.len(),
+        1,
+        "no server starts for the entry the configuration dropped: {starts:?}"
+    );
+    assert_eq!(cached_names(client), None, "nothing is cached for it");
+    assert_eq!(
+        client.protocol_version("srv"),
+        None,
+        "no connection is kept"
+    );
+    let pid = starts[0].split(' ').next().expect("pid").to_string();
+    assert!(
+        wait_until(|| !pid_alive(&pid), Duration::from_secs(5)).await,
+        "the first server is stopped"
+    );
+}
+
+/// A listing of `srv` connects a new server for the entry serving `new`, and
+/// is cached.
+async fn assert_lists_the_new_entry(client: &McpClient, dir: &Path) {
+    let tools = client.list_tools(None, "srv").await.expect("listed");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["new"]);
+    assert_eq!(cached_names(client), Some(vec!["new".to_string()]));
+    let starts = lines(&dir.join("starts"));
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    assert!(starts[1].ends_with(" new"), "{starts:?}");
+}
+
+// A server removed while one call connects it and another waits for that
+// connection attempt: both calls fail with `not-found`, no server starts or
+// stays for the removed entry, and nothing is cached for it. Configured again
+// under the same id, the server is connected afresh with its new entry.
+#[tokio::test]
+async fn calls_waiting_to_connect_a_removed_server_connect_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = server_script(
+        &[LOG_START_TOOL, FIRST_WAITS, HANDSHAKE, SERVE_TOOL],
+        dir.path(),
+        "2025-06-18",
+    );
+    let client = tool_client(&script, "old");
+    let calls = calls_waiting_to_connect(&client, dir.path()).await;
+
+    let reconfig = client.replace_config(McpServersConfig::builder().build());
+    assert_eq!(reconfig.removed, ["srv"]);
+    for err in release(dir.path(), calls).await {
+        assert_eq!(err.kind, McpErrorKind::NotFound, "{err:?}");
+        assert_eq!(err.message, "server 'srv' is no longer configured");
+    }
+    assert_nothing_kept(&client, dir.path()).await;
+
+    let reconfig = client.replace_config(config_of([tool_entry(&script, "new")]));
+    assert_eq!(reconfig.added, ["srv"]);
+    assert_lists_the_new_entry(&client, dir.path()).await;
+}
+
+// The same when the server's entry changes: both calls fail with
+// `transport-error`, no server starts or stays for the old entry, and the next
+// call connects the new one.
+#[tokio::test]
+async fn calls_waiting_to_connect_a_changed_server_connect_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = server_script(
+        &[LOG_START_TOOL, FIRST_WAITS, HANDSHAKE, SERVE_TOOL],
+        dir.path(),
+        "2025-06-18",
+    );
+    let client = tool_client(&script, "old");
+    let calls = calls_waiting_to_connect(&client, dir.path()).await;
+
+    let reconfig = client.replace_config(config_of([tool_entry(&script, "new")]));
+    assert_eq!(reconfig.changed, ["srv"]);
+    for err in release(dir.path(), calls).await {
+        assert_eq!(err.kind, McpErrorKind::TransportError, "{err:?}");
+        assert_eq!(
+            err.message,
+            "server 'srv' was reconfigured while the call was under way"
+        );
+    }
+    assert_nothing_kept(&client, dir.path()).await;
+    assert_lists_the_new_entry(&client, dir.path()).await;
+}
+
+// A listing whose request the server still holds when the server's entry
+// changes is neither cached nor returned: the server is left to be listed, and
+// the next listing connects the new entry and is cached.
+#[tokio::test]
+async fn a_listing_under_way_when_its_server_changes_is_not_cached() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = server_script(
+        &[LOG_START_TOOL, HANDSHAKE, FIRST_ANSWER_WAITS, SERVE_TOOL],
+        dir.path(),
+        "2025-06-18",
+    );
+    let client = tool_client(&script, "old");
+    let listing = listing_held_by_the_server(&client, dir.path()).await;
+
+    let reconfig = client.replace_config(config_of([tool_entry(&script, "new")]));
+    assert_eq!(reconfig.changed, ["srv"]);
+    let errors = release(dir.path(), vec![listing]).await;
+    assert_eq!(errors[0].kind, McpErrorKind::TransportError, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        "server 'srv' was reconfigured while the call was under way"
+    );
+    assert_eq!(
+        client.servers_to_list(),
+        ["srv"],
+        "the server is left to be listed"
+    );
+    assert_nothing_kept(&client, dir.path()).await;
+    assert_lists_the_new_entry(&client, dir.path()).await;
+    assert!(client.servers_to_list().is_empty());
+}
+
+// The same when the server is removed: the listing fails with `not-found` and
+// nothing is cached; configured again, the server is listed with its new entry.
+#[tokio::test]
+async fn a_listing_under_way_when_its_server_is_removed_is_not_cached() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = server_script(
+        &[LOG_START_TOOL, HANDSHAKE, FIRST_ANSWER_WAITS, SERVE_TOOL],
+        dir.path(),
+        "2025-06-18",
+    );
+    let client = tool_client(&script, "old");
+    let listing = listing_held_by_the_server(&client, dir.path()).await;
+
+    let reconfig = client.replace_config(McpServersConfig::builder().build());
+    assert_eq!(reconfig.removed, ["srv"]);
+    let errors = release(dir.path(), vec![listing]).await;
+    assert_eq!(errors[0].kind, McpErrorKind::NotFound, "{errors:?}");
+    assert_eq!(errors[0].message, "server 'srv' is no longer configured");
+    assert!(client.servers_to_list().is_empty());
+    assert_nothing_kept(&client, dir.path()).await;
+
+    let reconfig = client.replace_config(config_of([tool_entry(&script, "new")]));
+    assert_eq!(reconfig.added, ["srv"]);
+    assert_lists_the_new_entry(&client, dir.path()).await;
 }
 
 // Transport tasks run on the client's runtime, not on the runtime of the call
