@@ -136,7 +136,7 @@ async fn assert_unwired_empty(gw: &LlmGateway) {
 }
 
 #[tokio::test]
-async fn build_llm_gateway_shim_matches_internal_builder() {
+async fn module_001_ac31_build_llm_gateway_shim_matches_internal_builder() {
     let chain = Arc::new(StubChain);
     let shim = build_llm_gateway(
         Arc::new(StaticConfig(boot())),

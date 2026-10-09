@@ -2340,7 +2340,7 @@ database:
     }
 
     #[test]
-    fn claimable_off_keeps_v0_1_26_warnings() {
+    fn module_001_ac31_claimable_off_keeps_v0_1_26_warnings() {
         let f = Fixture::new();
         let admin = f.admin();
         assert!(!admin.marks_local_entries_claimable());
@@ -2361,7 +2361,7 @@ database:
     }
 
     #[test]
-    fn claimable_on_warns_create_local_without_sidecar() {
+    fn module_001_ac31_claimable_on_warns_create_local_without_sidecar() {
         let f = Fixture::new();
         let admin = f.admin().with_claimable_local_entries(true);
         assert!(admin.marks_local_entries_claimable());
@@ -2370,7 +2370,7 @@ database:
     }
 
     #[test]
-    fn claimable_on_warns_backend_class_or_sidecar_change_once() {
+    fn module_001_ac31_claimable_on_warns_backend_class_or_sidecar_change_once() {
         let f = Fixture::new();
         let admin = f.admin().with_claimable_local_entries(true);
         admin.create_provider(&local_create("local-a")).unwrap();
@@ -2405,7 +2405,7 @@ database:
     }
 
     #[test]
-    fn claimed_preflight_routes_only_claimed_local_entries() {
+    fn module_001_ac31_claimed_preflight_routes_only_claimed_local_entries() {
         let f = Fixture::new();
         let port = FakeClaimed::new(&["local-a"], Ok(()));
         let admin = f
@@ -2445,7 +2445,7 @@ database:
     }
 
     #[test]
-    fn claimed_preflight_verdict_mapping() {
+    fn module_001_ac31_claimed_preflight_verdict_mapping() {
         let f = Fixture::new();
         let port = FakeClaimed::new(&["local-a"], Ok(()));
         let admin = f
@@ -2479,7 +2479,7 @@ database:
     }
 
     #[test]
-    fn claimed_preflight_verdict_is_recorded_in_the_summary() {
+    fn module_001_ac31_claimed_preflight_verdict_is_recorded_in_the_summary() {
         let f = Fixture::new();
         let port = FakeClaimed::new(
             &["local-a"],

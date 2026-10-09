@@ -1010,7 +1010,7 @@ post-processor:
     }
 
     #[test]
-    fn finish_empty_catalog_is_shared_shape() {
+    fn module_001_ac31_finish_empty_catalog_is_shared_shape() {
         let (ok, holds, _) = run(&[]);
         let outcome = ok.expect("empty phase");
         assert!(outcome.claims.is_empty());

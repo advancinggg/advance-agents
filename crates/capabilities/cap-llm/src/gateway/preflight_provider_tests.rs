@@ -155,7 +155,7 @@ fn ping_messages() -> Vec<InferenceMessage> {
 }
 
 #[tokio::test]
-async fn preflight_provider_dispatches_the_pinned_port_once_without_budget() {
+async fn module_001_ac31_preflight_provider_dispatches_the_pinned_port_once_without_budget() {
     let h = harness(None);
     h.gateway
         .preflight_provider("local-a", &AtomicBool::new(false))
@@ -185,7 +185,7 @@ async fn preflight_provider_dispatches_the_pinned_port_once_without_budget() {
 }
 
 #[tokio::test]
-async fn preflight_provider_ignores_the_agent_policy_pin() {
+async fn module_001_ac31_preflight_provider_ignores_the_agent_policy_pin() {
     let h = harness(Some(Arc::new(PinCloudX)));
     h.gateway
         .preflight_provider("local-a", &AtomicBool::new(false))
@@ -195,7 +195,7 @@ async fn preflight_provider_ignores_the_agent_policy_pin() {
 }
 
 #[tokio::test]
-async fn preflight_provider_unknown_id_is_model_not_available() {
+async fn module_001_ac31_preflight_provider_unknown_id_is_model_not_available() {
     let h = harness(None);
     let err = h
         .gateway
@@ -212,7 +212,7 @@ async fn preflight_provider_unknown_id_is_model_not_available() {
 }
 
 #[tokio::test]
-async fn preflight_provider_cancelled_before_dispatch_never_calls_the_port() {
+async fn module_001_ac31_preflight_provider_cancelled_before_dispatch_never_calls_the_port() {
     let h = harness(None);
     let err = h
         .gateway

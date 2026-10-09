@@ -581,7 +581,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn drop_flag_sets_on_token_drop() {
+    fn module_001_ac31_fixture_drop_flag_sets_on_token_drop() {
         let flag = DropFlag::default();
         assert!(!flag.dropped());
         drop(flag.token());
@@ -589,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_yaml_loads_through_fixture_home() {
+    fn module_001_ac31_fixture_provider_yaml_loads_through_fixture_home() {
         let side = provider_yaml::side(Path::new("/bin/true"));
         let home = FixtureHome::new(FixtureHomeSpec {
             capabilities: vec![CapDecl::Granted("llm")],
@@ -610,7 +610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stub_port_chat_embed_and_stream() {
+    async fn module_001_ac31_fixture_stub_port_chat_embed_and_stream() {
         let port = StubInferencePort::new("pong", 2, 3);
         let req = InferenceChatRequest {
             provider_id: LOCAL_STUB_ID.into(),
