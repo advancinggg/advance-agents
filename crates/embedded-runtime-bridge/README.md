@@ -97,7 +97,8 @@ v2 health (`schema_version` 2) adds `composition_profile`, `agent_loop_up`, and
 (`schema_version` 1); use `health_v2()`.
 
 `advance_bridge_client_api_base` / `_session` use the health buffer protocol. The session
-getter mints an in-process bearer token (size query mints at most once). After
+getter mints an in-process bearer token (size query mints at most once); on a `linux` host
+the session's platform is `mac`, since the Client API has no Linux platform value. After
 `on_lifecycle(Foreground)`, re-read base and session before any request.
 
 ### Secrets

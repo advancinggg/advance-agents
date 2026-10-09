@@ -64,6 +64,12 @@ impl ToolRegistrar {
     /// Wraps `tool` in the containment adapter and registers it through
     /// [`LazyToolRegistry::register_host`]. Every refusal is also recorded
     /// (`compose` fails with the first one).
+    ///
+    /// The tool's call identity, which
+    /// [`ExtensionGrantCheck::check`](crate::api::ExtensionGrantCheck::check) reads, exists
+    /// only when the registry invokes the tool for an agent (`invoke_as`, as a guest's
+    /// `tool-invoke` does). An invoke without an agent id carries none, and a grant check
+    /// inside the tool answers `Deny("no host call in progress")`.
     pub async fn register(
         &mut self,
         id: impl Into<String> + Send,

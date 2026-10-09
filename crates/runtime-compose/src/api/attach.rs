@@ -145,9 +145,10 @@ fn state_of(seen: &Seen, accepts: impl Fn(&str) -> bool) -> RuntimeState {
     }
 }
 
+/// The Client API probe, tried twice: one probe's 150 ms bound can miss a live listener on
+/// a loaded host.
 fn accepts(base: &str) -> bool {
-    advance_home::discovery::client_api_accepts(base)
-        || advance_home::discovery::client_api_accepts(base)
+    (0..2).any(|_| advance_home::discovery::client_api_accepts(base))
 }
 
 fn mint_for(endpoint: &ClientApiEndpoint, platform: Platform) -> Option<AttachSession> {
@@ -246,6 +247,11 @@ struct LauncherInner {
 /// shutdowns finish) before dropping `runtime`. If `runtime` goes first, each composition's ordered
 /// shutdown is cut short: its registry entry is still released (RAII), but the drains and joins of
 /// the shutdown sequence do not run.
+///
+/// Foreground: the launcher does not rebind a Client API listener the OS reclaimed while the app was
+/// suspended (the bridge's `Foreground` does, ADR 2026-10-03 D3). If the home's `runtime_state` is
+/// not `Running` after the app returns to the foreground, call [`stop`](Self::stop) for the home,
+/// then `start_or_attach` again.
 pub struct InProcessLauncher {
     inner: Arc<LauncherInner>,
     start_bound: Duration,

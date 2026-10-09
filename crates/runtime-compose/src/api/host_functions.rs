@@ -37,6 +37,16 @@ use super::extension::ExtensionError;
 /// OSS host function's error does, and the agent loop does not replace the agent's
 /// instance (its later turns fail until the runtime restarts). Give a function that
 /// can fail an error slot in its WIT result.
+///
+/// # Value types
+///
+/// A function's parameters and results may use every WIT value type except, at any
+/// position: a resource (`own<T>`, `borrow<T>`), an async value (`future`, `stream`,
+/// `error-context`), and a `variant` inside a `list` (at any depth, also through a
+/// record, tuple, option or result inside the list). The guest's function type is
+/// known only when the guest calls, so such a call is refused then, before the handler
+/// runs: it fails with `HostCallError::HandlerError("unsupported-signature: …")`, which
+/// traps the call as a handler's own `Err` does.
 pub struct HostFunctionRegistrar {
     extension: &'static str,
     declared: &'static [&'static str],
@@ -237,7 +247,8 @@ fn is_wit_label(s: &str) -> bool {
     true
 }
 
-/// One host function an extension wants to register.
+/// One host function an extension wants to register. The value types it may use are
+/// listed on [`HostFunctionRegistrar`] (Value types).
 #[non_exhaustive]
 pub struct HostFunctionDef {
     pub capability: String,

@@ -41,7 +41,9 @@ pub trait RuntimeAttachSource: Send + Sync {
     fn live_pid(&self, home: &Path) -> Option<u32>;
     /// The provider the instance reports it adopted (`.runtime/selected-provider`).
     fn selected_provider(&self, home: &Path) -> Option<SelectedProvider>;
-    /// The attach target of a running instance; `None` when it cannot be attached now.
+    /// The attach target of a running instance; `None` when it cannot be attached now. Every
+    /// call re-verifies that the instance is live and that its Client API answers; it never
+    /// returns a cached target, so a stale or swapped record cannot redirect an attach.
     fn attach(&self, home: &Path) -> Option<AttachTarget>;
     /// Take the per-home launch claim; `false` while another starter holds a fresh one.
     fn claim_launch(&self, home: &Path) -> bool;

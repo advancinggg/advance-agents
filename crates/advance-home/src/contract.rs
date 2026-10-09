@@ -43,7 +43,7 @@ pub struct PreflightPass {
 pub struct ConnectedRuntime {
     pub home: PathBuf,
     pub client_api_base: String,
-    /// In-process attach only (MODULE-001-AC-34): the session minted for this caller. Never on disk.
+    /// See [`AttachSession`].
     pub session: Option<AttachSession>,
 }
 
@@ -142,8 +142,9 @@ pub trait WorkspaceHomeFirstOpen: Send + Sync {
 }
 
 /// A Client API session minted inside the host process for the attaching host (ADR 2026-10-03 D3).
-/// It exists only in memory: it is never written to disk, logged or put in a URL. `Debug` redacts
-/// the bearer token.
+/// Only an in-process attach (MODULE-001-AC-34) carries one, in [`ConnectedRuntime::session`];
+/// an attach through the pid lock and discovery file does not. It exists only in memory: it is
+/// never written to disk, logged or put in a URL. `Debug` redacts the bearer token.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AttachSession {
     session_id: String,

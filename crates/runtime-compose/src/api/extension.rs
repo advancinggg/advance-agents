@@ -29,7 +29,10 @@ pub trait ComposeExtension: Send + Sync + 'static {
     /// `[a-z][a-z0-9-]{0,31}`, not reserved, unique per compose.
     fn id(&self) -> &'static str;
 
-    /// Extra capability names a guest may declare, each `<id>.<name>`.
+    /// Extra capability names a guest may declare, each `<id>.<name>`. A pack may name
+    /// one in `required-capabilities` when it is installed through this composition's
+    /// Client API (`POST /client/packs:install`); `advance pack install` runs without a
+    /// composition and accepts only the runtime's own capability names.
     fn capabilities(&self) -> &'static [&'static str] {
         &[]
     }
@@ -64,8 +67,7 @@ pub trait ComposeExtension: Send + Sync + 'static {
     }
 
     /// Native tools, after the OSS tools (skills, pack skill tools, `data`) and
-    /// before pack tool-exposure reconciliation and the tool inventory snapshot.
-    /// Called only when the home declares `tools`.
+    /// before the tool inventory snapshot. Called only when the home declares `tools`.
     fn tools<'a>(
         &'a self,
         cx: &'a ComposeCx,
@@ -88,7 +90,10 @@ pub trait ComposeExtension: Send + Sync + 'static {
     }
 
     /// `true` asks for [`ComposeCx::secrets`](crate::api::ComposeCx::secrets), a view
-    /// limited to `ext/<id>/…`.
+    /// limited to `ext/<id>/…`. On a home that declares neither `secrets` nor `llm` (so
+    /// the composition opens no secret store of its own), the composition then loads the
+    /// operator master key (`MasterKeyInput::FromConfig`: from the home's key custody,
+    /// which may create it) and opens the home's secret storage for the view.
     fn needs_secret_store(&self) -> bool {
         false
     }
@@ -102,7 +107,9 @@ pub trait ComposeExtension: Send + Sync + 'static {
     }
 
     /// Shutdown step 3: reverse registration order, `catch_unwind`, 5-second bound,
-    /// then abandoned.
+    /// then abandoned. The hooks run one after another, so each hook that runs out its
+    /// bound delays the end of shutdown by up to 5 s. The bound takes effect at the
+    /// hook's next `.await`: a hook that blocks its thread is not interrupted.
     fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async {})
     }

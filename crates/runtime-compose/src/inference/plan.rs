@@ -115,6 +115,17 @@ impl InferenceContribution {
     }
 
     /// Serve the claimable entry `entry_id` with `port`.
+    ///
+    /// The gateway treats a claimed entry as an entry of its backend class (`local`). Its
+    /// leak scan follows the class, not who serves the port: like an OSS `local` entry, the
+    /// request and a non-streamed reply are not scanned by the gateway (it scans the egress of
+    /// `agent-cli` entries; the HTTP chain scans `cloud-http`). A port that forwards to a
+    /// network service carries that egress itself.
+    ///
+    /// The providers family's `:preflight` of a claimed entry is one short `chat` through the
+    /// composed gateway. A cancelled preflight drops that call at its next `.await`: the
+    /// port's request carries no cancel flag, and a call already under way gets no closing
+    /// `llm.response` or `llm.error` for its `llm.request`.
     pub fn claim(
         &mut self,
         entry_id: impl Into<String>,

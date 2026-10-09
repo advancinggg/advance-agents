@@ -267,7 +267,12 @@ impl ConfigView {
 
 /// Tasks spawned here run on the composition's runtime, are cancelled (dropped at
 /// their next await) and joined in shutdown step 3 after the hooks; a panic is
-/// contained and logged.
+/// contained and logged. Cancellation is cooperative: a task that reaches no `.await`
+/// within 5 s of the cancellation (CPU-bound or blocking work) keeps running,
+/// abandoned, and the composition logs it under
+/// [`EXT_TASKS_ABANDONED`](crate::api::log_keys::EXT_TASKS_ABANDONED). Run such work
+/// with `tokio::task::spawn_blocking` and have it check
+/// [`cancellation_token`](Self::cancellation_token).
 #[derive(Clone)]
 pub struct TaskSpawner {
     extension: &'static str,

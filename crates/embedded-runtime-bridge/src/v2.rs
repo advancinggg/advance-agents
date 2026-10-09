@@ -56,6 +56,8 @@ fn settings_from_options(o: &BridgeOptions) -> V2Settings {
     }
 }
 
+/// The Client API `Platform` of the sessions the bridge mints. `Platform` has no Linux value,
+/// so a Linux host's sessions carry `Mac`, the desktop class; admission does not read it.
 pub(crate) fn session_platform(platform: HostPlatform) -> advance_client_api::Platform {
     match platform {
         HostPlatform::MacOs => advance_client_api::Platform::Mac,

@@ -3247,8 +3247,9 @@ pub(crate) async fn wire_capabilities_inner(
             }
         }
         // MODULE-001 §1.4.7 (c): extension native tools — after the OSS tools
-        // (skills, pack skill tools, data), before pack tool-exposure
-        // reconciliation and before try_spawn_agent_loop snapshots the inventory.
+        // (skills, pack skill tools, data) and before try_spawn_agent_loop snapshots
+        // the inventory. (The boot-time pack tool-exposure reconciliation the spec
+        // places after them was retired with pack resource capabilities.)
         if !extensions.is_empty() {
             if let Err(error) =
                 crate::extension::tools::run_tools(&extensions, &tools_concrete, &log).await

@@ -25,6 +25,8 @@ pub(crate) enum LocaleChoice {
 
 /// `kill(pid, 0) == 0`; any error (ESRCH, EPERM) → false, exactly as `kill -0` exits non-zero;
 /// a pid above `i32::MAX` → false (never handed to `kill`, which would address a process group).
+/// Pid 0 addresses the caller's own process group, so a lock naming pid 0 reads as alive, the
+/// verdict `kill -0 0` gives.
 pub(crate) fn pid_alive(pid: u32) -> bool {
     if pid > i32::MAX as u32 {
         return false;

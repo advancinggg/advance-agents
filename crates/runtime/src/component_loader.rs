@@ -528,6 +528,10 @@ impl ComponentRuntime {
     /// `memory_guard_size(0)`, `memory_reservation(pulley_memory_reservation(max_memory_pages))`
     /// and `memory_reservation_for_growth(PULLEY_MEMORY_RESERVATION_FOR_GROWTH)`.
     ///
+    /// The tool engine reserves the same `max_memory_pages × 64 KiB` as the host engine, the
+    /// figure ADR 2026-10-03 D3 names, not the tool store's own memory cap. A tool memory that
+    /// grows past the reservation is moved (Wasmtime's `memory_may_move` default), not refused.
+    ///
     /// Errors: `EngineInit` when `!PULLEY_HOST_SUPPORTED`, or when a built engine does not
     /// report `is_pulley()` (defensive).
     pub fn with_backend(
