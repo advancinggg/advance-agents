@@ -44,6 +44,7 @@ fn entry(server_id: &str, patterns: Option<Vec<&str>>) -> McpServerEntry {
             command: "true".to_string(),
             args: vec![],
             env: BTreeMap::new(),
+            cwd: None,
         },
         tool_patterns,
         tool_schemas: BTreeMap::new(),

@@ -10,12 +10,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use advance_cli::mcp_wiring::stdio_child_env;
 use advance_cli::pack_bridges::{
     PackBridgeError, PackMcpBridge, PackMemorySeedBridge, PackMetaSchemaBridge, PackPresetBridge,
     PackSkillBridge,
 };
 use advance_pack_manager::{
-    AutoApprove, InMemoryPackRegistry, Installer, PackError, PackRegistry, SecretStore, SecretValue,
+    AutoApprove, InMemoryPackRegistry, Installer, McpTransportDecl, PackError, PackRegistry,
+    SecretStore, SecretValue,
 };
 use cap_fs::meta_schema::{FieldType, MetaSchemaLoader};
 use cap_grant::preset::PresetRegistry;
@@ -36,6 +38,7 @@ const MCP_STDIO: &str = "server-id: local-tools\ndescription: stdio server\ntran
 const MCP_HTTP: &str = "server-id: remote-tools\ndescription: http server\ntransport:\n  kind: http\n  endpoint-url: https://mcp.example.com/sse\n";
 const MCP_LOOPBACK: &str = "server-id: host-tools\ndescription: http server on the host\ntransport:\n  kind: http\n  endpoint-url: http://127.0.0.1:8931/mcp\n";
 const MCP_CREDENTIALED: &str = "server-id: keyed-tools\ndescription: http server with a key\ntransport:\n  kind: http\n  endpoint-url: https://mcp.example.com/mcp\ncredentials:\n  - position: bearer\n    secret: mcp-token\n";
+const MCP_ENV: &str = "server-id: env-tools\ndescription: stdio server with literals\ntransport:\n  kind: stdio\n  command: /usr/bin/true\n  env:\n    GREETING: hello\n    PATH: /pack/bin\n  cwd: /srv/env-tools\nsecret-refs:\n  API_TOKEN: mcp-token\n";
 // FIXTURE-GRAMMAR: `cap_grant::preset::parse_preset` requires `default-ttl` and a
 // per-grant `ttl` (once | lifecycle | persistent | {duration|until}); the plan's
 // draft omitted both.
@@ -62,6 +65,7 @@ fn write_pack(root: &Path, name: &str, trust: &str) -> PathBuf {
     std::fs::write(dir.join("mcp-servers/remote.yaml"), MCP_HTTP).unwrap();
     std::fs::write(dir.join("mcp-servers/loopback.yaml"), MCP_LOOPBACK).unwrap();
     std::fs::write(dir.join("mcp-servers/keyed.yaml"), MCP_CREDENTIALED).unwrap();
+    std::fs::write(dir.join("mcp-servers/envy.yaml"), MCP_ENV).unwrap();
     std::fs::write(dir.join("presets/data-readonly.yaml"), PRESET).unwrap();
     std::fs::write(
         dir.join("meta-schema-extensions/todo.yaml"),
@@ -69,7 +73,7 @@ fn write_pack(root: &Path, name: &str, trust: &str) -> PathBuf {
     )
     .unwrap();
     std::fs::write(dir.join("memory-seeds/base.jsonl"), SEEDS).unwrap();
-    let pack_yaml = format!("name: {name}\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\ntrust-level: {trust}\nprovides:\n  skills:\n    - web-search\n  mcp-servers:\n    - local\n    - remote\n    - loopback\n    - keyed\n  presets:\n    - data-readonly\n  meta-schema-extensions:\n    - todo\n  memory-seeds:\n    - base\nchecksums:\n  algo: sha256\n  files: {{}}\n");
+    let pack_yaml = format!("name: {name}\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\ntrust-level: {trust}\nprovides:\n  skills:\n    - web-search\n  mcp-servers:\n    - local\n    - remote\n    - loopback\n    - keyed\n    - envy\n  presets:\n    - data-readonly\n  meta-schema-extensions:\n    - todo\n  memory-seeds:\n    - base\nchecksums:\n  algo: sha256\n  files: {{}}\n");
     std::fs::write(dir.join("pack.yaml"), &pack_yaml).unwrap();
     if trust == "trusted" {
         let key = trust_root_key();
@@ -274,6 +278,115 @@ async fn br_02c_mcp_bridge_refuses_credentials_from_any_pack() {
             .expect("an http server without credentials");
         assert_eq!(registration.server_id, "remote-tools");
     }
+}
+
+// A trusted pack's stdio server carries its `env` literals and working directory: the
+// registration a sink persists holds them unchanged, and the entry's environment is built as
+// the loader builds an operator server's (the daemon's baseline variables, the literals over
+// them, the secrets over both), to run in that directory.
+#[tokio::test]
+async fn br_02d_mcp_bridge_carries_env_literals_and_the_working_directory() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let packs = tmp.path().join("packs");
+    let reg = registry_with(&packs, &[write_pack(tmp.path(), "t", "trusted")]).await;
+    let bridge = PackMcpBridge::new(reg);
+    let literals = BTreeMap::from([
+        ("GREETING".to_string(), "hello".to_string()),
+        ("PATH".to_string(), "/pack/bin".to_string()),
+    ]);
+
+    let registration = bridge
+        .plan("t@1.0.0/mcp-servers/envy", &BTreeMap::new())
+        .expect("a trusted pack's stdio server");
+    assert_eq!(
+        registration.transport,
+        McpTransportDecl::Stdio {
+            command: "/usr/bin/true".into(),
+            args: vec![],
+            env: literals.clone(),
+            cwd: Some("/srv/env-tools".into()),
+        }
+    );
+    assert_eq!(
+        registration.secret_refs,
+        BTreeMap::from([("API_TOKEN".to_string(), "mcp-token".to_string())])
+    );
+
+    let entry = bridge
+        .entry("t@1.0.0/mcp-servers/envy", &Secrets)
+        .expect("a trusted pack's stdio server");
+    match entry.transport {
+        McpTransportSpec::Stdio { env, cwd, .. } => {
+            assert_eq!(cwd, Some(PathBuf::from("/srv/env-tools")));
+            assert_eq!(
+                env,
+                stdio_child_env(
+                    std::env::vars_os(),
+                    &literals,
+                    [("API_TOKEN".to_string(), "tok-123".to_string())]
+                )
+            );
+            assert_eq!(env.get("PATH").map(String::as_str), Some("/pack/bin"));
+            assert_eq!(env.get("GREETING").map(String::as_str), Some("hello"));
+            assert_eq!(env.get("API_TOKEN").map(String::as_str), Some("tok-123"));
+        }
+        other => panic!("expected stdio, got {other:?}"),
+    }
+}
+
+// A workflow step's secret named as one of the manifest's `env` literals is refused, as a
+// registration to persist and as an entry: a variable of the server's environment is either a
+// literal or a secret.
+#[tokio::test]
+async fn br_02e_mcp_bridge_refuses_a_step_secret_named_as_an_env_literal() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let packs = tmp.path().join("packs");
+    let reg = registry_with(&packs, &[write_pack(tmp.path(), "t", "trusted")]).await;
+    let bridge = PackMcpBridge::new(reg);
+
+    let refusals = [
+        bridge
+            .plan(
+                "t@1.0.0/mcp-servers/envy",
+                &BTreeMap::from([("GREETING".to_string(), "mcp-token".to_string())]),
+            )
+            .map(|_| ())
+            .expect_err("a step's secret named as a literal"),
+        bridge
+            .entry_with_env(
+                "t@1.0.0/mcp-servers/envy",
+                &Secrets,
+                &BTreeMap::from([("GREETING".to_string(), SecretValue::new("tok-456"))]),
+            )
+            .map(|_| ())
+            .expect_err("a step's secret named as a literal"),
+    ];
+    for err in refusals {
+        match err {
+            PackBridgeError::Pack(PackError::ConstraintViolation { reason }) => {
+                assert!(
+                    reason.contains("GREETING") && reason.contains("env literal"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected a constraint violation, got {other:?}"),
+        }
+    }
+
+    // Under a name of its own, the step's secret is merged in.
+    let registration = bridge
+        .plan(
+            "t@1.0.0/mcp-servers/envy",
+            &BTreeMap::from([("EXTRA_TOKEN".to_string(), "mcp-token".to_string())]),
+        )
+        .expect("a step's secret under a name of its own");
+    assert_eq!(
+        registration
+            .secret_refs
+            .get("EXTRA_TOKEN")
+            .map(String::as_str),
+        Some("mcp-token")
+    );
 }
 
 #[tokio::test]

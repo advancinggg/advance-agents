@@ -12,8 +12,11 @@
 //! description: optional free text   # ≤ 1 KiB, no control bytes
 //! transport:
 //!   kind: stdio                     # subprocess — arbitrary code execution
-//!   command: /usr/bin/true
+//!   command: /usr/bin/true          # an absolute path (a bare name is looked up on a PATH)
 //!   args: []
+//!   env:                            # non-secret literals: ENV_NAME → value
+//!     LOG_LEVEL: info
+//!   cwd: /srv/local-tools           # the working directory, an absolute path (default /)
 //! # or
 //! transport:
 //!   kind: http                      # https://… (any host) or http://<loopback>
@@ -31,7 +34,14 @@
 //! ```
 //!
 //! Rules (all fail-closed):
-//! - unknown keys anywhere → `InvalidManifest` (`deny_unknown_fields`);
+//! - unknown keys anywhere → `InvalidManifest` (`deny_unknown_fields`); `env` and `cwd` are
+//!   keys of a `stdio` transport, so an `http` transport carrying either is refused;
+//! - `transport.env` holds at most [`MAX_ENV_VARS`] entries; each key is an
+//!   environment-variable name (`[A-Za-z_][A-Za-z0-9_]*`, at most 256 bytes), each value at
+//!   most 4096 bytes without control characters (it may be empty); a value is a literal, never
+//!   a secret: a key that is also a `secret-refs` key → `ConstraintViolation`;
+//! - `transport.cwd` is an absolute path of at most 4096 bytes without control characters
+//!   (NUL included);
 //! - `secret-refs` keys must be environment-variable names
 //!   (`[A-Za-z_][A-Za-z0-9_]*`), values non-empty secret-store keys;
 //! - `secret-refs` on an `http` transport → `ConstraintViolation` — the only
@@ -97,6 +107,12 @@ const MAX_ARGS: usize = 64;
 const MAX_ARG_LEN: usize = 4096;
 const MAX_SECRET_REFS: usize = 32;
 const MAX_SECRET_REF_LEN: usize = 256;
+/// Most `transport.env` entries one stdio server may set.
+pub const MAX_ENV_VARS: usize = 64;
+/// Longest `transport.env` value, in bytes.
+const MAX_ENV_VALUE_LEN: usize = 4096;
+/// Longest `transport.cwd`, in bytes.
+const MAX_CWD_LEN: usize = 4096;
 const MAX_ENDPOINT_URL_LEN: usize = 2048;
 /// Most `credentials` one server file may bind.
 pub const MAX_CREDENTIALS: usize = 8;
@@ -144,11 +160,22 @@ pub struct McpServerOrigin {
 }
 
 /// The declared transport. Mirrors `cap_mcp::McpTransportSpec` minus the
-/// resolved runtime material (env / http capability), which the bridge adds.
+/// resolved runtime material (the child's whole environment, the http capability),
+/// which the loader and the bridge add.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpTransportDecl {
-    Stdio { command: String, args: Vec<String> },
-    Http { endpoint_url: String },
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        /// `ENV_NAME → value`: non-secret literals for the child's environment (empty when
+        /// absent). No key is also a `secret-refs` key.
+        env: BTreeMap<String, String>,
+        /// The child's working directory, an absolute path; `None`: `/`.
+        cwd: Option<String>,
+    },
+    Http {
+        endpoint_url: String,
+    },
 }
 
 impl McpTransportDecl {
@@ -213,6 +240,10 @@ enum RawTransport {
         command: String,
         #[serde(default)]
         args: Vec<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     Http {
         #[serde(rename = "endpoint-url")]
@@ -274,7 +305,12 @@ pub fn parse_mcp_server_manifest_str(yaml: &str) -> Result<McpServerManifest, Pa
     }
 
     let transport = match raw.transport {
-        RawTransport::Stdio { command, args } => {
+        RawTransport::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        } => {
             validate_text("transport.command", &command, MAX_COMMAND_LEN)?;
             if args.len() > MAX_ARGS {
                 return Err(PackError::InvalidManifest(format!(
@@ -294,7 +330,16 @@ pub fn parse_mcp_server_manifest_str(yaml: &str) -> Result<McpServerManifest, Pa
                     )));
                 }
             }
-            McpTransportDecl::Stdio { command, args }
+            validate_env(&env)?;
+            if let Some(cwd) = &cwd {
+                validate_cwd(cwd)?;
+            }
+            McpTransportDecl::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            }
         }
         RawTransport::Http { endpoint_url } => {
             validate_endpoint_url(&endpoint_url)?;
@@ -331,6 +376,16 @@ pub fn parse_mcp_server_manifest_str(yaml: &str) -> Result<McpServerManifest, Pa
                 transport.kind_str()
             ),
         });
+    }
+    if let McpTransportDecl::Stdio { env, .. } = &transport {
+        if let Some(name) = env.keys().find(|name| raw.secret_refs.contains_key(*name)) {
+            return Err(PackError::ConstraintViolation {
+                reason: format!(
+                    "transport.env key {name} is also a secret-refs key: a variable of the \
+                     server's environment is either a literal or a secret"
+                ),
+            });
+        }
     }
 
     let credentials = validate_credentials(raw.credentials)?;
@@ -558,6 +613,54 @@ fn validate_text(field: &str, value: &str, max: usize) -> Result<(), PackError> 
     if value.contains('\0') {
         return Err(PackError::InvalidManifest(format!(
             "{field} contains a null byte"
+        )));
+    }
+    Ok(())
+}
+
+/// A stdio transport's `env`: at most [`MAX_ENV_VARS`] literals, each named as an environment
+/// variable, each value at most [`MAX_ENV_VALUE_LEN`] bytes without control characters (an
+/// empty value is a variable set to nothing).
+fn validate_env(env: &BTreeMap<String, String>) -> Result<(), PackError> {
+    if env.len() > MAX_ENV_VARS {
+        return Err(PackError::InvalidManifest(format!(
+            "transport.env has {} entries (max {MAX_ENV_VARS})",
+            env.len()
+        )));
+    }
+    for (name, value) in env {
+        if !is_env_var_name(name) {
+            return Err(PackError::InvalidManifest(format!(
+                "transport.env key {name:?} is not an environment-variable name \
+                 ([A-Za-z_][A-Za-z0-9_]*, ≤ {MAX_SECRET_REF_LEN} bytes)"
+            )));
+        }
+        if value.len() > MAX_ENV_VALUE_LEN || value.chars().any(char::is_control) {
+            return Err(PackError::InvalidManifest(format!(
+                "transport.env value for {name} must hold no control characters \
+                 (≤ {MAX_ENV_VALUE_LEN} bytes)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A stdio transport's `cwd`: an absolute path of at most [`MAX_CWD_LEN`] bytes without
+/// control characters (NUL among them).
+fn validate_cwd(cwd: &str) -> Result<(), PackError> {
+    if cwd.len() > MAX_CWD_LEN {
+        return Err(PackError::InvalidManifest(format!(
+            "transport.cwd exceeds {MAX_CWD_LEN} bytes"
+        )));
+    }
+    if cwd.chars().any(char::is_control) {
+        return Err(PackError::InvalidManifest(
+            "transport.cwd contains a control character".into(),
+        ));
+    }
+    if !Path::new(cwd).is_absolute() {
+        return Err(PackError::InvalidManifest(format!(
+            "transport.cwd {cwd:?} is not an absolute path"
         )));
     }
     Ok(())
@@ -1106,5 +1209,191 @@ mod tests {
             parse_mcp_server_origin_str(doc).unwrap().map(|o| o.pack),
             Some("p@1.0.0".to_string())
         );
+    }
+
+    /// A stdio server whose transport ends with `tail` (more transport keys, each line
+    /// indented by two spaces) and whose document ends with `rest`.
+    fn stdio_with(tail: &str, rest: &str) -> Result<McpServerManifest, PackError> {
+        parse_mcp_server_manifest_str(&format!(
+            "server-id: x\ntransport:\n  kind: stdio\n  command: /bin/true\n{tail}{rest}"
+        ))
+    }
+
+    /// The reason of an `InvalidManifest` refusal of the stdio transport keys `tail`.
+    fn stdio_refused(tail: &str) -> String {
+        match stdio_with(tail, "") {
+            Err(PackError::InvalidManifest(reason)) => reason,
+            other => panic!("{tail}: expected InvalidManifest, got {other:?}"),
+        }
+    }
+
+    /// A transport `env` block of the `entries` (`KEY: value` lines).
+    fn env_block(entries: &[String]) -> String {
+        let lines: String = entries.iter().map(|e| format!("    {e}\n")).collect();
+        format!("  env:\n{lines}")
+    }
+
+    // A stdio transport sets non-secret literals of its child's environment, an empty one
+    // included, and its working directory; without them it sets no literal and keeps the
+    // default directory.
+    #[test]
+    fn a_stdio_transport_takes_env_literals_and_a_working_directory() {
+        let m = stdio_with(
+            "  env:\n    LOG_LEVEL: info\n    EMPTY: \"\"\n    _UNDER_1: \"a b: c #d\"\n  \
+             cwd: /srv/tools\n",
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            m.transport,
+            McpTransportDecl::Stdio {
+                command: "/bin/true".into(),
+                args: vec![],
+                env: BTreeMap::from([
+                    ("EMPTY".to_string(), String::new()),
+                    ("LOG_LEVEL".to_string(), "info".to_string()),
+                    ("_UNDER_1".to_string(), "a b: c #d".to_string()),
+                ]),
+                cwd: Some("/srv/tools".into()),
+            }
+        );
+        assert_eq!(
+            stdio_with("", "").unwrap().transport,
+            McpTransportDecl::Stdio {
+                command: "/bin/true".into(),
+                args: vec![],
+                env: BTreeMap::new(),
+                cwd: None,
+            }
+        );
+    }
+
+    // At most MAX_ENV_VARS literals, each named as an environment variable.
+    #[test]
+    fn env_keys_are_environment_variable_names_and_bounded_in_number() {
+        let entries = |n: usize| -> Vec<String> { (0..n).map(|i| format!("V{i}: x")).collect() };
+        match stdio_with(&env_block(&entries(MAX_ENV_VARS)), "")
+            .unwrap()
+            .transport
+        {
+            McpTransportDecl::Stdio { env, .. } => assert_eq!(env.len(), MAX_ENV_VARS),
+            other => panic!("a stdio transport: {other:?}"),
+        }
+        let reason = stdio_refused(&env_block(&entries(MAX_ENV_VARS + 1)));
+        assert!(reason.contains("max 64"), "{reason}");
+
+        let longest = format!("V{}", "A".repeat(255));
+        stdio_with(&env_block(&[format!("{longest}: x")]), "").unwrap();
+        let too_long = format!("V{}", "A".repeat(256));
+        for key in [
+            "\"1BAD\"",
+            "\"A-B\"",
+            "\"A B\"",
+            "\"A=B\"",
+            "\"\"",
+            "\"Ü\"",
+            too_long.as_str(),
+        ] {
+            let reason = stdio_refused(&env_block(&[format!("{key}: x")]));
+            assert!(
+                reason.contains("is not an environment-variable name"),
+                "{key}: {reason}"
+            );
+        }
+    }
+
+    // A literal is at most 4096 bytes without control characters, and may be empty.
+    #[test]
+    fn env_values_are_bounded_and_hold_no_control_characters() {
+        let longest = "v".repeat(4096);
+        stdio_with(&env_block(&[format!("V: {longest}")]), "").unwrap();
+        stdio_with(&env_block(&["V: \"\"".to_string()]), "").unwrap();
+        for value in [
+            "v".repeat(4097),
+            "\"a\\tb\"".to_string(),
+            "\"a\\nb\"".to_string(),
+            "\"a\\u0000b\"".to_string(),
+            "\"a\\u007fb\"".to_string(),
+            "\"a\\u0085b\"".to_string(),
+        ] {
+            let reason = stdio_refused(&env_block(&[format!("V: {value}")]));
+            assert!(
+                reason.contains("value for V must hold no control characters"),
+                "{value}: {reason}"
+            );
+        }
+    }
+
+    // A variable of the child's environment is a literal or a secret, never both.
+    #[test]
+    fn an_env_key_that_is_also_a_secret_ref_is_a_constraint_violation() {
+        match stdio_with(
+            "  env:\n    API_TOKEN: literal\n",
+            "secret-refs:\n  API_TOKEN: mcp-token\n",
+        ) {
+            Err(PackError::ConstraintViolation { reason }) => assert!(
+                reason.contains("API_TOKEN") && reason.contains("also a secret-refs key"),
+                "{reason}"
+            ),
+            other => panic!("expected ConstraintViolation, got {other:?}"),
+        }
+        let m = stdio_with(
+            "  env:\n    LOG_LEVEL: info\n",
+            "secret-refs:\n  API_TOKEN: mcp-token\n",
+        )
+        .unwrap();
+        assert_eq!(m.secret_refs.len(), 1);
+    }
+
+    // The working directory is an absolute path of at most 4096 bytes without control
+    // characters.
+    #[test]
+    fn cwd_is_an_absolute_path_without_control_characters() {
+        let longest = format!("/{}", "d".repeat(4095));
+        match stdio_with(&format!("  cwd: {longest}\n"), "")
+            .unwrap()
+            .transport
+        {
+            McpTransportDecl::Stdio { cwd, .. } => assert_eq!(cwd, Some(longest)),
+            other => panic!("a stdio transport: {other:?}"),
+        }
+        let too_long = format!("/{}", "d".repeat(4096));
+        for (cwd, why) in [
+            ("srv/tools", "is not an absolute path"),
+            ("./tools", "is not an absolute path"),
+            ("\"~/tools\"", "is not an absolute path"),
+            ("\"\"", "is not an absolute path"),
+            (too_long.as_str(), "exceeds 4096 bytes"),
+            ("\"/srv/\\u0000x\"", "contains a control character"),
+            ("\"/srv/\\tx\"", "contains a control character"),
+            ("\"/srv/\\nx\"", "contains a control character"),
+        ] {
+            let reason = stdio_refused(&format!("  cwd: {cwd}\n"));
+            assert!(reason.contains(why), "{cwd}: {reason}");
+        }
+    }
+
+    // `env` and `cwd` are keys of a stdio transport: a stdio transport takes either, an http
+    // transport carrying either is refused, and neither is a key of the document itself.
+    #[test]
+    fn env_and_cwd_belong_to_the_stdio_transport() {
+        for key in ["env:\n    A: b\n", "cwd: /srv\n"] {
+            stdio_with(&format!("  {key}"), "")
+                .unwrap_or_else(|e| panic!("a stdio transport takes {key}: {e:?}"));
+            for doc in [
+                format!(
+                    "server-id: x\ntransport:\n  kind: http\n  endpoint-url: https://h/mcp\n  \
+                     {key}"
+                ),
+                format!("server-id: x\ntransport:\n  kind: stdio\n  command: /bin/true\n{key}"),
+            ] {
+                match parse_mcp_server_manifest_str(&doc) {
+                    Err(PackError::InvalidManifest(reason)) => {
+                        assert!(reason.contains("unknown field"), "{doc}: {reason}")
+                    }
+                    other => panic!("{doc}: expected InvalidManifest, got {other:?}"),
+                }
+            }
+        }
     }
 }

@@ -55,6 +55,7 @@ fn stdio_client(script: &str) -> McpClient {
                 command: "bash".into(),
                 args: vec!["-c".into(), script.into()],
                 env: shell_env(),
+                cwd: None,
             },
             tool_patterns: Some(vec![ToolPattern::compile("echo").expect("pattern")]),
             tool_schemas: BTreeMap::new(),

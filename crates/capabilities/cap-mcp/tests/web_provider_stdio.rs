@@ -12,6 +12,7 @@ fn t104_stdio_web_provider_refused() {
         command: "npx".into(),
         args: vec!["-y".into(), "fake-search".into()],
         env: BTreeMap::new(),
+        cwd: None,
     };
     assert_eq!(
         refuse_stdio_web_provider(&spec),

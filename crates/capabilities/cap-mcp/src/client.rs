@@ -1288,11 +1288,17 @@ impl McpClient {
                 let version = transport.initialize().await?;
                 Ok((shared, Some(version.to_string())))
             }
-            McpTransportSpec::Stdio { command, args, env } => {
+            McpTransportSpec::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => {
                 let options = StdioOptions {
                     request_timeout: self.limits.request_timeout,
                     max_line_bytes: self.limits.max_line_bytes,
                     runtime: Some(self.runtime()?),
+                    cwd: cwd.clone(),
                 };
                 let transport: Arc<dyn McpTransport> =
                     Arc::new(StdioMcpTransport::spawn_with_options(

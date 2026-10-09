@@ -49,12 +49,21 @@
 //!
 //! ## Transports
 //!
-//! A `stdio` server is a process the daemon starts, on its first use, with nothing in its
-//! environment but its `secret-refs`. An `http` server is reached through a cap-http security
-//! chain that only the MCP client uses (leak scans, credential injection, SSRF guard, rate
-//! limit, redirect re-check, `http.*` events), whose executor allows a request the configured
-//! `mcp.request-timeout-sec`. The server's allowlist is the origin of its endpoint: scheme,
-//! host and port.
+//! A `stdio` server is a process the daemon starts on its first use: the file's `command` with
+//! its `args`, in the working directory `cwd` (an absolute path; `/` when the file gives none).
+//! Its environment ([`stdio_child_env`]) is built in three layers, each over the one before:
+//! the daemon's own `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR`
+//! and `TZ`, those the daemon has set ([`STDIO_BASELINE_ENV`]); the file's `env` literals; its
+//! `secret-refs`, each the value of a secret (a name is never both a literal and a secret).
+//! Nothing else of the daemon's environment, its API keys and tokens among it, reaches a
+//! server. A `command` that is a bare name is looked up on the `PATH` the server is started
+//! with (the system's default search path when it has none), so give an absolute path: the
+//! loader warns about a command that is not one.
+//!
+//! An `http` server is reached through a cap-http security chain that only the MCP client uses
+//! (leak scans, credential injection, SSRF guard, rate limit, redirect re-check, `http.*`
+//! events), whose executor allows a request the configured `mcp.request-timeout-sec`. The
+//! server's allowlist is the origin of its endpoint: scheme, host and port.
 //!
 //! An endpoint on loopback (`localhost`, `127.0.0.0/8`, `::1`) is reachable although the
 //! chain forbids loopback: the server file exempts exactly that host and port
@@ -123,6 +132,7 @@
 //! it when it stops, and dropping the last handle to the runtime does the same.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -414,9 +424,10 @@ impl McpControlPlane {
                     if let McpTransportDecl::Stdio { command, .. } = &manifest.transport {
                         if !Path::new(command).is_absolute() {
                             files.warnings.push(format!(
-                                "server '{}': command {command:?} is not an absolute path; \
-                                 the server starts with an empty environment, so it is looked \
-                                 up on the system's default search path",
+                                "server '{}': command {command:?} is not an absolute path; it \
+                                 is looked up on the PATH the server is started with (the \
+                                 file's own, else the daemon's, else the system's default \
+                                 search path)",
                                 manifest.server_id
                             ));
                         }
@@ -648,25 +659,36 @@ const NO_SECRET_STORE: &str =
     "it needs secrets and the secret store is not open; the store is opened when the daemon \
      starts";
 
-/// The client's entry for the server `manifest` describes. A stdio server's `secret-refs` are
-/// resolved through `secrets` into its environment. An http server's `credentials` stay secret
-/// names, which the http chain resolves at each request: here they are only checked to be in
-/// `secrets`, and no value is kept.
+/// The client's entry for the server `manifest` describes. A stdio server's process gets the
+/// environment [`stdio_child_env`] builds from the daemon's own environment, the file's `env`
+/// literals and its `secret-refs`, resolved through `secrets`, and runs in the file's `cwd`. An
+/// http server's `credentials` stay secret names, which the http chain resolves at each
+/// request: here they are only checked to be in `secrets`, and no value is kept.
 fn server_entry(
     manifest: McpServerManifest,
     secrets: Option<&dyn ManifestSecrets>,
 ) -> Result<McpServerEntry, String> {
     let transport = match manifest.transport {
-        McpTransportDecl::Stdio { command, args } => {
-            let mut env = BTreeMap::new();
+        McpTransportDecl::Stdio {
+            command,
+            args,
+            env: literals,
+            cwd,
+        } => {
+            let mut resolved = BTreeMap::new();
             for (variable, key) in &manifest.secret_refs {
                 let secrets = secrets.ok_or(NO_SECRET_STORE)?;
                 let value = secrets.get(key).ok_or_else(|| {
                     format!("secret {key:?} (for {variable}) is not in the secret store")
                 })?;
-                env.insert(variable.clone(), value.expose_secret().to_string());
+                resolved.insert(variable.clone(), value.expose_secret().to_string());
             }
-            McpTransportSpec::Stdio { command, args, env }
+            McpTransportSpec::Stdio {
+                command,
+                args,
+                env: stdio_child_env(std::env::vars_os(), &literals, resolved),
+                cwd: cwd.map(PathBuf::from),
+            }
         }
         McpTransportDecl::Http { endpoint_url } => {
             let allowlist = Allowlist {
@@ -703,6 +725,46 @@ fn server_entry(
         tool_patterns: None,
         tool_schemas: BTreeMap::new(),
     })
+}
+
+/// The variables of the daemon's own environment a stdio server's process is given, each one
+/// only when the daemon has it set: what a server, or a launcher such as `npx` or `uvx`, needs to
+/// find programs, a home, a temporary directory, a locale and a time zone. No other variable
+/// of the daemon's environment (its API keys and tokens among them) reaches a server.
+pub const STDIO_BASELINE_ENV: [&str; 9] = [
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ",
+];
+
+/// The whole environment of a stdio server's process, in three layers, each over the one
+/// before: the [`STDIO_BASELINE_ENV`] variables `host` (the daemon's own environment) sets,
+/// with the daemon's values; the server file's `env` literals (`literals`); and its
+/// `secret-refs` resolved to their values (`secrets`). A baseline variable `host` does not set,
+/// or sets to a value that is not UTF-8, is absent (not empty), and no other variable of
+/// `host` is ever taken. The loader ([`McpServerFiles::into_servers`]) and the pack bridge
+/// ([`crate::pack_bridges::PackMcpBridge::entry_with_env`]) both build a server's environment
+/// here.
+pub fn stdio_child_env(
+    host: impl IntoIterator<Item = (OsString, OsString)>,
+    literals: &BTreeMap<String, String>,
+    secrets: impl IntoIterator<Item = (String, String)>,
+) -> BTreeMap<String, String> {
+    let mut env: BTreeMap<String, String> = host
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let name = name.into_string().ok()?;
+            if !STDIO_BASELINE_ENV.contains(&name.as_str()) {
+                return None;
+            }
+            Some((name, value.into_string().ok()?))
+        })
+        .collect();
+    env.extend(
+        literals
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+    );
+    env.extend(secrets);
+    env
 }
 
 /// A credential's position as a server file writes it, for a warning.
@@ -1767,8 +1829,8 @@ impl McpEntrySink for ControlPlaneMcpSink {
 }
 
 /// Whether `manifest` describes exactly the server `registration` writes: the same id,
-/// description, transport, secret-ref ids and origin, and no credentials (a registration binds
-/// none).
+/// description, transport (a stdio server's `env` literals and `cwd` included), secret-ref ids
+/// and origin, and no credentials (a registration binds none).
 fn matches_registration(manifest: &McpServerManifest, registration: &McpRegistration) -> bool {
     manifest.server_id == registration.server_id
         && manifest.description == registration.description
@@ -1835,9 +1897,9 @@ fn create_fresh(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-/// The server file of `registration`: every scalar double-quoted, the keys of `secret-refs`
-/// included, so no value and no name can change the document's shape or be read as another
-/// YAML type.
+/// The server file of `registration`: every scalar double-quoted, the keys of `env` and
+/// `secret-refs` included, so no value and no name can change the document's shape or be read
+/// as another YAML type.
 fn render_server_file(registration: &McpRegistration) -> String {
     let mut yaml = format!("server-id: {}\n", yaml_string(&registration.server_id));
     if !registration.description.is_empty() {
@@ -1847,7 +1909,12 @@ fn render_server_file(registration: &McpRegistration) -> String {
         ));
     }
     match &registration.transport {
-        McpTransportDecl::Stdio { command, args } => {
+        McpTransportDecl::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        } => {
             yaml.push_str("transport:\n  kind: stdio\n");
             yaml.push_str(&format!("  command: {}\n", yaml_string(command)));
             if !args.is_empty() {
@@ -1855,6 +1922,19 @@ fn render_server_file(registration: &McpRegistration) -> String {
                 for arg in args {
                     yaml.push_str(&format!("    - {}\n", yaml_string(arg)));
                 }
+            }
+            if !env.is_empty() {
+                yaml.push_str("  env:\n");
+                for (name, value) in env {
+                    yaml.push_str(&format!(
+                        "    {}: {}\n",
+                        yaml_string(name),
+                        yaml_string(value)
+                    ));
+                }
+            }
+            if let Some(cwd) = cwd {
+                yaml.push_str(&format!("  cwd: {}\n", yaml_string(cwd)));
             }
         }
         McpTransportDecl::Http { endpoint_url } => {
@@ -2033,9 +2113,19 @@ mod tests {
         let zeta = servers.config.get("zeta").unwrap();
         assert!(zeta.tool_patterns.is_none() && zeta.tool_schemas.is_empty());
         match &zeta.transport {
-            McpTransportSpec::Stdio { command, args, env } => {
+            McpTransportSpec::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => {
                 assert_eq!(command, "/bin/true");
-                assert!(args.is_empty() && env.is_empty());
+                assert!(args.is_empty() && cwd.is_none());
+                assert_eq!(
+                    env,
+                    &stdio_child_env(std::env::vars_os(), &BTreeMap::new(), BTreeMap::new()),
+                    "the daemon's baseline variables alone"
+                );
             }
             other => panic!("zeta is a stdio server: {other:?}"),
         }
@@ -2243,6 +2333,7 @@ mod tests {
         );
     }
 
+    // A bare command loads, with a warning that it is looked up on the server's PATH.
     #[test]
     fn a_relative_stdio_command_loads_with_a_warning() {
         let ws = tempfile::tempdir().unwrap();
@@ -2254,7 +2345,11 @@ mod tests {
         let files = plane(ws.path()).scan();
         assert_eq!(files.server_ids(), ["tools"]);
         let warning = one_warning(files.warnings(), "server 'tools'");
-        assert!(warning.contains("not an absolute path"), "{warning}");
+        assert!(
+            warning.contains("\"npx\" is not an absolute path")
+                && warning.contains("looked up on the PATH the server is started with"),
+            "{warning}"
+        );
     }
 
     #[test]
@@ -2392,10 +2487,14 @@ mod tests {
         match &servers.config.get("local").unwrap().transport {
             McpTransportSpec::Stdio { env, .. } => assert_eq!(
                 env,
-                &BTreeMap::from([
-                    ("API_TOKEN".to_string(), "t0ken".to_string()),
-                    ("OTHER".to_string(), "0ther".to_string()),
-                ])
+                &stdio_child_env(
+                    std::env::vars_os(),
+                    &BTreeMap::new(),
+                    BTreeMap::from([
+                        ("API_TOKEN".to_string(), "t0ken".to_string()),
+                        ("OTHER".to_string(), "0ther".to_string()),
+                    ])
+                )
             ),
             other => panic!("local is a stdio server: {other:?}"),
         }
@@ -2424,6 +2523,179 @@ mod tests {
         for id in ["local", "lacking"] {
             let warning = one_warning(&servers.warnings, &format!("server '{id}' is skipped"));
             assert!(warning.contains("secret store is not open"), "{warning}");
+        }
+    }
+
+    /// A host environment holding `vars`.
+    fn host_env(vars: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        vars.iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect()
+    }
+
+    /// `pairs` as an environment map.
+    fn env_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    // The daemon passes exactly these variables of its own environment on to a stdio server.
+    #[test]
+    fn the_baseline_names_the_variables_a_stdio_server_is_given() {
+        assert_eq!(
+            STDIO_BASELINE_ENV,
+            ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ"]
+        );
+    }
+
+    // The child's environment is the daemon's baseline, the file's literals over it, and the
+    // resolved secret-refs over both.
+    #[test]
+    fn a_stdio_child_env_layers_the_baseline_the_literals_and_the_secrets() {
+        let env = stdio_child_env(
+            host_env(&[
+                ("PATH", "/daemon/bin"),
+                ("HOME", "/home/daemon"),
+                ("LANG", "C.UTF-8"),
+                ("TZ", "UTC"),
+            ]),
+            &env_of(&[
+                ("PATH", "/server/bin"),
+                ("GREETING", "hello"),
+                ("TZ", "Europe/Paris"),
+            ]),
+            env_of(&[("TZ", "Asia/Tokyo"), ("API_TOKEN", "t0ken")]),
+        );
+        assert_eq!(
+            env,
+            env_of(&[
+                ("API_TOKEN", "t0ken"),
+                ("GREETING", "hello"),
+                ("HOME", "/home/daemon"),
+                ("LANG", "C.UTF-8"),
+                ("PATH", "/server/bin"),
+                ("TZ", "Asia/Tokyo"),
+            ])
+        );
+    }
+
+    // Nothing but the baseline names comes from the daemon's environment: a canary, the
+    // daemon's own credentials, other locale variables and names that only look like a
+    // baseline name stay behind.
+    #[test]
+    fn nothing_but_the_baseline_passes_from_the_daemon_environment() {
+        let mut host: Vec<(OsString, OsString)> = STDIO_BASELINE_ENV
+            .iter()
+            .map(|name| {
+                (
+                    OsString::from(name),
+                    OsString::from(format!("{name}-value")),
+                )
+            })
+            .collect();
+        host.extend(host_env(&[
+            ("ADVANCE_MCP_CANARY", "canary"),
+            ("ANTHROPIC_API_KEY", "sk-daemon"),
+            ("AWS_SECRET_ACCESS_KEY", "aws-daemon"),
+            ("LC_MESSAGES", "fr_FR.UTF-8"),
+            ("path", "/lower/case"),
+            ("PATH_EXTRA", "/extra"),
+            (" PATH", "/spaced"),
+            ("PWD", "/daemon/cwd"),
+            ("SHELL", "/bin/zsh"),
+        ]));
+        let env = stdio_child_env(host, &BTreeMap::new(), BTreeMap::new());
+        let expected: BTreeMap<String, String> = STDIO_BASELINE_ENV
+            .iter()
+            .map(|name| (name.to_string(), format!("{name}-value")))
+            .collect();
+        assert_eq!(env, expected);
+        assert!(!env.values().any(|value| value == "canary"));
+    }
+
+    // A baseline variable the daemon does not set is absent from the child's environment, not
+    // set to an empty value; one the daemon sets to an empty value is passed as such, and one
+    // whose value is not UTF-8 is left out.
+    #[test]
+    fn an_unset_baseline_variable_is_absent_not_empty() {
+        let env = stdio_child_env(
+            host_env(&[("PATH", "/bin"), ("LANG", "")]),
+            &BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        assert_eq!(env, env_of(&[("LANG", ""), ("PATH", "/bin")]));
+        for name in [
+            "HOME", "USER", "LOGNAME", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ",
+        ] {
+            assert!(!env.contains_key(name), "{name} is absent");
+        }
+        assert!(stdio_child_env(Vec::new(), &BTreeMap::new(), BTreeMap::new()).is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let env = stdio_child_env(
+                vec![
+                    (OsString::from("HOME"), OsString::from_vec(vec![b'/', 0xff])),
+                    (OsString::from("TZ"), OsString::from("UTC")),
+                ],
+                &BTreeMap::new(),
+                BTreeMap::new(),
+            );
+            assert_eq!(env, env_of(&[("TZ", "UTC")]));
+        }
+    }
+
+    // A stdio server file's `env` literals and `cwd` reach the process the client starts: the
+    // literals over the daemon's own baseline, the secret-refs over both, and the working
+    // directory as written.
+    #[test]
+    fn a_server_file_sets_the_literals_and_the_working_directory_of_its_process() {
+        let ws = tempfile::tempdir().unwrap();
+        server_file(
+            ws.path(),
+            "local.yaml",
+            "server-id: local\ntransport:\n  kind: stdio\n  command: /bin/true\n  env:\n    \
+             GREETING: hello\n    PATH: /server/bin\n  cwd: /srv/local\nsecret-refs:\n  \
+             API_TOKEN: local-token\n",
+        );
+        let secrets = ClosureSecretStore::new(|key| match key {
+            "local-token" => Some("t0ken".to_string()),
+            _ => None,
+        });
+        let servers = plane(ws.path()).scan().into_servers(Some(&secrets));
+        assert!(servers.warnings.is_empty(), "{:?}", servers.warnings);
+        match &servers.config.get("local").unwrap().transport {
+            McpTransportSpec::Stdio { env, cwd, .. } => {
+                assert_eq!(cwd.as_deref(), Some(Path::new("/srv/local")));
+                assert_eq!(env.get("GREETING").map(String::as_str), Some("hello"));
+                assert_eq!(env.get("PATH").map(String::as_str), Some("/server/bin"));
+                assert_eq!(env.get("API_TOKEN").map(String::as_str), Some("t0ken"));
+                for (name, value) in env {
+                    if ["GREETING", "PATH", "API_TOKEN"].contains(&name.as_str()) {
+                        continue;
+                    }
+                    assert!(
+                        STDIO_BASELINE_ENV.contains(&name.as_str()),
+                        "{name} is a baseline variable"
+                    );
+                    assert_eq!(
+                        std::env::var(name).ok().as_ref(),
+                        Some(value),
+                        "{name} has the daemon's value"
+                    );
+                }
+                assert_eq!(
+                    env,
+                    &stdio_child_env(
+                        std::env::vars_os(),
+                        &env_of(&[("GREETING", "hello"), ("PATH", "/server/bin")]),
+                        env_of(&[("API_TOKEN", "t0ken")]),
+                    )
+                );
+            }
+            other => panic!("local is a stdio server: {other:?}"),
         }
     }
 
@@ -3244,6 +3516,7 @@ mod tests {
                         command: "/bin/true".into(),
                         args: vec![],
                         env: BTreeMap::new(),
+                        cwd: None,
                     },
                     tool_patterns: None,
                     tool_schemas: BTreeMap::new(),
@@ -3609,6 +3882,8 @@ mod tests {
             transport: McpTransportDecl::Stdio {
                 command: "/bin/true".into(),
                 args: vec!["--flag".into()],
+                env: BTreeMap::new(),
+                cwd: None,
             },
             ..registration(id, pack)
         }
@@ -3715,6 +3990,92 @@ mod tests {
                 .all(|e| e.unwrap().file_name() == "-.yaml"),
             "no temporary file is left"
         );
+    }
+
+    // A stdio registration's `env` literals and `cwd` are written into its server file, every
+    // name and value quoted, and read back unchanged: names and values that plain YAML would
+    // read as another type or as more document, an empty value, spaces kept at both ends. The
+    // loader serves the file with those literals over the daemon's baseline, in that directory;
+    // a registration whose `env` or `cwd` differ is other content.
+    #[test]
+    fn env_literals_and_a_working_directory_round_trip_through_the_server_file() {
+        let env = BTreeMap::from([
+            ("null".to_string(), "~".to_string()),
+            ("no".to_string(), "yes".to_string()),
+            ("TRUE".to_string(), "123".to_string()),
+            ("_1".to_string(), String::new()),
+            (
+                "QUOTED".to_string(),
+                "'single' \"double\" back\\slash".to_string(),
+            ),
+            ("SHAPED".to_string(), "a: b #c - [d] {e}".to_string()),
+            ("SPACED".to_string(), "  both ends  ".to_string()),
+            ("ACCENT".to_string(), "caf\u{e9}".to_string()),
+        ]);
+        let cwd = "/srv/with space/#x: y".to_string();
+        let registration = McpRegistration {
+            transport: McpTransportDecl::Stdio {
+                command: "/bin/true".into(),
+                args: vec!["--flag".into()],
+                env: env.clone(),
+                cwd: Some(cwd.clone()),
+            },
+            ..registration("envy", "p@1.0.0")
+        };
+
+        let body = render_server_file(&registration);
+        let manifest = parse_mcp_server_manifest_str(&body)
+            .unwrap_or_else(|e| panic!("the rendered file parses: {e}\n{body}"));
+        assert_eq!(manifest.transport, registration.transport, "{body}");
+        assert!(matches_registration(&manifest, &registration), "{body}");
+
+        let ws = tempfile::tempdir().unwrap();
+        let sink = ControlPlaneMcpSink::new(plane(ws.path()));
+        assert!(sink.register(registration.clone()).unwrap().created());
+        let written =
+            std::fs::read_to_string(ws.path().join(".advance/mcp-servers/envy.yaml")).unwrap();
+        assert_eq!(written, body);
+        assert!(!sink.register(registration.clone()).unwrap().created());
+        for other in [
+            McpTransportDecl::Stdio {
+                command: "/bin/true".into(),
+                args: vec!["--flag".into()],
+                env: BTreeMap::new(),
+                cwd: Some(cwd.clone()),
+            },
+            McpTransportDecl::Stdio {
+                command: "/bin/true".into(),
+                args: vec!["--flag".into()],
+                env: env.clone(),
+                cwd: None,
+            },
+        ] {
+            let changed = McpRegistration {
+                transport: other,
+                ..registration.clone()
+            };
+            let reason = refusal(sink.register(changed));
+            assert!(reason.contains("different content"), "{reason}");
+        }
+
+        let files = plane(ws.path()).scan();
+        assert_eq!(files.server_ids(), ["envy"]);
+        assert!(files.warnings().is_empty(), "{:?}", files.warnings());
+        let servers = files.into_servers(None);
+        match &servers.config.get("envy").unwrap().transport {
+            McpTransportSpec::Stdio {
+                env: child,
+                cwd: dir,
+                ..
+            } => {
+                assert_eq!(
+                    child,
+                    &stdio_child_env(std::env::vars_os(), &env, BTreeMap::new())
+                );
+                assert_eq!(dir.as_deref(), Some(Path::new(&cwd)));
+            }
+            other => panic!("envy is a stdio server: {other:?}"),
+        }
     }
 
     // An operator's file is neither replaced nor removed by a pack, and a pack cannot

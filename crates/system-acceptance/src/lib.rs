@@ -2919,6 +2919,7 @@ impl SystemUnderTestBuilder {
                             command: "true".to_string(),
                             args: Vec::new(),
                             env: BTreeMap::new(),
+                            cwd: None,
                         },
                         tool_patterns: Some(patterns),
                         tool_schemas: BTreeMap::new(),

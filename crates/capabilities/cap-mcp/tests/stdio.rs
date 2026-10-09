@@ -594,6 +594,7 @@ while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
             request_timeout: Duration::from_secs(20),
             max_line_bytes: 64 * 1024,
             runtime: None,
+            cwd: None,
         },
     )
     .expect("spawn");
@@ -771,6 +772,7 @@ fn stdio_client_without_runtime(script: String, limits: McpClientLimits) -> McpC
                 command: "bash".into(),
                 args: vec!["-c".into(), script],
                 env: path_env(),
+                cwd: None,
             },
             tool_patterns: None,
             tool_schemas: BTreeMap::new(),
@@ -1138,6 +1140,7 @@ fn tool_entry(script: &str, tool: &str) -> McpServerEntry {
             command: "bash".into(),
             args: vec!["-c".into(), script.to_string()],
             env,
+            cwd: None,
         },
         tool_patterns: None,
         tool_schemas: BTreeMap::new(),
@@ -1643,4 +1646,130 @@ async fn closing_a_transport_fails_its_calls_and_stops_the_server() {
         .await
         .expect_err("a closed transport carries no call");
     assert_eq!(err.message, "the transport was closed");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The working directory of a stdio server
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Answers every further request with `{"pwd": <the server's working
+/// directory>}`, echoing its id.
+const SERVE_PWD: &str = r#"
+while read -r line; do
+  id=${line##*\"id\":}; id=${id%%[!0-9]*}
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"pwd":"%s"}}\n' "$id" "$(pwd -P)"
+done
+"#;
+
+/// The stdio server `id` running `bash -c <script>` in the working directory
+/// `cwd`.
+fn entry_in(id: &str, script: &str, cwd: Option<&Path>) -> McpServerEntry {
+    McpServerEntry {
+        server_id: id.into(),
+        description: "stdio".into(),
+        transport: McpTransportSpec::Stdio {
+            command: "bash".into(),
+            args: vec!["-c".into(), script.to_string()],
+            env: path_env(),
+            cwd: cwd.map(Path::to_path_buf),
+        },
+        tool_patterns: None,
+        tool_schemas: BTreeMap::new(),
+    }
+}
+
+// A server's entry names the directory the client starts it in; without one
+// the server runs in `/`.
+#[tokio::test]
+async fn a_stdio_server_runs_in_the_working_directory_of_its_entry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workdir = std::fs::canonicalize(dir.path()).expect("canonical tempdir");
+    let script = server_script(&[HANDSHAKE, SERVE_PWD], dir.path(), "2025-06-18");
+    let client = McpClient::new(
+        Arc::new(config_of([
+            entry_in("here", &script, Some(&workdir)),
+            entry_in("rooted", &script, None),
+        ])),
+        Arc::new(NoOpDetector),
+        None,
+    )
+    .with_runtime(tokio::runtime::Handle::current());
+
+    let here = client
+        .invoke_tool(None, "here", "pwd", b"{}")
+        .await
+        .expect("the server answers");
+    assert_eq!(json_of(&here)["pwd"], workdir.display().to_string());
+    let rooted = client
+        .invoke_tool(None, "rooted", "pwd", b"{}")
+        .await
+        .expect("the server answers");
+    assert_eq!(json_of(&rooted)["pwd"], "/");
+}
+
+// A working directory that is not a directory fails the spawn with an error
+// naming it, whether it is a file or missing, and through the client the
+// server never starts.
+#[tokio::test]
+async fn a_working_directory_that_is_not_a_directory_fails_the_spawn_naming_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("not-a-dir");
+    std::fs::write(&file, "x").expect("write");
+    let missing = dir.path().join("missing");
+    let spawn_in = |cwd: &Path| {
+        StdioMcpTransport::spawn_with_options(
+            "srv",
+            "bash",
+            &["-c".to_string(), "sleep 30".to_string()],
+            &path_env(),
+            Arc::new(NoOpDetector),
+            StdioOptions {
+                cwd: Some(cwd.to_path_buf()),
+                ..StdioOptions::default()
+            },
+        )
+    };
+
+    let err = spawn_in(&file).expect_err("a file is no working directory");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert_eq!(
+        err.message,
+        format!(
+            "stdio: working directory {} is not a directory",
+            file.display()
+        )
+    );
+    let err = spawn_in(&missing).expect_err("a missing working directory");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert!(
+        err.message.starts_with(&format!(
+            "stdio: working directory {} cannot be used: ",
+            missing.display()
+        )),
+        "msg={}",
+        err.message
+    );
+
+    let script = server_script(&[LOG_START, HANDSHAKE, SERVE], dir.path(), "2025-06-18");
+    let client = McpClient::new(
+        Arc::new(config_of([entry_in("srv", &script, Some(&file))])),
+        Arc::new(NoOpDetector),
+        None,
+    )
+    .with_runtime(tokio::runtime::Handle::current());
+    let err = client
+        .invoke_tool(None, "srv", "echo", b"{}")
+        .await
+        .expect_err("the server cannot start");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert!(
+        err.message.contains(&file.display().to_string())
+            && err.message.contains("is not a directory"),
+        "msg={}",
+        err.message
+    );
+    assert!(
+        lines(&dir.path().join("starts")).is_empty(),
+        "no server process started"
+    );
 }

@@ -726,7 +726,7 @@ mod mcp_client {
     /// `notifications/initialized`, then serves: `tools/list` names `echo`, `echo_twice` and
     /// `rm`; a call of `hang` is recorded (`<id>.unanswered`) and never answered; any other
     /// call is recorded (`<id>.calls`) and answered. `@EXTRA@` runs first. The script uses
-    /// builtins and absolute paths only: the server starts with an empty environment.
+    /// builtins and absolute paths only, so it runs whatever `PATH` the server is given.
     const SERVER_SCRIPT: &str = r#"
 @EXTRA@
 echo $$ >> '@MARKS@/@ID@.starts'
@@ -1296,10 +1296,6 @@ done
     /// recording under `server_id`) and whose workflow `mcp` registers it. Returns the pack's
     /// source directory.
     fn signed_mcp_pack(home: &Home, name: &str, server_id: &str) -> PathBuf {
-        use ed25519_dalek::Signer;
-
-        let key = trusted_key();
-        let pk = hex::encode(key.verifying_key().to_bytes());
         let script = home.marks.join(format!("{server_id}.sh"));
         std::fs::write(
             &script,
@@ -1309,16 +1305,29 @@ done
                 .replace("@ID@", server_id),
         )
         .unwrap();
+        signed_stdio_pack(
+            home,
+            name,
+            server_id,
+            &format!("  command: /bin/bash\n  args: [\"{}\"]\n", script.display()),
+        )
+    }
+
+    /// Write, outside `home`'s workspace, the signed trusted pack `p@1.0.0` whose
+    /// `mcp-servers/<name>.yaml` declares the stdio server `server_id` with the transport keys
+    /// `transport` (the lines after `kind: stdio`), and whose workflow `mcp` registers it.
+    /// Returns the pack's source directory.
+    fn signed_stdio_pack(home: &Home, name: &str, server_id: &str, transport: &str) -> PathBuf {
+        use ed25519_dalek::Signer;
+
+        let key = trusted_key();
+        let pk = hex::encode(key.verifying_key().to_bytes());
         let src = home.root.parent().unwrap().join("src/p");
         std::fs::create_dir_all(src.join("mcp-servers")).unwrap();
         std::fs::create_dir_all(src.join("workflows")).unwrap();
         std::fs::write(
             src.join(format!("mcp-servers/{name}.yaml")),
-            format!(
-                "server-id: {server_id}\ntransport:\n  kind: stdio\n  command: /bin/bash\n  \
-                 args: [\"{}\"]\n",
-                script.display()
-            ),
+            format!("server-id: {server_id}\ntransport:\n  kind: stdio\n{transport}"),
         )
         .unwrap();
         std::fs::write(
@@ -1765,6 +1774,146 @@ done
         cap_secrets::SecretStore::new(zeroize::Zeroizing::new([KEY_BYTE; 32]), storage)
             .store(name, value)
             .expect("provision the secret");
+    }
+
+    // ── The environment and working directory of a stdio server ───────────────────────
+
+    /// Set in this process, the daemon's, before a boot: no stdio server may see it.
+    const CANARY_ENV: &str = "ADV_PACK_RUNTIME_MCP_CANARY";
+
+    /// A bash MCP server over stdio whose one tool, `environment`, answers with what the
+    /// server's process was given, as its `structuredContent`: `$GREETING` (`unset` when
+    /// unset), its working directory, whether `PATH` and `HOME` are set (`set`, or empty), and
+    /// the canary (`absent` when unset). Builtins only, so it runs whatever `PATH` it is given.
+    const ENV_SERVER_SCRIPT: &str = r#"
+read -r init
+printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"env","version":"1"}}}\n'
+read -r initialized
+while read -r line; do
+  id=${line##*\"id\":}; id=${id%%[!0-9]*}
+  case "$line" in
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"environment","description":"What the server was given"}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"environment"}],"structuredContent":{"greeting":"%s","pwd":"%s","path":"%s","home":"%s","canary":"%s"}}}\n' "$id" "${GREETING-unset}" "$PWD" "${PATH+set}" "${HOME+set}" "${@CANARY@-absent}" ;;
+    *)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    /// Write [`ENV_SERVER_SCRIPT`] for the server `id` beside `home`'s marks; returns its path.
+    fn env_server_script(home: &Home, id: &str) -> PathBuf {
+        let script = home.marks.join(format!("{id}.sh"));
+        std::fs::write(&script, ENV_SERVER_SCRIPT.replace("@CANARY@", CANARY_ENV)).unwrap();
+        script
+    }
+
+    /// What the server `server`'s `environment` tool answers when `agent` calls it.
+    async fn environment(host: &RuntimeHost, agent: &str, server: &str) -> Value {
+        let result = invoke(host, agent, server, "environment")
+            .await
+            .unwrap_or_else(|e| panic!("{server} answers: {e:?}"));
+        result["structuredContent"].clone()
+    }
+
+    // An operator's stdio server file sets non-secret literals of its process's environment
+    // and its working directory. The process gets the daemon's own baseline variables (`PATH`
+    // and `HOME` among them), the literals over them, in that directory, and nothing else of
+    // the daemon's environment: a variable set in the daemon before it started never reaches
+    // the server.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stdio_server_runs_with_the_baseline_its_literals_and_its_working_directory() {
+        std::env::set_var(CANARY_ENV, "set-in-the-daemon");
+        assert!(
+            std::env::var_os("PATH").is_some() && std::env::var_os("HOME").is_some(),
+            "the daemon's environment sets PATH and HOME"
+        );
+        let home = home("capabilities:\n  mcp: true\n", NO_KEY_ENV, "");
+        let workdir = home.marks.join("workdir");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let script = env_server_script(&home, "envy");
+        server_file(
+            &home,
+            "envy",
+            &format!(
+                "server-id: envy\ntransport:\n  kind: stdio\n  command: /bin/bash\n  \
+                 args: [\"{}\"]\n  env:\n    GREETING: hello\n  cwd: \"{}\"\n",
+                script.display(),
+                workdir.display()
+            ),
+        );
+        let (host, handles) = boot(&home).await;
+        let mcp = handles.mcp.as_ref().expect("mcp declared");
+        assert!(mcp.warnings().is_empty(), "{:?}", mcp.warnings());
+
+        assert_eq!(
+            environment(&host, &handles.root_agent_id, "envy").await,
+            json!({
+                "greeting": "hello",
+                "pwd": workdir.display().to_string(),
+                "path": "set",
+                "home": "set",
+                "canary": "absent"
+            })
+        );
+        assert_eq!(
+            std::env::var(CANARY_ENV).as_deref(),
+            Ok("set-in-the-daemon"),
+            "the daemon still holds the canary"
+        );
+    }
+
+    // A trusted pack's stdio server declares an `env` literal and a working directory: the
+    // workflow's `:apply` writes both into the server file, which reads back as the pack's
+    // declaration, and the server runs with that variable, in that directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pack_stdio_server_keeps_its_literals_and_working_directory_through_its_file() {
+        with_master_key();
+        let home = pack_home("");
+        let workdir = home.marks.join("pack-workdir");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let script = env_server_script(&home, "packed");
+        let src = signed_stdio_pack(
+            &home,
+            "packed",
+            "packed",
+            &format!(
+                "  command: /bin/bash\n  args: [\"{}\"]\n  env:\n    GREETING: from-the-pack\n  \
+                 cwd: \"{}\"\n",
+                script.display(),
+                workdir.display()
+            ),
+        );
+        let (host, handles) = boot(&home).await;
+        let api = super::operator_api(&handles);
+        install_pack(&api, &src, "install-env-pack");
+        let env = apply_mcp_workflow(&api, "apply-env-pack");
+        assert!(env.is_ok(), "{:?}", env.error);
+
+        let body =
+            std::fs::read_to_string(home.root.join(".advance/mcp-servers/packed.yaml")).unwrap();
+        let manifest = advance_pack_manager::parse_mcp_server_manifest_str(&body)
+            .unwrap_or_else(|e| panic!("the server file parses: {e}\n{body}"));
+        assert_eq!(
+            manifest.transport,
+            advance_pack_manager::McpTransportDecl::Stdio {
+                command: "/bin/bash".into(),
+                args: vec![script.display().to_string()],
+                env: [("GREETING".to_string(), "from-the-pack".to_string())].into(),
+                cwd: Some(workdir.display().to_string()),
+            },
+            "{body}"
+        );
+        assert_eq!(
+            manifest.origin.map(|origin| origin.pack).as_deref(),
+            Some("p@1.0.0")
+        );
+
+        let report = environment(&host, &handles.root_agent_id, "packed").await;
+        assert_eq!(report["greeting"], "from-the-pack", "{report}");
+        assert_eq!(report["pwd"], workdir.display().to_string(), "{report}");
+        assert_eq!(report["path"], "set", "{report}");
     }
 
     // Shutting the MCP runtime down is what the daemon does when it stops: the stdio server
