@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use advance_shared_types::security_validator::{
-    Allowlist, HttpCapability, HttpError, HttpRequest, HttpResponse, HttpSecurityChain,
-    LeakDetector, RedirectRejectReason, ScanContext, ScanResult,
+    Allowlist, CredentialBinding, CredentialPosition, CredentialPositionTag, HttpCapability,
+    HttpError, HttpRequest, HttpResponse, HttpSecurityChain, LeakDetector, RedirectRejectReason,
+    ScanContext, ScanResult, SecretResolutionReason,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -1501,4 +1502,179 @@ async fn the_client_bounds_http_posts_by_its_request_timeout() {
     assert_eq!(err.kind, McpErrorKind::TransportError);
     assert_eq!(err.message, "wall-clock timeout");
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Credentials and secret placeholders
+// ─────────────────────────────────────────────────────────────────────────
+
+/// An MCP server behind a chain that injects the capability's bearer credential the way the
+/// cap-http security chain does: the secret is resolved by name, at each request, in the
+/// chain's store (here a map), and set as `Authorization: Bearer <secret>`. The server
+/// answers `401` to a request without `Authorization: Bearer <token>` and records each
+/// request's method with whether it was accepted.
+struct BearerServer {
+    store: BTreeMap<&'static str, &'static str>,
+    token: &'static str,
+    seen: Mutex<Vec<(String, bool)>>,
+}
+
+impl BearerServer {
+    fn new(token: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            store: BTreeMap::from([("mcp-token", token)]),
+            token,
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn seen(&self) -> Vec<(String, bool)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl HttpSecurityChain for BearerServer {
+    async fn execute(
+        &self,
+        _agent_id: &str,
+        mut req: HttpRequest,
+        cap: &HttpCapability,
+    ) -> Result<HttpResponse, HttpError> {
+        for binding in &cap.credentials {
+            if binding.position == CredentialPosition::BearerToken {
+                let secret = self.store.get(binding.secret_name.as_str()).ok_or(
+                    HttpError::SecretResolution(SecretResolutionReason::MissingSecretFor(
+                        CredentialPositionTag::BearerToken,
+                    )),
+                )?;
+                req.headers
+                    .retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
+                req.headers
+                    .push(("Authorization".into(), format!("Bearer {secret}")));
+            }
+        }
+        let message = body_of(&req);
+        let method = message["method"].as_str().unwrap_or_default().to_string();
+        let expected = format!("Bearer {}", self.token);
+        let authorized = header(&req, "authorization").as_deref() == Some(expected.as_str());
+        self.seen.lock().unwrap().push((method.clone(), authorized));
+        if !authorized {
+            return Ok(status(401));
+        }
+        Ok(match (method.as_str(), message["id"].as_u64()) {
+            ("initialize", Some(id)) => initialize_answer(id, "2025-06-18", Some("sess-1")),
+            ("tools/list", Some(id)) => answer(
+                id,
+                json!({"tools": [{"name": "echo", "description": "Echo"}]}),
+            ),
+            ("tools/call", Some(id)) => {
+                let event = json!({"jsonrpc": "2.0", "id": id, "result": {"ok": true}});
+                ok_response(format!("data: {event}\n\n").as_bytes(), "text/event-stream")
+            }
+            _ => accepted(),
+        })
+    }
+}
+
+/// A client of the one http server `srv`, whose capability binds `credentials`.
+fn credentialed_client(
+    chain: Arc<dyn HttpSecurityChain>,
+    credentials: Vec<CredentialBinding>,
+) -> McpClient {
+    let config = McpServersConfig::builder()
+        .add_server(McpServerEntry {
+            server_id: "srv".into(),
+            description: "http".into(),
+            transport: McpTransportSpec::Http {
+                endpoint_url: "https://mcp.example.com/mcp".into(),
+                capability: HttpCapability {
+                    credentials,
+                    ..dummy_cap()
+                },
+            },
+            tool_patterns: None,
+            tool_schemas: BTreeMap::new(),
+        })
+        .expect("add server")
+        .build();
+    McpClient::new(Arc::new(config), Arc::new(NoOpDetector), Some(chain))
+}
+
+// Every request the transport hands the security chain carries the server's capability, so the
+// credential the chain injects from it reaches the handshake (`initialize`, then
+// `notifications/initialized`), the listing and the call, whose answer is an SSE event. The
+// transport opens no GET stream: an SSE answer comes in the body of its POST. Without the
+// binding the server refuses the handshake and the listing fails.
+#[tokio::test]
+async fn the_credential_the_chain_injects_reaches_every_request() {
+    let server = BearerServer::new("tok-123");
+    let client = credentialed_client(
+        server.clone(),
+        vec![CredentialBinding {
+            position: CredentialPosition::BearerToken,
+            secret_name: "mcp-token".into(),
+        }],
+    );
+    let tools = client
+        .list_tools(Some("agent-1"), "srv")
+        .await
+        .expect("listed with the token");
+    assert_eq!(
+        tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+        ["echo"]
+    );
+    let out = client
+        .invoke_tool(Some("agent-1"), "srv", "echo", b"{}")
+        .await
+        .expect("called with the token");
+    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["ok"], true);
+    let allowed = |method: &str| (method.to_string(), true);
+    assert_eq!(
+        server.seen(),
+        [
+            allowed("initialize"),
+            allowed("notifications/initialized"),
+            allowed("tools/list"),
+            allowed("tools/call"),
+        ]
+    );
+
+    let server = BearerServer::new("tok-123");
+    let client = credentialed_client(server.clone(), Vec::new());
+    client
+        .list_tools(Some("agent-1"), "srv")
+        .await
+        .expect_err("refused without the token");
+    assert_eq!(server.seen(), [("initialize".to_string(), false)]);
+}
+
+// A request's strings are data. A `{` or `}` in them, as in a tool argument naming a secret,
+// goes out escaped, so the security chain finds no placeholder to fill with a secret, while the
+// server reads the same JSON.
+#[tokio::test]
+async fn a_request_carries_no_secret_placeholder() {
+    let chain = Arc::new(MockChain::default());
+    chain.push(Ok(answer(1, json!({"ok": true}))));
+    let params = json!({
+        "name": "echo",
+        "arguments": {"text": "{mcp-token} and {other}", "{key}": ["}{", "{}"]},
+    });
+    transport(&chain)
+        .invoke(None, "tools/call", params.clone())
+        .await
+        .expect("answered");
+
+    let sent = chain.captured();
+    let raw = String::from_utf8(sent[0].body.clone()).expect("utf-8");
+    assert!(
+        !raw.contains("{mcp-token}") && !raw.contains("{key}") && !raw.contains("{other}"),
+        "{raw}"
+    );
+    assert!(raw.contains(r"\u007bmcp-token\u007d"), "{raw}");
+    assert_eq!(body_of(&sent[0])["params"], params, "the same JSON");
+    assert!(
+        raw.starts_with(r#"{"jsonrpc":"2.0","method":"tools/call","params":{"#),
+        "the message itself is plain compact JSON: {raw}"
+    );
 }
