@@ -20,6 +20,14 @@
 //!   endpoint-url: https://mcp.example.com/mcp   # the Streamable HTTP endpoint
 //! secret-refs:                      # stdio only: ENV_NAME → secret-store key
 //!   API_TOKEN: mcp-token
+//! credentials:                      # http only, operator files only: secret-store keys
+//!   - position: bearer              # Authorization: Bearer <secret>
+//!     secret: mcp-token
+//!   - position: header              # <key>: <secret>
+//!     key: X-Api-Key
+//!     secret: mcp-api-key
+//! # `position: basic` with `username` sends Authorization: Basic base64(username:secret)
+//! # (instead of bearer); `position: query` with `key` adds <key>=<secret> to the URL's query.
 //! ```
 //!
 //! Rules (all fail-closed):
@@ -27,11 +35,32 @@
 //! - `secret-refs` keys must be environment-variable names
 //!   (`[A-Za-z_][A-Za-z0-9_]*`), values non-empty secret-store keys;
 //! - `secret-refs` on an `http` transport → `ConstraintViolation` — the only
-//!   injection point the bridge implements is the stdio child's `env`; http
-//!   credentials belong to cap-http's `CredentialBinding` chain, never to a
-//!   pack YAML;
+//!   injection point the bridge implements is the stdio child's `env`; an http
+//!   server's secrets are its `credentials`;
+//! - `credentials` bind secret-store secrets to positions of the requests an `http`
+//!   server is sent, as [`CredentialBinding`]s: the manifest holds secret names, never
+//!   values, and the cap-http security chain resolves and injects each one at every
+//!   request. Each of these is an `InvalidManifest`:
+//!   - more than [`MAX_CREDENTIALS`] entries, or a `position` other than `bearer`,
+//!     `basic`, `header` and `query` (there is no `url-path` position);
+//!   - a `secret` that is not a non-empty secret-store key of at most 256 bytes without
+//!     control characters (the rule of a `secret-refs` value);
+//!   - a second `bearer` or `basic` entry: each sets `Authorization`;
+//!   - a `header` key that is not a header name (visible ASCII without delimiters, at
+//!     most 256 bytes), that is bound twice (in any case), or that names a header the
+//!     transport or the http stack sets: `Authorization`, `Host`, `Content-Length`,
+//!     `Transfer-Encoding`, `Content-Type`, `Accept`, `Mcp-Session-Id`,
+//!     `MCP-Protocol-Version`, in any case;
+//!   - a `query` key outside `[A-Za-z0-9._-]+` or over 256 bytes, or bound twice;
+//!   - a `username` with a `:` or a control character, or over 256 bytes;
+//! - `credentials` on a `stdio` transport → `ConstraintViolation` (its secrets are its
+//!   `secret-refs`);
+//! - `credentials` in a document with an `origin` block → `ConstraintViolation`: a server
+//!   file a pack wrote may not bind cap-secrets credentials, only the operator's own may;
 //! - `http` endpoints must be `https://`, or `http://` on a loopback host;
-//!   userinfo (`user@host`) is refused (credential smuggling / redaction hazard);
+//!   userinfo (`user@host`) is refused (credential smuggling / redaction hazard), and so
+//!   are `{` and `}` (the security chain reads `{name}` in a request URL as a placeholder
+//!   for the secret `name`, which would put a credential in the URL);
 //! - the file is read through `O_NOFOLLOW` + fstat, capped at
 //!   [`MAX_MCP_SERVER_YAML_BYTES`], alias-guarded and nesting-bounded like every
 //!   other pack-shipped YAML this crate parses.
@@ -52,6 +81,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use advance_shared_types::mcp::{is_valid_server_id, MAX_SERVER_ID_BYTES};
+use advance_shared_types::security_validator::{CredentialBinding, CredentialPosition};
 use serde::Deserialize;
 
 use crate::component_manifest::yaml_nesting_within_bound;
@@ -68,6 +98,22 @@ const MAX_ARG_LEN: usize = 4096;
 const MAX_SECRET_REFS: usize = 32;
 const MAX_SECRET_REF_LEN: usize = 256;
 const MAX_ENDPOINT_URL_LEN: usize = 2048;
+/// Most `credentials` one server file may bind.
+pub const MAX_CREDENTIALS: usize = 8;
+/// Longest header key, query key or basic username of a credential, in bytes.
+const MAX_CREDENTIAL_KEY_LEN: usize = 256;
+/// The headers the MCP http transport and the http stack set themselves: a `header`
+/// credential may not name one (compared in any case).
+const TRANSPORT_HEADERS: [&str; 8] = [
+    "authorization",
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "content-type",
+    "accept",
+    "mcp-session-id",
+    "mcp-protocol-version",
+];
 
 /// Parsed + validated `mcp-servers/{name}.yaml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +125,10 @@ pub struct McpServerManifest {
     pub transport: McpTransportDecl,
     /// `ENV_NAME → secret-store key`; empty unless `transport` is `stdio`.
     pub secret_refs: BTreeMap<String, String>,
+    /// Secret-store secrets bound to positions of the server's requests, by name; the
+    /// cap-http security chain resolves and injects them at each request. Empty unless
+    /// `transport` is `http` and the document has no `origin` (an operator's file).
+    pub credentials: Vec<CredentialBinding>,
     /// The pack that materialized this file into the operator's servers
     /// directory. `None` on a file the operator wrote.
     pub origin: Option<McpServerOrigin>,
@@ -125,7 +175,19 @@ struct RawManifest {
     #[serde(default, rename = "secret-refs")]
     secret_refs: BTreeMap<String, String>,
     #[serde(default)]
+    credentials: Vec<RawCredential>,
+    #[serde(default)]
     origin: Option<RawOrigin>,
+}
+
+/// One entry of `credentials`, by its `position`.
+#[derive(Deserialize)]
+#[serde(tag = "position", rename_all = "kebab-case", deny_unknown_fields)]
+enum RawCredential {
+    Bearer { secret: String },
+    Basic { username: String, secret: String },
+    Header { key: String, secret: String },
+    Query { key: String, secret: String },
 }
 
 #[derive(Deserialize)]
@@ -271,15 +333,146 @@ pub fn parse_mcp_server_manifest_str(yaml: &str) -> Result<McpServerManifest, Pa
         });
     }
 
+    let credentials = validate_credentials(raw.credentials)?;
+    if !credentials.is_empty() && transport.is_stdio() {
+        return Err(PackError::ConstraintViolation {
+            reason: "credentials require an http transport (the cap-http security chain \
+                     injects them into the server's requests); a stdio server's secrets are \
+                     its secret-refs"
+                .into(),
+        });
+    }
+
     let origin = validate_origin(raw.origin)?;
+    if !credentials.is_empty() && origin.is_some() {
+        return Err(PackError::ConstraintViolation {
+            reason: "credentials are bound only in a server file the operator wrote: a \
+                     pack-origin server may not bind cap-secrets credentials"
+                .into(),
+        });
+    }
 
     Ok(McpServerManifest {
         server_id: raw.server_id,
         description,
         transport,
         secret_refs: raw.secret_refs,
+        credentials,
         origin,
     })
+}
+
+/// The `credentials` of a document as the bindings the security chain applies (see the
+/// module docs for the rules).
+fn validate_credentials(raw: Vec<RawCredential>) -> Result<Vec<CredentialBinding>, PackError> {
+    if raw.len() > MAX_CREDENTIALS {
+        return Err(PackError::InvalidManifest(format!(
+            "credentials has {} entries (max {MAX_CREDENTIALS})",
+            raw.len()
+        )));
+    }
+    let mut authorization = false;
+    let mut headers: Vec<String> = Vec::new();
+    let mut query_keys: Vec<String> = Vec::new();
+    let mut bindings = Vec::with_capacity(raw.len());
+    for (i, credential) in raw.into_iter().enumerate() {
+        let (position, secret) = match credential {
+            RawCredential::Bearer { secret } => (CredentialPosition::BearerToken, secret),
+            RawCredential::Basic { username, secret } => {
+                if username.len() > MAX_CREDENTIAL_KEY_LEN
+                    || username.contains(':')
+                    || username.chars().any(char::is_control)
+                {
+                    return Err(PackError::InvalidManifest(format!(
+                        "credentials[{i}].username must hold no ':' and no control \
+                         characters (≤ {MAX_CREDENTIAL_KEY_LEN} bytes)"
+                    )));
+                }
+                (CredentialPosition::BasicAuth { username }, secret)
+            }
+            RawCredential::Header { key, secret } => {
+                if !is_header_name(&key) {
+                    return Err(PackError::InvalidManifest(format!(
+                        "credentials[{i}].key is not a header name (visible ASCII without \
+                         delimiters, ≤ {MAX_CREDENTIAL_KEY_LEN} bytes)"
+                    )));
+                }
+                let lower = key.to_ascii_lowercase();
+                if TRANSPORT_HEADERS.contains(&lower.as_str()) {
+                    return Err(PackError::InvalidManifest(format!(
+                        "credentials[{i}].key {key:?} is a header the transport sets"
+                    )));
+                }
+                if headers.contains(&lower) {
+                    return Err(PackError::InvalidManifest(format!(
+                        "credentials[{i}].key {key:?} is bound twice"
+                    )));
+                }
+                headers.push(lower);
+                (CredentialPosition::CustomHeader { key }, secret)
+            }
+            RawCredential::Query { key, secret } => {
+                if !is_query_key(&key) {
+                    return Err(PackError::InvalidManifest(format!(
+                        "credentials[{i}].key is not a query key ([A-Za-z0-9._-]+, \
+                         ≤ {MAX_CREDENTIAL_KEY_LEN} bytes)"
+                    )));
+                }
+                if query_keys.contains(&key) {
+                    return Err(PackError::InvalidManifest(format!(
+                        "credentials[{i}].key {key:?} is bound twice"
+                    )));
+                }
+                query_keys.push(key.clone());
+                (CredentialPosition::QueryParam { key }, secret)
+            }
+        };
+        if matches!(
+            position,
+            CredentialPosition::BearerToken | CredentialPosition::BasicAuth { .. }
+        ) {
+            if authorization {
+                return Err(PackError::InvalidManifest(format!(
+                    "credentials[{i}]: one bearer or basic credential at most (each sets \
+                     the Authorization header)"
+                )));
+            }
+            authorization = true;
+        }
+        if secret.is_empty()
+            || secret.len() > MAX_SECRET_REF_LEN
+            || secret.chars().any(char::is_control)
+        {
+            return Err(PackError::InvalidManifest(format!(
+                "credentials[{i}].secret must be a non-empty secret key \
+                 (≤ {MAX_SECRET_REF_LEN} bytes, no control characters)"
+            )));
+        }
+        bindings.push(CredentialBinding {
+            position,
+            secret_name: secret,
+        });
+    }
+    Ok(bindings)
+}
+
+/// A header name the security chain injects: visible ASCII without the delimiters of
+/// RFC 9110 (the token characters), as cap-http checks it, within
+/// [`MAX_CREDENTIAL_KEY_LEN`].
+fn is_header_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_CREDENTIAL_KEY_LEN
+        && s.bytes()
+            .all(|b| b.is_ascii_graphic() && !b"\"(),/:;<=>?@[\\]{}".contains(&b))
+}
+
+/// A query key the security chain injects: `[A-Za-z0-9._-]+`, as cap-http checks it, within
+/// [`MAX_CREDENTIAL_KEY_LEN`].
+fn is_query_key(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_CREDENTIAL_KEY_LEN
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
 /// The `origin` block of an in-memory server-file document, and nothing else: `Ok(None)` for a
@@ -393,6 +586,13 @@ fn validate_endpoint_url(url: &str) -> Result<(), PackError> {
     {
         return Err(PackError::InvalidManifest(
             "transport.endpoint-url contains whitespace, control or non-ASCII characters".into(),
+        ));
+    }
+    // The security chain reads `{name}` in a request URL as a placeholder for the secret
+    // `name`: a credential goes only where `credentials` puts it.
+    if url.contains(['{', '}']) {
+        return Err(PackError::InvalidManifest(
+            "transport.endpoint-url must not contain '{' or '}'".into(),
         ));
     }
     let (scheme, rest) = url.split_once("://").ok_or_else(|| {
@@ -585,6 +785,20 @@ mod tests {
         assert!(validate_endpoint_url("ftp://h/").is_err());
         assert!(validate_endpoint_url("https:///nohost").is_err());
         assert!(validate_endpoint_url("https://h/ with space").is_err());
+        // `{name}` would be a secret placeholder to the security chain.
+        for braced in [
+            "https://h/{token}/mcp",
+            "https://h/mcp?key={token}",
+            "https://h/mcp}",
+            "http://127.0.0.1:9/{",
+        ] {
+            match validate_endpoint_url(braced) {
+                Err(PackError::InvalidManifest(reason)) => {
+                    assert!(reason.contains("'{' or '}'"), "{braced}: {reason}")
+                }
+                other => panic!("{braced}: expected InvalidManifest, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -601,5 +815,296 @@ mod tests {
             parse_mcp_server_manifest_str(doc),
             Err(PackError::InvalidManifest(_))
         ));
+    }
+
+    /// An http server whose `credentials` are the YAML flow sequence `list`.
+    fn with_credentials(list: &str) -> Result<McpServerManifest, PackError> {
+        parse_mcp_server_manifest_str(&format!(
+            "server-id: x\ntransport:\n  kind: http\n  endpoint-url: https://h/mcp\n\
+             credentials: {list}\n"
+        ))
+    }
+
+    /// The reason of an `InvalidManifest` refusal of `list`.
+    fn credentials_refused(list: &str) -> String {
+        match with_credentials(list) {
+            Err(PackError::InvalidManifest(reason)) => reason,
+            other => panic!("{list}: expected InvalidManifest, got {other:?}"),
+        }
+    }
+
+    fn binding(position: CredentialPosition, secret: &str) -> CredentialBinding {
+        CredentialBinding {
+            position,
+            secret_name: secret.into(),
+        }
+    }
+
+    // An http server binds secret-store secrets, by name, to the four positions the security
+    // chain injects; a file without the key binds none.
+    #[test]
+    fn credentials_bind_secret_names_to_the_four_positions() {
+        let m = with_credentials(
+            "[{position: bearer, secret: s3cret-name}, \
+             {position: header, key: X-Api-Key, secret: api-key}, \
+             {position: query, key: api_key, secret: query-key}]",
+        )
+        .unwrap();
+        assert_eq!(
+            m.credentials,
+            [
+                binding(CredentialPosition::BearerToken, "s3cret-name"),
+                binding(
+                    CredentialPosition::CustomHeader {
+                        key: "X-Api-Key".into()
+                    },
+                    "api-key"
+                ),
+                binding(
+                    CredentialPosition::QueryParam {
+                        key: "api_key".into()
+                    },
+                    "query-key"
+                ),
+            ]
+        );
+        assert!(
+            !format!("{m:?}").contains("s3cret-name"),
+            "a manifest's Debug hides the secret names"
+        );
+        for username in ["bot", "\"\""] {
+            let m = with_credentials(&format!(
+                "[{{position: basic, username: {username}, secret: pw}}]"
+            ))
+            .unwrap();
+            assert_eq!(
+                m.credentials,
+                [binding(
+                    CredentialPosition::BasicAuth {
+                        username: username.trim_matches('"').into()
+                    },
+                    "pw"
+                )]
+            );
+        }
+        assert!(parse_mcp_server_manifest_str(HTTP)
+            .unwrap()
+            .credentials
+            .is_empty());
+    }
+
+    // At most MAX_CREDENTIALS entries, each naming its secret by a secret-store key of the
+    // `secret-refs` value rule.
+    #[test]
+    fn credentials_are_bounded_and_name_their_secrets_as_secret_refs_do() {
+        let entry = |i: usize| format!("{{position: header, key: X-K{i}, secret: s{i}}}");
+        let list = |n: usize| format!("[{}]", (0..n).map(entry).collect::<Vec<_>>().join(", "));
+        assert_eq!(
+            with_credentials(&list(MAX_CREDENTIALS))
+                .unwrap()
+                .credentials
+                .len(),
+            MAX_CREDENTIALS
+        );
+        assert!(credentials_refused(&list(MAX_CREDENTIALS + 1)).contains("max 8"));
+
+        let longest = "k".repeat(256);
+        assert!(with_credentials(&format!("[{{position: bearer, secret: {longest}}}]")).is_ok());
+        for secret in [
+            "\"\"".to_string(),
+            "k".repeat(257),
+            "\"a\\tb\"".to_string(),
+            "\"a\\u0085b\"".to_string(),
+        ] {
+            let reason = credentials_refused(&format!("[{{position: bearer, secret: {secret}}}]"));
+            assert!(
+                reason.contains("non-empty secret key"),
+                "{secret}: {reason}"
+            );
+        }
+    }
+
+    // `bearer` and `basic` both set Authorization: one of them at most.
+    #[test]
+    fn one_bearer_or_basic_credential_at_most() {
+        for list in [
+            "[{position: bearer, secret: a}, {position: basic, username: u, secret: b}]",
+            "[{position: basic, username: u, secret: b}, {position: bearer, secret: a}]",
+            "[{position: bearer, secret: a}, {position: bearer, secret: b}]",
+            "[{position: basic, username: u, secret: a}, {position: basic, username: v, secret: b}]",
+        ] {
+            assert!(
+                credentials_refused(list).contains("one bearer or basic credential at most"),
+                "{list}"
+            );
+        }
+        with_credentials(
+            "[{position: bearer, secret: a}, {position: header, key: X-K, secret: b}]",
+        )
+        .unwrap();
+    }
+
+    // A header credential names a header (a token of visible ASCII), once, and never one the
+    // transport or the http stack sets, whatever its case.
+    #[test]
+    fn a_header_credential_names_a_header_the_transport_does_not_set() {
+        let header = |key: &str| format!("[{{position: header, key: {key}, secret: s}}]");
+        let longest = "h".repeat(256);
+        let too_long = "h".repeat(257);
+        for key in [
+            "X-Api-Key",
+            "x_token",
+            "X.Trace~1!#$%&'*+^`|",
+            longest.as_str(),
+        ] {
+            let quoted = format!("{key:?}");
+            assert!(with_credentials(&header(&quoted)).is_ok(), "{key}");
+        }
+        for key in [
+            "\"\"",
+            "\"X Api\"",
+            "\"X:Api\"",
+            "\"X-Api\\r\\nHost: evil\"",
+            "\"X\\u0001\"",
+            "\"X(1)\"",
+            "\"X/1\"",
+            "\"X{a}\"",
+            "\"Ü-Key\"",
+            too_long.as_str(),
+        ] {
+            assert!(
+                credentials_refused(&header(key)).contains("is not a header name"),
+                "{key}"
+            );
+        }
+        for key in [
+            "Authorization",
+            "HOST",
+            "content-length",
+            "Transfer-Encoding",
+            "Content-Type",
+            "ACCEPT",
+            "Mcp-Session-Id",
+            "mcp-protocol-version",
+        ] {
+            let reason = credentials_refused(&header(key));
+            assert!(
+                reason.contains("a header the transport sets"),
+                "{key}: {reason}"
+            );
+        }
+        let twice = credentials_refused(
+            "[{position: header, key: X-Key, secret: a}, {position: header, key: x-key, secret: b}]",
+        );
+        assert!(twice.contains("bound twice"), "{twice}");
+    }
+
+    // A query credential's key is a plain query key, bound once.
+    #[test]
+    fn a_query_credential_key_is_a_plain_query_key() {
+        let query = |key: &str| format!("[{{position: query, key: {key}, secret: s}}]");
+        let longest = "q".repeat(256);
+        let too_long = "q".repeat(257);
+        for key in ["api_key", "key.v2", "a-b", longest.as_str()] {
+            assert!(with_credentials(&query(key)).is_ok(), "{key}");
+        }
+        for key in [
+            "\"\"",
+            "\"a=b\"",
+            "\"a&b\"",
+            "\"a?b\"",
+            "\"a#b\"",
+            "\"a b\"",
+            "\"a\\r\\nb\"",
+            "\"a\\tb\"",
+            "\"ключ\"",
+            "\"{key}\"",
+            too_long.as_str(),
+        ] {
+            assert!(
+                credentials_refused(&query(key)).contains("is not a query key"),
+                "{key}"
+            );
+        }
+        let twice = credentials_refused(
+            "[{position: query, key: k, secret: a}, {position: query, key: k, secret: b}]",
+        );
+        assert!(twice.contains("bound twice"), "{twice}");
+    }
+
+    // A basic credential's username holds no ':' (RFC 7617) and no control character.
+    #[test]
+    fn a_basic_username_holds_no_colon_and_no_control_character() {
+        let basic =
+            |username: &str| format!("[{{position: basic, username: {username}, secret: s}}]");
+        assert!(with_credentials(&basic(&"u".repeat(256))).is_ok());
+        let too_long = "u".repeat(257);
+        for username in [
+            "\"a:b\"",
+            "\"a\\tb\"",
+            "\"a\\nb\"",
+            "\"a\\u0085b\"",
+            too_long.as_str(),
+        ] {
+            assert!(
+                credentials_refused(&basic(username)).contains("username must hold no ':'"),
+                "{username}"
+            );
+        }
+    }
+
+    // A position outside the four, a key a position does not take and a missing field are
+    // refused: there is no url-path position.
+    #[test]
+    fn credentials_take_the_four_positions_and_their_keys_only() {
+        for list in [
+            "[{position: url-path, key: k, secret: s}]",
+            "[{position: cookie, secret: s}]",
+            "[{secret: s}]",
+            "[{position: bearer, secret: s, key: k}]",
+            "[{position: bearer, secret: s, username: u}]",
+            "[{position: header, secret: s}]",
+            "[{position: basic, secret: s}]",
+            "[{position: query, key: k}]",
+            "[{position: bearer, secret: [s]}]",
+            "{position: bearer, secret: s}",
+        ] {
+            credentials_refused(list);
+        }
+    }
+
+    // Credentials are an http server's: on a stdio transport they are a constraint violation.
+    #[test]
+    fn stdio_credentials_are_a_constraint_violation() {
+        let doc = "server-id: x\ntransport:\n  kind: stdio\n  command: /bin/true\n\
+                   credentials: [{position: bearer, secret: s}]\n";
+        match parse_mcp_server_manifest_str(doc) {
+            Err(PackError::ConstraintViolation { reason }) => {
+                assert!(reason.contains("require an http transport"), "{reason}")
+            }
+            other => panic!("expected ConstraintViolation, got {other:?}"),
+        }
+    }
+
+    // A server file a pack wrote (it has an `origin` block) may not bind credentials; the
+    // sweep still reads which pack wrote it.
+    #[test]
+    fn pack_origin_credentials_are_a_constraint_violation() {
+        let doc = "server-id: x\ntransport:\n  kind: http\n  endpoint-url: https://h/mcp\n\
+                   credentials: [{position: bearer, secret: s}]\n\
+                   origin:\n  pack: p@1.0.0\n  config-ref: p@1.0.0/mcp-servers/x\n";
+        match parse_mcp_server_manifest_str(doc) {
+            Err(PackError::ConstraintViolation { reason }) => {
+                assert!(
+                    reason.contains("pack-origin server may not bind cap-secrets credentials"),
+                    "{reason}"
+                )
+            }
+            other => panic!("expected ConstraintViolation, got {other:?}"),
+        }
+        assert_eq!(
+            parse_mcp_server_origin_str(doc).unwrap().map(|o| o.pack),
+            Some("p@1.0.0".to_string())
+        );
     }
 }

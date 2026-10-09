@@ -1715,13 +1715,7 @@ done
     async fn a_server_that_needs_secrets_opens_the_secret_store() {
         with_master_key();
         let home = home("capabilities:\n  mcp: true\n", KEY_ENV, "");
-        let storage: Arc<dyn cap_secrets::SecretStorage> = Arc::new(
-            cap_secrets::FileSecretStorage::open(home.root.join(".advance/secrets.json"))
-                .expect("secrets file"),
-        );
-        cap_secrets::SecretStore::new(zeroize::Zeroizing::new([KEY_BYTE; 32]), storage)
-            .store("mcp-token", "heron-42")
-            .expect("provision the secret");
+        provision_secret(&home, "mcp-token", "heron-42");
         let record_token = format!(
             "printf '%s' \"$MCP_TOKEN\" > '{}/srv.token'",
             home.marks.display()
@@ -1759,6 +1753,18 @@ done
             "heron-42",
             "the secret is the server's MCP_TOKEN"
         );
+    }
+
+    /// Store `value` as the secret `name` of `home`'s secret store (its file layout, under the
+    /// master key [`with_master_key`] provides).
+    fn provision_secret(home: &Home, name: &str, value: &str) {
+        let storage: Arc<dyn cap_secrets::SecretStorage> = Arc::new(
+            cap_secrets::FileSecretStorage::open(home.root.join(".advance/secrets.json"))
+                .expect("secrets file"),
+        );
+        cap_secrets::SecretStore::new(zeroize::Zeroizing::new([KEY_BYTE; 32]), storage)
+            .store(name, value)
+            .expect("provision the secret");
     }
 
     // Shutting the MCP runtime down is what the daemon does when it stops: the stdio server
@@ -2090,20 +2096,25 @@ done
         }
     }
 
-    /// An http MCP double: what reached it, the tools it lists, and the loopback port of a
-    /// second listener it redirects the `hop` tool to.
+    /// An http MCP double: what reached it, the tools it lists, the loopback port of a
+    /// second listener it redirects the `hop` tool to, and the `Authorization` value every
+    /// request must carry (`None`: any request is served).
     #[derive(Clone)]
     struct Double {
         posts: Posts,
         tools: &'static [&'static str],
         elsewhere: u16,
+        authorization: Option<&'static str>,
     }
 
     /// A Streamable HTTP MCP server double: `initialize` gets a session id, a notification
     /// `202`, `tools/list` the double's tools. Calling `hop` answers with a redirect to another
-    /// loopback port, calling `slow` answers after fifteen seconds, any other call at once.
+    /// loopback port, calling `slow` answers after fifteen seconds, any other call at once with
+    /// the arguments it was sent. A request without the double's `Authorization` value gets
+    /// `401` and is recorded as `unauthorized <method>`.
     async fn mcp_double(
         axum::extract::State(double): axum::extract::State<Double>,
+        headers: axum::http::HeaderMap,
         body: axum::body::Bytes,
     ) -> axum::response::Response {
         use axum::http::{header, StatusCode};
@@ -2111,6 +2122,20 @@ done
 
         let message: Value = serde_json::from_slice(&body).unwrap_or_default();
         let method = message["method"].as_str().unwrap_or_default().to_string();
+        if let Some(expected) = double.authorization {
+            let carried = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok());
+            if carried != Some(expected) {
+                double
+                    .posts
+                    .0
+                    .lock()
+                    .unwrap()
+                    .push(format!("unauthorized {method}"));
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+        }
         double.posts.0.lock().unwrap().push(method.clone());
         let Some(id) = message.get("id").cloned() else {
             return StatusCode::ACCEPTED.into_response();
@@ -2151,7 +2176,8 @@ done
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 answer(json!({"late": true})).into_response()
             }
-            _ => answer(json!({"ok": true})).into_response(),
+            _ => answer(json!({"ok": true, "arguments": message["params"]["arguments"]}))
+                .into_response(),
         }
     }
 
@@ -2187,6 +2213,7 @@ done
             posts: Posts::default(),
             tools: &["echo"],
             elsewhere,
+            authorization: None,
         };
         let port = serve(
             axum::Router::new()
@@ -2285,6 +2312,7 @@ done
             posts: Posts::default(),
             tools: &["echo", "web.search"],
             elsewhere: 0,
+            authorization: None,
         };
         let port = serve(
             axum::Router::new()
@@ -2337,5 +2365,229 @@ done
                 .await
                 .unwrap_or_else(|e| panic!("{case}: echo needs no web grant: {e:?}"));
         }
+    }
+
+    // ── Credentials of an operator http server ──────────────────────────────────────────
+
+    /// The secret the doubles below require, as `Bearer <secret>`.
+    const BEARER: &str = "Bearer heron-42";
+
+    /// The operator file of the http server `id` at `endpoint`, binding the secret `secret`
+    /// as its bearer token, with `tail` appended.
+    fn bearer_server(home: &Home, id: &str, endpoint: &str, secret: &str, tail: &str) {
+        server_file(
+            home,
+            id,
+            &format!(
+                "server-id: \"{id}\"\ntransport:\n  kind: http\n  endpoint-url: \"{endpoint}\"\n\
+                 credentials:\n  - position: bearer\n    secret: \"{secret}\"\n{tail}"
+            ),
+        );
+    }
+
+    /// A double that requires [`BEARER`] on every request, served on a loopback port.
+    async fn guarded_double() -> (Double, u16) {
+        let double = Double {
+            posts: Posts::default(),
+            tools: &["echo"],
+            elsewhere: 0,
+            authorization: Some(BEARER),
+        };
+        let port = serve(
+            axum::Router::new()
+                .route("/mcp", axum::routing::post(mcp_double))
+                .with_state(double.clone()),
+        )
+        .await;
+        (double, port)
+    }
+
+    // An operator's http server file binds a secret of the home's store as its bearer token,
+    // which the double requires on every request. The credential is what opens the secret
+    // store (the root declares neither `secrets` nor `llm`), and the security chain resolves
+    // it at each request: the handshake, the listing and the call each carry it, and the tool
+    // reaches the root through the gate and through the inventory the daemon wires. The secret
+    // never becomes text an agent or the log sees: a tool argument naming the secret goes out
+    // as written, and no warning holds the value. Beside it, a server whose secret the store
+    // lacks is skipped with a warning, a server without the credential is refused by the
+    // double, and an installed pack's server file that binds a credential is refused by the
+    // loader.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_operator_http_server_sends_its_bound_secret_with_every_request() {
+        with_master_key();
+        let (double, port) = guarded_double().await;
+        let (anonymous_double, anonymous_port) = guarded_double().await;
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+
+        let pk = hex::encode(trusted_key().verifying_key().to_bytes());
+        let home = home(
+            "capabilities:\n  fs: true\n  mcp: true\n",
+            KEY_ENV,
+            &format!("\npack:\n  trust-roots:\n    - {pk}\n"),
+        );
+        deploy_driver(&home);
+        provision_secret(&home, "mcp-token", "heron-42");
+        bearer_server(&home, "remote", &endpoint, "mcp-token", "");
+        bearer_server(&home, "lacking", &endpoint, "absent-token", "");
+        server_file(
+            &home,
+            "anonymous",
+            &format!(
+                "server-id: anonymous\ntransport:\n  kind: http\n  \
+                 endpoint-url: http://127.0.0.1:{anonymous_port}/mcp\n"
+            ),
+        );
+        // The pack `p@1.0.0` is installed, so the start's sweep keeps its file.
+        let packs_dir = home.root.join(".advance/packs");
+        advance_pack_manager::Installer::new(
+            &packs_dir,
+            Arc::new(advance_pack_manager::InMemoryPackRegistry::new(
+                packs_dir.clone(),
+            )),
+            env!("CARGO_PKG_VERSION"),
+            Arc::new(advance_pack_manager::AutoApprove),
+        )
+        .with_trust_roots(vec![pk.clone()])
+        .install(signed_mcp_pack(&home, "srv", "srv").to_str().unwrap())
+        .await
+        .expect("install before boot");
+        bearer_server(
+            &home,
+            "packed",
+            "https://mcp.example.com/mcp",
+            "mcp-token",
+            "origin:\n  pack: \"p@1.0.0\"\n  config-ref: \"p@1.0.0/mcp-servers/packed\"\n",
+        );
+
+        let (host, handles) = boot(&home).await;
+        let root = handles.root_agent_id.clone();
+        assert!(
+            handles.secret_store.is_some(),
+            "the credential opens the secret store"
+        );
+        let warnings = handles.mcp.as_ref().expect("mcp").warnings().to_vec();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("\"packed.yaml\" is skipped")
+                    && w.contains("pack-origin server may not bind cap-secrets credentials")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("server 'lacking' is skipped")
+                    && w.contains("\"absent-token\" (for its bearer credential)")),
+            "{warnings:?}"
+        );
+        assert!(warnings.iter().all(|w| !w.contains("heron-42")));
+        assert!(
+            home.root.join(".advance/mcp-servers/packed.yaml").is_file(),
+            "the file of an installed pack stays"
+        );
+        assert_eq!(servers(&host, &root).await, ["anonymous", "remote"]);
+
+        // Through the gate: the listing and a call whose argument names the secret.
+        assert_eq!(
+            tools(&host, &root, "remote").await.expect("listed"),
+            ["echo"]
+        );
+        let result = call(
+            &host,
+            &root,
+            "invoke-mcp-tool",
+            vec![s("remote"), s("echo"), bytes(r#"{"text":"{mcp-token}"}"#)],
+        )
+        .await
+        .map(json_result)
+        .expect("called");
+        assert_eq!(
+            result["arguments"]["text"], "{mcp-token}",
+            "a tool argument is sent as written, never filled with the secret: {result}"
+        );
+        assert_eq!(
+            double.posts.methods(),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call"
+            ],
+            "every request carried the bearer token"
+        );
+
+        // A server without the credential is refused by the double.
+        tools(&host, &root, "anonymous")
+            .await
+            .expect_err("the double refuses a request without the token");
+        assert_eq!(
+            anonymous_double.posts.methods(),
+            ["unauthorized initialize"]
+        );
+
+        // Through the inventory the daemon wires for the root's loop and the Client API.
+        let api = super::operator_api(&handles);
+        let (serve, inventory) = serve_root(&host, &handles, &home, &api).await;
+        let shown: Vec<String> = inventory
+            .list_mcp_tools(&handles.root_mailbox_id)
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(shown, ["remote__echo"], "the listing above is cached");
+        let listed = client_tools(&api);
+        assert_eq!(mcp_listed(&listed), [("remote", "remote__echo")]);
+        assert!(
+            double
+                .posts
+                .methods()
+                .iter()
+                .all(|method| !method.starts_with("unauthorized")),
+            "{:?}",
+            double.posts.methods()
+        );
+        drop(serve);
+    }
+
+    // The http chain resolves credentials in the daemon's secret store whenever one is open,
+    // not only when a server file needed it at start: here `secrets` opened it, the only
+    // server file at start binds no credential (it exempts the double's loopback endpoint),
+    // and a credentialed server a reload admits on that endpoint sends its secret.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_credentialed_server_a_reload_admits_resolves_its_secret_in_the_open_store() {
+        with_master_key();
+        let (double, port) = guarded_double().await;
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+        let home = home("capabilities:\n  mcp: true\n  secrets: true\n", KEY_ENV, "");
+        provision_secret(&home, "mcp-token", "heron-42");
+        server_file(
+            &home,
+            "plain",
+            &format!("server-id: plain\ntransport:\n  kind: http\n  endpoint-url: {endpoint}\n"),
+        );
+        let (host, handles) = boot(&home).await;
+        assert!(handles.secret_store.is_some(), "`secrets` opens the store");
+        let mcp = Arc::clone(handles.mcp.as_ref().expect("mcp"));
+        assert!(mcp.warnings().is_empty(), "{:?}", mcp.warnings());
+
+        bearer_server(&home, "remote", &endpoint, "mcp-token", "");
+        mcp.reload();
+        let root = handles.root_agent_id.clone();
+        assert_eq!(
+            tools(&host, &root, "remote")
+                .await
+                .expect("listed with the token"),
+            ["echo"]
+        );
+        invoke(&host, &root, "remote", "echo")
+            .await
+            .expect("called with the token");
+        let methods = double.posts.methods();
+        assert_eq!(methods.first().map(String::as_str), Some("initialize"));
+        assert!(methods.iter().any(|m| m == "tools/call"), "{methods:?}");
+        assert!(
+            methods.iter().all(|m| !m.starts_with("unauthorized")),
+            "{methods:?}"
+        );
     }
 }

@@ -10,6 +10,9 @@
 //!   an endpoint on loopback is refused
 //!   ([`PackError::ConstraintViolation`]): only a server file the operator wrote
 //!   may reach the host's own loopback;
+//! - a manifest that binds `credentials` is refused from any pack
+//!   ([`PackError::ConstraintViolation`]): pack-origin http servers may not bind
+//!   cap-secrets credentials, only a server file the operator wrote may;
 //! - the manifest's `secret-refs` (`ENV_NAME → secret key`) are resolved through
 //!   the pack-manager `SecretStore` into the stdio child's `env` (missing key →
 //!   `MissingSecret`); a workflow step's pre-resolved secrets can be merged in
@@ -23,8 +26,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use advance_pack_manager::{
-    parse_mcp_server_manifest, ComponentKind, McpTransportDecl, PackError, PackRegistry,
-    SecretStore, SecretValue, TrustLevel as PackTrust,
+    parse_mcp_server_manifest, ComponentKind, McpServerManifest, McpTransportDecl, PackError,
+    PackRegistry, SecretStore, SecretValue, TrustLevel as PackTrust,
 };
 use advance_shared_types::security_validator::{Allowlist, HttpCapability};
 use cap_mcp::{McpServerEntry, McpTransportSpec};
@@ -64,6 +67,7 @@ impl PackMcpBridge {
         let resolution = resolve_kind(&*self.registry, pack_ref, ComponentKind::McpServer)?;
         let pack = pack_id(&resolution);
         let manifest = parse_mcp_server_manifest(&resolution.local_path)?;
+        refuse_credentials(&manifest, &pack)?;
         let trust = effective_trust(&*self.registry, &resolution.pack_name, &resolution.version)?;
 
         let transport = match manifest.transport {
@@ -153,7 +157,7 @@ impl PackMcpBridge {
 
     /// The registration a control-plane sink would persist: the pack's
     /// manifest, extra secret-ref *ids* (never values), and the origin pack.
-    /// Same trust and loopback checks as [`Self::entry_with_env`].
+    /// Same trust, loopback and credentials checks as [`Self::entry_with_env`].
     pub fn plan(
         &self,
         pack_ref: &str,
@@ -162,6 +166,7 @@ impl PackMcpBridge {
         let resolution = resolve_kind(&*self.registry, pack_ref, ComponentKind::McpServer)?;
         let pack = pack_id(&resolution);
         let manifest = parse_mcp_server_manifest(&resolution.local_path)?;
+        refuse_credentials(&manifest, &pack)?;
         let trust = effective_trust(&*self.registry, &resolution.pack_name, &resolution.version)?;
 
         match &manifest.transport {
@@ -278,6 +283,21 @@ pub trait McpEntrySink: Send + Sync {
     /// this sink created. An operator file (no origin) is left alone and
     /// reported as an error.
     fn deregister(&self, server_id: &str) -> Result<(), PackBridgeError>;
+}
+
+/// Refuse a pack's server manifest that binds `credentials`: only a server file the
+/// operator wrote may bind cap-secrets credentials to an http server's requests.
+fn refuse_credentials(manifest: &McpServerManifest, pack: &str) -> Result<(), PackBridgeError> {
+    if manifest.credentials.is_empty() {
+        return Ok(());
+    }
+    Err(PackBridgeError::Pack(PackError::ConstraintViolation {
+        reason: format!(
+            "mcp-server {} of pack {pack} binds credentials; pack-origin http servers may not \
+             bind cap-secrets credentials (only an operator's own server file may)",
+            manifest.server_id
+        ),
+    }))
 }
 
 fn is_env_var_name(s: &str) -> bool {

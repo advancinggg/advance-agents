@@ -19,10 +19,13 @@
 //! stderr, and the other servers are kept:
 //!
 //! - an entry that is not a regular file (a symlink, a FIFO, a directory), a file over
-//!   [`MAX_MCP_SERVER_YAML_BYTES`], or one the schema refuses;
+//!   [`MAX_MCP_SERVER_YAML_BYTES`], or one the schema refuses (among them a file with an
+//!   `origin` block that binds `credentials`);
 //! - a file whose name is not its `server-id` followed by `.yaml`;
 //! - a `stdio` server while `mcp.allow-stdio` is `false`;
-//! - a server whose `secret-refs` name a secret the store does not hold;
+//! - an `http` server of a file with an `origin` block whose endpoint is on loopback;
+//! - a server whose `secret-refs` or `credentials` name a secret the store does not hold, and
+//!   every server that names a secret while no secret store is open;
 //! - anything past [`cap_mcp::MAX_SERVERS`] servers.
 //!
 //! An absent directory is a home without servers. Entries that are not named `*.yaml`, and
@@ -48,8 +51,8 @@
 //!
 //! A `stdio` server is a process the daemon starts, on its first use, with nothing in its
 //! environment but its `secret-refs`. An `http` server is reached through a cap-http security
-//! chain that only the MCP client uses (leak scans, SSRF guard, rate limit, redirect re-check,
-//! `http.*` events), whose executor allows a request the configured
+//! chain that only the MCP client uses (leak scans, credential injection, SSRF guard, rate
+//! limit, redirect re-check, `http.*` events), whose executor allows a request the configured
 //! `mcp.request-timeout-sec`. The server's allowlist is the origin of its endpoint: scheme,
 //! host and port.
 //!
@@ -58,18 +61,40 @@
 //! ([`LoopbackExemptions`]), in the chain's guard and in its executor. Nothing else on
 //! loopback becomes reachable, and an endpoint in any other forbidden range stays blocked.
 //! Only the operator's files exempt anything: a pack's server on loopback is refused when the
-//! pack registers it ([`crate::pack_bridges::PackMcpBridge`]). The exemptions are those of the
-//! files read when the daemon started: a loopback server that appears on a later reload is
-//! refused with a warning until the daemon restarts ([`McpServerFiles::keep_loopback_within`]).
+//! pack registers it ([`crate::pack_bridges::PackMcpBridge`]), and the loader skips, with a
+//! warning, a server file with an `origin` block whose endpoint is on loopback, however the
+//! file got there. The exemptions are those of the files read when the daemon started: a
+//! loopback server that appears on a later reload is refused with a warning until the daemon
+//! restarts ([`McpServerFiles::keep_loopback_within`]).
 //!
 //! ## Secrets
 //!
-//! Only a `stdio` server's `secret-refs` need the secret store: each names a secret that
-//! becomes one variable of the server's environment. When a server file has some, the daemon
-//! opens its secret store as it does for `secrets` or `llm`, which needs the home's master
-//! key: without that key the daemon does not start, as with those two. Otherwise `mcp` needs
-//! no master key, and the http chain is built on an empty store: no server file binds a
-//! credential to an http request.
+//! Two kinds of server file name secrets of the daemon's secret store. A `stdio` server's
+//! `secret-refs` each name a secret that becomes one variable of the server's environment,
+//! resolved when the file is read. An `http` server's `credentials` each bind a secret to a
+//! position of every request the chain sends the server: `Authorization: Bearer`,
+//! `Authorization: Basic` with a username, a header of the file's choosing, or a query
+//! parameter. The server's entry holds those secrets' names only; the chain resolves each one
+//! in the store at every request and puts the value into that request alone, never into a
+//! file, an event or a log line. Only the operator's files bind credentials: a server file
+//! with an `origin` block that binds some is refused by the schema, and a pack whose server
+//! manifest binds some cannot register it ([`crate::pack_bridges::PackMcpBridge`]).
+//!
+//! When a server file names a secret either way, the daemon opens its secret store as it does
+//! for `secrets` or `llm`, which needs the home's master key: without that key the daemon does
+//! not start, as with those two. Otherwise `mcp` needs no master key. A server that names a
+//! secret the store does not hold when its file is read is skipped with a warning, and so is
+//! every server that names a secret while no store is open (one a reload brings to a daemon
+//! that opened none).
+//!
+//! The http chain is built on the daemon's secret store whenever one is open, whatever opened
+//! it, and on an empty store otherwise, so a credentialed server a reload admits resolves its
+//! secrets as one read at start does. A request carries the value the store holds when the
+//! request is made: the synchronized keychain is read at each request, so a value changed
+//! there is sent from the next request on, without a restart; the file layout's store reads
+//! `secrets.json` when the daemon starts (and keeps what the daemon itself stores), so a value
+//! another process writes into the file, as `advance secrets set` does, is sent once the daemon
+//! restarts.
 //!
 //! ## What an agent may reach
 //!
@@ -114,7 +139,7 @@ use advance_runtime::host_registry::HostRegistry;
 use advance_shared_types::capability::{McpToolEntry, McpToolsShown, ToolEntry};
 use advance_shared_types::mcp::{is_valid_server_id, MAX_SERVER_ID_BYTES};
 use advance_shared_types::security_validator::{
-    Allowlist, HttpCapability, HttpSecurityChain, LeakDetector, SsrfGuard,
+    Allowlist, CredentialPosition, HttpCapability, HttpSecurityChain, LeakDetector, SsrfGuard,
 };
 use advance_shared_types::traits::CallableInventoryReader;
 use advance_shared_types::traits::{EventBusEmit, GrantCheck};
@@ -422,6 +447,18 @@ impl McpControlPlane {
         if manifest.transport.is_stdio() && !self.allow_stdio {
             return Err("stdio servers are disabled (mcp.allow-stdio: false)".into());
         }
+        // Only a file the operator wrote may reach the host's loopback (and so exempt it).
+        if let (Some(origin), McpTransportDecl::Http { endpoint_url }) =
+            (&manifest.origin, &manifest.transport)
+        {
+            if LoopbackExemptions::is_loopback_endpoint(endpoint_url) {
+                return Err(format!(
+                    "the pack {} wrote it and its endpoint is on loopback, which only a \
+                     server file the operator wrote may reach",
+                    origin.pack
+                ));
+            }
+        }
         Ok(manifest)
     }
 }
@@ -519,9 +556,11 @@ impl McpServerFiles {
         &self.servers
     }
 
-    /// Whether a server needs the secret store: it names `secret-refs`.
+    /// Whether a server needs the secret store: it names `secret-refs` or binds `credentials`.
     pub fn need_secrets(&self) -> bool {
-        self.servers.iter().any(|m| !m.secret_refs.is_empty())
+        self.servers
+            .iter()
+            .any(|m| !m.secret_refs.is_empty() || !m.credentials.is_empty())
     }
 
     /// The warnings of the scan so far.
@@ -554,9 +593,10 @@ impl McpServerFiles {
         self.servers = kept;
     }
 
-    /// Build the client's server set, resolving each `secret-refs` entry through `secrets`.
-    /// A server whose secret is missing is left out with a warning, as is every server that
-    /// needs secrets when there is no store (`None`).
+    /// Build the client's server set, resolving each `secret-refs` entry through `secrets` and
+    /// checking that `secrets` holds the secret of each credential. A server whose secret is
+    /// missing is left out with a warning, as is every server that needs secrets when there is
+    /// no store (`None`).
     pub fn into_servers(self, secrets: Option<&dyn ManifestSecrets>) -> McpServers {
         let mut warnings = self.warnings;
         let mut loopback = LoopbackExemptions::none();
@@ -603,7 +643,15 @@ impl McpServerFiles {
     }
 }
 
-/// The client's entry for the server `manifest` describes.
+/// Why a server that names secrets is skipped while no secret store is open.
+const NO_SECRET_STORE: &str =
+    "it needs secrets and the secret store is not open; the store is opened when the daemon \
+     starts";
+
+/// The client's entry for the server `manifest` describes. A stdio server's `secret-refs` are
+/// resolved through `secrets` into its environment. An http server's `credentials` stay secret
+/// names, which the http chain resolves at each request: here they are only checked to be in
+/// `secrets`, and no value is kept.
 fn server_entry(
     manifest: McpServerManifest,
     secrets: Option<&dyn ManifestSecrets>,
@@ -612,13 +660,7 @@ fn server_entry(
         McpTransportDecl::Stdio { command, args } => {
             let mut env = BTreeMap::new();
             for (variable, key) in &manifest.secret_refs {
-                let Some(secrets) = secrets else {
-                    return Err(
-                        "it needs secrets and the secret store is not open; the store is \
-                         opened when the daemon starts"
-                            .into(),
-                    );
-                };
+                let secrets = secrets.ok_or(NO_SECRET_STORE)?;
                 let value = secrets.get(key).ok_or_else(|| {
                     format!("secret {key:?} (for {variable}) is not in the secret store")
                 })?;
@@ -634,11 +676,21 @@ fn server_entry(
             if !allowlist.matches(&endpoint_url) {
                 return Err("its endpoint-url is not a URL the http chain can address".into());
             }
+            for binding in &manifest.credentials {
+                let secrets = secrets.ok_or(NO_SECRET_STORE)?;
+                if secrets.get(&binding.secret_name).is_none() {
+                    return Err(format!(
+                        "secret {:?} (for its {} credential) is not in the secret store",
+                        binding.secret_name,
+                        credential_label(&binding.position)
+                    ));
+                }
+            }
             McpTransportSpec::Http {
                 endpoint_url,
                 capability: HttpCapability {
                     allowlist,
-                    credentials: Vec::new(),
+                    credentials: manifest.credentials,
                     component_id: manifest.server_id.clone(),
                 },
             }
@@ -651,6 +703,17 @@ fn server_entry(
         tool_patterns: None,
         tool_schemas: BTreeMap::new(),
     })
+}
+
+/// A credential's position as a server file writes it, for a warning.
+fn credential_label(position: &CredentialPosition) -> String {
+    match position {
+        CredentialPosition::BearerToken => "bearer".into(),
+        CredentialPosition::BasicAuth { .. } => "basic".into(),
+        CredentialPosition::CustomHeader { key } => format!("header {key:?}"),
+        CredentialPosition::QueryParam { key } => format!("query {key:?}"),
+        CredentialPosition::UrlPath { key } => format!("url-path {key:?}"),
+    }
 }
 
 /// The allowlist pattern of an endpoint: its origin (`scheme://host[:port]/`), so the server
@@ -701,7 +764,8 @@ fn executor_config(
 
 /// The cap-http security chain of the http servers, and the leak detector it shares with the
 /// stdio transports. Its `security.*` tunables are read live off `config_provider`, as on the
-/// daemon's other chains; `secrets` is the store it would resolve credential bindings from.
+/// daemon's other chains; `secrets` is the store it resolves the servers' credentials in, at
+/// each request.
 fn http_chain(
     secrets: Arc<SecretStore>,
     limits: &McpClientLimits,
@@ -722,8 +786,8 @@ fn http_chain(
     (Arc::new(chain), leak)
 }
 
-/// A secret store that holds nothing: what the http chain is built on when no server needs a
-/// secret.
+/// A secret store that holds nothing: what the http chain is built on when the daemon has no
+/// secret store open.
 fn empty_secret_store() -> Arc<SecretStore> {
     Arc::new(SecretStore::new(
         Zeroizing::new([0u8; 32]),
@@ -787,8 +851,6 @@ pub struct McpComposition<'a> {
 /// the daemon calls once the pack runtime is attached, after its sweep of the files of
 /// packs that are gone.
 pub fn compose_mcp(parts: McpComposition<'_>) -> Arc<McpRuntime> {
-    // One store for everything MCP reads secrets from: the daemon's when a server needs
-    // secrets, an empty one otherwise.
     let origins: BTreeMap<String, String> = parts
         .servers
         .manifests()
@@ -800,12 +862,11 @@ pub fn compose_mcp(parts: McpComposition<'_>) -> Arc<McpRuntime> {
                 .map(|origin| (manifest.server_id.clone(), origin.pack.clone()))
         })
         .collect();
+    // One store for everything MCP reads secrets from: the daemon's whenever one is open,
+    // whatever opened it, so a server a later reload admits resolves its secrets there too; an
+    // empty one otherwise.
     let live_secrets = parts.secret_store.clone();
-    let secret_store = match live_secrets.as_ref() {
-        Some(store) if parts.servers.need_secrets() => Some(Arc::clone(store)),
-        _ => None,
-    };
-    let manifest_secrets = secret_store
+    let manifest_secrets = live_secrets
         .as_ref()
         .map(|store| CapSecretsSecretStore::new(Arc::clone(store)));
     let servers = parts.servers.into_servers(
@@ -822,7 +883,7 @@ pub fn compose_mcp(parts: McpComposition<'_>) -> Arc<McpRuntime> {
     let limits = client_limits(parts.config);
     let loopback = servers.loopback.clone();
     let (chain, leak) = http_chain(
-        secret_store.unwrap_or_else(empty_secret_store),
+        live_secrets.clone().unwrap_or_else(empty_secret_store),
         &limits,
         servers.loopback,
         parts.config_provider,
@@ -875,6 +936,8 @@ pub struct McpRuntime {
     /// those not among them.
     printed: Mutex<BTreeSet<String>>,
     plane: McpControlPlane,
+    /// The daemon's secret store, when one is open: what a reload resolves the servers'
+    /// secrets in (the http chain holds the same store).
     secret_store: Option<Arc<SecretStore>>,
     origins: Mutex<BTreeMap<String, String>>,
     /// The installed packs (`name@version`) that are trusted, as the pack runtime last
@@ -1704,12 +1767,14 @@ impl McpEntrySink for ControlPlaneMcpSink {
 }
 
 /// Whether `manifest` describes exactly the server `registration` writes: the same id,
-/// description, transport, secret-ref ids and origin.
+/// description, transport, secret-ref ids and origin, and no credentials (a registration binds
+/// none).
 fn matches_registration(manifest: &McpServerManifest, registration: &McpRegistration) -> bool {
     manifest.server_id == registration.server_id
         && manifest.description == registration.description
         && manifest.transport == registration.transport
         && manifest.secret_refs == registration.secret_refs
+        && manifest.credentials.is_empty()
         && manifest.origin.as_ref().is_some_and(|origin| {
             origin.pack == registration.origin_pack && origin.config_ref == registration.origin_ref
         })
@@ -1845,7 +1910,7 @@ mod tests {
     use advance_database::{R2d2SqliteIndexHandle, SqliteIndexHandle};
     use advance_shared_types::capability::{CapParams, GrantDecision};
     use advance_shared_types::event::Event;
-    use advance_shared_types::security_validator::{ScanContext, ScanResult};
+    use advance_shared_types::security_validator::{CredentialBinding, ScanContext, ScanResult};
     use cap_grant::{
         CapParam, Grant, GrantId, GrantIssuer, GrantProvenance, GrantSqliteIndex, GrantStatus,
         GrantTtl,
@@ -2431,6 +2496,164 @@ mod tests {
         ] {
             assert!(!servers.loopback.covers(forbidden), "{forbidden}");
         }
+    }
+
+    /// The operator file of the http server `id` at `endpoint`, binding `credentials` (a YAML
+    /// flow sequence).
+    fn credentialed_server(workspace: &Path, id: &str, endpoint: &str, credentials: &str) {
+        server_file(
+            workspace,
+            &format!("{id}.yaml"),
+            &format!(
+                "server-id: {id}\ntransport:\n  kind: http\n  endpoint-url: {endpoint}\n\
+                 credentials: {credentials}\n"
+            ),
+        );
+    }
+
+    // An http server's credentials stay secret names in its entry, each checked to be in the
+    // store; a server whose secret is missing is skipped with a warning naming the secret and
+    // the position, and without a store every server that binds credentials is skipped. A
+    // pack's file may not bind credentials at all.
+    #[test]
+    fn credentials_bind_secret_names_to_an_http_server() {
+        let ws = tempfile::tempdir().unwrap();
+        credentialed_server(
+            ws.path(),
+            "remote",
+            "https://mcp.example.com/mcp",
+            "[{position: bearer, secret: remote-token}, \
+             {position: header, key: X-Api-Key, secret: remote-key}]",
+        );
+        credentialed_server(
+            ws.path(),
+            "lacking",
+            "https://lacking.example.com/mcp",
+            "[{position: query, key: api_key, secret: absent-key}]",
+        );
+        http_server(ws.path(), "plain", "https://plain.example.com/mcp");
+        server_file(
+            ws.path(),
+            "packed.yaml",
+            &format!(
+                "server-id: packed\ntransport:\n  kind: http\n  \
+                 endpoint-url: https://packed.example.com/mcp\n\
+                 credentials: [{{position: bearer, secret: remote-token}}]\n{}",
+                origin_block("p@1.0.0", "packed")
+            ),
+        );
+        let secrets = ClosureSecretStore::new(|key| match key {
+            "remote-token" => Some("t0ken".to_string()),
+            "remote-key" => Some("k3y".to_string()),
+            _ => None,
+        });
+
+        let files = plane(ws.path()).scan();
+        assert_eq!(files.server_ids(), ["lacking", "plain", "remote"]);
+        let packed = one_warning(files.warnings(), "\"packed.yaml\"");
+        assert!(
+            packed.contains("is skipped")
+                && packed.contains("pack-origin server may not bind cap-secrets credentials"),
+            "{packed}"
+        );
+        assert!(files.need_secrets(), "credentials need the secret store");
+        let servers = files.into_servers(Some(&secrets));
+        match &servers.config.get("remote").unwrap().transport {
+            McpTransportSpec::Http { capability, .. } => assert_eq!(
+                capability.credentials,
+                [
+                    CredentialBinding {
+                        position: CredentialPosition::BearerToken,
+                        secret_name: "remote-token".into(),
+                    },
+                    CredentialBinding {
+                        position: CredentialPosition::CustomHeader {
+                            key: "X-Api-Key".into()
+                        },
+                        secret_name: "remote-key".into(),
+                    },
+                ]
+            ),
+            other => panic!("remote is an http server: {other:?}"),
+        }
+        let shown = format!("{:?}", servers.config);
+        for hidden in ["t0ken", "k3y", "remote-token", "remote-key"] {
+            assert!(!shown.contains(hidden), "the entry's Debug shows {hidden}");
+        }
+        assert!(servers.config.get("plain").is_ok());
+        assert!(servers.config.get("lacking").is_err());
+        let warning = one_warning(&servers.warnings, "server 'lacking' is skipped");
+        assert!(
+            warning.contains("\"absent-key\"") && warning.contains("query \"api_key\""),
+            "{warning}"
+        );
+        assert!(
+            servers
+                .warnings
+                .iter()
+                .all(|w| !w.contains("t0ken") && !w.contains("k3y")),
+            "a warning never holds a secret"
+        );
+
+        // Without a store, every server that binds credentials is left out, and only those.
+        let servers = plane(ws.path()).scan().into_servers(None);
+        assert_eq!(
+            servers
+                .config
+                .list_servers()
+                .map(|e| e.server_id.as_str())
+                .collect::<Vec<_>>(),
+            ["plain"]
+        );
+        for id in ["remote", "lacking"] {
+            let warning = one_warning(&servers.warnings, &format!("server '{id}' is skipped"));
+            assert!(warning.contains("secret store is not open"), "{warning}");
+        }
+    }
+
+    // A server file with an `origin` block may not reach the host's loopback: the loader skips
+    // it with a warning and exempts nothing for it, while an operator's loopback file keeps its
+    // exemption and a pack's file off loopback loads.
+    #[test]
+    fn a_pack_server_file_on_loopback_is_skipped_and_exempts_nothing() {
+        let ws = tempfile::tempdir().unwrap();
+        http_server(ws.path(), "operator", "http://127.0.0.1:8931/mcp");
+        for (id, endpoint) in [
+            ("packed", "http://127.0.0.1:8932/mcp"),
+            ("named", "http://localhost:8933/mcp"),
+            ("remote", "https://mcp.example.com/mcp"),
+        ] {
+            server_file(
+                ws.path(),
+                &format!("{id}.yaml"),
+                &format!(
+                    "server-id: {id}\ntransport:\n  kind: http\n  endpoint-url: {endpoint}\n{}",
+                    origin_block("p@1.0.0", id)
+                ),
+            );
+        }
+
+        let files = plane(ws.path()).scan();
+        assert_eq!(files.server_ids(), ["operator", "remote"]);
+        for name in ["\"packed.yaml\"", "\"named.yaml\""] {
+            let warning = one_warning(files.warnings(), name);
+            assert!(
+                warning.contains("is skipped")
+                    && warning.contains("the pack p@1.0.0 wrote it")
+                    && warning.contains("loopback"),
+                "{warning}"
+            );
+        }
+        let servers = files.into_servers(None);
+        assert!(servers.loopback.covers("http://127.0.0.1:8931/mcp"));
+        for refused in ["http://127.0.0.1:8932/mcp", "http://localhost:8933/mcp"] {
+            assert!(
+                !servers.loopback.covers(refused),
+                "a pack's file exempts nothing: {refused}"
+            );
+        }
+        assert!(servers.config.get("packed").is_err());
+        assert!(servers.config.get("remote").is_ok());
     }
 
     #[test]
