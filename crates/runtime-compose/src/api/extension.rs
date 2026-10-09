@@ -51,7 +51,9 @@ pub trait ComposeExtension: Send + Sync + 'static {
     }
 
     /// Host functions, after `inference` and before the host is built. Always
-    /// called (independent of the home's declarations).
+    /// called (independent of the home's declarations). A panic in a registered
+    /// handler is contained; see [`HostFunctionRegistrar`] for what the guest and
+    /// the calling agent's next turn see.
     fn host_functions(
         &self,
         cx: &ComposeCx,

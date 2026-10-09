@@ -1,10 +1,14 @@
 //! MODULE-001-T112 (c) — host-function and native-tool containment, and the
 //! capability, host-function and tool startup legs of T112 (e).
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant, SystemTime};
 
-use advance_runtime_compose::agent_config::parse_agents_config_with;
+use advance_runtime_compose::agent_config::{
+    active_capabilities_with, parse_agents_config_with, read_agent_yaml,
+};
+use advance_runtime_compose::agent_loop::WasmMessageHandler;
+use advance_runtime_compose::compose_log::LogHandle;
 use advance_runtime_compose::effective_capabilities::MAX_EXTENSION_CAPABILITIES;
 use advance_runtime_compose::registry::reserved_homes_for_test;
 use advance_runtime_compose::test_support::fixture::{
@@ -17,6 +21,9 @@ use advance_runtime_compose::{
     compose, log_keys, CapabilityRefusal, ComposeError, ExtensionFailure, ExtensionPhase,
     HostFunctionRefusal, ToolError, ToolRefusal,
 };
+use advance_scheduler::hook::{HookError, MessageHandler};
+use advance_scheduler::types::ComponentConfig;
+use advance_shared_types::mailbox::{ActionResult, Message, MessageKind};
 use serde_json::json;
 
 #[path = "support/t112c.rs"]
@@ -931,6 +938,301 @@ async fn module_001_ac31_t112e_host_function_panic_mid_turn_is_contained_and_nex
     .expect("second compose");
     rt.shutdown().await.expect("shutdown");
     assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
+}
+
+/// The `component.error` messages of the root loop's failed turns.
+fn turn_errors(home: &std::path::Path) -> Vec<String> {
+    events(home)
+        .into_iter()
+        .filter(|event| event["event_type"] == "component.error")
+        .map(|event| {
+            event["payload"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// `(trapped turns, turns refused on a poisoned Store)` among `errors`.
+fn trapped_and_poisoned(errors: &[String]) -> (usize, usize) {
+    let trapped = errors
+        .iter()
+        .filter(|error| error.starts_with("call_handle_message trap"))
+        .count();
+    let poisoned = errors
+        .iter()
+        .filter(|error| *error == "guest Store is poisoned")
+        .count();
+    assert_eq!(trapped + poisoned, errors.len(), "{errors:?}");
+    (trapped, poisoned)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac31_t112e_trapping_host_function_panic_fails_the_turn_and_next_turn_runs() {
+    let home = FixtureHome::new(h_c()).expect("home");
+    let log = MemoryComposeLog::new();
+    let probe = Arc::new(ComposeProbe::new());
+    let ext = FixtureExtension::standard();
+    let rec = ext.record();
+    let rt = compose(
+        home.options(Arc::new(log.clone()), Arc::clone(&probe)),
+        vec![ext.arc()],
+    )
+    .await
+    .expect("compose");
+    let (status, body) = msg(&probe, "plain a").await;
+    assert_eq!((status, body.as_str()), (200, "plain:probe:a"), "{body}");
+    // `call-plain` returns a bare `string`: a panic has no in-band answer, so the call
+    // traps and that turn fails; the agent's next turn runs normally.
+    for (panic, next, reply) in [
+        ("plain panic", "plain b", "plain:probe:b"),
+        ("plain panic-sync", "call c", "ok:probe:c"),
+    ] {
+        let (status, body) = msg(&probe, panic).await;
+        assert_eq!((status, body.as_str()), (502, ""), "{panic}");
+        let (status, body) = msg(&probe, next).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (200, reply),
+            "after {panic}: {body}"
+        );
+    }
+    let panicked: Vec<_> = log
+        .lines()
+        .into_iter()
+        .filter(|line| line.key == log_keys::EXT_HOST_FUNCTION_PANICKED)
+        .map(|line| line.text)
+        .collect();
+    assert_eq!(
+        panicked,
+        vec![
+            "advance: WARN extension fixture host function fixture:probe/host@0.1.0::call-plain panicked; the call traps";
+            2
+        ]
+    );
+    assert_eq!(log.count(log_keys::FRESH_INSTANCE_FAILED), 0);
+    assert_eq!(rec.host_calls.load(std::sync::atomic::Ordering::SeqCst), 5);
+
+    // Control, no contained panic: the handler returns `Err`, which traps the call as
+    // any host function's error does. The Store stays poisoned, as before: the next
+    // turn fails without reaching the guest.
+    let (status, body) = msg(&probe, "plain fail").await;
+    assert_eq!((status, body.as_str()), (502, ""));
+    let (status, body) = msg(&probe, "plain d").await;
+    assert_eq!((status, body.as_str()), (502, ""));
+    assert_eq!(rec.host_calls.load(std::sync::atomic::Ordering::SeqCst), 6);
+    rt.shutdown().await.expect("shutdown");
+    // Three trapped turns (two contained panics, one handler `Err`), one turn refused
+    // on the poisoned Store; no panic payload in a log line or a turn error.
+    let errors = turn_errors(home.home());
+    assert_eq!(trapped_and_poisoned(&errors), (3, 1));
+    for text in log.lines().into_iter().map(|line| line.text).chain(errors) {
+        assert!(!text.contains("fixture host function panic"), "{text}");
+    }
+    assert_gone_for_home(&probe, home.home(), None).await;
+
+    // Control, OSS only: the guest traps by itself. Its Store stays poisoned too.
+    let probe = Arc::new(ComposeProbe::new());
+    let ext = FixtureExtension::standard();
+    let rec = ext.record();
+    let baseline = alive_tasks();
+    let rt = compose(
+        home.options(Arc::new(MemoryComposeLog::new()), Arc::clone(&probe)),
+        vec![ext.arc()],
+    )
+    .await
+    .expect("second compose");
+    let (status, body) = msg(&probe, "trap").await;
+    assert_eq!((status, body.as_str()), (502, ""));
+    let (status, body) = msg(&probe, "call e").await;
+    assert_eq!((status, body.as_str()), (502, ""));
+    assert_eq!(rec.host_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    rt.shutdown().await.expect("shutdown");
+    assert_eq!(trapped_and_poisoned(&turn_errors(home.home())), (4, 2));
+    assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
+}
+
+fn guest_message(payload: &str) -> Message {
+    Message {
+        id: format!("t112e-{payload}"),
+        kind: MessageKind::User,
+        from: "user:t112e".into(),
+        to: "agent:root".into(),
+        payload: payload.as_bytes().to_vec(),
+        context: None,
+        timestamp: SystemTime::UNIX_EPOCH,
+        origin: None,
+    }
+}
+
+fn replies(result: &ActionResult) -> Vec<String> {
+    result
+        .actions
+        .iter()
+        .map(|action| String::from_utf8_lossy(&action.payload).into_owned())
+        .collect()
+}
+
+fn is_trap(result: Result<ActionResult, HookError>) -> bool {
+    matches!(result, Err(HookError::Failure(reason)) if reason.starts_with("call_handle_message trap"))
+}
+
+/// The root loop's handler on the composition's runtime and injector, so its host
+/// functions are the composition's (behind the production containment adapter).
+fn root_handler(
+    rt: &advance_runtime_compose::ComposedRuntime,
+    probe: &ComposeProbe,
+    home: &FixtureHome,
+    log: &MemoryComposeLog,
+) -> (WasmMessageHandler, ComponentConfig) {
+    let record = probe.record();
+    let runtime = record
+        .component_runtime
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .expect("component runtime");
+    let injector = record
+        .capability_injector
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .expect("capability injector");
+    let caps = active_capabilities_with(
+        read_agent_yaml(home.home()).as_deref(),
+        &record.effective_capabilities.clone().unwrap_or_default(),
+    );
+    let component =
+        build_agent::encode_core_to_component(ext_probe_core()).expect("probe component");
+    let loaded = runtime.load_component(&component).expect("load probe");
+    let root = rt.root_agent_id().to_owned();
+    let handler = WasmMessageHandler::new(
+        runtime,
+        loaded,
+        injector,
+        caps,
+        root.clone(),
+        "t112e".into(),
+    )
+    .with_log(LogHandle::new(Arc::new(log.clone())));
+    let config = ComponentConfig {
+        id: root,
+        config_data: None,
+        trigger_context: None,
+    };
+    (handler, config)
+}
+
+/// The same recovery on a protected (CONTRACT-216) turn, driven in the order the
+/// scheduler drives it: the trapped turn's Store is destroyed with its incarnation,
+/// the fresh instance gets a new incarnation, and the next protected turn drains
+/// normally. A trap that is not a contained panic leaves the Store destroyed; a fresh
+/// instance that cannot start is logged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_001_ac31_t112e_protected_turn_after_a_trapping_panic_runs_on_a_fresh_store() {
+    let home = FixtureHome::new(h_c()).expect("home");
+    let probe = Arc::new(ComposeProbe::new());
+    let ext = FixtureExtension::standard();
+    let rec = ext.record();
+    let rt = compose(
+        home.options(Arc::new(MemoryComposeLog::new()), Arc::clone(&probe)),
+        vec![ext.arc()],
+    )
+    .await
+    .expect("compose");
+    let log = MemoryComposeLog::new();
+    let (handler, config) = root_handler(&rt, &probe, &home, &log);
+    let state = handler.init(config.clone()).await.expect("init");
+
+    let first = handler.trusted_store_incarnation().expect("live Store");
+    handler.stamp_trusted_turn("turn-1").await.expect("stamp 1");
+    // The turn's error is the call's typed error (the host function's failure), and
+    // carries no panic payload.
+    match handler
+        .handle_message(&guest_message("plain panic"), state.clone())
+        .await
+    {
+        Err(HookError::Failure(reason))
+            if reason.starts_with("call_handle_message trap")
+                && reason.contains(
+                    "host handler error: extension fixture: host function fixture:probe/host@0.1.0::call-plain failed",
+                )
+                && !reason.contains("fixture host function panic") => {}
+        other => panic!("{other:?}"),
+    }
+    handler
+        .destroy_trusted_turn("turn-1")
+        .await
+        .expect("turn 1 Store destroyed");
+    assert_eq!(handler.trusted_store_incarnation(), None);
+    handler.before_next_turn().await;
+    let second = handler.trusted_store_incarnation().expect("fresh Store");
+    assert_ne!(second, first, "the fresh Store has a new incarnation");
+    handler.stamp_trusted_turn("turn-2").await.expect("stamp 2");
+    let reply = handler
+        .handle_message(&guest_message("plain x"), state.clone())
+        .await
+        .expect("turn 2");
+    assert_eq!(replies(&reply), ["plain:probe:x"]);
+    assert_eq!(
+        handler.clear_trusted_turn("turn-2").await.expect("drained"),
+        1
+    );
+    // Nothing to do between two turns that did not trap.
+    handler.before_next_turn().await;
+    assert_eq!(handler.trusted_store_incarnation(), Some(second));
+
+    // Control: the handler's own `Err` is not a contained panic.
+    handler.stamp_trusted_turn("turn-3").await.expect("stamp 3");
+    assert!(is_trap(
+        handler
+            .handle_message(&guest_message("plain fail"), state.clone())
+            .await
+    ));
+    handler
+        .destroy_trusted_turn("turn-3")
+        .await
+        .expect("turn 3 Store destroyed");
+    handler.before_next_turn().await;
+    assert_eq!(handler.trusted_store_incarnation(), None, "stays destroyed");
+    match handler
+        .handle_message(&guest_message("plain y"), state.clone())
+        .await
+    {
+        Err(HookError::Failure(reason)) if reason == "guest Store is poisoned" => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(rec.host_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(log.count(log_keys::FRESH_INSTANCE_FAILED), 0);
+    drop(handler);
+
+    // A fresh instance that cannot start (here: the trapped turn was never retired)
+    // is logged, and the Store stays poisoned.
+    let (handler, config) = root_handler(&rt, &probe, &home, &log);
+    let state = handler.init(config).await.expect("init");
+    handler.stamp_trusted_turn("turn-1").await.expect("stamp");
+    assert!(is_trap(
+        handler
+            .handle_message(&guest_message("plain panic"), state)
+            .await
+    ));
+    handler.before_next_turn().await;
+    assert_eq!(handler.trusted_store_incarnation(), None);
+    let failed: Vec<_> = log
+        .lines()
+        .into_iter()
+        .filter(|line| line.key == log_keys::FRESH_INSTANCE_FAILED)
+        .map(|line| line.text)
+        .collect();
+    assert_eq!(
+        failed,
+        [format!(
+            "advance: WARN agent {}: no fresh guest instance after a contained extension panic: hook failure: guest Store initialized during an active turn",
+            rt.root_agent_id()
+        )]
+    );
+    drop(handler);
+    rt.shutdown().await.expect("shutdown");
+    assert_gone_for_home(&probe, home.home(), None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

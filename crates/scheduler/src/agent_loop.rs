@@ -682,10 +682,15 @@ impl AgentLoopDriverImpl {
     /// `POST /msg` correlation slot + clear its single-in-flight guard without
     /// waiting for the reply timeout.
     ///
+    /// Between two turns (after the observer, and only when the loop goes on)
+    /// the loop awaits [`MessageHandler::before_next_turn`].
+    ///
     /// Known limitation: the daemon's `WasmMessageHandler` reuses ONE Wasmtime
     /// `Store` across turns; a guest trap poisons it, so after the first trap
     /// every turn fails instantly (perpetual-error) with no auto-recovery.
     /// Restart-on-trap is the daemon restart-policy's job (§1.4.2b / AC-21).
+    /// The one exception is a trap caused by a contained extension host-function
+    /// panic: the handler then starts a fresh instance in `before_next_turn`.
     pub async fn serve(
         &self,
         agent_id: &str,
@@ -708,6 +713,7 @@ impl AgentLoopDriverImpl {
             if self.stop_requested.load(Ordering::SeqCst) {
                 break;
             }
+            self.message_handler.before_next_turn().await;
         }
     }
 
@@ -748,7 +754,7 @@ impl AgentLoopDriverImpl {
             Some(s) => s,
             None => return,
         };
-        for _ in 0..n {
+        for turn in 1..=n {
             state = self.run_turn_once(agent_id, state).await;
             if let Some(observer) = &self.turn_observer {
                 observer.on_turn_complete(agent_id);
@@ -758,6 +764,9 @@ impl AgentLoopDriverImpl {
             // test-support driver witnesses the policy-driven break — T-029b).
             if self.stop_requested.load(Ordering::SeqCst) {
                 break;
+            }
+            if turn < n {
+                self.message_handler.before_next_turn().await;
             }
         }
     }

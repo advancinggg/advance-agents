@@ -168,6 +168,18 @@ pub trait MessageHandler: Send + Sync {
             "synchronous protected Store destruction unavailable".to_string(),
         ))
     }
+
+    /// Called by the serving loops ([`serve`] and the bounded `serve_n_turns`)
+    /// between two turns: after the previous turn has been fully retired — its
+    /// trap handling and the turn observer included — and before the next turn
+    /// is received. It is not called after the last turn, once the restart
+    /// policy stopped the loop, or by the single-turn `run_agent`. A handler
+    /// that can recover from the previous turn's failure (for example by
+    /// replacing a trapped guest instance with a fresh one) does it here, so
+    /// the next turn runs normally. The default does nothing.
+    ///
+    /// [`serve`]: crate::agent_loop::AgentLoopDriverImpl::serve
+    async fn before_next_turn(&self) {}
 }
 
 /// Scheduler-local inversion seam for CONTRACT-216 execution. The concrete

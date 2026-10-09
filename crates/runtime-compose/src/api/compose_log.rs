@@ -100,6 +100,9 @@ pub mod log_keys {
     pub const AUTO_TICK_SETTLE_FAILED: &str = "auto_tick.settle_failed";
     /// stderr: recording a completed round failed.
     pub const COMPLETE_ROUND_FAILED: &str = "agent_loop.complete_round_failed";
+    /// stderr: after a contained extension host-function panic trapped a turn, the
+    /// agent's fresh instance could not be started (its turns keep failing).
+    pub const FRESH_INSTANCE_FAILED: &str = "agent_loop.fresh_instance_failed";
     /// stderr: a child gets no `fs` grant (the parent's grant is path-restricted).
     pub const PERCHILD_NO_FS_GRANT: &str = "perchild.no_fs_grant";
     /// stderr: a child gets no grant for a capability.
@@ -269,6 +272,7 @@ pub mod log_keys {
         AUTO_TICK_CANCEL_FAILED,
         AUTO_TICK_SETTLE_FAILED,
         COMPLETE_ROUND_FAILED,
+        FRESH_INSTANCE_FAILED,
         PERCHILD_NO_FS_GRANT,
         PERCHILD_NO_GRANT,
         PERCHILD_UNBOUND,

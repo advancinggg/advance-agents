@@ -17,11 +17,12 @@ use async_trait::async_trait;
 
 use advance_scheduler::agent_loop::AgentLoopDriverImpl;
 use advance_scheduler::hook::{
-    BootstrapError, CrashCascadeSink, HookError, MessageHandler, RunBootstrap,
+    BootstrapError, CrashCascadeSink, HookError, MessageHandler, RunBootstrap, TurnObserver,
 };
 use advance_scheduler::types::{
     ComponentConfig, ComponentId, RestartPolicy, TrapError, WasmInstance,
 };
+use advance_scheduler::AgentLoopDriver;
 use advance_shared_types::context::{
     AssemblyContext, AssemblyError, AssemblyResult, ContextAssembler, TierTokenCounts,
 };
@@ -378,4 +379,208 @@ async fn t029c_crash_cascade_sink_on_crash_only() {
         1,
         "None crash_sink leaves the Never-policy trap path unchanged"
     );
+}
+
+/// One ordered record of what the loop asked of the handler, the trap emitter and the
+/// turn observer.
+type Sequence = Arc<Mutex<Vec<String>>>;
+
+/// Traps on its even turns (0, 2, ...), succeeds on its odd turns, and records every
+/// call, `before_next_turn` included.
+struct SequenceHandler {
+    sequence: Sequence,
+    turns: Mutex<usize>,
+}
+#[async_trait]
+impl MessageHandler for SequenceHandler {
+    async fn init(&self, _config: ComponentConfig) -> Result<Vec<u8>, HookError> {
+        self.sequence.lock().unwrap().push("init".into());
+        Ok(Vec::new())
+    }
+    async fn handle_message(
+        &self,
+        _msg: &Message,
+        _state: Vec<u8>,
+    ) -> Result<ActionResult, HookError> {
+        let n = {
+            let mut turns = self.turns.lock().unwrap();
+            *turns += 1;
+            *turns - 1
+        };
+        self.sequence.lock().unwrap().push(format!("handle {n}"));
+        if n % 2 == 0 {
+            return Err(HookError::Failure(format!("trap {n}")));
+        }
+        Ok(ActionResult {
+            new_state: Vec::new(),
+            actions: Vec::<AgentAction>::new(),
+        })
+    }
+    async fn before_next_turn(&self) {
+        self.sequence.lock().unwrap().push("next".into());
+    }
+}
+
+struct SequenceBus(Sequence);
+impl EventBusEmit for SequenceBus {
+    fn emit(&self, event: Event) {
+        self.0.lock().unwrap().push(event.event_type);
+    }
+}
+
+struct SequenceObserver(Sequence);
+impl TurnObserver for SequenceObserver {
+    fn on_turn_complete(&self, _agent_id: &str) {
+        self.0.lock().unwrap().push("observed".into());
+    }
+}
+
+/// Yields `left` messages, then parks every later `recv` (as an idle mailbox does).
+struct ParkingMailbox {
+    left: Mutex<usize>,
+}
+#[async_trait]
+impl MailboxReader for ParkingMailbox {
+    async fn recv(&self, agent_id: &str) -> Message {
+        let more = {
+            let mut left = self.left.lock().unwrap();
+            let more = *left > 0;
+            if more {
+                *left -= 1;
+            }
+            more
+        };
+        if !more {
+            std::future::pending::<()>().await;
+        }
+        YieldMailbox.recv(agent_id).await
+    }
+    fn poll(&self, _agent_id: &str) -> Option<Message> {
+        None
+    }
+    fn depth(&self, _agent_id: &str) -> usize {
+        0
+    }
+    fn freeze(&self, _agent_id: &str) {}
+    fn unfreeze(&self, _agent_id: &str) {}
+}
+
+fn sequence_driver(
+    mailbox: Arc<dyn MailboxReader>,
+    sequence: &Sequence,
+    policy: Option<RestartPolicy>,
+) -> AgentLoopDriverImpl {
+    let mut driver = AgentLoopDriverImpl::new(
+        mailbox,
+        Arc::new(OkAssembler),
+        Arc::new(OkPostProcessor),
+        Arc::new(OkDispatcher),
+        Arc::new(OkBootstrap),
+        Arc::new(SequenceHandler {
+            sequence: Arc::clone(sequence),
+            turns: Mutex::new(0),
+        }),
+    )
+    .with_component_error_emitter(Arc::new(SequenceBus(Arc::clone(sequence))))
+    .with_turn_observer(Arc::new(SequenceObserver(Arc::clone(sequence))));
+    if let Some(policy) = policy {
+        driver = driver.with_restart_policy(policy);
+    }
+    driver
+}
+
+fn recorded(sequence: &Sequence) -> Vec<String> {
+    sequence.lock().unwrap().clone()
+}
+
+/// MODULE-001-AC-31 (the loop's part of "the next turn runs normally"): the serving
+/// loops await `MessageHandler::before_next_turn` between two turns — after the previous
+/// turn, its trap handling and the turn observer — and never after the last turn, once
+/// the restart policy stopped the loop, or from the single-turn `run_agent`.
+#[tokio::test]
+async fn module_001_ac31_serving_loops_prepare_the_handler_between_turns() {
+    // `serve` (the daemon's loop): three turns, then the mailbox is idle.
+    let sequence: Sequence = Arc::default();
+    let driver = Arc::new(sequence_driver(
+        Arc::new(ParkingMailbox {
+            left: Mutex::new(3),
+        }),
+        &sequence,
+        None,
+    ));
+    let serving = tokio::spawn({
+        let driver = Arc::clone(&driver);
+        async move { driver.serve("agent:trap", cfg(), inst()).await }
+    });
+    let expected = [
+        "init",
+        "handle 0",
+        "component.error",
+        "observed",
+        "next",
+        "handle 1",
+        "observed",
+        "next",
+        "handle 2",
+        "component.error",
+        "observed",
+        "next",
+    ];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while recorded(&sequence).len() < expected.len() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "serve stalled at {:?}",
+            recorded(&sequence)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Parked on the idle mailbox: nothing more happens.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!serving.is_finished(), "serve parks on the idle mailbox");
+    serving.abort();
+    assert_eq!(recorded(&sequence), expected);
+
+    // `serve_n_turns`: between the turns only.
+    let sequence: Sequence = Arc::default();
+    sequence_driver(Arc::new(YieldMailbox), &sequence, None)
+        .serve_n_turns("agent:trap", cfg(), inst(), 3)
+        .await;
+    assert_eq!(
+        recorded(&sequence),
+        [
+            "init",
+            "handle 0",
+            "component.error",
+            "observed",
+            "next",
+            "handle 1",
+            "observed",
+            "next",
+            "handle 2",
+            "component.error",
+            "observed",
+        ]
+    );
+
+    // A `Never` policy stops the loop at the first trap: there is no next turn.
+    let sequence: Sequence = Arc::default();
+    sequence_driver(
+        Arc::new(YieldMailbox),
+        &sequence,
+        Some(RestartPolicy::Never),
+    )
+    .serve_n_turns("agent:trap", cfg(), inst(), 3)
+    .await;
+    assert_eq!(
+        recorded(&sequence),
+        ["init", "handle 0", "component.error", "observed"]
+    );
+
+    // The single-turn `run_agent` never prepares a next turn.
+    let sequence: Sequence = Arc::default();
+    sequence_driver(Arc::new(YieldMailbox), &sequence, None)
+        .run_agent("agent:trap", cfg(), inst())
+        .await;
+    assert_eq!(recorded(&sequence), ["init", "handle 0", "component.error"]);
 }

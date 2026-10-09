@@ -2,9 +2,10 @@
 //!
 //! Targets the `advance-host-ext-probe` world (imports `fixture:probe/host@0.1.0`,
 //! exports `message-driven` + `runnable`). On `handle-message` a payload of
-//! `call <arg>` calls the host function and replies `ok:<v>` or `err:<e>`; any
-//! other payload replies `noop`. The guest always returns `Ok` so a host-side
-//! error cannot poison the store.
+//! `call <arg>` calls `call` and replies `ok:<v>` or `err:<e>`; `plain <arg>` calls
+//! `call-plain` (no error slot) and replies `plain:<v>`; `trap` traps the guest
+//! itself; any other payload replies `noop`. The guest never returns `Err`, so a
+//! host-side error cannot poison the store.
 
 wit_bindgen::generate!({
     path: "wit",
@@ -32,6 +33,10 @@ impl MessageDrivenGuest for ProbeGuest {
                 Ok(value) => format!("ok:{value}"),
                 Err(error) => format!("err:{error}"),
             }
+        } else if let Some(arg) = line.strip_prefix("plain ") {
+            format!("plain:{}", fixture::probe::host::call_plain(arg))
+        } else if line == "trap" {
+            core::arch::wasm32::unreachable()
         } else {
             "noop".to_string()
         };

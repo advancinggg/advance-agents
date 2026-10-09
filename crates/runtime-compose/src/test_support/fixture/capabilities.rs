@@ -16,6 +16,8 @@ use super::FixtureRecord;
 pub const PROBE_CAPABILITY: &str = "fixture.probe";
 pub const PROBE_NAMESPACE: &str = "fixture:probe/host@0.1.0";
 pub const PROBE_FUNCTION: &str = "call";
+/// `call-plain: func(input: string) -> string` — no error slot in the result.
+pub const PROBE_PLAIN_FUNCTION: &str = "call-plain";
 pub const ECHO_TOOL: &str = "fixture.echo";
 
 #[derive(Clone)]
@@ -38,26 +40,39 @@ pub struct FixtureSpec {
 }
 
 impl FixtureSpec {
-    /// capabilities `[fixture.probe]`; host function `fixture.probe` →
+    /// capabilities `[fixture.probe]`; host functions under `fixture.probe`:
     /// `fixture:probe/host@0.1.0::call` (no PanicAnswer: the function returns
-    /// `result<string, string>`, so the automatic in-band answer applies);
-    /// tool `fixture.echo`.
+    /// `result<string, string>`, so the automatic in-band answer applies) and
+    /// `::call-plain` (returns `string`: a panic traps the call); tool
+    /// `fixture.echo`.
     pub fn standard() -> Self {
         Self {
             capabilities: &[PROBE_CAPABILITY],
-            host_functions: vec![FixtureHostFn {
-                capability: PROBE_CAPABILITY,
-                namespace: PROBE_NAMESPACE,
-                name: PROBE_FUNCTION,
-            }],
+            host_functions: vec![
+                FixtureHostFn {
+                    capability: PROBE_CAPABILITY,
+                    namespace: PROBE_NAMESPACE,
+                    name: PROBE_FUNCTION,
+                },
+                FixtureHostFn {
+                    capability: PROBE_CAPABILITY,
+                    namespace: PROBE_NAMESPACE,
+                    name: PROBE_PLAIN_FUNCTION,
+                },
+            ],
             tools: vec![FixtureTool { id: ECHO_TOOL }],
         }
     }
 }
 
+/// Answers `probe:<input>` (`call`: `ok(..)`; `call-plain`: the bare string). Input
+/// `panic` panics while the future is polled, `panic-sync` while it is built; `fail`
+/// returns `Err` without panicking; `grant:<cap>` reports the grant check.
 pub struct ProbeHandler {
     pub(crate) record: Arc<FixtureRecord>,
     pub(crate) cx: ComposeCx,
+    /// Registered as `call-plain`: answers a bare `string`.
+    pub(crate) plain: bool,
 }
 
 impl HostFunctionHandler for ProbeHandler {
@@ -75,6 +90,15 @@ impl HostFunctionHandler for ProbeHandler {
         if input == "panic-sync" {
             panic!("fixture host function panic (sync)");
         }
+        let plain = self.plain;
+        let answer = move |text: String| {
+            let text = Val::String(text);
+            if plain {
+                vec![text]
+            } else {
+                vec![Val::Result(Ok(Some(Box::new(text))))]
+            }
+        };
         if let Some(cap) = input.strip_prefix("grant:") {
             let decision = self.cx.grants().check(cap, &CapParams::empty());
             let d = match decision {
@@ -82,18 +106,19 @@ impl HostFunctionHandler for ProbeHandler {
                 GrantDecision::Deny(_) => "deny",
             };
             let agent = ctx.agent_id;
-            let reply = format!("probe:grant:{cap}={d} agent={agent}");
-            return Box::pin(async move {
-                Ok(vec![Val::Result(Ok(Some(Box::new(Val::String(reply)))))])
-            });
+            let reply = answer(format!("probe:grant:{cap}={d} agent={agent}"));
+            return Box::pin(async move { Ok(reply) });
         }
         Box::pin(async move {
             if input == "panic" {
                 panic!("fixture host function panic");
             }
-            Ok(vec![Val::Result(Ok(Some(Box::new(Val::String(format!(
-                "probe:{input}"
-            ))))))])
+            if input == "fail" {
+                return Err(HostCallError::HandlerError(
+                    "fixture host function failed".into(),
+                ));
+            }
+            Ok(answer(format!("probe:{input}")))
         })
     }
 }

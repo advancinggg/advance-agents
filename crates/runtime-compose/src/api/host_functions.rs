@@ -14,6 +14,29 @@ use super::extension::ExtensionError;
 
 /// Records the extension's host functions; validated at [`register`](Self::register),
 /// replayed into the host registry after every extension's `host_functions` returned.
+///
+/// # Containment
+///
+/// Every registered handler runs behind a `catch_unwind` adapter, both while it builds
+/// its future and while that future is polled. A panic is logged under
+/// [`EXT_HOST_FUNCTION_PANICKED`](crate::api::log_keys::EXT_HOST_FUNCTION_PANICKED),
+/// never with its payload, and becomes that call's typed error:
+///
+/// - **With an error slot** — the function's single result is `result<_, string>`
+///   (answered `err("<HostFunctionFailure>")`), or its [`PanicAnswer`] returns values
+///   of the guest's result types — the call answers in band: the guest's call returns
+///   that value and the guest goes on.
+/// - **Without one**, the call traps and the guest's export call fails. In an agent's
+///   message turn, that turn ends with its typed error (the turn error any trap
+///   gives), and the agent loop starts a fresh instance of the agent's component
+///   (its `init` export runs again) before the agent's next turn, so that turn runs
+///   normally. The instance's linear memory is not kept; the state the host carries
+///   between turns is.
+///
+/// A handler that returns `Err(HostCallError)` has not panicked: the call traps as an
+/// OSS host function's error does, and the agent loop does not replace the agent's
+/// instance (its later turns fail until the runtime restarts). Give a function that
+/// can fail an error slot in its WIT result.
 pub struct HostFunctionRegistrar {
     extension: &'static str,
     declared: &'static [&'static str],
@@ -250,7 +273,7 @@ impl HostFunctionDef {
     /// The value the guest receives when the handler panics. Optional: without one,
     /// a function whose single result is `result<T, string>` answers
     /// `err("<HostFunctionFailure Display>")` automatically; any other result shape
-    /// traps the call.
+    /// traps the call (see [`HostFunctionRegistrar`], Containment).
     pub fn with_panic_answer(mut self, answer: PanicAnswer) -> Self {
         self.panic_answer = Some(answer);
         self

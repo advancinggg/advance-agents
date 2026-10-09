@@ -22,7 +22,7 @@ mod squatter;
 
 pub use capabilities::{
     EchoTool, FixtureHostFn, FixtureSpec, FixtureTool, ProbeHandler, ECHO_TOOL, PROBE_CAPABILITY,
-    PROBE_FUNCTION, PROBE_NAMESPACE,
+    PROBE_FUNCTION, PROBE_NAMESPACE, PROBE_PLAIN_FUNCTION,
 };
 pub use client::{
     client_message_turn, mint_browser_session, mint_session, mint_session_with, post_msg,
@@ -200,6 +200,7 @@ impl ComposeExtension for FixtureExtension {
                 let handler = Arc::new(ProbeHandler {
                     record: Arc::clone(&self.record),
                     cx: cx.clone(),
+                    plain: host_fn.name == PROBE_PLAIN_FUNCTION,
                 });
                 reg.register(HostFunctionDef::new(
                     host_fn.capability,

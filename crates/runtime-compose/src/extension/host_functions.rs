@@ -20,6 +20,7 @@ use crate::api::{
 use crate::compose_log::LogHandle;
 use crate::extension::call::{scope, scope_sync, CallIdentity};
 use crate::extension::guard;
+use crate::extension::guest_call;
 use crate::extension::set::ExtensionSet;
 
 type BoxedHostFuture =
@@ -86,6 +87,14 @@ pub(crate) fn run_host_functions(
     Ok(n)
 }
 
+/// The containment adapter every extension host function is replayed behind (ADR
+/// 2026-10-03 D2, Containment). The extension's handler runs under `catch_unwind`, both
+/// while it builds its future and while that future is polled, with the call identity
+/// in scope. A panic is logged without its payload and answers in band when the
+/// guest's result type leaves room for it (a conforming [`PanicAnswer`], else the
+/// automatic `err` of a single `result<_, string>`). Otherwise the call traps, and the
+/// adapter marks the agent loop's guest call ([`guest_call`]) so that the loop starts
+/// a fresh instance of the agent's component before its next turn.
 pub(crate) struct ContainedHostFunction {
     failure: HostFunctionFailure,
     inner: Option<Arc<dyn HostFunctionHandler>>,
@@ -237,6 +246,7 @@ impl Fallback {
             return Ok(auto.clone());
         }
         self.log_panicked("the call traps");
+        guest_call::mark_trapped_by_contained_panic();
         Err(HostCallError::HandlerError(self.failure.to_string()))
     }
 
@@ -1361,6 +1371,110 @@ mod tests {
             )]
         );
         assert_no_payload(&sink);
+    }
+
+    /// MODULE-001-AC-31 (containment, the trapping leg): only a panic that leaves no
+    /// in-band answer marks the agent loop's guest call; an in-band answer, a handler
+    /// that returns `Err`, and a refused signature leave it unmarked.
+    /// One host call inside the agent loop's guest call. As in the injector, the
+    /// handler's future is built and polled inside the guest's call.
+    async fn in_guest_call(
+        contained: &ContainedHostFunction,
+        func: &ComponentFunc,
+        results_len: usize,
+    ) -> (Result<Vec<Val>, HostCallError>, bool) {
+        guest_call::run(async {
+            contained
+                .call_typed(func, ctx(), Vec::new(), results_len)
+                .await
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn module_001_ac31_contained_panic_marks_the_guest_call_only_when_it_traps() {
+        let funcs = load_funcs(PANIC_WAT);
+        let auto = named(&funcs, "auto");
+        let variant_err = named(&funcs, "variant-err");
+        let plain = named(&funcs, "plain-u32");
+        let failed = || failure().to_string();
+
+        // Traps: no answer slot, no PanicAnswer — sync and async panics alike.
+        for (label, inner, func) in [
+            (
+                "sync, plain",
+                Arc::new(PanicOnBuild) as Arc<dyn HostFunctionHandler>,
+                plain,
+            ),
+            (
+                "async, plain",
+                Arc::new(PanicOnPoll) as Arc<dyn HostFunctionHandler>,
+                plain,
+            ),
+            (
+                "async, variant error",
+                Arc::new(PanicOnPoll) as Arc<dyn HostFunctionHandler>,
+                variant_err,
+            ),
+        ] {
+            let (contained, sink) = wrap(inner, None);
+            let (result, marked) = in_guest_call(&contained, func, 1).await;
+            match result {
+                Err(HostCallError::HandlerError(message)) if message == failed() => {}
+                other => panic!("{label}: {other:?}"),
+            }
+            assert!(marked, "{label}: the trapping panic marks the guest call");
+            assert!(texts(&sink)[0].1.ends_with("; the call traps"), "{label}");
+            assert_no_payload(&sink);
+        }
+
+        // In band: the automatic answer, and a usable PanicAnswer.
+        let (contained, _sink) = wrap(Arc::new(PanicOnPoll), None);
+        let (result, marked) = in_guest_call(&contained, auto, 1).await;
+        assert_eq!(result.expect("automatic answer"), auto_answer_value());
+        assert!(!marked, "an in-band answer does not mark the call");
+        let (contained, _sink) = wrap(
+            Arc::new(PanicOnBuild),
+            Some(PanicAnswer::new(|_| vec![Val::U32(9)])),
+        );
+        let (result, marked) = in_guest_call(&contained, plain, 1).await;
+        assert_eq!(result.expect("panic answer"), vec![Val::U32(9)]);
+        assert!(!marked, "a PanicAnswer does not mark the call");
+
+        // Not a panic: the handler's own `Err` traps as any host function's error.
+        let seq = Arc::new(Sequence {
+            n: AtomicUsize::new(0),
+            ok: vec![Val::U32(7)],
+            err: "x".into(),
+            sync: Mutex::new(None),
+            polled: Arc::new(Mutex::new(None)),
+        });
+        let (contained, _sink) = wrap(seq, None);
+        let (result, marked) = in_guest_call(&contained, plain, 1).await;
+        match result {
+            Err(HostCallError::HandlerError(message)) if message == "x" => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(!marked, "a returned Err is not a contained panic");
+
+        // A refused signature never reaches the extension, so nothing panicked.
+        let walker = load_funcs(WALKER_WAT);
+        let (contained, _sink) = wrap(Arc::new(PanicOnBuild), None);
+        let (result, marked) = in_guest_call(&contained, named(&walker, "list-var"), 0).await;
+        match result {
+            Err(HostCallError::HandlerError(message))
+                if message.starts_with("unsupported-signature: list<variant>") => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(!marked, "a refused signature does not mark the call");
+
+        // Outside a guest call the trapping leg still answers its typed error.
+        let (contained, sink) = wrap(Arc::new(PanicOnPoll), None);
+        match contained.call_typed(plain, ctx(), Vec::new(), 1).await {
+            Err(HostCallError::HandlerError(message)) if message == failed() => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(sink.count(log_keys::EXT_HOST_FUNCTION_PANICKED), 1);
     }
 
     const VAL_WAT: &str = r#"

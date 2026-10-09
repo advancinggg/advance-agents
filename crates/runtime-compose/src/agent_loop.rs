@@ -27,7 +27,7 @@
 //! - [`build_agent_loop`] — assembles all six deps into an `AgentLoopDriverImpl`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError};
 
 use async_trait::async_trait;
 use wasmtime::Store;
@@ -179,7 +179,14 @@ pub struct WasmMessageHandler {
     /// reacquire/reuse the Store even if task abort prevented async destruction.
     store_poisoned: AtomicBool,
     active_turn: StdMutex<Option<String>>,
-    /// Where a failed `complete_round` is reported ([`Self::with_log`]; none by default).
+    /// The config of the latest `init`, kept to start a fresh instance.
+    init_config: StdMutex<Option<ComponentConfig>>,
+    /// Set when the last guest call trapped because a contained extension
+    /// host-function panic left no in-band answer; `before_next_turn` then starts a
+    /// fresh instance. No other trap sets it.
+    fresh_instance_due: AtomicBool,
+    /// Where a failed `complete_round` or fresh instance is reported
+    /// ([`Self::with_log`]; none by default).
     log: LogHandle,
 }
 
@@ -206,6 +213,8 @@ impl WasmMessageHandler {
             store_epoch: AtomicU64::new(0),
             store_poisoned: AtomicBool::new(false),
             active_turn: StdMutex::new(None),
+            init_config: StdMutex::new(None),
+            fresh_instance_due: AtomicBool::new(false),
             log: LogHandle::null(),
         }
     }
@@ -219,7 +228,8 @@ impl WasmMessageHandler {
         self
     }
 
-    /// Report a failed per-turn `complete_round` to `log`.
+    /// Report a failed per-turn `complete_round`, or a fresh instance that could not
+    /// be started, to `log`.
     pub fn with_log(mut self, log: LogHandle) -> Self {
         self.log = log;
         self
@@ -229,6 +239,10 @@ impl WasmMessageHandler {
 #[async_trait]
 impl MessageHandler for WasmMessageHandler {
     async fn init(&self, config: ComponentConfig) -> Result<Vec<u8>, HookError> {
+        *self
+            .init_config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(config.clone());
         let mut ctx = ComponentCtx::new(self.agent_id.clone(), self.trace_id.clone(), Vec::new());
         // Phase-3 kickoff: set the session run_id on the ComponentCtx BEFORE
         // instantiation (instantiate consumes `ctx` by value into the Store and
@@ -367,12 +381,16 @@ impl MessageHandler for WasmMessageHandler {
         let wit_msg = wit_types::Message {
             payload: msg.payload.clone(),
         };
-        let call_result = {
+        let (call_result, trapped_by_contained_panic) = {
             let pair = owned.pair_mut();
-            pair.0
-                .advance_runtime_message_driven()
-                .call_handle_message(&mut pair.1, &wit_msg, &state)
-                .await
+            crate::extension::guest_call::run(
+                pair.0.advance_runtime_message_driven().call_handle_message(
+                    &mut pair.1,
+                    &wit_msg,
+                    &state,
+                ),
+            )
+            .await
         };
 
         let wit_result = match call_result {
@@ -387,6 +405,9 @@ impl MessageHandler for WasmMessageHandler {
             Err(error) => {
                 self.store_poisoned.store(true, Ordering::Release);
                 drop(owned);
+                if trapped_by_contained_panic {
+                    self.fresh_instance_due.store(true, Ordering::Release);
+                }
                 return Err(HookError::Failure(format!(
                     "call_handle_message trap: {error:?}"
                 )));
@@ -562,6 +583,36 @@ impl MessageHandler for WasmMessageHandler {
             *active = None;
         }
         Ok(())
+    }
+
+    /// After a turn whose guest call a contained extension host-function panic
+    /// trapped, start a fresh instance of the component (the same path as `init`,
+    /// which replaces the destroyed Store under a new incarnation), so the next turn
+    /// runs normally. The guest's linear memory is not kept; the state the host
+    /// carries between turns is. Every other trap leaves the Store poisoned, as
+    /// before. A fresh instance that cannot be started is logged, and the Store
+    /// stays poisoned.
+    async fn before_next_turn(&self) {
+        if !self.fresh_instance_due.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let config = self
+            .init_config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(config) = config else {
+            return;
+        };
+        if let Err(error) = self.init(config).await {
+            self.log.err(
+                log_keys::FRESH_INSTANCE_FAILED,
+                format!(
+                    "advance: WARN agent {}: no fresh guest instance after a contained extension panic: {error}",
+                    self.agent_id
+                ),
+            );
+        }
     }
 }
 

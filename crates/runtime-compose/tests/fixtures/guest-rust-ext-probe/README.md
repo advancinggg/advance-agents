@@ -5,9 +5,12 @@ by the host `CapabilityInjector` under that versioned namespace) and exports
 `message-driven` + `runnable`.
 
 On `handle-message`, payload text `call <arg>` calls `fixture:probe/host::call`
-and replies with action payload `ok:<v>` or `err:<e>`. Any other payload replies
-`noop`. `handle-message` always returns `Ok` (a guest `Err` would poison the
-Store). `init` returns empty state; `run` is a trivial `Completed`.
+and replies with action payload `ok:<v>` or `err:<e>`. `plain <arg>` calls
+`fixture:probe/host::call-plain`, whose result (`string`) has no error slot, and
+replies `plain:<v>`. `trap` makes the guest trap by itself (`unreachable`). Any
+other payload replies `noop`. `handle-message` always returns `Ok` (a guest `Err`
+would poison the Store). `init` returns empty state; `run` is a trivial
+`Completed`.
 
 The committed `../guest-rust-ext-probe.core.wasm` is wrapped to a Component at
 test time via `wit_component::ComponentEncoder` (production wraps through
