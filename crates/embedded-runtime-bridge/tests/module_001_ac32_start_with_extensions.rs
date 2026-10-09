@@ -21,7 +21,7 @@ use advance_runtime_compose::log_keys;
 use advance_runtime_compose::test_support::fixture::{
     FixtureDriver, FixtureExtension, FixtureFamilies, FIXTURE_ID, FIXTURE_MASTER_KEY,
 };
-use advance_runtime_compose::test_support::MemoryComposeLog;
+use advance_runtime_compose::test_support::{reserved_homes, MemoryComposeLog};
 use common::{c_start_v2, c_stop_free, fixture_home, http, json_with_state_root, last_error};
 use serde_json::json;
 
@@ -242,6 +242,61 @@ fn module_001_ac32_host_only_v2_reports_health_v2() {
     assert!(v2.client_api_base.is_none());
     assert_eq!(v2.profile.host_backend, HostBackend::Pulley);
     c_stop_free(started.handle);
+}
+
+#[test]
+fn module_001_ac32_dropped_async_start_still_shuts_its_composition_down() {
+    let _g = SERIAL.blocking_lock();
+    let fixture = fixture_home(&["fs"], FixtureDriver::None);
+    let home = std::fs::canonicalize(fixture.home()).expect("canonical home");
+    let mem = MemoryComposeLog::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread");
+    let dropped = rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            start_with_extensions_async(
+                fixture.home(),
+                default_options(fixture.state_root()).with_log(Arc::new(mem.clone())),
+                vec![],
+            ),
+        )
+        .await
+    });
+    assert!(
+        dropped.is_err(),
+        "the start must still be composing when its future is dropped"
+    );
+    // The detached start still composes, then shuts down the composition nobody waits for,
+    // which releases the home.
+    let started = Instant::now();
+    while mem.count(log_keys::READY) == 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "the dropped start never composed: {:?}",
+            mem.lines()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let composed = Instant::now();
+    while reserved_homes().iter().any(|p| p == &home) {
+        assert!(
+            composed.elapsed() < Duration::from_secs(120),
+            "the home is still reserved 120 s after the dropped start composed ({:?} to compose)",
+            composed.duration_since(started)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let handle = start_with_extensions(
+        fixture.home(),
+        default_options(fixture.state_root()),
+        vec![],
+    )
+    .expect("a fresh start on the released home");
+    stop(handle).expect("stop");
 }
 
 #[test]

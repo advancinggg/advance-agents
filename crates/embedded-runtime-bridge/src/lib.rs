@@ -166,17 +166,31 @@ pub fn start_with_extensions(
 }
 
 /// Async variant: always composes on the global runtime, callable from any runtime. If the caller
-/// drops this future, the composition still finishes and is then shut down (no task outlives it).
+/// drops this future, the composition still finishes and is then shut down (no task outlives it):
+/// the start task stops it on the global runtime.
 pub async fn start_with_extensions_async(
     workspace: &Path,
     options: BridgeOptions,
     extensions: Vec<Arc<dyn ComposeExtension>>,
 ) -> Result<BridgeHandle, BridgeError> {
     let root = workspace.to_path_buf();
-    runtime_rt::global_rt()
-        .spawn(v2::start(root, options, extensions))
-        .await
-        .map_err(|e| BridgeError::Internal(format!("join: {e}")))?
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let task = runtime_rt::global_rt().spawn(async move {
+        let started = v2::start(root, options, extensions).await;
+        if let Err(Ok(orphan)) = tx.send(started) {
+            // Nobody waits for the handle. Stop it here with the async stop: left to the
+            // handle's Drop on this worker, the stop would block the worker while the
+            // shutdown it waits for may need a task queued on that same worker.
+            let _ = orphan.stop_async_inner().await;
+        }
+    });
+    match rx.await {
+        Ok(started) => started,
+        Err(_) => Err(BridgeError::Internal(match task.await {
+            Err(e) => format!("join: {e}"),
+            Ok(()) => "join: the start task ended without a result".into(),
+        })),
+    }
 }
 
 pub fn client_api_base(handle: &BridgeHandle) -> Result<String, BridgeError> {
