@@ -29,7 +29,7 @@ use chrono::{TimeZone, Utc};
 use serde_json::{json, Value};
 use t29::{
     api, compose_home, deltas_ws, error_code, error_message, events_ws, grant_snapshot, has_data,
-    home, next_json, park, publish_deltas, query, read_port, registry_specs, send_message,
+    home, next_json, park, parked, publish_deltas, query, read_port, registry_specs, send_message,
     session_run, stable_compare, syntactic_revision, try_next_json, warning_codes, write_skill,
     ws_send, WsFrame, POLL, WAIT,
 };
@@ -285,10 +285,7 @@ async fn module_020_ac18_t29_a_fs_llm_turn_home_read_views_answer_data() {
         .to_owned();
     assert!(!stream_id.is_empty(), "{:?}", seed.body);
     let (mut events_sock, ws_seed) = events_ws(addr, &tok, "?event_type=run.round_completed").await;
-    assert!(
-        has_data(&ws_seed) || ws_seed.get("error").is_none(),
-        "{ws_seed}"
-    );
+    assert!(has_data(&ws_seed), "{ws_seed}");
     let mut ws_frames = Vec::new();
 
     let (status, body) = post_msg(msg_addr(&probe), "llm:hi").await;
@@ -740,7 +737,8 @@ async fn module_020_ac18_t29_c_grant_without_lifecycle_never_lists_empty_while_a
         assert_unwired(&pending);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let grant_id = grant_snapshot(&probe, &root)
+    let s0 = grant_snapshot(&probe, &root);
+    let grant_id = s0
         .first()
         .map(|g| g.id.to_string())
         .unwrap_or_else(|| "g1".into());
@@ -753,6 +751,9 @@ async fn module_020_ac18_t29_c_grant_without_lifecycle_never_lists_empty_while_a
             .await;
         assert_unwired(&resp);
     }
+    // The refused mutations touched neither the grant store nor the intake.
+    assert_eq!(grant_snapshot(&probe, &root), s0);
+    assert_eq!(parked(&probe), 1, "the parked request is still pending");
     let events = Http::get(addr, "/client/events").session(&tok).send().await;
     assert_eq!(events.status, 200, "{:?}", events.body);
     let tools = Http::get(addr, "/client/tools").session(&tok).send().await;

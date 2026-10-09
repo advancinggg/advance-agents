@@ -66,7 +66,12 @@ impl PreflightPort for PassPreflight {
     }
 }
 
+/// Fields drop in declaration order: `h` and `launcher` first (the last launcher reference stops
+/// every runtime it launched, on `rt`), then `rt`, then the home's directories.
 struct Env {
+    h: HostWorkspaceHome,
+    launcher: Arc<InProcessLauncher>,
+    rt: tokio::runtime::Runtime,
     _home_dir: tempfile::TempDir,
     _state_dir: tempfile::TempDir,
     handle: WorkspaceHomeHandle,
@@ -76,9 +81,6 @@ struct Env {
     probes: Arc<Mutex<Vec<Arc<ComposeProbe>>>>,
     plan_calls: Arc<AtomicUsize>,
     s0: spawn_counter::SpawnCounts,
-    rt: tokio::runtime::Runtime,
-    launcher: Arc<InProcessLauncher>,
-    h: HostWorkspaceHome,
 }
 
 fn make_rt() -> tokio::runtime::Runtime {
@@ -809,6 +811,34 @@ fn module_001_ac34_in_process_launcher_requires_a_multi_thread_runtime_with_two_
 
     let two = make_rt();
     InProcessLauncher::new(two.handle().clone(), dummy_plan).expect("two workers");
+}
+
+#[test]
+fn module_001_ac34_dropping_the_launcher_stops_what_it_launched() {
+    let _guard = serial();
+    let env = open_env(Arc::new(NoPreflight), semantic_row);
+    let connected = env
+        .h
+        .start_or_attach(&env.handle, &CancelToken::new())
+        .expect("start");
+    assert!(connected.session.is_some());
+    assert_eq!(env.h.runtime_state(&env.handle), RuntimeState::Running);
+    assert!(reserved_homes().iter().any(|p| p == &env.canonical));
+    let probe = probe_at(&env, 0);
+    let Env {
+        h,
+        launcher,
+        rt,
+        canonical,
+        s0,
+        ..
+    } = env;
+    // `h` holds the launcher too: dropping both runs the launcher's `Drop` while `rt` is up.
+    drop(h);
+    drop(launcher);
+    assert_home_released(&canonical);
+    rt.block_on(assert_gone_for_home(&probe, &canonical, None));
+    assert_spawn_free(&s0);
 }
 
 #[test]

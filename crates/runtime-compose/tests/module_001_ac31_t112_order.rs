@@ -282,6 +282,8 @@ async fn module_001_ac31_t112_callback_order_skips_inference_without_llm_and_too
     assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
 }
 
+/// A source tripwire next to the executed order witnesses: each marker below appears once, in
+/// this order. A refactor that renames a marker fails it; rename the marker here with it.
 #[test]
 fn module_001_ac31_callback_sites_follow_composition_order() {
     let src = source_scan::src_dir();

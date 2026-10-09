@@ -186,6 +186,23 @@ async fn module_001_ac31_t112b_claimed_entry_turn_profile_hold_preflight_and_adm
     assert!(updated.body.get("data").is_some(), "{:?}", updated.body);
     assert_eq!(restart_required_count(&updated), 1, "{:?}", updated.body);
 
+    // The backend registry and the claims are fixed at boot: after the two admin writes
+    // above reached the running config, the claimed entry still answers through the
+    // extension's port, and the `local` entry created since is served by no port.
+    let (status, body) = msg(&probe, "llm:again").await;
+    assert_eq!((status, body.as_str()), (200, "llm-ok:stub-pong"), "{body}");
+    assert_eq!(stub.calls(), 3);
+    let again = stub.requests().pop().expect("turn after the admin writes");
+    assert_eq!(again.provider_id, "local-stub");
+    let late = Http::post(addr, "/client/providers/local-two:preflight")
+        .session(&tok)
+        .idempotency_key("k-pf-two")
+        .send()
+        .await;
+    assert_eq!(late.body["data"]["ok"], false, "{:?}", late.body);
+    assert_eq!(late.body["data"]["reason"], "unsupported-backend-class");
+    assert_eq!(stub.calls(), 3);
+
     assert!(!flag.dropped());
     rt.shutdown().await.expect("shutdown");
     assert!(flag.dropped());

@@ -760,6 +760,32 @@ fn module_001_ac31_compose_cx_exposes_no_raw_ports() {
                         "the only Arc<LlmGateway> is GatewayHandle::upgrade: {sig}"
                     );
                 }
+                // Any shared pointer a view hands out is one of these: the stateless clock and
+                // leak detector, the config snapshot, and the gateway `GatewayHandle::upgrade`
+                // lends for one call. A new one (say an `Arc` of the EventBus or of a store)
+                // fails here until it is reviewed and listed.
+                let ret = sig
+                    .split_once("->")
+                    .map(|(_, ret)| {
+                        ret.split(" where ")
+                            .next()
+                            .unwrap_or(ret)
+                            .trim_end_matches(['{', ';', ' '])
+                            .trim()
+                    })
+                    .unwrap_or("");
+                if ret.contains("Arc<") || ret.contains("Weak<") {
+                    assert!(
+                        [
+                            "&Arc<dyn Clock>",
+                            "&Arc<dyn LeakDetector>",
+                            "Result<Arc<RuntimeConfig>, ViewError>",
+                            "Option<Arc<cap_llm::LlmGateway>>",
+                        ]
+                        .contains(&ret),
+                        "pub fn returns a shared pointer `{ret}`: {sig}"
+                    );
+                }
             }
         }
     }

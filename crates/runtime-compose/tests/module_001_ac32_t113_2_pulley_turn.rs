@@ -177,6 +177,10 @@ async fn module_001_ac32_t113_2_embedded_pulley_turn_no_exec_memory_no_child() {
     assert_eq!((d.admitted_total(), d.refused_total()), (0, 0), "{d:?}");
     #[cfg(target_os = "linux")]
     {
+        // Strict on purpose: no executable mapping may appear during the turn, file-backed
+        // ones included. The turn talks to an IP-literal loopback address (no DNS, no NSS),
+        // so it never reaches the dynamic loader; a shared object loaded here is a change to
+        // look at, not noise. The check since compose below allows file-backed mappings.
         let during = proc_self::new_executable(&s1, &s2);
         assert!(
             during.is_empty(),

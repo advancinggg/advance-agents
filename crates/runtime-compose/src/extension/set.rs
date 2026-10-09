@@ -1124,6 +1124,62 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct RecordingTriggerBus {
+        dispatched: StdMutex<Vec<String>>,
+    }
+
+    impl advance_scheduler::TriggerBusDispatch for RecordingTriggerBus {
+        fn subscribe(
+            &self,
+            _subscription: advance_scheduler::types::TriggerSubscription,
+        ) -> advance_scheduler::types::SubscriptionId {
+            advance_scheduler::types::SubscriptionId(0)
+        }
+
+        fn unsubscribe(&self, _id: advance_scheduler::types::SubscriptionId) {}
+
+        fn dispatch(&self, event: Event) {
+            self.dispatched.lock().unwrap().push(event.event_type);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn module_001_ac31_t112_d1_admitted_ext_event_is_never_dispatched_to_the_trigger_bus() {
+        let trigger = Arc::new(RecordingTriggerBus::default());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("jsonl")).unwrap();
+        let mut cfg = EventBusConfig::new(dir.path().join("jsonl"), dir.path().join("events.db"));
+        cfg.websocket_addr = "127.0.0.1:0".parse().unwrap();
+        cfg.trigger_bus_dispatch =
+            Some(Arc::clone(&trigger) as Arc<dyn advance_scheduler::TriggerBusDispatch>);
+        let bus = Arc::new(EventBus::new(cfg).await.expect("event bus"));
+
+        // Control: the production pipeline dispatches a whitelisted event, in the emit call.
+        let whitelisted = taxonomy::TRIGGER_BUS_WHITELIST[0];
+        EventBusEmit::emit(
+            &*bus,
+            Event::observability(whitelisted, "agent", json!({}), None),
+        );
+        assert_eq!(*trigger.dispatched.lock().unwrap(), [whitelisted]);
+
+        let emitter = ExtensionEmitter::new(
+            "fixture",
+            Arc::downgrade(&(Arc::clone(&bus) as Arc<dyn EventBusEmit>)),
+            Arc::new(SystemClock),
+            Revocation::new(),
+        );
+        emitter
+            .emit("ext.fixture.ping", json!({}))
+            .expect("admitted");
+        assert_eq!(
+            *trigger.dispatched.lock().unwrap(),
+            [whitelisted],
+            "the admitted extension event reached the trigger bus"
+        );
+        bus.shutdown_shared().await;
+    }
+
     struct Hook {
         id: &'static str,
         behaviour: HookBehaviour,

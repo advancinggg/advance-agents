@@ -850,6 +850,10 @@ fn expect_refusal(brk: RouteRuleBreak) -> (&'static str, String, RouteRefusalRea
             "GET /client/{x}/y".into(),
             RouteRefusalReason::ParameterisedFirstSegment,
         ),
+        // The two duplicate-by-shape rows against OSS and against another extension answer the
+        // label rule: every OSS label is reserved and every other extension's label is owned, and
+        // that rule runs before the shape rule. The shape rule on its own is witnessed with the
+        // label rules relaxed (client-api's `module_001_ac31_duplicate_shape_against_*_isolated`).
         RouteRuleBreak::DuplicateShapeOss => (
             "fixture",
             "GET /client/runs/{other}/history".into(),

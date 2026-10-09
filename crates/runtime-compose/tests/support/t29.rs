@@ -229,6 +229,19 @@ pub fn grant_snapshot(probe: &ComposeProbe, root: &str) -> Vec<Grant> {
     grants
 }
 
+/// Requests parked in the composition's grant approval intake right now.
+pub fn parked(probe: &ComposeProbe) -> usize {
+    let intake = probe
+        .record()
+        .grant_approval_intake
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)
+        .expect("grant approval intake");
+    let n = intake.list_pending().len();
+    drop(intake);
+    n
+}
+
 pub fn park(probe: &ComposeProbe, req: ChannelApprovalRequest) -> usize {
     let intake = probe
         .record()
