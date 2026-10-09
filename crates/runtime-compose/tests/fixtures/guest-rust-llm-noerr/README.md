@@ -26,7 +26,10 @@ keep the appended world block.
    `guest-rust-hello-llm` (or `crates/runtime/wit/advance.wit` plus the
    `advance-host-llm` world). Validate: `wasm-tools component wit wit/advance.wit`.
 3. First-time bootstrap (no Cargo.lock): `cargo generate-lockfile`.
-4. Build: `cargo build --target wasm32-unknown-unknown --release --locked`.
+4. Build: `cargo build --target wasm32-unknown-unknown --release --locked`, with rustc
+   1.91.0 (the crate has no toolchain file of its own, so the workspace's
+   `rust-toolchain.toml` applies, as for `guest-rust-hello-llm`). The artifact is stripped
+   (`strip = true`) and records no producer, so keep that toolchain.
 5. Copy artifact: `cp target/wasm32-unknown-unknown/release/guest_rust_llm_noerr.wasm ../guest-rust-llm-noerr.core.wasm`.
 6. Verify size < 500 KiB: `wc -c ../guest-rust-llm-noerr.core.wasm`.
 7. `cargo clean`. Do NOT commit `target/`.

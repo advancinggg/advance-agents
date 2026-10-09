@@ -33,7 +33,9 @@ Validate: `wasm-tools component wit wit/`.
    `crates/runtime/wit/advance.wit` and keep the `advance-host-ext-probe` world.
    Validate: `wasm-tools component wit wit/`.
 3. First-time bootstrap (no Cargo.lock): `cargo generate-lockfile`.
-4. Build: `cargo build --target wasm32-unknown-unknown --release --locked`.
+4. Build: `cargo build --target wasm32-unknown-unknown --release --locked`, with rustc
+   1.91.0 (this crate's `rust-toolchain.toml`, the workspace's version). The artifact is
+   stripped (`strip = true`) and records no producer, so keep that toolchain.
 5. Copy artifact: `cp target/wasm32-unknown-unknown/release/guest_rust_ext_probe.wasm ../guest-rust-ext-probe.core.wasm`.
 6. Verify size < 500 KiB: `wc -c ../guest-rust-ext-probe.core.wasm`.
 7. `cargo clean`. Do NOT commit `target/`.
