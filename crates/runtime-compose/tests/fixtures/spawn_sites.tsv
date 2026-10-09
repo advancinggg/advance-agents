@@ -26,3 +26,5 @@ crates/runtime/src/runtime_lock.rs	let mut child = Command::new("sleep").arg("5"
 crates/runtime/src/runtime_lock.rs	let mut child = Command::new("true").spawn().expect("true");	1	test-only	unit-test fixture
 crates/runtime/src/runtime_lock.rs	let mut child = Command::new("sleep").arg("5").spawn().expect("sleep 5");	2	test-only	unit-test fixture
 crates/runtime/src/runtime_lock.rs	let mut cmd = Command::new(exe);	1	test-only	platform_uid env-matrix self re-exec
+crates/runtime/src/runtime_lock.rs	let mut ps = Command::new("ps");	1	test-only	unit-test fixture
+crates/runtime/src/process_probe.rs	let listed = std::process::Command::new("locale")	1	test-only	unit-test fixture

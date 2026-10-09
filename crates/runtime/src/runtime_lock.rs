@@ -8,9 +8,10 @@
 //!
 //! 1. **PID alive** — spawned `kill -0 {pid}` under `ProcessPolicy::Allow`, in-process
 //!    `kill(pid, 0)` under `ProcessPolicy::Forbid`.
-//! 2. **platform_uid matches** — regenerated UID for the existing PID equals the stored UID
-//!    (prevents PID-reuse false positives after reboot). Spawned `ps -o lstart=` under
-//!    Allow, in-process under Forbid.
+//! 2. **platform_uid matches** — the stored UID names the process that has the PID now
+//!    (prevents PID-reuse false positives after reboot). Under Allow the spawned
+//!    `ps -o lstart=` must reproduce it byte for byte; under Forbid the in-process probe reads
+//!    its start time as an instant, in any rendering a `ps` prints.
 //! 3. **Heartbeat fresh** — `heartbeat_at` is within the staleness threshold (default 120s).
 //!
 //! If any gate fails, the lock is considered stale and overwritten.
@@ -103,9 +104,12 @@ pub fn inspect_lock(workspace: &Path) -> LockInspection {
 ///
 /// Gate A + B use the in-process probe under `Forbid` (no `kill` / `ps` child), the spawned
 /// `kill -0` / `ps -o lstart=` under `Allow`. Both give the same verdict for the same lock when
-/// the prober runs under the same LANG / LC_* / TZ as the lock's writer. Under `Forbid`
-/// the probe reads TZ and the locale variables through libc: do not mutate the process
-/// environment while it runs.
+/// the prober runs under the same LANG / LC_* / TZ as the lock's writer. The `Forbid` probe
+/// also judges live a lock that `ps` wrote for a live process under another locale, time zone
+/// or procps-ng version, or wrote with an `unknown` start where `ps` failed; the `Allow` probe
+/// still compares bytes, so it judges such a lock stale, as before the in-process probe
+/// existed. Under `Forbid` the probe reads TZ and the locale variables through libc: do not
+/// mutate the process environment while it runs.
 pub fn inspect_lock_with_policy(workspace: &Path, policy: ProcessPolicy) -> LockInspection {
     let path = workspace.join(".runtime").join("runtime.lock");
     let meta = match std::fs::symlink_metadata(&path) {
@@ -368,8 +372,13 @@ fn is_pid_alive(pid: u32, policy: ProcessPolicy) -> bool {
         .unwrap_or(false)
 }
 
-/// Gate B: regenerate platform_uid for the given PID and compare.
+/// Gate B: whether the stored platform_uid names the process that has `pid` now. `Allow`:
+/// regenerate it with `ps` and compare bytes. `Forbid`: the in-process probe compares the
+/// stored start time as an instant (`process_probe::platform_uid_names`).
 fn platform_uid_matches(pid: u32, stored_uid: &str, policy: ProcessPolicy) -> bool {
+    if policy.check(SpawnSite::PidLockProbe).is_err() {
+        return crate::process_probe::platform_uid_names(pid, stored_uid);
+    }
     let current = generate_platform_uid(pid, policy);
     current == stored_uid
 }
@@ -644,6 +653,130 @@ mod module_001_ac32_tests {
             }
             drop(lock);
         });
+    }
+
+    /// Writes `.runtime/runtime.lock` under `home` naming this process with `platform_uid`
+    /// and a fresh heartbeat.
+    fn write_own_lock(home: &Path, platform_uid: &str) {
+        let now = Utc::now().to_rfc3339();
+        let data = LockData {
+            pid: std::process::id(),
+            platform_uid: platform_uid.to_string(),
+            started_at: now.clone(),
+            heartbeat_at: now,
+            workspace_root: home.display().to_string(),
+            version: "0.1.0".to_string(),
+        };
+        let dir = home.join(".runtime");
+        std::fs::create_dir_all(&dir).expect("runtime dir");
+        std::fs::write(dir.join("runtime.lock"), data.to_yaml()).expect("write lock");
+    }
+
+    /// ADR 2026-10-03 D3: a lock that `ps` wrote for this live process under another locale or
+    /// time zone than this process's reads live to the in-process probe, which spawns nothing.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn module_001_ac32_forbid_probe_judges_live_a_lock_ps_wrote_under_another_locale_or_time_zone()
+    {
+        let _guard = serial();
+        let own = std::process::id();
+        let in_process = generate_platform_uid(own, ProcessPolicy::Forbid);
+        let legs: [(&str, &[(&str, &str)]); 9] = [
+            ("TZ=UTC", &[("TZ", "UTC")]),
+            ("TZ=Asia/Shanghai", &[("TZ", "Asia/Shanghai")]),
+            ("TZ=Asia/Kathmandu", &[("TZ", "Asia/Kathmandu")]),
+            ("TZ=Pacific/Kiritimati", &[("TZ", "Pacific/Kiritimati")]),
+            ("TZ=Etc/GMT+12", &[("TZ", "Etc/GMT+12")]),
+            ("LC_ALL=en_GB.UTF-8", &[("LC_ALL", "en_GB.UTF-8")]),
+            ("LC_ALL=de_DE.UTF-8", &[("LC_ALL", "de_DE.UTF-8")]),
+            (
+                "LC_ALL=zh_CN.UTF-8 TZ=Asia/Shanghai",
+                &[("LC_ALL", "zh_CN.UTF-8"), ("TZ", "Asia/Shanghai")],
+            ),
+            (
+                "LANG=C LC_TIME=zh_CN.UTF-8",
+                &[("LANG", "C"), ("LC_TIME", "zh_CN.UTF-8")],
+            ),
+        ];
+        let home = tempfile::tempdir().expect("tempdir");
+        let before = spawn_counter::snapshot();
+        let mut other_bytes = Vec::new();
+        for (leg, vars) in legs {
+            let mut ps = Command::new("ps");
+            ps.args(["-o", "lstart=", "-p", &own.to_string()]);
+            if !vars.iter().any(|(name, _)| *name == "LC_ALL") {
+                ps.env_remove("LC_ALL");
+            }
+            for (name, value) in vars {
+                ps.env(name, value);
+            }
+            let out = ps.output().expect("ps -o lstart=");
+            assert!(out.status.success(), "{leg}: {out:?}");
+            let lstart = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let uid = format!("{}:{own}:{lstart}", std::env::consts::OS);
+            write_own_lock(home.path(), &uid);
+            match inspect_lock_with_policy(home.path(), ProcessPolicy::Forbid) {
+                LockInspection::Live { pid } => assert_eq!(pid, own, "{leg}"),
+                other => {
+                    panic!("{leg}: {uid:?} must read live, got {other:?} (own: {in_process:?})")
+                }
+            }
+            if uid != in_process {
+                other_bytes.push(leg);
+            }
+        }
+        assert!(
+            !other_bytes.is_empty(),
+            "every leg printed this process's own bytes {in_process:?}"
+        );
+        let delta = spawn_counter::snapshot().since(&before);
+        assert_eq!(delta.admitted(SpawnSite::PidLockProbe), 0);
+        assert_eq!(
+            delta.refused(SpawnSite::PidLockProbe),
+            2 * legs.len() as u64
+        );
+        println!("legs with other bytes than {in_process:?}: {other_bytes:?}");
+    }
+
+    /// The in-process probe still refuses a lock that names another start of this pid, another
+    /// pid or another OS, and judges live one whose writer could not read a start time.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn module_001_ac32_forbid_probe_refuses_another_start_and_reads_unknown_live() {
+        let _guard = serial();
+        let own = std::process::id();
+        let os = std::env::consts::OS;
+        let start = crate::process_probe::start_secs(own).expect("own start time");
+        let english = |t: i64| {
+            crate::process_probe::format_time(
+                t,
+                c"%a %b %e %H:%M:%S %Y",
+                crate::process_probe::LocaleChoice::C,
+            )
+            .expect("C strftime")
+        };
+        let home = tempfile::tempdir().expect("tempdir");
+        let cases = [
+            (format!("{os}:{own}:{}", english(start)), true),
+            (format!("{os}:{own}:unknown"), true),
+            (format!("{os}:{own}:{}", english(start - 1)), false),
+            (
+                format!("{os}:{own}:{}", english(start + 366 * 86_400)),
+                false,
+            ),
+            (format!("{os}:{}:{}", own + 1, english(start)), false),
+            (format!("fake:{own}:{}", english(start)), false),
+        ];
+        for (uid, live) in &cases {
+            write_own_lock(home.path(), uid);
+            let got = inspect_lock_with_policy(home.path(), ProcessPolicy::Forbid);
+            let want = if *live {
+                LockInspection::Live { pid: own }
+            } else {
+                LockInspection::Stale { pid: own }
+            };
+            assert_eq!(got, want, "{uid:?}");
+        }
     }
 
     #[test]
