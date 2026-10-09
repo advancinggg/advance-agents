@@ -3166,7 +3166,8 @@ pub(crate) async fn wire_capabilities_inner(
     // holds a weak reference; its owner stops it at shutdown.
     started.packs_watcher = hot_reload
         .then(|| pack_runtime.spawn_packs_watcher(crate::pack_runtime::PACKS_POLL_INTERVAL));
-    probe_record!(probe, |record| record.packs_poll = Some(hot_reload));
+    probe_record!(probe, |record| record.packs_poll =
+        Some(started.packs_watcher.is_some()));
 
     // Step 7 — cap-tools, POST-build. The `LazyToolRegistry` engine handle only
     // exists once `ComponentRuntime` is built. `host.host_registry()` is the
