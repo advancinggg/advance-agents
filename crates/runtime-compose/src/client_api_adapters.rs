@@ -1065,8 +1065,10 @@ impl ToolsProvider for BindTimeToolsProvider {
 }
 
 /// A redactor no other component can feed: a fresh association key and boot id,
-/// and an implementation that blocks every document.
-pub fn fail_closed_redactor() -> Arc<SensitiveObservationRedactor> {
+/// and an implementation that blocks every document. The role factory refuses only
+/// an all-zero key or boot id (both are forced non-zero here) and a provider and
+/// verifier of different factories, so the `Err` arm is not expected in practice.
+pub fn fail_closed_redactor() -> Result<Arc<SensitiveObservationRedactor>, String> {
     let mut key = Zeroizing::new([0u8; 32]);
     OsRng.fill_bytes(key.as_mut());
     key[0] |= 1;
@@ -1075,15 +1077,14 @@ pub fn fail_closed_redactor() -> Arc<SensitiveObservationRedactor> {
     boot[0] |= 1;
     let parts = ObservationAssociationRoleFactory::new_at_composition(key, boot, Vec::new())
         .and_then(ObservationAssociationRoleFactory::split_once)
-        .expect("nonzero key and boot id; structural schemas only");
-    Arc::new(
-        parts
-            .provider
-            .bind_once(parts.verifier, |_| RedactionDisposition::Blocked {
-                reason: RedactionBlockReason::AuthorityUnavailable,
-            })
-            .expect("provider and verifier come from one factory"),
-    )
+        .map_err(|error| format!("observation role factory: {error}"))?;
+    parts
+        .provider
+        .bind_once(parts.verifier, |_| RedactionDisposition::Blocked {
+            reason: RedactionBlockReason::AuthorityUnavailable,
+        })
+        .map(Arc::new)
+        .map_err(|error| format!("fail-closed redactor: {error}"))
 }
 
 /// MODULE-020-AC-18: the pending-grant list of a home with no grant intake.
@@ -1093,16 +1094,11 @@ pub struct NoIntakePendingGrants {
 }
 
 impl NoIntakePendingGrants {
-    pub fn new() -> Self {
-        Self {
-            redactor: fail_closed_redactor(),
-        }
-    }
-}
-
-impl Default for NoIntakePendingGrants {
-    fn default() -> Self {
-        Self::new()
+    /// `Err` only when [`fail_closed_redactor`] does.
+    pub fn new() -> Result<Self, String> {
+        Ok(Self {
+            redactor: fail_closed_redactor()?,
+        })
     }
 }
 
@@ -1537,10 +1533,10 @@ mod tests {
 
     #[test]
     fn module_020_ac18_no_intake_pending_list_is_empty_and_its_redactor_is_its_own() {
-        let port = NoIntakePendingGrants::new();
+        let port = NoIntakePendingGrants::new().expect("no-intake list");
         assert!(port.list_pending_bound().expect("list").is_empty());
-        let a = fail_closed_redactor();
-        let b = fail_closed_redactor();
+        let a = fail_closed_redactor().expect("redactor");
+        let b = fail_closed_redactor().expect("redactor");
         assert!(!Arc::ptr_eq(&a, &b));
     }
 
@@ -1578,7 +1574,9 @@ mod tests {
             ClientApi::new(ClientApiConfig::default()),
             FirstPartyClientCompose {
                 unbound_history: Some(Arc::new(UnboundPort)),
-                pending_grants_list: Some(Arc::new(NoIntakePendingGrants::new())),
+                pending_grants_list: Some(Arc::new(
+                    NoIntakePendingGrants::new().expect("no-intake list"),
+                )),
                 leak_detector: Some(Arc::new(cap_http::DefaultLeakDetector::new())),
                 ..Default::default()
             },

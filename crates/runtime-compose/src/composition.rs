@@ -466,7 +466,7 @@ impl Composition {
         let (client_api, msg_overran, hooks_overran, preflight_ran) = tokio::join!(
             async {
                 match client_ingress {
-                    Some(ing) => Some(ing.shutdown(CLIENT_API_DRAIN).await),
+                    Some(ing) => ing.shutdown(CLIENT_API_DRAIN).await,
                     None => None,
                 }
             },

@@ -151,7 +151,8 @@ pub mod log_keys {
     pub const ROLLBACK_MEMORY_UNAVAILABLE: &str = "wiring.rollback_memory_unavailable";
     /// stderr: the `data` tool is not registered.
     pub const DATA_TOOL_NOT_REGISTERED: &str = "wiring.data_tool_not_registered";
-    /// stderr: the Client API history / events adapters are unavailable.
+    /// stderr: a Client API read-view adapter is unavailable (history, events, or the
+    /// pending-grant list of a home without a grant intake).
     pub const CLIENT_API_HISTORY_UNAVAILABLE: &str = "wiring.client_api_history_unavailable";
     /// stderr: the Client API and Web Console address.
     pub const CLIENT_API_LISTENING: &str = "wiring.client_api_listening";

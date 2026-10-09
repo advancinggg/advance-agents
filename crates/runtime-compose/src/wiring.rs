@@ -3543,8 +3543,12 @@ pub(crate) async fn wire_capabilities_inner(
                     Err(error) => history_unavailable(error),
                 },
                 // Unreachable: the projector and the carrier store both exist iff
-                // `lifecycle`. No history adapter, as v0.1.26's `_ => None`.
-                (Some(_), None) | (None, Some(_)) => {}
+                // `lifecycle`. No history adapter, as v0.1.26's `_ => None`, and the
+                // log says why.
+                (Some(_), None) | (None, Some(_)) => history_unavailable(
+                    "the CONTRACT-219 projector and the observation carrier store were not composed together"
+                        .into(),
+                ),
             }
             // ADR 2026-10-03 D4: the CONTRACT-185 event adapter on every home,
             // independent of CONTRACT-219.
@@ -3564,10 +3568,22 @@ pub(crate) async fn wire_capabilities_inner(
             // answering `{requests: []}`; with an intake and no CONTRACT-219 the
             // list stays unwired (never `[]`).
             let pending_list_for_api: Option<Arc<dyn advance_client_api::PendingGrantListPort>> =
-                grant_approval_intake.is_none().then(|| {
-                    Arc::new(NoIntakePendingGrants::new())
-                        as Arc<dyn advance_client_api::PendingGrantListPort>
-                });
+                if grant_approval_intake.is_none() {
+                    match NoIntakePendingGrants::new() {
+                        Ok(list) => Some(Arc::new(list)),
+                        Err(error) => {
+                            log.err(
+                                log_keys::CLIENT_API_HISTORY_UNAVAILABLE,
+                                format!(
+                                    "advance: Client API pending-grant list unavailable: {error}"
+                                ),
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
             // The tools view at bind (D4); the late install replaces it.
             let bind_time_tools: Arc<dyn advance_client_api::ToolsProvider> =
                 Arc::new(BindTimeToolsProvider::new(skills_root.clone()));

@@ -111,18 +111,20 @@ impl ClientIngress {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = endpoint;
     }
 
-    pub(crate) async fn shutdown(&self, budget: Duration) -> ShutdownIngress {
+    /// Teardown step 1 for this listener. `None` once an earlier call shut it down: there is
+    /// nothing left to drain.
+    pub(crate) async fn shutdown(&self, budget: Duration) -> Option<ShutdownIngress> {
         let deadline = Instant::now() + budget;
         let mut st = self.state.lock().await;
         st.closed = true;
         self.set_endpoint(None);
-        let api = st.api.take().expect("Client API ingress shuts down once");
+        let api = st.api.take()?;
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if let Some(server) = st.server.take() {
+        Some(if let Some(server) = st.server.take() {
             server.shutdown_ingress(remaining).await
         } else {
             ClientApiServer::shutdown_unbound(api, remaining).await
-        }
+        })
     }
 
     #[cfg(test)]
@@ -386,5 +388,39 @@ mod tests {
         );
         assert_eq!(ing.probes_sent(), 0);
         let _ = ing.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn module_001_ac30_a_second_ingress_shutdown_finds_nothing_to_drain() {
+        let api = Arc::new(ClientApi::new(ClientApiConfig::default()));
+        let server = ClientApiServer::bind(api, 0)
+            .await
+            .expect("bind a listener");
+        let addr = server.local_addr();
+        let dir = tempfile::tempdir().expect("home");
+        let home = std::fs::canonicalize(dir.path()).expect("canonical home");
+        let ing = ClientIngress::new(
+            server,
+            IngressFromGraph {
+                admission: Admission::SameUserLoopback,
+                write_discovery: false,
+                home,
+                #[cfg(feature = "test-support")]
+                probe: None,
+            },
+            LogHandle::null(),
+            tokio::runtime::Handle::current(),
+        );
+        let first = ing
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("the first shutdown drains the listener");
+        assert!(first.drained && first.ws_joined && !first.serve_overran);
+        assert!(ing.endpoint().is_none());
+        assert!(
+            std::net::TcpListener::bind(addr).is_ok(),
+            "{addr} still bound"
+        );
+        assert!(ing.shutdown(Duration::from_secs(1)).await.is_none());
     }
 }

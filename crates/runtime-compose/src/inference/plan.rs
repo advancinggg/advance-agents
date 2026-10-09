@@ -96,6 +96,17 @@ impl InferenceContribution {
         self.current.map(|(id, _)| id).unwrap_or("")
     }
 
+    /// The extension a record belongs to. The composer hands `&mut self` to one extension's
+    /// `inference` callback at a time, so a record made with no callback running is a composer
+    /// bug: a debug build panics, a release build records nothing.
+    fn recording(&self) -> Option<(&'static str, ProcessPolicy)> {
+        debug_assert!(
+            self.current.is_some(),
+            "InferenceContribution recorded outside an extension's inference callback"
+        );
+        self.current
+    }
+
     /// Entries this extension may claim now: backend class `local`, no sidecar,
     /// present in the home's boot config, not claimed by an earlier extension.
     /// Declaration order.
@@ -109,7 +120,7 @@ impl InferenceContribution {
         entry_id: impl Into<String>,
         port: Arc<dyn InferenceBackendPort>,
     ) -> &mut Self {
-        let Some((id, processes)) = self.current else {
+        let Some((id, processes)) = self.recording() else {
             return self;
         };
         let entry = entry_id.into();
@@ -143,7 +154,7 @@ impl InferenceContribution {
         profile_id: impl Into<String>,
         profile: ModelProfile,
     ) -> &mut Self {
-        let Some((id, _)) = self.current else {
+        let Some((id, _)) = self.recording() else {
             return self;
         };
         let profile_id = profile_id.into();
@@ -173,7 +184,7 @@ impl InferenceContribution {
 
     /// Attach a hold. Never refused. Kept even when this callback fails.
     pub fn hold<H: Send + 'static>(&mut self, hold: H) -> &mut Self {
-        let Some((id, _)) = self.current else {
+        let Some((id, _)) = self.recording() else {
             return self;
         };
         self.holds
@@ -184,7 +195,7 @@ impl InferenceContribution {
 
     /// Supply THE dispatch every `mesh-remote` entry uses. At most one per composition.
     pub fn mesh_dispatch(&mut self, dispatch: Arc<dyn MeshInferenceDispatch>) -> &mut Self {
-        let Some((id, _)) = self.current else {
+        let Some((id, _)) = self.recording() else {
             return self;
         };
         let contained: Arc<dyn MeshInferenceDispatch> =
@@ -206,7 +217,7 @@ impl InferenceContribution {
     /// Declare that this extension serves `local` entries without a sidecar even
     /// when it claims none at this boot.
     pub fn serves_local_entries(&mut self) -> &mut Self {
-        if self.current.is_some() {
+        if self.recording().is_some() {
             self.staged.serves_local = true;
         }
         self
@@ -805,6 +816,65 @@ post-processor:
         out.claim("local-stub", port(&d));
         assert!(out.end_extension(false).is_none());
         assert!(!out.finish().marks_claimable);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn module_001_ac31_contribution_recorded_outside_a_callback_is_a_composer_bug() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let records: Vec<(&str, Box<dyn Fn(&mut InferenceContribution)>)> = vec![
+            (
+                "claim",
+                Box::new(move |out| {
+                    out.claim("local-stub", port(&drops));
+                }),
+            ),
+            (
+                "add_profile",
+                Box::new(|out| {
+                    out.add_profile("p", text_profile("v"));
+                }),
+            ),
+            (
+                "hold",
+                Box::new(|out| {
+                    out.hold(1u8);
+                }),
+            ),
+            (
+                "mesh_dispatch",
+                Box::new(|out| {
+                    out.mesh_dispatch(Arc::new(NopDispatch));
+                }),
+            ),
+            (
+                "serves_local_entries",
+                Box::new(|out| {
+                    out.serves_local_entries();
+                }),
+            ),
+        ];
+        for (name, record) in records {
+            let mut out = InferenceContribution::new(boot(), LogHandle::null());
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| record(&mut out)));
+            let message = outcome
+                .expect_err(name)
+                .downcast::<&str>()
+                .map(|m| (*m).to_owned())
+                .unwrap_or_default();
+            assert_eq!(
+                message, "InferenceContribution recorded outside an extension's inference callback",
+                "{name}"
+            );
+            assert!(out.take_holds().is_empty(), "{name}");
+            let outcome = out.finish();
+            assert!(
+                outcome.claims.is_empty() && outcome.mesh_dispatch.is_none(),
+                "{name}"
+            );
+            assert!(!outcome.marks_claimable, "{name}");
+        }
     }
 
     #[test]
