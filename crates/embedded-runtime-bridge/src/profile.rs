@@ -256,6 +256,63 @@ mod tests {
         }
     }
 
+    /// Named rows with literal expectations, independent of `build_profile_v2`'s formula.
+    #[test]
+    fn module_001_ac32_profile_v2_availability_named_rows() {
+        use CompositionProfile::{Full, HostOnly as Host};
+        use HostBackend::{Cranelift as Cl, Pulley as Pu};
+        use HostPlatform::{Android, Ios, Linux, MacOs, Windows};
+        use PlatformLifecycleState::{Background as Bg, Foreground as Fg, Suspended as Su};
+        // (platform, backend, lifecycle, runtime_up, agent_loop_up, composition,
+        //  agent_host_available, max_concurrent_runs)
+        let rows = [
+            (Ios, Pu, Fg, true, true, Full, true, 2),
+            (Ios, Cl, Fg, true, true, Full, false, 2),
+            (Ios, Pu, Fg, true, false, Full, false, 2),
+            (Ios, Pu, Fg, true, true, Host, false, 2),
+            (Ios, Pu, Bg, true, true, Full, false, 0),
+            (Android, Pu, Fg, true, true, Full, true, 4),
+            (Android, Cl, Fg, true, true, Full, false, 4),
+            (Android, Pu, Fg, true, true, Host, false, 4),
+            (MacOs, Cl, Fg, true, true, Full, true, 8),
+            (MacOs, Pu, Fg, true, true, Full, true, 8),
+            (MacOs, Cl, Fg, true, false, Full, false, 8),
+            (MacOs, Cl, Fg, true, false, Host, true, 8),
+            (MacOs, Cl, Fg, false, true, Full, false, 8),
+            (Linux, Cl, Fg, true, true, Full, true, 8),
+            (Windows, Cl, Su, true, true, Full, false, 0),
+            (Windows, Cl, Fg, true, false, Host, true, 8),
+        ];
+        for (
+            platform,
+            backend,
+            lifecycle,
+            runtime_up,
+            agent_loop_up,
+            composition,
+            available,
+            max,
+        ) in rows
+        {
+            let p = build_profile_v2(ProfileV2 {
+                platform,
+                backend,
+                lifecycle,
+                runtime_up,
+                agent_loop_up,
+                composition,
+                battery_pct: None,
+                network_class: None,
+            });
+            let row = format!(
+                "{platform:?} {backend:?} {lifecycle:?} up={runtime_up} loop={agent_loop_up} {composition:?}"
+            );
+            assert_eq!(p.agent_host_available, available, "{row}");
+            assert_eq!(p.max_concurrent_runs, max, "{row}");
+            assert_eq!(p.host_backend, backend, "{row}");
+        }
+    }
+
     #[test]
     fn module_001_ac32_profile_v2_availability_table() {
         let platforms = [

@@ -281,8 +281,13 @@ fn module_001_ac32_t113_5_embedded_admission_and_foreground_rebind() {
         let (ok, body) = get_runs(addr_e, Some(&tok_e), None);
         assert_eq!(ok, 200, "{body}");
     } else {
+        // Another process took the freed port first, so this Foreground moved: the move
+        // contract of leg (f) holds instead (new session; the old one is revoked).
+        assert_ne!(tok_e, tok, "a move must mint a new session");
         let (ok, body) = get_runs(addr_e, Some(&tok_e), None);
         assert_eq!(ok, 200, "{body}");
+        let (old, body) = get_runs(addr_e, Some(&tok), None);
+        assert_eq!(old, 401, "the session before the move is revoked: {body}");
     }
     let ep_e = rt.client_api().expect("endpoint after rebind");
     assert!(

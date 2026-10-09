@@ -242,6 +242,24 @@ fn module_001_ac32_host_only_v2_reports_health_v2() {
     assert!(v2.client_api_base.is_none());
     assert_eq!(v2.profile.host_backend, HostBackend::Pulley);
     c_stop_free(started.handle);
+
+    // A mobile `host_only` handle offers no agent host, even up, in foreground and on Pulley.
+    let ios = json_with_state_root(json!({ "composition": "host_only", "platform": "ios" }), sr);
+    let started = c_start_v2(fixture.home(), Some(&ios));
+    assert_eq!(started.code, 0, "{}", started.last_error);
+    let health = common::c_health(started.handle);
+    assert_eq!(health.code, 0, "{}", health.last_error);
+    let v: serde_json::Value = serde_json::from_str(health.value.as_deref().unwrap()).unwrap();
+    assert_eq!(v["composition_profile"], "host_only", "{v}");
+    assert_eq!(v["runtime_up"], true, "{v}");
+    assert_eq!(
+        v["profile"]["platform_lifecycle_state"], "foreground",
+        "{v}"
+    );
+    assert_eq!(v["profile"]["host_backend"], "pulley", "{v}");
+    assert_eq!(v["profile"]["max_concurrent_runs"], 2, "{v}");
+    assert_eq!(v["profile"]["agent_host_available"], false, "{v}");
+    c_stop_free(started.handle);
 }
 
 #[test]
