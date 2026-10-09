@@ -19,7 +19,7 @@ const UNKNOWN_LSTART: &str = "unknown";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LocaleChoice {
     Env,
-    #[allow(dead_code)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     C,
 }
 
@@ -102,8 +102,9 @@ pub(crate) fn start_secs(pid: u32) -> Option<i64> {
 }
 
 /// `start` as `ps -o lstart=` prints it on this host under this process's LANG / LC_* / TZ:
-/// BSD `ps` prints `strftime("%c")`, procps-ng 4.0.3 and later `strftime("%a %b %e %H:%M:%S %Y")`
-/// (procps-ng before 4.0.3 prints `ctime()`: the same bytes when LC_TIME names English).
+/// BSD `ps` prints `strftime("%c")`; procps-ng 4.0.3 and later print
+/// `strftime("%a %b %e %H:%M:%S %Y")`, and earlier procps-ng `ctime()`, which is that layout
+/// with English names whatever the locale ([`procps_prints_ctime`]).
 fn render_lstart(start: i64) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -111,7 +112,12 @@ fn render_lstart(start: i64) -> Option<String> {
     }
     #[cfg(target_os = "linux")]
     {
-        format_time(start, c"%a %b %e %H:%M:%S %Y", LocaleChoice::Env)
+        let locale = if procps_prints_ctime() {
+            LocaleChoice::C
+        } else {
+            LocaleChoice::Env
+        };
+        format_time(start, c"%a %b %e %H:%M:%S %Y", locale)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -139,6 +145,78 @@ fn linux_btime() -> Option<i64> {
         }
     }
     None
+}
+
+/// Whether the `ps` the `ps`-based probe runs is procps-ng before 4.0.3, which prints
+/// `lstart` with `ctime()`: English names in every locale. Read once, without running it,
+/// from the `procps-ng <version>` string of the first `ps` on PATH; any other `ps`, or none,
+/// counts as printing `strftime` in the env locale.
+#[cfg(target_os = "linux")]
+fn procps_prints_ctime() -> bool {
+    static PRINTS_CTIME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PRINTS_CTIME.get_or_init(|| {
+        ps_on_path()
+            .and_then(|ps| read_prefix(&ps, PS_BINARY_READ_LIMIT))
+            .and_then(|bytes| procps_ng_version(&bytes))
+            .is_some_and(prints_ctime)
+    })
+}
+
+/// How much of the `ps` binary [`procps_prints_ctime`] reads.
+#[cfg(target_os = "linux")]
+const PS_BINARY_READ_LIMIT: u64 = 16 << 20;
+
+/// The `ps` that `Command::new("ps")` runs: the first executable `ps` file on PATH.
+#[cfg(target_os = "linux")]
+fn ps_on_path() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("ps"))
+        .find(|ps| {
+            std::fs::metadata(ps)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn read_prefix(path: &std::path::Path, limit: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
+}
+
+/// The version of the first `procps-ng <major>.<minor>[.<patch>]` in `bytes`.
+#[cfg(any(target_os = "linux", test))]
+fn procps_ng_version(bytes: &[u8]) -> Option<(u32, u32, u32)> {
+    const MARK: &[u8] = b"procps-ng ";
+    let at = bytes.windows(MARK.len()).position(|w| w == MARK)? + MARK.len();
+    let digits: Vec<u8> = bytes[at..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit() || **b == b'.')
+        .copied()
+        .collect();
+    let text = std::str::from_utf8(&digits).ok()?;
+    let mut parts = text.split('.').map(str::parse::<u32>);
+    let major = parts.next()?.ok()?;
+    let minor = parts.next()?.ok()?;
+    let patch = match parts.next() {
+        Some(patch) => patch.ok()?,
+        None => 0,
+    };
+    Some((major, minor, patch))
+}
+
+/// procps-ng prints `lstart` with `ctime()` before 4.0.3 and with `strftime` in the env locale
+/// from 4.0.3 on.
+#[cfg(any(target_os = "linux", test))]
+fn prints_ctime(version: (u32, u32, u32)) -> bool {
+    version < (4, 0, 3)
 }
 
 // ---------------------------------------------------------------------------
@@ -805,6 +883,48 @@ mod module_001_ac32_lstart_tests {
         ] {
             assert!(!lstart_names_start(lstart, MACOS_START), "{lstart:?}");
         }
+    }
+
+    #[test]
+    fn module_001_ac32_procps_ng_version_picks_the_lstart_format() {
+        assert_eq!(
+            procps_ng_version(b"\x7fELF\0ps from procps-ng 3.3.17\n\0"),
+            Some((3, 3, 17))
+        );
+        assert_eq!(procps_ng_version(b"\0procps-ng 4.0.2\0"), Some((4, 0, 2)));
+        assert_eq!(procps_ng_version(b"\0procps-ng 4.0.4\0"), Some((4, 0, 4)));
+        assert_eq!(procps_ng_version(b"procps-ng 4.1"), Some((4, 1, 0)));
+        assert_eq!(
+            procps_ng_version(b"BusyBox v1.36.1 multi-call binary"),
+            None
+        );
+        assert_eq!(procps_ng_version(b"procps-ng x"), None);
+        assert_eq!(procps_ng_version(b"procps-ng 4."), None);
+        for ctime in [(3, 3, 17), (4, 0, 0), (4, 0, 2)] {
+            assert!(prints_ctime(ctime), "{ctime:?}");
+        }
+        for strftime in [(4, 0, 3), (4, 0, 4), (4, 0, 6), (4, 1, 0), (5, 0, 0)] {
+            assert!(!prints_ctime(strftime), "{strftime:?}");
+        }
+    }
+
+    /// The version read from the `ps` binary without running it is the one `ps --version`
+    /// reports.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn module_001_ac32_procps_ng_version_read_from_the_binary_is_ps_version() {
+        let out = std::process::Command::new("ps")
+            .arg("--version")
+            .output()
+            .expect("ps --version");
+        let said = String::from_utf8_lossy(&out.stdout).to_string();
+        let reported = procps_ng_version(said.as_bytes());
+        assert!(reported.is_some(), "ps --version: {said:?}");
+        let read = ps_on_path()
+            .and_then(|ps| read_prefix(&ps, PS_BINARY_READ_LIMIT))
+            .and_then(|bytes| procps_ng_version(&bytes));
+        assert_eq!(read, reported, "ps --version: {said:?}");
+        assert_eq!(procps_prints_ctime(), prints_ctime(read.expect("version")));
     }
 
     #[test]
