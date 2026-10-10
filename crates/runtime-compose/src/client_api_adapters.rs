@@ -886,8 +886,12 @@ pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCom
 }
 
 /// Install a tools provider only when a real inventory Arc is present.
-/// `skill_root` is the cap-skills provider root (`<workspace>/.agent`); the
-/// bounded walk appends `.agent/skills`, matching `DiskSkillSummaryReader`.
+/// `mapped_agent` is the cap-layer id (the grant-store grantee,
+/// `WiringHandles::root_agent_id`): WASM allowlists and MCP scopes are read
+/// under this id. The mailbox key (`agent:<handle>`) is a different grammar
+/// and would project an empty view. `skill_root` is the cap-skills provider
+/// root (`<workspace>/.agent`); the bounded walk appends `.agent/skills`,
+/// matching `DiskSkillSummaryReader`.
 pub fn install_tools_if_real(
     api: &ClientApi,
     inventory: Option<Arc<dyn CallableInventoryReader>>,

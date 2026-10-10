@@ -481,16 +481,18 @@ pub(crate) async fn compose_graph(
             #[cfg(feature = "test-support")]
             if let Some(p) = failpoints.probe.as_ref() {
                 p.set_late_tools(spawned.tools_inventory.as_ref().map(|inv| {
-                    inv.list_wasm_tools(&wiring_handles.root_mailbox_id)
+                    inv.list_wasm_tools(&wiring_handles.root_agent_id)
                         .into_iter()
                         .map(|t| t.name)
                         .collect()
                 }));
             }
+            // WASM allowlists and MCP scopes live under the cap-layer id. The
+            // mailbox key is a different grammar and would project an empty view.
             crate::client_api_adapters::install_tools_if_real(
                 server.api().as_ref(),
                 spawned.tools_inventory.clone(),
-                &wiring_handles.root_mailbox_id,
+                &wiring_handles.root_agent_id,
                 wiring_handles.skills_root.clone(),
             );
         }

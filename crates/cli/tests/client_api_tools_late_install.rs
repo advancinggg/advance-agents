@@ -203,6 +203,10 @@ fn module_020_ac18_production_installs_the_bind_time_view_and_late_installs_tool
         start.contains("wiring_handles.skills_root"),
         "production late-install must pass the CLI bounded skill root"
     );
+    assert!(
+        start.contains("&wiring_handles.root_agent_id"),
+        "production late-install must map tools through the cap-grant grantee"
+    );
     let wiring = include_str!("../../runtime-compose/src/wiring.rs");
     assert_eq!(
         wiring.matches("BindTimeToolsProvider::new(").count(),
