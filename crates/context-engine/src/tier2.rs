@@ -94,6 +94,21 @@ pub fn assemble_unified(
 /// the entry text); deterministic ordering (host → WASM → MCP; args sorted
 /// alphabetically for stability across `serde_json::Map` feature toggles).
 pub fn format_available_tools_section(records: &[UnifiedToolRecord]) -> String {
+    format_available_tools_section_with_not_shown(records, 0)
+}
+
+/// [`format_available_tools_section`], closed by one line that says how many MCP tools
+/// the agent may call the section leaves out, `… N more MCP tools not shown`, when
+/// `mcp_not_shown` (N) is not zero: an inventory bounds the MCP tools one prompt shows
+/// ([`CallableInventoryReader::mcp_tools_shown`]), and the assembler leaves out the
+/// last MCP entries of a prompt that would not fit its budget. With zero, the section
+/// is the one [`format_available_tools_section`] renders, byte for byte.
+///
+/// [`CallableInventoryReader::mcp_tools_shown`]: advance_shared_types::traits::CallableInventoryReader::mcp_tools_shown
+pub fn format_available_tools_section_with_not_shown(
+    records: &[UnifiedToolRecord],
+    mcp_not_shown: usize,
+) -> String {
     let mut s = String::from("# Available Tools\n\n");
     let mut seen = BTreeSet::new();
     for r in records {
@@ -110,6 +125,10 @@ pub fn format_available_tools_section(records: &[UnifiedToolRecord]) -> String {
             sanitized_args.join(", "),
             sanitize_description(r.description()),
         ));
+    }
+    if mcp_not_shown > 0 {
+        let tools = if mcp_not_shown == 1 { "tool" } else { "tools" };
+        s.push_str(&format!("… {mcp_not_shown} more MCP {tools} not shown\n"));
     }
     s
 }
@@ -163,9 +182,13 @@ pub(crate) fn is_unsafe_for_tier2_line(c: char) -> bool {
         ','
             | '('
             | ')'
-            // Unicode dashes that look like the ASCII hyphen / ` — ` delimiter
-            // to operator audit text. ASCII '-' is kept so MCP server ids
-            // (`[A-Za-z0-9._-]`) round-trip in the prompt.
+            // Unicode dashes that look like the ASCII hyphen or the ` — `
+            // delimiter in operator audit text. ASCII '-' itself is not in the
+            // set, so callable and argument names keep their hyphens: host
+            // functions (`read-slug`), WASM tools (`editor-x.format`), MCP
+            // tools shown as `<server>__<tool>` (`my-server__do-thing`) and
+            // arguments (`peer-id`). The one exception is the cache-breakpoint
+            // marker, which `sanitize_tool_name` rewrites in a tool name.
             | '\u{2010}'
             | '\u{2011}'
             | '\u{2012}'

@@ -2919,6 +2919,7 @@ impl SystemUnderTestBuilder {
                             command: "true".to_string(),
                             args: Vec::new(),
                             env: BTreeMap::new(),
+                            cwd: None,
                         },
                         tool_patterns: Some(patterns),
                         tool_schemas: BTreeMap::new(),
@@ -3349,8 +3350,8 @@ impl SystemUnderTestBuilder {
                     )
                 } else {
                     let mut wasm = vec![ToolEntry {
-                        // Hyphenless name: the Tier-2 tool-name sanitizer maps '-' → '_',
-                        // so a hyphenless fixture name renders verbatim for a clean witness.
+                        // A plain name renders verbatim in Tier-2, so the witness looks
+                        // for it as written.
                         name: "wasmtool".to_string(),
                         description: "echo tool".to_string(),
                         params_schema: serde_json::json!({"properties": {"text": {}}}),

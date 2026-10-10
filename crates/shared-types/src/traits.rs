@@ -17,7 +17,9 @@
 //! 1 Slice m012-B + 3 Slice m012-C + CostTrackerQuery + ToolsGrantReader +
 //! McpGrantReader + WebGrantReader + RememberContentPolicy) `Box<dyn>`-constructible.
 
-use crate::capability::{BudgetDecision, CapParams, GrantDecision, McpToolEntry, ToolEntry};
+use crate::capability::{
+    BudgetDecision, CapParams, GrantDecision, McpToolEntry, McpToolsShown, ToolEntry,
+};
 use crate::cost::{AttributedCost, CostLedgerError, CostWindow, RunCost};
 use crate::event::Event;
 use crate::mcp::McpGrantScope;
@@ -86,6 +88,17 @@ pub trait RunBudget: Send + Sync {
 pub trait CallableInventoryReader: Send + Sync {
     fn list_wasm_tools(&self, agent_id: &str) -> Vec<ToolEntry>;
     fn list_mcp_tools(&self, agent_id: &str) -> Vec<McpToolEntry>;
+
+    /// The MCP tools `agent_id`'s prompt shows: the entries of
+    /// [`list_mcp_tools`](Self::list_mcp_tools), and how many more MCP tools the agent
+    /// may call that they leave out. An inventory that bounds what it shows reports
+    /// here what it left out; by default every entry is shown and none is left out.
+    fn mcp_tools_shown(&self, agent_id: &str) -> McpToolsShown {
+        McpToolsShown {
+            tools: self.list_mcp_tools(agent_id),
+            not_shown: 0,
+        }
+    }
 }
 
 /// CONTRACT-180 — runtime observability emit hook. See Slice B' rustdoc for full
@@ -145,9 +158,16 @@ impl std::error::Error for DurableAppendError {}
 /// `"ns-fs::read"`) is the 3rd arg, between `capability` and `params`. The new arg
 /// surfaces the call-site identity into the `authz.checked` event's `function`
 /// payload field per PRD §15.3.18. It is observability-only: it does NOT participate
-/// in authorization. The Slice-A fail-closed `CapParams::Null` precondition in the
-/// MODULE-013 impl stays intact; SubsetValidator wiring into the L1 path is deferred
-/// to a future slice that also lowers WASM call-frame params into `CapParams`.
+/// in authorization.
+///
+/// `params` decides how much is checked. Null params ([`CapParams::empty`], what the
+/// capability injector passes for a guest's call) ask only whether the agent holds an
+/// active, unexpired grant for `capability`. Other params, passed by a host function
+/// that authorizes a resource itself (the `mcp-client` functions with `servers` /
+/// `tool-patterns`, the `data` tool asking `fs` for a path), are allowed only when one
+/// held grant covers them under the CONTRACT-122 subset rules: the MODULE-013
+/// implementation, cap-grant's `GrantCheckImpl`, decides that with
+/// `SubsetValidatorImpl::covers_request`.
 pub trait GrantCheck: Send + Sync {
     fn check(
         &self,

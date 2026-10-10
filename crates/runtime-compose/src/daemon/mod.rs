@@ -1218,10 +1218,15 @@ async fn try_spawn_agent_loop(
         } else {
             Vec::new()
         };
+        // The assembler and the Client API read the inventory under the colon routing id
+        // (`msg_agent_id`); the root's grants are stored under the bare `cap_agent_id`. The
+        // inventory maps the same alias pair the memory readers use to the bare id.
         let callable: Arc<dyn CallableInventoryReader> = match mcp.clone() {
-            Some(mcp) => Arc::new(crate::mcp_wiring::LiveCallableInventory::new(
+            Some(mcp) => Arc::new(crate::mcp_wiring::LiveCallableInventory::for_agent(
                 wasm_entries,
                 mcp,
+                &cap_agent_id,
+                &[cap_agent_id.clone(), msg_agent_id.clone()],
             )),
             None if tool_registry.is_some() => {
                 Arc::new(cap_tools::CallableInventory::new(wasm_entries, vec![]))
@@ -1289,15 +1294,23 @@ async fn try_spawn_agent_loop(
             &cap_agent_id,
         );
         client_api_tools = Some(match mcp.clone() {
-            Some(mcp) => Arc::new(crate::mcp_wiring::LiveCallableInventory::new(entries, mcp))
-                as Arc<dyn CallableInventoryReader>,
+            Some(mcp) => Arc::new(crate::mcp_wiring::LiveCallableInventory::for_agent(
+                entries,
+                mcp,
+                &cap_agent_id,
+                &[cap_agent_id.clone(), msg_agent_id.clone()],
+            )) as Arc<dyn CallableInventoryReader>,
             None => Arc::new(cap_tools::CallableInventory::new(entries, vec![])),
         });
     } else if let Some(mcp) = mcp.clone() {
-        client_api_tools = Some(Arc::new(crate::mcp_wiring::LiveCallableInventory::new(
-            Vec::new(),
-            mcp,
-        )));
+        client_api_tools = Some(Arc::new(
+            crate::mcp_wiring::LiveCallableInventory::for_agent(
+                Vec::new(),
+                mcp,
+                &cap_agent_id,
+                &[cap_agent_id.clone(), msg_agent_id.clone()],
+            ),
+        ));
     }
     // ComponentConfig.id carries the CAP id (the guest's self-identity for caps).
     let cfg = ComponentConfig {
@@ -1530,6 +1543,12 @@ impl TestServeLoop {
 
     pub fn agent_id(&self) -> &str {
         &self.inner.agent_id
+    }
+
+    /// The callable inventory the loop was spawned with, the one the daemon installs as the
+    /// Client API tools provider (`None` when the home registers no tools and no MCP client).
+    pub fn tools_inventory(&self) -> Option<Arc<dyn CallableInventoryReader>> {
+        self.inner.tools_inventory.clone()
     }
 }
 

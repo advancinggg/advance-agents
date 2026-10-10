@@ -26,6 +26,7 @@
 //! `tool_patterns: None` on the entry).
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use advance_shared_types::mcp::{self as shared, ToolPatternError};
 use advance_shared_types::security_validator::HttpCapability;
@@ -103,8 +104,8 @@ pub struct ToolSchemas {
 /// Per-server transport specification.
 ///
 /// `Debug` never prints what may hold a secret: a stdio `env` shows its keys
-/// only (its values are resolved secrets), `args` show only their count, and an
-/// http endpoint shows no query or fragment.
+/// only (some of its values are resolved secrets), `args` show only their
+/// count, and an http endpoint shows no query or fragment.
 #[derive(Clone)]
 pub enum McpTransportSpec {
     /// HTTP/SSE transport — reuses MODULE-012 HttpSecurityChain.
@@ -116,7 +117,10 @@ pub enum McpTransportSpec {
     Stdio {
         command: String,
         args: Vec<String>,
+        /// The child's whole environment: nothing else reaches it.
         env: BTreeMap<String, String>,
+        /// The child's working directory; `None`: `/`.
+        cwd: Option<PathBuf>,
     },
 }
 
@@ -131,11 +135,17 @@ impl std::fmt::Debug for McpTransportSpec {
                 .field("endpoint_url", &RedactedUrl(endpoint_url))
                 .field("capability", capability)
                 .finish(),
-            McpTransportSpec::Stdio { command, args, env } => f
+            McpTransportSpec::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => f
                 .debug_struct("Stdio")
                 .field("command", command)
                 .field("args", &format_args!("<{} redacted>", args.len()))
                 .field("env", &RedactedEnv(env))
+                .field("cwd", cwd)
                 .finish(),
         }
     }
@@ -188,9 +198,10 @@ pub struct McpServerEntry {
 
 impl McpServerEntry {
     /// A digest of the fields that decide whether a live connection can be
-    /// reused: the transport (command, args, env values, endpoint, allowlist),
-    /// the tool patterns and the schemas. Two entries with the same digest
-    /// describe the same server; a secret rotation changes it.
+    /// reused: the transport (command, args, env values, working directory,
+    /// endpoint, allowlist, credential bindings), the tool patterns and the
+    /// schemas. Two entries with the same digest describe the same server; a
+    /// secret rotation changes it.
     pub fn fingerprint(&self) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -198,7 +209,12 @@ impl McpServerEntry {
         self.server_id.hash(&mut hasher);
         self.description.hash(&mut hasher);
         match &self.transport {
-            McpTransportSpec::Stdio { command, args, env } => {
+            McpTransportSpec::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => {
                 0u8.hash(&mut hasher);
                 command.hash(&mut hasher);
                 args.hash(&mut hasher);
@@ -206,6 +222,7 @@ impl McpServerEntry {
                     key.hash(&mut hasher);
                     value.hash(&mut hasher);
                 }
+                cwd.hash(&mut hasher);
             }
             McpTransportSpec::Http {
                 endpoint_url,
@@ -314,7 +331,8 @@ impl McpServersConfigBuilder {
     pub fn add_server(mut self, entry: McpServerEntry) -> Result<Self, McpError> {
         if !shared::is_valid_server_id(&entry.server_id) {
             return Err(McpError::invalid_response(format!(
-                "server_id {:?} must be 1..={} characters from [A-Za-z0-9._-]",
+                "server_id {:?} must be 1..={} characters from [A-Za-z0-9._-], not starting \
+                 with '.'",
                 entry.server_id,
                 shared::MAX_SERVER_ID_BYTES
             )));

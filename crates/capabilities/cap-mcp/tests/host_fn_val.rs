@@ -40,6 +40,7 @@ fn dummy_client() -> Arc<McpClient> {
             command: "true".to_string(),
             args: vec![],
             env: BTreeMap::new(),
+            cwd: None,
         },
         tool_patterns: None,
         tool_schemas: BTreeMap::new(),
@@ -139,6 +140,7 @@ fn client_with(servers: &[(&str, bool, &Arc<CountingMockTransport>)]) -> Arc<Mcp
                 command: "true".into(),
                 args: vec![],
                 env: BTreeMap::new(),
+                cwd: None,
             }
         } else {
             McpTransportSpec::Http {

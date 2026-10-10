@@ -20,11 +20,17 @@ pub struct ClientToolEntry {
     pub description: String,
 }
 
-/// An MCP callable tool (client-safe projection; carries the MCP `server_id` provenance).
+/// An MCP callable tool (client-safe projection).
+///
+/// `name` is `<server_id>__<tool>`: the server's id, two underscores and the tool's own name,
+/// which is the one callable name the model sees in its prompt and that this listing shares
+/// with it. `server_id` is the server the tool belongs to, beside it.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ClientMcpEntry {
+    /// `<server_id>__<tool>`, the name the model sees.
     pub name: String,
     pub description: String,
+    /// The MCP server the tool belongs to.
     pub server_id: String,
 }
 

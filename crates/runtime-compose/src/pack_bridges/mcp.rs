@@ -1,35 +1,52 @@
 //! MCP bridge (§3.1 row 3, §3.2 rule 2): an installed pack's
-//! `mcp-servers/{name}.yaml` (schema: `advance_pack_manager::mcp_server_manifest`)
-//! → a `cap_mcp::McpServerEntry` ready for `McpServersConfig::builder().add_server`.
+//! `mcp-servers/{name}.yaml` (schema: `advance_pack_manager::mcp_server_manifest`),
+//! checked against the pack and turned into what the runtime keeps of it. Both paths
+//! below make the same checks:
 //!
 //! - `stdio` transport from a pack whose EFFECTIVE trust is `untrusted` →
 //!   [`PackBridgeError::TrustDenied`] (a subprocess is arbitrary code execution);
-//! - `http` transport is admitted from any pack: the entry carries an
-//!   `HttpCapability` whose allowlist is exactly the endpoint's host, so the
-//!   cap-http security chain (SSRF / redirect / TLS policy) governs every request;
-//!   an endpoint on loopback is refused
-//!   ([`PackError::ConstraintViolation`]): only a server file the operator wrote
-//!   may reach the host's own loopback;
-//! - the manifest's `secret-refs` (`ENV_NAME → secret key`) are resolved through
-//!   the pack-manager `SecretStore` into the stdio child's `env` (missing key →
-//!   `MissingSecret`); a workflow step's pre-resolved secrets can be merged in
-//!   through [`PackMcpBridge::entry_with_env`] under the same env-name grammar.
+//! - `http` transport is admitted from any pack, and the cap-http security chain
+//!   (SSRF / redirect / TLS policy) governs every request; an endpoint on loopback is
+//!   refused ([`PackError::ConstraintViolation`]): only a server file the operator
+//!   wrote may reach the host's own loopback;
+//! - a manifest that binds `credentials` is refused from any pack
+//!   ([`PackError::ConstraintViolation`]): pack-origin http servers may not bind
+//!   cap-secrets credentials, only a server file the operator wrote may;
+//! - a workflow step's own secrets (`ENV_NAME → secret key`) go to a stdio server
+//!   only, each under an environment-variable name the manifest does not already
+//!   give a literal or a secret.
 //!
-//! [`McpEntrySink`] is where a `WorkflowExecutor::register_mcp_server` hands
-//! a planned registration: the control-plane sink writes a server file (secret-ref
-//! ids only, origin recorded) and the MCP client reloads.
+//! [`PackMcpBridge::plan`] is the path of a workflow's `register-mcp-server` step,
+//! and it resolves no secret: the registration carries the manifest's transport
+//! unchanged (a stdio server's `env` literals and `cwd` included), the manifest's
+//! and the step's `secret-refs` as secret-store keys (never values) and the origin
+//! pack. [`McpEntrySink`] is where the step hands it: the control-plane sink writes
+//! it as a server file and the MCP client reloads, and the loader resolves the
+//! secrets when it reads the file, as for an operator's file.
+//!
+//! [`PackMcpBridge::entry`] / [`PackMcpBridge::entry_with_env`] build a client entry
+//! (`cap_mcp::McpServerEntry`, for `McpServersConfig::builder().add_server`) instead,
+//! resolving the manifest's `secret-refs` through the pack-manager `SecretStore` at
+//! once (missing key → `MissingSecret`) and merging a step's pre-resolved secrets:
+//! the stdio environment is built as the loader builds an operator server's
+//! ([`crate::mcp_wiring::stdio_child_env`]), the manifest's `cwd` is the working
+//! directory, and an http entry's allowlist is exactly the endpoint's host. The
+//! daemon registers a pack's servers through [`PackMcpBridge::plan`] and the server
+//! file only.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use advance_pack_manager::{
-    parse_mcp_server_manifest, ComponentKind, McpTransportDecl, PackError, PackRegistry,
-    SecretStore, SecretValue, TrustLevel as PackTrust,
+    parse_mcp_server_manifest, ComponentKind, McpServerManifest, McpTransportDecl, PackError,
+    PackRegistry, SecretStore, SecretValue, TrustLevel as PackTrust,
 };
 use advance_shared_types::security_validator::{Allowlist, HttpCapability};
 use cap_mcp::{McpServerEntry, McpTransportSpec};
 
 use super::{effective_trust, pack_id, resolve_kind, PackBridgeError};
+use crate::mcp_wiring::stdio_child_env;
 
 pub struct PackMcpBridge {
     registry: Arc<dyn PackRegistry>,
@@ -51,10 +68,13 @@ impl PackMcpBridge {
 
     /// [`Self::entry`] plus `extra_env` — a workflow step's already-resolved
     /// `secret-refs` (placeholder = environment-variable name) merged into the
-    /// stdio child's environment. A placeholder that is not an env-var name, or
-    /// that collides with a manifest `secret-refs` entry, is refused; on an
-    /// `http` transport a non-empty `extra_env` has no destination and is
-    /// refused too (fail-closed — the secret is never silently discarded).
+    /// stdio child's environment with the manifest's own. A placeholder that is
+    /// not an env-var name, or that collides with a manifest `secret-refs` entry
+    /// or `env` literal, is refused; on an `http` transport a non-empty
+    /// `extra_env` has no destination and is refused too (fail-closed — the
+    /// secret is never silently discarded). The child's environment is
+    /// [`stdio_child_env`] of the daemon's own, the manifest's `env` literals and
+    /// all those secrets; its working directory is the manifest's `cwd`.
     pub fn entry_with_env(
         &self,
         pack_ref: &str,
@@ -64,10 +84,16 @@ impl PackMcpBridge {
         let resolution = resolve_kind(&*self.registry, pack_ref, ComponentKind::McpServer)?;
         let pack = pack_id(&resolution);
         let manifest = parse_mcp_server_manifest(&resolution.local_path)?;
+        refuse_credentials(&manifest, &pack)?;
         let trust = effective_trust(&*self.registry, &resolution.pack_name, &resolution.version)?;
 
         let transport = match manifest.transport {
-            McpTransportDecl::Stdio { command, args } => {
+            McpTransportDecl::Stdio {
+                command,
+                args,
+                env: literals,
+                cwd,
+            } => {
                 if trust != PackTrust::Trusted {
                     return Err(PackBridgeError::TrustDenied {
                         pack,
@@ -79,12 +105,12 @@ impl PackMcpBridge {
                         ),
                     });
                 }
-                let mut env: BTreeMap<String, String> = BTreeMap::new();
+                let mut resolved: BTreeMap<String, String> = BTreeMap::new();
                 for (env_name, key) in &manifest.secret_refs {
                     let value = secrets
                         .get(key)
                         .ok_or_else(|| PackError::MissingSecret { key: key.clone() })?;
-                    env.insert(env_name.clone(), value.expose_secret().to_string());
+                    resolved.insert(env_name.clone(), value.expose_secret().to_string());
                 }
                 for (env_name, value) in extra_env {
                     if !is_env_var_name(env_name) {
@@ -95,7 +121,7 @@ impl PackMcpBridge {
                             ),
                         }));
                     }
-                    if env.contains_key(env_name) {
+                    if resolved.contains_key(env_name) {
                         return Err(PackBridgeError::Pack(PackError::ConstraintViolation {
                             reason: format!(
                                 "register-mcp-server secret-ref {env_name} collides with the \
@@ -103,9 +129,17 @@ impl PackMcpBridge {
                             ),
                         }));
                     }
-                    env.insert(env_name.clone(), value.expose_secret().to_string());
+                    if literals.contains_key(env_name) {
+                        return Err(env_literal_collision(env_name));
+                    }
+                    resolved.insert(env_name.clone(), value.expose_secret().to_string());
                 }
-                McpTransportSpec::Stdio { command, args, env }
+                McpTransportSpec::Stdio {
+                    command,
+                    args,
+                    env: stdio_child_env(std::env::vars_os(), &literals, resolved),
+                    cwd: cwd.map(PathBuf::from),
+                }
             }
             McpTransportDecl::Http { endpoint_url } => {
                 if !extra_env.is_empty() {
@@ -152,8 +186,10 @@ impl PackMcpBridge {
     }
 
     /// The registration a control-plane sink would persist: the pack's
-    /// manifest, extra secret-ref *ids* (never values), and the origin pack.
-    /// Same trust and loopback checks as [`Self::entry_with_env`].
+    /// manifest (its transport unchanged, a stdio server's `env` literals and
+    /// `cwd` included), extra secret-ref *ids* (never values), and the origin
+    /// pack. Same trust, loopback, credentials and placeholder checks as
+    /// [`Self::entry_with_env`].
     pub fn plan(
         &self,
         pack_ref: &str,
@@ -162,6 +198,7 @@ impl PackMcpBridge {
         let resolution = resolve_kind(&*self.registry, pack_ref, ComponentKind::McpServer)?;
         let pack = pack_id(&resolution);
         let manifest = parse_mcp_server_manifest(&resolution.local_path)?;
+        refuse_credentials(&manifest, &pack)?;
         let trust = effective_trust(&*self.registry, &resolution.pack_name, &resolution.version)?;
 
         match &manifest.transport {
@@ -219,6 +256,12 @@ impl PackMcpBridge {
                          server manifest's own secret-refs"
                     ),
                 }));
+            }
+            if matches!(
+                &manifest.transport,
+                McpTransportDecl::Stdio { env, .. } if env.contains_key(env_name)
+            ) {
+                return Err(env_literal_collision(env_name));
             }
             secret_refs.insert(env_name.clone(), key.clone());
         }
@@ -278,6 +321,32 @@ pub trait McpEntrySink: Send + Sync {
     /// this sink created. An operator file (no origin) is left alone and
     /// reported as an error.
     fn deregister(&self, server_id: &str) -> Result<(), PackBridgeError>;
+}
+
+/// Refuse a pack's server manifest that binds `credentials`: only a server file the
+/// operator wrote may bind cap-secrets credentials to an http server's requests.
+fn refuse_credentials(manifest: &McpServerManifest, pack: &str) -> Result<(), PackBridgeError> {
+    if manifest.credentials.is_empty() {
+        return Ok(());
+    }
+    Err(PackBridgeError::Pack(PackError::ConstraintViolation {
+        reason: format!(
+            "mcp-server {} of pack {pack} binds credentials; pack-origin http servers may not \
+             bind cap-secrets credentials (only an operator's own server file may)",
+            manifest.server_id
+        ),
+    }))
+}
+
+/// The refusal of a workflow step's secret-ref named as one of the manifest's `env` literals: a
+/// variable of the server's environment is either a literal or a secret.
+fn env_literal_collision(env_name: &str) -> PackBridgeError {
+    PackBridgeError::Pack(PackError::ConstraintViolation {
+        reason: format!(
+            "register-mcp-server secret-ref {env_name} collides with the server manifest's env \
+             literal of the same name"
+        ),
+    })
 }
 
 fn is_env_var_name(s: &str) -> bool {

@@ -357,6 +357,8 @@ fn builder_admits_only_server_ids_from_the_charset() {
         "a\u{200B}b",
         "a\nb",
         too_long.as_str(),
+        ".",
+        ".hidden",
     ] {
         assert!(!is_valid_server_id(id), "{id:?}");
         let err = McpServersConfig::builder()
@@ -383,6 +385,7 @@ fn debug_output_hides_env_values_args_and_endpoint_queries() {
             command: "/usr/local/bin/server".to_string(),
             args: vec!["--token=arg-secret-123".to_string()],
             env: BTreeMap::from([("API_TOKEN".to_string(), "env-secret-456".to_string())]),
+            cwd: None,
         },
         tool_patterns: None,
         tool_schemas: BTreeMap::new(),
@@ -413,6 +416,40 @@ fn debug_output_hides_env_values_args_and_endpoint_queries() {
         .unwrap()
         .build();
     assert!(!format!("{config:?}").contains("env-secret-456"));
+}
+
+// A stdio server's working directory is part of its entry: the fingerprint
+// follows it, so a changed directory is a changed server, and Debug shows it.
+#[test]
+fn a_stdio_entry_fingerprints_and_shows_its_working_directory() {
+    let entry = |cwd: Option<&str>| McpServerEntry {
+        server_id: "local".to_string(),
+        description: "stdio".to_string(),
+        transport: McpTransportSpec::Stdio {
+            command: "/usr/local/bin/server".to_string(),
+            args: vec![],
+            env: BTreeMap::from([("LOG_LEVEL".to_string(), "info".to_string())]),
+            cwd: cwd.map(std::path::PathBuf::from),
+        },
+        tool_patterns: None,
+        tool_schemas: BTreeMap::new(),
+    };
+    assert_eq!(entry(None).fingerprint(), entry(None).fingerprint());
+    assert_eq!(
+        entry(Some("/srv/a")).fingerprint(),
+        entry(Some("/srv/a")).fingerprint()
+    );
+    assert_ne!(
+        entry(None).fingerprint(),
+        entry(Some("/srv/a")).fingerprint()
+    );
+    assert_ne!(
+        entry(Some("/srv/a")).fingerprint(),
+        entry(Some("/srv/b")).fingerprint()
+    );
+    let text = format!("{:?}", entry(Some("/srv/a")));
+    assert!(text.contains("/srv/a"), "{text}");
+    assert!(!text.contains("info"), "{text}");
 }
 
 fn _unused_mcp_error_type(_e: &McpError) {

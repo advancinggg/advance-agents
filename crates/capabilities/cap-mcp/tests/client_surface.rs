@@ -48,6 +48,7 @@ fn entry_with_patterns(server_id: &str, patterns: Option<Vec<&str>>) -> McpServe
             command: "true".to_string(),
             args: vec![],
             env: BTreeMap::new(),
+            cwd: None,
         },
         tool_patterns,
         tool_schemas: BTreeMap::new(),
@@ -419,6 +420,7 @@ async fn the_tool_cache_shares_the_total_cap_fairly_and_marks_cut_listings() {
     let first_names =
         |count: usize| -> Vec<String> { (0..count).map(|i| format!("t{i}")).collect() };
     assert!(client.cached_tools().is_empty());
+    assert_eq!(client.servers_to_list(), ids, "none is listed yet");
 
     // As many full listings as fit are cached whole.
     for (id, mock) in ids.iter().zip(&mocks).take(fitting) {
@@ -426,6 +428,7 @@ async fn the_tool_cache_shares_the_total_cap_fairly_and_marks_cut_listings() {
         client.list_tools(None, id).await.expect("listed");
     }
     assert!(client.cached_tools().iter().all(|l| !l.is_truncated()));
+    assert_eq!(client.servers_to_list(), [ids[fitting].clone()]);
 
     // One more: every listing is cut to its share and marked.
     mocks[fitting].push_ok(full_page(MAX_TOOLS_PER_SERVER));
@@ -450,14 +453,19 @@ async fn the_tool_cache_shares_the_total_cap_fairly_and_marks_cut_listings() {
         assert!((share..=share + 1).contains(&listing.tools.len()));
         assert_eq!(names(&listing.tools), first_names(listing.tools.len()));
     }
+    assert!(
+        client.servers_to_list().is_empty(),
+        "each listing holds its share of the full cache: listing it again changes nothing"
+    );
 
-    // A server listing no tools keeps an empty entry, and the last server's
-    // next listing takes the room it left.
+    // A server listing no tools keeps an empty entry, and the room it left is there for
+    // each cut listing's next listing.
     mocks[0].push_ok(full_page(0));
     client.list_tools(None, &ids[0]).await.expect("listed");
     let empty = cached_of(&client, &ids[0]);
     assert_eq!((empty.tools.len(), empty.listed), (0, 0));
     assert!(!empty.is_truncated());
+    assert_eq!(client.servers_to_list(), ids[1..]);
     mocks[fitting].push_ok(full_page(MAX_TOOLS_PER_SERVER));
     client
         .list_tools(None, &ids[fitting])
@@ -466,6 +474,7 @@ async fn the_tool_cache_shares_the_total_cap_fairly_and_marks_cut_listings() {
     let last = cached_of(&client, &ids[fitting]);
     assert_eq!(last.tools.len(), MAX_TOOLS_PER_SERVER);
     assert!(!last.is_truncated());
+    assert_eq!(client.servers_to_list(), ids[1..fitting]);
     assert!(
         client
             .cached_tools()
@@ -600,4 +609,63 @@ async fn replace_config_drops_removed_and_changed_servers_and_their_cache() {
     assert_eq!(reconfig.removed, ["old"]);
     assert!(client.cached_tools().is_empty());
     assert!(client.list_servers().await.is_empty());
+}
+
+// A server whose entry changes (here its tool patterns, so its fingerprint) is
+// reported as changed, beside a server added: its connection is closed and its
+// cached tools are dropped, and the next call connects the new entry instead of
+// reusing the old connection.
+#[tokio::test]
+async fn replace_config_closes_the_connection_of_a_changed_server() {
+    let mock = Arc::new(CountingMockTransport::new("srv"));
+    mock.push_ok(json!({"tools": [{"name": "echo"}]}));
+    let client = build_client_with_mock("srv", Arc::clone(&mock), None);
+    client.list_tools(None, "srv").await.unwrap();
+    assert_eq!(client.cached_tools().len(), 1);
+
+    let next = McpServersConfig::builder()
+        .add_server(entry_with_patterns("srv", Some(vec!["echo"])))
+        .unwrap()
+        .add_server(entry_with_patterns("fresh", None))
+        .unwrap()
+        .build();
+    let reconfig = client.replace_config(next);
+    assert_eq!(
+        reconfig,
+        McpReconfig {
+            added: vec!["fresh".to_string()],
+            removed: vec![],
+            changed: vec!["srv".to_string()],
+        }
+    );
+    assert!(
+        client.cached_tools().is_empty(),
+        "the changed server's tools are dropped"
+    );
+    assert_eq!(
+        Arc::strong_count(&mock),
+        1,
+        "the client let go of the old connection"
+    );
+
+    // Connecting the new entry needs a runtime for stdio servers, which this
+    // client lacks: the call fails instead of reaching the old connection.
+    let err = client
+        .invoke_tool(None, "srv", "echo", b"{}")
+        .await
+        .expect_err("the new entry is not connected");
+    assert_eq!(err.kind, McpErrorKind::TransportError);
+    assert!(err.message.contains("with_runtime"), "msg={}", err.message);
+    assert_eq!(
+        mock.call_count(),
+        1,
+        "only the listing reached the old connection"
+    );
+    let ids: Vec<String> = client
+        .list_servers()
+        .await
+        .into_iter()
+        .map(|server| server.id)
+        .collect();
+    assert_eq!(ids, ["fresh", "srv"]);
 }

@@ -220,6 +220,7 @@ async fn sys_ac_338_j83_forbid_spawn_sites_refuse_typed_no_child() {
             command: marker_m.command().display().to_string(),
             args: vec![],
             env: BTreeMap::new(),
+            cwd: None,
         },
         tool_patterns: None,
         tool_schemas: BTreeMap::new(),

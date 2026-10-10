@@ -22,9 +22,10 @@
 //! starts its session ([`HttpMcpTransport::initialize`]). Concurrent first calls
 //! share one connection attempt, and no std lock is held while it runs.
 //!
-//! A slot belongs to one generation. [`McpClient::disconnect`] retires it: a
-//! connection attempt that completes for a retired slot publishes nothing, and
-//! its process is stopped.
+//! A slot belongs to one generation. [`McpClient::disconnect`] retires it, and
+//! so does [`McpClient::replace_config`] when the server's entry changes or goes
+//! (see "Configuration" below): a connection attempt that completes for a
+//! retired slot publishes nothing, and its process is stopped.
 //!
 //! A transport that reports itself closed (its process exited, a line
 //! overflowed) is evicted, and a later call reconnects the server. A server
@@ -48,6 +49,26 @@
 //! with the agent id `runtime`: a connection serves every agent. A connection
 //! attempt that fails, or one retired by [`McpClient::disconnect`] or
 //! [`McpClient::shutdown`], reports nothing.
+//!
+//! ## Configuration
+//!
+//! The configured servers are the authority over the connections. A call
+//! targets its server's entry as the configuration held it when the call
+//! began, and a slot belongs to the entry it was created for (by the entry's
+//! [fingerprint](McpServerEntry::fingerprint)). [`McpClient::replace_config`]
+//! swaps the configuration and, in the same step, retires every slot whose
+//! entry the new configuration does not hold, whenever that slot was created:
+//! the slot of a removed server, and that of a server whose entry changed. It
+//! also drops those servers' cached tools. From then on a call that targets an
+//! entry the configuration no longer holds connects nothing: it gets no slot,
+//! a connection it was making is not published and its process is stopped,
+//! and the call fails, with `not-found` when its server was removed and with
+//! `transport-error` when the server's entry changed. A request already under
+//! way on a retired connection runs to its end, as after
+//! [`McpClient::disconnect`], and its result is returned, except a tool
+//! listing's: a listing that completes against an entry the configuration no
+//! longer holds is neither cached nor returned. The next call targets the
+//! server as it is configured now.
 //!
 //! ## Shutdown
 //!
@@ -249,10 +270,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// One server's connection state for one generation. [`McpClient::disconnect`]
-/// replaces the slot; an attempt still holding a replaced slot publishes
-/// nothing.
+/// One server's connection state for one generation, for the entry it was
+/// created for. [`McpClient::disconnect`] replaces the slot, and
+/// [`McpClient::replace_config`] does when the configuration stops holding that
+/// entry; an attempt still holding a replaced slot publishes nothing.
 struct ServerSlot {
+    /// The [fingerprint](McpServerEntry::fingerprint) of the entry the slot was
+    /// created for: the slot is current only while the configuration holds
+    /// that entry.
+    fingerprint: u64,
     /// Serializes connection attempts, so concurrent first calls start one
     /// server. An async lock: it is held across the attempt's awaits.
     connecting: tokio::sync::Mutex<()>,
@@ -281,8 +307,10 @@ struct Live {
 }
 
 impl ServerSlot {
-    fn new() -> Self {
+    /// A slot for the entry whose fingerprint is `fingerprint`.
+    fn new(fingerprint: u64) -> Self {
         Self {
+            fingerprint,
             connecting: tokio::sync::Mutex::new(()),
             state: Mutex::new(SlotState::default()),
         }
@@ -388,11 +416,115 @@ pub struct McpReconfig {
     pub changed: Vec<String>,
 }
 
+impl McpReconfig {
+    /// What changes from `old` to `new`, server by server, by each entry's
+    /// fingerprint.
+    fn between(old: &Configured, new: &Configured) -> Self {
+        let mut reconfig = Self::default();
+        for entry in old.servers.list_servers() {
+            let server_id = &entry.server_id;
+            match new.fingerprint(server_id) {
+                None => reconfig.removed.push(server_id.clone()),
+                Some(next) if Some(next) != old.fingerprint(server_id) => {
+                    reconfig.changed.push(server_id.clone());
+                }
+                Some(_) => {}
+            }
+        }
+        for entry in new.servers.list_servers() {
+            if old.fingerprint(&entry.server_id).is_none() {
+                reconfig.added.push(entry.server_id.clone());
+            }
+        }
+        reconfig
+    }
+}
+
+/// One configuration of the client: the configured servers, and the
+/// [fingerprint](McpServerEntry::fingerprint) of each one's entry.
+struct Configured {
+    servers: Arc<McpServersConfig>,
+    fingerprints: HashMap<String, u64>,
+}
+
+impl Configured {
+    fn new(servers: Arc<McpServersConfig>) -> Arc<Self> {
+        let fingerprints = servers
+            .list_servers()
+            .map(|entry| (entry.server_id.clone(), entry.fingerprint()))
+            .collect();
+        Arc::new(Self {
+            servers,
+            fingerprints,
+        })
+    }
+
+    /// The entry configured for `server_id`, as a call targets it.
+    fn target(&self, server_id: &str) -> Result<Target<'_>, McpError> {
+        let entry = self.servers.get(server_id)?;
+        Ok(Target {
+            entry,
+            fingerprint: entry.fingerprint(),
+        })
+    }
+
+    /// The fingerprint of the entry configured for `server_id`; `None` when the
+    /// server is not configured.
+    fn fingerprint(&self, server_id: &str) -> Option<u64> {
+        self.fingerprints.get(server_id).copied()
+    }
+
+    /// `None` when this configuration holds the entry `target` was taken from;
+    /// otherwise the error a call targeting it fails with: its server was
+    /// removed, or its entry changed.
+    fn refusal(&self, target: Target<'_>) -> Option<McpError> {
+        let server_id = &target.entry.server_id;
+        match self.fingerprint(server_id) {
+            Some(current) if current == target.fingerprint => None,
+            Some(_) => Some(McpError::transport(format!(
+                "server '{server_id}' was reconfigured while the call was under way"
+            ))),
+            None => Some(McpError::not_found(format!(
+                "server '{server_id}' is no longer configured"
+            ))),
+        }
+    }
+}
+
+/// A server as a call found it configured: its entry, and that entry's
+/// fingerprint, by which the client tells whether the configuration still
+/// holds it.
+#[derive(Clone, Copy)]
+struct Target<'a> {
+    entry: &'a McpServerEntry,
+    fingerprint: u64,
+}
+
+/// The configuration and the connection slots of the configured servers, under
+/// one lock (see the module docs, "Configuration"): a slot is created only for
+/// an entry the configuration holds, and [`McpClient::replace_config`] retires
+/// the slots of the entries it drops in the step that swaps the configuration.
+struct Servers {
+    config: Arc<Configured>,
+    slots: HashMap<String, Arc<ServerSlot>>,
+}
+
+impl Servers {
+    /// Whether `slot` is the current slot of `server_id`: the one the map
+    /// holds, for the entry the configuration holds.
+    fn is_current(&self, server_id: &str, slot: &Arc<ServerSlot>) -> bool {
+        self.slots
+            .get(server_id)
+            .is_some_and(|current| Arc::ptr_eq(current, slot))
+            && self.config.fingerprint(server_id) == Some(slot.fingerprint)
+    }
+}
+
 /// High-level MCP client. Owns the `McpServersConfig` whitelist, the
 /// per-server connection slots and the tool cache.
 pub struct McpClient {
-    config: Mutex<Arc<McpServersConfig>>,
-    slots: Mutex<HashMap<String, Arc<ServerSlot>>>,
+    /// The configured servers and their connection slots.
+    servers: Mutex<Servers>,
     tool_cache: Mutex<ToolCache>,
     leak_detector: Arc<dyn LeakDetector>,
     http_chain: Option<Arc<dyn HttpSecurityChain>>,
@@ -404,7 +536,7 @@ pub struct McpClient {
     /// [`with_event_bus`](McpClient::with_event_bus) gives one.
     event_bus: Option<Arc<dyn EventBusEmit>>,
     /// Set by [`shutdown`](McpClient::shutdown). Written and read under the
-    /// `slots` lock, so no slot is created once it is set.
+    /// `servers` lock, so no slot is created once it is set.
     shut_down: AtomicBool,
     /// Whether this composition may start child processes (stdio servers);
     /// `Allow` from both constructors, see [`with_process_policy`](McpClient::with_process_policy).
@@ -431,8 +563,10 @@ impl McpClient {
         http_chain: Option<Arc<dyn HttpSecurityChain>>,
     ) -> Self {
         Self {
-            config: Mutex::new(config),
-            slots: Mutex::new(HashMap::new()),
+            servers: Mutex::new(Servers {
+                config: Configured::new(config),
+                slots: HashMap::new(),
+            }),
             tool_cache: Mutex::new(ToolCache::default()),
             leak_detector,
             http_chain,
@@ -475,30 +609,31 @@ impl McpClient {
     }
 
     /// Construct a test-only client where transports are pre-injected as live,
-    /// already-initialized connections. Used by `tests/support/mock_transport.rs`
-    /// and `tests/client_surface.rs`.
+    /// already-initialized connections of the configured servers; a transport
+    /// injected for a server `config` does not hold is dropped. Used by
+    /// `tests/support/mock_transport.rs` and `tests/client_surface.rs`.
     #[doc(hidden)]
     pub fn new_with_transports(
         config: Arc<McpServersConfig>,
         leak_detector: Arc<dyn LeakDetector>,
         injected: HashMap<String, Arc<dyn McpTransport>>,
     ) -> Self {
+        let config = Configured::new(config);
         let since = Instant::now();
         let slots = injected
             .into_iter()
-            .map(|(server_id, transport)| {
-                let slot = ServerSlot::new();
+            .filter_map(|(server_id, transport)| {
+                let slot = ServerSlot::new(config.fingerprint(&server_id)?);
                 slot.state().live = Some(Live {
                     transport,
                     since,
                     protocol_version: None,
                 });
-                (server_id, Arc::new(slot))
+                Some((server_id, Arc::new(slot)))
             })
             .collect();
         Self {
-            config: Mutex::new(config),
-            slots: Mutex::new(slots),
+            servers: Mutex::new(Servers { config, slots }),
             tool_cache: Mutex::new(ToolCache::default()),
             leak_detector,
             http_chain: None,
@@ -510,42 +645,55 @@ impl McpClient {
         }
     }
 
-    fn servers(&self) -> Arc<McpServersConfig> {
-        Arc::clone(&lock(&self.config))
+    /// The configuration and the slots, locked.
+    fn servers(&self) -> MutexGuard<'_, Servers> {
+        lock(&self.servers)
     }
 
-    /// Replace the configured servers. Connections of a removed or changed
-    /// server are closed ([`disconnect`](Self::disconnect)); their tool-cache
-    /// entries are dropped. An unchanged server keeps its connection. A client
-    /// that has been shut down ignores the new set.
+    /// The current configuration.
+    fn config(&self) -> Arc<Configured> {
+        Arc::clone(&self.servers().config)
+    }
+
+    /// Replace the configured servers (see the module docs, "Configuration").
+    /// The connection of a removed or changed server is closed, as
+    /// [`disconnect`](Self::disconnect) closes it, and one a call is still
+    /// making for it is not published and is stopped; the tool-cache entries of
+    /// those servers are dropped. A call that targets an entry the new
+    /// configuration does not hold connects nothing, fails, and caches no
+    /// listing. An unchanged server keeps its connection. A client that has
+    /// been shut down ignores the new set.
     pub fn replace_config(&self, new: McpServersConfig) -> McpReconfig {
-        if self.is_shut_down() {
-            return McpReconfig::default();
-        }
-        let new = Arc::new(new);
-        let old = {
-            let mut guard = lock(&self.config);
-            let old = Arc::clone(&*guard);
-            *guard = Arc::clone(&new);
-            old
+        let new = Configured::new(Arc::new(new));
+        let (reconfig, retired) = {
+            let mut servers = self.servers();
+            if self.is_shut_down() {
+                return McpReconfig::default();
+            }
+            let old = std::mem::replace(&mut servers.config, Arc::clone(&new));
+            let reconfig = McpReconfig::between(&old, &new);
+            // Every slot whose entry the new configuration does not hold goes
+            // in the step that swaps it, however the slot came to exist: no
+            // call sees the new configuration beside such a slot. Its live
+            // connection is dropped outside the lock.
+            let mut retired = Vec::new();
+            servers.slots.retain(|server_id, slot| {
+                let kept = new.fingerprint(server_id) == Some(slot.fingerprint);
+                if !kept {
+                    retired.extend(slot.state().live.take());
+                }
+                kept
+            });
+            // So do the cached tools of the servers removed or changed, a
+            // listing stored before the swap included (see `store_listing`).
+            let mut cache = lock(&self.tool_cache);
+            for server_id in reconfig.removed.iter().chain(&reconfig.changed) {
+                cache.drop_server(server_id);
+            }
+            (reconfig, retired)
         };
-        let mut reconfig = McpReconfig::default();
-        for entry in old.list_servers() {
-            match new.get(&entry.server_id) {
-                Ok(next) if next.fingerprint() == entry.fingerprint() => {}
-                Ok(_) => reconfig.changed.push(entry.server_id.clone()),
-                Err(_) => reconfig.removed.push(entry.server_id.clone()),
-            }
-        }
-        for entry in new.list_servers() {
-            if old.get(&entry.server_id).is_err() {
-                reconfig.added.push(entry.server_id.clone());
-            }
-        }
-        for id in reconfig.removed.iter().chain(reconfig.changed.iter()) {
-            self.disconnect(id);
-            lock(&self.tool_cache).drop_server(id);
-        }
+        // Dropping a connection stops its process once no call holds it.
+        drop(retired);
         reconfig
     }
 
@@ -553,7 +701,7 @@ impl McpClient {
     /// its live connection; `None` when it has no live connection or the client
     /// did not initialize it.
     pub fn protocol_version(&self, server_id: &str) -> Option<String> {
-        let slot = self.slots().get(server_id).cloned()?;
+        let slot = self.servers().slots.get(server_id).cloned()?;
         let state = slot.state();
         state.live.as_ref()?.protocol_version.clone()
     }
@@ -562,7 +710,7 @@ impl McpClient {
     /// process stops once they have; a connection attempt in flight publishes
     /// nothing. The next call connects afresh, with no backoff carried over.
     pub fn disconnect(&self, server_id: &str) {
-        let Some(slot) = self.slots().remove(server_id) else {
+        let Some(slot) = self.servers().slots.remove(server_id) else {
             return;
         };
         let live = slot.state().live.take();
@@ -576,9 +724,9 @@ impl McpClient {
     /// nothing.
     pub fn shutdown(&self) {
         let retired: Vec<Arc<ServerSlot>> = {
-            let mut slots = self.slots();
+            let mut servers = self.servers();
             self.shut_down.store(true, Ordering::SeqCst);
-            slots.drain().map(|(_, slot)| slot).collect()
+            servers.slots.drain().map(|(_, slot)| slot).collect()
         };
         for slot in retired {
             slot.close_transports();
@@ -597,14 +745,16 @@ impl McpClient {
     /// refuse calls to them. False for an http server and for an id that is not
     /// configured.
     pub fn refuses_web_tools(&self, server_id: &str) -> bool {
-        self.servers()
+        self.config()
+            .servers
             .get(server_id)
             .is_ok_and(|entry| refuse_stdio_web_provider(&entry.transport).is_err())
     }
 
     /// List configured servers (filtered by whitelist).
     pub async fn list_servers(&self) -> Vec<McpServerInfo> {
-        self.servers()
+        self.config()
+            .servers
             .list_servers()
             .map(|e| McpServerInfo {
                 id: e.server_id.clone(),
@@ -626,14 +776,17 @@ impl McpClient {
     /// limits (see the module docs). The caller receives the whole listing; it
     /// also becomes the server's entry in the tool cache
     /// ([`cached_tools`](Self::cached_tools)), within the server's share. A
-    /// failed listing leaves the cache as it was.
+    /// failed listing leaves the cache as it was. A listing that completes
+    /// against an entry the configuration no longer holds (its server removed
+    /// or changed meanwhile, see the module docs) fails: it is neither cached
+    /// nor returned.
     pub async fn list_tools(
         &self,
         caller: Option<&str>,
         server_id: &str,
     ) -> Result<Vec<McpToolInfo>, McpError> {
-        let servers = self.servers();
-        let entry = servers.get(server_id)?;
+        let config = self.config();
+        let target = config.target(server_id)?;
         let mut listing = ToolListing::new(server_id);
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_TOOL_LIST_PAGES {
@@ -641,10 +794,10 @@ impl McpClient {
                 None => serde_json::json!({}),
                 Some(cursor) => serde_json::json!({ "cursor": cursor }),
             };
-            let bytes = self.call(caller, entry, "tools/list", params).await?;
+            let bytes = self.call(caller, target, "tools/list", params).await?;
             let page: serde_json::Value = serde_json::from_slice(&bytes)
                 .map_err(|_| McpError::invalid_response("tools/list result is not JSON"))?;
-            match listing.read_page(entry, page)? {
+            match listing.read_page(target.entry, page)? {
                 Some(next) if !listing.is_full() && cursor.as_deref() != Some(next.as_str()) => {
                     cursor = Some(next);
                 }
@@ -652,8 +805,27 @@ impl McpClient {
             }
         }
         let tools = listing.into_tools();
-        lock(&self.tool_cache).store(server_id, &tools);
+        self.store_listing(target, &tools)?;
         Ok(tools)
+    }
+
+    /// Make `tools` the cached listing of `target`'s server when the
+    /// configuration still holds the entry the listing was made against;
+    /// otherwise fail with the configuration's refusal. The check holds the
+    /// servers lock until the cache is locked, and
+    /// [`replace_config`](Self::replace_config) drops the entries of the
+    /// servers it removes or changes after the swap, under both locks: a
+    /// listing that passed the check before a swap is dropped by it, and one
+    /// checked after it is refused.
+    fn store_listing(&self, target: Target<'_>, tools: &[McpToolInfo]) -> Result<(), McpError> {
+        let servers = self.servers();
+        if let Some(refusal) = servers.config.refusal(target) {
+            return Err(refusal);
+        }
+        let mut cache = lock(&self.tool_cache);
+        drop(servers);
+        cache.store(&target.entry.server_id, tools);
+        Ok(())
     }
 
     /// Each server's latest successful [`list_tools`](Self::list_tools), in
@@ -679,6 +851,26 @@ impl McpClient {
         lock(&self.tool_cache).listings()
     }
 
+    /// The configured servers a [`list_tools`](Self::list_tools) would add
+    /// tools to the cache for, in id order, read without contacting any
+    /// server: a server the cache holds no listing of (not listed yet, or every
+    /// listing of it failed), and one whose cached listing is cut
+    /// ([`CachedToolListing::is_truncated`]) to fewer tools than the cache now
+    /// has room for it, room another server's listing took and has since given
+    /// back. A listing cut to its share of a full cache is not among them:
+    /// listing it again would cut it the same way.
+    pub fn servers_to_list(&self) -> Vec<String> {
+        let config = self.config();
+        let cache = lock(&self.tool_cache);
+        let growable = cache.growable();
+        config
+            .servers
+            .list_servers()
+            .filter(|entry| !cache.holds(&entry.server_id) || growable.contains(&entry.server_id))
+            .map(|entry| entry.server_id.clone())
+            .collect()
+    }
+
     /// Put `tools` in the cache as the listing of `server_id`, without contacting
     /// the server.
     #[doc(hidden)]
@@ -693,12 +885,12 @@ impl McpClient {
         caller: Option<&str>,
         server_id: &str,
     ) -> Result<Vec<McpPromptInfo>, McpError> {
-        let servers = self.servers();
-        let entry = servers.get(server_id)?;
+        let config = self.config();
+        let target = config.target(server_id)?;
         let bytes = self
             .call(
                 caller,
-                entry,
+                target,
                 "prompts/list",
                 serde_json::Value::Object(Default::default()),
             )
@@ -737,14 +929,14 @@ impl McpClient {
         prompt_name: &str,
         args: Vec<(String, String)>,
     ) -> Result<Vec<u8>, McpError> {
-        let servers = self.servers();
-        let entry = servers.get(server_id)?;
+        let config = self.config();
+        let target = config.target(server_id)?;
         let args_obj: serde_json::Map<String, serde_json::Value> = args
             .into_iter()
             .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
         let params = serde_json::json!({"name": prompt_name, "arguments": args_obj});
-        self.call(caller, entry, "prompts/get", params).await
+        self.call(caller, target, "prompts/get", params).await
     }
 
     /// List resources on a server, for `caller` (see the module docs).
@@ -753,12 +945,12 @@ impl McpClient {
         caller: Option<&str>,
         server_id: &str,
     ) -> Result<Vec<McpResourceInfo>, McpError> {
-        let servers = self.servers();
-        let entry = servers.get(server_id)?;
+        let config = self.config();
+        let target = config.target(server_id)?;
         let bytes = self
             .call(
                 caller,
-                entry,
+                target,
                 "resources/list",
                 serde_json::Value::Object(Default::default()),
             )
@@ -798,10 +990,10 @@ impl McpClient {
         server_id: &str,
         uri: &str,
     ) -> Result<Vec<u8>, McpError> {
-        let servers = self.servers();
-        let entry = servers.get(server_id)?;
+        let config = self.config();
+        let target = config.target(server_id)?;
         let params = serde_json::json!({"uri": uri});
-        self.call(caller, entry, "resources/read", params).await
+        self.call(caller, target, "resources/read", params).await
     }
 
     /// Invoke a tool, for `caller` (see the module docs). Order:
@@ -827,8 +1019,9 @@ impl McpClient {
             )));
         }
 
-        let servers = self.servers();
-        let entry = servers.get(server_id)?;
+        let config = self.config();
+        let target = config.target(server_id)?;
+        let entry = target.entry;
         if !entry.tool_allowed(tool_name) {
             return Err(McpError::tool_not_found(format!(
                 "tool '{tool_name}' does not match the tool patterns configured for server \
@@ -856,7 +1049,7 @@ impl McpClient {
             "name": tool_name,
             "arguments": params_json,
         });
-        let bytes = self.call(caller, entry, "tools/call", call_params).await?;
+        let bytes = self.call(caller, target, "tools/call", call_params).await?;
 
         if let Some(s) = schemas {
             if let Some(output_schema) = &s.output {
@@ -870,20 +1063,20 @@ impl McpClient {
         Ok(bytes)
     }
 
-    /// Send one request to the server for `caller`. A failed call that found
-    /// the transport closed evicts it; a result over `max_result_bytes` fails
-    /// the call.
+    /// Send one request to `target`'s server for `caller`. A failed call that
+    /// found the transport closed evicts it; a result over `max_result_bytes`
+    /// fails the call.
     async fn call(
         &self,
         caller: Option<&str>,
-        entry: &McpServerEntry,
+        target: Target<'_>,
         method: &str,
         params: serde_json::Value,
     ) -> Result<Vec<u8>, McpError> {
-        let transport = self.transport_for(entry).await?;
+        let transport = self.transport_for(target).await?;
         let result = transport.invoke(caller, method, params).await;
         if result.is_err() {
-            self.evict_if_closed(&entry.server_id, &transport);
+            self.evict_if_closed(&target.entry.server_id, &transport);
         }
         let bytes = result?;
         if bytes.len() > self.limits.max_result_bytes {
@@ -895,39 +1088,42 @@ impl McpClient {
         Ok(bytes)
     }
 
-    fn slots(&self) -> MutexGuard<'_, HashMap<String, Arc<ServerSlot>>> {
-        lock(&self.slots)
-    }
-
-    /// The server's current slot, created on first use; none once the client
-    /// is shut down. Only whitelisted ids reach here, so the map is bounded by
-    /// the config.
-    fn slot(&self, server_id: &str) -> Result<Arc<ServerSlot>, McpError> {
-        let mut slots = self.slots();
+    /// The current slot of `target`'s server, created on first use; none once
+    /// the client is shut down, and none when the configuration no longer
+    /// holds the entry `target` was taken from: the call then fails with the
+    /// configuration's refusal and connects nothing. Only configured entries
+    /// get a slot, so the map is bounded by the configuration.
+    fn slot(&self, target: Target<'_>) -> Result<Arc<ServerSlot>, McpError> {
+        let mut servers = self.servers();
         if self.shut_down.load(Ordering::SeqCst) {
             return Err(McpError::transport("the mcp client is shut down"));
         }
+        if let Some(refusal) = servers.config.refusal(target) {
+            return Err(refusal);
+        }
         Ok(Arc::clone(
-            slots
-                .entry(server_id.to_string())
-                .or_insert_with(|| Arc::new(ServerSlot::new())),
+            servers
+                .slots
+                .entry(target.entry.server_id.clone())
+                .or_insert_with(|| Arc::new(ServerSlot::new(target.fingerprint))),
         ))
     }
 
-    /// The server's live transport, connecting it if it has none (see the
-    /// module docs: one attempt at a time per server, backoff after failures).
-    async fn transport_for(
-        &self,
-        entry: &McpServerEntry,
-    ) -> Result<Arc<dyn McpTransport>, McpError> {
+    /// The live transport of `target`'s server, connecting it if it has none
+    /// (see the module docs: one attempt at a time per server, backoff after
+    /// failures, and nothing for an entry the configuration no longer holds).
+    async fn transport_for(&self, target: Target<'_>) -> Result<Arc<dyn McpTransport>, McpError> {
+        let entry = target.entry;
         loop {
-            let slot = self.slot(&entry.server_id)?;
+            let slot = self.slot(target)?;
             if let Some(transport) = self.live_transport(&entry.server_id, &slot) {
                 return Ok(transport);
             }
             let _attempt = slot.connecting.lock().await;
-            // `disconnect` may have retired the slot while this caller waited
-            // for the attempt lock: use the server's new slot instead.
+            // `disconnect` or `replace_config` may have retired the slot while
+            // this caller waited for the attempt lock: take the server's new
+            // slot, which `slot` refuses when the configuration no longer holds
+            // the entry this call targets.
             if !self.is_current(&entry.server_id, &slot) {
                 continue;
             }
@@ -942,7 +1138,7 @@ impl McpClient {
                     wait.as_millis().max(1)
                 )));
             }
-            return match self.connect(entry, &slot).await {
+            return match self.connect(target, &slot).await {
                 Ok((transport, protocol_version)) => {
                     let live = Live {
                         transport: Arc::clone(&transport),
@@ -956,7 +1152,7 @@ impl McpClient {
                         ));
                         Ok(transport)
                     } else {
-                        Err(disconnected_while_connecting(&entry.server_id))
+                        Err(self.retired(target))
                     }
                 }
                 Err(error) => {
@@ -995,28 +1191,36 @@ impl McpClient {
         }
     }
 
-    /// Whether `slot` is still the server's current slot.
+    /// Whether `slot` is still the server's current slot: the server's slot,
+    /// for the entry the configuration holds.
     fn is_current(&self, server_id: &str, slot: &Arc<ServerSlot>) -> bool {
-        self.slots()
-            .get(server_id)
-            .is_some_and(|current| Arc::ptr_eq(current, slot))
+        self.servers().is_current(server_id, slot)
     }
 
-    /// Store `live` in `slot` if the slot is still the server's current one.
-    /// Returns whether it was stored; otherwise `live` is dropped, which stops
-    /// its process once no call holds it.
+    /// Store `live` in `slot` if the slot is still the server's current one
+    /// ([`is_current`](Self::is_current)). Returns whether it was stored;
+    /// otherwise `live` is dropped, which stops its process once no call holds
+    /// it.
     fn publish(&self, server_id: &str, slot: &Arc<ServerSlot>, live: Live) -> bool {
-        let slots = self.slots();
-        let current = slots
-            .get(server_id)
-            .is_some_and(|current| Arc::ptr_eq(current, slot));
+        let servers = self.servers();
+        let current = servers.is_current(server_id, slot);
         if current {
             let mut state = slot.state();
             state.live = Some(live);
             state.opening = None;
         }
-        drop(slots);
+        drop(servers);
         current
+    }
+
+    /// The error of a call whose slot was retired while it connected: the
+    /// configuration's refusal when it no longer holds the entry `target` was
+    /// taken from, otherwise (the slot was disconnected, or the client shut
+    /// down) that the server was disconnected while connecting.
+    fn retired(&self, target: Target<'_>) -> McpError {
+        self.config()
+            .refusal(target)
+            .unwrap_or_else(|| disconnected_while_connecting(&target.entry.server_id))
     }
 
     /// Record `transport` as the one the attempt on `slot` has opened, so that
@@ -1025,16 +1229,16 @@ impl McpClient {
     /// transport is then closed here and the attempt fails.
     fn opened(
         &self,
-        server_id: &str,
+        target: Target<'_>,
         slot: &Arc<ServerSlot>,
         transport: &Arc<dyn McpTransport>,
     ) -> Result<(), McpError> {
         slot.state().opening = Some(Arc::downgrade(transport));
-        if self.is_current(server_id, slot) {
+        if self.is_current(&target.entry.server_id, slot) {
             return Ok(());
         }
         transport.close();
-        Err(disconnected_while_connecting(server_id))
+        Err(self.retired(target))
     }
 
     /// Evict `transport` if it has closed and is still the server's live one.
@@ -1042,7 +1246,7 @@ impl McpClient {
         if !transport.is_closed() {
             return;
         }
-        let Some(slot) = self.slots().get(server_id).cloned() else {
+        let Some(slot) = self.servers().slots.get(server_id).cloned() else {
             return;
         };
         let evicted = {
@@ -1061,17 +1265,18 @@ impl McpClient {
         }
     }
 
-    /// Open a transport for `entry` and initialize it within the startup
-    /// timeout. A stdio server is spawned on the client's runtime; an http
-    /// transport posts through the client's security chain with the client's
-    /// request timeout. A failed or late initialization drops the transport,
-    /// which stops a stdio server's process. The transport is recorded in
-    /// `slot` while it connects (see [`opened`](Self::opened)).
+    /// Open a transport for `target`'s entry and initialize it within the
+    /// startup timeout. A stdio server is spawned on the client's runtime; an
+    /// http transport posts through the client's security chain with the
+    /// client's request timeout. A failed or late initialization drops the
+    /// transport, which stops a stdio server's process. The transport is
+    /// recorded in `slot` while it connects (see [`opened`](Self::opened)).
     async fn connect(
         &self,
-        entry: &McpServerEntry,
+        target: Target<'_>,
         slot: &Arc<ServerSlot>,
     ) -> Result<(Arc<dyn McpTransport>, Option<String>), McpError> {
+        let entry = target.entry;
         match &entry.transport {
             McpTransportSpec::Http {
                 endpoint_url,
@@ -1093,11 +1298,16 @@ impl McpClient {
                     },
                 ));
                 let shared: Arc<dyn McpTransport> = transport.clone();
-                self.opened(&entry.server_id, slot, &shared)?;
+                self.opened(target, slot, &shared)?;
                 let version = transport.initialize().await?;
                 Ok((shared, Some(version.to_string())))
             }
-            McpTransportSpec::Stdio { command, args, env } => {
+            McpTransportSpec::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => {
                 let options = StdioOptions {
                     request_timeout: self.limits.request_timeout,
                     max_line_bytes: self.limits.max_line_bytes,
@@ -1109,6 +1319,7 @@ impl McpClient {
                         Some(self.runtime()?)
                     },
                     process_policy: self.process_policy,
+                    cwd: cwd.clone(),
                 };
                 let transport: Arc<dyn McpTransport> =
                     Arc::new(StdioMcpTransport::spawn_with_options(
@@ -1119,7 +1330,7 @@ impl McpClient {
                         Arc::clone(&self.leak_detector),
                         options,
                     )?);
-                self.opened(&entry.server_id, slot, &transport)?;
+                self.opened(target, slot, &transport)?;
                 let startup = self.limits.startup_timeout;
                 let version = match tokio::time::timeout(startup, initialize(transport.as_ref()))
                     .await
@@ -1408,6 +1619,7 @@ mod module_001_ac32_tests {
                 command: command.display().to_string(),
                 args: vec![],
                 env: BTreeMap::new(),
+                cwd: None,
             },
             tool_patterns: None,
             tool_schemas: BTreeMap::new(),

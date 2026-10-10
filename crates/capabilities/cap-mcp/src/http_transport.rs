@@ -60,6 +60,15 @@
 //! count of lines over the budget is logged with the first line of a later
 //! window.
 //!
+//! ## Request bodies
+//!
+//! A message goes out as compact JSON whose strings hold no literal `{` or `}`: each is
+//! written as the escape `\u007b` or `\u007d`, which a JSON reader decodes to the same
+//! string. The security chain reads `{name}` in a request as a placeholder for the secret
+//! `name`, and fills it in when the server's credentials bind that secret; a message's
+//! strings (a tool's arguments, a resource URI) are data, so none of them can make the chain
+//! put a secret into a request.
+//!
 //! ## Bounds
 //!
 //! - `MAX_JSONRPC_REQ_BYTES = 4 MiB` — request body cap.
@@ -553,9 +562,37 @@ impl HttpMcpTransport {
     }
 }
 
-/// A JSON-RPC message serialized for the wire.
+/// A JSON-RPC message serialized for the wire: compact JSON whose strings hold no literal
+/// `{` or `}` (see the module docs, "Request bodies").
 fn message_body(message: &impl Serialize) -> Result<Vec<u8>, McpError> {
-    serde_json::to_vec(message).map_err(|_| McpError::invalid_response("serialize request"))
+    let mut body = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut body, NoBraceStrings);
+    message
+        .serialize(&mut serializer)
+        .map_err(|_| McpError::invalid_response("serialize request"))?;
+    Ok(body)
+}
+
+/// Compact JSON whose strings carry every `{` and `}` as an escape (`\u007b`, `\u007d`).
+struct NoBraceStrings;
+
+impl serde_json::ser::Formatter for NoBraceStrings {
+    fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        let mut rest = fragment.as_bytes();
+        while let Some(at) = rest.iter().position(|&b| b == b'{' || b == b'}') {
+            writer.write_all(&rest[..at])?;
+            writer.write_all(if rest[at] == b'{' {
+                b"\\u007b"
+            } else {
+                b"\\u007d"
+            })?;
+            rest = &rest[at + 1..];
+        }
+        writer.write_all(rest)
+    }
 }
 
 /// The value of the first header named `name` (any case).

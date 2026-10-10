@@ -8,9 +8,9 @@
 //!
 //! # Server ids
 //!
-//! A server id is 1..=[`MAX_SERVER_ID_BYTES`] characters from `[A-Za-z0-9._-]` (see
-//! [`is_valid_server_id`]). A pack's `mcp-servers/*.yaml` and cap-mcp's server whitelist accept
-//! exactly these ids.
+//! A server id is 1..=[`MAX_SERVER_ID_BYTES`] characters from `[A-Za-z0-9._-]`, the first not a
+//! `.` (see [`is_valid_server_id`]). A pack's `mcp-servers/*.yaml` and cap-mcp's server whitelist
+//! accept exactly these ids.
 //!
 //! # Tool patterns
 //!
@@ -182,12 +182,15 @@ pub fn is_request_token(name: &str) -> bool {
         && name.trim() == name
 }
 
-/// Whether `server_id` is 1..=[`MAX_SERVER_ID_BYTES`] characters from `[A-Za-z0-9._-]`. Such an
-/// id holds no whitespace, comma, path separator, control or non-ASCII character, so it reads the
-/// same in a log line and a call can carry it.
+/// Whether `server_id` is 1..=[`MAX_SERVER_ID_BYTES`] characters from `[A-Za-z0-9._-]`, the
+/// first not a `.`. Such an id holds no whitespace, comma, path separator, control or non-ASCII
+/// character, so it reads the same in a log line and a call can carry it; and as a server's file
+/// is named `<id>.yaml`, an id starting with a dot would name a hidden file, which no loader
+/// reads as a server file (`.` and `..` would not even name a file of their own).
 pub fn is_valid_server_id(server_id: &str) -> bool {
     !server_id.is_empty()
         && server_id.len() <= MAX_SERVER_ID_BYTES
+        && !server_id.starts_with('.')
         && server_id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
@@ -451,8 +454,16 @@ mod tests {
             "a\u{200B}b",
             "a\nb",
             too_long.as_str(),
+            // A file named after one of these would be hidden, or no file of its own.
+            ".",
+            "..",
+            ".hidden",
         ] {
             assert!(!is_valid_server_id(id), "{id:?}");
+        }
+        // A dot anywhere else is fine.
+        for id in ["a.", "a..b", "v1.2.3"] {
+            assert!(is_valid_server_id(id), "{id:?}");
         }
     }
 

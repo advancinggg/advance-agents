@@ -35,8 +35,11 @@
 //! tools) and says so ([`CachedToolListing::listed`]), while the caller of the
 //! listing still receives all of it. A new listing can shrink the other
 //! servers' shares: their cached listings are cut to them at once, and grow
-//! back only with their servers' next listings. A cached listing is shared:
-//! reading the cache clones no tool.
+//! back only with their servers' next listings.
+//! [`McpClient::servers_to_list`](crate::McpClient::servers_to_list) names the
+//! servers whose next listing would add to the cache: those it holds no listing
+//! of, and those whose share has outgrown their cut listing. A cached listing is
+//! shared: reading the cache clones no tool.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io;
@@ -154,11 +157,23 @@ fn keeps_name(entry: &McpServerEntry, name: &str) -> bool {
 
 /// `text` cut to at most [`MAX_TOOL_DESCRIPTION_BYTES`], on a character
 /// boundary, ending in `…` when cut.
-fn cut_description(mut text: String) -> String {
-    if text.len() <= MAX_TOOL_DESCRIPTION_BYTES {
+fn cut_description(text: String) -> String {
+    cut_description_to(text, MAX_TOOL_DESCRIPTION_BYTES)
+}
+
+/// `text` cut to at most `max_bytes` as a listing cuts a tool's description to
+/// [`MAX_TOOL_DESCRIPTION_BYTES`]: on a character boundary, ending in `…` when
+/// cut. When `max_bytes` leaves no room for the `…`, nothing is kept.
+pub fn cut_description_to(mut text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
         return text;
     }
-    let mut end = MAX_TOOL_DESCRIPTION_BYTES - '…'.len_utf8();
+    let ellipsis = '…'.len_utf8();
+    if max_bytes < ellipsis {
+        text.clear();
+        return text;
+    }
+    let mut end = max_bytes - ellipsis;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -261,6 +276,28 @@ impl ToolCache {
         self.listings.values().cloned().collect()
     }
 
+    /// Whether the cache holds a listing of `server_id`.
+    pub(crate) fn holds(&self, server_id: &str) -> bool {
+        self.listings.contains_key(server_id)
+    }
+
+    /// The servers whose cached listing a new listing of the same tools would
+    /// grow, in server-id order: those cut to fewer tools than their share for
+    /// the listings held now. A listing is cut to its share when it is stored
+    /// and keeps what it holds when another listing shrinks or goes, so its
+    /// share can outgrow it; one cut to its share of a full cache would be cut
+    /// the same way again.
+    pub(crate) fn growable(&self) -> Vec<String> {
+        let demands: Vec<usize> = self.listings.values().map(|l| l.listed).collect();
+        let shares = fair_shares(&demands, MAX_CACHED_TOOLS);
+        self.listings
+            .values()
+            .zip(shares)
+            .filter(|(listing, share)| listing.tools.len() < *share)
+            .map(|(listing, _)| listing.server_id.clone())
+            .collect()
+    }
+
     /// Drop the cached listing of `server_id`, if any.
     pub(crate) fn drop_server(&mut self, server_id: &str) {
         self.listings.remove(server_id);
@@ -335,6 +372,18 @@ mod tests {
         assert!(cut.len() <= MAX_TOOL_DESCRIPTION_BYTES, "{}", cut.len());
         assert!(cut.ends_with('…'));
         assert!(cut.trim_end_matches('…').chars().all(|c| c == 'é'));
+    }
+
+    // Any limit cuts the same way; one with no room for the `…` keeps nothing.
+    #[test]
+    fn a_description_is_cut_to_any_limit_the_same_way() {
+        assert_eq!(cut_description_to("abc".into(), 3), "abc");
+        assert_eq!(cut_description_to("abcdef".into(), 5), "ab…");
+        assert_eq!(cut_description_to("ééé".into(), 6), "ééé");
+        assert_eq!(cut_description_to("ééé".into(), 5), "é…");
+        assert_eq!(cut_description_to("ééé".into(), 4), "…");
+        assert_eq!(cut_description_to("abcd".into(), 2), "");
+        assert_eq!(cut_description_to("abcd".into(), 0), "");
     }
 
     #[test]
@@ -458,6 +507,43 @@ mod tests {
             ]
         );
         assert!(cache.listings().iter().all(|l| l.is_truncated()));
+    }
+
+    // A listing cut to its share of a full cache cannot grow by listing again; one cut while
+    // another listing held room that has since been given back (a shorter listing, or a
+    // server gone) can, until its server lists again.
+    #[test]
+    fn a_cut_listing_can_grow_only_once_its_share_outgrows_it() {
+        let mut cache = ToolCache::default();
+        assert!(!cache.holds("a"));
+        cache.store("a", &tools("a", MAX_CACHED_TOOLS - 10));
+        cache.store("b", &tools("b", 25));
+        assert!(cache.holds("a") && cache.holds("b"));
+        assert!(cache.listings()[0].is_truncated());
+        assert!(
+            cache.growable().is_empty(),
+            "a full cache holds `a` at its share"
+        );
+
+        cache.store("b", &tools("b", 5));
+        assert_eq!(cache.growable(), ["a"]);
+        cache.store("a", &tools("a", MAX_CACHED_TOOLS - 10));
+        assert!(cache.growable().is_empty());
+        assert!(!cache.listings()[0].is_truncated());
+
+        for server in ["e", "d", "c", "b", "a"] {
+            cache.store(server, &tools(server, MAX_TOOLS_PER_SERVER));
+        }
+        assert!(cache.listings().iter().all(|l| l.is_truncated()));
+        assert!(
+            cache.growable().is_empty(),
+            "five full listings at their shares"
+        );
+        cache.drop_server("e");
+        assert!(!cache.holds("e"));
+        assert_eq!(cache.growable(), ["a", "b", "c", "d"]);
+        cache.store("b", &tools("b", MAX_TOOLS_PER_SERVER));
+        assert_eq!(cache.growable(), ["a", "c", "d"]);
     }
 
     // A read shares the cached listings: it clones no tool.

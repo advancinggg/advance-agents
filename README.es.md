@@ -44,7 +44,7 @@ bienvenido a construir tus propios clientes de agentes, herramientas y runtimes 
 Depende del crate fachada [`crates/advance-core`](crates/advance-core):
 
 ```toml
-advance-core = { git = "https://github.com/advancinggg/advance-agents", tag = "v0.1.31" }
+advance-core = { git = "https://github.com/advancinggg/advance-agents", tag = "v0.1.32" }
 ```
 
 ## Arquitectura de un vistazo

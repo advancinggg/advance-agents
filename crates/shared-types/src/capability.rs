@@ -80,6 +80,18 @@ pub struct McpToolEntry {
     pub server_id: String,
 }
 
+/// The MCP tools an agent's prompt shows, read through
+/// [`crate::traits::CallableInventoryReader::mcp_tools_shown`]: the entries, and how
+/// many more MCP tools the agent may call that they leave out.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct McpToolsShown {
+    /// The entries shown, in the order shown.
+    pub tools: Vec<McpToolEntry>,
+    /// The MCP tools the agent may call that `tools` leaves out, because the inventory
+    /// bounds what it shows; zero when it shows them all.
+    pub not_shown: usize,
+}
+
 // ============================================================================
 // Slice I — capability wiring data types
 // ============================================================================

@@ -39,8 +39,9 @@ pub use http_transport::{HttpMcpTransport, HttpOptions, MAX_SESSION_ID_BYTES};
 pub use inventory::{mcp_tool_entries, mcp_tool_entries_from_infos};
 pub use jsonrpc::{JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 pub use listing::{
-    CachedToolListing, MAX_CACHED_TOOLS, MAX_TOOLS_PER_SERVER, MAX_TOOL_DESCRIPTION_BYTES,
-    MAX_TOOL_LIST_CURSOR_BYTES, MAX_TOOL_LIST_PAGES, MAX_TOOL_NAME_BYTES, MAX_TOOL_SCHEMA_BYTES,
+    cut_description_to, CachedToolListing, MAX_CACHED_TOOLS, MAX_TOOLS_PER_SERVER,
+    MAX_TOOL_DESCRIPTION_BYTES, MAX_TOOL_LIST_CURSOR_BYTES, MAX_TOOL_LIST_PAGES,
+    MAX_TOOL_NAME_BYTES, MAX_TOOL_SCHEMA_BYTES,
 };
 pub use schema_validator::SchemaValidator;
 pub use stdio_transport::{StdioMcpTransport, StdioOptions};

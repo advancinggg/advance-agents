@@ -8,8 +8,13 @@
 //! ## Lifecycle + cleanup
 //!
 //! - The subprocess runs with a cleared environment (only the explicit `env`
-//!   map), cwd `/`, and leads its own process group, so one signal reaches every
-//!   process it starts (wrappers such as `npx` or `uvx` start grandchildren).
+//!   map, which is the child's whole environment), in the working directory
+//!   [`StdioOptions::cwd`] (default `/`), and leads its own process group, so
+//!   one signal reaches every process it starts (wrappers such as `npx` or `uvx`
+//!   start grandchildren). A working directory that is not a directory fails the
+//!   spawn with an error naming it. A `command` that is a bare name (no `/`) is
+//!   looked up on the `PATH` of that environment (the system's default search
+//!   path when it sets none).
 //! - The child is spawned, and its reader / writer / stderr tasks run, on the
 //!   runtime named by [`StdioOptions::runtime`] (default: the current one). The
 //!   transport therefore keeps working after the runtime of the call that
@@ -55,6 +60,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -123,6 +129,8 @@ pub struct StdioOptions {
     /// [`ProcessPolicy::Forbid`] the spawn answers a typed refusal
     /// (`stdio: process_forbidden: … (MCP stdio server)`) and nothing is started.
     pub process_policy: ProcessPolicy,
+    /// The child's working directory. `None`: `/`.
+    pub cwd: Option<PathBuf>,
 }
 
 impl Default for StdioOptions {
@@ -132,6 +140,7 @@ impl Default for StdioOptions {
             max_line_bytes: MAX_STDIO_LINE_BYTES,
             runtime: None,
             process_policy: ProcessPolicy::Allow,
+            cwd: None,
         }
     }
 }
@@ -412,7 +421,9 @@ impl StdioMcpTransport {
         )
     }
 
-    /// [`spawn`](Self::spawn) with explicit limits and runtime.
+    /// [`spawn`](Self::spawn) with explicit limits, runtime and working
+    /// directory. A working directory that does not exist or is not a directory
+    /// fails the spawn with an error naming it.
     pub fn spawn_with_options(
         server_id: impl Into<String>,
         command: &str,
@@ -432,6 +443,26 @@ impl StdioMcpTransport {
             None => Handle::try_current()
                 .map_err(|_| McpError::transport("stdio: no tokio runtime to run the transport"))?,
         };
+        // The subprocess does not inherit the host's working directory: it runs
+        // in the configured one, or in `/`. Checked here, so a directory that
+        // cannot serve is named in the error (a failed spawn would not say
+        // whether the command or the directory was missing).
+        let cwd = options.cwd.as_deref().unwrap_or(Path::new("/"));
+        match std::fs::metadata(cwd) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(McpError::transport(format!(
+                    "stdio: working directory {} is not a directory",
+                    cwd.display()
+                )))
+            }
+            Err(e) => {
+                return Err(McpError::transport(format!(
+                    "stdio: working directory {} cannot be used: {e}",
+                    cwd.display()
+                )))
+            }
+        }
         // The child's pipes belong to the runtime that is current when it is
         // spawned, so spawn inside the transport's runtime.
         let _runtime_context = runtime.enter();
@@ -440,11 +471,11 @@ impl StdioMcpTransport {
         cmd.args(args)
             // Only the explicit `env` map reaches the subprocess: the host's
             // environment (cloud credentials, API keys, service tokens) is not
-            // inherited.
+            // inherited. A `command` that is a bare name is looked up on that
+            // map's `PATH`, or on the system's default search path without one.
             .env_clear()
             .envs(env.iter())
-            // The subprocess does not inherit the host's working directory.
-            .current_dir("/")
+            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

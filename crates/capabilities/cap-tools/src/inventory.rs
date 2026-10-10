@@ -34,10 +34,13 @@
 //! (CONTRACT-183) is wired via [`CallableInventory::with_tools_grant_reader`], the WASM
 //! set is narrowed to the agent's effective `tools.ids` allowlist (`None` allowlist =
 //! wildcard/all; `Some(set)` = retain granted names). With NO reader wired the set is
-//! returned unfiltered (matching the `MockCallableInventory`/`EmptyCallableInventory`
-//! precedent — and production currently wires `EmptyCallableInventory`, so the filter is
-//! dormant in prod). The MCP half of this snapshot type is unfiltered per agent;
-//! production uses the live inventory, which filters through the agent's `mcp` grants.
+//! returned unfiltered (as `MockCallableInventory` / `EmptyCallableInventory` return theirs).
+//! The daemon wires no reader: it filters the WASM tools by the root agent's `tools` grant
+//! (and the `web` grant) when it gathers them ([`crate::web::project_callable_tool_entries`])
+//! and hands the result to this type when the root declares `tools` but not `mcp`, or to the
+//! live inventory of `advance-runtime-compose::mcp_wiring` when it declares `mcp`; a root that
+//! declares neither gets `EmptyCallableInventory`. The MCP half of this snapshot type is
+//! unfiltered per agent; the live inventory filters it through the agent's `mcp` grants.
 //!
 //! ## No cap-* cycle
 //!
@@ -131,8 +134,8 @@ impl CallableInventoryReader for CallableInventory {
         // parity with the capability-level GrantCheck allow); `Some(set)` = retain only
         // entries whose `name` is granted. With NO reader wired the set is returned
         // unfiltered (byte-identical to the pre-filter behaviour — preserves SYS-AC-010
-        // and the production `EmptyCallableInventory` dormant path). Returns ONLY the
-        // WASM inventory; never the MCP entries (AC-30 never-combined).
+        // and the daemon's path, which filters the entries before handing them over).
+        // Returns ONLY the WASM inventory; never the MCP entries (AC-30 never-combined).
         match &self.tools_grant {
             None => self.wasm.clone(),
             Some(reader) => match reader.tool_allowlist(agent_id) {

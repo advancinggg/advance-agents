@@ -3392,6 +3392,10 @@ pub(crate) async fn wire_capabilities_inner(
         mcp_sink.bind_runtime(Arc::clone(runtime));
         pack_runtime.attach_mcp(Arc::clone(runtime));
     }
+    // A pack uninstalled while the daemon was down left its server files behind (the CLI
+    // touches none): swept now that the runtime that would serve them is attached, before
+    // its warm-up.
+    let _ = pack_runtime.sweep_mcp_origins().await;
 
     // MODULE-001 §1.4.7 (a): extension client families — after tools, before
     // bind_runtime and the Client API bind factory.

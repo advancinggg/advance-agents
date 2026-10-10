@@ -466,9 +466,12 @@ impl AgentTreeSnapshot for EmptyAgentTree {
     }
 }
 
-/// Empty `CallableInventoryReader` — production default (no wasm/mcp tools
-/// surfaced until cap-tools/cap-mcp inventory wiring lands in Step-3). The
-/// harness passes a populated `cap_tools::CallableInventory` instead.
+/// A `CallableInventoryReader` with no WASM and no MCP tools: what the daemon gives
+/// the root agent's context assembler when the root declares neither `tools` nor `mcp`
+/// (a root that declares `tools` gets a `cap_tools::CallableInventory` of its granted
+/// WASM tools, one that declares `mcp` a
+/// [`LiveCallableInventory`](crate::mcp_wiring::LiveCallableInventory)). Tests pass it
+/// where a prompt needs no tools.
 pub struct EmptyCallableInventory;
 impl CallableInventoryReader for EmptyCallableInventory {
     fn list_wasm_tools(&self, _agent_id: &str) -> Vec<ToolEntry> {
@@ -996,9 +999,11 @@ fn build_with_all_ports(
 
 /// Assemble the real [`ContextAssemblerImpl`] from the 4 caller-supplied
 /// "real-able" ports + the 7 hermetic stubs. The caller decides how real the
-/// tool/tree ports are (production passes [`EmptyCallableInventory`] /
-/// [`EmptyAgentTree`] / an empty [`FixedHostFnInventory`]; the harness passes
-/// populated ones to witness SYS-AC-010).
+/// tool/tree ports are: tests pass [`EmptyCallableInventory`] / [`EmptyAgentTree`] /
+/// an empty [`FixedHostFnInventory`], or populated ones to witness SYS-AC-010. The
+/// daemon does not build its assembler here: it uses
+/// [`build_context_assembler_for_agent_with_pack_skills`] with the root agent's
+/// inventory, host functions, agent tree and data ports.
 pub fn build_context_assembler(
     event_bus: Arc<dyn EventBusEmit>,
     callable_inventory: Arc<dyn CallableInventoryReader>,

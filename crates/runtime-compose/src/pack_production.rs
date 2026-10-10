@@ -13,9 +13,10 @@
 //!   the production `Spawner` (the same template-resolving `DefaultSpawner` the
 //!   guest `spawn-child` host-fn uses), `submit-component` through the
 //!   scheduler's `ComponentSubmitApi` (admission rules, quota, subset gate),
-//!   `register-mcp-server` through the `PackMcpBridge` (trust + secrets) into an
-//!   [`McpEntrySink`], and the §3.5 compensations `terminate_child` (tree node +
-//!   workspace) / `withdraw_component` (`kill_component`).
+//!   `register-mcp-server` through the `PackMcpBridge` (trust checks; secret-ref
+//!   ids, never values) into an [`McpEntrySink`], and the §3.5 compensations
+//!   `terminate_child` (tree node + workspace) / `withdraw_component`
+//!   (`kill_component`).
 //!
 //! The boot-time `PackWiring` is built BEFORE the spawner, the scheduler API and
 //! the secret store exist (they depend on the template resolver / master key it
