@@ -12,10 +12,14 @@ use advance_runtime_compose::test_support::fixture::inference::{
 use advance_runtime_compose::test_support::fixture::{
     assert_gone_for_home, FixtureExtension, Http,
 };
+#[cfg(unix)]
+use advance_runtime_compose::test_support::ComposeProbe;
 use advance_runtime_compose::test_support::{MemoryComposeLog, TEARDOWN_ORDER};
 use advance_runtime_compose::{log_keys, ComposeLogLine, LogStream};
 #[cfg(unix)]
 use advance_runtime_compose::{RunInfo, RunView};
+#[cfg(unix)]
+use advance_shared_types::cost::RunCost;
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
@@ -261,44 +265,78 @@ async fn run_at_iteration(runs: &RunView, run_id: &str, iteration: u32) -> RunIn
     }
 }
 
-/// What one turn added to its run, as the extension's run view reads it.
+/// The run's cost-tracker record (the per-run figures the gateway's budget preflight reads) once
+/// it counts at least `requests` requests.
+#[cfg(unix)]
+async fn run_cost_at(probe: &ComposeProbe, run_id: &str, requests: u32) -> RunCost {
+    let tracker = probe
+        .record()
+        .event_bus
+        .and_then(|bus| bus.upgrade())
+        .expect("the composition's event bus")
+        .cost_tracker_query();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let cost = tracker.query_run(run_id).unwrap_or_default();
+        if cost.request_count >= requests {
+            return cost;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run {run_id} did not count {requests} requests within {WAIT:?}: {cost:?}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// What one turn added to its run: the round the extension's run view counts, and the requests,
+/// tokens and cost the run's cost tracker records.
 #[cfg(unix)]
 #[derive(Debug)]
 struct TurnUsage {
     rounds: u32,
-    tokens: u64,
+    requests: u32,
+    tokens_in: u64,
+    tokens_out: u64,
     cost_usd: f64,
 }
 
 #[cfg(unix)]
 impl TurnUsage {
-    fn between(before: &RunInfo, after: &RunInfo) -> Self {
+    fn between(before: (&RunInfo, &RunCost), after: (&RunInfo, &RunCost)) -> Self {
         Self {
-            rounds: after.iteration - before.iteration,
-            tokens: after.token_used - before.token_used,
-            cost_usd: after.cost_usd - before.cost_usd,
+            rounds: after.0.iteration - before.0.iteration,
+            requests: after.1.request_count - before.1.request_count,
+            tokens_in: after.1.tokens_in - before.1.tokens_in,
+            tokens_out: after.1.tokens_out - before.1.tokens_out,
+            cost_usd: after.1.cost_usd - before.1.cost_usd,
         }
     }
 
-    fn assert_same_as(&self, oss: &TurnUsage) {
+    /// One round and one request, with the 7 + 5 tokens both stub backends answer and their
+    /// cost.
+    fn assert_one_stub_turn(&self, entry: &str) {
         assert_eq!(
-            (self.rounds, self.tokens),
-            (oss.rounds, oss.tokens),
-            "claimed turn {self:?} vs OSS turn {oss:?}"
+            (self.rounds, self.requests, self.tokens_in, self.tokens_out),
+            (1, 1, 7, 5),
+            "{entry} turn: {self:?}"
         );
         assert!(
-            (self.cost_usd - oss.cost_usd).abs() < 1e-12,
-            "claimed turn {self:?} vs OSS turn {oss:?}"
+            (self.cost_usd - expected_stub_cost()).abs() < 1e-12,
+            "{entry} turn: {self:?} vs {}",
+            expected_stub_cost()
         );
     }
 }
 
 /// A turn routed to the claimed entry is accounted as a turn routed to an OSS entry of the
 /// same class on the same path (the session run's non-streaming generate), in one
-/// composition: the run view adds the same round, tokens and cost for both; both entries'
-/// turns count against one run cost limit, so the claimed turn's cost is what makes the
-/// gateway's preflight refuse the last turn before its port is called; and each turn
-/// carries the same `llm.*` events.
+/// composition: each adds one round to the run view and the same request, tokens and cost to
+/// the run's cost-tracker record; both entries' turns count against one run cost limit, so the
+/// claimed turn's cost is what makes the gateway's preflight refuse the last turn before its
+/// port is called; and each turn carries the same `llm.*` events. The run view's `token_used`
+/// and `cost_usd` are not compared: this path reserves nothing before the call and
+/// `RunBudget::commit` clamps to the reservation, so they stay 0 for either entry.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_001_ac31_t112b_claimed_turn_is_budgeted_as_an_oss_entry_turn() {
@@ -322,19 +360,24 @@ async fn module_001_ac31_t112b_claimed_turn_is_budgeted_as_an_oss_entry_turn() {
     let runs = started.cx.runs();
     let start = session_run(runs, rt.root_agent_id()).await;
     let run = start.run_id.clone();
+    let start_cost = run_cost_at(&probe, &run, 0).await;
 
     let (status, body) = msg(&probe, "llm:hi").await;
     assert_eq!((status, body.as_str()), (200, "llm-ok:side-pong"), "{body}");
     assert_eq!((sidecar.chats(), stub.calls()), (1, 0));
     let after_oss = run_at_iteration(runs, &run, start.iteration + 1).await;
+    let oss_cost = run_cost_at(&probe, &run, start_cost.request_count + 1).await;
 
     pin_root_provider(&home, "local-stub");
     let (status, body) = msg(&probe, "llm:hi").await;
     assert_eq!((status, body.as_str()), (200, "llm-ok:stub-pong"), "{body}");
     assert_eq!((sidecar.chats(), stub.calls()), (1, 1));
     let after_claimed = run_at_iteration(runs, &run, after_oss.iteration + 1).await;
-    TurnUsage::between(&after_oss, &after_claimed)
-        .assert_same_as(&TurnUsage::between(&start, &after_oss));
+    let claimed_cost = run_cost_at(&probe, &run, oss_cost.request_count + 1).await;
+    TurnUsage::between((&start, &start_cost), (&after_oss, &oss_cost))
+        .assert_one_stub_turn(LOCAL_SIDE);
+    TurnUsage::between((&after_oss, &oss_cost), (&after_claimed, &claimed_cost))
+        .assert_one_stub_turn("local-stub");
 
     pin_root_provider(&home, LOCAL_SIDE);
     let (status, body) = msg(&probe, "llm:hi").await;
