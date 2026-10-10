@@ -32,6 +32,8 @@ pub use families::{FamiliesControl, Feed, FeedCall, FixtureFamilies, RouteRuleBr
 pub use gone::assert_gone_for_home;
 pub use guests::{ext_probe_core, hello_llm_core, llm_noerr_core, minimal_core};
 pub use home::{CapDecl, FixtureDriver, FixtureHome, FixtureHomeSpec, FIXTURE_MASTER_KEY};
+#[cfg(unix)]
+pub use home::McpStdioServerMarker;
 pub use inference::{DropFlag, FixtureInference, StubInferencePort, StubMeshDispatch};
 pub use lifecycle::{FixtureLifecycle, OnStartedMode, ShutdownMode};
 pub use squatter::{header_value, PortSquatter};

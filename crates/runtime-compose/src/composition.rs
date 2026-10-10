@@ -68,6 +68,9 @@ pub(crate) const EXTENSION_SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
 /// still running past it is reported), the config watcher's OS-watcher release (never
 /// reported), the WAL-mode observer.
 const THREAD_JOIN_BOUND: Duration = Duration::from_secs(2);
+/// How long the teardown waits for the MCP runtime's background listings after its client
+/// is shut down (they fail fast once it is; a listing stuck in an http request is abandoned).
+const MCP_JOIN_BOUND: Duration = Duration::from_secs(5);
 /// After this long, a ChatGPT token renewal still finishing is reported; the teardown
 /// keeps waiting for it (a renewal may already have rotated the refresh token, which
 /// must be persisted).
@@ -555,8 +558,17 @@ impl Composition {
         if let Some(mcp) = self.stoppers.mcp.take() {
             // A stdio server leads its own process group and would otherwise outlive
             // this process. Drop of the last handle does the same; doing it here keeps
-            // those groups from outliving the loops.
-            mcp.shutdown();
+            // those groups from outliving the loops. The background listings end once
+            // the client is shut down (their calls fail) and are awaited, within a bound.
+            if tokio::time::timeout(MCP_JOIN_BOUND, mcp.shutdown_and_join())
+                .await
+                .is_err()
+            {
+                log.err(
+                    log_keys::MCP_WARN,
+                    "advance: WARN mcp: a tool listing did not end within the shutdown bound",
+                );
+            }
             self.steps.record("loops.mcp");
         }
         if let Some((cancel, task)) = self.auto_tick.take() {

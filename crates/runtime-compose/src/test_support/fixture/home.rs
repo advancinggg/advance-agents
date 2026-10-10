@@ -150,7 +150,116 @@ impl FixtureHome {
         let yaml = std::fs::read_to_string(&path)?;
         std::fs::write(path, replace_providers_block(&yaml, providers_yaml))
     }
+
+    /// Append a top-level block (such as `mcp:\n  warm-tool-cache: true\n`) to
+    /// `.advance/runtime-config.yaml`.
+    pub fn append_runtime_config(&self, block: &str) -> io::Result<()> {
+        let path = self.home.join(".advance/runtime-config.yaml");
+        let mut yaml = std::fs::read_to_string(&path)?;
+        if !yaml.ends_with('\n') {
+            yaml.push('\n');
+        }
+        yaml.push('\n');
+        yaml.push_str(block);
+        std::fs::write(path, yaml)
+    }
+
+    /// Write the operator server file `.advance/mcp-servers/<server_id>.yaml` for a stdio
+    /// MCP server run as `command args…` (the directory `mcp.servers-dir` defaults to).
+    pub fn write_mcp_stdio_server(
+        &self,
+        server_id: &str,
+        command: &Path,
+        args: &[&str],
+    ) -> io::Result<()> {
+        let dir = self.home.join(".advance/mcp-servers");
+        std::fs::create_dir_all(&dir)?;
+        let args = args
+            .iter()
+            .map(|arg| format!("\"{arg}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            dir.join(format!("{server_id}.yaml")),
+            format!(
+                "server-id: {server_id}\ntransport:\n  kind: stdio\n  command: {}\n  args: [{args}]\n",
+                command.display()
+            ),
+        )
+    }
 }
+
+/// A stdio MCP server for witnesses: a `/bin/bash` script in its own tempdir that records
+/// that it ran, answers `initialize` and lists one tool (`echo`) for every later request,
+/// and keeps a `sleep` child of its own, so a daemon that stops the server's process group
+/// can be told apart from one that leaves it (or its child) running.
+#[cfg(unix)]
+pub struct McpStdioServerMarker {
+    dir: tempfile::TempDir,
+    script: PathBuf,
+}
+
+#[cfg(unix)]
+impl McpStdioServerMarker {
+    pub fn new() -> io::Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(dir.path())?;
+        let script = root.join("mcp-srv.sh");
+        let quoted = root.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            &script,
+            MCP_STDIO_SERVER_SCRIPT.replace("@DIR@", &quoted),
+        )?;
+        let mut perms = std::fs::metadata(&script)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms)?;
+        Ok(Self { dir, script })
+    }
+
+    /// The script path (its `#!` line runs it under `/bin/bash`).
+    pub fn command(&self) -> &Path {
+        &self.script
+    }
+
+    /// Whether the server was ever started.
+    pub fn ran(&self) -> bool {
+        self.dir.path().join("ran").exists()
+    }
+
+    /// How many `tools/list` requests the server answered.
+    pub fn listings(&self) -> usize {
+        std::fs::read_to_string(self.dir.path().join("listed"))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// The pids of the server and of the `sleep` it started, once it ran.
+    pub fn pids(&self) -> Vec<u32> {
+        ["server.pid", "child.pid"]
+            .iter()
+            .filter_map(|name| std::fs::read_to_string(self.dir.path().join(name)).ok())
+            .filter_map(|text| text.trim().parse().ok())
+            .collect()
+    }
+}
+
+#[cfg(unix)]
+const MCP_STDIO_SERVER_SCRIPT: &str = r#"#!/bin/bash
+echo $$ > '@DIR@/server.pid'
+touch '@DIR@/ran'
+/bin/sleep 300 &
+echo $! > '@DIR@/child.pid'
+read -r init
+printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"srv","version":"1"}}}\n'
+read -r initialized
+while read -r line; do
+  id=${line##*\"id\":}; id=${id%%[!0-9]*}
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echo"}]}}\n' "$id"
+  echo listed >> '@DIR@/listed'
+done
+"#;
 
 fn driver_bytes(driver: &FixtureDriver) -> Option<&'static [u8]> {
     match driver {

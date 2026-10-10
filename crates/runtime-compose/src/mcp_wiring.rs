@@ -99,6 +99,7 @@ use cap_mcp::{
     McpServerEntry, McpServersConfig, McpTransportSpec, McpWebGrant,
 };
 use cap_secrets::{InMemorySecretStorage, SecretStore};
+use tokio_util::task::TaskTracker;
 use zeroize::Zeroizing;
 
 use crate::api::log_keys;
@@ -717,6 +718,7 @@ pub fn compose_mcp(parts: McpComposition<'_>) -> Arc<McpRuntime> {
         secret_store: live_secrets,
         origins: Mutex::new(origins),
         listings_in_flight: Mutex::new(BTreeSet::new()),
+        tasks: TaskTracker::new(),
         log: parts.log,
     });
     if parts.config.warm_tool_cache {
@@ -728,7 +730,10 @@ pub fn compose_mcp(parts: McpComposition<'_>) -> Arc<McpRuntime> {
 /// The daemon's MCP client and the gate of its host functions.
 ///
 /// Dropping the last handle shuts the client down ([`shutdown`](Self::shutdown)): keep one for
-/// as long as agents run.
+/// as long as agents run. The listings the warm-up and a reload start in the background belong
+/// to this runtime's task tracker; the composition's teardown awaits them through
+/// [`shutdown_and_join`](Self::shutdown_and_join), so none outlives the runtime (ADR 2026-10-03
+/// D1; MODULE-001-AC-30).
 pub struct McpRuntime {
     client: Arc<McpClient>,
     gate: McpGate,
@@ -740,6 +745,8 @@ pub struct McpRuntime {
     /// Server ids whose `list_tools` is running; dropped when it finishes so a
     /// failed listing can be tried again.
     listings_in_flight: Mutex<BTreeSet<String>>,
+    /// The background listings (warm-up, reload), joined by `shutdown_and_join`.
+    tasks: TaskTracker,
     log: LogHandle,
 }
 
@@ -767,7 +774,7 @@ impl McpRuntime {
         let scopes = self.gate.scopes(agent_id);
         let client = Arc::clone(&self.client);
         let log = self.log.clone();
-        self.runtime.spawn(async move {
+        self.spawn_tracked(async move {
             let mut servers = client
                 .list_servers()
                 .await
@@ -805,11 +812,33 @@ impl McpRuntime {
         });
     }
 
+    /// Spawn a background listing on the daemon runtime, tracked so that
+    /// [`shutdown_and_join`](Self::shutdown_and_join) can await it. After
+    /// [`shutdown`](Self::shutdown) nothing new is started: the client refuses every call,
+    /// so a listing would only fail.
+    fn spawn_tracked<F>(&self, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if self.tasks.is_closed() {
+            return;
+        }
+        self.tasks.spawn_on(task, &self.runtime);
+    }
+
     /// Close every MCP connection now and stop the stdio servers' process groups; no server
-    /// is connected afterwards, and every later call fails
-    /// ([`McpClient::shutdown`]).
+    /// is connected afterwards, every later call fails ([`McpClient::shutdown`]), and no
+    /// further background listing is started. The listings already running end on their
+    /// own (their calls fail); [`shutdown_and_join`](Self::shutdown_and_join) awaits them.
     pub fn shutdown(&self) {
         self.client.shutdown();
+        self.tasks.close();
+    }
+
+    /// [`shutdown`](Self::shutdown), then wait until every background listing has ended.
+    pub async fn shutdown_and_join(&self) {
+        self.shutdown();
+        self.tasks.wait().await;
     }
 
     /// Re-read the server files and swap them into the client. Connections of a
@@ -846,7 +875,7 @@ impl McpRuntime {
         for id in reconfig.added.iter().chain(reconfig.changed.iter()) {
             let client = Arc::clone(&self.client);
             let id = id.clone();
-            self.runtime.spawn(async move {
+            self.spawn_tracked(async move {
                 let _ = client.list_tools(None, &id).await;
             });
         }
@@ -939,7 +968,7 @@ impl LiveCallableInventory {
     fn kick_refresh(&self, agent_id: &str) {
         let scopes = self.mcp.gate().scopes(agent_id);
         let mcp = Arc::clone(&self.mcp);
-        self.mcp.runtime.spawn(async move {
+        self.mcp.spawn_tracked(async move {
             let client = mcp.client();
             for server in client.list_servers().await {
                 if !scopes.reaches_server(&server.id) {
