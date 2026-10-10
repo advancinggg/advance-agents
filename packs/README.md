@@ -65,9 +65,10 @@ pack's `memory-seeds/<name>.jsonl` as its knowledge file. `workflows` run on the
 request, `POST /client/packs/{name}@{version}:apply` with `{ "workflow": "<name>" }`: a
 workflow spawns child agents from the pack's templates, submits the pack's `components` to
 the scheduler and registers its `mcp-servers`; a failed step is compensated. `mcp-servers`
-are written into `.advance/mcp-servers/` (secret-ref ids only, origin recorded) and become
-callable when the root agent declares `mcp`; uninstalling the origin pack removes those
-files. Applying the same workflow again is a no-op when the server is unchanged.
+are written into the MCP servers directory (`.advance/mcp-servers/` by default; secret-ref
+ids only, origin recorded) and become callable when the root agent declares `mcp`;
+uninstalling the origin pack removes those files. Applying the same workflow again is a
+no-op when the server is unchanged. [MCP servers](#mcp-servers) below has the details.
 `channel-adapters` are refused at install: the runtime does not load channel adapters from
 packs. `provides: resource-capabilities` is a retired content kind: install (and `advance pack
 bundle`) refuses a manifest that declares it, and the layout check refuses a top-level
@@ -77,11 +78,233 @@ loads; the runtime ignores the key and logs a warning for that pack. A pack's
 
 ## MCP servers
 
-Declare `mcp` on the root agent (`mcp: true`, or `mcp: { servers: [...], tool-patterns: [...] }`).
-Operator server files live in `.advance/mcp-servers/<server-id>.yaml` (the `mcp.servers-dir`
-knob). A pack registers a server with a workflow `register-mcp-server` step; that writes the
-same directory (secret-ref ids only) and is removed when the pack is uninstalled. The model
-sees each tool as `<server>__<tool>`.
+The runtime reaches MCP servers only when the root agent's `.agent/config.yaml` declares
+`mcp`. The daemon then reads the server files, builds one MCP client, and gives agents the
+seven `mcp-client` host functions, each call decided by the caller's `mcp` grant. A home
+whose root does not declare `mcp` loads no server file, starts no server and prints nothing
+about MCP when it starts.
+
+### Grants
+
+```yaml
+capabilities:
+  mcp: true                                  # every server, every tool
+```
+
+```yaml
+capabilities:
+  mcp:
+    servers: [github, search]                # the server ids the grant reaches
+    tool-patterns: ["get_*", search_code]    # the tools on them; leave it out for every tool
+```
+
+`servers` lists the ids of the servers the grant reaches, as written: a grant with
+`tool-patterns` and no `servers` reaches no server (the daemon warns when it starts).
+`tool-patterns` narrows the tools on those servers; without it the grant reaches every
+tool. A pattern is a tool name, or a prefix followed by one `*` (`get_*` matches every tool
+whose name starts with `get_`). A bare `*` or any other glob character makes the pattern
+malformed, and the grant then covers no tool; a key other than these two makes it cover
+nothing. A server's prompts and resources are reachable only through a grant without
+`tool-patterns`. A server's `web.search` and `web.extract` tools also need the agent's `web`
+grant (in the `offline` web mode no agent gets them), and those of a stdio server are never
+shown or callable.
+
+A child agent that declares `mcp` with its own `servers` / `tool-patterns` gets exactly
+those when its parent's grant covers them (`get_*` covers `get_issue` and `get_is*`), and no
+`mcp` grant otherwise; a child that declares `mcp: true` gets its parent's grant. Only the
+root agent's prompt lists MCP tools.
+
+### Server files
+
+Each server is one file, `<server-id>.yaml`, in the servers directory (`mcp.servers-dir`,
+default `.advance/mcp-servers`, a directory inside `.advance/` that no agent can write). A
+server id is 1 to 128 characters from `[A-Za-z0-9._-]`, not starting with `.`. The daemon
+reads the directory when it starts and again on every pack event. A file that cannot serve
+never stops the daemon: it is skipped with a warning on stderr (an entry that is not a
+regular file, a file over 64 KiB or one the schema refuses, a file not named after its
+`server-id`, a stdio server while `mcp.allow-stdio` is `false`, a server whose secret is not
+in the store, anything past 128 servers) and the others are kept. Hidden entries and names
+that do not end in `.yaml` are ignored.
+
+```yaml
+server-id: local-tools
+description: Local tools                     # optional, at most 1 KiB
+transport:
+  kind: stdio
+  command: /usr/local/bin/local-tools-mcp    # give an absolute path
+  args: ["--stdio"]
+  env:                                       # literals, never secrets
+    LOG_LEVEL: info
+  cwd: /srv/local-tools                      # absolute; the default is /
+secret-refs:                                 # stdio only: variable -> secret-store key
+  API_TOKEN: local-tools-token
+```
+
+```yaml
+server-id: github
+transport:
+  kind: http
+  endpoint-url: https://mcp.example.com/mcp   # the server's Streamable HTTP endpoint
+credentials:                                  # http only, and only in your own files
+  - position: bearer                          # Authorization: Bearer <secret>
+    secret: github-token
+```
+
+A `stdio` server is a process the daemon starts on its first use (a listing or a call) and
+stops when the daemon stops. A bare `command` name is looked up on the `PATH` the server gets
+(the file's own, else the daemon's, else the system's default search path), and how a
+relative path such as `./server` resolves depends on the platform, so give an absolute path:
+the daemon warns about a command that is not one. `args` (at most 64) are passed as written.
+The process runs in `cwd`, an absolute path (`/` when the file gives none); a `cwd` that is
+not an existing directory fails each start of the server with an error that names it. Its
+environment is built in three layers, each over the one before:
+
+1. the daemon's own `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR`
+   and `TZ`, those the daemon has set;
+2. the file's `env` literals: at most 64, each name `[A-Za-z_][A-Za-z0-9_]*`, each value at
+   most 4 KiB without control characters (it may be empty);
+3. the file's `secret-refs` (at most 32): each variable gets the value of a secret, read
+   when the file is read. A name is never both an `env` literal and a `secret-refs` variable.
+
+Nothing else of the daemon's environment, its API keys and tokens among it, reaches a server.
+
+An `http` server is one Streamable HTTP endpoint: `endpoint-url` is `https://` on any host,
+or `http://` on loopback (`localhost`, `127.0.0.0/8`, `::1`), which only your own server
+files may use. A URL with userinfo (`user@host`) or a `{` or `}` is refused, and a server on
+the older HTTP+SSE transport (a GET stream beside a separate message endpoint) is refused
+when it connects. Every request goes through a security chain of its own (leak scans, SSRF
+guard, rate limit, redirect re-check) that reaches the endpoint's scheme, host and port only.
+A loopback endpoint is exempted from the chain's loopback ban for exactly its host and port,
+for the files read when the daemon starts: a loopback server that appears later is refused
+with a warning until the daemon restarts.
+
+`credentials` (at most 8) bind secrets of the daemon's secret store to every request the
+server is sent:
+
+- `{position: bearer, secret: <name>}` sends `Authorization: Bearer <secret>`;
+- `{position: basic, username: <user>, secret: <name>}` sends `Authorization: Basic` of
+  `<user>:<secret>` (at most one of `bearer` and `basic`; the username holds no `:`);
+- `{position: header, key: <header>, secret: <name>}` sends that header, which may not be one
+  the transport sets (`Authorization`, `Host`, `Content-Length`, `Transfer-Encoding`,
+  `Content-Type`, `Accept`, `Mcp-Session-Id`, `MCP-Protocol-Version`, in any case);
+- `{position: query, key: <key>, secret: <name>}` adds `<key>=<secret>` to the URL's query
+  (`key` from `[A-Za-z0-9._-]`).
+
+A file names secrets, never values: the chain looks each one up at every request and puts
+its value into that request alone, never into a file, an event or a log line. A value changed
+in the synchronized keychain is sent from the next request on; with the file store, a value
+another process writes (as `advance secrets set` does) is sent once the daemon restarts.
+
+A server file read at start that names a secret, through `secret-refs` or `credentials`,
+makes the daemon open its secret store, as `secrets` or `llm` do, and that needs the home's
+master key: without it the daemon does not start. A server whose secret is not in the store
+is skipped with a warning, and so is every server that names a secret while no store is
+open (one a pack registers on a daemon that started without opening its store, until the
+daemon restarts).
+
+### The `mcp:` block of runtime-config.yaml
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `servers-dir` | `.advance/mcp-servers` | the servers directory: relative to the workspace, inside `.advance/`, no `..` |
+| `allow-stdio` | `true` | `false` skips every stdio server file with a warning and refuses a pack's stdio server |
+| `request-timeout-sec` | `30` | `1..=300`: one request to a server |
+| `startup-timeout-sec` | `10` | `1..=120`: starting a server and its `initialize` exchange |
+| `max-result-bytes` | `4194304` | `1..=4194304`: a larger call result fails the call |
+| `warm-tool-cache` | `false` | `true` lists, right after start, the tools of the servers the root's grants reach |
+
+The block is read when the daemon starts: an edit takes effect at the next start, and a value
+out of its range is a configuration error.
+
+### Servers from packs
+
+A pack ships a server as `mcp-servers/<name>.yaml`, in the schema above, and registers it
+with a workflow step, which runs when the operator applies the workflow
+(`POST /client/packs/{name}@{version}:apply`):
+
+```yaml
+name: setup
+steps:
+  - type: register-mcp-server
+    config-ref: my-pack@1.0.0/mcp-servers/search
+    secret-refs:                  # optional, stdio only: variable -> secret-store key
+      SEARCH_TOKEN: search-token
+```
+
+The step writes `<server-id>.yaml` into the servers directory: the pack's transport as
+written, the manifest's and the step's `secret-refs` as secret-store keys (never values; a
+step's own keys must be in the open store when it runs) and an `origin` block naming the
+pack:
+
+```yaml
+origin:
+  pack: "my-pack@1.0.0"
+  config-ref: "my-pack@1.0.0/mcp-servers/search"
+```
+
+A running daemon whose root declares `mcp` loads the server at once. A daemon whose root does
+not declare `mcp` writes the file all the same and logs `advance: WARN mcp: server '<id>' of
+pack <name@version> is registered but not loaded: …`. Applying the same workflow again
+changes nothing; a registration with other content, or under an id that your own file or
+another registration holds, is refused. A pack may not register:
+
+- a stdio server, unless the pack's effective trust is `trusted` (see Trust below), and no
+  stdio server at all while `mcp.allow-stdio` is `false`;
+- an http server on loopback;
+- a server that binds `credentials`.
+
+The loader enforces two of these on any file with an `origin` block: it skips one whose
+endpoint is on loopback, and the schema refuses `credentials` beside an `origin` block. Do
+not write an `origin` block into a file of your own: the file then belongs to the pack it
+names, and goes when that pack is not installed.
+
+A pack's server files go with the pack. A running daemon removes them as soon as the pack is
+uninstalled, through the Client API or by `advance pack uninstall` from a shell (which the
+daemon notices within a few seconds), and disconnects the server (a stdio server's process
+stops once a call still running on it ends). The files of a pack uninstalled while no daemon
+ran are removed when the next daemon whose root declares `mcp` starts, before any agent
+runs; a home whose root does not declare `mcp` removes them at its next pack event, without a
+log line. Only the highest installed version of a pack applies, and a file belongs to the
+`name@version` that wrote it: installing a newer version removes the older version's server
+files, so apply the new version's workflow to register its servers again.
+
+### What the model and the Client API see
+
+The root agent's prompt lists, under `# Available Tools`, the MCP tools its grants reach,
+each as `<server>__<tool>` (a tool whose name already starts with `<server>__` keeps it as
+is; the prompt writes a character that is unsafe in its tool lines, such as a delimiter or a
+look-alike of one, as `_`, and keeps ASCII `-`). While the root agent runs,
+`GET /client/tools` lists the same tools under `mcp`: `name` is that same `<server>__<tool>`,
+and `server_id` the server's id.
+
+The tools come from a cache of each server's tool listing. With `warm-tool-cache: false`, the
+default, nothing is listed when the daemon starts: the first read (the root agent's first
+turn, or the first `GET /client/tools`) shows no MCP tools and starts listing, in the
+background, the servers the root's grants reach, and a later read shows their tools.
+`warm-tool-cache: true` starts those listings when the daemon starts. A server a pack
+registers while the daemon runs is listed at once when the root's grants reach it, and a
+listing that fails is tried again at the next read. A listing keeps at most 512 tools of a
+server: a tool whose name is over 256 bytes is dropped, a description is cut at 2 KiB, and
+an input schema over 16 KiB is left out. The cache holds at most 2048 tools across the
+servers.
+
+One read shows at most 32 KiB (32768 bytes) of MCP tool text, each tool counted as the line
+the prompt renders for it, `- <server>__<tool>(<arguments>) — <description>`: the tools of
+your own servers first, then those of trusted packs' servers, then those of the other
+packs' servers, each group by server id and each server's tools by name, up to the first
+tool that does not fit. When tools are left out, the prompt's tools section ends with
+`… N more MCP tools not shown` (`… 1 more MCP tool not shown`), `GET /client/tools` lists the
+same budgeted tools (it has no field for the count), and stderr says
+`advance: WARN mcp: N of the M MCP tools agent <id> may call are left out of its prompt and
+its /client/tools listing: …` each time that number changes, unless it drops to zero. When
+a prompt's fixed content (all but the conversation history) does not fit the model's context
+budget, its last MCP tools give way first, counted in the same closing line; only a prompt
+that does not fit even without them loses its host functions, WASM tools, skills and
+delegates.
+
+The description of a pack server's tool ends in `[pack name@version]`, in the prompt and in
+`GET /client/tools`, within the 2 KiB description cap: the text before it is cut, never the
+marker.
 
 ## Contribution rules
 

@@ -1,8 +1,9 @@
-//! Pack lane P2 — the PRODUCTION `WorkflowExecutor`
-//! end to end: `SchedulerWorkflowExecutor` over a real template-resolving
-//! `DefaultSpawner` (cap-lifecycle agent tree + pack template), the real
-//! scheduler `InMemoryComponentSubmitApi`, the trust-gated MCP bridge and the
-//! in-memory MCP entry sink, driven by `DefaultMaterializer::apply_workflow`.
+//! The PRODUCTION `WorkflowExecutor` end to end: `SchedulerWorkflowExecutor` over
+//! a real template-resolving `DefaultSpawner` (cap-lifecycle agent tree + pack
+//! template), the real scheduler `InMemoryComponentSubmitApi`, the trust-gated MCP
+//! bridge and the control-plane MCP sink (`ControlPlaneMcpSink`, writing server
+//! files into the workspace's `.advance/mcp-servers`, with no MCP runtime bound),
+//! driven by `DefaultMaterializer::apply_workflow`.
 //!
 //! - success path: spawn-child materializes the child from the pack template,
 //!   submit-component admits the pack's task component under its FQ ref,

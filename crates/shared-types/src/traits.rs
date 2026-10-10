@@ -158,9 +158,16 @@ impl std::error::Error for DurableAppendError {}
 /// `"ns-fs::read"`) is the 3rd arg, between `capability` and `params`. The new arg
 /// surfaces the call-site identity into the `authz.checked` event's `function`
 /// payload field per PRD §15.3.18. It is observability-only: it does NOT participate
-/// in authorization. The Slice-A fail-closed `CapParams::Null` precondition in the
-/// MODULE-013 impl stays intact; SubsetValidator wiring into the L1 path is deferred
-/// to a future slice that also lowers WASM call-frame params into `CapParams`.
+/// in authorization.
+///
+/// `params` decides how much is checked. Null params ([`CapParams::empty`], what the
+/// capability injector passes for a guest's call) ask only whether the agent holds an
+/// active, unexpired grant for `capability`. Other params, passed by a host function
+/// that authorizes a resource itself (the `mcp-client` functions with `servers` /
+/// `tool-patterns`, the `data` tool asking `fs` for a path), are allowed only when one
+/// held grant covers them under the CONTRACT-122 subset rules: the MODULE-013
+/// implementation, cap-grant's `GrantCheckImpl`, decides that with
+/// `SubsetValidatorImpl::covers_request`.
 pub trait GrantCheck: Send + Sync {
     fn check(
         &self,

@@ -1,32 +1,38 @@
 //! MCP bridge (§3.1 row 3, §3.2 rule 2): an installed pack's
-//! `mcp-servers/{name}.yaml` (schema: `advance_pack_manager::mcp_server_manifest`)
-//! → a `cap_mcp::McpServerEntry` ready for `McpServersConfig::builder().add_server`.
+//! `mcp-servers/{name}.yaml` (schema: `advance_pack_manager::mcp_server_manifest`),
+//! checked against the pack and turned into what the runtime keeps of it. Both paths
+//! below make the same checks:
 //!
 //! - `stdio` transport from a pack whose EFFECTIVE trust is `untrusted` →
 //!   [`PackBridgeError::TrustDenied`] (a subprocess is arbitrary code execution);
-//! - `http` transport is admitted from any pack: the entry carries an
-//!   `HttpCapability` whose allowlist is exactly the endpoint's host, so the
-//!   cap-http security chain (SSRF / redirect / TLS policy) governs every request;
-//!   an endpoint on loopback is refused
-//!   ([`PackError::ConstraintViolation`]): only a server file the operator wrote
-//!   may reach the host's own loopback;
+//! - `http` transport is admitted from any pack, and the cap-http security chain
+//!   (SSRF / redirect / TLS policy) governs every request; an endpoint on loopback is
+//!   refused ([`PackError::ConstraintViolation`]): only a server file the operator
+//!   wrote may reach the host's own loopback;
 //! - a manifest that binds `credentials` is refused from any pack
 //!   ([`PackError::ConstraintViolation`]): pack-origin http servers may not bind
 //!   cap-secrets credentials, only a server file the operator wrote may;
-//! - a stdio entry's environment is built as the loader builds an operator
-//!   server's ([`crate::mcp_wiring::stdio_child_env`]): the daemon's baseline
-//!   variables, the manifest's `env` literals over them, and its `secret-refs`
-//!   (`ENV_NAME → secret key`, resolved through the pack-manager `SecretStore`;
-//!   missing key → `MissingSecret`) over both; a workflow step's pre-resolved
-//!   secrets can be merged in through [`PackMcpBridge::entry_with_env`] under the
-//!   same env-name grammar, never under a name the manifest already gives a
-//!   literal or a secret. The manifest's `cwd` is the entry's working directory;
-//! - [`PackMcpBridge::plan`] carries the manifest's transport, its `env` literals
-//!   and `cwd` included, unchanged into the registration a sink persists.
+//! - a workflow step's own secrets (`ENV_NAME → secret key`) go to a stdio server
+//!   only, each under an environment-variable name the manifest does not already
+//!   give a literal or a secret.
 //!
-//! [`McpEntrySink`] is where a `WorkflowExecutor::register_mcp_server` hands
-//! a planned registration: the control-plane sink writes a server file (secret-ref
-//! ids only, origin recorded) and the MCP client reloads.
+//! [`PackMcpBridge::plan`] is the path of a workflow's `register-mcp-server` step,
+//! and it resolves no secret: the registration carries the manifest's transport
+//! unchanged (a stdio server's `env` literals and `cwd` included), the manifest's
+//! and the step's `secret-refs` as secret-store keys (never values) and the origin
+//! pack. [`McpEntrySink`] is where the step hands it: the control-plane sink writes
+//! it as a server file and the MCP client reloads, and the loader resolves the
+//! secrets when it reads the file, as for an operator's file.
+//!
+//! [`PackMcpBridge::entry`] / [`PackMcpBridge::entry_with_env`] build a client entry
+//! (`cap_mcp::McpServerEntry`, for `McpServersConfig::builder().add_server`) instead,
+//! resolving the manifest's `secret-refs` through the pack-manager `SecretStore` at
+//! once (missing key → `MissingSecret`) and merging a step's pre-resolved secrets:
+//! the stdio environment is built as the loader builds an operator server's
+//! ([`crate::mcp_wiring::stdio_child_env`]), the manifest's `cwd` is the working
+//! directory, and an http entry's allowlist is exactly the endpoint's host. The
+//! daemon registers a pack's servers through [`PackMcpBridge::plan`] and the server
+//! file only.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

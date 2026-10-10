@@ -1,6 +1,6 @@
 //! Slice J (V1-b) — cap-mcp half of the CONTRACT-165 inventory feed:
 //! `mcp_tool_entries` gather over a mock transport (T32 sub-(2) MCP side, incl.
-//! the `mcp.tool-patterns` filter + skip-on-error) and the `invoke_tool`
+//! the server entry's `tool_patterns` filter + skip-on-error) and the `invoke_tool`
 //! cross-name rejection (T32 sub-(3)). The pure `mcp_tool_entries_from_infos`
 //! mapping is unit-tested inline in `src/inventory.rs`.
 
@@ -89,7 +89,7 @@ async fn mj_gather_01_collects_entries_with_server_id() {
         .all(|e| e.params_schema == serde_json::json!({})));
 }
 
-// MJ-GATHER-02 — the `mcp.tool-patterns` filter is respected end-to-end through
+// MJ-GATHER-02 — a server entry's `tool_patterns` filter is respected end-to-end through
 // `mcp_tool_entries`: a clean-ASCII non-matching name (`delete-all`) is dropped
 // while `search.*` matches pass (T32 sub-(2) MCP side; mirrors SD-13).
 #[tokio::test]
@@ -109,7 +109,7 @@ async fn mj_gather_02_respects_tool_patterns_filter() {
     assert_eq!(names, vec!["search.web", "search.code"]);
     assert!(
         !names.contains(&"delete-all"),
-        "mcp.tool-patterns filter not applied during gather"
+        "the server entry's tool_patterns filter is not applied during gather"
     );
 }
 
@@ -148,8 +148,8 @@ async fn mj_gather_03_skips_erroring_server() {
     assert!(entries.is_empty());
 }
 
-// T32 sub-(3) — `invoke_tool` with a name that FAILS the server's tool-patterns
-// → `ToolNotFound` (the `!entry.tool_allowed(name)` arm, client.rs:293-297).
+// T32 sub-(3) — `invoke_tool` with a name that FAILS the server's tool_patterns
+// → `ToolNotFound` (the `!entry.tool_allowed(name)` arm of `McpClient::invoke_tool`).
 // Co-located inventory-suite witness; whitelist.rs also covers this.
 #[tokio::test]
 async fn mj_t32_sub3_invoke_cross_name_tool_not_found() {
