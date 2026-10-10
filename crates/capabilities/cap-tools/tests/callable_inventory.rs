@@ -46,9 +46,9 @@ use cap_tools::{tool_entries_from_infos, CallableInventory, MethodInfo, ToolInfo
 // ─── synthetic inventory snapshots (no WASM build, no real MCP server) ───
 
 // Sanitization-stable identifiers: M010's `tier2::sanitize_tool_name` rewrites
-// `-` (and other delimiter/Unicode-spoof chars) to `_` in the rendered line, so
-// we use underscore names whose raw form == rendered form. This keeps the e2e
-// assertions about "the tool appears in the section" decoupled from M010's
+// delimiter and Unicode-spoof chars to `_` in the rendered line (ASCII '-' is
+// kept). Underscore names have raw form == rendered form, so e2e assertions
+// about "the tool appears in the section" stay decoupled from M010's
 // substitution rule (which has its own M010 sanitizer tests).
 const WASM_TOOL: &str = "fs_read";
 const MCP_TOOL: &str = "web_search";
@@ -74,6 +74,7 @@ fn mcp_snapshot() -> Vec<McpToolEntry> {
         name: MCP_TOOL.into(),
         description: "Search the web".into(),
         server_id: "srv-1".into(),
+        input_schema: None,
     }])
 }
 
@@ -122,7 +123,8 @@ fn module_017_t32_two_methods_distinct_types_never_combined() {
 }
 
 /// T32 sub-(4): `params_schema` is the empty object for both halves (V1-b
-/// mapping); the Tier-2 line renders `- name() — desc` (no args).
+/// mapping; the MCP tool here was listed without an input schema); the Tier-2
+/// line renders `- name() — desc` (no args).
 #[test]
 fn module_017_t32_params_schema_is_empty_object() {
     let reader = production_reader();

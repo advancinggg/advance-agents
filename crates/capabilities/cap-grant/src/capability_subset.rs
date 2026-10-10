@@ -65,6 +65,11 @@ pub const MAX_PARAMS_ARRAY_LEN: usize = 256;
 /// `MAX_PARAMS_BYTES = 4096` in `delegate_grant` (store.rs:1148).
 pub const MAX_PARAMS_STRING_BYTES: usize = 4096;
 
+// An `mcp` grant scope covers no name longer than one request string may be, so a listing
+// filtered through the scopes never shows an entry this projection would refuse at call time.
+const _: () =
+    assert!(advance_shared_types::mcp::MAX_REQUEST_TOKEN_BYTES == MAX_PARAMS_STRING_BYTES);
+
 /// Whitelist of param keys per capability family. Matches the
 /// `SubsetValidatorImpl::validate` match dispatch in `subset.rs` exactly.
 fn allowed_param_keys(capability: &str) -> Option<&'static [&'static str]> {
@@ -293,9 +298,10 @@ fn array_element_to_string(
 }
 
 /// Project a `shared_types::Capability` into a `Vec<CapParam>` (cap-grant's
-/// per-family helpers' input shape). Returns `Ok(vec![])` for whole-capability
-/// semantics (`Value::Null` or `Value::Object({})`).
-fn project_capability_params(capability: &Capability) -> Result<Vec<CapParam>, CapGrantError> {
+/// per-family helpers' input shape) through the same fail-closed whitelist and
+/// identity-loss guards as the subset gates. Returns `Ok(vec![])` for
+/// whole-capability semantics (`Value::Null` or `Value::Object({})`).
+pub fn project_capability_params(capability: &Capability) -> Result<Vec<CapParam>, CapGrantError> {
     project_params(capability.id.as_str(), capability.params.as_value())
 }
 

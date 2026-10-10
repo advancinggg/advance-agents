@@ -1,18 +1,16 @@
-//! JSON-RPC 2.0 wire shapes used over MCP HTTP/SSE transport.
+//! JSON-RPC 2.0 wire shapes used by the MCP transports (HTTP/SSE and stdio).
 //!
-//! MODULE-017 §1.3.5 references "MCP HTTP/SSE transport" without spelling
-//! out the on-the-wire JSON-RPC shape — the MCP specification (Anthropic /
-//! Model Context Protocol) layers JSON-RPC 2.0 over HTTP. Slice B ships the
-//! minimum shapes needed to construct a request and decode a single matched
-//! response.
+//! The Model Context Protocol layers JSON-RPC 2.0 over each transport. These
+//! are the shapes the client sends (requests and notifications) and the
+//! response envelope it decodes.
 
 use serde::{Deserialize, Serialize};
 
 /// JSON-RPC 2.0 request envelope.
 ///
-/// The `id` field is monotonic per-transport (managed by [`HttpMcpTransport`]
-/// via an `AtomicU64`). `params` carry the method-specific payload encoded
-/// as raw JSON.
+/// The `id` field is monotonic per transport (each transport allocates it from
+/// an `AtomicU64`). `params` carry the method-specific payload encoded as raw
+/// JSON.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
@@ -30,6 +28,29 @@ impl JsonRpcRequest {
             method: method.into(),
             params,
             id,
+        }
+    }
+}
+
+/// JSON-RPC 2.0 notification: a message without an `id`, which the receiver
+/// never answers (for example `notifications/initialized`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct JsonRpcNotification {
+    pub jsonrpc: String,
+    pub method: String,
+    /// Omitted from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
+
+impl JsonRpcNotification {
+    /// Build a JSON-RPC 2.0 notification with the canonical `"2.0"` version
+    /// string.
+    pub fn new(method: impl Into<String>, params: Option<serde_json::Value>) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            method: method.into(),
+            params,
         }
     }
 }
@@ -69,6 +90,21 @@ mod tests {
         let back: JsonRpcRequest = serde_json::from_str(&s).unwrap();
         assert_eq!(req, back);
         assert!(s.contains("\"jsonrpc\":\"2.0\""));
+    }
+
+    #[test]
+    fn notification_carries_no_id_and_omits_absent_params() {
+        let n = JsonRpcNotification::new("notifications/initialized", None);
+        let v: serde_json::Value = serde_json::to_value(&n).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        );
+        let with_params =
+            JsonRpcNotification::new("notifications/progress", Some(serde_json::json!({"p": 1})));
+        let v: serde_json::Value = serde_json::to_value(&with_params).unwrap();
+        assert!(v.get("id").is_none());
+        assert_eq!(v["params"]["p"], 1);
     }
 
     #[test]

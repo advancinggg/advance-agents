@@ -19,26 +19,33 @@
 //! - `AuthzLevel::All`: emit on every check (Allow + Deny).
 //!
 //! Parameter subset (MODULE-013-AC-23): a non-empty `CapParams` is projected
-//! via the shared fail-closed `capability_subset::project_params` and validated
-//! against the agent's held grants with `SubsetValidatorImpl::validate` — Allow
-//! iff some held `Active`, non-expired grant for the capability covers the
-//! request; a request whose params fail the projection returns Deny
-//! (fail-closed preserved). `CapParams::Null` keeps the capability-level path.
-//! The `function` arg is observability-only. WASM-call-frame param lowering into
-//! `CapParams` remains a future M001 bootstrap concern, but the L1 subset
-//! enforcement itself is wired; until a real caller supplies non-empty params,
-//! the only production caller (`capability_injector`) passes `CapParams::empty()`,
-//! so the subset path is reachable today only via direct Rust / tests.
+//! via the shared fail-closed `capability_subset::project_params` and checked
+//! against the agent's held grants with `SubsetValidatorImpl::covers_request` —
+//! Allow iff some held `Active`, non-expired grant for the capability covers the
+//! request on its own; a request whose params fail the projection returns Deny
+//! (fail-closed preserved). `covers_request` is the issuance rule
+//! (`SubsetValidator::validate`) for every family except `mcp`, whose requests
+//! carry literal server ids and tool names. `CapParams::Null` keeps the
+//! capability-level path. The `function` arg is observability-only. The
+//! injector passes `CapParams::empty()`; tools that authorize a resource
+//! themselves (the `data` tool asking `fs`) pass real params.
+//!
+//! [`McpGrantReaderImpl`] is the listing counterpart for `mcp`: it returns the
+//! scopes of the held grants without deciding or emitting anything, so a
+//! filtered listing never writes one deny event per hidden entry.
+//! [`WebGrantReaderImpl`] is the same for `web`: whether a listing may offer
+//! the web family tools, read without an event.
 
 use std::sync::Arc;
 
 use advance_shared_types::capability::{CapParams, GrantDecision};
-use advance_shared_types::traits::{GrantCheck, ToolsGrantReader};
+use advance_shared_types::mcp::McpGrantScope;
+use advance_shared_types::traits::{GrantCheck, McpGrantReader, ToolsGrantReader, WebGrantReader};
+use advance_shared_types::web_search::WEB_GRANT_CAPABILITY;
 
-use crate::data::{GrantId, GrantStatus};
+use crate::data::{Grant, GrantId, GrantStatus};
 use crate::events::authz_checked_event;
 use crate::store::GrantStore;
-use crate::subset::SubsetValidator;
 
 /// Runtime-config knob for `authz.checked` emission policy. Constructor-only
 /// in Slice C; future M001 bootstrap slice will thread `event-bus.authz-level`
@@ -62,12 +69,13 @@ pub enum AuthzLevel {
 /// non-expired grant for the capability). For a non-empty `CapParams` it
 /// ADDITIONALLY enforces CONTRACT-122 subset: the request is projected via the
 /// shared fail-closed `capability_subset::project_params` and `Allow`ed iff a
-/// held grant COVERS it (`SubsetValidatorImpl::validate`); a request whose params
-/// fail projection → `Deny`. This closes the would-be elevation-of-privilege
+/// held grant COVERS it (`SubsetValidatorImpl::covers_request`); a request whose
+/// params fail projection → `Deny`. This closes the would-be elevation-of-privilege
 /// where a narrowly-scoped grant (e.g. `fs.read: { read-paths: /tmp/foo }`) must
-/// not authorize an `fs.read` request for a different path. The held grant's
-/// stored `Vec<CapParam>` is canonical (validated at issue time); only the
-/// request is projected.
+/// not authorize an `fs.read` request for a different path. Only the request is
+/// projected. Held grants are not re-validated at call time: a static-config
+/// grant is stored as written and may be malformed, and the family rule reads it
+/// as it is (the `mcp` rule reads a malformed part as covering nothing).
 pub struct GrantCheckImpl {
     store: Arc<GrantStore>,
     authz_level: AuthzLevel,
@@ -131,12 +139,14 @@ impl GrantCheck for GrantCheckImpl {
         // — identical whitelist / identity-loss guards as the spawn/submit
         // admission gate) and Allow iff some held `Active`, non-expired grant for
         // this capability COVERS the request under the CONTRACT-122 subset rules
-        // (`SubsetValidatorImpl::validate(held_grant, request_draft)`). A request
-        // whose params fail the projection → Deny (fail-closed preserved). The
-        // held grant's stored `Vec<CapParam>` is already canonical (validated at
-        // issue time); only the request is projected. `CapParams::Null`
-        // (whole-capability) falls through to the unchanged capability-level path
-        // (Step 2).
+        // (`SubsetValidatorImpl::covers_request(held_grant, request_draft)`, the
+        // issuance rule except for `mcp` call requests). A request
+        // whose params fail the projection → Deny (fail-closed preserved). Only
+        // the request is projected; held grants are not re-validated here. A
+        // static-config grant is stored as written and may be malformed, and the
+        // family rule reads it as it is (`mcp` reads a malformed part as covering
+        // nothing). `CapParams::Null` (whole-capability) falls through to the
+        // unchanged capability-level path (Step 2).
         if !matches!(params.as_value(), serde_json::Value::Null) {
             let now = chrono::Utc::now();
             let child_params =
@@ -154,8 +164,8 @@ impl GrantCheck for GrantCheckImpl {
                         return decision;
                     }
                 };
-            // `ttl` is not consulted by `SubsetValidatorImpl::validate` (it reads
-            // only `capability` + `params`); Persistent is a neutral placeholder.
+            // `ttl` is not consulted by `SubsetValidatorImpl::covers_request` (it
+            // reads only `capability` + `params`); Persistent is a neutral placeholder.
             let child_draft = crate::data::GrantDraft {
                 capability: capability.to_string(),
                 params: child_params,
@@ -174,7 +184,7 @@ impl GrantCheck for GrantCheckImpl {
                         g.status == GrantStatus::Active
                             && g.capability == capability
                             && g.expires_at.map_or(true, |t| t > now)
-                            && validator.validate(g, &child_draft).is_ok()
+                            && validator.covers_request(g, &child_draft).is_ok()
                     })
                     .collect();
                 matched.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
@@ -449,22 +459,27 @@ impl std::fmt::Debug for ToolsGrantReaderImpl {
     }
 }
 
-impl ToolsGrantReader for ToolsGrantReaderImpl {
-    fn tool_allowlist(&self, agent_id: &str) -> Option<Vec<String>> {
-        let now = chrono::Utc::now();
-        // Colon→bare grantee bridge: a grant may be seeded under the bare cap-id OR
-        // the colon `agent:`-prefixed id; query both forms (de-duped by `GrantId`) so
-        // the assembler's colon `ctx.agent_id` resolves a bare-keyed grant too.
-        let mut grants = self.store.list_by_grantee(agent_id);
-        if let Some(bare) = agent_id.strip_prefix("agent:") {
-            if bare != agent_id {
-                for g in self.store.list_by_grantee(bare) {
-                    if !grants.iter().any(|h| h.id == g.id) {
-                        grants.push(g);
-                    }
+/// The grants a list projection reads for `agent_id`. Colon→bare grantee bridge: a grant may
+/// be seeded under the bare cap-id OR the colon `agent:`-prefixed id; query both forms (de-duped
+/// by `GrantId`) so the assembler's colon `ctx.agent_id` resolves a bare-keyed grant too.
+fn reader_grants(store: &GrantStore, agent_id: &str) -> Vec<Grant> {
+    let mut grants = store.list_by_grantee(agent_id);
+    if let Some(bare) = agent_id.strip_prefix("agent:") {
+        if bare != agent_id {
+            for g in store.list_by_grantee(bare) {
+                if !grants.iter().any(|h| h.id == g.id) {
+                    grants.push(g);
                 }
             }
         }
+    }
+    grants
+}
+
+impl ToolsGrantReader for ToolsGrantReaderImpl {
+    fn tool_allowlist(&self, agent_id: &str) -> Option<Vec<String>> {
+        let now = chrono::Utc::now();
+        let grants = reader_grants(&self.store, agent_id);
 
         let mut ids: Vec<String> = Vec::new();
         let mut has_tools_grant = false;
@@ -501,5 +516,81 @@ impl ToolsGrantReader for ToolsGrantReaderImpl {
             return None;
         }
         Some(ids)
+    }
+}
+
+/// [`McpGrantReader`] provider: the scope of each active, unexpired `mcp` grant an agent holds.
+///
+/// Each grant becomes one [`McpGrantScope`], built by the same rules
+/// [`GrantCheckImpl`] applies to an `mcp` call, so a listing filtered through these scopes shows
+/// exactly what a call may reach. A grant whose params carry a key other than `servers` /
+/// `tool-patterns` covers nothing and is left out. Read-only LIST projection, NOT an
+/// authorization gate: it decides nothing and emits no `authz.checked` event.
+pub struct McpGrantReaderImpl {
+    store: Arc<GrantStore>,
+}
+
+impl McpGrantReaderImpl {
+    pub fn new(store: Arc<GrantStore>) -> Self {
+        Self { store }
+    }
+}
+
+// Manual `Debug` for the same reason as `ToolsGrantReaderImpl`: `GrantStore` is not `Debug`.
+impl std::fmt::Debug for McpGrantReaderImpl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpGrantReaderImpl").finish_non_exhaustive()
+    }
+}
+
+impl McpGrantReader for McpGrantReaderImpl {
+    fn mcp_grant_scopes(&self, agent_id: &str) -> Vec<McpGrantScope> {
+        let now = chrono::Utc::now();
+        let mut grants: Vec<Grant> = reader_grants(&self.store, agent_id)
+            .into_iter()
+            .filter(|g| {
+                g.status == GrantStatus::Active
+                    && g.capability == "mcp"
+                    && g.expires_at.map_or(true, |t| t > now)
+            })
+            .collect();
+        grants.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        grants
+            .iter()
+            .filter_map(|g| crate::subset::mcp_scope(&g.params))
+            .collect()
+    }
+}
+
+/// [`WebGrantReader`] provider: whether an agent holds an active, unexpired `web` grant.
+///
+/// The answer [`GrantCheckImpl`] gives a whole-capability `web` request (`CapParams::empty()`, as
+/// the web family tools ask it), read for a listing. Read-only LIST projection, NOT an
+/// authorization gate: it decides nothing and emits no `authz.checked` event.
+pub struct WebGrantReaderImpl {
+    store: Arc<GrantStore>,
+}
+
+impl WebGrantReaderImpl {
+    pub fn new(store: Arc<GrantStore>) -> Self {
+        Self { store }
+    }
+}
+
+// Manual `Debug` for the same reason as `ToolsGrantReaderImpl`: `GrantStore` is not `Debug`.
+impl std::fmt::Debug for WebGrantReaderImpl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebGrantReaderImpl").finish_non_exhaustive()
+    }
+}
+
+impl WebGrantReader for WebGrantReaderImpl {
+    fn web_grant_held(&self, agent_id: &str) -> bool {
+        let now = chrono::Utc::now();
+        reader_grants(&self.store, agent_id).iter().any(|g| {
+            g.status == GrantStatus::Active
+                && g.capability == WEB_GRANT_CAPABILITY
+                && g.expires_at.map_or(true, |t| t > now)
+        })
     }
 }

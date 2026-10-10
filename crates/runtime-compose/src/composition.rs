@@ -7,9 +7,9 @@
 //!    `/hooks` listener and any claimed-entry preflight stop accepting and drain
 //!    concurrently, each within its budget;
 //! 2. **loops** — the root serve loop, the channel host pump, the per-child loops,
-//!    the auto tick loop and the readiness walk stop; then every live LLM stream is
-//!    settled and the stream reaper stopped. A requested shutdown then prints
-//!    `advance: shutting down`;
+//!    the MCP client (stdio process groups), the auto tick loop and the readiness
+//!    walk stop; then every live LLM stream is settled and the stream reaper stopped.
+//!    A requested shutdown then prints `advance: shutting down`;
 //! 3. **extension hooks** — each extension's shutdown hook, in reverse registration
 //!    order, each bounded and isolated from the others' panics; then the composition
 //!    cancels and joins the extension tasks, revokes the extensions' views and lets go
@@ -94,6 +94,7 @@ pub const TEARDOWN_ORDER: &[&str] = &[
     "loops.root",
     "loops.host_pump",
     "loops.perchild",
+    "loops.mcp",
     "loops.auto_tick",
     "loops.readiness_walk",
     "loops.llm_stream_reaper",
@@ -338,6 +339,7 @@ impl Composition {
             extension_secret_store: wiring_handles.extension_secret_store.take(),
             extension_holds: Vec::new(),
             claimed_preflight: wiring_handles.claimed_preflight.take(),
+            mcp: wiring_handles.mcp.take(),
         };
         let extension_holds = std::mem::take(&mut wiring_handles.extension_holds);
         let client_ingress = wiring_handles.client_api_server.take().map(|server| {
@@ -550,6 +552,13 @@ impl Composition {
             manager.shutdown().await;
             self.steps.record("loops.perchild");
         }
+        if let Some(mcp) = self.stoppers.mcp.take() {
+            // A stdio server leads its own process group and would otherwise outlive
+            // this process. Drop of the last handle does the same; doing it here keeps
+            // those groups from outliving the loops.
+            mcp.shutdown();
+            self.steps.record("loops.mcp");
+        }
         if let Some((cancel, task)) = self.auto_tick.take() {
             cancel.cancel();
             abort_and_join(task).await;
@@ -698,6 +707,7 @@ impl HoldStoppers {
             extension_secret_store,
             extension_holds,
             claimed_preflight,
+            mcp,
         } = self;
         event_bus.is_none()
             && cap_grant_sweeper_handle.is_none()
@@ -712,6 +722,7 @@ impl HoldStoppers {
             && extension_secret_store.is_none()
             && extension_holds.is_empty()
             && claimed_preflight.is_none()
+            && mcp.is_none()
     }
 
     /// Stop what a failed wiring had started (no ingress and no loop exist yet): the

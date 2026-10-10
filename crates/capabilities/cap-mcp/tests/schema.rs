@@ -124,7 +124,7 @@ async fn sd_20_bad_input_rejected_before_dispatch() {
     // Invoke with input missing required "x" field.
     let bad_input = serde_json::to_vec(&serde_json::json!({})).unwrap();
     let err = client
-        .invoke_tool("alpha", "echo", &bad_input)
+        .invoke_tool(None, "alpha", "echo", &bad_input)
         .await
         .expect_err("input validation must reject");
     assert_eq!(err.kind, McpErrorKind::InvalidResponse);
@@ -179,7 +179,7 @@ async fn sd_21_bad_output_rejected_via_output_schema() {
     let client = McpClient::new_with_transports(cfg, Arc::new(NoOpDetector), injected);
 
     let err = client
-        .invoke_tool("alpha", "echo", b"{}")
+        .invoke_tool(None, "alpha", "echo", b"{}")
         .await
         .expect_err("output validation must reject");
     assert_eq!(err.kind, McpErrorKind::InvalidResponse);

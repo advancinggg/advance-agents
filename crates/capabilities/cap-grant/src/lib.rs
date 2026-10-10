@@ -42,9 +42,11 @@ pub use approval_intake::{
     GrantApprovalIntake, PendingApprovalView, RequestInspect, MAX_PENDING_PER_CALLER,
     MAX_PENDING_REQUESTS,
 };
-pub use capability_subset::validate_capability_subset;
+pub use capability_subset::{project_capability_params, validate_capability_subset};
 pub use cascade::CascadeResult;
-pub use check::{AuthzLevel, GrantCheckImpl, ToolsGrantReaderImpl};
+pub use check::{
+    AuthzLevel, GrantCheckImpl, McpGrantReaderImpl, ToolsGrantReaderImpl, WebGrantReaderImpl,
+};
 pub use compile::{StaticConfigCompiler, MAX_YAML_BYTES};
 pub use data::{
     CapParam, ChainDecision, ComponentId, Grant, GrantDraft, GrantId, GrantIssuer, GrantProvenance,

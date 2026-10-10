@@ -235,31 +235,9 @@ fn pc_07_retired_resource_capabilities_key() {
 // names (no installed pack widens it), and the install note never names the retired kind.
 #[test]
 fn pc_08_capability_catalog_is_exactly_the_known_capabilities() {
-    use advance_pack_manager::{ComponentKind, PackProvideEntry};
     let mut known = advance_cli::agent_config::KNOWN_CAPABILITIES.to_vec();
     known.sort_unstable();
     known.dedup();
     let catalog = advance_cli::commands::pack::capability_catalog();
     assert_eq!(catalog.names().collect::<Vec<_>>(), known);
-
-    let every_kind: Vec<PackProvideEntry> = [
-        ComponentKind::Binary,
-        ComponentKind::AgentTemplate,
-        ComponentKind::Skill,
-        ComponentKind::RunnableComponent,
-        ComponentKind::ChannelAdapter,
-        ComponentKind::McpServer,
-        ComponentKind::Preset,
-        ComponentKind::Workflow,
-        ComponentKind::MemorySeed,
-        ComponentKind::MetaSchemaExtension,
-    ]
-    .into_iter()
-    .map(|kind| PackProvideEntry {
-        kind,
-        name: "x".into(),
-    })
-    .collect();
-    let inert = advance_cli::pack_runtime::inert_kinds(&every_kind);
-    assert!(!inert.contains(&"resource-capabilities"), "{inert:?}");
 }

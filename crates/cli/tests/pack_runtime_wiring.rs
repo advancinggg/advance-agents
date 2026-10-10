@@ -11,9 +11,15 @@
 //!   caller's identity, and serves an agent that holds an `fs` grant (no grant of its own);
 //! - the pack's views and presentation reach `/client/schema` and the agent's `describe`.
 //!
-//! Fixture discipline: env-var master key (never read), no network, the agenda skill's
-//! `tool.wasm` is the cap-tools clock fixture (any component exporting `tool-exports` passes
-//! the installer; the registered id is what the operations bind to).
+//! The same boot composes the MCP client (module `mcp_client` below): a root that declares
+//! `mcp` gets the seven `mcp-client` host functions over the operator's server files, each call
+//! decided by its `mcp` grant; a root that does not gets nothing MCP at all.
+//!
+//! Fixture discipline of the pack tests: env-var master key (never read), no network, the
+//! agenda skill's `tool.wasm` is the cap-tools clock fixture (any component exporting
+//! `tool-exports` passes the installer; the registered id is what the operations bind to).
+//! The MCP tests bring their own servers: bash scripts over stdio and an http double on
+//! loopback; one of their homes reads a master key from its environment variable.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -627,4 +633,1189 @@ async fn client_api_apply_runs_a_pack_workflow() {
         "apply-nope",
     );
     assert!(!env.is_ok(), "an unknown workflow is refused");
+}
+
+// ── The MCP client over the production wiring ───────────────────────────────────────────
+//
+// An operator server file names a server (a bash script speaking MCP over its stdin and
+// stdout, or an http double on loopback), the root declares `mcp`, and the `mcp-client` host
+// functions the daemon registered are called the way the capability injector calls them:
+// with the caller's agent id in the call context.
+#[cfg(unix)]
+mod mcp_client {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use advance_cli::wiring::{wire_capabilities, WiringHandles};
+    use advance_event_bus::{EventFilter, ReadNext};
+    use advance_runtime::bootstrap::{RuntimeHost, RuntimeHostBuilder};
+    use advance_runtime::host_registry::HostCallContext;
+    use advance_runtime::ComponentCtx;
+    use advance_shared_types::capability::{CapParams, CapRequest, CapabilityId, GrantDecision};
+    use cap_grant::data::GrantStatus;
+    use serde_json::{json, Value};
+    use wasmtime::component::Val;
+
+    use super::runtime_yaml;
+
+    const NAMESPACE: &str = "advance:runtime/mcp-client@0.1.0";
+
+    /// Never set: a home whose master key comes from this variable finds none there.
+    const NO_KEY_ENV: &str = "ADV_PACK_RUNTIME_MCP_NO_KEY";
+    /// Set by [`with_master_key`], for a home that needs its master key.
+    const KEY_ENV: &str = "ADV_PACK_RUNTIME_MCP_KEY";
+    const KEY_BYTE: u8 = 0x4d;
+
+    fn with_master_key() {
+        static SET: std::sync::Once = std::sync::Once::new();
+        SET.call_once(|| std::env::set_var(KEY_ENV, format!("{KEY_BYTE:02x}").repeat(32)));
+    }
+
+    struct Home {
+        _guard: tempfile::TempDir,
+        root: PathBuf,
+        config: PathBuf,
+        /// Outside the workspace: the server scripts and what they record.
+        marks: PathBuf,
+    }
+
+    /// A workspace whose `.agent/config.yaml` is `agent_yaml`, and whose runtime config takes
+    /// its master key from the environment variable `key_env` and ends with `tail` (more
+    /// blocks, such as `mcp:`).
+    fn home(agent_yaml: &str, key_env: &str, tail: &str) -> Home {
+        let guard = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(guard.path()).unwrap();
+        let root = base.join("ws");
+        let marks = base.join("marks");
+        for dir in [
+            root.join(".advance"),
+            root.join(".runtime/events/jsonl"),
+            root.join(".agent"),
+            marks.clone(),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let config = root.join(".advance/runtime-config.yaml");
+        let yaml = runtime_yaml().replace("ADV_PACK_RUNTIME_MK_UNUSED", key_env);
+        assert!(yaml.contains(key_env));
+        std::fs::write(&config, yaml + tail).unwrap();
+        std::fs::write(root.join(".agent/config.yaml"), agent_yaml).unwrap();
+        Home {
+            _guard: guard,
+            root,
+            config,
+            marks,
+        }
+    }
+
+    /// A bash MCP server over stdio. It records its pid (`<id>.starts`, one line per start)
+    /// and the pid of a process it starts (`<id>.children`), answers `initialize`, takes
+    /// `notifications/initialized`, then serves: `tools/list` names `echo`, `echo_twice` and
+    /// `rm`; a call of `hang` is recorded (`<id>.unanswered`) and never answered; any other
+    /// call is recorded (`<id>.calls`) and answered. `@EXTRA@` runs first. The script uses
+    /// builtins and absolute paths only: the server starts with an empty environment.
+    const SERVER_SCRIPT: &str = r#"
+@EXTRA@
+echo $$ >> '@MARKS@/@ID@.starts'
+/bin/sleep 300 &
+echo $! >> '@MARKS@/@ID@.children'
+read -r init
+printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"@ID@","version":"1"}}}\n'
+read -r initialized
+while read -r line; do
+  id=${line##*\"id\":}; id=${id%%[!0-9]*}
+  case "$line" in
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echo"},{"name":"echo_twice","description":"Echo twice"},{"name":"rm","description":"Remove"}]}}\n' "$id" ;;
+    *'"name":"hang"'*)
+      echo got >> '@MARKS@/@ID@.unanswered' ;;
+    *'"method":"tools/call"'*)
+      echo called >> '@MARKS@/@ID@.calls'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong from @ID@"}]}}\n' "$id" ;;
+    *)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    /// Write the operator server file of the stdio server `id`: `/bin/bash <script>`, with
+    /// `extra` run first by the script and `tail` appended to the file (more keys).
+    fn stdio_server(home: &Home, id: &str, extra: &str, tail: &str) {
+        let script = home.marks.join(format!("{id}.sh"));
+        std::fs::write(
+            &script,
+            SERVER_SCRIPT
+                .replace("@EXTRA@", extra)
+                .replace("@MARKS@", home.marks.to_str().unwrap())
+                .replace("@ID@", id),
+        )
+        .unwrap();
+        server_file(
+            home,
+            id,
+            &format!(
+                "server-id: {id}\ndescription: {id} tools\ntransport:\n  kind: stdio\n  \
+                 command: /bin/bash\n  args: [\"{}\"]\n{tail}",
+                script.display()
+            ),
+        );
+    }
+
+    fn server_file(home: &Home, id: &str, body: &str) {
+        let dir = home.root.join(".advance/mcp-servers");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{id}.yaml")), body).unwrap();
+    }
+
+    /// The lines a server recorded in `<marks>/<name>`.
+    fn marks(home: &Home, name: &str) -> Vec<String> {
+        std::fs::read_to_string(home.marks.join(name))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// `kill -0 <pid>`: whether the process exists.
+    fn pid_alive(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Poll `condition` every 20 ms until it holds or `limit` passes.
+    async fn wait_until(mut condition: impl FnMut() -> bool, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        condition()
+    }
+
+    /// Wait for each of `pids` to be gone; a survivor is killed and fails the test.
+    async fn assert_stopped(pids: &[&String], why: &str) {
+        for pid in pids {
+            let stopped = wait_until(|| !pid_alive(pid), Duration::from_secs(5)).await;
+            if !stopped {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", pid.as_str()])
+                    .status();
+            }
+            assert!(stopped, "process {pid} is still running: {why}");
+        }
+    }
+
+    async fn boot(home: &Home) -> (RuntimeHost, WiringHandles) {
+        let builder = RuntimeHostBuilder::new(&home.config, &home.root)
+            .await
+            .expect("builder");
+        wire_capabilities(builder, &home.root).await.expect("wire")
+    }
+
+    /// The names of the host functions registered under `mcp`.
+    fn registered(host: &RuntimeHost) -> BTreeSet<String> {
+        host.host_registry()
+            .lookup("mcp")
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect()
+    }
+
+    /// Link a guest that declares `mcp`, as the agent loop does.
+    fn link_mcp(host: &RuntimeHost) -> Result<(), String> {
+        let runtime = host.component_runtime();
+        let mut linker =
+            wasmtime::component::Linker::<ComponentCtx>::new(runtime.host_engine_handle().engine());
+        host.capability_injector()
+            .inject(
+                &mut linker,
+                &[CapRequest {
+                    capability: CapabilityId::new("mcp"),
+                }],
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    /// An `mcp-error`: its arm and its message.
+    type McpErr = (String, String);
+
+    /// Start a call of the mcp-client host function `name` as `agent`, with the context the
+    /// injector builds for a guest call. The future yields the call's one result, `Err`
+    /// holding the `mcp-error`; it borrows nothing, so it can run on a task of its own.
+    fn begin(
+        host: &RuntimeHost,
+        agent: &str,
+        name: &str,
+        params: Vec<Val>,
+    ) -> impl std::future::Future<Output = Result<Val, McpErr>> + Send + 'static {
+        let spec = host
+            .host_registry()
+            .lookup("mcp")
+            .into_iter()
+            .find(|spec| spec.name == name)
+            .unwrap_or_else(|| panic!("mcp-client function {name} is registered"));
+        let ctx = HostCallContext {
+            agent_id: agent.to_string(),
+            trace_id: "trace-mcp".to_string(),
+            turn_id: None,
+            capability: "mcp".to_string(),
+            function: format!("{NAMESPACE}::{name}"),
+            run_id: None,
+            iteration: None,
+        };
+        let pending = spec.handler.call(ctx, params, 1);
+        let name = name.to_string();
+        async move {
+            let mut out = pending.await.unwrap_or_else(|e| panic!("{name}: {e}"));
+            match out.remove(0) {
+                Val::Result(Ok(Some(value))) => Ok(*value),
+                Val::Result(Err(Some(error))) => match *error {
+                    Val::Variant(arm, Some(message)) => match *message {
+                        Val::String(message) => Err((arm, message)),
+                        other => panic!("{name}: error payload {other:?}"),
+                    },
+                    other => panic!("{name}: error {other:?}"),
+                },
+                other => panic!("{name}: result {other:?}"),
+            }
+        }
+    }
+
+    /// [`begin`] a call and wait for its result.
+    async fn call(
+        host: &RuntimeHost,
+        agent: &str,
+        name: &str,
+        params: Vec<Val>,
+    ) -> Result<Val, McpErr> {
+        begin(host, agent, name, params).await
+    }
+
+    fn s(text: &str) -> Val {
+        Val::String(text.into())
+    }
+
+    fn bytes(text: &str) -> Val {
+        Val::List(text.bytes().map(Val::U8).collect())
+    }
+
+    /// The string field `name` of each record in a listing.
+    fn field(listing: Val, name: &str) -> Vec<String> {
+        let Val::List(records) = listing else {
+            panic!("a listing is a list: {listing:?}");
+        };
+        records
+            .into_iter()
+            .map(|record| {
+                let Val::Record(fields) = record else {
+                    panic!("a listing holds records: {record:?}");
+                };
+                match fields.into_iter().find(|(key, _)| key == name) {
+                    Some((_, Val::String(value))) => value,
+                    other => panic!("no string field {name:?}: {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    /// The bytes of a call result, as JSON.
+    fn json_result(result: Val) -> Value {
+        let Val::List(items) = result else {
+            panic!("a call result is a byte list: {result:?}");
+        };
+        let raw: Vec<u8> = items
+            .into_iter()
+            .map(|item| match item {
+                Val::U8(byte) => byte,
+                other => panic!("a byte: {other:?}"),
+            })
+            .collect();
+        serde_json::from_slice(&raw).expect("a call result is JSON")
+    }
+
+    async fn servers(host: &RuntimeHost, agent: &str) -> Vec<String> {
+        field(
+            call(host, agent, "list-mcp-servers", vec![])
+                .await
+                .expect("list-mcp-servers"),
+            "id",
+        )
+    }
+
+    async fn tools(host: &RuntimeHost, agent: &str, server: &str) -> Result<Vec<String>, McpErr> {
+        call(host, agent, "list-mcp-tools", vec![s(server)])
+            .await
+            .map(|listing| field(listing, "name"))
+    }
+
+    async fn invoke(
+        host: &RuntimeHost,
+        agent: &str,
+        server: &str,
+        tool: &str,
+    ) -> Result<Value, McpErr> {
+        call(
+            host,
+            agent,
+            "invoke-mcp-tool",
+            vec![s(server), s(tool), bytes("{}")],
+        )
+        .await
+        .map(json_result)
+    }
+
+    fn denied(result: Result<impl std::fmt::Debug, McpErr>) -> String {
+        let (arm, message) = result.expect_err("refused");
+        assert_eq!(arm, "permission-denied", "{message}");
+        message
+    }
+
+    const SCOPED_ROOT: &str =
+        "capabilities:\n  mcp:\n    servers: [srv]\n    tool-patterns: [\"echo*\"]\n";
+
+    // The root declares `mcp` with a grant on one server and its `echo*` tools. The seven
+    // host functions are registered and link; the granted tool is called, a tool outside the
+    // patterns and a server outside the grant are refused before any server is touched; and
+    // no server needs a secret, so the home's secret store is never opened.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_root_that_declares_mcp_calls_what_its_grant_covers() {
+        let home = home(SCOPED_ROOT, NO_KEY_ENV, "");
+        stdio_server(&home, "srv", "", "");
+        stdio_server(&home, "other", "", "");
+        let (host, handles) = boot(&home).await;
+        let root = handles.root_agent_id.clone();
+
+        assert_eq!(
+            registered(&host),
+            [
+                "list-mcp-servers",
+                "list-mcp-tools",
+                "list-mcp-prompts",
+                "get-mcp-prompt",
+                "list-mcp-resources",
+                "read-mcp-resource",
+                "invoke-mcp-tool",
+            ]
+            .map(String::from)
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+        );
+        let specs = host.host_registry().lookup("mcp");
+        assert_eq!(specs.len(), 7);
+        assert!(specs
+            .iter()
+            .all(|spec| spec.capability == "mcp" && spec.namespace == NAMESPACE));
+        link_mcp(&host).expect("a guest that declares mcp links mcp-client");
+
+        let mcp = handles.mcp.as_ref().expect("mcp declared");
+        assert!(mcp.warnings().is_empty(), "{:?}", mcp.warnings());
+        let configured: Vec<String> = mcp
+            .client()
+            .list_servers()
+            .await
+            .into_iter()
+            .map(|server| server.id)
+            .collect();
+        assert_eq!(configured, ["other", "srv"]);
+        assert!(
+            handles.secret_store.is_none(),
+            "no server needs secrets: the secret store stays closed"
+        );
+
+        // The events of the calls below, off the production bus.
+        let mut events = handles
+            .observability_read_api
+            .clone()
+            .expect("read api")
+            .subscribe(EventFilter {
+                event_type_prefix: Some("mcp.".into()),
+                ..Default::default()
+            });
+
+        // Listing the servers reads the grant and starts nothing.
+        assert_eq!(servers(&host, &root).await, ["srv"]);
+        assert!(
+            marks(&home, "srv.starts").is_empty(),
+            "servers start lazily"
+        );
+
+        assert_eq!(
+            tools(&host, &root, "srv")
+                .await
+                .expect("the granted server"),
+            ["echo", "echo_twice"]
+        );
+        let pong = invoke(&host, &root, "srv", "echo")
+            .await
+            .expect("a tool the grant covers");
+        assert_eq!(pong["content"][0]["text"], "pong from srv");
+
+        let message = denied(invoke(&host, &root, "srv", "rm").await);
+        assert!(message.contains("\"rm\""), "{message}");
+        denied(invoke(&host, &root, "other", "echo").await);
+        denied(tools(&host, &root, "other").await);
+
+        assert_eq!(marks(&home, "srv.starts").len(), 1, "one server process");
+        assert_eq!(
+            marks(&home, "srv.calls").len(),
+            1,
+            "a refused call never reaches the server"
+        );
+        assert!(
+            marks(&home, "other.starts").is_empty(),
+            "a server no grant reaches is never started"
+        );
+
+        // The connection, the call and the refusal were reported on the production bus.
+        let mut seen: Vec<(String, Value)> = Vec::new();
+        while seen.len() < 4 {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+                Ok(ReadNext::Event(event)) => {
+                    seen.push((event.event_type.clone(), event.payload.clone()))
+                }
+                other => panic!("mcp events are missing after {seen:?}: {other:?}"),
+            }
+        }
+        let of = |event_type: &str| -> Vec<&Value> {
+            seen.iter()
+                .filter(|(name, _)| name == event_type)
+                .map(|(_, payload)| payload)
+                .collect()
+        };
+        assert_eq!(
+            of("mcp.server_started"),
+            [&json!({"server_id": "srv", "transport": "stdio"})]
+        );
+        let invoked = of("mcp.tool_invoked");
+        assert_eq!(invoked.len(), 1, "{seen:?}");
+        assert_eq!(invoked[0]["tool_name"], "echo");
+        assert_eq!(invoked[0]["agent_id"], json!(root));
+        let refused: Vec<(&Value, &Value)> = of("mcp.tool_error")
+            .into_iter()
+            .map(|payload| (&payload["server_id"], &payload["tool_name"]))
+            .collect();
+        assert_eq!(
+            refused,
+            [
+                (&json!("srv"), &json!("rm")),
+                (&json!("other"), &json!("echo"))
+            ]
+        );
+        assert!(of("mcp.tool_error")
+            .iter()
+            .all(|payload| payload["error_type"] == "permission-denied"));
+    }
+
+    // The gate is asked with the id the runtime stamps on a guest's calls: the agent's
+    // immutable id (the daemon gives the root's guest `root_agent_id`), which is also the id
+    // its grants are stored under. A listing (the silent grant reader) and a call (the grant
+    // check) read the same grants for it. No other spelling of the agent gets as far as the
+    // gate, and those that name no grantee find a grant in neither.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listing_and_a_call_read_the_same_grants_for_the_id_the_runtime_stamps() {
+        let home = home(SCOPED_ROOT, NO_KEY_ENV, "");
+        stdio_server(&home, "srv", "", "");
+        let (host, handles) = boot(&home).await;
+        let root = handles.root_agent_id.clone();
+        let mailbox = handles.root_mailbox_id.clone();
+
+        // The stamped id is the bare tree id, never the `agent:` mailbox key, and the root's
+        // static `mcp` grant is stored under exactly it.
+        assert!(!root.contains(':'), "{root}");
+        assert_eq!(
+            mailbox.strip_prefix("agent:").map(str::is_empty),
+            Some(false)
+        );
+        assert_ne!(mailbox, root);
+        let held: Vec<String> = handles
+            .cap_grant
+            .store
+            .list_by_grantee(&root)
+            .into_iter()
+            .filter(|grant| grant.capability == "mcp" && grant.status == GrantStatus::Active)
+            .map(|grant| grant.grantee)
+            .collect();
+        assert_eq!(held, [root.clone()]);
+        assert!(handles.cap_grant.store.list_by_grantee(&mailbox).is_empty());
+
+        // A guest's call reaches a handler only after the injector, with the stamped id and
+        // this same grant check, has allowed `mcp`. Only the id the grant is stored under
+        // passes: the mailbox key, the handle and the `agent:` spelling of the id are
+        // stopped there, before any gate decision.
+        let handle = mailbox.trim_start_matches("agent:").to_string();
+        let colon_id = format!("agent:{root}");
+        let linked = |agent: &str| {
+            handles.cap_grant.grant_check.check(
+                agent,
+                "mcp",
+                &format!("{NAMESPACE}::list-mcp-servers"),
+                &CapParams::empty(),
+            )
+        };
+        assert_eq!(linked(&root), GrantDecision::Allow);
+        for other in [mailbox.as_str(), handle.as_str(), colon_id.as_str()] {
+            assert!(matches!(linked(other), GrantDecision::Deny(_)), "{other}");
+        }
+
+        // For the stamped id, the listing and the call agree on every entry: the granted
+        // server is listed, every tool the listing shows is callable and every tool it hides
+        // is refused.
+        assert_eq!(servers(&host, &root).await, ["srv"]);
+        let shown = tools(&host, &root, "srv").await.expect("granted");
+        assert_eq!(shown, ["echo", "echo_twice"]);
+        for tool in ["echo", "echo_twice", "rm"] {
+            let called = invoke(&host, &root, "srv", tool).await;
+            if shown.iter().any(|name| name == tool) {
+                called.unwrap_or_else(|e| panic!("{tool} is listed, so it is callable: {e:?}"));
+            } else {
+                denied(called);
+            }
+        }
+        // The server's prompts and resources fall under no tool pattern, so this grant
+        // reaches none of them: their listings and a read are refused alike.
+        denied(call(&host, &root, "list-mcp-prompts", vec![s("srv")]).await);
+        denied(call(&host, &root, "list-mcp-resources", vec![s("srv")]).await);
+        denied(
+            call(
+                &host,
+                &root,
+                "read-mcp-resource",
+                vec![s("srv"), s("file:///notes")],
+            )
+            .await,
+        );
+
+        // Under the mailbox key, or its handle, nothing is listed and nothing is callable.
+        for other in [mailbox.as_str(), handle.as_str(), "agent:nobody", "nobody"] {
+            assert!(servers(&host, other).await.is_empty(), "{other}");
+            denied(tools(&host, other, "srv").await);
+            denied(invoke(&host, other, "srv", "echo").await);
+        }
+        assert_eq!(marks(&home, "srv.calls").len(), 2);
+    }
+
+    // Without `mcp` in the root's config nothing MCP exists: no host function, no runtime,
+    // no server process, although a server file is there and the warm-up is on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_root_that_does_not_declare_mcp_gets_nothing_mcp() {
+        let home = home(
+            "capabilities:\n  fs: true\n  tools: true\n",
+            NO_KEY_ENV,
+            "\nmcp:\n  warm-tool-cache: true\n",
+        );
+        stdio_server(&home, "srv", "", "");
+        // A file that would be refused is not even read.
+        server_file(&home, "broken", "server-id: [unclosed\n");
+        let (host, handles) = boot(&home).await;
+
+        assert!(registered(&host).is_empty());
+        assert!(handles.mcp.is_none());
+        let error = link_mcp(&host).expect_err("mcp is not registered");
+        assert!(error.contains("unknown capability"), "{error}");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !home.marks.join("srv.starts").exists(),
+            "no server process is started"
+        );
+    }
+
+    // `mcp` declared with no server file at all: the host functions are registered and a
+    // guest links; there is simply no server.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_without_server_files_still_links() {
+        let home = home("capabilities:\n  mcp: true\n", NO_KEY_ENV, "");
+        let (host, handles) = boot(&home).await;
+        let root = handles.root_agent_id.clone();
+
+        assert_eq!(registered(&host).len(), 7);
+        link_mcp(&host).expect("mcp links with no server configured");
+        assert!(handles.mcp.as_ref().expect("mcp").warnings().is_empty());
+        assert!(servers(&host, &root).await.is_empty());
+        let (arm, message) = invoke(&host, &root, "srv", "echo")
+            .await
+            .expect_err("no such server");
+        assert_eq!(arm, "not-found", "{message}");
+        assert!(
+            !home.root.join(".advance/mcp-servers").exists(),
+            "reading creates nothing"
+        );
+    }
+
+    // A pack workflow's register-mcp-server writes the operator file and makes the
+    // server callable; applying it again succeeds; uninstalling the pack removes the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pack_workflow_registers_an_mcp_server_and_uninstall_removes_it() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        with_master_key();
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let pk = hex::encode(key.verifying_key().to_bytes());
+        let home = home(
+            "capabilities:\n  mcp: true\n  lifecycle: true\n",
+            KEY_ENV,
+            &format!("\npack:\n  trust-roots:\n    - {pk}\n"),
+        );
+        let script = home.marks.join("srv.sh");
+        std::fs::write(
+            &script,
+            SERVER_SCRIPT
+                .replace("@EXTRA@", "")
+                .replace("@MARKS@", home.marks.to_str().unwrap())
+                .replace("@ID@", "srv"),
+        )
+        .unwrap();
+        let src = home.root.parent().unwrap().join("src/p");
+        std::fs::create_dir_all(src.join("mcp-servers")).unwrap();
+        std::fs::create_dir_all(src.join("workflows")).unwrap();
+        std::fs::write(
+            src.join("mcp-servers/srv.yaml"),
+            format!(
+                "server-id: srv\ntransport:\n  kind: stdio\n  command: /bin/bash\n  args: [\"{}\"]\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("workflows/mcp.yaml"),
+            "name: mcp\nsteps:\n  - type: register-mcp-server\n    config-ref: p@1.0.0/mcp-servers/srv\n",
+        )
+        .unwrap();
+        let pack_yaml = "name: p\nversion: 1.0.0\nruntime-version: \">=0.1.0\"\ntrust-level: trusted\nprovides:\n  mcp-servers:\n    - srv\n  workflows:\n    - mcp\nchecksums:\n  algo: sha256\n  files: {}\n";
+        std::fs::write(src.join("pack.yaml"), pack_yaml).unwrap();
+        let sig = key.sign(pack_yaml.as_bytes());
+        std::fs::write(
+            src.join("pack.sig"),
+            format!(
+                "alg: ed25519\npublic-key: {}\nsignature: {}\n",
+                pk,
+                hex::encode(sig.to_bytes())
+            ),
+        )
+        .unwrap();
+
+        let (host, handles) = boot(&home).await;
+        let api = super::operator_api(&handles);
+        let env = super::post(
+            &api,
+            "/client/packs:install",
+            json!({ "source": src.to_str().unwrap(), "accepted_capabilities": ["mcp"] }),
+            "install-mcp-pack",
+        );
+        assert!(env.is_ok(), "{:?}", env.error);
+
+        let env = super::post(
+            &api,
+            "/client/packs/p@1.0.0:apply",
+            json!({ "workflow": "mcp" }),
+            "apply-mcp",
+        );
+        assert!(env.is_ok(), "{:?}", env.error);
+        assert_eq!(
+            env.data.unwrap()["steps_executed"],
+            json!(["register-mcp-server"])
+        );
+        let file = home.root.join(".advance/mcp-servers/srv.yaml");
+        assert!(file.is_file(), "the pack materialized a server file");
+        let body = std::fs::read_to_string(&file).unwrap();
+        assert!(body.contains("origin:"), "{body}");
+
+        let root = handles.root_agent_id.clone();
+        invoke(&host, &root, "srv", "echo")
+            .await
+            .expect("the pack's server is callable");
+
+        let env = super::post(
+            &api,
+            "/client/packs/p@1.0.0:apply",
+            json!({ "workflow": "mcp" }),
+            "apply-mcp-again",
+        );
+        assert!(env.is_ok(), "re-applying is idempotent: {:?}", env.error);
+
+        let env = super::post(
+            &api,
+            "/client/packs/p@1.0.0:uninstall",
+            json!({}),
+            "uninstall-mcp-pack",
+        );
+        assert!(env.is_ok(), "{:?}", env.error);
+        assert!(
+            !file.exists(),
+            "uninstalling the origin pack removes the file"
+        );
+        let (arm, _) = invoke(&host, &root, "srv", "echo")
+            .await
+            .expect_err("the server is gone");
+        assert_eq!(arm, "not-found");
+    }
+
+    // Server files that cannot serve do not stop the daemon: each is skipped with a warning
+    // and the good server next to them works. With `allow-stdio: false` no stdio server is
+    // loaded at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bad_server_file_is_skipped_and_the_daemon_boots() {
+        let home = home("capabilities:\n  mcp: true\n", NO_KEY_ENV, "");
+        stdio_server(&home, "srv", "", "");
+        server_file(&home, "broken", "server-id: [unclosed\n");
+        server_file(
+            &home,
+            "renamed",
+            "server-id: original\ntransport:\n  kind: stdio\n  command: /bin/true\n",
+        );
+        let (host, handles) = boot(&home).await;
+        let root = handles.root_agent_id.clone();
+
+        let warnings = handles.mcp.as_ref().expect("mcp").warnings().to_vec();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("\"broken.yaml\""), "{warnings:?}");
+        assert!(warnings[1].contains("\"renamed.yaml\""), "{warnings:?}");
+        assert_eq!(servers(&host, &root).await, ["srv"]);
+        invoke(&host, &root, "srv", "echo")
+            .await
+            .expect("the good server serves");
+        drop((host, handles));
+
+        let no_stdio = self::home(
+            "capabilities:\n  mcp: true\n",
+            NO_KEY_ENV,
+            "\nmcp:\n  allow-stdio: false\n",
+        );
+        stdio_server(&no_stdio, "srv", "", "");
+        let (host, handles) = boot(&no_stdio).await;
+        let warnings = handles.mcp.as_ref().expect("mcp").warnings().to_vec();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("mcp.allow-stdio: false"),
+            "{warnings:?}"
+        );
+        assert!(servers(&host, &handles.root_agent_id).await.is_empty());
+        assert_eq!(registered(&host).len(), 7);
+    }
+
+    // A stdio server that names `secret-refs` gets each secret in its environment, and is
+    // what opens the daemon's secret store here: the root declares neither `secrets` nor
+    // `llm`. A server whose secret is missing is skipped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_that_needs_secrets_opens_the_secret_store() {
+        with_master_key();
+        let home = home("capabilities:\n  mcp: true\n", KEY_ENV, "");
+        let storage: Arc<dyn cap_secrets::SecretStorage> = Arc::new(
+            cap_secrets::FileSecretStorage::open(home.root.join(".advance/secrets.json"))
+                .expect("secrets file"),
+        );
+        cap_secrets::SecretStore::new(zeroize::Zeroizing::new([KEY_BYTE; 32]), storage)
+            .store("mcp-token", "heron-42")
+            .expect("provision the secret");
+        let record_token = format!(
+            "printf '%s' \"$MCP_TOKEN\" > '{}/srv.token'",
+            home.marks.display()
+        );
+        stdio_server(
+            &home,
+            "srv",
+            &record_token,
+            "secret-refs:\n  MCP_TOKEN: mcp-token\n",
+        );
+        stdio_server(
+            &home,
+            "lacking",
+            "",
+            "secret-refs:\n  MCP_TOKEN: absent-token\n",
+        );
+        let (host, handles) = boot(&home).await;
+        let root = handles.root_agent_id.clone();
+
+        assert!(handles.secret_store.is_some(), "the secret store is open");
+        let warnings = handles.mcp.as_ref().expect("mcp").warnings().to_vec();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("server 'lacking' is skipped")
+                && warnings[0].contains("\"absent-token\""),
+            "{warnings:?}"
+        );
+        assert!(warnings.iter().all(|w| !w.contains("heron-42")));
+        assert_eq!(servers(&host, &root).await, ["srv"]);
+        invoke(&host, &root, "srv", "echo")
+            .await
+            .expect("srv serves");
+        assert_eq!(
+            std::fs::read_to_string(home.marks.join("srv.token")).unwrap(),
+            "heron-42",
+            "the secret is the server's MCP_TOKEN"
+        );
+    }
+
+    // Shutting the MCP runtime down is what the daemon does when it stops: the stdio server
+    // and the process it started are gone at once, with a call still waiting on the server,
+    // and nothing starts a server again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_shutdown_stops_the_stdio_servers_with_a_call_in_flight() {
+        let home = home("capabilities:\n  mcp: true\n", NO_KEY_ENV, "");
+        stdio_server(&home, "srv", "", "");
+        let (host, handles) = boot(&home).await;
+        let root = handles.root_agent_id.clone();
+        invoke(&host, &root, "srv", "echo")
+            .await
+            .expect("srv serves");
+        let server = marks(&home, "srv.starts")[0].clone();
+        let child = marks(&home, "srv.children")[0].clone();
+        assert!(pid_alive(&server) && pid_alive(&child));
+
+        // A call the server never answers holds its connection for the request timeout.
+        let hung = tokio::spawn(begin(
+            &host,
+            &root,
+            "invoke-mcp-tool",
+            vec![s("srv"), s("hang"), bytes("{}")],
+        ));
+        assert!(
+            wait_until(
+                || !marks(&home, "srv.unanswered").is_empty(),
+                Duration::from_secs(5)
+            )
+            .await,
+            "the server read the call it will not answer"
+        );
+
+        handles.mcp.as_ref().expect("mcp").shutdown();
+
+        let (arm, _) = tokio::time::timeout(Duration::from_secs(5), hung)
+            .await
+            .expect("the call ends with the shutdown, not with its timeout")
+            .expect("join")
+            .expect_err("its connection was closed");
+        assert_eq!(arm, "transport-error");
+        assert_stopped(&[&child, &server], "the MCP runtime was shut down").await;
+
+        let (arm, message) = invoke(&host, &root, "srv", "echo")
+            .await
+            .expect_err("nothing is connected after a shutdown");
+        assert_eq!(arm, "transport-error", "{message}");
+        assert_eq!(marks(&home, "srv.starts").len(), 1);
+    }
+
+    // The runtime's last handle going away stops the servers too: a path that leaves the
+    // daemon without reaching its shutdown sequence leaves no server behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_the_mcp_runtime_stops_the_stdio_servers() {
+        let home = home("capabilities:\n  mcp: true\n", NO_KEY_ENV, "");
+        stdio_server(&home, "srv", "", "");
+        let (host, mut handles) = boot(&home).await;
+        let root = handles.root_agent_id.clone();
+        invoke(&host, &root, "srv", "echo")
+            .await
+            .expect("srv serves");
+        let server = marks(&home, "srv.starts")[0].clone();
+        let child = marks(&home, "srv.children")[0].clone();
+        assert!(pid_alive(&server) && pid_alive(&child));
+
+        drop(handles.mcp.take());
+
+        assert_stopped(&[&child, &server], "the MCP runtime was dropped").await;
+        assert!(invoke(&host, &root, "srv", "echo").await.is_err());
+    }
+
+    // With `warm-tool-cache: true` the daemon connects, on its own, the servers the root's
+    // grant reaches and lists their tools; a server the grant does not reach stays unstarted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_warm_up_connects_only_the_servers_the_root_grant_reaches() {
+        let home = home(
+            "capabilities:\n  mcp:\n    servers: [srv]\n",
+            NO_KEY_ENV,
+            "\nmcp:\n  warm-tool-cache: true\n",
+        );
+        stdio_server(&home, "srv", "", "");
+        stdio_server(&home, "other", "", "");
+        let (_host, handles) = boot(&home).await;
+        let client = Arc::clone(handles.mcp.as_ref().expect("mcp").client());
+
+        assert!(
+            wait_until(
+                || !client.cached_tools().is_empty(),
+                Duration::from_secs(10)
+            )
+            .await,
+            "the warm-up lists the granted server's tools"
+        );
+        let cached = client.cached_tools();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].server_id, "srv");
+        let names: Vec<&str> = cached[0].tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["echo", "echo_twice", "rm"]);
+        assert_eq!(marks(&home, "srv.starts").len(), 1);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            marks(&home, "other.starts").is_empty(),
+            "a server no grant reaches is not warmed up"
+        );
+    }
+
+    // ── An operator http server on loopback ─────────────────────────────────────────────
+
+    /// What reached an http MCP double: the JSON-RPC method of each POST.
+    #[derive(Clone, Default)]
+    struct Posts(Arc<Mutex<Vec<String>>>);
+
+    impl Posts {
+        fn methods(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// An http MCP double: what reached it, the tools it lists, and the loopback port of a
+    /// second listener it redirects the `hop` tool to.
+    #[derive(Clone)]
+    struct Double {
+        posts: Posts,
+        tools: &'static [&'static str],
+        elsewhere: u16,
+    }
+
+    /// A Streamable HTTP MCP server double: `initialize` gets a session id, a notification
+    /// `202`, `tools/list` the double's tools. Calling `hop` answers with a redirect to another
+    /// loopback port, calling `slow` answers after fifteen seconds, any other call at once.
+    async fn mcp_double(
+        axum::extract::State(double): axum::extract::State<Double>,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        use axum::http::{header, StatusCode};
+        use axum::response::IntoResponse;
+
+        let message: Value = serde_json::from_slice(&body).unwrap_or_default();
+        let method = message["method"].as_str().unwrap_or_default().to_string();
+        double.posts.0.lock().unwrap().push(method.clone());
+        let Some(id) = message.get("id").cloned() else {
+            return StatusCode::ACCEPTED.into_response();
+        };
+        let answer = |result: Value| {
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
+            )
+        };
+        match (method.as_str(), message["params"]["name"].as_str()) {
+            ("initialize", _) => (
+                [("mcp-session-id", "double-session")],
+                answer(json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "double", "version": "1"},
+                })),
+            )
+                .into_response(),
+            ("tools/list", _) => {
+                let tools: Vec<Value> = double
+                    .tools
+                    .iter()
+                    .map(|name| json!({"name": name, "description": "A tool"}))
+                    .collect();
+                answer(json!({ "tools": tools })).into_response()
+            }
+            ("tools/call", Some("hop")) => (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(
+                    header::LOCATION,
+                    format!("http://127.0.0.1:{}/mcp", double.elsewhere),
+                )],
+            )
+                .into_response(),
+            ("tools/call", Some("slow")) => {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                answer(json!({"late": true})).into_response()
+            }
+            _ => answer(json!({"ok": true})).into_response(),
+        }
+    }
+
+    /// Serve `router` on a loopback port of its own.
+    async fn serve(router: axum::Router) -> u16 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        port
+    }
+
+    // An operator file may point an http server at loopback: the daemon reaches exactly that
+    // endpoint, through the security chain (the calls are the root's http traffic). A
+    // redirect to another loopback port is not followed, and the configured request timeout
+    // bounds a call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_operator_http_server_on_loopback_is_reached_on_its_port_only() {
+        // A second loopback listener, which nothing may reach.
+        let strays = Posts::default();
+        let elsewhere = serve(axum::Router::new().fallback({
+            let strays = strays.clone();
+            move || {
+                strays.0.lock().unwrap().push("stray".to_string());
+                async { "stray" }
+            }
+        }))
+        .await;
+        let double = Double {
+            posts: Posts::default(),
+            tools: &["echo"],
+            elsewhere,
+        };
+        let port = serve(
+            axum::Router::new()
+                .route("/mcp", axum::routing::post(mcp_double))
+                .with_state(double.clone()),
+        )
+        .await;
+
+        let home = home(
+            "capabilities:\n  mcp: true\n",
+            NO_KEY_ENV,
+            "\nmcp:\n  request-timeout-sec: 3\n",
+        );
+        server_file(
+            &home,
+            "local",
+            &format!(
+                "server-id: local\ntransport:\n  kind: http\n  \
+                 endpoint-url: http://127.0.0.1:{port}/mcp\n"
+            ),
+        );
+        let (host, handles) = boot(&home).await;
+        let root = handles.root_agent_id.clone();
+        assert!(handles.mcp.as_ref().expect("mcp").warnings().is_empty());
+        let mut http_events = handles
+            .observability_read_api
+            .clone()
+            .expect("read api")
+            .subscribe(EventFilter {
+                event_type_prefix: Some("http.request".into()),
+                ..Default::default()
+            });
+
+        assert_eq!(
+            tools(&host, &root, "local").await.expect("listed"),
+            ["echo"]
+        );
+        let result = invoke(&host, &root, "local", "echo")
+            .await
+            .expect("the loopback endpoint of the server file is reachable");
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            double.posts.methods(),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call"
+            ]
+        );
+
+        // The traffic went through the chain: its requests are reported, the handshake as
+        // the server's and the calls as the root's.
+        let mut requesters = Vec::new();
+        while requesters.len() < 4 {
+            match tokio::time::timeout(Duration::from_secs(5), http_events.recv()).await {
+                Ok(ReadNext::Event(event)) => {
+                    assert_eq!(event.payload["host"], "127.0.0.1", "{:?}", event.payload);
+                    requesters.push(event.agent_id.clone());
+                }
+                other => panic!("http.request events are missing: {other:?}"),
+            }
+        }
+        assert_eq!(requesters, ["local", "local", root.as_str(), root.as_str()]);
+
+        // A redirect off the endpoint, to another loopback port, is not followed.
+        let refused = denied(invoke(&host, &root, "local", "hop").await);
+        assert_eq!(refused, "redirect rejected");
+        assert!(
+            strays.methods().is_empty(),
+            "nothing reached the other port"
+        );
+
+        // The request timeout of the `mcp:` block ends a call the server sits on.
+        let started = Instant::now();
+        let (arm, message) = invoke(&host, &root, "local", "slow")
+            .await
+            .expect_err("the call times out");
+        assert_eq!(arm, "transport-error", "{message}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the call ended with the 3 s request timeout, not with the server's answer"
+        );
+    }
+
+    // The web family tools of an http server also need the `web` grant, and in the `offline`
+    // web mode no agent gets them, whatever it holds: the gate is given the web grant only
+    // when the mode lets the web family out at all. A refused call never reaches the server.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_web_family_tools_follow_the_web_grant_and_the_web_mode() {
+        const WITH_WEB: &str = "capabilities:\n  mcp: true\n  web: true\n";
+        const WITHOUT_WEB: &str = "capabilities:\n  mcp: true\n";
+        const OFFLINE: &str = "\nweb:\n  mode: offline\n";
+
+        let double = Double {
+            posts: Posts::default(),
+            tools: &["echo", "web.search"],
+            elsewhere: 0,
+        };
+        let port = serve(
+            axum::Router::new()
+                .route("/mcp", axum::routing::post(mcp_double))
+                .with_state(double.clone()),
+        )
+        .await;
+        let calls = || {
+            double
+                .posts
+                .methods()
+                .iter()
+                .filter(|method| *method == "tools/call")
+                .count()
+        };
+
+        // (agent config, runtime config tail, whether the web family is offered)
+        for (agent_yaml, runtime_tail, offered) in [
+            (WITH_WEB, "", true),
+            (WITH_WEB, OFFLINE, false),
+            (WITHOUT_WEB, "", false),
+        ] {
+            let case = format!("{agent_yaml:?} {runtime_tail:?}");
+            let home = home(agent_yaml, NO_KEY_ENV, runtime_tail);
+            server_file(
+                &home,
+                "local",
+                &format!(
+                    "server-id: local\ntransport:\n  kind: http\n  \
+                     endpoint-url: http://127.0.0.1:{port}/mcp\n"
+                ),
+            );
+            let (host, handles) = boot(&home).await;
+            let root = handles.root_agent_id.clone();
+
+            let listed = tools(&host, &root, "local").await.expect("listed");
+            let before = calls();
+            let called = invoke(&host, &root, "local", "web.search").await;
+            if offered {
+                assert_eq!(listed, ["echo", "web.search"], "{case}");
+                called.unwrap_or_else(|e| panic!("{case}: web.search is offered: {e:?}"));
+                assert_eq!(calls(), before + 1, "{case}");
+            } else {
+                assert_eq!(listed, ["echo"], "{case}");
+                denied(called);
+                assert_eq!(calls(), before, "{case}: a refused call reaches no server");
+            }
+            // The rest of the server is reached under the `mcp` grant alone.
+            invoke(&host, &root, "local", "echo")
+                .await
+                .unwrap_or_else(|e| panic!("{case}: echo needs no web grant: {e:?}"));
+        }
+    }
 }

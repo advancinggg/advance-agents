@@ -5,7 +5,9 @@
 //! Witnessed test-local against the REAL `cap_mcp::McpClient` + REAL `HttpMcpTransport`
 //! routing JSON-RPC through the REAL `cap_http::DefaultHttpSecurityChain` (real
 //! `ReqwestHttpExecutor` doing a REAL TCP request to a local axum MCP server). Only the
-//! external MCP server is doubled; no transport/security module is mocked.
+//! external MCP server is doubled; no transport/security module is mocked. The double
+//! speaks Streamable HTTP: it answers `initialize` with a session id, takes
+//! `notifications/initialized` with `202 Accepted`, then serves the tool call.
 //!
 //! In-scope SYS-AC: 086, 087, 088, 089, 220, 221.
 //!
@@ -74,14 +76,71 @@ fn mcp_client(
     McpClient::new(Arc::new(config), leak(), Some(chain))
 }
 
+/// The session id the MCP server double assigns.
+const SESSION: &str = "track-e-session";
+
+/// The JSON-RPC message a recorded request carried.
+fn message(req: &RecordedReq) -> serde_json::Value {
+    serde_json::from_slice(&req.body).unwrap_or_default()
+}
+
 /// Build a JSON-RPC success response echoing the request's id with `result`.
 fn mcp_response(req: &RecordedReq, result: serde_json::Value) -> BackendResp {
-    let id = serde_json::from_slice::<serde_json::Value>(&req.body)
-        .ok()
-        .and_then(|v| v.get("id").and_then(|i| i.as_u64()))
-        .unwrap_or(1);
+    let id = message(req).get("id").and_then(|i| i.as_u64()).unwrap_or(1);
     let body = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
     BackendResp::ok_json(&body)
+}
+
+/// A Streamable HTTP MCP server double: it answers `initialize` with a supported protocol
+/// version and the session id [`SESSION`], takes notifications with `202 Accepted`, and
+/// answers every other request with `on_request`.
+fn mcp_server(
+    on_request: impl Fn(&RecordedReq) -> BackendResp + Send + Sync + 'static,
+) -> impl Fn(usize, &RecordedReq) -> BackendResp + Send + Sync + 'static {
+    move |_, req| {
+        let msg = message(req);
+        if msg.get("id").is_none() {
+            return BackendResp {
+                status: 202,
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+        }
+        if msg["method"] == "initialize" {
+            return mcp_response(
+                req,
+                serde_json::json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "track-e", "version": "1"},
+                }),
+            )
+            .with_header("mcp-session-id", SESSION);
+        }
+        on_request(req)
+    }
+}
+
+/// The JSON-RPC methods of the requests that reached `backend`, in order.
+fn methods(backend: &Backend) -> Vec<String> {
+    backend
+        .recorded()
+        .iter()
+        .map(|req| {
+            message(req)["method"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The value of header `name` on a recorded request.
+fn header<'a>(req: &'a RecordedReq, name: &str) -> Option<&'a str> {
+    req.headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }
 
 fn dead_addr() -> SocketAddr {
@@ -93,9 +152,10 @@ fn dead_addr() -> SocketAddr {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sys_ac_086_invoke_tool_over_http_transport_through_chain() {
-    let backend = Backend::spawn("mcp.test", |_, req| {
-        mcp_response(req, serde_json::json!({"ok": true, "tool": "echo"}))
-    })
+    let backend = Backend::spawn(
+        "mcp.test",
+        mcp_server(|req| mcp_response(req, serde_json::json!({"ok": true, "tool": "echo"}))),
+    )
     .await;
     let client = mcp_client(
         &["mcp.test"],
@@ -105,16 +165,23 @@ async fn sys_ac_086_invoke_tool_over_http_transport_through_chain() {
     );
 
     let out = client
-        .invoke_tool("srv", "echo", br#"{"x":1}"#)
+        .invoke_tool(None, "srv", "echo", br#"{"x":1}"#)
         .await
         .expect("tool result returned after passing the cap-http chain");
     let parsed: serde_json::Value = serde_json::from_slice(&out).expect("result json");
     assert_eq!(parsed["ok"], serde_json::json!(true));
     assert_eq!(
-        backend.recorded().len(),
-        1,
-        "exactly one real HTTP request reached the MCP server"
+        methods(&backend),
+        ["initialize", "notifications/initialized", "tools/call"],
+        "the session handshake, then exactly one tool call, reached the MCP server"
     );
+    let call = &backend.recorded()[2];
+    assert_eq!(
+        header(call, "mcp-session-id"),
+        Some(SESSION),
+        "the tool call went out in the session the server assigned"
+    );
+    assert_eq!(header(call, "mcp-protocol-version"), Some("2025-06-18"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -122,7 +189,7 @@ async fn sys_ac_087_non_allowlisted_or_ssrf_host_rejected_no_outbound() {
     // (a) endpoint host not on the allowlist → blocked at the chain; no server hit.
     let client_a = mcp_client(&["other.test"], &[("mcp.test", PUBLIC_IP)], &[], &["echo"]);
     let err_a = client_a
-        .invoke_tool("srv", "echo", br#"{}"#)
+        .invoke_tool(None, "srv", "echo", br#"{}"#)
         .await
         .expect_err("non-allowlisted MCP host blocked");
     assert_eq!(err_a.kind, McpErrorKind::PermissionDenied, "got {err_a:?}");
@@ -130,7 +197,7 @@ async fn sys_ac_087_non_allowlisted_or_ssrf_host_rejected_no_outbound() {
     // (b) endpoint host resolves to a private IP → SSRF-blocked at the chain; no server hit.
     let client_b = mcp_client(&["mcp.test"], &[("mcp.test", PRIVATE_IP)], &[], &["echo"]);
     let err_b = client_b
-        .invoke_tool("srv", "echo", br#"{}"#)
+        .invoke_tool(None, "srv", "echo", br#"{}"#)
         .await
         .expect_err("SSRF MCP host blocked");
     assert_eq!(err_b.kind, McpErrorKind::PermissionDenied, "got {err_b:?}");
@@ -141,7 +208,7 @@ async fn sys_ac_088_tool_not_found_for_unregistered_tool() {
     // Only "echo" is allowed by tool-patterns; "delete-all" is rejected before transport.
     let client = mcp_client(&["mcp.test"], &[("mcp.test", PUBLIC_IP)], &[], &["echo"]);
     let err = client
-        .invoke_tool("srv", "delete-all", br#"{}"#)
+        .invoke_tool(None, "srv", "delete-all", br#"{}"#)
         .await
         .expect_err("unregistered tool is rejected");
     assert_eq!(err.kind, McpErrorKind::ToolNotFound, "got {err:?}");
@@ -149,11 +216,12 @@ async fn sys_ac_088_tool_not_found_for_unregistered_tool() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sys_ac_089_inbound_credential_in_response_blocked_before_guest() {
-    // The MCP server returns a result carrying a Block-class credential; the chain's
+    // The MCP server returns a tool result carrying a Block-class credential; the chain's
     // inbound leak scan blocks it → the credential bytes never reach the caller.
-    let backend = Backend::spawn("mcp.test", |_, req| {
-        mcp_response(req, serde_json::json!({"data": SECRET_OPENAI}))
-    })
+    let backend = Backend::spawn(
+        "mcp.test",
+        mcp_server(|req| mcp_response(req, serde_json::json!({"data": SECRET_OPENAI}))),
+    )
     .await;
     let client = mcp_client(
         &["mcp.test"],
@@ -162,13 +230,21 @@ async fn sys_ac_089_inbound_credential_in_response_blocked_before_guest() {
         &["echo"],
     );
     let err = client
-        .invoke_tool("srv", "echo", br#"{}"#)
+        .invoke_tool(None, "srv", "echo", br#"{}"#)
         .await
         .expect_err("inbound credential in the MCP response is blocked");
     assert_eq!(err.kind, McpErrorKind::InvalidResponse, "got {err:?}");
+    assert_eq!(
+        err.message, "inbound leak detected; response sanitized away",
+        "the tool result, not the handshake, was blocked"
+    );
     assert!(
         !err.message.contains("sk-proj"),
         "the credential is not echoed into the guest-visible error"
+    );
+    assert_eq!(
+        methods(&backend).last().map(String::as_str),
+        Some("tools/call")
     );
 }
 
@@ -178,19 +254,23 @@ async fn sys_ac_220_unreachable_server_surfaces_transport_error() {
     let dns = vec![("mcp.test".to_string(), dead_addr())];
     let client = mcp_client(&["mcp.test"], &[("mcp.test", PUBLIC_IP)], &dns, &["echo"]);
     let err = client
-        .invoke_tool("srv", "echo", br#"{}"#)
+        .invoke_tool(None, "srv", "echo", br#"{}"#)
         .await
         .expect_err("unreachable MCP server surfaces a transport error (not a hang)");
     assert_eq!(err.kind, McpErrorKind::TransportError, "got {err:?}");
 }
 
-/// Spawn an MCP backend that returns a fixed-size body of `n` bytes (status 200).
+/// Spawn an MCP backend that completes the session handshake, then answers the tool call
+/// with a fixed-size body of `n` bytes (status 200).
 async fn oversize_backend(n: usize) -> Backend {
-    Backend::spawn("mcp.test", move |_, _| BackendResp {
-        status: 200,
-        headers: vec![("content-type".into(), "application/json".into())],
-        body: vec![b'x'; n],
-    })
+    Backend::spawn(
+        "mcp.test",
+        mcp_server(move |_| BackendResp {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: vec![b'x'; n],
+        }),
+    )
     .await
 }
 
@@ -219,13 +299,18 @@ async fn sys_ac_221_oversize_response_aborted_not_buffered_unboundedly() {
         &["echo"],
     );
     let err_scan = client_scan
-        .invoke_tool("srv", "echo", br#"{}"#)
+        .invoke_tool(None, "srv", "echo", br#"{}"#)
         .await
         .expect_err("2 MiB response aborted at the 1 MiB scan-overflow");
     assert_eq!(
         err_scan.kind,
         McpErrorKind::InvalidResponse,
         "got {err_scan:?}"
+    );
+    assert_eq!(
+        methods(&backend_scan).last().map(String::as_str),
+        Some("tools/call"),
+        "the oversize answer was the tool call's"
     );
 
     // (b) 9 MiB → executor streaming-cap abort (transport-error). The criterion's
@@ -238,12 +323,17 @@ async fn sys_ac_221_oversize_response_aborted_not_buffered_unboundedly() {
         &["echo"],
     );
     let err_exec = client_exec
-        .invoke_tool("srv", "echo", br#"{}"#)
+        .invoke_tool(None, "srv", "echo", br#"{}"#)
         .await
         .expect_err("9 MiB response aborted at the 8 MiB executor streaming cap");
     assert_eq!(
         err_exec.kind,
         McpErrorKind::TransportError,
         "got {err_exec:?}"
+    );
+    assert_eq!(
+        methods(&backend_exec).last().map(String::as_str),
+        Some("tools/call"),
+        "the oversize answer was the tool call's"
     );
 }

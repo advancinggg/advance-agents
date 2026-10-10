@@ -203,6 +203,16 @@ pub struct RuntimeConfig {
     /// `fetch-timeout-sec`, `approval`).
     #[serde(default)]
     pub pack: PackConfig,
+    /// The MCP client of an agent that declares the `mcp` capability (`mcp:`
+    /// block; CONTRACT-003 additive extension). `#[serde(default)]` per the
+    /// `database` / `tools` / … precedent: a `runtime-config.yaml` without an
+    /// `mcp:` block parses cleanly under `deny_unknown_fields`, producing
+    /// `McpConfig::default()` (`servers-dir: ".advance/mcp-servers"`, stdio
+    /// servers allowed, a 30 s request and a 10 s startup budget, 4 MiB results,
+    /// no tool-cache warm-up). Read by the composition root when the daemon
+    /// starts; a home that does not declare `mcp` never reads it.
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 /// /dev Phase-3 kickoff (2026-06-06) — per-run budget caps seeded into the live
@@ -1360,6 +1370,144 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// McpConfig — the `mcp:` block (CONTRACT-003 additive extension): where the
+// operator's MCP server files live and the bounds of the MCP client.
+// ---------------------------------------------------------------------------
+
+/// `mcp:` block of `runtime-config.yaml`: the MCP client the daemon composes
+/// for an agent that declares the `mcp` capability. Every field defaults, so
+/// the block is optional (see `RuntimeConfig.mcp`). Shape-validated by
+/// [`McpConfig::validate`]; `load_config` applies the same rules through
+/// `validate_config`, so a bad block never loads.
+///
+/// The block is read when the daemon starts: a later edit is reported by
+/// [`config_sections_changed`] as `"mcp"` and takes effect at the next start.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct McpConfig {
+    /// Directory of the operator's MCP server files (`*.yaml`, one server
+    /// each), RELATIVE to the workspace root and inside its `.advance/`
+    /// directory. A server file can start a process on the host, so it must
+    /// lie where no agent can write: cap-fs hides `.advance/` from every
+    /// agent. Absolute paths and `..` segments are rejected as for
+    /// `pack.packs-dir` (tampered-config redirection), and so is a directory
+    /// that is not below `.advance/`. Default `.advance/mcp-servers`.
+    #[serde(default = "default_mcp_servers_dir")]
+    pub servers_dir: String,
+    /// Whether a server file may declare a `stdio` transport (a subprocess the
+    /// daemon starts). `false` refuses every stdio server. Default `true`.
+    #[serde(default = "default_true")]
+    pub allow_stdio: bool,
+    /// Budget for one request to a server, in seconds; `1..=300`. Default 30.
+    #[serde(default = "default_mcp_request_timeout_sec")]
+    pub request_timeout_sec: u64,
+    /// Budget for connecting a server (starting a stdio server and completing
+    /// the `initialize` exchange), in seconds; `1..=120`. Default 10.
+    #[serde(default = "default_mcp_startup_timeout_sec")]
+    pub startup_timeout_sec: u64,
+    /// Largest result a call returns, in bytes; a larger one fails the call.
+    /// `1..=4194304` (the transports carry at most 4 MiB). Default 4194304.
+    #[serde(default = "default_mcp_max_result_bytes")]
+    pub max_result_bytes: usize,
+    /// `true` connects the servers the root agent's `mcp` grants reach and
+    /// lists their tools in the background once the daemon has started.
+    /// `false` (the default) connects a server on its first use.
+    #[serde(default)]
+    pub warm_tool_cache: bool,
+}
+
+fn default_mcp_servers_dir() -> String {
+    ".advance/mcp-servers".to_string()
+}
+fn default_mcp_request_timeout_sec() -> u64 {
+    30
+}
+fn default_mcp_startup_timeout_sec() -> u64 {
+    10
+}
+fn default_mcp_max_result_bytes() -> usize {
+    McpConfig::MAX_RESULT_BYTES
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            servers_dir: default_mcp_servers_dir(),
+            allow_stdio: true,
+            request_timeout_sec: default_mcp_request_timeout_sec(),
+            startup_timeout_sec: default_mcp_startup_timeout_sec(),
+            max_result_bytes: default_mcp_max_result_bytes(),
+            warm_tool_cache: false,
+        }
+    }
+}
+
+impl McpConfig {
+    /// Upper bound on `request-timeout-sec` (five minutes).
+    pub const MAX_REQUEST_TIMEOUT_SEC: u64 = 300;
+    /// Upper bound on `startup-timeout-sec` (two minutes).
+    pub const MAX_STARTUP_TIMEOUT_SEC: u64 = 120;
+    /// Upper bound on `max-result-bytes`: what one stdio line or one http
+    /// response body carries at most (4 MiB).
+    pub const MAX_RESULT_BYTES: usize = 4 * 1024 * 1024;
+
+    /// Shape validation (standalone form). The error names the offending
+    /// field; the path is the generic `runtime-config.yaml` because this form
+    /// has no file context — `load_config` reports the real path.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_message().map_err(|msg| ConfigError::IoError {
+            path: PathBuf::from("runtime-config.yaml"),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, msg),
+        })
+    }
+
+    /// The single source of the `mcp:` shape rules; `validate_config` wraps the
+    /// message under the real config path.
+    pub(crate) fn validate_message(&self) -> Result<(), String> {
+        let dir = &self.servers_dir;
+        if dir.trim().is_empty() || dir.contains('\0') {
+            return Err(
+                "mcp.servers-dir must be non-empty, non-whitespace, and contain no NUL bytes"
+                    .into(),
+            );
+        }
+        if std::path::Path::new(dir).is_absolute() {
+            return Err("mcp.servers-dir must be relative to the workspace root (absolute paths are rejected to prevent tampered-config redirection)".into());
+        }
+        if dir.split(['/', '\\']).any(|seg| seg == "..") {
+            return Err("mcp.servers-dir must not contain `..` segments (path traversal is rejected to prevent tampered-config redirection)".into());
+        }
+        if !is_below_advance_dir(dir) {
+            return Err("mcp.servers-dir must be a directory inside `.advance/` (a server file can start a process on the host, and agents cannot write there)".into());
+        }
+        if self.request_timeout_sec == 0 || self.request_timeout_sec > Self::MAX_REQUEST_TIMEOUT_SEC
+        {
+            return Err("mcp.request-timeout-sec must be in [1, 300]".into());
+        }
+        if self.startup_timeout_sec == 0 || self.startup_timeout_sec > Self::MAX_STARTUP_TIMEOUT_SEC
+        {
+            return Err("mcp.startup-timeout-sec must be in [1, 120]".into());
+        }
+        if self.max_result_bytes == 0 || self.max_result_bytes > Self::MAX_RESULT_BYTES {
+            return Err("mcp.max-result-bytes must be in [1, 4194304] (4 MiB)".into());
+        }
+        Ok(())
+    }
+}
+
+/// Whether `dir`, a relative path without `..` segments, names a directory
+/// below the workspace's `.advance/` directory (not `.advance` itself). The
+/// name is compared exactly: `.Advance` or `.advance ` is another directory.
+fn is_below_advance_dir(dir: &str) -> bool {
+    use std::path::Component;
+    let mut components = Path::new(dir)
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir));
+    matches!(components.next(), Some(Component::Normal(first)) if first == ".advance")
+        && components.next().is_some()
+}
+
+// ---------------------------------------------------------------------------
 // SecurityConfig (Wave-16 Lane-4, 2026-06-25) — MODULE-012 AC-17.
 // CONTRACT-003 additive `security:` block. Snake_case keys match the §1.5 AC-17
 // criterion. Each sub-struct's Default mirrors the cap-http compile-time constant
@@ -1587,6 +1735,7 @@ pub fn config_sections_changed(old: &RuntimeConfig, new: &RuntimeConfig) -> Vec<
         security,
         genui,
         pack,
+        mcp,
     } = old;
     let mut changed = Vec::new();
     if wasm != &new.wasm {
@@ -1639,6 +1788,9 @@ pub fn config_sections_changed(old: &RuntimeConfig, new: &RuntimeConfig) -> Vec<
     }
     if pack != &new.pack {
         changed.push("pack");
+    }
+    if mcp != &new.mcp {
+        changed.push("mcp");
     }
     changed
 }
@@ -2832,6 +2984,11 @@ fn validate_config(path: &Path, cfg: &RuntimeConfig) -> Result<(), ConfigError> 
     // pack — Pack lane P1: shape rules live on `PackConfig` so the
     // standalone `PackConfig::validate` and this file-path-aware gate never drift.
     if let Err(msg) = cfg.pack.validate_message() {
+        return invalid(&msg);
+    }
+
+    // mcp — the shape rules live on `McpConfig`, as for `pack`.
+    if let Err(msg) = cfg.mcp.validate_message() {
         return invalid(&msg);
     }
 

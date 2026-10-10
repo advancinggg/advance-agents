@@ -15,9 +15,11 @@
 //! [`WorkflowExecutor::withdraw_component`] and the applier returns
 //! [`PackError::WorkflowStepFailed`] carrying the failing step, its error, the
 //! compensations that succeeded and the ones that failed (never swallowed).
-//! `register-mcp-server` has no compensation (the executor only returns an id;
-//! nothing is persisted by the applier). A failure at the first executed step
-//! surfaces the raw step error unchanged (nothing to undo).
+//! `register-mcp-server` is compensated through
+//! [`WorkflowExecutor::deregister_mcp_server`] when the executor reports that
+//! it created a new server ([`WorkflowExecutor::mcp_register_created`]). A
+//! failure at the first executed step surfaces the raw step error unchanged
+//! (nothing to undo).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -88,6 +90,19 @@ pub trait WorkflowExecutor: Send + Sync {
         resolved_secrets: &BTreeMap<String, SecretValue>,
     ) -> Result<McpServerId, PackError>;
 
+    /// [`register_mcp_server`](Self::register_mcp_server) plus the secret-ref
+    /// *ids* (environment name → store key) that a persisted server file must
+    /// carry. The default ignores the ids and calls `register_mcp_server`.
+    fn register_mcp_server_refs(
+        &self,
+        config_ref: &str,
+        secret_ref_ids: &BTreeMap<String, String>,
+        resolved_secrets: &BTreeMap<String, SecretValue>,
+    ) -> Result<McpServerId, PackError> {
+        let _ = secret_ref_ids;
+        self.register_mcp_server(config_ref, resolved_secrets)
+    }
+
     /// Pack lane P2: undo an earlier successful
     /// [`spawn_child`](Self::spawn_child) for the same `target_path` when a later
     /// step fails. Default: `NotImplemented` — an executor that cannot undo a
@@ -104,6 +119,22 @@ pub trait WorkflowExecutor: Send + Sync {
     fn withdraw_component(&self, component_ref: &str) -> Result<(), PackError> {
         let _ = component_ref;
         Err(PackError::NotImplemented("withdraw_component"))
+    }
+
+    /// Undo an earlier successful [`register_mcp_server`](Self::register_mcp_server)
+    /// that created a persisted server. Default: `NotImplemented`.
+    fn deregister_mcp_server(&self, server_id: &str) -> Result<(), PackError> {
+        let _ = server_id;
+        Err(PackError::NotImplemented("deregister_mcp_server"))
+    }
+
+    /// Whether the last [`register_mcp_server`](Self::register_mcp_server) for
+    /// `server_id` created a new persisted server that compensation should
+    /// remove. Default `false` so test executors that persist nothing do not
+    /// record a compensation.
+    fn mcp_register_created(&self, server_id: &str) -> bool {
+        let _ = server_id;
+        false
     }
 }
 
@@ -308,9 +339,11 @@ impl WorkflowApplier {
                             })?;
                     resolved.insert(placeholder.clone(), value);
                 }
-                let _ = executor.register_mcp_server(config_ref, &resolved)?;
-                // No compensation: the applier persists nothing for this step.
-                Ok(("register-mcp-server", None))
+                let id = executor.register_mcp_server_refs(config_ref, secret_refs, &resolved)?;
+                let compensation = executor
+                    .mcp_register_created(&id.0)
+                    .then(|| Compensation::RegisterMcpServer(id.0));
+                Ok(("register-mcp-server", compensation))
             }
         }
     }
@@ -334,6 +367,10 @@ impl WorkflowApplier {
                     format!("submit-component:{component_ref}"),
                     executor.withdraw_component(component_ref),
                 ),
+                Compensation::RegisterMcpServer(server_id) => (
+                    format!("register-mcp-server:{server_id}"),
+                    executor.deregister_mcp_server(server_id),
+                ),
             };
             match result {
                 Ok(()) => compensated.push(label),
@@ -344,11 +381,12 @@ impl WorkflowApplier {
     }
 }
 
-/// An executed step's undo handle (P2 §3.5). `register-mcp-server` records none.
+/// An executed step's undo handle (P2 §3.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Compensation {
     SpawnChild(PathBuf),
     SubmitComponent(String),
+    RegisterMcpServer(String),
 }
 
 fn step_type_name(step: &WorkflowStep) -> &'static str {

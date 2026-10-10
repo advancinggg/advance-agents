@@ -118,16 +118,6 @@ pub fn compose_schema(base: &str, packs: &[PackSchemaExtensions]) -> ComposedSch
     }
 }
 
-/// The content kinds among `provides` that no part of the runtime consumes: they install
-/// and list, and nothing activates them.
-pub fn inert_kinds(provides: &[advance_pack_manager::PackProvideEntry]) -> Vec<&'static str> {
-    [(ComponentKind::McpServer, "mcp-servers")]
-        .into_iter()
-        .filter(|(kind, _)| provides.iter().any(|p| p.kind == *kind))
-        .map(|(_, label)| label)
-        .collect()
-}
-
 fn label(pack: &PackMetadata) -> String {
     format!("{}@{}", pack.name, pack.version)
 }
@@ -285,6 +275,8 @@ pub struct PackRuntime {
     presets: OnceLock<Arc<PresetRegistry>>,
     tools: OnceLock<Arc<LazyToolRegistry>>,
     reindex: OnceLock<EntityReindex>,
+    mcp: OnceLock<std::sync::Weak<crate::mcp_wiring::McpRuntime>>,
+    mcp_plane: OnceLock<crate::mcp_wiring::McpControlPlane>,
     state: tokio::sync::Mutex<Applied>,
     /// Where new apply warnings and failed rescans are reported ([`Self::with_log`];
     /// none by default).
@@ -300,6 +292,8 @@ impl PackRuntime {
             presets: OnceLock::new(),
             tools: OnceLock::new(),
             reindex: OnceLock::new(),
+            mcp: OnceLock::new(),
+            mcp_plane: OnceLock::new(),
             state: tokio::sync::Mutex::new(Applied::default()),
             log: LogHandle::null(),
         }
@@ -325,6 +319,18 @@ impl PackRuntime {
     /// The tool registry the `tool-invoke` host fn and the `data` store's reducer use.
     pub fn attach_tools(&self, tools: Arc<LazyToolRegistry>) {
         let _ = self.tools.set(tools);
+    }
+
+    /// The MCP runtime: every apply reloads its servers and drops files whose
+    /// origin pack is no longer installed.
+    pub fn attach_mcp(&self, mcp: Arc<crate::mcp_wiring::McpRuntime>) {
+        let _ = self.mcp.set(Arc::downgrade(&mcp));
+    }
+
+    /// The server-file directory, used to drop stale pack-origin files when
+    /// the root does not declare `mcp` (no client to reload).
+    pub fn attach_mcp_plane(&self, plane: crate::mcp_wiring::McpControlPlane) {
+        let _ = self.mcp_plane.set(plane);
     }
 
     /// Where a schema change re-projects the workspace's Markdown files.
@@ -409,6 +415,12 @@ impl PackRuntime {
         if let Some(tools) = self.tools.get() {
             self.apply_tools(tools, &packs, &mut state, &mut report.warnings)
                 .await;
+        }
+        let installed: BTreeSet<String> = report.packs.iter().cloned().collect();
+        if let Some(mcp) = self.mcp.get().and_then(std::sync::Weak::upgrade) {
+            mcp.drop_uninstalled_origins(&installed);
+        } else if let Some(plane) = self.mcp_plane.get() {
+            plane.remove_origins_not_in(&installed);
         }
         report.presets = state.presets.keys().cloned().collect();
         report.tools = state.tools.keys().cloned().collect();
@@ -541,6 +553,12 @@ impl PackRuntime {
                 "skill tools",
                 "tools",
             ),
+            (
+                ComponentKind::McpServer,
+                self.mcp.get().is_some_and(|mcp| mcp.strong_count() > 0),
+                "mcp servers",
+                "mcp",
+            ),
         ] {
             if has(kind) && !attached {
                 notes.push(format!(
@@ -548,13 +566,6 @@ impl PackRuntime {
                      `{capability}` (add `{capability}: true` and restart)"
                 ));
             }
-        }
-        let inert = inert_kinds(&provides);
-        if !inert.is_empty() {
-            notes.push(format!(
-                "installed but not activated by this runtime: {}",
-                inert.join(", ")
-            ));
         }
         notes
     }

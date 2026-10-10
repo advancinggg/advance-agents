@@ -1,8 +1,10 @@
 //! SYS-AC-338: under `Forbid` a sidecar, `agent-cli`, MCP stdio or `git`
 //! pack-source request answers a typed refusal and no child process exists.
 //!
-//! MCP stdio has no production compose path; that leg is port-level
-//! `cap_mcp::McpClient`. Own binary because the spawn counter is process-global.
+//! The MCP stdio leg here is port-level `cap_mcp::McpClient`; the production
+//! compose path (an `mcp` root with an operator stdio server file) is witnessed by
+//! `sys_j83_sys_ac_338_forbid_mcp_stdio`. Own binary because the spawn counter is
+//! process-global.
 
 #![cfg(unix)]
 
@@ -210,8 +212,7 @@ async fn sys_ac_338_j83_forbid_spawn_sites_refuse_typed_no_child() {
     assert_process_forbidden(&installed);
     assert_eq!(listing(&packs), before_listing);
 
-    // Port-level MCP stdio leg: no production compose path reaches
-    // StdioMcpTransport::spawn.
+    // Port-level MCP stdio leg (the composed leg is its own binary).
     let entry = McpServerEntry {
         server_id: "srv".into(),
         description: "test".into(),
@@ -231,7 +232,7 @@ async fn sys_ac_338_j83_forbid_spawn_sites_refuse_typed_no_child() {
     );
     let err = McpClient::new(cfg, Arc::new(NoOpDetector), None)
         .with_process_policy(ProcessPolicy::Forbid)
-        .list_tools("srv")
+        .list_tools(None, "srv")
         .await
         .expect_err("mcp stdio forbid");
     assert!(err.to_string().contains("process_forbidden"), "{err}");

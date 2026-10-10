@@ -73,7 +73,7 @@ impl SchemaValidator {
 /// own internal walks can still exhaust stack on such inputs.
 pub(crate) const MAX_SCHEMA_DEPTH: usize = 64;
 
-fn require_intra_schema_refs(schema: &serde_json::Value) -> Result<(), McpError> {
+pub(crate) fn require_intra_schema_refs(schema: &serde_json::Value) -> Result<(), McpError> {
     fn walk(v: &serde_json::Value, depth: usize) -> Result<(), McpError> {
         if depth > MAX_SCHEMA_DEPTH {
             return Err(McpError::invalid_response(format!(

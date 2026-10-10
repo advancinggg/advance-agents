@@ -210,16 +210,6 @@ async fn run_install_async(source: String, packs_dir: Option<PathBuf>, no_input:
             );
             // What takes effect is decided by the running daemon (it applies an install
             // within seconds, per capability the root agent declares); say what never does.
-            let provides = registry
-                .provides(&report.name, &report.version)
-                .unwrap_or_default();
-            let inert = crate::pack_runtime::inert_kinds(&provides);
-            if !inert.is_empty() {
-                println!(
-                    "note: installed but not activated by this runtime: {}",
-                    inert.join(", ")
-                );
-            }
             ExitCode::SUCCESS
         }
         Err(e) => {

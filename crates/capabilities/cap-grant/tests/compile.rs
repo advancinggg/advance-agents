@@ -123,6 +123,34 @@ fn param_lists_become_csv_and_fs_aliases_resolve() {
     ));
 }
 
+// An `mcp` grant is stored as written; what in it covers nothing (reported at boot) comes
+// from the same rules the checks apply.
+#[test]
+fn static_mcp_params_are_kept_and_their_problems_named() {
+    let f = write_yaml(
+        "capabilities:\n  mcp:\n    servers: [github]\n    tool-patterns: [\"get_*\", \"*\", search_code]\n",
+    );
+    let grants = StaticConfigCompiler::compile_from_path(f.path(), "root-agent").unwrap();
+    let mcp = grants.iter().find(|g| g.capability == "mcp").expect("mcp");
+    let value = |key: &str| {
+        mcp.params
+            .iter()
+            .find(|p| p.key == key)
+            .map(|p| p.value.as_str())
+    };
+    assert_eq!(value("servers"), Some("github"));
+    assert_eq!(value("tool-patterns"), Some("get_*,*,search_code"));
+    let problems = cap_grant::subset::mcp_param_problems(&mcp.params);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("\"*\""), "{problems:?}");
+
+    let clean = write_yaml(
+        "capabilities:\n  mcp:\n    servers: [github]\n    tool-patterns: [\"get_*\"]\n",
+    );
+    let grants = StaticConfigCompiler::compile_from_path(clean.path(), "root-agent").unwrap();
+    assert!(cap_grant::subset::mcp_param_problems(&grants[0].params).is_empty());
+}
+
 // `data` is a retired family: the key is ignored instead of minting a grant nothing reads.
 #[test]
 fn a_retired_data_key_emits_no_grant() {

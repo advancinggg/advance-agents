@@ -798,8 +798,9 @@ pub struct WiringHandles {
     pub agent_admin: Option<Arc<crate::client_api_agents::AgentAdminAdapter>>,
     /// Providers family (lane providers-family): the daemon's LIVE `SecretStore` — the ONE
     /// instance the LLM egress chain resolves keys from (`Some` iff `llm` / `secrets` is
-    /// declared) — and the composed `WiredProviderAdmin` the Client API serves (always
-    /// composed; it falls back to opening the file when no live store exists).
+    /// declared, or `mcp` is and one of its server files needs secrets) — and the composed
+    /// `WiredProviderAdmin` the Client API serves (always composed; it falls back to
+    /// opening the file when no live store exists).
     pub secret_store: Option<Arc<SecretStore>>,
     /// Extension-only store when the home declares neither `secrets` nor `llm`
     /// but an extension asked for one (`SecretPlan::BuildForExtensions`). Views
@@ -859,6 +860,11 @@ pub struct WiringHandles {
     /// Installed packs → the running runtime (schema extensions, presets, skill tools);
     /// re-applied on every install / uninstall. See [`crate::pack_runtime`].
     pub pack_runtime: Arc<crate::pack_runtime::PackRuntime>,
+    /// The MCP client and the gate of its `mcp-client` host functions
+    /// ([`crate::mcp_wiring`]). `Some` iff `.agent/config.yaml` declares `mcp`. The
+    /// composition shuts it down with the loops, which stops the stdio servers;
+    /// dropping the last handle does the same.
+    pub mcp: Option<Arc<crate::mcp_wiring::McpRuntime>>,
     /// The Client API adapters' worker threads (events, history, run control), so an
     /// owner shutting down can close their queues and join them without blocking.
     pub(crate) adapter_workers: Vec<Arc<dyn crate::client_api_adapters::WorkerControl>>,
@@ -1369,6 +1375,8 @@ pub(crate) struct HoldStoppers {
     /// (`WiringHandles` takes it and `Composition::from_graph` moves it onto
     /// these stoppers).
     pub claimed_preflight: Option<crate::inference::ClaimedPreflightStopper>,
+    /// The MCP client, shut down with the loops so stdio process groups do not outlive them.
+    pub mcp: Option<Arc<crate::mcp_wiring::McpRuntime>>,
 }
 
 /// An error inside wiring: either an existing CLI wiring failure or a
@@ -1533,7 +1541,22 @@ pub(crate) async fn wire_capabilities_inner(
     let declares_tools = declares("tools");
     let declares_web = declares("web");
     let web_cfg_snapshot = builder.config().web.clone();
-    let secret_plan = match extensions.secret_plan(declares_secrets || declares_llm) {
+    // The operator's MCP server files, read once and only for a root that declares
+    // `mcp` (bad files are skipped, never fatal). A server that needs secrets opens
+    // the secret store, as `secrets` / `llm` do; without one, `mcp` needs no key.
+    let mcp_plane = crate::mcp_wiring::McpControlPlane::new(workspace, &builder.config().mcp)
+        .with_log(log.clone());
+    let mcp_sink = Arc::new(crate::mcp_wiring::ControlPlaneMcpSink::new(
+        mcp_plane.clone(),
+    ));
+    let mcp_servers = declares("mcp").then(|| mcp_plane.scan());
+    let mcp_needs_secrets = mcp_servers
+        .as_ref()
+        .is_some_and(|servers| servers.need_secrets());
+    // What OSS opens the secret store for; an extension that needs one reuses it
+    // (`SecretPlan::ReuseOss`) or, without it, gets its own (`BuildForExtensions`).
+    let opens_secret_store = declares_secrets || declares_llm || mcp_needs_secrets;
+    let secret_plan = match extensions.secret_plan(opens_secret_store) {
         Ok(plan) => plan,
         Err(error) => {
             return Err(WiringFailure {
@@ -1585,6 +1608,7 @@ pub(crate) async fn wire_capabilities_inner(
         || declares_llm
         || declares_messaging
         || declares_lifecycle
+        || mcp_needs_secrets
         || secret_plan == SecretPlan::BuildForExtensions;
 
     // Step 2a — load the real master key and stage the complete C216→C215
@@ -1659,10 +1683,10 @@ pub(crate) async fn wire_capabilities_inner(
     // cap-secrets/cap-llm consume the original operator key after the journal
     // has derived its purpose-separated subkey. A messaging-only boot does not
     // open the secret-value storage backend.
-    let secret_store: Option<Arc<SecretStore>> = if declares_secrets || declares_llm {
+    let secret_store: Option<Arc<SecretStore>> = if opens_secret_store {
         let key = master_key
             .take()
-            .expect("secrets/llm declaration is included in needs_key");
+            .expect("what opens the secret store is included in needs_key");
         // WS-A: persistent backend so the daemon resolves provider keys (provisioned via
         // `advance secrets set` / the providers family) at request time. Was
         // `InMemorySecretStorage`, which started EMPTY every boot, so a provider
@@ -1704,8 +1728,8 @@ pub(crate) async fn wire_capabilities_inner(
     };
     // Pack lane P2: the pack materializer resolves workflow /
     // mcp `secret-refs` through the SAME cap-secrets store (P1 left the slot
-    // unwired, so every ref was `MissingSecret`). No store (no secrets/llm
-    // declaration) → the slot stays unbound and keeps failing closed.
+    // unwired, so every ref was `MissingSecret`). No store (nothing above opened
+    // one) → the slot stays unbound and keeps failing closed.
     if let Some(store) = secret_store.as_ref() {
         let _ = pack_wiring.secret_store.bind(Arc::new(
             crate::pack_production::CapSecretsSecretStore::new(Arc::clone(store)),
@@ -2426,7 +2450,7 @@ pub(crate) async fn wire_capabilities_inner(
         // Pack lane P2: the production `WorkflowExecutor` —
         // `spawn-child` through THIS spawner (template-resolving, observer-bearing),
         // `submit-component` through the scheduler submit API, `register-mcp-server`
-        // through the trust-gated MCP bridge into `PackWiring::mcp_entries` — bound
+        // through the trust-gated MCP bridge into the control-plane sink — bound
         // into the pack materializer's slot so `apply_workflow` stops failing closed
         // with `NotImplemented`. Without a scheduler API (no component registry) the
         // slot stays unbound.
@@ -2439,7 +2463,7 @@ pub(crate) async fn wire_capabilities_inner(
                 root_uid.as_str(),
                 pack_wiring.registry.clone() as Arc<dyn advance_pack_manager::PackRegistry>,
                 pack_wiring.secret_store.clone() as Arc<dyn advance_pack_manager::SecretStore>,
-                pack_wiring.mcp_entries.clone() as Arc<dyn crate::pack_bridges::McpEntrySink>,
+                Arc::clone(&mcp_sink) as Arc<dyn crate::pack_bridges::McpEntrySink>,
             ));
             let _ = pack_wiring
                 .workflow_executor
@@ -3341,6 +3365,34 @@ pub(crate) async fn wire_capabilities_inner(
         repetition_guard_handle = Some(guard);
     }
 
+    // The MCP client, for a root that declares `mcp`: the `mcp-client` host functions
+    // join the registry the injector reads at link time (post-build, like cap-tools),
+    // each call decided by the caller's `mcp` grants. Infallible: see `mcp_wiring`.
+    let mcp_runtime = mcp_servers.map(|servers| {
+        crate::mcp_wiring::compose_mcp(crate::mcp_wiring::McpComposition {
+            servers,
+            config: &host.config().mcp,
+            registry: &*host.host_registry(),
+            grant_check: cap_grant.grant_check.clone(),
+            grant_store: cap_grant.store.clone(),
+            secret_store: secret_store.clone(),
+            event_bus: event_bus_dyn.clone(),
+            config_provider: host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
+            web_mode: web_cfg_snapshot.mode,
+            runtime: tokio::runtime::Handle::current(),
+            root_agent_id: root_uid.as_str(),
+            plane: mcp_plane.clone(),
+            log: log.clone(),
+            process_policy: processes,
+        })
+    });
+    started.mcp = mcp_runtime.clone();
+    pack_runtime.attach_mcp_plane(mcp_plane);
+    if let Some(runtime) = mcp_runtime.as_ref() {
+        mcp_sink.bind_runtime(Arc::clone(runtime));
+        pack_runtime.attach_mcp(Arc::clone(runtime));
+    }
+
     // MODULE-001 §1.4.7 (a): extension client families — after tools, before
     // bind_runtime and the Client API bind factory.
     let client_api_config_base = advance_client_api::ClientApiConfig::default();
@@ -3806,6 +3858,7 @@ pub(crate) async fn wire_capabilities_inner(
             web_grant: web_grant_handle,
             pack: pack_wiring,
             pack_runtime,
+            mcp: mcp_runtime,
             adapter_workers: std::mem::take(&mut started.adapter_workers),
             packs_watcher: started.packs_watcher.take(),
             extension_holds: std::mem::take(&mut started.extension_holds),

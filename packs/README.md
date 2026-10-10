@@ -65,13 +65,23 @@ pack's `memory-seeds/<name>.jsonl` as its knowledge file. `workflows` run on the
 request, `POST /client/packs/{name}@{version}:apply` with `{ "workflow": "<name>" }`: a
 workflow spawns child agents from the pack's templates, submits the pack's `components` to
 the scheduler and registers its `mcp-servers`; a failed step is compensated. `mcp-servers`
-entries are recorded but the runtime has no MCP client yet; install says so.
+are written into `.advance/mcp-servers/` (secret-ref ids only, origin recorded) and become
+callable when the root agent declares `mcp`; uninstalling the origin pack removes those
+files. Applying the same workflow again is a no-op when the server is unchanged.
 `channel-adapters` are refused at install: the runtime does not load channel adapters from
 packs. `provides: resource-capabilities` is a retired content kind: install (and `advance pack
 bundle`) refuses a manifest that declares it, and the layout check refuses a top-level
 `resource-capabilities/` directory. A pack installed by an older runtime with the key still
 loads; the runtime ignores the key and logs a warning for that pack. A pack's
 `dependencies:` are installed from the configured registry when they are not present already.
+
+## MCP servers
+
+Declare `mcp` on the root agent (`mcp: true`, or `mcp: { servers: [...], tool-patterns: [...] }`).
+Operator server files live in `.advance/mcp-servers/<server-id>.yaml` (the `mcp.servers-dir`
+knob). A pack registers a server with a workflow `register-mcp-server` step; that writes the
+same directory (secret-ref ids only) and is removed when the pack is uninstalled. The model
+sees each tool as `<server>__<tool>`.
 
 ## Contribution rules
 

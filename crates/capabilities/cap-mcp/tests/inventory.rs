@@ -112,6 +112,30 @@ async fn mj_gather_02_respects_tool_patterns_filter() {
     );
 }
 
+// MJ-GATHER-04 — a tool's `inputSchema`, kept by the listing, becomes the
+// entry's params_schema.
+#[tokio::test]
+async fn mj_gather_04_carries_the_input_schema() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    });
+    let mock = Arc::new(CountingMockTransport::new("srv"));
+    mock.push_ok(serde_json::json!({
+        "tools": [
+            {"name": "search", "description": "Search", "inputSchema": schema},
+            {"name": "ping", "description": "Ping"},
+        ]
+    }));
+    let client = client_with("srv", mock, None);
+
+    let entries = mcp_tool_entries(&client).await;
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].params_schema, schema);
+    assert_eq!(entries[1].params_schema, serde_json::json!({}));
+}
+
 // MJ-GATHER-03 — skip-on-error: a server whose `list_tools` errors (no scripted
 // response → transport error) contributes nothing rather than aborting the
 // whole gather.
@@ -131,7 +155,7 @@ async fn mj_t32_sub3_invoke_cross_name_tool_not_found() {
     let mock = Arc::new(CountingMockTransport::new("srv"));
     let client = client_with("srv", mock, Some(vec!["search.*"]));
     let err = client
-        .invoke_tool("srv", "delete-all", b"{}")
+        .invoke_tool(None, "srv", "delete-all", b"{}")
         .await
         .expect_err("a tool outside tool-patterns must be rejected");
     assert_eq!(err.kind, McpErrorKind::ToolNotFound);

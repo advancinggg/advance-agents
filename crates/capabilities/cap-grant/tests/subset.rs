@@ -5,11 +5,12 @@
 //! spawn-child AND spawn-sub) + 8 boundary conditions + 2 URL-pattern
 //! abuse-vector tests (Round 5 Warning 2 fix).
 
+use advance_shared_types::mcp::{MAX_REQUEST_TOKEN_BYTES, SERVER_WIDE_TOOL};
 use cap_grant::data::{
     CapParam, Grant, GrantDraft, GrantId, GrantIssuer, GrantProvenance, GrantStatus, GrantTtl,
 };
 use cap_grant::error::CapGrantError;
-use cap_grant::subset::{SubsetValidator, SubsetValidatorImpl};
+use cap_grant::subset::{mcp_param_problems, SubsetValidator, SubsetValidatorImpl};
 use chrono::Utc;
 
 fn parent(capability: &str, params: Vec<CapParam>) -> Grant {
@@ -346,6 +347,308 @@ fn t32_neg_tool_patterns() {
         v.validate(&pa, &ch),
         Err(CapGrantError::SubsetViolation(_))
     ));
+}
+
+fn violates(v: &SubsetValidatorImpl, pa: &Grant, ch: &GrantDraft) -> bool {
+    matches!(v.validate(pa, ch), Err(CapGrantError::SubsetViolation(_)))
+}
+
+#[test]
+fn mcp_tool_patterns_are_compared_by_subsumption() {
+    let v = SubsetValidatorImpl::new();
+    let pa = parent(
+        "mcp",
+        vec![
+            p("servers", "github"),
+            p("tool-patterns", "get_*,search_code"),
+        ],
+    );
+    let child = |patterns: &str| {
+        draft(
+            "mcp",
+            vec![p("servers", "github"), p("tool-patterns", patterns)],
+        )
+    };
+    for narrower in [
+        "get_issue",
+        "get_is*",
+        "get_*",
+        "search_code",
+        "get_issue,search_code",
+    ] {
+        assert!(v.validate(&pa, &child(narrower)).is_ok(), "{narrower}");
+    }
+    for wider in ["g*", "delete_repo", "search_*", "get_issue,delete_repo"] {
+        assert!(violates(&v, &pa, &child(wider)), "{wider}");
+    }
+    // A literal covers only itself.
+    let literal = parent(
+        "mcp",
+        vec![p("servers", "github"), p("tool-patterns", "get_issue")],
+    );
+    assert!(violates(&v, &literal, &child("get_*")));
+}
+
+#[test]
+fn mcp_malformed_patterns_are_violations_on_either_side() {
+    let v = SubsetValidatorImpl::new();
+    let pa = parent(
+        "mcp",
+        vec![p("servers", "github"), p("tool-patterns", "get_*")],
+    );
+    let open = parent("mcp", vec![p("servers", "github")]);
+    let covered = draft(
+        "mcp",
+        vec![p("servers", "github"), p("tool-patterns", "get_issue")],
+    );
+    for bad in ["*", "get_*_x", "*get", "get?", "a*b", "x[1]", "x{a}"] {
+        let ch = draft("mcp", vec![p("servers", "github"), p("tool-patterns", bad)]);
+        assert!(violates(&v, &pa, &ch), "child {bad}");
+        assert!(violates(&v, &open, &ch), "child {bad} under an open parent");
+        // A malformed parent pattern refuses even a child its other patterns cover.
+        let bad_parent = parent(
+            "mcp",
+            vec![
+                p("servers", "github"),
+                p("tool-patterns", &format!("get_*,{bad}")),
+            ],
+        );
+        assert!(violates(&v, &bad_parent, &covered), "parent {bad}");
+    }
+}
+
+#[test]
+fn mcp_absent_tool_patterns_reach_every_tool() {
+    let v = SubsetValidatorImpl::new();
+    // A parent without tool-patterns covers any well-formed patterns on its servers.
+    let open = parent("mcp", vec![p("servers", "github")]);
+    let narrowed = draft(
+        "mcp",
+        vec![p("servers", "github"), p("tool-patterns", "get_*")],
+    );
+    assert!(v.validate(&open, &narrowed).is_ok());
+    // A child that drops the parent's tool-patterns would reach every tool.
+    let restricted = parent(
+        "mcp",
+        vec![p("servers", "github"), p("tool-patterns", "get_*")],
+    );
+    let dropped = draft("mcp", vec![p("servers", "github")]);
+    assert!(violates(&v, &restricted, &dropped));
+}
+
+#[test]
+fn mcp_absent_servers_reach_no_server() {
+    let v = SubsetValidatorImpl::new();
+    let no_servers = parent("mcp", vec![p("tool-patterns", "get_*")]);
+    let ch = draft(
+        "mcp",
+        vec![p("servers", "github"), p("tool-patterns", "get_*")],
+    );
+    assert!(violates(&v, &no_servers, &ch));
+    // A child without servers reaches none, which is narrower than any parent.
+    let pa = parent("mcp", vec![p("servers", "github")]);
+    let ch = draft("mcp", vec![p("tool-patterns", "get_*")]);
+    assert!(v.validate(&pa, &ch).is_ok());
+}
+
+#[test]
+fn mcp_keys_outside_servers_and_tool_patterns_are_violations() {
+    let v = SubsetValidatorImpl::new();
+    // A misspelled `tool-patterns` must not read as "every tool".
+    let pa = parent("mcp", vec![p("servers", "github")]);
+    let typo = draft(
+        "mcp",
+        vec![p("servers", "github"), p("tool_patterns", "get_*")],
+    );
+    assert!(violates(&v, &pa, &typo));
+    let typo_parent = parent(
+        "mcp",
+        vec![p("servers", "github"), p("tool_patterns", "get_*")],
+    );
+    let ch = draft(
+        "mcp",
+        vec![p("servers", "github"), p("tool-patterns", "get_issue")],
+    );
+    assert!(violates(&v, &typo_parent, &ch));
+}
+
+// From `mcp: true` (the most common root form) `validate` still refuses a child with a
+// misspelled key or a malformed pattern, which would otherwise mint a grant that silently
+// covers less than it reads.
+#[test]
+fn mcp_child_grammar_is_checked_under_a_whole_capability_parent() {
+    let v = SubsetValidatorImpl::new();
+    let whole = parent("mcp", vec![]);
+    for well_formed in [
+        vec![],
+        vec![p("servers", "github")],
+        vec![
+            p("servers", "github"),
+            p("tool-patterns", "get_*,search_code"),
+        ],
+    ] {
+        let ch = draft("mcp", well_formed);
+        assert!(v.validate(&whole, &ch).is_ok(), "{ch:?}");
+    }
+    for bad in ["*", "a*b", "get_*_x", "*get", "get?", "x[1]", "x{a}"] {
+        let ch = draft("mcp", vec![p("servers", "github"), p("tool-patterns", bad)]);
+        assert!(violates(&v, &whole, &ch), "pattern {bad}");
+    }
+    for typo in ["tool_patterns", "server", "tools"] {
+        let ch = draft("mcp", vec![p("servers", "github"), p(typo, "get_*")]);
+        assert!(violates(&v, &whole, &ch), "key {typo}");
+    }
+}
+
+// ===== covers_request: the call-time check of the L1 gate =====
+
+#[test]
+fn covers_request_reads_mcp_tokens_as_literal_names() {
+    let v = SubsetValidatorImpl::new();
+    let held = parent(
+        "mcp",
+        vec![p("servers", "github"), p("tool-patterns", "get_*")],
+    );
+    let call = |tool: &str| {
+        draft(
+            "mcp",
+            vec![p("servers", "github"), p("tool-patterns", tool)],
+        )
+    };
+    assert!(v.covers_request(&held, &call("get_issue")).is_ok());
+    assert!(v.covers_request(&held, &call("delete_repo")).is_err());
+    // `get_*x` is a tool name here, covered because it starts with `get_`; as a grant
+    // draft the same token is a malformed pattern.
+    assert!(v.covers_request(&held, &call("get_*x")).is_ok());
+    assert!(v.validate(&held, &call("get_*x")).is_err());
+    // A name never widens to a pattern: `get*` does not start with `get_`.
+    assert!(v.covers_request(&held, &call("get*")).is_err());
+    assert!(v.covers_request(&held, &call("get_\u{200B}x")).is_err());
+    // A name longer than one request string may be is never covered, even by a
+    // whole-capability grant.
+    let whole = parent("mcp", vec![]);
+    let longest = format!("get_{}", "x".repeat(MAX_REQUEST_TOKEN_BYTES - 4));
+    assert!(v.covers_request(&whole, &call(&longest)).is_ok());
+    assert!(v.covers_request(&held, &call(&longest)).is_ok());
+    let too_long = format!("{longest}x");
+    assert!(v.covers_request(&whole, &call(&too_long)).is_err());
+    assert!(v.covers_request(&held, &call(&too_long)).is_err());
+}
+
+#[test]
+fn covers_request_without_tool_patterns_asks_for_the_server_only() {
+    let v = SubsetValidatorImpl::new();
+    let held = parent(
+        "mcp",
+        vec![p("servers", "github"), p("tool-patterns", "get_*")],
+    );
+    let server_level = draft("mcp", vec![p("servers", "github")]);
+    assert!(v.covers_request(&held, &server_level).is_ok());
+    // As a grant draft, the same params would drop the tool restriction.
+    assert!(v.validate(&held, &server_level).is_err());
+    assert!(v
+        .covers_request(&held, &draft("mcp", vec![p("servers", "slack")]))
+        .is_err());
+    // A request names the server it addresses, whatever the grant.
+    let serverless = draft("mcp", vec![p("tool-patterns", "get_issue")]);
+    assert!(v.covers_request(&held, &serverless).is_err());
+    assert!(v
+        .covers_request(&parent("mcp", vec![]), &serverless)
+        .is_err());
+}
+
+#[test]
+fn covers_request_server_wide_needs_an_unrestricted_tool_axis() {
+    let v = SubsetValidatorImpl::new();
+    let server_wide = draft(
+        "mcp",
+        vec![p("servers", "github"), p("tool-patterns", SERVER_WIDE_TOOL)],
+    );
+    assert!(v
+        .covers_request(&parent("mcp", vec![]), &server_wide)
+        .is_ok());
+    assert!(v
+        .covers_request(&parent("mcp", vec![p("servers", "github")]), &server_wide)
+        .is_ok());
+    let restricted = parent(
+        "mcp",
+        vec![p("servers", "github"), p("tool-patterns", "get_*")],
+    );
+    assert!(v.covers_request(&restricted, &server_wide).is_err());
+}
+
+#[test]
+fn covers_request_is_validate_for_other_families() {
+    let v = SubsetValidatorImpl::new();
+    let held = parent(
+        "fs",
+        vec![p("read-paths", "/notes"), p("write-paths", "/notes/drafts")],
+    );
+    for (request, covered) in [
+        (vec![p("read-paths", "/notes/a.md")], true),
+        (
+            vec![
+                p("read-paths", "/notes/drafts/b.md"),
+                p("write-paths", "/notes/drafts/b.md"),
+            ],
+            true,
+        ),
+        (
+            vec![
+                p("read-paths", "/notes/a.md"),
+                p("write-paths", "/notes/a.md"),
+            ],
+            false,
+        ),
+        (vec![p("read-paths", "/etc")], false),
+        (vec![], false),
+    ] {
+        let ch = draft("fs", request);
+        assert_eq!(v.covers_request(&held, &ch).is_ok(), covered, "{ch:?}");
+        assert_eq!(
+            v.covers_request(&held, &ch).is_ok(),
+            v.validate(&held, &ch).is_ok(),
+            "{ch:?}"
+        );
+    }
+    // The retired `data` family keeps its set rule.
+    let read_only = parent("data", vec![p("mode", "read")]);
+    for (mode, covered) in [("read", true), ("write", false), ("read,write", false)] {
+        let ch = draft("data", vec![p("mode", mode)]);
+        assert_eq!(v.covers_request(&read_only, &ch).is_ok(), covered, "{mode}");
+        assert_eq!(
+            v.covers_request(&read_only, &ch).is_ok(),
+            v.validate(&read_only, &ch).is_ok(),
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn mcp_param_problems_name_what_covers_nothing() {
+    assert!(mcp_param_problems(&[]).is_empty());
+    assert!(mcp_param_problems(&[
+        p("servers", "github,slack"),
+        p("tool-patterns", "get_*,search_code")
+    ])
+    .is_empty());
+
+    let problems =
+        mcp_param_problems(&[p("servers", "github,*"), p("tool-patterns", "get_*,*,a*b")]);
+    assert_eq!(problems.len(), 3, "{problems:?}");
+    assert!(problems[0].contains("\"*\"") && problems[0].contains("literal id"));
+    assert!(problems[1].contains("\"*\"") && problems[1].contains("covers no tool"));
+    assert!(problems[2].contains("\"a*b\"") && problems[2].contains("covers no tool"));
+
+    let typo = mcp_param_problems(&[p("server", "github"), p("tool-patterns", "get_*")]);
+    assert_eq!(typo.len(), 2, "{typo:?}");
+    assert!(typo[0].contains("`server`") && typo[0].contains("covers nothing"));
+    assert!(typo[1].contains("reaches no server"));
+
+    let empty = mcp_param_problems(&[p("servers", ""), p("tool-patterns", "")]);
+    assert_eq!(empty.len(), 2, "{empty:?}");
+    assert!(empty[0].contains("`servers` is empty"));
+    assert!(empty[1].contains("`tool-patterns` is empty"));
 }
 
 // ===== Row 13+14: skills =====

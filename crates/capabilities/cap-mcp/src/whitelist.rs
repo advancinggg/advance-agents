@@ -6,18 +6,15 @@
 //! input + output JSON schemas attach here too; they are consumed by `McpClient`
 //! through `SchemaValidator` (AC-13).
 //!
-//! Layer-3 (per-agent grant) is enforced by the framework `CapabilityInjector`
-//! via the SPLIT capability dimensions registered in `host_fn::register_mcp_client`
-//! — see that module for details. AC-30 architectural intent: server-level methods
-//! gate on `mcp.servers`, tool-level methods (`list-mcp-tools`, `invoke-mcp-tool`)
-//! gate on `mcp.tool-patterns`.
+//! Layer 3 (per-agent grant) is the `mcp` grant: the mcp-client host functions
+//! ask the caller's grants about the server and tool of each call (`McpGate`).
+//! A tool must pass both this server's patterns and the caller's grant.
 //!
-//! ## In-house `ToolPattern` matcher
+//! ## `ToolPattern` grammar
 //!
-//! cap-mcp deliberately ships an in-house matcher rather than pulling `globset`
-//! or `glob` into the workspace — neither dep is currently pinned, and adding
-//! one would be a cross-cutting supply-chain expansion outside this slice's
-//! scope. Supported grammar:
+//! The grammar, the matcher and the unsafe-name rule are the shared ones in
+//! [`advance_shared_types::mcp`], which the `mcp` grant family uses too, so the
+//! server filter and the grant check read a pattern the same way:
 //!
 //! - `Literal("foo")` — exact string match.
 //! - `Prefix("foo.")` — derived from raw pattern `"foo.*"` — matches any tool
@@ -30,12 +27,10 @@
 
 use std::collections::BTreeMap;
 
+use advance_shared_types::mcp::{self as shared, ToolPatternError};
 use advance_shared_types::security_validator::HttpCapability;
 
 use crate::error::McpError;
-
-/// Max bytes for a single tool-pattern string. Bounds memory + compile cost.
-pub const MAX_PATTERN_BYTES: usize = 256;
 
 /// Max patterns per server entry. Bounds per-`list_tools` filter cost.
 pub const MAX_PATTERNS_PER_SERVER: usize = 64;
@@ -57,106 +52,44 @@ pub enum ToolPattern {
 impl ToolPattern {
     /// Compile a raw pattern string. See module-level rustdoc for grammar.
     pub fn compile(raw: &str) -> Result<Self, McpError> {
-        if raw.is_empty() || raw.len() > MAX_PATTERN_BYTES {
-            return Err(McpError::invalid_response(
-                "tool-pattern: length out of range (1..=MAX_PATTERN_BYTES)",
-            ));
-        }
-        if let Some(stripped) = raw.strip_suffix('*') {
-            // Bare "*" → empty prefix would match every tool name. Reject;
-            // operators wanting "allow all" should use `tool_patterns: None`
-            // at the McpServerEntry level instead.
-            if stripped.is_empty() {
-                return Err(McpError::invalid_response(
-                    "tool-pattern: bare '*' rejected — use `tool_patterns: None` for allow-all",
-                ));
+        match shared::ToolPattern::parse(raw) {
+            Ok(shared::ToolPattern::Literal(literal)) => {
+                Ok(ToolPattern::Literal(literal.to_string()))
             }
-            if stripped.contains(['*', '?', '[', ']', '{', '}']) {
-                return Err(McpError::invalid_response(
-                    "tool-pattern: only a single trailing '*' is supported",
-                ));
-            }
-            return Ok(ToolPattern::Prefix(stripped.to_string()));
-        }
-        if raw.contains(['*', '?', '[', ']', '{', '}']) {
-            return Err(McpError::invalid_response(
+            Ok(shared::ToolPattern::Prefix(prefix)) => Ok(ToolPattern::Prefix(prefix.to_string())),
+            // The length bound keeps memory and match cost small.
+            Err(ToolPatternError::Length) => Err(McpError::invalid_response(format!(
+                "tool-pattern: length out of range (1..={} bytes)",
+                shared::MAX_TOOL_PATTERN_BYTES
+            ))),
+            // Bare "*" → empty prefix would match every tool name. Operators wanting
+            // "allow all" use `tool_patterns: None` at the McpServerEntry level instead.
+            Err(ToolPatternError::BareStar) => Err(McpError::invalid_response(
+                "tool-pattern: bare '*' rejected — use `tool_patterns: None` for allow-all",
+            )),
+            Err(ToolPatternError::Glob) => Err(McpError::invalid_response(
                 "tool-pattern: only a single trailing '*' is supported",
-            ));
+            )),
         }
-        Ok(ToolPattern::Literal(raw.to_string()))
     }
 
     /// True iff `name` matches this pattern.
     ///
-    /// Adversarial round 1 W2 fix: tool names containing control characters
-    /// (U+0000-U+001F, U+007F-U+009F), zero-width / invisible characters
-    /// (ZWSP U+200B, ZWNJ U+200C, ZWJ U+200D, BOM U+FEFF, WJ U+2060,
-    /// HYPHEN U+00AD), or bidi-override characters (U+202A-U+202E,
-    /// U+2066-U+2069) are REJECTED at the matcher boundary. Without this,
-    /// an attacker-controlled MCP server could publish a tool name like
-    /// `"search.\u{200B}delete_all"` (zero-width space invisible to the
-    /// operator + agent UI) that passes a `"search.*"` prefix pattern but
-    /// is semantically a different tool. Confusables (Cyrillic `е` vs
-    /// Latin `e`) cannot pass byte-string equality, so the Literal arm is
-    /// already safe — the prefix arm + visually-invisible characters were
-    /// the concrete bypass.
+    /// A name that fails [`shared::is_tool_name_safe`] (control, zero-width,
+    /// invisible, bidi, variation-selector or tag characters) matches nothing.
+    /// Without this, an attacker-controlled MCP server could publish a tool name
+    /// like `"search.\u{200B}delete_all"` (zero-width space invisible to the
+    /// operator + agent UI) that passes a `"search.*"` prefix pattern but is
+    /// semantically a different tool. Confusables (Cyrillic `е` vs Latin `e`)
+    /// cannot pass byte-string equality, so the Literal arm is already safe — the
+    /// prefix arm + visually-invisible characters were the concrete bypass.
     pub fn matches(&self, name: &str) -> bool {
-        if !is_tool_name_safe(name) {
-            return false;
-        }
-        match self {
-            ToolPattern::Literal(s) => name == s,
-            ToolPattern::Prefix(p) => name.starts_with(p),
-        }
+        let pattern = match self {
+            ToolPattern::Literal(literal) => shared::ToolPattern::Literal(literal),
+            ToolPattern::Prefix(prefix) => shared::ToolPattern::Prefix(prefix),
+        };
+        pattern.matches(name)
     }
-}
-
-/// Reject control characters, zero-width / invisible characters, and bidi
-/// controls. Returns false (= unsafe / reject) for any character in the
-/// forbidden set.
-///
-/// Adversarial round 2 W1: rejection set expanded to align with cap-skills
-/// SecurityScan precedent (U+200E LRM + U+200F RLM bidi marks were missing
-/// in round 1; also adding invisible operators, Hangul fillers, and
-/// combining grapheme joiner). Set is conservative — any character that
-/// renders invisible OR can visually spoof a different code point is
-/// rejected.
-pub(crate) fn is_tool_name_safe(name: &str) -> bool {
-    for c in name.chars() {
-        let cp = c as u32;
-        // ASCII control chars + DEL + C1 control range
-        if cp < 0x20 || (0x7F..=0x9F).contains(&cp) {
-            return false;
-        }
-        // Zero-width / invisible / soft-hyphen / WJ / BOM + bidi marks
-        if matches!(
-            cp,
-            0x00AD       // SOFT HYPHEN
-            | 0x034F     // COMBINING GRAPHEME JOINER
-            | 0x115F     // HANGUL CHOSEONG FILLER
-            | 0x1160     // HANGUL JUNGSEONG FILLER
-            | 0x180E     // MONGOLIAN VOWEL SEPARATOR
-            | 0x200B     // ZERO WIDTH SPACE
-            | 0x200C     // ZERO WIDTH NON-JOINER
-            | 0x200D     // ZERO WIDTH JOINER
-            | 0x200E     // LEFT-TO-RIGHT MARK
-            | 0x200F     // RIGHT-TO-LEFT MARK
-            | 0x2060     // WORD JOINER
-            | 0x2061     // FUNCTION APPLICATION
-            | 0x2062     // INVISIBLE TIMES
-            | 0x2063     // INVISIBLE SEPARATOR
-            | 0x2064     // INVISIBLE PLUS
-            | 0x3164     // HANGUL FILLER
-            | 0xFEFF // ZERO WIDTH NO-BREAK SPACE (BOM)
-        ) {
-            return false;
-        }
-        // Bidi embedding/overrides + isolates
-        if (0x202A..=0x202E).contains(&cp) || (0x2066..=0x2069).contains(&cp) {
-            return false;
-        }
-    }
-    true
 }
 
 /// Optional per-tool input + output JSON schemas. Consumed by `McpClient`'s
@@ -168,7 +101,11 @@ pub struct ToolSchemas {
 }
 
 /// Per-server transport specification.
-#[derive(Clone, Debug)]
+///
+/// `Debug` never prints what may hold a secret: a stdio `env` shows its keys
+/// only (its values are resolved secrets), `args` show only their count, and an
+/// http endpoint shows no query or fragment.
+#[derive(Clone)]
 pub enum McpTransportSpec {
     /// HTTP/SSE transport — reuses MODULE-012 HttpSecurityChain.
     Http {
@@ -181,6 +118,60 @@ pub enum McpTransportSpec {
         args: Vec<String>,
         env: BTreeMap<String, String>,
     },
+}
+
+impl std::fmt::Debug for McpTransportSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            McpTransportSpec::Http {
+                endpoint_url,
+                capability,
+            } => f
+                .debug_struct("Http")
+                .field("endpoint_url", &RedactedUrl(endpoint_url))
+                .field("capability", capability)
+                .finish(),
+            McpTransportSpec::Stdio { command, args, env } => f
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", &format_args!("<{} redacted>", args.len()))
+                .field("env", &RedactedEnv(env))
+                .finish(),
+        }
+    }
+}
+
+/// An endpoint URL without its query and fragment, which may carry tokens.
+struct RedactedUrl<'a>(&'a str);
+
+impl std::fmt::Debug for RedactedUrl<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keep the separator (`?` or `#`, one byte) so the shape stays visible.
+        match self.0.find(['?', '#']) {
+            Some(end) => write!(f, "{:?}", format!("{}<redacted>", &self.0[..=end])),
+            None => write!(f, "{:?}", self.0),
+        }
+    }
+}
+
+/// An environment map with every value hidden.
+struct RedactedEnv<'a>(&'a BTreeMap<String, String>);
+
+impl std::fmt::Debug for RedactedEnv<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|key| (key, Hidden)))
+            .finish()
+    }
+}
+
+/// Debug-prints as `<redacted>`.
+struct Hidden;
+
+impl std::fmt::Debug for Hidden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 /// Single server entry in the whitelist.
@@ -196,6 +187,65 @@ pub struct McpServerEntry {
 }
 
 impl McpServerEntry {
+    /// A digest of the fields that decide whether a live connection can be
+    /// reused: the transport (command, args, env values, endpoint, allowlist),
+    /// the tool patterns and the schemas. Two entries with the same digest
+    /// describe the same server; a secret rotation changes it.
+    pub fn fingerprint(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        self.server_id.hash(&mut hasher);
+        self.description.hash(&mut hasher);
+        match &self.transport {
+            McpTransportSpec::Stdio { command, args, env } => {
+                0u8.hash(&mut hasher);
+                command.hash(&mut hasher);
+                args.hash(&mut hasher);
+                for (key, value) in env {
+                    key.hash(&mut hasher);
+                    value.hash(&mut hasher);
+                }
+            }
+            McpTransportSpec::Http {
+                endpoint_url,
+                capability,
+            } => {
+                1u8.hash(&mut hasher);
+                endpoint_url.hash(&mut hasher);
+                capability.allowlist.patterns.hash(&mut hasher);
+                for binding in &capability.credentials {
+                    format!("{:?}", binding.position).hash(&mut hasher);
+                    binding.secret_name.hash(&mut hasher);
+                }
+                capability.component_id.hash(&mut hasher);
+            }
+        }
+        match &self.tool_patterns {
+            None => 0u8.hash(&mut hasher),
+            Some(patterns) => {
+                1u8.hash(&mut hasher);
+                for pattern in patterns {
+                    format!("{pattern:?}").hash(&mut hasher);
+                }
+            }
+        }
+        for (name, schemas) in &self.tool_schemas {
+            name.hash(&mut hasher);
+            schemas
+                .input
+                .as_ref()
+                .map(ToString::to_string)
+                .hash(&mut hasher);
+            schemas
+                .output
+                .as_ref()
+                .map(ToString::to_string)
+                .hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     /// True iff the given tool name passes the tool-pattern filter (or no
     /// filter is configured) AND contains no forbidden Unicode characters.
     ///
@@ -205,7 +255,7 @@ impl McpServerEntry {
     /// extend to "allow visually-spoofed names" — that's an attacker-side
     /// bypass of any whitelist rationale.
     pub fn tool_allowed(&self, tool_name: &str) -> bool {
-        if !is_tool_name_safe(tool_name) {
+        if !shared::is_tool_name_safe(tool_name) {
             return false;
         }
         match &self.tool_patterns {
@@ -231,9 +281,9 @@ impl McpServersConfig {
     /// Lookup a server by id. Returns `McpError::not_found(...)` for unknown
     /// ids (AC-23 layer 1).
     pub fn get(&self, server_id: &str) -> Result<&McpServerEntry, McpError> {
-        self.servers.get(server_id).ok_or_else(|| {
-            McpError::not_found(format!("server '{server_id}' not in mcp.servers whitelist"))
-        })
+        self.servers
+            .get(server_id)
+            .ok_or_else(|| McpError::not_found(format!("server '{server_id}' is not configured")))
     }
 
     /// Iterate over the registered servers in stable (sorted-by-id) order.
@@ -257,9 +307,18 @@ pub struct McpServersConfigBuilder {
 }
 
 impl McpServersConfigBuilder {
-    /// Add a server entry. Returns an error if the id collides with an existing
-    /// entry, or if the total would exceed `MAX_SERVERS`.
+    /// Add a server entry. Returns an error if the id is not a valid server id
+    /// (the shared grammar, [`shared::is_valid_server_id`], which a pack's
+    /// `mcp-servers/*.yaml` follows too), collides with an existing entry, or if
+    /// the total would exceed `MAX_SERVERS`.
     pub fn add_server(mut self, entry: McpServerEntry) -> Result<Self, McpError> {
+        if !shared::is_valid_server_id(&entry.server_id) {
+            return Err(McpError::invalid_response(format!(
+                "server_id {:?} must be 1..={} characters from [A-Za-z0-9._-]",
+                entry.server_id,
+                shared::MAX_SERVER_ID_BYTES
+            )));
+        }
         if self.servers.contains_key(&entry.server_id) {
             return Err(McpError::invalid_response(format!(
                 "duplicate server_id '{}'",
@@ -338,9 +397,31 @@ mod tests {
 
     #[test]
     fn pattern_oversize_rejected() {
-        let raw = "a".repeat(MAX_PATTERN_BYTES + 1);
+        let raw = "a".repeat(shared::MAX_TOOL_PATTERN_BYTES + 1);
         let err = ToolPattern::compile(&raw).expect_err("oversize");
         assert!(err.message.contains("length out of range"));
+    }
+
+    // The server filter and the `mcp` grant family read patterns and names alike.
+    #[test]
+    fn pattern_grammar_and_matcher_are_the_shared_ones() {
+        for raw in [
+            "search", "search.*", "ns:*", "*", "", "*tool*", "tool?", "a*b", "x[1]",
+        ] {
+            assert_eq!(
+                ToolPattern::compile(raw).is_ok(),
+                shared::ToolPattern::parse(raw).is_ok(),
+                "{raw:?}"
+            );
+        }
+        let p = ToolPattern::compile("search.*").expect("compile");
+        let entry = dummy_http_entry("alpha", None);
+        // A variation selector or a tag character is as invisible as a zero-width space.
+        for name in ["search.web\u{FE0F}", "search.\u{E0041}web"] {
+            assert!(!p.matches(name), "{name:?}");
+            assert!(!entry.tool_allowed(name), "{name:?}");
+        }
+        assert!(p.matches("search.web"));
     }
 
     fn dummy_http_entry(server_id: &str, patterns: Option<Vec<&str>>) -> McpServerEntry {
@@ -383,7 +464,7 @@ mod tests {
             .unwrap()
             .build();
         let err = cfg.get("gamma").expect_err("miss");
-        assert!(err.message.contains("not in mcp.servers whitelist"));
+        assert_eq!(err.message, "server 'gamma' is not configured");
     }
 
     #[test]

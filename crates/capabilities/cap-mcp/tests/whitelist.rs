@@ -1,17 +1,25 @@
-//! Slice D AC-23 — whitelist + tool-patterns + capability split (SD-11..SD-15c).
+//! Slice D AC-23 — whitelist + tool-patterns (SD-11..SD-15b), the one `mcp`
+//! capability (SD-15c), and a tool call needing both the server's tool
+//! patterns and the caller's `mcp` grant.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use advance_runtime::host_registry::HostRegistry;
 use advance_runtime::host_registry::InMemoryHostRegistry;
+use advance_shared_types::mcp::is_valid_server_id;
 use advance_shared_types::security_validator::{
     Allowlist, HttpCapability, LeakDetector, ScanContext, ScanResult,
 };
 use cap_mcp::{
-    register_mcp_client, McpClient, McpError, McpErrorKind, McpServerEntry, McpServersConfig,
-    McpTransportSpec, ToolPattern,
+    register_mcp_client, McpClient, McpError, McpErrorKind, McpGate, McpServerEntry,
+    McpServersConfig, McpTransport, McpTransportSpec, ToolPattern,
 };
+use wasmtime::component::Val;
+
+mod support;
+use support::gate::{ctx, open_gate, spec, CapturingBus, FixedScopes, RecordingCheck};
+use support::mock_transport::CountingMockTransport;
 
 struct NoOpDetector;
 impl LeakDetector for NoOpDetector {
@@ -79,12 +87,12 @@ async fn sd_12_unknown_server_blocked() {
     );
     let client = McpClient::new(cfg, Arc::new(NoOpDetector), None);
     let err = client
-        .invoke_tool("gamma", "x", b"{}")
+        .invoke_tool(None, "gamma", "x", b"{}")
         .await
-        .expect_err("not in whitelist");
+        .expect_err("not configured");
     assert_eq!(err.kind, McpErrorKind::NotFound);
     assert!(err.message.contains("'gamma'"));
-    assert!(err.message.contains("whitelist"));
+    assert!(err.message.contains("is not configured"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -103,12 +111,17 @@ async fn sd_14_tool_pattern_blocks_invoke() {
     );
     let client = McpClient::new(cfg, Arc::new(NoOpDetector), None);
     let err = client
-        .invoke_tool("alpha", "delete-all", b"{}")
+        .invoke_tool(None, "alpha", "delete-all", b"{}")
         .await
         .expect_err("blocked by tool-patterns");
     assert_eq!(err.kind, McpErrorKind::ToolNotFound);
     assert!(err.message.contains("delete-all"));
-    assert!(err.message.contains("mcp.tool-patterns"));
+    assert!(
+        err.message
+            .contains("tool patterns configured for server 'alpha'"),
+        "msg={}",
+        err.message
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -227,10 +240,10 @@ fn sd_15d_unsafe_blocked_even_with_no_patterns() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// SD-15c — verify SPLIT capability registration (5 server + 2 tool)
+// SD-15c — the 7 host functions register under the one capability `mcp`
 // ─────────────────────────────────────────────────────────────────────────
 #[test]
-fn sd_15c_split_capability_registration() {
+fn sd_15c_one_capability_registration() {
     let cfg = Arc::new(
         McpServersConfig::builder()
             .add_server(http_entry("alpha", None))
@@ -239,66 +252,167 @@ fn sd_15c_split_capability_registration() {
     );
     let client = Arc::new(McpClient::new(cfg, Arc::new(NoOpDetector), None));
     let registry = InMemoryHostRegistry::new();
-    register_mcp_client(&registry, client);
+    register_mcp_client(&registry, client, open_gate(), CapturingBus::new());
 
-    let servers_specs = registry.lookup("mcp.servers");
-    let tools_specs = registry.lookup("mcp.tool-patterns");
-
-    // 5 server-level handlers under mcp.servers
-    assert_eq!(servers_specs.len(), 5, "mcp.servers should have 5 specs");
-    let server_names: std::collections::BTreeSet<_> =
-        servers_specs.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(
-        server_names,
-        [
-            "list-mcp-servers",
-            "list-mcp-prompts",
-            "get-mcp-prompt",
-            "list-mcp-resources",
-            "read-mcp-resource"
-        ]
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>()
-    );
-
-    // 2 tool-level handlers under mcp.tool-patterns
-    assert_eq!(
-        tools_specs.len(),
-        2,
-        "mcp.tool-patterns should have 2 specs"
-    );
-    let tool_names: std::collections::BTreeSet<_> =
-        tools_specs.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(
-        tool_names,
-        ["list-mcp-tools", "invoke-mcp-tool"]
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>()
-    );
-
-    // All specs share the canonical namespace.
-    for spec in servers_specs.iter().chain(tools_specs.iter()) {
+    let specs = registry.lookup("mcp");
+    assert_eq!(specs.len(), 7, "all 7 mcp-client functions under `mcp`");
+    for capability in ["mcp.servers", "mcp.tool-patterns", "tools"] {
+        assert!(registry.lookup(capability).is_empty(), "{capability}");
+    }
+    for spec in &specs {
         assert_eq!(spec.namespace, "advance:runtime/mcp-client@0.1.0");
-    }
-
-    // Idempotent flag: invoke-mcp-tool is the only non-idempotent.
-    for spec in tools_specs.iter() {
-        let expected = !matches!(spec.name.as_str(), "invoke-mcp-tool");
+        // invoke-mcp-tool is the only non-idempotent one.
         assert_eq!(
-            spec.idempotent, expected,
-            "name={} expected idempotent={}",
-            spec.name, expected
-        );
-    }
-    for spec in servers_specs.iter() {
-        assert!(
             spec.idempotent,
-            "server-level handler {} should be idempotent",
+            spec.name != "invoke-mcp-tool",
+            "{}",
             spec.name
         );
     }
+}
+
+// A tool call passes two filters: the server's configured tool patterns
+// (layer 2, `tool-not-found`) and the caller's `mcp` grant (layer 3,
+// `permission-denied`). Neither lets through what the other refuses.
+#[tokio::test]
+async fn a_tool_call_needs_the_server_patterns_and_the_grant() {
+    let mock = Arc::new(CountingMockTransport::new("alpha"));
+    mock.push_ok(serde_json::json!({"content": []}));
+    let cfg = Arc::new(
+        McpServersConfig::builder()
+            .add_server(http_entry("alpha", Some(vec!["search.*"])))
+            .unwrap()
+            .build(),
+    );
+    let mut injected: HashMap<String, Arc<dyn McpTransport>> = HashMap::new();
+    injected.insert("alpha".into(), mock.clone());
+    let client = Arc::new(McpClient::new_with_transports(
+        cfg,
+        Arc::new(NoOpDetector),
+        injected,
+    ));
+    // The grant covers `search.web` and `delete-all`, not `search.code`.
+    let check = RecordingCheck::new(|(_, _, _, params)| {
+        params["tool-patterns"] == "search.web" || params["tool-patterns"] == "delete-all"
+    });
+    let registry = InMemoryHostRegistry::new();
+    register_mcp_client(
+        &registry,
+        client,
+        McpGate::new(check, FixedScopes::unrestricted(), None),
+        CapturingBus::new(),
+    );
+    let invoke = spec(&registry, "invoke-mcp-tool");
+    let call = |tool: &str| {
+        let params = vec![
+            Val::String("alpha".into()),
+            Val::String(tool.into()),
+            Val::List(vec![]),
+        ];
+        invoke
+            .handler
+            .call(ctx("agent-x", "invoke-mcp-tool"), params, 1)
+    };
+    let class = |out: Vec<Val>| match &out[0] {
+        Val::Result(Ok(_)) => "ok".to_string(),
+        Val::Result(Err(Some(e))) => match e.as_ref() {
+            Val::Variant(case, _) => case.clone(),
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(class(call("search.web").await.unwrap()), "ok");
+    assert_eq!(
+        class(call("search.code").await.unwrap()),
+        "permission-denied"
+    );
+    assert_eq!(class(call("delete-all").await.unwrap()), "tool-not-found");
+    assert_eq!(
+        mock.call_count(),
+        1,
+        "only the call both allow reached the server"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Server ids: the builder admits only the shared grammar, which a pack's
+// `mcp-servers/*.yaml` follows too
+// ─────────────────────────────────────────────────────────────────────────
+#[test]
+fn builder_admits_only_server_ids_from_the_charset() {
+    let longest = "a".repeat(128);
+    for id in ["a", "srv-1", "alpha.beta_gamma", "A9", longest.as_str()] {
+        assert!(is_valid_server_id(id), "{id:?}");
+        McpServersConfig::builder()
+            .add_server(http_entry(id, None))
+            .unwrap_or_else(|e| panic!("{id:?} refused: {e}"));
+    }
+    let too_long = "a".repeat(129);
+    for id in [
+        "",
+        "a b",
+        "a/b",
+        "srv:1",
+        "ü",
+        "a\u{200B}b",
+        "a\nb",
+        too_long.as_str(),
+    ] {
+        assert!(!is_valid_server_id(id), "{id:?}");
+        let err = McpServersConfig::builder()
+            .add_server(http_entry(id, None))
+            .expect_err("invalid server id");
+        assert_eq!(err.kind, McpErrorKind::InvalidResponse);
+        assert!(
+            err.message.contains("[A-Za-z0-9._-]"),
+            "msg={}",
+            err.message
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Debug never prints a resolved secret
+// ─────────────────────────────────────────────────────────────────────────
+#[test]
+fn debug_output_hides_env_values_args_and_endpoint_queries() {
+    let stdio = McpServerEntry {
+        server_id: "local".to_string(),
+        description: "stdio".to_string(),
+        transport: McpTransportSpec::Stdio {
+            command: "/usr/local/bin/server".to_string(),
+            args: vec!["--token=arg-secret-123".to_string()],
+            env: BTreeMap::from([("API_TOKEN".to_string(), "env-secret-456".to_string())]),
+        },
+        tool_patterns: None,
+        tool_schemas: BTreeMap::new(),
+    };
+    let text = format!("{stdio:?}");
+    assert!(text.contains("API_TOKEN"), "{text}");
+    assert!(text.contains("/usr/local/bin/server"), "{text}");
+    assert!(!text.contains("env-secret-456"), "{text}");
+    assert!(!text.contains("arg-secret-123"), "{text}");
+
+    let http = McpTransportSpec::Http {
+        endpoint_url: "https://mcp.example.com/mcp?key=query-secret-789#frag".to_string(),
+        capability: HttpCapability {
+            allowlist: Allowlist {
+                patterns: vec!["mcp.example.com".to_string()],
+            },
+            credentials: vec![],
+            component_id: "remote".into(),
+        },
+    };
+    let text = format!("{http:?}");
+    assert!(text.contains("https://mcp.example.com/mcp"), "{text}");
+    assert!(!text.contains("query-secret-789"), "{text}");
+    assert!(!text.contains("frag"), "{text}");
+
+    let config = McpServersConfig::builder()
+        .add_server(stdio)
+        .unwrap()
+        .build();
+    assert!(!format!("{config:?}").contains("env-secret-456"));
 }
 
 fn _unused_mcp_error_type(_e: &McpError) {

@@ -130,10 +130,12 @@ use advance_shared_types::event::Event;
 use advance_shared_types::mailbox::{
     AgentAction, DispatchError, Message, MessageContext, MessageKind,
 };
+use advance_shared_types::mcp::McpGrantScope;
 use advance_shared_types::outbound::DeliveryReport;
 use advance_shared_types::repetition::{OutputHash, RepetitionDecision, ToolCallSignature};
 use advance_shared_types::traits::{
-    EventBusEmit, GrantCheck, LlmDeltaSink, NotWiredDeltaSink, RepetitionGuardCheck, RunBudget,
+    EventBusEmit, GrantCheck, LlmDeltaSink, McpGrantReader, NotWiredDeltaSink,
+    RepetitionGuardCheck, RunBudget,
 };
 use cap_http::DefaultPromptInjectionHelpers;
 use cap_tools::web::{
@@ -152,8 +154,8 @@ use cap_grant::data::{Grant as CapGrant, GrantStatus};
 use cap_grant::{
     register_agent_grant, register_cap_grant, validate_capability_subset, AgentGrantBundle,
     AutoDenyResolver, BudgetCheckResolver, CapGrantError, ChannelApprovalPort, ChannelResolver,
-    GrantStore, ParentApprovalResolver, PresetRegistry, Resolver, ResolverChain,
-    SubsetAutoApproveResolver, SubsetValidator, SubsetValidatorImpl,
+    GrantStore, McpGrantReaderImpl, ParentApprovalResolver, PresetRegistry, Resolver,
+    ResolverChain, SubsetAutoApproveResolver, SubsetValidator, SubsetValidatorImpl,
 };
 use cap_memory::{
     register_agent_memory_with_git, BatchExtractor, Components, FailureCooldown,
@@ -191,7 +193,7 @@ use cap_lifecycle::{
     DefaultSpawner, SubsetCheckedComponentSubmit,
 };
 use cap_mcp::{
-    register_mcp_client, McpClient, McpServerEntry, McpServersConfig, McpTransport,
+    register_mcp_client, McpClient, McpGate, McpServerEntry, McpServersConfig, McpTransport,
     McpTransportSpec, ToolPattern,
 };
 use std::collections::BTreeMap;
@@ -439,6 +441,8 @@ impl LeakDetector for NoOpLeakDetector {
 // enforcement (SYS-AC-046/048).
 
 /// In-process scripted MCP transport — returns canned bytes for any tool call.
+/// The client treats an injected transport as an initialized connection, so it
+/// never sees the `initialize` exchange.
 struct ScriptedMcpTransport {
     server_id: String,
     reply: Vec<u8>,
@@ -448,10 +452,18 @@ struct ScriptedMcpTransport {
 impl McpTransport for ScriptedMcpTransport {
     async fn invoke(
         &self,
+        _caller: Option<&str>,
         _method: &str,
         _params: serde_json::Value,
     ) -> Result<Vec<u8>, cap_mcp::McpError> {
         Ok(self.reply.clone())
+    }
+    async fn notify(
+        &self,
+        _method: &str,
+        _params: Option<serde_json::Value>,
+    ) -> Result<(), cap_mcp::McpError> {
+        Ok(())
     }
     fn server_id(&self) -> &str {
         &self.server_id
@@ -782,6 +794,15 @@ struct AllowAll;
 impl GrantCheck for AllowAll {
     fn check(&self, _: &str, _: &str, _: &str, _: &CapParams) -> GrantDecision {
         GrantDecision::Allow
+    }
+}
+
+/// The `mcp` grant scopes that go with [`AllowAll`]: every server and tool.
+#[derive(Debug)]
+struct AllMcpScopes;
+impl McpGrantReader for AllMcpScopes {
+    fn mcp_grant_scopes(&self, _: &str) -> Vec<McpGrantScope> {
+        vec![McpGrantScope::unrestricted()]
     }
 }
 
@@ -2917,7 +2938,21 @@ impl SystemUnderTestBuilder {
                 Arc::new(NoOpLeakDetector),
                 injected,
             ));
-            register_mcp_client(&*registry, client.clone());
+            // The gate's listings read the grants its calls are decided by.
+            let reader: Arc<dyn McpGrantReader> = match self.grant {
+                GrantMode::Real => Arc::new(McpGrantReaderImpl::new(
+                    grant_store
+                        .clone()
+                        .expect("GrantMode::Real wires the grant check's store"),
+                )),
+                GrantMode::AllowAll => Arc::new(AllMcpScopes),
+            };
+            register_mcp_client(
+                &*registry,
+                client.clone(),
+                McpGate::new(grant_check.clone(), reader, None),
+                bus_dyn.clone(),
+            );
             Some(client)
         };
 
@@ -5984,7 +6019,8 @@ impl SystemUnderTest {
     }
 
     /// Invoke an MCP tool through the real `McpClient` (whitelist → tool-pattern →
-    /// input-schema → transport → output-schema) over the scripted transport.
+    /// input-schema → transport → output-schema) over the scripted transport, on
+    /// no agent's behalf.
     pub async fn drive_mcp_tool(
         &self,
         server_id: &str,
@@ -5994,7 +6030,7 @@ impl SystemUnderTest {
         self.mcp_client
             .as_ref()
             .expect(".with_mcp_transports() required")
-            .invoke_tool(server_id, tool, params)
+            .invoke_tool(None, server_id, tool, params)
             .await
     }
 

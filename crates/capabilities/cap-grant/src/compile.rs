@@ -168,6 +168,14 @@ fn compile_from_value(root: &Value, workspace_root_agent: &str) -> Result<Vec<Gr
             }
         };
 
+        // The grant is stored as written; the `mcp` rules read a malformed part of it as
+        // covering nothing, so say which part at boot rather than letting calls fail silently.
+        if capability_name == "mcp" {
+            for problem in crate::subset::mcp_param_problems(&params) {
+                eprintln!("advance: WARN `capabilities.mcp`: {problem}");
+            }
+        }
+
         let grantee: ComponentId = workspace_root_agent.to_string();
         out.push(Grant {
             id: GrantId(format!("static:{grantee}:{capability_name}")),

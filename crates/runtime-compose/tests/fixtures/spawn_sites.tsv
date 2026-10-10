@@ -4,7 +4,7 @@ crates/runtime/src/runtime_lock.rs	let lstart = std::process::Command::new("ps")
 crates/capabilities/cap-llm/src/backend_local.rs	let mut cmd = Command::new(&self.command);	1	policy-checked	admit(SpawnSite::LocalSidecar)
 crates/capabilities/cap-llm/src/backend_cli.rs	let mut cmd = Command::new(command);	1	policy-checked	admit(SpawnSite::AgentCli)
 crates/capabilities/cap-llm/src/backend_cli.rs	let mut cmd = Command::new(command);	2	policy-checked	admit(SpawnSite::AgentCli)
-crates/capabilities/cap-mcp/src/stdio_transport.rs	let mut cmd = Command::new(command);	1	policy-checked	admit(SpawnSite::McpStdio)	unreached=McpClient,StdioMcpTransport	allow=crates/capabilities/cap-mcp/src/
+crates/capabilities/cap-mcp/src/stdio_transport.rs	let mut cmd = Command::new(command);	1	policy-checked	admit(SpawnSite::McpStdio)
 crates/services/pack-manager/src/fetch.rs	let mut cmd = std::process::Command::new("git");	1	policy-checked	admit(SpawnSite::PackGitSource)
 crates/services/pack-manager/src/fetch.rs	std::process::Command::new("git")	1	policy-checked	admit(SpawnSite::PackGitSource)
 crates/advance-home/src/connect.rs	let mut cmd = Command::new(bin);	1	policy-checked	admit(SpawnSite::DaemonLauncher)
@@ -22,6 +22,7 @@ crates/capabilities/cap-fs/src/meta_schema.rs	let status = std::process::Command
 crates/capabilities/cap-fs/src/meta_schema.rs	assert!(std::process::Command::new("mkfifo")	1	test-only	unit-test fixture
 crates/capabilities/cap-lifecycle/src/producer_boundary.rs	let made = std::process::Command::new("mkfifo")	1	test-only	unit-test fixture
 crates/runtime-compose/src/vlm_indexer.rs	let made_fifo = std::process::Command::new("mkfifo")	1	test-only	unit-test fixture
+crates/runtime-compose/src/mcp_wiring.rs	let made = std::process::Command::new("mkfifo")	1	test-only	unit-test fixture
 crates/runtime/src/runtime_lock.rs	let mut child = Command::new("sleep").arg("5").spawn().expect("sleep 5");	1	test-only	unit-test fixture
 crates/runtime/src/runtime_lock.rs	let mut child = Command::new("true").spawn().expect("true");	1	test-only	unit-test fixture
 crates/runtime/src/runtime_lock.rs	let mut child = Command::new("sleep").arg("5").spawn().expect("sleep 5");	2	test-only	unit-test fixture

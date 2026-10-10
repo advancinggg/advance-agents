@@ -6,7 +6,7 @@
 //!
 //! - success path: spawn-child materializes the child from the pack template,
 //!   submit-component admits the pack's task component under its FQ ref,
-//!   register-mcp-server (http) lands in the sink;
+//!   register-mcp-server (http) writes a server file;
 //! - failure path: an untrusted pack's stdio mcp-server is refused at step 2
 //!   → the step-1 spawn is COMPENSATED for real: tree node gone, child
 //!   workspace gone, `WorkflowStepFailed` names the compensation.
@@ -14,7 +14,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use advance_cli::pack_bridges::InMemoryMcpEntrySink;
+use advance_cli::mcp_wiring::{ControlPlaneMcpSink, McpControlPlane};
+use advance_cli::pack_bridges::McpEntrySink;
 use advance_cli::pack_production::{ClosureSecretStore, SchedulerWorkflowExecutor};
 use advance_pack_manager::{
     AutoApprove, DefaultMaterializer, InMemoryPackRegistry, Installer, MaterializeAction,
@@ -65,7 +66,7 @@ fn write_pack(root: &Path) -> PathBuf {
 struct Rig {
     tree: Arc<AgentTreeStore>,
     submit: Arc<InMemoryComponentSubmitApi>,
-    sink: Arc<InMemoryMcpEntrySink>,
+    servers_dir: PathBuf,
     executor: Arc<SchedulerWorkflowExecutor>,
     materializer: DefaultMaterializer,
     workspace: PathBuf,
@@ -101,7 +102,10 @@ async fn rig(tmp: &Path) -> Rig {
         resolver,
     ));
     let submit = Arc::new(InMemoryComponentSubmitApi::new());
-    let sink = Arc::new(InMemoryMcpEntrySink::new());
+    let servers_dir = workspace.join(".advance/mcp-servers");
+    std::fs::create_dir_all(&servers_dir).unwrap();
+    let plane = McpControlPlane::new(&workspace, &advance_runtime::config::McpConfig::default());
+    let sink = Arc::new(ControlPlaneMcpSink::new(plane));
     let secrets: Arc<dyn SecretStore> = Arc::new(ClosureSecretStore::new(|_| None));
     let executor = Arc::new(SchedulerWorkflowExecutor::new(
         spawner,
@@ -111,7 +115,7 @@ async fn rig(tmp: &Path) -> Rig {
         "root",
         registry_dyn.clone(),
         Arc::clone(&secrets),
-        Arc::clone(&sink) as Arc<dyn advance_cli::pack_bridges::McpEntrySink>,
+        sink as Arc<dyn McpEntrySink>,
     ));
     let materializer = DefaultMaterializer::new(
         registry_dyn,
@@ -121,7 +125,7 @@ async fn rig(tmp: &Path) -> Rig {
     Rig {
         tree,
         submit,
-        sink,
+        servers_dir,
         executor,
         materializer,
         workspace,
@@ -201,8 +205,12 @@ async fn pe_01_success_path_spawns_submits_and_registers() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id.as_str(), "p@1.0.0/components/nightly");
 
-    // register-mcp-server: the http entry reached the sink.
-    assert_eq!(r.sink.server_ids(), vec!["remote-tools".to_string()]);
+    // register-mcp-server: the http entry is a server file with origin.
+    let file = r.servers_dir.join("remote-tools.yaml");
+    let body = std::fs::read_to_string(&file).expect("server file");
+    assert!(body.contains("server-id: remote-tools"), "{body}");
+    assert!(body.contains("origin:"), "{body}");
+    assert!(body.contains("p@1.0.0"), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -243,7 +251,10 @@ async fn pe_02_trust_refusal_compensates_the_real_spawn() {
         .get_node(&AgentId("doomed-assistant".into()))
         .is_none());
     assert!(!r.workspace.join("doomed-assistant").exists());
-    assert!(r.sink.is_empty());
+    assert!(
+        !r.servers_dir.join("local-tools.yaml").exists(),
+        "a refused register writes no server file"
+    );
     assert!(r.submit.list_components().await.is_empty());
 }
 

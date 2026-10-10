@@ -447,6 +447,7 @@ pub(crate) async fn compose_graph(
         wiring_handles.tools_grant_reader.clone(),
         wiring_handles.web_grant.clone(),
         Some(wiring_handles.pack_runtime.clone()),
+        wiring_handles.mcp.clone(),
         LoopSpawnExtras {
             log: log.clone(),
             hooks_shutdown: CancellationToken::new(),
@@ -923,6 +924,7 @@ async fn try_spawn_agent_loop(
     tools_grant_reader: Option<Arc<dyn advance_shared_types::traits::ToolsGrantReader>>,
     web_grant: Option<Arc<dyn advance_shared_types::traits::GrantCheck>>,
     pack_runtime: Option<Arc<crate::pack_runtime::PackRuntime>>,
+    mcp: Option<Arc<crate::mcp_wiring::McpRuntime>>,
     extras: LoopSpawnExtras,
 ) -> Result<Option<SpawnedAgentLoop>, SpawnLoopError> {
     let log = &extras.log;
@@ -1200,22 +1202,32 @@ async fn try_spawn_agent_loop(
             )),
             None => Arc::new(crate::context_wiring::EmptyDecomposition),
         };
-        let callable: Arc<dyn CallableInventoryReader> = if let Some(reg) = tool_registry.as_ref() {
+        let wasm_entries = if let Some(reg) = tool_registry.as_ref() {
             let listed = cap_tools::ToolRegistry::list(reg.as_ref()).await;
             let allow = tools_grant_reader
                 .as_ref()
                 .and_then(|r| r.tool_allowlist(&cap_agent_id));
-            let entries = cap_tools::web::project_callable_tool_entries(
+            cap_tools::web::project_callable_tool_entries(
                 listed,
                 allow.as_deref(),
                 web_grant.as_deref(),
                 &cap_agent_id,
-            );
-            Arc::new(cap_tools::CallableInventory::new(entries, vec![]))
+            )
         } else {
-            Arc::new(crate::context_wiring::EmptyCallableInventory)
+            Vec::new()
         };
-        client_api_tools = tool_registry.as_ref().map(|_| Arc::clone(&callable));
+        let callable: Arc<dyn CallableInventoryReader> = match mcp.clone() {
+            Some(mcp) => Arc::new(crate::mcp_wiring::LiveCallableInventory::new(
+                wasm_entries,
+                mcp,
+            )),
+            None if tool_registry.is_some() => {
+                Arc::new(cap_tools::CallableInventory::new(wasm_entries, vec![]))
+            }
+            None => Arc::new(crate::context_wiring::EmptyCallableInventory),
+        };
+        client_api_tools =
+            (tool_registry.is_some() || mcp.is_some()).then(|| Arc::clone(&callable));
         let inner = crate::context_wiring::build_context_assembler_for_agent_with_pack_skills(
             assembler_bus,
             callable,
@@ -1274,7 +1286,16 @@ async fn try_spawn_agent_loop(
             web_grant.as_deref(),
             &cap_agent_id,
         );
-        client_api_tools = Some(Arc::new(cap_tools::CallableInventory::new(entries, vec![])));
+        client_api_tools = Some(match mcp.clone() {
+            Some(mcp) => Arc::new(crate::mcp_wiring::LiveCallableInventory::new(entries, mcp))
+                as Arc<dyn CallableInventoryReader>,
+            None => Arc::new(cap_tools::CallableInventory::new(entries, vec![])),
+        });
+    } else if let Some(mcp) = mcp.clone() {
+        client_api_tools = Some(Arc::new(crate::mcp_wiring::LiveCallableInventory::new(
+            Vec::new(),
+            mcp,
+        )));
     }
     // ComponentConfig.id carries the CAP id (the guest's self-identity for caps).
     let cfg = ComponentConfig {
@@ -1586,6 +1607,7 @@ pub async fn spawn_test_agent_loop(
         handles.tools_grant_reader.clone(),
         handles.web_grant.clone(),
         Some(handles.pack_runtime.clone()),
+        handles.mcp.clone(),
         LoopSpawnExtras::default(),
     )
     .await

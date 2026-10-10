@@ -17,7 +17,7 @@
 //! # or
 //! transport:
 //!   kind: http                      # https://… (any host) or http://<loopback>
-//!   endpoint-url: https://mcp.example.com/sse
+//!   endpoint-url: https://mcp.example.com/mcp   # the Streamable HTTP endpoint
 //! secret-refs:                      # stdio only: ENV_NAME → secret-store key
 //!   API_TOKEN: mcp-token
 //! ```
@@ -36,12 +36,18 @@
 //!   [`MAX_MCP_SERVER_YAML_BYTES`], alias-guarded and nesting-bounded like every
 //!   other pack-shipped YAML this crate parses.
 //!
+//! An `http` endpoint is the server's one Streamable HTTP endpoint. A server
+//! on the older HTTP+SSE transport (a GET stream such as `/sse` beside a
+//! separate message endpoint) parses here, but the MCP client refuses it when
+//! it connects.
+//!
 //! Trust (§3.2 rule 2) is NOT decided here — the manifest carries no trust; the
 //! bridge refuses `stdio` from a pack whose `.meta.yaml` trust is `untrusted`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use advance_shared_types::mcp::{is_valid_server_id, MAX_SERVER_ID_BYTES};
 use serde::Deserialize;
 
 use crate::component_manifest::yaml_nesting_within_bound;
@@ -51,7 +57,6 @@ use crate::materialize_impl::read_bytes_nofollow_bounded;
 
 /// Size cap on `mcp-servers/{name}.yaml` (the document is a handful of lines).
 pub const MAX_MCP_SERVER_YAML_BYTES: u64 = 64 * 1024;
-const MAX_SERVER_ID_LEN: usize = 128;
 const MAX_DESCRIPTION_LEN: usize = 1024;
 const MAX_COMMAND_LEN: usize = 4096;
 const MAX_ARGS: usize = 64;
@@ -70,6 +75,18 @@ pub struct McpServerManifest {
     pub transport: McpTransportDecl,
     /// `ENV_NAME → secret-store key`; empty unless `transport` is `stdio`.
     pub secret_refs: BTreeMap<String, String>,
+    /// The pack that materialized this file into the operator's servers
+    /// directory. `None` on a file the operator wrote.
+    pub origin: Option<McpServerOrigin>,
+}
+
+/// The pack that wrote a server file under `.advance/mcp-servers/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerOrigin {
+    /// `name@version` of the installed pack.
+    pub pack: String,
+    /// The FQ ref that registered it (`{pack}@{ver}/mcp-servers/{name}`).
+    pub config_ref: String,
 }
 
 /// The declared transport. Mirrors `cap_mcp::McpTransportSpec` minus the
@@ -103,6 +120,16 @@ struct RawManifest {
     transport: RawTransport,
     #[serde(default, rename = "secret-refs")]
     secret_refs: BTreeMap<String, String>,
+    #[serde(default)]
+    origin: Option<RawOrigin>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOrigin {
+    pack: String,
+    #[serde(rename = "config-ref")]
+    config_ref: String,
 }
 
 #[derive(Deserialize)]
@@ -232,29 +259,56 @@ pub fn parse_mcp_server_manifest_str(yaml: &str) -> Result<McpServerManifest, Pa
         });
     }
 
+    let origin = match raw.origin {
+        None => None,
+        Some(origin) => {
+            if origin.pack.trim().is_empty()
+                || origin.pack.contains('\0')
+                || origin.pack.len() > MAX_SECRET_REF_LEN
+            {
+                return Err(PackError::InvalidManifest(
+                    "origin.pack must be a non-empty pack id (name@version)".into(),
+                ));
+            }
+            if origin.config_ref.trim().is_empty()
+                || origin.config_ref.contains('\0')
+                || origin.config_ref.len() > MAX_COMMAND_LEN
+            {
+                return Err(PackError::InvalidManifest(
+                    "origin.config-ref must be a non-empty pack FQ ref".into(),
+                ));
+            }
+            Some(McpServerOrigin {
+                pack: origin.pack,
+                config_ref: origin.config_ref,
+            })
+        }
+    };
+
     Ok(McpServerManifest {
         server_id: raw.server_id,
         description,
         transport,
         secret_refs: raw.secret_refs,
+        origin,
     })
 }
 
+/// The shared server-id grammar (`advance_shared_types::mcp::is_valid_server_id`), which
+/// cap-mcp's whitelist applies too. The id is quoted in the error only when its length is in
+/// range.
 fn validate_server_id(id: &str) -> Result<(), PackError> {
-    if id.is_empty() || id.len() > MAX_SERVER_ID_LEN {
+    if is_valid_server_id(id) {
+        return Ok(());
+    }
+    if id.is_empty() || id.len() > MAX_SERVER_ID_BYTES {
         return Err(PackError::InvalidManifest(format!(
-            "server-id must be 1..={MAX_SERVER_ID_LEN} bytes"
+            "server-id must be 1..={MAX_SERVER_ID_BYTES} bytes"
         )));
     }
-    if !id
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        return Err(PackError::InvalidManifest(format!(
-            "server-id {id:?} must match [A-Za-z0-9._-]+"
-        )));
-    }
-    Ok(())
+    Err(PackError::InvalidManifest(format!(
+        "server-id {id:?} must match [A-Za-z0-9._-]+"
+    )))
 }
 
 fn validate_text(field: &str, value: &str, max: usize) -> Result<(), PackError> {
@@ -396,6 +450,31 @@ mod tests {
             parse_mcp_server_manifest_str("server-id: x\ntransport:\n  kind: ssh\n  host: h\n"),
             Err(PackError::InvalidManifest(_))
         ));
+    }
+
+    // The manifest accepts exactly the shared server-id grammar, which cap-mcp's whitelist
+    // applies too.
+    #[test]
+    fn server_ids_follow_the_shared_grammar() {
+        let longest = "a".repeat(MAX_SERVER_ID_BYTES);
+        let too_long = "a".repeat(MAX_SERVER_ID_BYTES + 1);
+        for id in [
+            "a",
+            "srv-1",
+            "alpha.beta_gamma",
+            longest.as_str(),
+            "",
+            "a b",
+            "srv:1",
+            "ü",
+            too_long.as_str(),
+        ] {
+            let doc = format!(
+                "server-id: {id:?}\ntransport:\n  kind: http\n  endpoint-url: https://h/\n"
+            );
+            let parsed = parse_mcp_server_manifest_str(&doc);
+            assert_eq!(parsed.is_ok(), is_valid_server_id(id), "{id:?}: {parsed:?}");
+        }
     }
 
     #[test]
