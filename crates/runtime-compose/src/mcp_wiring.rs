@@ -2680,7 +2680,7 @@ mod tests {
             ("path", "/lower/case"),
             ("PATH_EXTRA", "/extra"),
             (" PATH", "/spaced"),
-            ("PWD", "/daemon/cwd"),
+            ("OLDPWD", "/daemon/previous-cwd"),
             ("SHELL", "/bin/zsh"),
         ]));
         let env = stdio_child_env(host, &BTreeMap::new(), BTreeMap::new());
