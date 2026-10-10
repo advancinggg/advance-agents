@@ -1213,9 +1213,11 @@ done
         assert_eq!(marks(&home, "srv.calls").len(), 2);
     }
 
-    // Without `mcp` in the root's config nothing MCP exists: no host function, no runtime,
-    // no server process, although a server file is there and the warm-up is on. The start
-    // still removes the file of a pack that is not installed, and nothing else.
+    // Without `mcp` in the root's config nothing MCP exists: no host function, no runtime, no
+    // server process and not one MCP line when the daemon starts, although server files are
+    // there (one the loader would refuse, one of a pack that is not installed) and the warm-up
+    // is on. A start sweeps nothing; a pack event removes the file of the pack that is gone,
+    // quietly, and nothing else.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_root_that_does_not_declare_mcp_gets_nothing_mcp() {
         let home = home(
@@ -1233,17 +1235,51 @@ done
             "server-id: stale\ntransport:\n  kind: stdio\n  command: /bin/true\norigin:\n  \
              pack: gone@1.0.0\n  config-ref: gone@1.0.0/mcp-servers/stale\n",
         );
-        let (host, handles) = boot(&home).await;
-        assert!(
-            !dir.join("stale.yaml").exists(),
-            "the start removes the file of a pack that is not installed"
-        );
-        assert!(dir.join("srv.yaml").is_file() && dir.join("broken.yaml").is_file());
 
+        // Composed as `advance start` composes it, with every line it prints captured.
+        let log = advance_runtime_compose::test_support::MemoryComposeLog::new();
+        let started = advance_runtime_compose::compose(
+            advance_runtime_compose::ComposeOptions::daemon(&home.root, Arc::new(log.clone())),
+            Vec::new(),
+        )
+        .await
+        .expect("the daemon starts");
+        let printed = log.lines();
+        assert!(!printed.is_empty(), "the start's lines are captured");
+        let mcp_lines: Vec<&str> = printed
+            .iter()
+            .filter(|line| {
+                line.key.starts_with("mcp.")
+                    || line.text.contains("mcp:")
+                    || line.text.contains("mcp-servers")
+            })
+            .map(|line| line.text.as_str())
+            .collect();
+        assert!(mcp_lines.is_empty(), "no MCP line at start: {mcp_lines:?}");
+        started.shutdown().await.expect("the daemon stops");
+        assert!(dir.join("stale.yaml").is_file(), "the start sweeps nothing");
+
+        let (host, handles) = boot(&home).await;
+        assert!(dir.join("stale.yaml").is_file(), "no start sweeps");
         assert!(registered(&host).is_empty());
         assert!(handles.mcp.is_none());
         let error = link_mcp(&host).expect_err("mcp is not registered");
         assert!(error.contains("unknown capability"), "{error}");
+
+        let report = handles.pack_runtime.apply().await;
+        assert!(
+            !dir.join("stale.yaml").exists(),
+            "a pack event removes the file of a pack that is not installed"
+        );
+        assert!(dir.join("srv.yaml").is_file() && dir.join("broken.yaml").is_file());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("mcp")),
+            "a pack event reports nothing about MCP: {:?}",
+            report.warnings
+        );
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(
             !home.marks.join("srv.starts").exists(),

@@ -17,7 +17,8 @@
 //! - **Conflicts warn and skip.** A pack whose extension conflicts with the base or with a
 //!   pack merged before it is skipped as a whole. A preset or skill tool whose name is
 //!   already taken (a built-in preset, a workspace skill, another pack) is skipped. Nothing
-//!   here blocks boot or fails an install; each distinct warning is logged once.
+//!   here blocks boot or fails an install; a warning is logged once while it lasts (again
+//!   only after an apply without it).
 //! - **One version per pack.** When several versions of a pack are installed (mid-upgrade),
 //!   only the highest applies.
 //! - **Retired keys are ignored.** A pack installed by an older runtime may declare
@@ -255,7 +256,9 @@ struct Applied {
     presets: BTreeMap<String, String>,
     /// Pack skill tool id → the registered bytes' digest.
     tools: BTreeMap<String, [u8; 32]>,
-    /// Warnings already logged (each distinct one is logged once).
+    /// The warnings of the latest apply, and those the start sweep reported since: an apply
+    /// logs only the warnings not among them, so a warning that lasts is logged once, and
+    /// again only after an apply without it.
     warned: BTreeSet<String>,
 }
 
@@ -339,8 +342,11 @@ impl PackRuntime {
         let _ = self.mcp.set(Arc::downgrade(&mcp));
     }
 
-    /// The server-file directory, used to drop stale pack-origin files when
-    /// the root does not declare `mcp` (no client to reload).
+    /// The server-file directory, swept quietly on every apply when the root does not declare
+    /// `mcp` (no client to reload): stale pack-origin files go, and only a file that cannot be
+    /// removed is logged ([`remove_origins_not_in_quietly`]).
+    ///
+    /// [`remove_origins_not_in_quietly`]: crate::mcp_wiring::McpControlPlane::remove_origins_not_in_quietly
     pub fn attach_mcp_plane(&self, plane: crate::mcp_wiring::McpControlPlane) {
         let _ = self.mcp_plane.set(plane);
     }
@@ -433,7 +439,7 @@ impl PackRuntime {
             mcp.set_trusted_packs(trusted_labels(&packs));
             mcp.drop_uninstalled_origins(&installed)
         } else if let Some(plane) = self.mcp_plane.get() {
-            plane.remove_origins_not_in(&installed)
+            plane.remove_origins_not_in_quietly(&installed)
         } else {
             McpSweep::default()
         };
@@ -468,27 +474,27 @@ impl PackRuntime {
     }
 
     /// Delete the pack-origin MCP server files whose origin pack is not installed, as
-    /// [`apply`](Self::apply) does on every apply: through the attached MCP runtime
+    /// [`apply`](Self::apply) does on every apply, through the attached MCP runtime
     /// ([`McpRuntime::start`](crate::mcp_wiring::McpRuntime::start), which reloads the client
-    /// when a file went and then runs its warm-up), or through the attached plane when the root
-    /// does not declare `mcp`. The daemon runs this once at start, after attaching both (the
-    /// boot applies run before they exist), so a pack uninstalled while the daemon was down
-    /// (`advance pack uninstall` touches no server file) loses its server files, and its
-    /// servers, before an agent runs. A file whose origin could not be read is reported like an
-    /// apply warning, once.
+    /// when a file went and then runs its warm-up). The daemon runs this once at start, after
+    /// attaching the runtime (the boot applies run before it exists), so a pack uninstalled
+    /// while the daemon was down (`advance pack uninstall` touches no server file) loses its
+    /// server files, and its servers, before an agent runs. A file whose origin could not be
+    /// read is reported like an apply warning, once.
+    ///
+    /// A home whose root does not declare `mcp` (no runtime attached) serves no server file,
+    /// so nothing is swept and nothing is printed at its start: its applies sweep quietly, and
+    /// the first start that declares `mcp` sweeps before any agent runs.
     pub async fn sweep_mcp_origins(&self) -> McpSweep {
+        let Some(mcp) = self.mcp.get().and_then(std::sync::Weak::upgrade) else {
+            return McpSweep::default();
+        };
         let mut state = self.state.lock().await;
         let mut shadowed = Vec::new();
         let packs = effective_packs(self.registry.list_installed(), &mut shadowed);
         let installed: BTreeSet<String> = packs.iter().map(label).collect();
-        let sweep = if let Some(mcp) = self.mcp.get().and_then(std::sync::Weak::upgrade) {
-            mcp.set_trusted_packs(trusted_labels(&packs));
-            mcp.start(&installed)
-        } else if let Some(plane) = self.mcp_plane.get() {
-            plane.remove_origins_not_in(&installed)
-        } else {
-            McpSweep::default()
-        };
+        mcp.set_trusted_packs(trusted_labels(&packs));
+        let sweep = mcp.start(&installed);
         for warning in &sweep.warnings {
             let warning = format!("mcp: {warning}");
             if state.warned.insert(warning.clone()) {
@@ -965,5 +971,70 @@ mod tests {
             BTreeSet::from(["signed@1.0.0".to_string(), "also-signed@1.0.0".to_string()])
         );
         assert!(trusted_labels(&[]).is_empty());
+    }
+
+    /// Keeps the text of every line the pack runtime and the plane would print.
+    #[derive(Default)]
+    struct Lines(std::sync::Mutex<Vec<String>>);
+
+    impl crate::api::ComposeLog for Lines {
+        fn line(&self, line: &crate::api::ComposeLogLine) {
+            self.0.lock().unwrap().push(line.text.clone());
+        }
+        fn ready(&self, _: &crate::api::ComposeLogLine) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // A home whose root does not declare `mcp` has the server-file directory attached and no
+    // MCP runtime. Its start sweeps nothing and prints nothing; a pack event removes the file
+    // of a pack that is not installed without a line and without an apply warning, and leaves
+    // the operator's files, a broken one included.
+    #[tokio::test]
+    async fn a_home_without_mcp_sweeps_only_on_pack_events_and_quietly() {
+        let ws = tempfile::tempdir().unwrap();
+        let dir = ws.path().join(".advance/mcp-servers");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stdio = "transport:\n  kind: stdio\n  command: /bin/true\n";
+        let stale = dir.join("stale.yaml");
+        std::fs::write(
+            &stale,
+            format!(
+                "server-id: stale\n{stdio}origin:\n  pack: gone@1.0.0\n  config-ref: \
+                 gone@1.0.0/mcp-servers/stale\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("ops.yaml"), format!("server-id: ops\n{stdio}")).unwrap();
+        std::fs::write(dir.join("broken.yaml"), "server-id: [unclosed\n").unwrap();
+
+        let lines = Arc::new(Lines::default());
+        let log = LogHandle::new(lines.clone());
+        let packs_dir = ws.path().join(".advance/packs");
+        let runtime = PackRuntime::new(
+            Arc::new(InMemoryPackRegistry::new(packs_dir.clone())),
+            packs_dir,
+        )
+        .with_log(log.clone());
+        runtime.attach_mcp_plane(
+            crate::mcp_wiring::McpControlPlane::new(
+                ws.path(),
+                &advance_runtime::config::McpConfig::default(),
+            )
+            .with_log(log),
+        );
+
+        assert_eq!(runtime.sweep_mcp_origins().await, McpSweep::default());
+        assert!(stale.is_file(), "the start sweeps nothing");
+
+        let report = runtime.apply().await;
+        assert!(
+            !stale.exists(),
+            "a pack event removes the file of a pack that is not installed"
+        );
+        assert!(dir.join("ops.yaml").is_file() && dir.join("broken.yaml").is_file());
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        let printed = lines.0.lock().unwrap().clone();
+        assert!(printed.is_empty(), "{printed:?}");
     }
 }

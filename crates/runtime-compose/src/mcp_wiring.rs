@@ -3,8 +3,9 @@
 //!
 //! All of it exists only when the root agent's `.agent/config.yaml` declares the `mcp`
 //! capability. A home that does not declare it loads no server file, builds no client,
-//! registers no host function and starts no server; it reads its server files only to remove
-//! those of packs that are gone (below).
+//! registers no host function, starts no server and prints nothing about MCP when it starts;
+//! a pack event reads its server files only to remove those of packs that are gone, without a
+//! word unless one cannot be removed (below).
 //!
 //! ## Server files
 //!
@@ -30,22 +31,32 @@
 //!
 //! An absent directory is a home without servers. Entries that are not named `*.yaml`, and
 //! hidden ones (a name starting with a dot), are not server files and are ignored. The loader
-//! visits the directory's entries and compares each file's name with the id inside it; it
-//! never builds a path from a server id.
+//! and the sweep visit the directory's entries, and the loader compares each file's name with
+//! the id inside it: neither builds a path from a server id.
 //!
 //! A pack's server is a file in the same directory, written by the pack's workflow
-//! ([`ControlPlaneMcpSink`]) with an `origin` block naming the pack, and gone with the pack:
-//! every pack event and every start of the daemon (for a root that declares `mcp`,
-//! [`McpRuntime::start`], before the warm-up) sweep the files whose origin pack is not
-//! installed ([`McpControlPlane::remove_origins_not_in`]), so a pack uninstalled while the
-//! daemon was down (`advance pack uninstall` touches no server file) loses its servers before
-//! an agent runs. The sweep reads each `*.yaml` entry for its `origin` block alone, hidden
-//! names included and whatever the loader makes of the rest of the file; a file whose origin
-//! cannot be read is reported and left. The sink writes only what the loader will read back
-//! as the same server: an id of the shared grammar (no leading dot, so the file is never
-//! hidden), a stdio transport only while `mcp.allow-stdio` is `true`, a body within the size
-//! cap that re-parses to the registration, into the directory itself (never through a
-//! symlink), through a fresh temporary file renamed into place.
+//! ([`ControlPlaneMcpSink`]) with an `origin` block naming the pack (`name@version`), and gone
+//! with the pack: the files whose origin pack is not installed (not among the packs that
+//! apply, the highest installed version of each) are swept on every pack event and, for a root
+//! that declares `mcp`, when the daemon starts ([`McpRuntime::start`], before the warm-up and
+//! before any agent runs), so a pack uninstalled while the daemon was down (`advance pack
+//! uninstall` touches no server file) loses its servers before they can serve. The sweep
+//! ([`McpControlPlane::remove_origins_not_in`]) reads each `*.yaml` entry for its `origin`
+//! block alone, hidden names included and whatever the loader makes of the rest of the file;
+//! each removal is logged, and a file whose origin cannot be read is reported and left. A home
+//! whose root does not declare `mcp` serves no file, so its start sweeps nothing and its pack
+//! events sweep quietly ([`McpControlPlane::remove_origins_not_in_quietly`]): the same files
+//! go, and only a file that cannot be removed is logged.
+//!
+//! The sink writes only what the loader will read back as the same server: an id of the
+//! shared grammar, a stdio transport only while `mcp.allow-stdio` is `true`, a body within
+//! the size cap that re-parses to the registration, into the directory itself (never through
+//! a symlink), through a fresh temporary file renamed into place. It is the one part of this
+//! module that makes a path of a server id, `<dir>/<id>.yaml` and its temporary
+//! `.<id>.yaml.tmp`: the grammar (`[A-Za-z0-9._-]`, not starting with `.`) admits no path
+//! separator and no hidden name, so the file is always a visible entry of the directory
+//! itself. On a home whose root does not declare `mcp` the sink writes a registration all the
+//! same, and logs that its server is not loaded.
 //!
 //! ## Transports
 //!
@@ -121,9 +132,10 @@
 //! readers. One read shows at most [`MCP_PROMPT_BUDGET_BYTES`] of tool text: the tools of the
 //! operator's servers first, then those of trusted packs' servers, then the others, each
 //! group by server id and tool name. The tools past it are counted, the prompt's tools
-//! section closes with a line saying how many, and stderr says so once for each number. A
-//! read lists in the background the servers the cache lacks, so the first read after the
-//! daemon starts shows no MCP tools unless `mcp.warm-tool-cache` filled the cache.
+//! section closes with a line saying how many, and stderr says so whenever that number
+//! changes to one that is not zero. A read lists in the background the servers the cache
+//! lacks, so the first read after the daemon starts shows no MCP tools unless
+//! `mcp.warm-tool-cache` filled the cache.
 //!
 //! ## Shutdown
 //!
@@ -293,10 +305,24 @@ impl McpControlPlane {
     /// unreadable) is not swept and adds no warning: no file in it can serve, and the loader
     /// reports it whenever it reads.
     pub fn remove_origins_not_in(&self, installed: &BTreeSet<String>) -> McpSweep {
+        self.sweep(installed, SweepReport::Everything)
+    }
+
+    /// [`remove_origins_not_in`](Self::remove_origins_not_in) for a home whose root does not
+    /// declare `mcp`, which serves no server file: the same files go, but a removal and a file
+    /// whose origin cannot be read say nothing. The one line it logs is
+    /// `advance: WARN mcp: could not remove stale server file <path>: <error>`, for a file it
+    /// cannot remove; its warnings are always empty.
+    pub fn remove_origins_not_in_quietly(&self, installed: &BTreeSet<String>) -> McpSweep {
+        self.sweep(installed, SweepReport::FailuresOnly)
+    }
+
+    fn sweep(&self, installed: &BTreeSet<String>, report: SweepReport) -> McpSweep {
         let mut sweep = McpSweep::default();
         let Ok(Some(entries)) = self.entries() else {
             return sweep;
         };
+        let everything = report == SweepReport::Everything;
         let mut warnings = Warnings::default();
         let mut names: Vec<String> = entries
             .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
@@ -308,7 +334,9 @@ impl McpControlPlane {
             let text = match read_bounded_file(&path, MAX_SWEEP_FILE_BYTES) {
                 Ok(text) => text,
                 Err(reason) => {
-                    warnings.push(format!("server file {name:?} is not swept: {reason}"));
+                    if everything {
+                        warnings.push(format!("server file {name:?} is not swept: {reason}"));
+                    }
                     continue;
                 }
             };
@@ -316,10 +344,12 @@ impl McpControlPlane {
                 Ok(Some(origin)) => origin,
                 Ok(None) => continue,
                 Err(e) => {
-                    warnings.push(format!(
-                        "server file {name:?} is not swept: its origin cannot be read: {}",
-                        manifest_reason(e)
-                    ));
+                    if everything {
+                        warnings.push(format!(
+                            "server file {name:?} is not swept: its origin cannot be read: {}",
+                            manifest_reason(e)
+                        ));
+                    }
                     continue;
                 }
             };
@@ -328,21 +358,31 @@ impl McpControlPlane {
             }
             match std::fs::remove_file(&path) {
                 Ok(()) => {
-                    self.log.err(
-                        log_keys::MCP_STALE_FILE_REMOVED,
-                        printable(&format!(
-                            "advance: mcp: removed server file {}: its pack {} is not installed",
-                            path.display(),
-                            origin.pack
-                        )),
-                    );
+                    if everything {
+                        self.log.err(
+                            log_keys::MCP_STALE_FILE_REMOVED,
+                            printable(&format!(
+                                "advance: mcp: removed server file {}: its pack {} is not \
+                                 installed",
+                                path.display(),
+                                origin.pack
+                            )),
+                        );
+                    }
                     sweep.removed.push(name);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => warnings.push(format!(
+                Err(e) if everything => warnings.push(format!(
                     "server file {name:?} of the uninstalled pack {} could not be removed: {e}",
                     origin.pack
                 )),
+                Err(e) => self.log.err(
+                    log_keys::MCP_WARN,
+                    printable(&format!(
+                        "advance: WARN mcp: could not remove stale server file {}: {e}",
+                        path.display()
+                    )),
+                ),
             }
         }
         sweep.warnings = warnings.into_lines();
@@ -519,6 +559,17 @@ fn read_bounded_file(path: &Path, cap: u64) -> Result<String, String> {
         return Err(too_large());
     }
     String::from_utf8(bytes).map_err(|_| "it is not valid UTF-8".to_string())
+}
+
+/// What a sweep of the pack-origin server files says about what it did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SweepReport {
+    /// Each removal is logged; a file whose origin cannot be read, or that cannot be removed,
+    /// is a warning of the sweep ([`McpControlPlane::remove_origins_not_in`]).
+    Everything,
+    /// Only a file that cannot be removed is logged, and the sweep has no warning
+    /// ([`McpControlPlane::remove_origins_not_in_quietly`]).
+    FailuresOnly,
 }
 
 /// What one sweep of the pack-origin server files did
@@ -1628,7 +1679,9 @@ impl CallableInventoryReader for LiveCallableInventory {
 /// existing file as the loader does (a regular file within the cap, never through a symlink)
 /// and refuses to replace or remove what it cannot read; it refuses a servers directory the
 /// loader would not read (a symlink, or an entry that is not a directory); and it writes
-/// through a fresh temporary file renamed into place.
+/// through a fresh temporary file renamed into place. On a home whose root does not declare
+/// `mcp` ([`bind_runtime`](Self::bind_runtime) was never called) a registration is written
+/// all the same, and logged as registered but not loaded.
 pub struct ControlPlaneMcpSink {
     plane: McpControlPlane,
     runtime: Mutex<Option<Weak<McpRuntime>>>,
@@ -1643,21 +1696,43 @@ impl ControlPlaneMcpSink {
         }
     }
 
-    /// The runtime that reloads after a register or deregister. Absent: files
-    /// are still written, and nothing is connected.
+    /// The runtime that reloads after a register or deregister: the daemon binds it when the
+    /// root declares `mcp`. Absent (a root that does not declare `mcp`): files are still
+    /// written, nothing is connected, and each registration is logged as not loaded.
     pub fn bind_runtime(&self, runtime: Arc<McpRuntime>) {
         *self.runtime.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&runtime));
     }
 
-    fn reload(&self) {
-        if let Some(runtime) = self
-            .runtime
+    /// The runtime bound to this sink: `None` when none was ever bound (a root that does not
+    /// declare `mcp`), `Some(None)` once it is gone (the daemon is stopping).
+    fn bound_runtime(&self) -> Option<Option<Arc<McpRuntime>>> {
+        self.runtime
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .and_then(Weak::upgrade)
-        {
+            .map(Weak::upgrade)
+    }
+
+    fn reload(&self) {
+        if let Some(Some(runtime)) = self.bound_runtime() {
             runtime.reload();
+        }
+    }
+
+    /// Log, on a home whose root does not declare `mcp` (no runtime was bound), that the
+    /// server `registration` names is registered but not loaded: the workflow step succeeds,
+    /// and nothing else would tell the operator that the server does not serve.
+    fn report_not_loaded(&self, registration: &McpRegistration) {
+        if self.bound_runtime().is_none() {
+            self.plane.log.err(
+                log_keys::MCP_WARN,
+                printable(&format!(
+                    "advance: WARN mcp: server '{}' of pack {} is registered but not loaded: the \
+                     root agent's .agent/config.yaml does not declare `mcp` (add `mcp: true` \
+                     and restart)",
+                    registration.server_id, registration.origin_pack
+                )),
+            );
         }
     }
 
@@ -1784,6 +1859,7 @@ impl McpEntrySink for ControlPlaneMcpSink {
                     )));
                 }
                 Some(_) if matches_registration(&manifest, &registration) => {
+                    self.report_not_loaded(&registration);
                     return Ok(McpRegister::Unchanged(id));
                 }
                 Some(_) => {
@@ -1795,6 +1871,7 @@ impl McpEntrySink for ControlPlaneMcpSink {
         }
         write_server_file(self.plane.dir(), &path, &id, &body)?;
         self.reload();
+        self.report_not_loaded(&registration);
         Ok(McpRegister::Created(id))
     }
 
@@ -3716,6 +3793,81 @@ mod tests {
         assert!(!ws.path().join(".advance/mcp-servers/srv.yaml").exists());
     }
 
+    // On a home whose root does not declare `mcp` no runtime is bound to the sink: a
+    // registration is written all the same, and each one is logged as not loaded. A sink with
+    // a runtime bound (a root that declares `mcp`) loads the server and says nothing of the
+    // kind.
+    #[tokio::test]
+    async fn a_registration_without_a_runtime_is_logged_as_not_loaded() {
+        const NOT_LOADED: &str = "advance: WARN mcp: server 'srv' of pack p@1.0.0 is registered \
+                                  but not loaded: the root agent's .agent/config.yaml does not \
+                                  declare `mcp` (add `mcp: true` and restart)";
+        let ws = tempfile::tempdir().unwrap();
+        let log = Arc::new(RecordingLog::default());
+        let sink = ControlPlaneMcpSink::new(plane(ws.path()).with_log(LogHandle::new(log.clone())));
+        assert!(sink
+            .register(registration("srv", "p@1.0.0"))
+            .unwrap()
+            .created());
+        assert!(ws.path().join(".advance/mcp-servers/srv.yaml").is_file());
+        assert_eq!(log.lines(), [NOT_LOADED]);
+        assert!(!sink
+            .register(registration("srv", "p@1.0.0"))
+            .unwrap()
+            .created());
+        assert_eq!(
+            log.lines(),
+            [NOT_LOADED, NOT_LOADED],
+            "every registration says so"
+        );
+        sink.deregister("srv").unwrap();
+        assert_eq!(log.lines().len(), 2, "a deregistration says nothing");
+
+        let bound_log = Arc::new(RecordingLog::default());
+        let control = plane(ws.path()).with_log(LogHandle::new(bound_log.clone()));
+        let runtime = McpRuntime::for_test_over(
+            Arc::new(McpClient::new(
+                Arc::new(McpServersConfig::builder().build()),
+                Arc::new(CleanLeak),
+                None,
+            )),
+            mcp_gate(
+                Arc::new(RecordingCheck::default()),
+                grant_store(),
+                WebRunMode::Standard,
+            ),
+            BTreeMap::new(),
+            control.clone(),
+            LoopbackExemptions::none(),
+        );
+        let sink = ControlPlaneMcpSink::new(control);
+        sink.bind_runtime(Arc::clone(&runtime));
+        assert!(sink
+            .register(registration("srv", "p@1.0.0"))
+            .unwrap()
+            .created());
+        assert!(!sink
+            .register(registration("srv", "p@1.0.0"))
+            .unwrap()
+            .created());
+        assert!(
+            bound_log
+                .lines()
+                .iter()
+                .all(|line| !line.contains("not loaded")),
+            "{:?}",
+            bound_log.lines()
+        );
+        let configured: Vec<String> = runtime
+            .client()
+            .list_servers()
+            .await
+            .into_iter()
+            .map(|server| server.id)
+            .collect();
+        assert_eq!(configured, ["srv"], "the bound runtime loaded the server");
+    }
+
     #[test]
     fn stale_pack_origin_files_are_removed_when_the_pack_is_gone() {
         let ws = tempfile::tempdir().unwrap();
@@ -3874,6 +4026,88 @@ mod tests {
             plane(absent.path()).remove_origins_not_in(&installed),
             McpSweep::default()
         );
+    }
+
+    // The sweep of a home whose root does not declare `mcp` removes the same stale pack files,
+    // and says nothing about a removal or a file whose origin cannot be read: only a file that
+    // cannot be removed is logged.
+    #[cfg(unix)]
+    #[test]
+    fn the_quiet_sweep_removes_the_same_files_and_logs_only_a_failed_removal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let ws = tempfile::tempdir().unwrap();
+        let dir = ws.path().join(".advance/mcp-servers");
+        let gone = |id: &str| origin_block("gone@1.0.0", id);
+        server_file(
+            ws.path(),
+            "stale.yaml",
+            &format!("server-id: stale\n{STDIO}{}", gone("stale")),
+        );
+        server_file(
+            ws.path(),
+            ".hidden.yaml",
+            &format!("server-id: hidden\n{STDIO}{}", gone("hidden")),
+        );
+        stdio_server(ws.path(), "ops");
+        server_file(
+            ws.path(),
+            "kept.yaml",
+            &format!(
+                "server-id: kept\n{STDIO}{}",
+                origin_block("here@1.0.0", "kept")
+            ),
+        );
+        server_file(ws.path(), "broken.yaml", "server-id: [unclosed\n");
+        let outside = ws.path().join("outside.yaml");
+        std::fs::write(
+            &outside,
+            format!("server-id: linked\n{STDIO}{}", gone("linked")),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("linked.yaml")).unwrap();
+
+        let log = Arc::new(RecordingLog::default());
+        let control = plane(ws.path()).with_log(LogHandle::new(log.clone()));
+        let installed = BTreeSet::from(["here@1.0.0".to_string()]);
+        let sweep = control.remove_origins_not_in_quietly(&installed);
+        assert_eq!(sweep.removed, [".hidden.yaml", "stale.yaml"]);
+        assert!(sweep.warnings.is_empty(), "{:?}", sweep.warnings);
+        assert!(log.lines().is_empty(), "{:?}", log.lines());
+        for name in ["ops.yaml", "kept.yaml", "broken.yaml", "linked.yaml"] {
+            assert!(std::fs::symlink_metadata(dir.join(name)).is_ok(), "{name}");
+        }
+        assert!(outside.is_file(), "the link's target is untouched");
+
+        // A stale file in a directory that refuses removals stays, and is the one line said.
+        // The probe tells whether this process can remove files there all the same (root can).
+        server_file(
+            ws.path(),
+            "stuck.yaml",
+            &format!("server-id: stuck\n{STDIO}{}", gone("stuck")),
+        );
+        std::fs::write(dir.join("probe"), "").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let removals_refused = std::fs::remove_file(dir.join("probe")).is_err();
+        let sweep = control.remove_origins_not_in_quietly(&installed);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(sweep.warnings.is_empty(), "{:?}", sweep.warnings);
+        if removals_refused {
+            assert_eq!(sweep.removed, [] as [&str; 0]);
+            assert!(dir.join("stuck.yaml").is_file());
+            let lines = log.lines();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(
+                lines[0].starts_with(&format!(
+                    "advance: WARN mcp: could not remove stale server file {}: ",
+                    dir.join("stuck.yaml").display()
+                )),
+                "{lines:?}"
+            );
+        } else {
+            assert_eq!(sweep.removed, ["stuck.yaml"]);
+            assert!(log.lines().is_empty(), "{:?}", log.lines());
+        }
     }
 
     /// The pack `pack`'s stdio registration of `id`.
