@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use advance_runtime::config::{
     AgentCliSpec, AgentCliVendor, InferenceBackendClass, LlmProviderConfig, ProviderBackend,
@@ -61,6 +62,16 @@ struct RecordingPort {
     calls: AtomicUsize,
     last_prompt: Mutex<String>,
     reply: String,
+    last_remaining: Mutex<Option<Duration>>,
+}
+
+fn recording(reply: &str) -> RecordingPort {
+    RecordingPort {
+        calls: AtomicUsize::new(0),
+        last_prompt: Mutex::new(String::new()),
+        reply: reply.into(),
+        last_remaining: Mutex::new(None),
+    }
 }
 
 #[async_trait]
@@ -70,6 +81,8 @@ impl InferenceBackendPort for RecordingPort {
         req: InferenceChatRequest,
     ) -> Result<InferenceChatResponse, InferenceBackendError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_remaining.lock().unwrap() =
+            Some(req.deadline.saturating_duration_since(Instant::now()));
         *self.last_prompt.lock().unwrap() = req
             .messages
             .iter()
@@ -158,11 +171,7 @@ fn user(text: &str) -> Vec<ChatMessage> {
 
 #[tokio::test]
 async fn agent_cli_prompt_is_scanned_before_hand_off_and_reply_after() {
-    let port = Arc::new(RecordingPort {
-        calls: AtomicUsize::new(0),
-        last_prompt: Mutex::new(String::new()),
-        reply: "fine".into(),
-    });
+    let port = Arc::new(recording("fine"));
     let detector = Arc::new(MarkerDetector {
         marker: "SECRET-MARKER",
         scans: Mutex::new(Vec::new()),
@@ -197,11 +206,7 @@ async fn agent_cli_prompt_is_scanned_before_hand_off_and_reply_after() {
 
 #[tokio::test]
 async fn agent_cli_reply_that_fails_the_scan_is_discarded() {
-    let port = Arc::new(RecordingPort {
-        calls: AtomicUsize::new(0),
-        last_prompt: Mutex::new(String::new()),
-        reply: "here is SECRET-MARKER".into(),
-    });
+    let port = Arc::new(recording("here is SECRET-MARKER"));
     let detector = Arc::new(MarkerDetector {
         marker: "SECRET-MARKER",
         scans: Mutex::new(Vec::new()),
@@ -223,11 +228,7 @@ async fn agent_cli_reply_that_fails_the_scan_is_discarded() {
 
 #[tokio::test]
 async fn agent_cli_without_a_detector_fails_closed() {
-    let port = Arc::new(RecordingPort {
-        calls: AtomicUsize::new(0),
-        last_prompt: Mutex::new(String::new()),
-        reply: "fine".into(),
-    });
+    let port = Arc::new(recording("fine"));
     let gw = gateway(port.clone(), None);
     let err = gw
         .chat_for_run(
@@ -242,6 +243,134 @@ async fn agent_cli_without_a_detector_fails_closed() {
         .expect_err("no detector");
     assert!(err.to_string().contains("egress scan not wired"), "{err}");
     assert_eq!(port.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn agent_cli_generate_without_timeout_outruns_the_http_default() {
+    let port = Arc::new(recording("fine"));
+    let gw = gateway(
+        port.clone(),
+        Some(Arc::new(MarkerDetector {
+            marker: "unused",
+            scans: Mutex::new(Vec::new()),
+        })),
+    );
+    gw.chat_for_run(
+        user("hello"),
+        ChatParams {
+            model: Some("sonnet".into()),
+            ..Default::default()
+        },
+        "run-deadline".into(),
+    )
+    .await
+    .expect("agent-cli reply");
+    let remaining = port
+        .last_remaining
+        .lock()
+        .unwrap()
+        .expect("deadline recorded");
+    assert!(
+        remaining > Duration::from_secs(30),
+        "unset generate_timeout must not use the 30s HTTP default, remaining {remaining:?}"
+    );
+    assert!(
+        remaining <= crate::backend_cli::MAX_CALL_DURATION,
+        "agent-cli deadline must not exceed MAX_CALL_DURATION, remaining {remaining:?}"
+    );
+}
+
+#[tokio::test]
+async fn agent_cli_explicit_generate_timeout_still_bounds_the_hop() {
+    let port = Arc::new(recording("fine"));
+    let gw = gateway(
+        port.clone(),
+        Some(Arc::new(MarkerDetector {
+            marker: "unused",
+            scans: Mutex::new(Vec::new()),
+        })),
+    )
+    .with_generate_timeout(Duration::from_millis(200));
+    gw.chat_for_run(
+        user("hello"),
+        ChatParams {
+            model: Some("sonnet".into()),
+            ..Default::default()
+        },
+        "run-short".into(),
+    )
+    .await
+    .expect("explicit timeout still completes a fast reply");
+    let remaining = port
+        .last_remaining
+        .lock()
+        .unwrap()
+        .expect("deadline recorded");
+    assert!(
+        remaining <= Duration::from_millis(200),
+        "with_generate_timeout must still bind the hop, remaining {remaining:?}"
+    );
+    assert!(
+        remaining < Duration::from_secs(30),
+        "explicit timeout must not fall through to the 30s or 600s budget, remaining {remaining:?}"
+    );
+}
+
+#[test]
+fn agent_cli_elapsed_does_not_expire_the_next_cloud_hop() {
+    let gw = gateway(
+        Arc::new(recording("fine")),
+        Some(Arc::new(MarkerDetector {
+            marker: "unused",
+            scans: Mutex::new(Vec::new()),
+        })),
+    );
+    let start = Instant::now();
+    let cli = gw.hop_deadline(start, InferenceBackendClass::AgentCli, Duration::ZERO);
+    assert_eq!(
+        cli.duration_since(start),
+        crate::backend_cli::MAX_CALL_DURATION
+    );
+    let cloud = gw.hop_deadline(start, InferenceBackendClass::CloudHttp, Duration::ZERO);
+    assert_eq!(cloud.duration_since(start), cap_http::DEFAULT_TIMEOUT);
+    assert_eq!(
+        gw.hop_deadline(start, InferenceBackendClass::Local, Duration::ZERO)
+            .duration_since(start),
+        cap_http::DEFAULT_TIMEOUT
+    );
+    assert_eq!(
+        gw.hop_deadline(start, InferenceBackendClass::MeshRemote, Duration::ZERO)
+            .duration_since(start),
+        cap_http::DEFAULT_TIMEOUT
+    );
+    let after_cli = gw.hop_deadline(
+        start,
+        InferenceBackendClass::CloudHttp,
+        Duration::from_secs(61),
+    );
+    assert_eq!(
+        after_cli.duration_since(start),
+        cap_http::DEFAULT_TIMEOUT + Duration::from_secs(61)
+    );
+    assert!(after_cli > start + Duration::from_secs(61));
+
+    let limited = gw.with_generate_timeout(Duration::from_millis(80));
+    assert_eq!(
+        limited
+            .hop_deadline(
+                start,
+                InferenceBackendClass::AgentCli,
+                Duration::from_secs(61)
+            )
+            .duration_since(start),
+        Duration::from_millis(80)
+    );
+    assert_eq!(
+        limited
+            .hop_deadline(start, InferenceBackendClass::CloudHttp, Duration::ZERO)
+            .duration_since(start),
+        Duration::from_millis(80)
+    );
 }
 
 #[test]

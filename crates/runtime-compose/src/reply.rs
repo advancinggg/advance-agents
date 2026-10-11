@@ -63,6 +63,11 @@ pub struct ReplyRegistry {
     pending_message: Mutex<HashMap<String, VecDeque<String>>>,
     /// stream_key stored on a Client API message_id (pointer only, never body).
     keys_by_message: Mutex<HashMap<String, String>>,
+    /// Client API message id currently in flight for each agent alias.
+    inflight_message: Mutex<HashMap<String, String>>,
+    /// Redacted failure class keyed by Client API message id. The only value stored
+    /// is `subscription-usage-limit`.
+    failure_by_message: Mutex<HashMap<String, String>>,
 }
 
 impl ReplyRegistry {
@@ -74,6 +79,8 @@ impl ReplyRegistry {
             last_stream_key: Mutex::new(HashMap::new()),
             pending_message: Mutex::new(HashMap::new()),
             keys_by_message: Mutex::new(HashMap::new()),
+            inflight_message: Mutex::new(HashMap::new()),
+            failure_by_message: Mutex::new(HashMap::new()),
         }
     }
 
@@ -121,6 +128,62 @@ impl ReplyRegistry {
             .entry(slot)
             .or_default()
             .push_back(message_id.to_string());
+        let mut inflight = self
+            .inflight_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in self.alias_keys(agent_id) {
+            inflight.insert(key, message_id.to_string());
+        }
+    }
+
+    fn inflight_message_id(&self, agent_id: &str) -> Option<String> {
+        let inflight = self
+            .inflight_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in self.alias_keys(agent_id) {
+            if let Some(id) = inflight.get(&key) {
+                return Some(id.clone());
+            }
+        }
+        None
+    }
+
+    /// Attach the redacted subscription-usage class to the in-flight Client API message.
+    /// The stored value is only the fixed token.
+    pub fn record_subscription_usage_limit(&self, agent_id: &str) {
+        let Some(message_id) = self.inflight_message_id(agent_id) else {
+            return;
+        };
+        self.failure_by_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                message_id,
+                cap_llm::SUBSCRIPTION_USAGE_LIMIT_CLASS.to_string(),
+            );
+    }
+
+    /// Drop the redacted class for the in-flight message after a successful model call.
+    pub fn clear_recorded_failure_class(&self, agent_id: &str) {
+        let Some(message_id) = self.inflight_message_id(agent_id) else {
+            return;
+        };
+        self.failure_by_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&message_id);
+    }
+
+    /// `Some("subscription-usage-limit")` when this message's model call stopped on
+    /// an exhausted subscription window. Never vendor text.
+    pub fn failure_class_for_message(&self, message_id: &str) -> Option<String> {
+        self.failure_by_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(message_id)
+            .cloned()
     }
 
     pub fn record_stream_key(&self, agent_id: &str, key: &str) {
@@ -262,6 +325,16 @@ impl StreamKeyAnnouncer {
         replies: Arc<ReplyRegistry>,
     ) -> Self {
         Self { inner, replies }
+    }
+}
+
+impl cap_llm::FailureClassNote for ReplyRegistry {
+    fn note_subscription_usage_limit(&self, agent_id: &str) {
+        self.record_subscription_usage_limit(agent_id);
+    }
+
+    fn clear_subscription_usage_limit(&self, agent_id: &str) {
+        self.clear_recorded_failure_class(agent_id);
     }
 }
 
@@ -694,5 +767,30 @@ mod tests {
         reg.clear_last_outbound("agent:root");
         assert!(reg.last_stream_key("root").is_none());
         assert!(reg.last_stream_key("agent:root").is_none());
+    }
+
+    #[test]
+    fn subscription_usage_limit_is_stored_on_the_inflight_message_only() {
+        let reg = ReplyRegistry::new();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.record_subscription_usage_limit("root");
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-1").as_deref(),
+            Some(cap_llm::SUBSCRIPTION_USAGE_LIMIT_CLASS)
+        );
+        assert!(reg.failure_class_for_message("cmsg-2").is_none());
+        let stored = reg.failure_class_for_message("cmsg-1").unwrap();
+        assert!(!stored.contains("resets"));
+        assert!(!stored.contains('@'));
+        assert!(!stored.contains("sk-"));
+
+        reg.note_pending_message("agent:root", "cmsg-2");
+        reg.clear_recorded_failure_class("agent:root");
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-1").as_deref(),
+            Some(cap_llm::SUBSCRIPTION_USAGE_LIMIT_CLASS),
+            "a later message does not erase the earlier class"
+        );
+        assert!(reg.failure_class_for_message("cmsg-2").is_none());
     }
 }

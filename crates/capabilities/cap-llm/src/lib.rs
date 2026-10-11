@@ -98,7 +98,7 @@ pub use backend_mesh::MeshRemoteAdapter;
 pub use catalog::ModelProfileCatalog;
 pub use cost::compute_cost;
 pub use credential::{CredentialFailure, ProviderCredentialSource};
-pub use error::LlmError;
+pub use error::{FailureClassNote, LlmError, SUBSCRIPTION_USAGE_LIMIT_CLASS};
 pub use events::{LLM_ERROR, LLM_REQUEST, LLM_RESPONSE, LLM_RETRY};
 pub use gateway::{
     ChatDelta, ChatMessage, ChatParams, ChatResponse, ChatRole, LlmGateway, LlmGatewayInternal,

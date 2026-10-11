@@ -685,12 +685,12 @@ impl AgentLoopDriverImpl {
     /// Between two turns (after the observer, and only when the loop goes on)
     /// the loop awaits [`MessageHandler::before_next_turn`].
     ///
-    /// Known limitation: the daemon's `WasmMessageHandler` reuses ONE Wasmtime
-    /// `Store` across turns; a guest trap poisons it, so after the first trap
-    /// every turn fails instantly (perpetual-error) with no auto-recovery.
-    /// Restart-on-trap is the daemon restart-policy's job (§1.4.2b / AC-21).
-    /// The one exception is a trap caused by a contained extension host-function
-    /// panic: the handler then starts a fresh instance in `before_next_turn`.
+    /// The daemon's `WasmMessageHandler` reuses one Wasmtime `Store` across turns.
+    /// A `handle_message` error or trap drops that Store and marks it poisoned.
+    /// `before_next_turn` then starts a fresh instance (new linear memory, same
+    /// host-carried state) before the next turn reads the Store incarnation.
+    /// A poisoned Store that was not destroyed stays refused. A Store still inside
+    /// a guest call is not replaced here.
     pub async fn serve(
         &self,
         agent_id: &str,
@@ -735,7 +735,7 @@ impl AgentLoopDriverImpl {
     /// Recv contract: each turn's first action is `mailbox_reader.recv(agent_id)`,
     /// which AWAITS a message. The caller MUST enqueue at least `n` messages
     /// before (or concurrently with) the call, or the `n`-th turn parks forever.
-    /// Same Wasmtime-Store-reuse trap caveat as `serve` applies.
+    /// Between turns it awaits `before_next_turn`, same as `serve`.
     ///
     /// **`test-support`-gated**: this bounded driver exists ONLY for the
     /// system-acceptance harness + the scheduler unit test. The production daemon

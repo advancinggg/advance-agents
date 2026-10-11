@@ -776,6 +776,7 @@ impl MessagingProvider for ServeLoopMessagingProvider {
             from: "user:client-api".to_string(),
             delivery_state: "delivered".to_string(),
             reply_state: reply_state.to_string(),
+            failure_class: self.replies.failure_class_for_message(message_id),
         })
     }
 }
@@ -1757,5 +1758,26 @@ mod tests {
             .get(&format!("cmsg-{MAX_TRACKED_CLIENT_MESSAGES}"))
             .is_some());
         assert_eq!(sent.by_id.len(), MAX_TRACKED_CLIENT_MESSAGES);
+    }
+
+    #[test]
+    fn message_status_failure_class_is_the_subscription_token() {
+        let store = Arc::new(MailboxStore::new(
+            std::num::NonZeroUsize::new(8).expect("capacity"),
+        ));
+        let replies = Arc::new(ReplyRegistry::new());
+        let provider =
+            ServeLoopMessagingProvider::new(store, None, Arc::clone(&replies), "agent:root");
+        let ack = provider.send("agent:root", b"hello").expect("send");
+        replies.record_subscription_usage_limit("root");
+        let status = provider.message_status(&ack.message_id).expect("status");
+        assert_eq!(status.reply_state, "none");
+        assert_eq!(
+            status.failure_class.as_deref(),
+            Some(cap_llm::SUBSCRIPTION_USAGE_LIMIT_CLASS)
+        );
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["failure_class"], "subscription-usage-limit");
+        assert_eq!(json["reply_state"], "none");
     }
 }

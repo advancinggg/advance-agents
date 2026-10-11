@@ -178,6 +178,7 @@ impl MessagingProvider for DispatcherMessaging {
             delivery_state: "delivered".to_string(),
             reply_state: if st.replied { "replied" } else { "none" }.to_string(),
             stream_key: None,
+            failure_class: None,
         })
     }
 }

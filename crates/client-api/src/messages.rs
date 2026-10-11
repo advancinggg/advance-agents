@@ -41,11 +41,25 @@ pub struct ClientMessageStatus {
     pub from: String,
     /// `delivered | pending`.
     pub delivery_state: String,
-    /// `none | replied`.
+    /// `none | replied`. This vocabulary is unchanged. Subscription usage exhaustion
+    /// is not a third `reply_state`; it is [`Self::failure_class`].
     pub reply_state: String,
     /// Opaque C235 subscribe pointer (`st_<hex>`). Never assistant body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_key: Option<String>,
+    /// Redacted failure class for this message, independent of `reply_state`.
+    ///
+    /// Omitted when unset. Older clients that only branch on `reply_state`
+    /// (`none` | `replied`) keep working: this field is optional and is left out
+    /// of the JSON when absent.
+    ///
+    /// `subscription-usage-limit` means the agent's model call stopped because the
+    /// subscription usage window is exhausted. The value is that fixed token. It
+    /// does not include vendor stderr, account identifiers, reset times, or tokens.
+    /// The WIT `provider-error` payload the guest reads is the same token (the WIT
+    /// case stays `provider-error`). Other provider failures stay `"provider error"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
 }
 
 /// Register the messaging routes, capturing the shared provider slot in each closure.

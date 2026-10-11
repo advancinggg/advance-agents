@@ -345,6 +345,9 @@ pub struct LlmGateway {
     /// start. `None` uses `cap_http::DEFAULT_TIMEOUT` for cloud-http, local, and
     /// mesh, and [`crate::backend_cli::MAX_CALL_DURATION`] for an agent-cli hop.
     generate_timeout: Option<Duration>,
+    /// Optional Client API note for a guest-visible subscription-usage failure.
+    /// `None` (every plain `new`) records nothing.
+    failure_note: Mutex<Option<Arc<dyn crate::error::FailureClassNote>>>,
     /// Lane agent-llm-policy: the per-agent policy source consulted before placement on every
     /// generate / stream request. `None` = not wired (byte-identical to the pre-lane gateway).
     agent_policy: Option<Arc<dyn crate::policy::AgentLlmPolicySource>>,
@@ -457,8 +460,36 @@ impl LlmGateway {
             catalog: Arc::new(crate::catalog::ModelProfileCatalog::new()),
             placement_telemetry: crate::placement::default_telemetry(),
             generate_timeout: None,
+            failure_note: Mutex::new(None),
             agent_policy: None,
             credential_source: None,
+        }
+    }
+
+    /// Install the Client API note for subscription-usage failures. The note stores
+    /// only the redacted class token. Call once at composition, before requests.
+    pub fn set_failure_class_note(&self, note: Arc<dyn crate::error::FailureClassNote>) {
+        *self.failure_note.lock().unwrap_or_else(|e| e.into_inner()) = Some(note);
+    }
+
+    /// Tell the Client API note about the result that is about to cross into the guest.
+    /// A subscription-usage failure records the redacted class. A success clears it for
+    /// the in-flight message. Any other error leaves a previously recorded class in place.
+    pub(crate) fn observe_guest_visible_error(&self, agent_id: &str, err: Option<&LlmError>) {
+        let note = self
+            .failure_note
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(note) = note else {
+            return;
+        };
+        match err {
+            Some(err) if crate::error::is_subscription_usage_limit(err) => {
+                note.note_subscription_usage_limit(agent_id);
+            }
+            None => note.clear_subscription_usage_limit(agent_id),
+            Some(_) => {}
         }
     }
 

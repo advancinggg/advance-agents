@@ -182,8 +182,9 @@ pub struct WasmMessageHandler {
     /// The config of the latest `init`, kept to start a fresh instance.
     init_config: StdMutex<Option<ComponentConfig>>,
     /// Set when the last guest call trapped because a contained extension
-    /// host-function panic left no in-band answer; `before_next_turn` then starts a
-    /// fresh instance. No other trap sets it.
+    /// host-function panic left no in-band answer. `before_next_turn` also revives
+    /// after any other failure that destroyed the Store; this flag only selects
+    /// the log text when that revive cannot start.
     fresh_instance_due: AtomicBool,
     /// Where a failed `complete_round` or fresh instance is reported
     /// ([`Self::with_log`]; none by default).
@@ -585,17 +586,32 @@ impl MessageHandler for WasmMessageHandler {
         Ok(())
     }
 
-    /// After a turn whose guest call a contained extension host-function panic
-    /// trapped, start a fresh instance of the component (the same path as `init`,
-    /// which replaces the destroyed Store under a new incarnation), so the next turn
-    /// runs normally. The guest's linear memory is not kept; the state the host
-    /// carries between turns is. Every other trap leaves the Store poisoned, as
-    /// before. A fresh instance that cannot be started is logged, and the Store
-    /// stays poisoned.
+    /// After a turn whose failure destroyed the guest Store, start a fresh instance
+    /// before the next turn reads [`Self::trusted_store_incarnation`]. The guest's
+    /// linear memory is not kept. The state the host carries between turns is: this
+    /// method discards the bytes `init` returns, and the scheduler keeps the vector
+    /// it already holds. A Store that is still inside a guest call is left alone.
+    /// A poisoned Store that was not destroyed is left poisoned, so the next call
+    /// still refuses. A fresh instance that cannot be started is logged, and the
+    /// Store stays poisoned.
     async fn before_next_turn(&self) {
-        if !self.fresh_instance_due.swap(false, Ordering::AcqRel) {
+        if self.store_in_guest_call.load(Ordering::Acquire) {
             return;
         }
+        let store_present = self
+            .instance
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        if store_present {
+            return;
+        }
+        let poisoned = self.store_poisoned.load(Ordering::Acquire);
+        let from_panic = self.fresh_instance_due.load(Ordering::Acquire);
+        if !poisoned && !from_panic {
+            return;
+        }
+        self.fresh_instance_due.store(false, Ordering::Release);
         let config = self
             .init_config
             .lock()
@@ -605,10 +621,15 @@ impl MessageHandler for WasmMessageHandler {
             return;
         };
         if let Err(error) = self.init(config).await {
+            let why = if from_panic {
+                "after a contained extension panic"
+            } else {
+                "after the previous turn destroyed the guest Store"
+            };
             self.log.err(
                 log_keys::FRESH_INSTANCE_FAILED,
                 format!(
-                    "advance: WARN agent {}: no fresh guest instance after a contained extension panic: {error}",
+                    "advance: WARN agent {}: no fresh guest instance {why}: {error}",
                     self.agent_id
                 ),
             );

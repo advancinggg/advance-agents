@@ -332,6 +332,10 @@ pub(crate) fn encode_llm_response(response: &ChatResponse) -> Val {
 pub(crate) fn encode_llm_error(err: &LlmError) -> Val {
     let (case, redacted): (&'static str, &'static str) = match err {
         LlmError::ContextTooLong(_) => ("context-too-long", "context too long"),
+        LlmError::ProviderError(msg) if crate::error::subscription_usage_limit_text(msg) => (
+            "provider-error",
+            crate::error::SUBSCRIPTION_USAGE_LIMIT_CLASS,
+        ),
         LlmError::ProviderError(_) => ("provider-error", "provider error"),
         LlmError::ModelNotAvailable(_) => ("model-not-available", "model not available"),
         LlmError::RateLimited(_) => ("rate-limited", "rate limited"),
@@ -520,6 +524,7 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
                 policy_source: Default::default(),
             };
             let result = gateway.generate(llm_ctx).await;
+            gateway.observe_guest_visible_error(&ctx.agent_id, result.as_ref().err());
             Ok(vec![encode_llm_result(result)])
         })
     }
@@ -568,21 +573,35 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
             // not error-string sniffing.
             if gateway.has_live_streaming() {
                 return match gateway.stream_begin_live(llm_ctx, &registry).await {
-                    Ok(handle) => Ok(vec![encode_stream_result(Ok(handle))]),
-                    Err(e) => Ok(vec![encode_stream_result(Err(e))]),
+                    Ok(handle) => {
+                        gateway.observe_guest_visible_error(&ctx.agent_id, None);
+                        Ok(vec![encode_stream_result(Ok(handle))])
+                    }
+                    Err(e) => {
+                        gateway.observe_guest_visible_error(&ctx.agent_id, Some(&e));
+                        Ok(vec![encode_stream_result(Err(e))])
+                    }
                 };
             }
             match gateway.stream_begin(llm_ctx).await {
                 Ok(ready) => {
                     let deltas = crate::stream::chunk_text_into_deltas(&ready.response.text);
                     match registry.insert(deltas, ready) {
-                        Some(handle) => Ok(vec![encode_stream_result(Ok(handle))]),
-                        None => Ok(vec![encode_stream_result(Err(LlmError::ProviderError(
-                            "stream registry full".into(),
-                        )))]),
+                        Some(handle) => {
+                            gateway.observe_guest_visible_error(&ctx.agent_id, None);
+                            Ok(vec![encode_stream_result(Ok(handle))])
+                        }
+                        None => {
+                            let err = LlmError::ProviderError("stream registry full".into());
+                            gateway.observe_guest_visible_error(&ctx.agent_id, Some(&err));
+                            Ok(vec![encode_stream_result(Err(err))])
+                        }
                     }
                 }
-                Err(e) => Ok(vec![encode_stream_result(Err(e))]),
+                Err(e) => {
+                    gateway.observe_guest_visible_error(&ctx.agent_id, Some(&e));
+                    Ok(vec![encode_stream_result(Err(e))])
+                }
             }
         })
     }
@@ -613,6 +632,7 @@ impl HostFunctionHandler for AgentLlmPollStreamHandler {
                 // S4: a live stream's Failed phase surfaces its REAL enum-coded
                 // error as WIT result::err — never collapsed to Unknown.
                 PollOutcome::Failed(e) => {
+                    gateway.observe_guest_visible_error(&ctx.agent_id, Some(&e));
                     return Ok(vec![Val::Result(Err(Some(Box::new(encode_llm_error(&e)))))]);
                 }
                 // An unknown LIVE handle falls through to the buffered table (the
@@ -625,6 +645,7 @@ impl HostFunctionHandler for AgentLlmPollStreamHandler {
                         encode_stream_chunk(None, true, Some(&response))
                     }
                     PollOutcome::Failed(e) => {
+                        gateway.observe_guest_visible_error(&ctx.agent_id, Some(&e));
                         return Ok(vec![Val::Result(Err(Some(Box::new(encode_llm_error(&e)))))]);
                     }
                     PollOutcome::Unknown => {
@@ -2110,6 +2131,20 @@ mod tests {
                 "provider error",
             ),
             (
+                LlmError::ProviderError(
+                    "agent-cli: subscription usage limit reached (resets at 5pm; account user@example.com; sk-live-secret)".into(),
+                ),
+                crate::error::SUBSCRIPTION_USAGE_LIMIT_CLASS,
+            ),
+            (
+                LlmError::ProviderError("agent-cli: egress scan blocked the prompt".into()),
+                "provider error",
+            ),
+            (
+                LlmError::ProviderError("usage limit resets at 5pm sk-live-secret".into()),
+                "provider error",
+            ),
+            (
                 LlmError::ContextTooLong("model context: 8192 tokens, prompt: ...".into()),
                 "context too long",
             ),
@@ -2145,6 +2180,21 @@ mod tests {
                 },
                 other => panic!("expected Val::Variant with Some payload, got {other:?}"),
             }
+        }
+        match encode_llm_error(&LlmError::ProviderError(
+            "agent-cli: subscription usage limit reached (resets at 5pm; sk-live-secret)".into(),
+        )) {
+            Val::Variant(case, Some(boxed)) => {
+                assert_eq!(case, "provider-error");
+                match *boxed {
+                    Val::String(s) => {
+                        assert_eq!(s, crate::error::SUBSCRIPTION_USAGE_LIMIT_CLASS);
+                        assert!(!s.contains("5pm") && !s.contains("sk-live"), "{s}");
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            other => panic!("{other:?}"),
         }
     }
 

@@ -556,6 +556,8 @@ pub fn classify_failure(text: &str) -> InferenceBackendError {
         "purchase more credits",
     ];
     if quota.iter().any(|q| lower.contains(q)) {
+        // The parenthetical is daemon-internal (logs, failover matching). Guest and
+        // Client API see only `subscription-usage-limit`; encode_llm_error drops this text.
         return err(format!(
             "subscription usage limit reached ({})",
             squeeze(text)

@@ -6,6 +6,40 @@
 
 use std::fmt;
 
+/// Guest-visible and Client API token for an exhausted subscription usage window.
+///
+/// The WIT case stays `provider-error` (no new discriminant, so existing guests
+/// keep decoding). The payload is this token, not `"provider error"` and not the
+/// vendor text `classify_failure` keeps in parentheses for the daemon.
+pub const SUBSCRIPTION_USAGE_LIMIT_CLASS: &str = "subscription-usage-limit";
+
+/// `true` when `msg` is the daemon-internal agent-cli quota failure
+/// (`agent-cli: subscription usage limit reached (...)`). The parenthetical is
+/// not required and is never part of the guest or Client API value.
+pub fn subscription_usage_limit_text(msg: &str) -> bool {
+    let rest = msg.trim();
+    let rest = rest
+        .strip_prefix(crate::backend_cli::AGENT_CLI_PREFIX)
+        .map(str::trim_start)
+        .unwrap_or(rest);
+    rest.starts_with("subscription usage limit reached")
+}
+
+pub fn is_subscription_usage_limit(err: &LlmError) -> bool {
+    match err {
+        LlmError::ProviderError(msg) => subscription_usage_limit_text(msg),
+        _ => false,
+    }
+}
+
+/// Records the redacted subscription-usage class for the Client API. Implementations
+/// store [`SUBSCRIPTION_USAGE_LIMIT_CLASS`] only — never vendor stderr, account
+/// identifiers, reset times, or tokens.
+pub trait FailureClassNote: Send + Sync {
+    fn note_subscription_usage_limit(&self, agent_id: &str);
+    fn clear_subscription_usage_limit(&self, agent_id: &str);
+}
+
 /// LLM-gateway error variants. Variant names are kebab-case strings matching
 /// the WIT discriminants in MODULE-009 §1.4.1.
 ///

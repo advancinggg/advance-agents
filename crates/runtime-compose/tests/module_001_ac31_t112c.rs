@@ -1014,25 +1014,28 @@ async fn module_001_ac31_t112e_trapping_host_function_panic_fails_the_turn_and_n
     assert_eq!(log.count(log_keys::FRESH_INSTANCE_FAILED), 0);
     assert_eq!(rec.host_calls.load(std::sync::atomic::Ordering::SeqCst), 5);
 
-    // Control, no contained panic: the handler returns `Err`, which traps the call as
-    // any host function's error does. The Store stays poisoned, as before: the next
-    // turn fails without reaching the guest.
+    // A host-function `Err` (not a contained panic) destroys the Store. The next
+    // turn revives it and reaches the guest again.
     let (status, body) = msg(&probe, "plain fail").await;
     assert_eq!((status, body.as_str()), (502, ""));
     let (status, body) = msg(&probe, "plain d").await;
-    assert_eq!((status, body.as_str()), (502, ""));
-    assert_eq!(rec.host_calls.load(std::sync::atomic::Ordering::SeqCst), 6);
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "plain:probe:d"),
+        "after a handle_message error: {body}"
+    );
+    assert_eq!(rec.host_calls.load(std::sync::atomic::Ordering::SeqCst), 7);
     rt.shutdown().await.expect("shutdown");
-    // Three trapped turns (two contained panics, one handler `Err`), one turn refused
-    // on the poisoned Store; no panic payload in a log line or a turn error.
+    // Three trapped turns (two contained panics, one handler `Err`). The turn after
+    // the handler `Err` ran, so it is not a poisoned-Store refusal.
     let errors = turn_errors(home.home());
-    assert_eq!(trapped_and_poisoned(&errors), (3, 1));
+    assert_eq!(trapped_and_poisoned(&errors), (3, 0));
     for text in log.lines().into_iter().map(|line| line.text).chain(errors) {
         assert!(!text.contains("fixture host function panic"), "{text}");
     }
     assert_gone_for_home(&probe, home.home(), None).await;
 
-    // Control, OSS only: the guest traps by itself. Its Store stays poisoned too.
+    // A guest trap destroys the Store too. The next turn revives it and enters the guest.
     let probe = Arc::new(ComposeProbe::new());
     let ext = FixtureExtension::standard();
     let rec = ext.record();
@@ -1046,10 +1049,14 @@ async fn module_001_ac31_t112e_trapping_host_function_panic_fails_the_turn_and_n
     let (status, body) = msg(&probe, "trap").await;
     assert_eq!((status, body.as_str()), (502, ""));
     let (status, body) = msg(&probe, "call e").await;
-    assert_eq!((status, body.as_str()), (502, ""));
-    assert_eq!(rec.host_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "ok:probe:e"),
+        "after a guest trap: {body}"
+    );
+    assert_eq!(rec.host_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     rt.shutdown().await.expect("shutdown");
-    assert_eq!(trapped_and_poisoned(&turn_errors(home.home())), (4, 2));
+    assert_eq!(trapped_and_poisoned(&turn_errors(home.home())), (4, 0));
     assert_gone_for_home(&probe, home.home(), Some(baseline)).await;
 }
 
@@ -1181,7 +1188,13 @@ async fn module_001_ac31_t112e_protected_turn_after_a_trapping_panic_runs_on_a_f
     handler.before_next_turn().await;
     assert_eq!(handler.trusted_store_incarnation(), Some(second));
 
-    // Control: the handler's own `Err` is not a contained panic.
+    // A handle_message error that is not a contained panic still destroys the Store.
+    // before_next_turn revives it before the next call, clears poisoned, and the
+    // next call enters the guest on a new incarnation. The host state vector is the
+    // one this test still holds.
+    let before_fail = handler
+        .trusted_store_incarnation()
+        .expect("live before fail");
     handler.stamp_trusted_turn("turn-3").await.expect("stamp 3");
     assert!(is_trap(
         handler
@@ -1192,16 +1205,28 @@ async fn module_001_ac31_t112e_protected_turn_after_a_trapping_panic_runs_on_a_f
         .destroy_trusted_turn("turn-3")
         .await
         .expect("turn 3 Store destroyed");
+    assert_eq!(
+        handler.trusted_store_incarnation(),
+        None,
+        "poisoned until revive"
+    );
     handler.before_next_turn().await;
-    assert_eq!(handler.trusted_store_incarnation(), None, "stays destroyed");
-    match handler
+    let revived = handler
+        .trusted_store_incarnation()
+        .expect("revived before the next call");
+    assert_ne!(revived, before_fail, "guest linear memory is a new Store");
+    handler.stamp_trusted_turn("turn-4").await.expect("stamp 4");
+    let reply = handler
         .handle_message(&guest_message("plain y"), state.clone())
         .await
-    {
-        Err(HookError::Failure(reason)) if reason == "guest Store is poisoned" => {}
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(rec.host_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        .expect("enters the guest again");
+    assert_eq!(replies(&reply), ["plain:probe:y"]);
+    assert_eq!(
+        handler.clear_trusted_turn("turn-4").await.expect("drained"),
+        1,
+        "revive resets the drain epoch with the new Store"
+    );
+    assert_eq!(rec.host_calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     assert_eq!(log.count(log_keys::FRESH_INSTANCE_FAILED), 0);
     drop(handler);
 

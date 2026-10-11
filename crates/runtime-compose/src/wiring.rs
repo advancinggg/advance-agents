@@ -3131,6 +3131,9 @@ pub(crate) async fn wire_capabilities_inner(
                 .map(|sign_in| Arc::clone(sign_in) as Arc<dyn cap_llm::ProviderCredentialSource>),
             gateway_inference,
         );
+        gateway.set_failure_class_note(
+            Arc::clone(&reply_registry) as Arc<dyn cap_llm::FailureClassNote>
+        );
         // Hold an Arc clone for the composition root before registration
         // moves one into the host-fn handlers (all clones share the one gateway,
         // so its per-agent assembled-context store is the same on both sides).
