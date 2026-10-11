@@ -217,7 +217,10 @@ mod tests {
 
     #[test]
     fn module_001_ac31_extension_capability_bound_fits_agent_node() {
-        assert_eq!(MAX_EXTENSION_CAPABILITIES, 54);
+        assert_eq!(
+            MAX_EXTENSION_CAPABILITIES,
+            AGENT_NODE_CAPABILITY_BOUND - KNOWN_CAPABILITIES.len()
+        );
         let tmp = tempfile::tempdir().unwrap();
         let tree = AgentTreeStore::new(tmp.path().to_path_buf()).unwrap();
         let root_ws = tree.workspace_root().join("root");

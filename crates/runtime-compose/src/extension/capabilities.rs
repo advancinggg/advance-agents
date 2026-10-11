@@ -383,15 +383,17 @@ mod tests {
     #[test]
     fn module_001_ac31_check_total_bound() {
         let first = leaked_names("fixture", 30);
-        let second_ok = leaked_names("fixture-two", 24);
-        check_total(&[("fixture", first), ("fixture-two", second_ok)])
-            .expect("54 across two extensions");
+        let second_n = MAX_EXTENSION_CAPABILITIES - 30;
+        let second_ok = leaked_names("fixture-two", second_n);
+        check_total(&[("fixture", first), ("fixture-two", second_ok)]).expect(
+            "two extension lists that add up to MAX_EXTENSION_CAPABILITIES must be admitted",
+        );
 
-        let second_over = leaked_names("fixture-two", 25);
+        let second_over = leaked_names("fixture-two", second_n + 1);
         assert_collision(
             check_total(&[("fixture", first), ("fixture-two", second_over)]),
             "fixture-two",
-            second_over[24],
+            second_over[second_n],
             CapabilityRefusal::TooMany {
                 limit: MAX_EXTENSION_CAPABILITIES,
             },
