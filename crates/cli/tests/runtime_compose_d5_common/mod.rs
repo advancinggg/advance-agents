@@ -220,31 +220,31 @@ pub const BASELINE_GOLDEN_SHA256: &[(&str, &str)] = &[
     ),
     (
         "route_probe.h1_fs_llm.golden",
-        "831cb55772ee6a2e2f42ee9672d98b5bbac50caea2fb1a9dc661729934d8a29c",
+        "1cc3c572c60be69b6a9f79aeef9948f480c2d534eb1c4e1fec04809a84e4d30a",
     ),
     (
         "route_probe.h2_all_capabilities.golden",
-        "a7867005f8ab098fcd9e5fd456f250a11c3765b96a0de7824e40361ef14c3ea5",
+        "485a1ae41dba24cc8c894202fad2f266bc9e9f3eb7eab4d4661a0d3965137412",
     ),
     (
         "route_probe.h3_fs_llm_lifecycle.golden",
-        "98b4bd9738c7299fef2b88a469f061fc1fe2d42e263dfe063609a38f7a65a7e1",
+        "4fd7e1a128b3793005f8200d1c56100b4b3a5e5fd89b3517cbfbebf81233c032",
     ),
     (
         "route_probe.h4_fs_llm_grant.golden",
-        "6c03a0c9bd793db9013c4c2193a809e329a1a924579c244d93d2c44c53ef2e6e",
+        "51207898c8cc0027be6d716daf288ed090ec7800636e87cfabfb428b6a6e2d98",
     ),
     (
         "route_probe.h5_fs_llm_tools_no_driver.golden",
-        "bf7be8af05a70c378bac5a2f6d0d49f7ab8866f1112fb829d7257b21a86ecb0c",
+        "a2626563f7371ee3bac353eaa11dfd56ec33c45c70b391785d7ab8da5d1aed61",
     ),
     (
         "route_table.h1_fs_llm.golden",
-        "b09dd0ccf9a4604c400701df9d9ae477171ed3db2e1e3381bac8bce0bd545527",
+        "760f74630584197a40fd92a24d7088efe88aa36a29bd09d973484bb748218b7f",
     ),
     (
         "route_table.h2_all_capabilities.golden",
-        "4331c411de5d7efc5448140d0ae59ab92fe19e73b06b9a731fcb84e54ef6be2e",
+        "ea6b7c287bbec12a22740c97129a6edf83b0b7f3b1bee8b006a8c06630cc2cc4",
     ),
     (
         "runtime_files.h1_fs_llm.golden",

@@ -13,6 +13,7 @@ POST /client/agents (console Origin + its session + idempotency-key, no x-csrf-t
 GET /client/agent-templates -> 200 data {"templates":[{"description":"Read-only exploration sub-agent (Slice B built-in template).","template_ref":"explorer"},{"description":"Inherits parent's full capabilities (Slice B built-in template).","template_ref":"general-purpose"},{"description":"Plan-decomposition sub-agent (Slice B built-in template).","template_ref":"planner"},{"description":"Critique-and-flag sub-agent (Slice B built-in template).","template_ref":"reviewer"}]}
 GET /client/agents -> 200 data {"agents":[{"agent_id":"root","id":"<ROOT_AGENT_ID>","kind":"root","status":"active","workspace_path":"."}]}
 GET /client/agents/{agent_id} -> 404 error not_found "resource not found"
+GET /client/agents/{agent_id}/agents-md -> 404 error not_found "resource not found"
 GET /client/costs/agents -> 200 data {"agents":[],"window":{}}
 GET /client/costs/agents/{agent_id} -> 200 data {"agent_id":"golden-probe-id","by_provider":[],"totals":{"cost_usd":0.0,"request_count":0,"tokens_in":0,"tokens_out":0},"window":{}}
 GET /client/costs/providers -> 200 data {"providers":[],"window":{}}
@@ -42,6 +43,7 @@ POST /client/entities:query -> 400 error invalid_request "invalid entity request
 == POST mutations
 POST /client/agents -> 400 error invalid_request "invalid agent request body"
 POST /client/agents/{agent_id}:delete -> 404 error not_found "resource not found"
+POST /client/agents/{agent_id}:set-agents-md -> 400 error invalid_request "invalid agent request body"
 POST /client/agents/{agent_id}:update -> 400 error invalid_request "empty agent update"
 POST /client/entities/{entity_id}:apply -> 400 error invalid_request "invalid entity id"
 POST /client/entities/{entity_id}:demote -> 400 error invalid_request "invalid entity id"
