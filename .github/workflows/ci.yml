@@ -196,7 +196,10 @@ jobs:
         with:
           cache: false
       - name: Add the iOS device target to the pinned toolchain
-        run: rustup target add aarch64-apple-ios
+        run: |
+          rustup target add aarch64-apple-ios
+          # Xcode 16.4 nm cannot read Rust 1.91 (LLVM 21) objects. llvm-nm can.
+          rustup component add llvm-tools-preview
       - name: Xcode and the iPhoneOS SDK in use
         run: |
           set -euo pipefail
@@ -226,8 +229,10 @@ jobs:
           build_version="$(grep -A4 LC_BUILD_VERSION <<<"$load_cmds")" || { echo "$dylib has no LC_BUILD_VERSION"; exit 1; }
           echo "$build_version"
           grep -Eq '^ *platform 2$' <<<"$build_version" || { echo "platform is not 2 (iOS device)"; exit 1; }
-          dylib_syms="$(nm -gU "$dylib")" || { echo "nm failed on $dylib"; exit 1; }
-          lib_syms="$(nm -gU "$lib")" || { echo "nm failed on $lib"; exit 1; }
+          nm_bin="$(find "$(rustc --print sysroot)/lib/rustlib" -type f -name llvm-nm | head -1)"
+          [ -n "$nm_bin" ] || { echo "llvm-nm missing from the pinned toolchain"; exit 1; }
+          dylib_syms="$("$nm_bin" --extern-only --defined-only "$dylib")" || { echo "llvm-nm failed on $dylib"; exit 1; }
+          lib_syms="$("$nm_bin" --extern-only --defined-only "$lib")" || { echo "llvm-nm failed on $lib"; exit 1; }
           for sym in advance_bridge_start advance_bridge_stop advance_bridge_health \
                      advance_bridge_on_lifecycle advance_bridge_last_error \
                      advance_bridge_free_handle advance_bridge_abi_version \

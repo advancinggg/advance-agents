@@ -379,7 +379,9 @@ async fn pv01_entry_lifecycle_over_production_wiring() {
     }
     eprintln!("PV-01 select: watcher observed reorder within 5s = {observed}");
 
-    // A sidecar-backed local entry: restart_required.
+    // A sidecar-backed local entry starts in this process. It does not wait for
+    // the next daemon start. `/usr/bin/true` never completes the port handshake,
+    // so the entry records `sidecar-not-started` instead of `restart_required`.
     let local = json!({
         "provider_id": "lm",
         "backend_class": "local",
@@ -392,7 +394,14 @@ async fn pv01_entry_lifecycle_over_production_wiring() {
     let lm: ClientProviderSummary = data(&env);
     assert!(lm.sidecar_present);
     assert_eq!(lm.backend_class, "local");
-    assert!(has_warning(&env, WARNING_RESTART_REQUIRED));
+    assert!(
+        !has_warning(&env, WARNING_RESTART_REQUIRED),
+        "a live sidecar binder does not defer the entry to the next start"
+    );
+    assert_eq!(
+        lm.last_preflight.as_ref().and_then(|p| p.reason.as_deref()),
+        Some("sidecar-not-started")
+    );
     assert_eq!(ids(&ws), vec!["anthropic", "openai", "lm"]);
 
     // delete: openai goes; the head stays anthropic; keys are untouched by design.
