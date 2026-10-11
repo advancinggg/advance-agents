@@ -14,13 +14,13 @@ path = "src/lib.rs"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
-advance-client-api = { path = "../client-api", version = "0.1.32" }
-advance-runtime = { path = "../runtime", version = "0.1.32" }
+advance-client-api = { path = "../client-api", version = "0.1.33" }
+advance-runtime = { path = "../runtime", version = "0.1.33" }
 # The process-local home registry is the composition's (shared with `compose`).
-advance-runtime-compose = { path = "../runtime-compose", version = "0.1.32" }
-advance-shared-types = { path = "../shared-types", version = "0.1.32" }
-cap-grant = { path = "../capabilities/cap-grant", version = "0.1.32" }
-cap-lifecycle = { path = "../capabilities/cap-lifecycle", version = "0.1.32" }
+advance-runtime-compose = { path = "../runtime-compose", version = "0.1.33" }
+advance-shared-types = { path = "../shared-types", version = "0.1.33" }
+cap-grant = { path = "../capabilities/cap-grant", version = "0.1.33" }
+cap-lifecycle = { path = "../capabilities/cap-lifecycle", version = "0.1.33" }
 chrono = { workspace = true, features = ["clock"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -29,7 +29,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 zeroize = { workspace = true }
 
 [dev-dependencies]
-advance-runtime-compose = { path = "../runtime-compose", version = "0.1.32", features = ["test-support"] }
+advance-runtime-compose = { path = "../runtime-compose", version = "0.1.33", features = ["test-support"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "test-util"] }
 
