@@ -44,6 +44,11 @@
 //!   fixed at boot. [`WiredProviderAdmin::with_claimed_preflight`] serves `:preflight` of those
 //!   claimed entries through the composed gateway; without it they keep
 //!   `unsupported-backend-class`.
+//! - **Live sidecars.** With [`WiredProviderAdmin::with_local_sidecar_binder`], creating,
+//!   updating, or selecting a sidecar-backed `local` entry starts that sidecar in this
+//!   process (the same command keeps the process already running). Delete stops it. Those
+//!   mutations do not answer `restart_required`. Without a binder they still do: the
+//!   registry would otherwise keep the boot-time set.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -75,6 +80,7 @@ use advance_shared_types::process_policy::{ProcessPolicy, SpawnSite};
 use cap_llm::backend_cli::{
     AgentCliAuthProbe, AgentCliUsageProbe, ProcessAuthProbe, ProcessUsageProbe,
 };
+use cap_llm::LocalSidecarBinder;
 use cap_secrets::{SecretError, SecretStore};
 use secrecy::ExposeSecret;
 use serde_yml::{Mapping, Value};
@@ -166,6 +172,9 @@ pub struct WiredProviderAdmin {
     claimed_preflight: Option<Arc<dyn ClaimedEntryPreflight>>,
     process_policy: ProcessPolicy,
     hot_reload: bool,
+    /// When set, a sidecar-backed local entry starts in this process instead of at the next
+    /// daemon start.
+    sidecar_binder: Option<Arc<dyn LocalSidecarBinder>>,
 }
 
 impl WiredProviderAdmin {
@@ -194,6 +203,7 @@ impl WiredProviderAdmin {
             claimed_preflight: None,
             process_policy: ProcessPolicy::Allow,
             hot_reload: true,
+            sidecar_binder: None,
         }
     }
 
@@ -280,6 +290,13 @@ impl WiredProviderAdmin {
     /// `.runtime/selected-provider` (the runtime has not adopted the change).
     pub fn with_hot_reload(mut self, hot_reload: bool) -> Self {
         self.hot_reload = hot_reload;
+        self
+    }
+
+    /// Start and stop sidecar-backed local entries in this process. The production gateway
+    /// is the binder. Without one, those entries still answer `restart_required`.
+    pub fn with_local_sidecar_binder(mut self, binder: Arc<dyn LocalSidecarBinder>) -> Self {
+        self.sidecar_binder = Some(binder);
         self
     }
 
@@ -741,6 +758,49 @@ pub fn project_usage(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidecarSync {
+    /// No binder: the boot-time registry is unchanged until the next daemon start.
+    Unbound,
+    Applied,
+    Failed,
+}
+
+impl WiredProviderAdmin {
+    /// Start, replace, or stop the entry's sidecar. `Failed` records `sidecar-not-started`.
+    fn sync_sidecar(&self, entry: &LlmProviderConfig) -> SidecarSync {
+        let Some(binder) = self.sidecar_binder.as_ref() else {
+            return SidecarSync::Unbound;
+        };
+        match entry.sidecar.as_ref() {
+            Some(sc) => match binder.apply_local_sidecar(
+                &entry.id,
+                &sc.command,
+                &sc.args,
+                entry.embedding_model.as_deref(),
+                self.process_policy,
+            ) {
+                Ok(()) => SidecarSync::Applied,
+                Err(()) => {
+                    self.record_preflight(
+                        &entry.id,
+                        &ClientProviderPreflightResult {
+                            ok: false,
+                            checked_at_ms: now_ms(),
+                            reason: Some("sidecar-not-started".into()),
+                        },
+                    );
+                    SidecarSync::Failed
+                }
+            },
+            None => {
+                binder.release_local_sidecar(&entry.id);
+                SidecarSync::Applied
+            }
+        }
+    }
+}
+
 impl ProviderAdminProvider for WiredProviderAdmin {
     fn list_providers(&self) -> Result<Vec<ClientProviderSummary>, ProviderError> {
         Ok(self
@@ -786,7 +846,15 @@ impl ProviderAdminProvider for WiredProviderAdmin {
             move |cfg| cfg.llm_providers.iter().any(|p| *p == applied),
         );
         if outcome.value.sidecar_present && outcome.value.backend_class == "local" {
-            outcome = outcome.with_warning(ProviderAdminWarning::RestartRequired);
+            match self.sync_sidecar(&entry) {
+                SidecarSync::Applied => {}
+                SidecarSync::Failed => {
+                    outcome.value = self.summary(&entry, idx == 0);
+                }
+                SidecarSync::Unbound => {
+                    outcome = outcome.with_warning(ProviderAdminWarning::RestartRequired);
+                }
+            }
         }
         if let (InferenceBackendClass::AgentCli, Some(spec)) =
             (entry.backend_class, &entry.agent_cli)
@@ -843,14 +911,24 @@ impl ProviderAdminProvider for WiredProviderAdmin {
             rx,
             move |cfg| cfg.llm_providers.iter().any(|p| *p == applied),
         );
-        if request.sidecar.is_some() && outcome.value.backend_class == "local" {
-            outcome = outcome.with_warning(ProviderAdminWarning::RestartRequired);
+        let mut sidecar_live = false;
+        if request.sidecar.is_some() && entry.backend_class == InferenceBackendClass::Local {
+            match self.sync_sidecar(&entry) {
+                SidecarSync::Applied => sidecar_live = entry.sidecar.is_some(),
+                SidecarSync::Failed => {
+                    outcome.value = self.summary(&entry, idx == 0);
+                }
+                SidecarSync::Unbound => {
+                    outcome = outcome.with_warning(ProviderAdminWarning::RestartRequired);
+                }
+            }
         }
         if request.agent_cli.is_some() && entry.backend_class == InferenceBackendClass::AgentCli {
             outcome = outcome.with_warning(ProviderAdminWarning::RestartRequired);
         }
         if self.claimable_local
             && (current.backend_class != entry.backend_class || current.sidecar != entry.sidecar)
+            && !sidecar_live
             && !outcome
                 .warnings
                 .contains(&ProviderAdminWarning::RestartRequired)
@@ -887,6 +965,13 @@ impl ProviderAdminProvider for WiredProviderAdmin {
         }
         // An `agent-cli` entry owned only its placeholder secret: drop it with the entry so
         // nothing accumulates in the store (a real key of another class stays, as before).
+        if let Some(entry) = removed.as_ref() {
+            if entry.sidecar.is_some() {
+                if let Some(binder) = self.sidecar_binder.as_ref() {
+                    binder.release_local_sidecar(&entry.id);
+                }
+            }
+        }
         if let (Some(entry), Some(store)) = (removed.as_ref(), self.store.as_ref()) {
             if entry.backend_class == InferenceBackendClass::AgentCli {
                 let is_placeholder = store
@@ -1043,11 +1128,16 @@ impl ProviderAdminProvider for WiredProviderAdmin {
         }
         let (_, entry) = self.find(provider_id)?;
         let id = provider_id.to_string();
-        let outcome = self.after_yaml_write(
+        let mut outcome = self.after_yaml_write(
             ProviderAdminOutcome::new(self.summary(&entry, true)),
             rx,
             move |cfg| cfg.llm_providers.first().map(|p| p.id.as_str()) == Some(id.as_str()),
         );
+        if entry.backend_class == InferenceBackendClass::Local && entry.sidecar.is_some() {
+            if self.sync_sidecar(&entry) == SidecarSync::Failed {
+                outcome.value = self.summary(&entry, true);
+            }
+        }
         Ok(outcome)
     }
 
@@ -2402,6 +2492,112 @@ database:
             )
             .unwrap();
         assert_eq!(restart_count(&class), 1);
+    }
+
+    struct RecBinder {
+        applied: Mutex<Vec<String>>,
+        released: Mutex<Vec<String>>,
+        fail: Mutex<bool>,
+    }
+
+    impl LocalSidecarBinder for RecBinder {
+        fn apply_local_sidecar(
+            &self,
+            provider_id: &str,
+            _command: &str,
+            _args: &[String],
+            _embedding_model: Option<&str>,
+            _policy: ProcessPolicy,
+        ) -> Result<(), ()> {
+            self.applied.lock().unwrap().push(provider_id.to_string());
+            if *self.fail.lock().unwrap() {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn release_local_sidecar(&self, provider_id: &str) {
+            self.released.lock().unwrap().push(provider_id.to_string());
+        }
+    }
+
+    fn sidecar_create(id: &str) -> ClientCreateProviderRequest {
+        ClientCreateProviderRequest {
+            sidecar: Some(ClientProviderSidecar {
+                command: "/bin/true".into(),
+                args: vec!["--model".into()],
+            }),
+            ..local_create(id)
+        }
+    }
+
+    #[test]
+    fn a_live_binder_starts_a_local_sidecar_without_waiting_for_the_next_start() {
+        let f = Fixture::new();
+        let binder = Arc::new(RecBinder {
+            applied: Mutex::new(Vec::new()),
+            released: Mutex::new(Vec::new()),
+            fail: Mutex::new(false),
+        });
+        let admin = f
+            .admin()
+            .with_local_sidecar_binder(binder.clone() as Arc<dyn LocalSidecarBinder>)
+            .with_claimable_local_entries(true);
+
+        let created = admin.create_provider(&sidecar_create("local-a")).unwrap();
+        assert_eq!(restart_count(&created), 0, "{:?}", created.warnings);
+        assert!(created.value.last_preflight.is_none());
+
+        let selected = admin.select_provider("local-a").unwrap();
+        assert_eq!(restart_count(&selected), 0);
+        assert_eq!(
+            binder.applied.lock().unwrap().as_slice(),
+            ["local-a".to_string(), "local-a".to_string()]
+        );
+
+        let updated = admin
+            .update_provider(
+                "local-a",
+                &ClientUpdateProviderRequest {
+                    sidecar: Some(ClientProviderSidecar {
+                        command: "/bin/true".into(),
+                        args: vec!["--other".into()],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            restart_count(&updated),
+            0,
+            "a started sidecar is not a restart"
+        );
+
+        admin.delete_provider("local-a").unwrap();
+        assert_eq!(
+            binder.released.lock().unwrap().as_slice(),
+            ["local-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_live_binder_that_cannot_start_does_not_claim_the_next_start() {
+        let f = Fixture::new();
+        let binder = Arc::new(RecBinder {
+            applied: Mutex::new(Vec::new()),
+            released: Mutex::new(Vec::new()),
+            fail: Mutex::new(true),
+        });
+        let admin = f
+            .admin()
+            .with_local_sidecar_binder(binder as Arc<dyn LocalSidecarBinder>);
+        let created = admin.create_provider(&sidecar_create("local-a")).unwrap();
+        assert_eq!(restart_count(&created), 0);
+        assert_eq!(
+            created.value.last_preflight.and_then(|p| p.reason),
+            Some("sidecar-not-started".into())
+        );
     }
 
     #[test]

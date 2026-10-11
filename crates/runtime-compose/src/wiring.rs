@@ -220,7 +220,14 @@ pub(crate) fn build_llm_gateway_with(
         processes,
     } = inference;
     let boot = snapshot.unwrap_or_else(|| config.current());
-    let mut holds: Vec<Arc<cap_llm::SupervisedChild>> = Vec::new();
+    struct BootSidecar {
+        id: String,
+        command: String,
+        args: Vec<String>,
+        handoff: advance_shared_types::inference::SidecarHandoff,
+        child: Arc<cap_llm::SupervisedChild>,
+    }
+    let mut booted: Vec<BootSidecar> = Vec::new();
     let mut registry = advance_shared_types::inference::InferenceBackendRegistry::new();
     for p in boot.llm_providers.iter() {
         if p.backend_class != advance_runtime::config::InferenceBackendClass::Local {
@@ -241,7 +248,13 @@ pub(crate) fn build_llm_gateway_with(
         match sup.spawn_with_policy(processes) {
             Ok((handoff, child)) => {
                 let child = Arc::new(child);
-                holds.push(Arc::clone(&child));
+                booted.push(BootSidecar {
+                    id: p.id.clone(),
+                    command: sc.command.clone(),
+                    args: sc.args.clone(),
+                    handoff: handoff.clone(),
+                    child: Arc::clone(&child),
+                });
                 registry.insert(
                     p.id.clone(),
                     Arc::new(cap_llm::backend_local::SidecarClient {
@@ -311,8 +324,16 @@ pub(crate) fn build_llm_gateway_with(
     )
     .with_delta_sink(delta_sink)
     .with_inference_backends(registry)
-    .with_sidecar_holds(holds)
     .with_shared_catalog(catalog);
+    for started in booted {
+        gateway.remember_sidecar(
+            started.id,
+            started.command,
+            started.args,
+            started.handoff,
+            started.child,
+        );
+    }
     if let Some(policy) = agent_policy {
         gateway = gateway.with_agent_policy(policy);
     }
@@ -3535,6 +3556,12 @@ pub(crate) async fn wire_capabilities_inner(
             admin.with_claimable_local_entries(true)
         } else {
             admin
+        };
+        let admin = match llm_gateway.as_ref() {
+            Some(gateway) => admin.with_local_sidecar_binder(
+                Arc::clone(gateway) as Arc<dyn cap_llm::LocalSidecarBinder>
+            ),
+            None => admin,
         };
         let admin = match (llm_gateway.as_ref(), inference_claimed.is_empty()) {
             (Some(gateway), false) => {

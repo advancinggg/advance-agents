@@ -238,6 +238,10 @@ impl InferenceBackendRegistry {
         self.map.get(id).cloned()
     }
 
+    pub fn remove(&mut self, id: &str) -> Option<Arc<dyn InferenceBackendPort>> {
+        self.map.remove(id)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }

@@ -5,19 +5,20 @@ use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use advance_shared_types::inference::{
-    InferenceBackendError, InferenceBackendPort, InferenceChatRequest, InferenceChatResponse,
-    InferenceEmbedRequest, InferenceEmbedResponse, InferenceStream, InferenceStreamClass,
-    InferenceStreamHead, InferenceTextDelta, LocalHttpRequest, LocalInferenceTransportPolicy,
-    NormalizedUsage, SidecarHandoff,
+    InferenceBackendError, InferenceBackendPort, InferenceBackendRegistry, InferenceChatRequest,
+    InferenceChatResponse, InferenceEmbedRequest, InferenceEmbedResponse, InferenceStream,
+    InferenceStreamClass, InferenceStreamHead, InferenceTextDelta, LocalHttpRequest,
+    LocalInferenceTransportPolicy, NormalizedUsage, SidecarHandoff,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use advance_shared_types::process_policy::{ProcessPolicy, SpawnSite};
+use cap_http::DefaultLocalInferenceTransport;
 
 use crate::error::LlmError;
 use crate::providers::openai::OpenAiAdapter;
@@ -56,6 +57,159 @@ impl SidecarSupervisor for OwnedHandoffSupervisor {
             ));
         }
         Ok(self.handoff.clone())
+    }
+}
+
+/// One live sidecar the daemon already owns. Re-applying the same command keeps this process.
+struct HeldSidecar {
+    provider_id: String,
+    command: String,
+    args: Vec<String>,
+    handoff: SidecarHandoff,
+    child: Arc<SupervisedChild>,
+}
+
+/// Sidecar processes the running daemon can start after boot.
+///
+/// `backends` is the gateway's registry lock: a chat lookup and an apply share it.
+/// Applying the same command and args of a still-running child does not spawn again.
+pub struct SidecarTable {
+    apply_lock: Mutex<()>,
+    backends: Arc<RwLock<InferenceBackendRegistry>>,
+    holds: Mutex<Vec<HeldSidecar>>,
+}
+
+impl SidecarTable {
+    pub fn new(backends: Arc<RwLock<InferenceBackendRegistry>>) -> Self {
+        Self {
+            apply_lock: Mutex::new(()),
+            backends,
+            holds: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn remember(
+        &self,
+        provider_id: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        handoff: SidecarHandoff,
+        child: Arc<SupervisedChild>,
+    ) {
+        let mut holds = self.holds.lock().unwrap_or_else(|e| e.into_inner());
+        let provider_id = provider_id.into();
+        holds.retain(|h| h.provider_id != provider_id);
+        holds.push(HeldSidecar {
+            provider_id,
+            command: command.into(),
+            args,
+            handoff,
+            child,
+        });
+    }
+
+    pub fn children(&self) -> Vec<Arc<SupervisedChild>> {
+        self.holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|h| Arc::clone(&h.child))
+            .collect()
+    }
+
+    /// Start `command` for `provider_id`, or keep the process already serving that spec.
+    /// `Err` means nothing is listening; the registry then answers `sidecar-not-started`.
+    pub fn apply(
+        &self,
+        provider_id: &str,
+        command: &str,
+        args: &[String],
+        embedding_model: Option<&str>,
+        policy: ProcessPolicy,
+    ) -> Result<(), ()> {
+        let _guard = self.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let embedding = embedding_model.map(str::to_string);
+        {
+            let holds = self.holds.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = holds.iter().find(|h| h.provider_id == provider_id) {
+                if existing.command == command && existing.args == args && !existing.child.exited()
+                {
+                    let handoff = existing.handoff.clone();
+                    let child = Arc::clone(&existing.child);
+                    drop(holds);
+                    self.insert_client(provider_id, embedding, handoff, child);
+                    return Ok(());
+                }
+            }
+        }
+        let sup = ProcessSupervisor {
+            command: command.to_string(),
+            args: args.to_vec(),
+        };
+        match sup.spawn_with_policy(policy) {
+            Ok((handoff, child)) => {
+                let child = Arc::new(child);
+                self.insert_client(provider_id, embedding, handoff.clone(), Arc::clone(&child));
+                let mut holds = self.holds.lock().unwrap_or_else(|e| e.into_inner());
+                holds.retain(|h| h.provider_id != provider_id);
+                holds.push(HeldSidecar {
+                    provider_id: provider_id.to_string(),
+                    command: command.to_string(),
+                    args: args.to_vec(),
+                    handoff,
+                    child,
+                });
+                Ok(())
+            }
+            Err(_) => {
+                self.backends
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        provider_id.to_string(),
+                        Arc::new(FailedSpawnBackend {
+                            reason: "sidecar-not-started".into(),
+                        }),
+                    );
+                Err(())
+            }
+        }
+    }
+
+    /// Stop the process and drop the backend. A provider that no longer has a sidecar
+    /// must not keep answering through the old loopback.
+    pub fn release(&self, provider_id: &str) {
+        let _guard = self.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|h| h.provider_id != provider_id);
+        let _ = self
+            .backends
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(provider_id);
+    }
+
+    fn insert_client(
+        &self,
+        provider_id: &str,
+        embedding_model: Option<String>,
+        handoff: SidecarHandoff,
+        child: Arc<SupervisedChild>,
+    ) {
+        self.backends
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                provider_id.to_string(),
+                Arc::new(SidecarClient {
+                    policy: Arc::new(DefaultLocalInferenceTransport),
+                    supervisor: Arc::new(OwnedHandoffSupervisor { handoff, child }),
+                    provider_id: provider_id.to_string(),
+                    embedding_model,
+                }),
+            );
     }
 }
 
@@ -712,6 +866,49 @@ mod spawn_tests {
         let body = oai_chat_body(&req);
         assert!(body["tools"].is_array(), "{body}");
         assert_eq!(body["tools"][0]["function"]["name"], "search");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn applying_a_local_sidecar_starts_it_and_a_repeat_keeps_the_process() {
+        let backends = Arc::new(RwLock::new(InferenceBackendRegistry::new()));
+        let table = SidecarTable::new(Arc::clone(&backends));
+        let args = vec!["-c".into(), "echo PORT=9; exec sleep 30".into()];
+        table
+            .apply("local-a", "/bin/bash", &args, None, ProcessPolicy::Allow)
+            .expect("first start");
+        let pid = table.children()[0].pid();
+        assert!(backends.read().unwrap().get("local-a").is_some());
+        table
+            .apply(
+                "local-a",
+                "/bin/bash",
+                &args,
+                Some("embed"),
+                ProcessPolicy::Allow,
+            )
+            .expect("same spec");
+        assert_eq!(table.children().len(), 1);
+        assert_eq!(
+            table.children()[0].pid(),
+            pid,
+            "same spec must not spawn again"
+        );
+
+        let changed = vec!["-c".into(), "echo PORT=9; exec sleep 31".into()];
+        table
+            .apply("local-a", "/bin/bash", &changed, None, ProcessPolicy::Allow)
+            .expect("changed spec");
+        assert_eq!(table.children().len(), 1);
+        assert_ne!(
+            table.children()[0].pid(),
+            pid,
+            "a new spec replaces the process"
+        );
+
+        table.release("local-a");
+        assert!(table.children().is_empty());
+        assert!(backends.read().unwrap().get("local-a").is_none());
     }
 }
 

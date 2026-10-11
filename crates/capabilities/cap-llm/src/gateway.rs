@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -27,9 +27,11 @@ use advance_runtime::config::{InferenceBackendClass, LlmProviderConfig, RuntimeC
 use advance_shared_types::capability::BudgetDecision;
 use advance_shared_types::context::LlmMessage;
 use advance_shared_types::inference::{
-    remaining_until, InferenceBackendPort, InferenceChatRequest, InferenceMessage, InferenceStream,
-    InferenceStreamClass, InferenceTextDelta, InferenceTool,
+    remaining_until, InferenceBackendPort, InferenceBackendRegistry, InferenceChatRequest,
+    InferenceMessage, InferenceStream, InferenceStreamClass, InferenceTextDelta, InferenceTool,
+    SidecarHandoff,
 };
+use advance_shared_types::process_policy::ProcessPolicy;
 use advance_shared_types::repetition::{OutputHash, RepetitionDecision};
 use advance_shared_types::security_validator::{
     Allowlist, CredentialBinding, HttpCapability, HttpError, HttpRequest, HttpSecurityChain,
@@ -326,10 +328,12 @@ pub struct LlmGateway {
     /// as used by the chain for single scan authority.
     streaming_chain: Option<Arc<dyn HttpStreamingChain>>,
     decoded_detector: Option<Arc<dyn LeakDetector>>,
-    inference_backends: Arc<advance_shared_types::inference::InferenceBackendRegistry>,
+    inference_backends: Arc<RwLock<InferenceBackendRegistry>>,
     catalog: Arc<crate::catalog::ModelProfileCatalog>,
     /// Sidecar OS-process owners. Last `LlmGateway` Arc drop kills them.
-    sidecar_holds: Vec<Arc<crate::backend_local::SupervisedChild>>,
+    /// Shared with [`Self::inference_backends`] so a provider added while the daemon
+    /// is running can start its sidecar without a restart.
+    sidecar_table: Arc<crate::backend_local::SidecarTable>,
     /// CONTRACT-234 post-scan token-delta tee (ADR 2026-07-22 D6, tee slice T1).
     ///
     /// Always a real sink, never an `Option`: the frozen criterion and the registry
@@ -337,7 +341,9 @@ pub struct LlmGateway {
     /// from `LlmDeltaSink::is_wired`, checked before any frame is built.
     delta_sink: Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
     placement_telemetry: Arc<dyn crate::placement::PlacementTelemetry>,
-    /// Test-only hop budget. Production `None` uses `cap_http::DEFAULT_TIMEOUT`.
+    /// Test-only hop budget. `Some` bounds every hop of that `generate` from its
+    /// start. `None` uses `cap_http::DEFAULT_TIMEOUT` for cloud-http, local, and
+    /// mesh, and [`crate::backend_cli::MAX_CALL_DURATION`] for an agent-cli hop.
     generate_timeout: Option<Duration>,
     /// Lane agent-llm-policy: the per-agent policy source consulted before placement on every
     /// generate / stream request. `None` = not wired (byte-identical to the pre-lane gateway).
@@ -431,6 +437,7 @@ impl LlmGateway {
         repetition_guard: Arc<dyn RepetitionGuardCheck>,
         default_agent_id: String,
     ) -> Self {
+        let inference_backends = Arc::new(RwLock::new(InferenceBackendRegistry::new()));
         Self {
             config_provider,
             chain,
@@ -443,11 +450,11 @@ impl LlmGateway {
             streaming_chain: None,
             delta_sink: Arc::new(advance_shared_types::traits::NotWiredDeltaSink),
             decoded_detector: None,
-            inference_backends: Arc::new(
-                advance_shared_types::inference::InferenceBackendRegistry::new(),
-            ),
+            sidecar_table: Arc::new(crate::backend_local::SidecarTable::new(Arc::clone(
+                &inference_backends,
+            ))),
+            inference_backends,
             catalog: Arc::new(crate::catalog::ModelProfileCatalog::new()),
-            sidecar_holds: Vec::new(),
             placement_telemetry: crate::placement::default_telemetry(),
             generate_timeout: None,
             agent_policy: None,
@@ -455,11 +462,32 @@ impl LlmGateway {
         }
     }
 
-    pub fn with_inference_backends(
-        mut self,
-        registry: advance_shared_types::inference::InferenceBackendRegistry,
-    ) -> Self {
-        self.inference_backends = Arc::new(registry);
+    /// Deadline for one hop of `generate`, measured from `start` (the start of that
+    /// `generate`). An explicit `generate_timeout` applies to every hop. Otherwise an
+    /// agent-cli hop gets [`crate::backend_cli::MAX_CALL_DURATION`], and cloud-http /
+    /// local / mesh keep the 30s default plus time already spent inside agent-cli hops
+    /// (`cli_elapsed`), so a long CLI call does not expire the next hop the moment it returns.
+    pub(crate) fn hop_deadline(
+        &self,
+        start: Instant,
+        backend: InferenceBackendClass,
+        cli_elapsed: Duration,
+    ) -> Instant {
+        if let Some(limit) = self.generate_timeout {
+            return start + limit;
+        }
+        if backend == InferenceBackendClass::AgentCli {
+            return start + crate::backend_cli::MAX_CALL_DURATION;
+        }
+        start + cap_http::DEFAULT_TIMEOUT + cli_elapsed
+    }
+
+    pub fn with_inference_backends(mut self, registry: InferenceBackendRegistry) -> Self {
+        let inference_backends = Arc::new(RwLock::new(registry));
+        self.sidecar_table = Arc::new(crate::backend_local::SidecarTable::new(Arc::clone(
+            &inference_backends,
+        )));
+        self.inference_backends = inference_backends;
         self
     }
 
@@ -649,19 +677,63 @@ impl LlmGateway {
         Arc::clone(&self.catalog)
     }
 
-    pub fn with_sidecar_holds(
-        mut self,
-        holds: Vec<Arc<crate::backend_local::SupervisedChild>>,
-    ) -> Self {
-        self.sidecar_holds = holds;
-        self
+    /// Remember a sidecar this process already spawned at boot, so a later apply of the
+    /// same command keeps that process instead of starting a second one.
+    pub fn remember_sidecar(
+        &mut self,
+        provider_id: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        handoff: SidecarHandoff,
+        child: Arc<crate::backend_local::SupervisedChild>,
+    ) {
+        self.sidecar_table
+            .remember(provider_id, command, args, handoff, child);
     }
 
     /// Production-owned sidecar children (empty when no local sidecar spawned).
-    pub fn sidecar_holds(&self) -> &[Arc<crate::backend_local::SupervisedChild>] {
-        &self.sidecar_holds
+    pub fn sidecar_holds(&self) -> Vec<Arc<crate::backend_local::SupervisedChild>> {
+        self.sidecar_table.children()
+    }
+}
+
+/// Starts and stops a local provider's sidecar on the running daemon.
+///
+/// Installed on the providers admin so creating, changing, or selecting a sidecar-backed
+/// local model applies in this process. Without a binder the admin still answers
+/// `restart_required`.
+pub trait LocalSidecarBinder: Send + Sync {
+    fn apply_local_sidecar(
+        &self,
+        provider_id: &str,
+        command: &str,
+        args: &[String],
+        embedding_model: Option<&str>,
+        policy: ProcessPolicy,
+    ) -> Result<(), ()>;
+
+    fn release_local_sidecar(&self, provider_id: &str);
+}
+
+impl LocalSidecarBinder for LlmGateway {
+    fn apply_local_sidecar(
+        &self,
+        provider_id: &str,
+        command: &str,
+        args: &[String],
+        embedding_model: Option<&str>,
+        policy: ProcessPolicy,
+    ) -> Result<(), ()> {
+        self.sidecar_table
+            .apply(provider_id, command, args, embedding_model, policy)
     }
 
+    fn release_local_sidecar(&self, provider_id: &str) {
+        self.sidecar_table.release(provider_id);
+    }
+}
+
+impl LlmGateway {
     pub(crate) fn map_backend_err(
         e: advance_shared_types::inference::InferenceBackendError,
     ) -> LlmError {
@@ -726,7 +798,12 @@ impl LlmGateway {
         &self,
         resolved: &ResolvedProvider,
     ) -> Result<Arc<dyn InferenceBackendPort>, LlmError> {
-        match self.inference_backends.get(&resolved.id) {
+        match self
+            .inference_backends
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&resolved.id)
+        {
             Some(p) => Ok(p),
             None if resolved.backend_class
                 == advance_runtime::config::InferenceBackendClass::MeshRemote =>
@@ -2306,7 +2383,9 @@ impl LlmGateway {
         pin: Option<&str>,
     ) -> Result<ChatResponse, LlmError> {
         let start = Instant::now();
-        let deadline = start + self.generate_timeout.unwrap_or(cap_http::DEFAULT_TIMEOUT);
+        // Wall time spent inside agent-cli hops when no explicit generate_timeout is set.
+        // Added back onto the 30s budget of later cloud-http / local / mesh hops.
+        let mut cli_elapsed = Duration::ZERO;
         let cfg = self.config_provider.current();
         // Lane agent-llm-policy: the agent's pin / default model / constraint shape the
         // request BEFORE placement; a pinned provider absent from config fails closed here.
@@ -2357,14 +2436,6 @@ impl LlmGateway {
         let mut last_ok: Option<DispatchOutcome> = None;
         let mut strength_floor: Option<crate::placement::Strength> = None;
         loop {
-            if Instant::now() >= deadline {
-                if let Some(outcome) = last_ok.take() {
-                    return self.finish_winner(&ctx, outcome, start, &mut tee);
-                }
-                return Err(
-                    last_err.unwrap_or_else(|| LlmError::ProviderError("deadline-exceeded".into()))
-                );
-            }
             let rec = match crate::placement::place(
                 &cands,
                 &ctx.user_constraints,
@@ -2388,6 +2459,15 @@ impl LlmGateway {
             };
             let resolved = crate::provider::make_resolved(&pcfg, rec.model_revision.clone());
             ctx.placement = Some(rec.clone());
+            let hop_deadline = self.hop_deadline(start, resolved.backend_class, cli_elapsed);
+            if Instant::now() >= hop_deadline {
+                if let Some(outcome) = last_ok.take() {
+                    return self.finish_winner(&ctx, outcome, start, &mut tee);
+                }
+                return Err(
+                    last_err.unwrap_or_else(|| LlmError::ProviderError("deadline-exceeded".into()))
+                );
+            }
             if resolved.backend_class.uses_inference_port() {
                 // MeshRemote !is_wired is the OSS NotWired stub (plan §6.2).
                 // Local FailedSpawnBackend is fail-closed in-registry: dispatch
@@ -2412,17 +2492,23 @@ impl LlmGateway {
                     return Err(err);
                 }
             }
-            match self
+            let count_cli = self.generate_timeout.is_none()
+                && resolved.backend_class == InferenceBackendClass::AgentCli;
+            let hop_started = Instant::now();
+            let dispatched = self
                 .dispatch_one(
                     &mut ctx,
                     &resolved,
                     &pcfg,
                     &mut tee,
                     &mut tee_armed,
-                    deadline,
+                    hop_deadline,
                 )
-                .await
-            {
+                .await;
+            if count_cli {
+                cli_elapsed = cli_elapsed.saturating_add(hop_started.elapsed());
+            }
+            match dispatched {
                 Ok(outcome) if ctx.hard_task_class => {
                     last_ok = Some(outcome);
                     last_err = None;
