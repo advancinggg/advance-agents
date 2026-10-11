@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use advance_runtime_compose::compose;
 use advance_runtime_compose::test_support::fixture::{
-    assert_gone_for_home, mint_session, CapDecl, FixtureDriver, FixtureHome, FixtureHomeSpec,
-    Http, McpStdioServerMarker,
+    assert_gone_for_home, mint_session, CapDecl, FixtureDriver, FixtureHome, FixtureHomeSpec, Http,
+    McpStdioServerMarker,
 };
 use advance_runtime_compose::test_support::proc_self::child_pids;
 use advance_runtime_compose::test_support::{spawn_counter, ComposeProbe, MemoryComposeLog};
@@ -54,7 +54,10 @@ fn mcp_home(marker: &McpStdioServerMarker) -> FixtureHome {
 async fn wait_until(what: &str, mut holds: impl FnMut() -> bool) {
     let deadline = Instant::now() + WAIT;
     while !holds() {
-        assert!(Instant::now() < deadline, "{what} did not hold within {WAIT:?}");
+        assert!(
+            Instant::now() < deadline,
+            "{what} did not hold within {WAIT:?}"
+        );
         tokio::time::sleep(POLL).await;
     }
 }
@@ -89,7 +92,10 @@ async fn sys_ac_338_j83_forbid_refuses_the_composed_mcp_stdio_server() {
     // The warm-up runs on the daemon runtime right after compose_mcp: its listing is what
     // would start the server, and the policy refuses it at the spawn site.
     wait_until("the McpStdio refusal is counted", || {
-        spawn_counter::snapshot().since(&s0).refused(SpawnSite::McpStdio) >= 1
+        spawn_counter::snapshot()
+            .since(&s0)
+            .refused(SpawnSite::McpStdio)
+            >= 1
     })
     .await;
     wait_until("the listing warning names the refusal", || {
@@ -146,7 +152,10 @@ async fn module_001_ac30_t111_6_mcp_listings_are_joined_and_the_server_group_sto
     let addr = ep.socket_addr;
     let deadline = Instant::now() + WAIT;
     let mcp_tools = loop {
-        let resp = Http::get(addr, "/client/tools").session(&token).send().await;
+        let resp = Http::get(addr, "/client/tools")
+            .session(&token)
+            .send()
+            .await;
         assert_eq!(resp.status, 200, "{:?}", resp.body);
         let tools = resp
             .body

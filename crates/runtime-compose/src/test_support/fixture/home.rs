@@ -208,10 +208,7 @@ impl McpStdioServerMarker {
         let root = std::fs::canonicalize(dir.path())?;
         let script = root.join("mcp-srv.sh");
         let quoted = root.display().to_string().replace('\'', "'\\''");
-        std::fs::write(
-            &script,
-            MCP_STDIO_SERVER_SCRIPT.replace("@DIR@", &quoted),
-        )?;
+        std::fs::write(&script, MCP_STDIO_SERVER_SCRIPT.replace("@DIR@", &quoted))?;
         let mut perms = std::fs::metadata(&script)?.permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms)?;
