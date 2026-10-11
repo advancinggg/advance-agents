@@ -16,10 +16,10 @@ use serde_json::{json, Value};
 
 use advance_client_api::agents::{
     ClientAgentCapability, ClientAgentConfig, ClientAgentDeclaredChild, ClientAgentDeleteResult,
-    ClientAgentDetail, ClientAgentLlm, ClientAgentSummary, ClientAgentTemplate,
-    ClientCreateAgentRequest, ClientDeleteAgentRequest, ClientUpdateAgentRequest,
-    MAX_AGENT_CONFIG_BYTES, MAX_DISPLAY_NAME_BYTES, MAX_REQUESTED_CAPABILITIES,
-    MAX_WORKSPACE_PATH_DEPTH, WARNING_RESTART_REQUIRED,
+    ClientAgentDetail, ClientAgentLlm, ClientAgentSummary, ClientAgentTemplate, ClientAgentsMd,
+    ClientCreateAgentRequest, ClientDeleteAgentRequest, ClientSetAgentsMdRequest,
+    ClientUpdateAgentRequest, MAX_AGENTS_MD_BYTES, MAX_AGENT_CONFIG_BYTES, MAX_DISPLAY_NAME_BYTES,
+    MAX_REQUESTED_CAPABILITIES, MAX_WORKSPACE_PATH_DEPTH, WARNING_RESTART_REQUIRED,
 };
 use advance_client_api::audit::RecordingSink;
 use advance_client_api::clock::{Clock, TestClock};
@@ -43,6 +43,7 @@ struct AgentRecord {
     capabilities: Vec<String>,
     children: Vec<String>,
     llm: Option<ClientAgentLlm>,
+    agents_md: Option<String>,
 }
 
 #[derive(Default)]
@@ -53,6 +54,8 @@ struct Calls {
     update: AtomicUsize,
     delete: AtomicUsize,
     templates: AtomicUsize,
+    get_md: AtomicUsize,
+    set_md: AtomicUsize,
 }
 
 struct MemoryAgentAdmin {
@@ -62,6 +65,7 @@ struct MemoryAgentAdmin {
     last_create: Mutex<Option<ClientCreateAgentRequest>>,
     last_update: Mutex<Option<(String, ClientUpdateAgentRequest)>>,
     last_delete: Mutex<Option<(String, ClientDeleteAgentRequest)>>,
+    last_set_md: Mutex<Option<(String, ClientSetAgentsMdRequest)>>,
     panic_on_list: bool,
 }
 
@@ -85,6 +89,7 @@ impl MemoryAgentAdmin {
                 capabilities: vec!["fs".into(), "llm".into()],
                 children: vec!["research".into()],
                 llm: None,
+                agents_md: Some("# Home\n".into()),
             },
         );
         agents.insert(
@@ -108,6 +113,7 @@ impl MemoryAgentAdmin {
                     model: Some("tiny".into()),
                     constraint: None,
                 }),
+                agents_md: None,
             },
         );
         Arc::new(Self {
@@ -116,6 +122,7 @@ impl MemoryAgentAdmin {
             last_create: Mutex::new(None),
             last_update: Mutex::new(None),
             last_delete: Mutex::new(None),
+            last_set_md: Mutex::new(None),
             panic_on_list: false,
         })
     }
@@ -127,6 +134,7 @@ impl MemoryAgentAdmin {
             last_create: Mutex::new(None),
             last_update: Mutex::new(None),
             last_delete: Mutex::new(None),
+            last_set_md: Mutex::new(None),
             panic_on_list: true,
         })
     }
@@ -234,6 +242,7 @@ impl AgentAdminProvider for MemoryAgentAdmin {
             capabilities: request.capabilities.clone(),
             children: vec![],
             llm: request.llm.clone().filter(|l| !l.is_empty()),
+            agents_md: None,
         };
         let detail = Self::detail(&rec);
         agents.insert(handle.clone(), rec);
@@ -308,6 +317,36 @@ impl AgentAdminProvider for MemoryAgentAdmin {
             agent_id: agent_id.to_string(),
             removed_agent_ids: vec![agent_id.to_string()],
             workspace_removed: request.remove_workspace,
+        })
+    }
+
+    fn get_agents_md(&self, agent_id: &str) -> Result<ClientAgentsMd, ProviderError> {
+        self.calls.get_md.fetch_add(1, Ordering::SeqCst);
+        let agents = self.agents.lock().unwrap();
+        let rec = agents
+            .get(agent_id)
+            .ok_or_else(|| ProviderError::NotFound("agent".into()))?;
+        Ok(ClientAgentsMd {
+            agent_id: rec.summary.agent_id.clone(),
+            content: rec.agents_md.clone(),
+        })
+    }
+
+    fn set_agents_md(
+        &self,
+        agent_id: &str,
+        request: &ClientSetAgentsMdRequest,
+    ) -> Result<ClientAgentsMd, ProviderError> {
+        self.calls.set_md.fetch_add(1, Ordering::SeqCst);
+        *self.last_set_md.lock().unwrap() = Some((agent_id.to_string(), request.clone()));
+        let mut agents = self.agents.lock().unwrap();
+        let rec = agents
+            .get_mut(agent_id)
+            .ok_or_else(|| ProviderError::NotFound("agent".into()))?;
+        rec.agents_md = Some(request.content.clone());
+        Ok(ClientAgentsMd {
+            agent_id: rec.summary.agent_id.clone(),
+            content: rec.agents_md.clone(),
         })
     }
 
@@ -406,6 +445,7 @@ fn ag01_absent_provider_is_module_unavailable_not_unknown_route() {
         get(routes::PATH_AGENTS),
         get(routes::PATH_AGENT_TEMPLATES),
         get("/client/agents/research"),
+        get("/client/agents/research/agents-md"),
         post(routes::PATH_AGENTS, create_body(), "k-create"),
         post(
             "/client/agents/research:update",
@@ -413,6 +453,11 @@ fn ag01_absent_provider_is_module_unavailable_not_unknown_route() {
             "k-update",
         ),
         post("/client/agents/research:delete", Value::Null, "k-delete"),
+        post(
+            "/client/agents/research:set-agents-md",
+            json!({ "content": "# Research\n" }),
+            "k-md",
+        ),
     ];
     for req in probes {
         let path = req.path.clone();
@@ -1040,6 +1085,7 @@ fn ag13_reads_require_read_runs_scope() {
     for path in [
         routes::PATH_AGENTS,
         "/client/agents/research",
+        "/client/agents/research/agents-md",
         routes::PATH_AGENT_TEMPLATES,
     ] {
         let env = api.handle(ClientRequest::get(path).with_session("ctl"));
@@ -1048,6 +1094,7 @@ fn ag13_reads_require_read_runs_scope() {
     assert_eq!(provider.calls.list.load(Ordering::SeqCst), 0);
     assert_eq!(provider.calls.get.load(Ordering::SeqCst), 0);
     assert_eq!(provider.calls.templates.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.calls.get_md.load(Ordering::SeqCst), 0);
 }
 
 // ── AG-14: a path-bound agent id is validated before the provider sees it ────────────────────
@@ -1115,6 +1162,8 @@ fn ag16_contract_surface_registered() {
         "ClientUpdateAgentRequest",
         "ClientDeleteAgentRequest",
         "ClientAgentLlm",
+        "ClientAgentsMd",
+        "ClientSetAgentsMdRequest",
     ] {
         assert!(comps.contains_key(dto), "schema missing {dto}");
     }
@@ -1124,6 +1173,7 @@ fn ag16_contract_surface_registered() {
         "ClientAgentDeleteResult",
         "ClientAgentTemplate",
         "ClientAgentLlm",
+        "ClientAgentsMd",
     ] {
         assert!(RESPONSE_COMPONENTS.contains(&r), "{r} inventoried");
     }
@@ -1131,6 +1181,7 @@ fn ag16_contract_surface_registered() {
         "ClientCreateAgentRequest",
         "ClientUpdateAgentRequest",
         "ClientDeleteAgentRequest",
+        "ClientSetAgentsMdRequest",
     ] {
         assert!(EXCLUDED_COMPONENTS.contains(&x), "{x} excluded");
     }
@@ -1416,4 +1467,151 @@ fn ag20_llm_policy_read_update_and_validation() {
     assert!(inventory["ClientAgentConfig"]
         .keys()
         .any(|k| k.starts_with("llm")));
+}
+
+fn agents_md(env: &ClientEnvelope<Value>) -> ClientAgentsMd {
+    assert!(env.is_ok(), "expected ok envelope, got {:?}", env.error);
+    serde_json::from_value(env.data.clone().unwrap()).expect("ClientAgentsMd parses")
+}
+
+// ── AG-21: read and replace `.agent/AGENTS.md` ───────────────────────────────────────────────
+#[test]
+fn ag21_agents_md_read_and_replace() {
+    let provider = MemoryAgentAdmin::new();
+    let (api, sink) = api_with(provider.clone());
+    operator(&api);
+
+    let doc = agents_md(&api.handle(get("/client/agents/root/agents-md")));
+    assert_eq!(doc.agent_id, "root");
+    assert_eq!(doc.content.as_deref(), Some("# Home\n"));
+    let raw = api.handle(get("/client/agents/root/agents-md"));
+    assert!(raw.data.as_ref().unwrap().get("content").is_some());
+
+    let missing = agents_md(&api.handle(get("/client/agents/research/agents-md")));
+    assert_eq!(missing.agent_id, "research");
+    assert!(missing.content.is_none());
+    assert!(api
+        .handle(get("/client/agents/research/agents-md"))
+        .data
+        .unwrap()["content"]
+        .is_null());
+
+    let env = api.handle(get("/client/agents/nope/agents-md"));
+    assert_eq!(code(&env), Some(ClientErrorCode::NotFound));
+
+    let written = agents_md(&api.handle(post(
+        "/client/agents/research:set-agents-md",
+        json!({ "content": "# Research\n\nLook carefully.\n" }),
+        "k-md-1",
+    )));
+    assert_eq!(
+        written.content.as_deref(),
+        Some("# Research\n\nLook carefully.\n")
+    );
+    let again = agents_md(&api.handle(get("/client/agents/research/agents-md")));
+    assert_eq!(again.content, written.content);
+    let last = provider.last_set_md.lock().unwrap().clone().unwrap();
+    assert_eq!(last.0, "research");
+    assert_eq!(last.1.content, "# Research\n\nLook carefully.\n");
+
+    let cleared = agents_md(&api.handle(post(
+        "/client/agents/research:set-agents-md",
+        json!({ "content": "" }),
+        "k-md-empty",
+    )));
+    assert_eq!(cleared.content.as_deref(), Some(""));
+
+    let env = api.handle(post(
+        "/client/agents/ghost:set-agents-md",
+        json!({ "content": "x" }),
+        "k-md-missing",
+    ));
+    assert_eq!(code(&env), Some(ClientErrorCode::NotFound));
+
+    let too_big = "x".repeat(MAX_AGENTS_MD_BYTES + 1);
+    let env = api.handle(post(
+        "/client/agents/root:set-agents-md",
+        json!({ "content": too_big }),
+        "k-md-big",
+    ));
+    assert_eq!(code(&env), Some(ClientErrorCode::RequestTooLarge));
+    assert_eq!(
+        agents_md(&api.handle(get("/client/agents/root/agents-md")))
+            .content
+            .as_deref(),
+        Some("# Home\n"),
+        "an oversize write does not reach the provider"
+    );
+
+    for (body, key) in [
+        (json!({}), "k-md-empty-body"),
+        (json!({ "content": "a", "extra": 1 }), "k-md-extra"),
+        (Value::Null, "k-md-null"),
+        (json!({ "content": "a\u{0000}b" }), "k-md-nul"),
+    ] {
+        let env = api.handle(post("/client/agents/root:set-agents-md", body, key));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{key}");
+    }
+    let env = api.handle(post(
+        "/client/agents/bad id:set-agents-md",
+        json!({ "content": "x" }),
+        "k-md-bad-id",
+    ));
+    assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest));
+
+    let sets_before = provider.calls.set_md.load(Ordering::SeqCst);
+    let first = api.handle(post(
+        "/client/agents/root:set-agents-md",
+        json!({ "content": "# replay\n" }),
+        "k-md-replay",
+    ));
+    let replay = api.handle(post(
+        "/client/agents/root:set-agents-md",
+        json!({ "content": "# replay\n" }),
+        "k-md-replay",
+    ));
+    assert_eq!(first.data, replay.data);
+    assert!(replay
+        .warnings
+        .iter()
+        .any(|w| w.code == "idempotent_replay"));
+    assert_eq!(
+        provider.calls.set_md.load(Ordering::SeqCst),
+        sets_before + 1,
+        "replay must not re-enter the provider"
+    );
+    let conflict = api.handle(post(
+        "/client/agents/root:set-agents-md",
+        json!({ "content": "# other\n" }),
+        "k-md-replay",
+    ));
+    assert_eq!(code(&conflict), Some(ClientErrorCode::IdempotencyConflict));
+    assert_eq!(
+        provider.calls.set_md.load(Ordering::SeqCst),
+        sets_before + 1
+    );
+
+    mint(&api, "ro", vec![Scope::ReadRuns], None);
+    let env = api.handle(
+        ClientRequest::post(
+            "/client/agents/root:set-agents-md",
+            json!({ "content": "nope" }),
+        )
+        .with_session("ro")
+        .with_idempotency_key("k-md-ro"),
+    );
+    assert_eq!(code(&env), Some(ClientErrorCode::Forbidden));
+    let env = api.handle(ClientRequest::get("/client/agents/root/agents-md").with_session("ro"));
+    assert!(env.is_ok(), "{:?}", env.error);
+
+    mint(&api, "ctl", vec![Scope::ControlRuns], None);
+    let env = api.handle(ClientRequest::get("/client/agents/root/agents-md").with_session("ctl"));
+    assert_eq!(code(&env), Some(ClientErrorCode::Forbidden));
+
+    assert!(sink
+        .events()
+        .iter()
+        .any(|e| e.family == "agents" && e.kind == "client_api.response"));
+    assert!(provider.calls.get_md.load(Ordering::SeqCst) > 0);
+    assert!(provider.calls.set_md.load(Ordering::SeqCst) > 0);
 }

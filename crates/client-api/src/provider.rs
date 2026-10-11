@@ -20,7 +20,8 @@ use advance_shared_types::sensitive_observation::SensitiveObservationRedactor;
 
 use crate::agents::{
     ClientAgentDeleteResult, ClientAgentDetail, ClientAgentSummary, ClientAgentTemplate,
-    ClientCreateAgentRequest, ClientDeleteAgentRequest, ClientUpdateAgentRequest,
+    ClientAgentsMd, ClientCreateAgentRequest, ClientDeleteAgentRequest, ClientSetAgentsMdRequest,
+    ClientUpdateAgentRequest,
 };
 use crate::costs::{
     ClientAgentCostEntry, ClientAgentCostReport, ClientProviderCostEntry, ClientProviderCostReport,
@@ -197,9 +198,10 @@ pub trait ToolsProvider: Send + Sync {
 
 /// Agent administration provider (MODULE-005 tree + workspace territories, CONTRACT-040/041 host
 /// side) behind the `agents` family. The adapter owns the real `AgentTreeStore`, spawner, terminate
-/// controller, and the `.agent/config.yaml` / display-name files; every argument it receives has
-/// already passed the handler-side validation in [`crate::agents`]. Read results are client-safe
-/// projections (workspace paths are workspace-root-relative, never absolute host paths).
+/// controller, and the `.agent/config.yaml` / `.agent/AGENTS.md` / display-name files; every
+/// argument it receives has already passed the handler-side validation in [`crate::agents`]. Read
+/// results are client-safe projections (workspace paths are workspace-root-relative, never absolute
+/// host paths).
 pub trait AgentAdminProvider: Send + Sync {
     fn list_agents(&self) -> Result<Vec<ClientAgentSummary>, ProviderError>;
     fn get_agent(&self, agent_id: &str) -> Result<ClientAgentDetail, ProviderError>;
@@ -223,6 +225,15 @@ pub trait AgentAdminProvider: Send + Sync {
         request: &ClientDeleteAgentRequest,
     ) -> Result<ClientAgentDeleteResult, ProviderError>;
     fn list_templates(&self) -> Result<Vec<ClientAgentTemplate>, ProviderError>;
+    /// The agent's `.agent/AGENTS.md`. `content: null` when the file is absent. A symlink or
+    /// other non-regular file is refused (never followed).
+    fn get_agents_md(&self, agent_id: &str) -> Result<ClientAgentsMd, ProviderError>;
+    /// Replace `.agent/AGENTS.md` in full. The handler has already bounded the document.
+    fn set_agents_md(
+        &self,
+        agent_id: &str,
+        request: &ClientSetAgentsMdRequest,
+    ) -> Result<ClientAgentsMd, ProviderError>;
     /// A capability id outside the `[A-Za-z0-9_-]` charset that this provider admits in
     /// `capabilities` lists (the composition's extension capabilities). Default: none, so
     /// validation is exactly the charset rule.

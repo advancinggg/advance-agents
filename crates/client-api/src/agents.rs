@@ -6,6 +6,8 @@
 //! - `GET  /client/agents/{agent_id}`            read one agent + its config document (`ReadRuns`)
 //! - `POST /client/agents/{agent_id}:update`     update display name / config document / persisted capabilities (`ControlRuns`)
 //! - `POST /client/agents/{agent_id}:delete`     terminate + de-register an agent (`ControlRuns`)
+//! - `GET  /client/agents/{agent_id}/agents-md`  read `.agent/AGENTS.md` (`ReadRuns`)
+//! - `POST /client/agents/{agent_id}:set-agents-md` replace `.agent/AGENTS.md` (`ControlRuns`, mutation)
 //! - `GET  /client/agent-templates`              list the templates a create may reference (`ReadRuns`)
 //!
 //! The family reuses the run-control scopes on purpose: `Scope` is a closed enum inventoried by the
@@ -51,6 +53,8 @@ use crate::session::Scope;
 pub const MAX_AGENT_ID_LEN: usize = 64;
 /// Bound on a config document carried by create/update (matches the lifecycle atomic-write cap).
 pub const MAX_AGENT_CONFIG_BYTES: usize = 64 * 1024;
+/// Bound on `.agent/AGENTS.md` (matches `cap_lifecycle::atomic::MAX_BYTES`).
+pub const MAX_AGENTS_MD_BYTES: usize = 64 * 1024;
 /// Bound on a display name (matches the first-open display-name persist cap).
 pub const MAX_DISPLAY_NAME_BYTES: usize = 256;
 /// Bound on a workspace path string.
@@ -259,6 +263,26 @@ pub struct ClientAgentDeleteResult {
     pub workspace_removed: bool,
 }
 
+/// `GET /client/agents/{agent_id}/agents-md` and the `:set-agents-md` response.
+///
+/// `content` is the verbatim `.agent/AGENTS.md`. `null` means the file is absent; an empty
+/// string means the file exists and is empty. The path is never returned (it would be a host path).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientAgentsMd {
+    pub agent_id: String,
+    /// Verbatim document. Null when `.agent/AGENTS.md` does not exist.
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
+/// The body of `POST /client/agents/{agent_id}:set-agents-md`. Full replacement of
+/// `.agent/AGENTS.md`. An empty string writes an empty file; it does not delete it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClientSetAgentsMdRequest {
+    pub content: String,
+}
+
 /// One template a create may reference (`GET /client/agent-templates`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientAgentTemplate {
@@ -359,6 +383,22 @@ pub fn validate_display_name(name: &str) -> Result<(), ClientError> {
         || trimmed.chars().any(char::is_control)
     {
         return Err(invalid("invalid display name"));
+    }
+    Ok(())
+}
+
+/// An `AGENTS.md` document: bounded (`request_too_large` beyond [`MAX_AGENTS_MD_BYTES`]) and
+/// NUL-free. UTF-8 is structural (the body is a JSON string). The provider refuses to follow a
+/// symlink at the file path.
+pub fn validate_agents_md(content: &str) -> Result<(), ClientError> {
+    if content.len() > MAX_AGENTS_MD_BYTES {
+        return Err(ClientError::new(
+            ClientErrorCode::RequestTooLarge,
+            "AGENTS.md exceeds max size",
+        ));
+    }
+    if content.contains('\0') {
+        return Err(invalid("invalid AGENTS.md"));
     }
     Ok(())
 }
@@ -661,6 +701,44 @@ pub(crate) fn register(api: &mut ClientApi, slot: AgentProviderSlot) {
         .with_scopes(vec![Scope::ControlRuns]),
     );
 
+    // GET /client/agents/{agent_id}/agents-md — verbatim `.agent/AGENTS.md`.
+    let s = slot.clone();
+    api.register_templated(
+        Method::Get,
+        routes::TPL_AGENT_AGENTS_MD,
+        HandlerSpec::read(true, move |ctx| {
+            let agent_id = ctx.path_param("agent_id")?;
+            validate_agent_id(&agent_id)?;
+            let provider = provider_or_unavailable(&s)?;
+            let doc = provider
+                .get_agents_md(&agent_id)
+                .map_err(ProviderError::into_client_error)?;
+            Ok(serde_json::to_value(doc).expect("ClientAgentsMd serializes"))
+        })
+        .with_scopes(vec![Scope::ReadRuns]),
+    );
+
+    // POST /client/agents/{agent_id}:set-agents-md — full replacement of `.agent/AGENTS.md`.
+    // No `restart_required`: the document is a file the next reader observes, not boot wiring.
+    let s = slot.clone();
+    api.register_templated(
+        Method::Post,
+        routes::TPL_AGENT_SET_AGENTS_MD,
+        HandlerSpec::mutation(true, move |ctx| {
+            let agent_id = ctx.path_param("agent_id")?;
+            validate_agent_id(&agent_id)?;
+            let req: ClientSetAgentsMdRequest = parse_body(&ctx.body)?;
+            validate_agents_md(&req.content)?;
+            let provider = provider_or_unavailable(&s)?;
+            mark_provider_entry(ctx)?;
+            let doc = provider
+                .set_agents_md(&agent_id, &req)
+                .map_err(ProviderError::into_client_error)?;
+            Ok(serde_json::to_value(doc).expect("ClientAgentsMd serializes"))
+        })
+        .with_scopes(vec![Scope::ControlRuns]),
+    );
+
     // POST /client/agents/{agent_id}:delete — terminate cascade + de-register.
     let s = slot.clone();
     api.register_templated(
@@ -817,6 +895,19 @@ mod tests {
         );
         assert_eq!(
             validate_config_document("a\0b").unwrap_err().code,
+            ClientErrorCode::InvalidRequest
+        );
+        assert!(validate_agents_md("").is_ok());
+        assert!(validate_agents_md("# Agent\n").is_ok());
+        assert!(validate_agents_md(&"x".repeat(MAX_AGENTS_MD_BYTES)).is_ok());
+        assert_eq!(
+            validate_agents_md(&"x".repeat(MAX_AGENTS_MD_BYTES + 1))
+                .unwrap_err()
+                .code,
+            ClientErrorCode::RequestTooLarge
+        );
+        assert_eq!(
+            validate_agents_md("a\0b").unwrap_err().code,
             ClientErrorCode::InvalidRequest
         );
     }

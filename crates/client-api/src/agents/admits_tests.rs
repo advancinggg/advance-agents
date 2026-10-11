@@ -33,6 +33,16 @@ impl AgentAdminProvider for StubAdmin {
     fn list_templates(&self) -> Result<Vec<ClientAgentTemplate>, ProviderError> {
         Err(ProviderError::Unavailable("stub".into()))
     }
+    fn get_agents_md(&self, _agent_id: &str) -> Result<ClientAgentsMd, ProviderError> {
+        Err(ProviderError::Unavailable("stub".into()))
+    }
+    fn set_agents_md(
+        &self,
+        _agent_id: &str,
+        _request: &ClientSetAgentsMdRequest,
+    ) -> Result<ClientAgentsMd, ProviderError> {
+        Err(ProviderError::Unavailable("stub".into()))
+    }
 }
 
 #[test]

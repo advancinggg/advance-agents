@@ -18,8 +18,8 @@ use advance_client_api::{
     AeadClientCursorCodec, AgentAdminProvider, BoundGrantApprovalPort, BoundGrantMutation,
     BoundHistoryPage, BoundHistoryReadPort, BoundMutationOutcome, ClientAgentCostEntry,
     ClientAgentCostReport, ClientAgentDeleteResult, ClientAgentDetail, ClientAgentSummary,
-    ClientAgentTemplate, ClientAgentTreeNode, ClientApi, ClientApiConfig, ClientApiServer,
-    ClientCreateAgentRequest, ClientCreateProviderRequest, ClientCursorCodec,
+    ClientAgentTemplate, ClientAgentTreeNode, ClientAgentsMd, ClientApi, ClientApiConfig,
+    ClientApiServer, ClientCreateAgentRequest, ClientCreateProviderRequest, ClientCursorCodec,
     ClientDeleteAgentRequest, ClientEntityApplyRequest, ClientEntityCreateRequest,
     ClientEntityPage, ClientEntityPatchRequest, ClientEntityQueryRequest, ClientEntityRow,
     ClientEntityTarget, ClientErrorCode, ClientEventProvider, ClientMessageAck,
@@ -27,13 +27,14 @@ use advance_client_api::{
     ClientPackInstallResult, ClientPackSummary, ClientPackUninstallResult, ClientProviderCostEntry,
     ClientProviderCostReport, ClientProviderDeleteResult, ClientProviderKeyResult,
     ClientProviderPreflightResult, ClientProviderSummary, ClientRequest, ClientRunMutation,
-    ClientRunSummary, ClientSchema, ClientSecretsMode, ClientSession, ClientSetSecretsModeRequest,
-    ClientToolInventory, ClientUpdateAgentRequest, ClientUpdateProviderRequest, CostProvider,
-    DeltaHoldSplit, DeltaPumpExit, DeltaPumpExitObserver, EntityProvider, HandlerSpec, LlmDeltaHub,
-    MemoryCursorKeyCustody, MessagingProvider, Method, NormalizedEventFilter, OsCursorEntropy,
-    PackAdminProvider, Platform, Principal, ProviderAdminOutcome, ProviderAdminProvider,
-    ProviderClientDoneReceipt, ProviderError, ProviderMutationRecovery, ProviderPrepareOutcome,
-    RawEventRow, RunControlProvider, Scope, SecretsAdminProvider, SystemCursorClock, ToolsProvider,
+    ClientRunSummary, ClientSchema, ClientSecretsMode, ClientSession, ClientSetAgentsMdRequest,
+    ClientSetSecretsModeRequest, ClientToolInventory, ClientUpdateAgentRequest,
+    ClientUpdateProviderRequest, CostProvider, DeltaHoldSplit, DeltaPumpExit,
+    DeltaPumpExitObserver, EntityProvider, HandlerSpec, LlmDeltaHub, MemoryCursorKeyCustody,
+    MessagingProvider, Method, NormalizedEventFilter, OsCursorEntropy, PackAdminProvider, Platform,
+    Principal, ProviderAdminOutcome, ProviderAdminProvider, ProviderClientDoneReceipt,
+    ProviderError, ProviderMutationRecovery, ProviderPrepareOutcome, RawEventRow,
+    RunControlProvider, Scope, SecretsAdminProvider, SystemCursorClock, ToolsProvider,
     ValidatedCostWindow, API_VERSION, CLIENT_WS_PROTOCOL,
 };
 use advance_shared_types::security_validator::LeakDetector;
@@ -438,6 +439,16 @@ impl AgentAdminProvider for Sentinel {
         unreachable!()
     }
     fn list_templates(&self) -> Result<Vec<ClientAgentTemplate>, ProviderError> {
+        unreachable!()
+    }
+    fn get_agents_md(&self, _: &str) -> Result<ClientAgentsMd, ProviderError> {
+        unreachable!()
+    }
+    fn set_agents_md(
+        &self,
+        _: &str,
+        _: &ClientSetAgentsMdRequest,
+    ) -> Result<ClientAgentsMd, ProviderError> {
         unreachable!()
     }
 }

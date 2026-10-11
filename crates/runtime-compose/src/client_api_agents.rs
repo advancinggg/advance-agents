@@ -37,8 +37,9 @@ use std::sync::{Arc, Mutex};
 use advance_client_api::agents::{
     validate_display_name, ClientAgentCapability, ClientAgentConfig, ClientAgentDeclaredChild,
     ClientAgentDeleteResult, ClientAgentDetail, ClientAgentLlm, ClientAgentSummary,
-    ClientAgentTemplate, ClientCreateAgentRequest, ClientDeleteAgentRequest,
-    ClientUpdateAgentRequest, MAX_AGENT_CONFIG_BYTES,
+    ClientAgentTemplate, ClientAgentsMd, ClientCreateAgentRequest, ClientDeleteAgentRequest,
+    ClientSetAgentsMdRequest, ClientUpdateAgentRequest, MAX_AGENTS_MD_BYTES,
+    MAX_AGENT_CONFIG_BYTES,
 };
 use advance_client_api::{AgentAdminProvider, ClientApi, ClientCapParam, ProviderError};
 use advance_home::{TopLevelDisplayName, DISPLAY_NAME_KEY};
@@ -72,6 +73,7 @@ use crate::effective_capabilities::{EffectiveCapabilities, EffectiveSubsetGate};
 
 const AGENT_DIR: &str = ".agent";
 const CONFIG_FILE: &str = "config.yaml";
+const AGENTS_MD_FILE: &str = "AGENTS.md";
 const MAX_PROJECTED_PARAMS: usize = 64;
 const MAX_PROJECTED_PARAM_BYTES: usize = 4096;
 
@@ -798,6 +800,28 @@ impl AgentAdminProvider for AgentAdminAdapter {
     fn admits_capability_name(&self, name: &str) -> bool {
         self.capabilities.is_extension(name)
     }
+
+    fn get_agents_md(&self, agent_id: &str) -> Result<ClientAgentsMd, ProviderError> {
+        let node = self.node(agent_id)?;
+        Ok(ClientAgentsMd {
+            agent_id: self.handle_of(&node.id),
+            content: read_agents_document(&node.workspace_path)?,
+        })
+    }
+
+    fn set_agents_md(
+        &self,
+        agent_id: &str,
+        request: &ClientSetAgentsMdRequest,
+    ) -> Result<ClientAgentsMd, ProviderError> {
+        let _guard = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let node = self.node(agent_id)?;
+        write_agents_document(&node.workspace_path, &request.content)?;
+        Ok(ClientAgentsMd {
+            agent_id: self.handle_of(&node.id),
+            content: read_agents_document(&node.workspace_path)?,
+        })
+    }
 }
 
 // ── production terminate controller ──────────────────────────────────────────────────────────
@@ -1010,6 +1034,55 @@ fn parse_mapping(bytes: &[u8]) -> Result<Mapping, ()> {
         Value::Null => Ok(Mapping::new()),
         _ => Err(()),
     }
+}
+
+/// Verbatim `.agent/AGENTS.md`. `Ok(None)` when the file is absent. A symlink (or any other
+/// non-regular file) is refused and never followed, so a planted link cannot leak or receive
+/// the replacement bytes.
+fn read_agents_document(workspace: &Path) -> Result<Option<String>, ProviderError> {
+    let path = workspace.join(AGENT_DIR).join(AGENTS_MD_FILE);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(ProviderError::Unavailable("agents.md unreadable".into())),
+    };
+    if !meta.file_type().is_file() {
+        return Err(ProviderError::InvalidRequest("agents.md".into()));
+    }
+    if meta.len() > MAX_AGENTS_MD_BYTES as u64 {
+        return Err(ProviderError::TooLarge("agents.md".into()));
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|_| ProviderError::Unavailable("agents.md unreadable".into()))?;
+    if bytes.len() > MAX_AGENTS_MD_BYTES {
+        return Err(ProviderError::TooLarge("agents.md".into()));
+    }
+    let text =
+        String::from_utf8(bytes).map_err(|_| ProviderError::InvalidRequest("agents.md".into()))?;
+    Ok(Some(text))
+}
+
+/// Replace `.agent/AGENTS.md`. The parent `.agent/` directory must be a real directory, and an
+/// existing `AGENTS.md` must already be a regular file (a symlink is not replaced and not followed).
+fn write_agents_document(workspace: &Path, content: &str) -> Result<(), ProviderError> {
+    if content.len() > MAX_AGENTS_MD_BYTES {
+        return Err(ProviderError::TooLarge("agents.md".into()));
+    }
+    if content.contains('\0') {
+        return Err(ProviderError::InvalidRequest("agents.md".into()));
+    }
+    let agent_dir = workspace.join(AGENT_DIR);
+    if !is_real_dir(&agent_dir) {
+        return Err(ProviderError::Unavailable("agent dir missing".into()));
+    }
+    let path = agent_dir.join(AGENTS_MD_FILE);
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if !meta.file_type().is_file() {
+            return Err(ProviderError::InvalidRequest("agents.md".into()));
+        }
+    }
+    atomic_write(&path, content.as_bytes())
+        .map_err(|_| ProviderError::Unavailable("agents.md write".into()))
 }
 
 /// The verbatim config document under `workspace`, when present, readable, and within bound.

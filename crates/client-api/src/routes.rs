@@ -95,6 +95,11 @@ pub const TPL_RUN_HISTORY: &str = "/client/runs/{run_id}/history";
 pub const TPL_AGENT_GET: &str = "/client/agents/{agent_id}";
 pub const TPL_AGENT_UPDATE: &str = "/client/agents/{agent_id}:update";
 pub const TPL_AGENT_DELETE: &str = "/client/agents/{agent_id}:delete";
+/// Read the agent's `.agent/AGENTS.md` (GET). Its own template so it cannot collide with
+/// `TPL_AGENT_GET` (segment count differs).
+pub const TPL_AGENT_AGENTS_MD: &str = "/client/agents/{agent_id}/agents-md";
+/// Replace the agent's `.agent/AGENTS.md` (POST mutation).
+pub const TPL_AGENT_SET_AGENTS_MD: &str = "/client/agents/{agent_id}:set-agents-md";
 /// Packs family templated routes: one installed pack (`{name}@{version}`), uninstall it.
 pub const TPL_PACK_GET: &str = "/client/packs/{pack_id}";
 pub const TPL_PACK_UNINSTALL: &str = "/client/packs/{pack_id}:uninstall";

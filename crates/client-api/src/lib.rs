@@ -52,8 +52,9 @@ pub mod version;
 
 pub use agents::{
     ClientAgentCapability, ClientAgentConfig, ClientAgentDeclaredChild, ClientAgentDeleteResult,
-    ClientAgentDetail, ClientAgentLlm, ClientAgentSummary, ClientAgentTemplate,
-    ClientCreateAgentRequest, ClientDeleteAgentRequest, ClientUpdateAgentRequest,
+    ClientAgentDetail, ClientAgentLlm, ClientAgentSummary, ClientAgentTemplate, ClientAgentsMd,
+    ClientCreateAgentRequest, ClientDeleteAgentRequest, ClientSetAgentsMdRequest,
+    ClientUpdateAgentRequest,
 };
 pub use api::{ClientApi, ClientMutationContext, HandlerCtx, HandlerResponse, HandlerSpec};
 pub use audit::{AuditEvent, AuditSink, NoopSink};

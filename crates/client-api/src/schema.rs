@@ -203,6 +203,14 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
             "ClientDeleteAgentRequest".to_string(),
             schema_value::<crate::agents::ClientDeleteAgentRequest>(),
         );
+        m.insert(
+            "ClientAgentsMd".to_string(),
+            schema_value::<crate::agents::ClientAgentsMd>(),
+        );
+        m.insert(
+            "ClientSetAgentsMdRequest".to_string(),
+            schema_value::<crate::agents::ClientSetAgentsMdRequest>(),
+        );
         // Lane agent-llm-policy: the typed `llm:` policy block of an agent's config document
         // (a response component on `ClientAgentConfig.llm`, also the create/update sub-object).
         m.insert(

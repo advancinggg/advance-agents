@@ -161,6 +161,8 @@ fn t02e_schema_fidelity() {
         "ClientCreateAgentRequest",
         "ClientUpdateAgentRequest",
         "ClientDeleteAgentRequest",
+        "ClientAgentsMd",
+        "ClientSetAgentsMdRequest",
     ] {
         assert!(comps.get(dto).is_some(), "schema missing DTO {dto}");
     }

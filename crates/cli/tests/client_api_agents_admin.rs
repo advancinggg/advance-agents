@@ -17,12 +17,12 @@ use std::sync::Arc;
 use advance_cli::agent_config::parse_agents_config;
 use advance_cli::client_api_agents::{project_config, AgentAdminAdapter};
 use advance_cli::wiring::{wire_capabilities, WiringHandles};
-use advance_client_api::agents::WARNING_RESTART_REQUIRED;
+use advance_client_api::agents::{MAX_AGENTS_MD_BYTES, WARNING_RESTART_REQUIRED};
 use advance_client_api::{
     AgentAdminProvider, ClientAgentDeleteResult, ClientAgentDetail, ClientAgentSummary,
     ClientAgentTemplate, ClientApi, ClientCreateAgentRequest, ClientEnvelope, ClientErrorCode,
-    ClientRequest, ClientSession, ClientUpdateAgentRequest, Platform, Principal, ProviderError,
-    Scope,
+    ClientRequest, ClientSession, ClientSetAgentsMdRequest, ClientUpdateAgentRequest, Platform,
+    Principal, ProviderError, Scope,
 };
 use advance_runtime::bootstrap::RuntimeHostBuilder;
 use advance_shared_types::agent_tree::{AgentId, AgentKind, AgentNode, AgentStatus, Capability};
@@ -1039,4 +1039,130 @@ fn aa04_adapter_edge_rules_over_real_tree() {
     // Projection helper is reachable for adapters/tests.
     let cfg = project_config(Some("capabilities:\n  fs: false\n"));
     assert!(!cfg.capabilities[0].enabled);
+}
+
+// ── AA-05: `.agent/AGENTS.md` is readable and replaceable without touching config.yaml ───────
+#[test]
+fn aa05_agents_md_read_and_replace_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::create_dir_all(ws.join(".agent")).unwrap();
+    let config = "capabilities:\n  fs: true\n";
+    std::fs::write(ws.join(".agent/config.yaml"), config).unwrap();
+    let (adapter, _) = direct_adapter(&ws);
+
+    let missing = adapter.get_agents_md(ROOT).unwrap();
+    assert_eq!(missing.agent_id, ROOT);
+    assert!(missing.content.is_none());
+
+    let written = adapter
+        .set_agents_md(
+            ROOT,
+            &ClientSetAgentsMdRequest {
+                content: "# Root agent\n".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(written.content.as_deref(), Some("# Root agent\n"));
+    assert_eq!(
+        std::fs::read_to_string(ws.join(".agent/AGENTS.md")).unwrap(),
+        "# Root agent\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join(".agent/config.yaml")).unwrap(),
+        config,
+        "replacing AGENTS.md leaves config.yaml untouched"
+    );
+    assert_eq!(
+        adapter.get_agents_md(ROOT).unwrap().content.as_deref(),
+        Some("# Root agent\n")
+    );
+
+    let cleared = adapter
+        .set_agents_md(
+            ROOT,
+            &ClientSetAgentsMdRequest {
+                content: String::new(),
+            },
+        )
+        .unwrap();
+    assert_eq!(cleared.content.as_deref(), Some(""));
+    assert_eq!(std::fs::read(ws.join(".agent/AGENTS.md")).unwrap(), b"");
+
+    assert!(matches!(
+        adapter.get_agents_md("missing"),
+        Err(ProviderError::NotFound(_))
+    ));
+    assert!(matches!(
+        adapter.set_agents_md(
+            "missing",
+            &ClientSetAgentsMdRequest {
+                content: "x".into(),
+            },
+        ),
+        Err(ProviderError::NotFound(_))
+    ));
+
+    let big = "x".repeat(MAX_AGENTS_MD_BYTES + 1);
+    assert!(matches!(
+        adapter.set_agents_md(ROOT, &ClientSetAgentsMdRequest { content: big }),
+        Err(ProviderError::TooLarge(_))
+    ));
+    assert_eq!(std::fs::read(ws.join(".agent/AGENTS.md")).unwrap(), b"");
+
+    std::fs::write(ws.join(".agent/AGENTS.md"), [0xff, 0xfe]).unwrap();
+    assert!(matches!(
+        adapter.get_agents_md(ROOT),
+        Err(ProviderError::InvalidRequest(_))
+    ));
+
+    std::fs::remove_file(ws.join(".agent/AGENTS.md")).unwrap();
+    std::fs::create_dir(ws.join(".agent/AGENTS.md")).unwrap();
+    assert!(matches!(
+        adapter.get_agents_md(ROOT),
+        Err(ProviderError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        adapter.set_agents_md(
+            ROOT,
+            &ClientSetAgentsMdRequest {
+                content: "nope".into(),
+            },
+        ),
+        Err(ProviderError::InvalidRequest(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn aa06_agents_md_refuses_to_follow_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ws = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::create_dir_all(ws.join(".agent")).unwrap();
+    std::fs::write(ws.join(".agent/config.yaml"), "capabilities:\n  fs: true\n").unwrap();
+    let secret = ws.join("secret.txt");
+    std::fs::write(&secret, "SECRET").unwrap();
+    symlink(&secret, ws.join(".agent/AGENTS.md")).unwrap();
+    let (adapter, _) = direct_adapter(&ws);
+
+    assert!(matches!(
+        adapter.get_agents_md(ROOT),
+        Err(ProviderError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        adapter.set_agents_md(
+            ROOT,
+            &ClientSetAgentsMdRequest {
+                content: "planted".into(),
+            },
+        ),
+        Err(ProviderError::InvalidRequest(_))
+    ));
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "SECRET");
+    assert!(std::fs::symlink_metadata(ws.join(".agent/AGENTS.md"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }
