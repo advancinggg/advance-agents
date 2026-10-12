@@ -54,6 +54,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -450,6 +451,19 @@ fn publish_models_waiter(waiter: &Waiter, fill: CatalogFill) {
     let mut state = waiter.state.lock().unwrap_or_else(|e| e.into_inner());
     *state = WaiterState::Ready(fill);
     waiter.cv.notify_all();
+}
+
+struct LeaderPublishGuard {
+    waiter: Arc<Waiter>,
+    published: bool,
+}
+
+impl Drop for LeaderPublishGuard {
+    fn drop(&mut self) {
+        if !self.published && self.waiter.pending.load(Ordering::Acquire) {
+            publish_models_waiter(&self.waiter, CatalogFill::incomplete(Vec::new()));
+        }
+    }
 }
 
 /// The production `ProviderAdminProvider`.
@@ -985,13 +999,21 @@ impl WiredProviderAdmin {
                 ready
             };
         }
-        let fill = self.probe_models_entry(entry);
+        let mut guard = LeaderPublishGuard {
+            waiter: Arc::clone(&waiter),
+            published: false,
+        };
+        let fill = match catch_unwind(AssertUnwindSafe(|| self.probe_models_entry(entry))) {
+            Ok(fill) => fill,
+            Err(_) => CatalogFill::incomplete(Vec::new()),
+        };
         let published = if self.fingerprint(entry) == fp {
             fill.clone()
         } else {
             CatalogFill::empty_complete()
         };
         publish_models_waiter(&waiter, published);
+        guard.published = true;
         if self.fingerprint(entry) != fp {
             publish_models_waiter(&waiter, CatalogFill::empty_complete());
             self.drop_inflight_if(&entry.id, fp);
@@ -3951,6 +3973,37 @@ post-processor:
         drop(tx);
         let woken = join.join().expect("thread");
         assert!(woken.unwrap().available_models.is_empty());
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn am_t15_probe_panic_does_not_stick_inflight() {
+        struct PanicThenOk {
+            calls: AtomicUsize,
+        }
+        impl CloudHttpModelsProbe for PanicThenOk {
+            fn list_models(&self, _entry: &LlmProviderConfig) -> CatalogFill {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("probe boom");
+                }
+                CatalogFill::complete(vec![ClientProviderSignInModel {
+                    id: "gpt-4o".into(),
+                    display_name: None,
+                }])
+            }
+        }
+        let f = Fixture::new();
+        f.store.store("openai-api-key", "sk-abcdefgh").unwrap();
+        let probe = Arc::new(PanicThenOk {
+            calls: AtomicUsize::new(0),
+        });
+        let admin = f
+            .admin()
+            .with_cloud_http_models_probe(Arc::clone(&probe) as Arc<dyn CloudHttpModelsProbe>);
+        let first = admin.get_provider("openai").unwrap();
+        assert!(first.available_models.is_empty());
+        let second = admin.get_provider("openai").unwrap();
+        assert_eq!(second.available_models[0].id, "gpt-4o");
         assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
     }
 
