@@ -5,8 +5,9 @@
 //!   (sanitized full document; [`crate::tier1::build_tier1a`]). Broader static
 //!   population (architecture/security model) still future.
 //! - **Tier 1b (dynamic)**: Slice B fills the knowledge-map section (AC-16;
-//!   [`crate::tier1::build_tier1b`]). Capability config / mode state / child
-//!   roster ⑥ still future.
+//!   [`crate::tier1::build_tier1b`]). Child roster ⑥
+//!   ([`crate::tier1_children`]) lists this agent's direct `Child` nodes.
+//!   Capability config / mode state still future.
 //! - **Tier 2 (session)**: AC-18 unified `# Available Tools` view
 //!   ([`crate::tier2`]) followed by the AC-19 `# Available Delegates` section
 //!   ([`crate::tier2_delegates`]) — parallel sections, both before the
@@ -51,6 +52,7 @@ use crate::processing_pipeline::{coordinate_processing, MultiLevelReaders};
 use crate::recall_section::format_recall_section;
 use crate::task_router::{TaskRouter, TaskRoutingDecision};
 use crate::tier1::{build_tier1a, build_tier1b};
+use crate::tier1_children::format_available_children_section_with_aliases;
 use crate::tier2::{
     assemble_unified, format_available_tools_section_with_not_shown,
     neutralize_cache_breakpoint_markers, sanitize_description, UnifiedToolRecord,
@@ -131,13 +133,14 @@ pub struct ContextAssemblerImpl {
     // buffer.
     warnings: Arc<WarningQueue>,
     // Wave-12 — the agent-id alias set {bare cap-id, colon msg-id} used to
-    // match the Tier-2 ⑬ delegates `node.parent` AND drain the Tier-3
-    // `WarningQueue`, bridging the colon/bare keying split (production spawns
-    // record + the MODULE-008 RepetitionGuard injects under the BARE cap-id,
-    // while `assemble()` runs under the COLON msg-id). Empty ⇒ single-id
-    // (`ctx.agent_id`-only) behaviour, byte-identical to pre-Wave-12. Set via
-    // `with_agent_id_aliases`; defaults empty in `new()` (signature unchanged,
-    // so the existing direct `new()` callers are untouched).
+    // match the Tier-1b ⑥ child roster + Tier-2 ⑬ delegates `node.parent`
+    // AND drain the Tier-3 `WarningQueue`, bridging the colon/bare keying
+    // split (production spawns record + the MODULE-008 RepetitionGuard injects
+    // under the BARE cap-id, while `assemble()` runs under the COLON msg-id).
+    // Empty ⇒ single-id (`ctx.agent_id`-only) behaviour, byte-identical to
+    // pre-Wave-12. Set via `with_agent_id_aliases`; defaults empty in `new()`
+    // (signature unchanged, so the existing direct `new()` callers are
+    // untouched).
     agent_id_aliases: Vec<String>,
 }
 
@@ -208,11 +211,12 @@ impl ContextAssemblerImpl {
     }
 
     /// Wave-12 — set the agent-id alias set ({bare cap-id, colon msg-id}) used
-    /// by `assemble()` to match the Tier-2 ⑬ delegates `node.parent` AND drain
-    /// the Tier-3 `WarningQueue` (in ADDITION to `ctx.agent_id`). The cli
-    /// composition root passes the production `query_aliases` (the SAME set
-    /// already wired to the Tier-1b memory readers). Empty ⇒ unchanged single-id
-    /// behaviour. `new()`'s signature is intentionally left unchanged.
+    /// by `assemble()` to match the Tier-1b ⑥ child roster and Tier-2 ⑬
+    /// delegates `node.parent` AND drain the Tier-3 `WarningQueue` (in ADDITION
+    /// to `ctx.agent_id`). The cli composition root passes the production
+    /// `query_aliases` (the SAME set already wired to the Tier-1b memory
+    /// readers). Empty ⇒ unchanged single-id behaviour. `new()`'s signature is
+    /// intentionally left unchanged.
     pub fn with_agent_id_aliases(mut self, aliases: Vec<String>) -> Self {
         self.agent_id_aliases = aliases;
         self
@@ -249,16 +253,33 @@ impl ContextAssembler for ContextAssemblerImpl {
 
         // ── Tier 1a (static): sanitized AGENTS.md identity slot.
         let tier1a = build_tier1a(self.agent_identity.as_ref(), &ctx.agent_id).await;
-        // ── Tier 1b (dynamic): knowledge-map section (AC-16). The §1.3.3 ⑨
+        // ── Tier 1b (dynamic): child roster ⑥ (direct Child only; omitted
+        // when empty) THEN knowledge-map section (AC-16 / ⑨). The §1.3.3 ⑨
         // hard cap is enforced inside `build_knowledge_map_section`; pass the
         // 500-token ceiling as the Slice-B budget (broader budget arithmetic
         // — progressive-load modes — is a future slice).
-        let tier1b = build_tier1b(
-            self.knowledge_map_reader.as_ref(),
+        let mut tier1b = Vec::new();
+        if let Some(roster) = format_available_children_section_with_aliases(
+            self.agent_tree.as_ref(),
+            self.agent_identity.as_ref(),
             &ctx.agent_id,
-            KNOWLEDGE_MAP_MAX_TOKENS,
+            &self.agent_id_aliases,
         )
-        .await;
+        .await
+        {
+            tier1b.push(LlmMessage {
+                role: "system".into(),
+                content: roster,
+            });
+        }
+        tier1b.extend(
+            build_tier1b(
+                self.knowledge_map_reader.as_ref(),
+                &ctx.agent_id,
+                KNOWLEDGE_MAP_MAX_TOKENS,
+            )
+            .await,
+        );
 
         // Model window → budget. Hoisted above Tier-2 build because the
         // Tier-2 ⑩ skills section (Slice V1-c) is capped by `budget`; the

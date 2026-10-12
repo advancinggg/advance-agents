@@ -8,10 +8,10 @@
 //!
 //! **Presentation scope** (MODULE-010 §1.3.3 ⑬ clarification): this section
 //! renders `AgentKind::Sub` agents ONLY. The child-agent roster is the
-//! separate Tier 1b ⑥ presentation (a future slice). Both are presentations
+//! separate Tier 1b ⑥ presentation (`tier1_children`). Both are presentations
 //! of the same unchanged CONTRACT-040 reader surface (which §2.2 documents as
 //! enumerating both child + sub). The `Sub`-only filter here prevents the
-//! future Tier 1b ⑥ slice from double-rendering child agents.
+//! Tier 1b ⑥ roster from double-rendering child agents.
 //!
 //! **Sanitization**: a Sub-Agent's `id` (`AgentId`) is *documented* as
 //! whitelist-validatable (`^[A-Za-z0-9_-]{1,64}$` per `agent_tree.rs:60-70`),
@@ -102,7 +102,7 @@ pub fn format_available_delegates_section_with_aliases(
     let mut s = String::from("# Available Delegates\n\n");
     for node in &data.nodes {
         // Sub-Agents whose parent is THIS agent (under ANY of its id aliases).
-        // `Child` is intentionally excluded (Tier 1b ⑥, future).
+        // `Child` is intentionally excluded (Tier 1b ⑥ roster).
         if node.kind != AgentKind::Sub {
             continue;
         }
@@ -124,7 +124,7 @@ pub fn format_available_delegates_section_with_aliases(
     s
 }
 
-fn join_caps_capped(caps: &[advance_shared_types::agent_tree::Capability]) -> String {
+pub(crate) fn join_caps_capped(caps: &[advance_shared_types::agent_tree::Capability]) -> String {
     let mut out = String::with_capacity(MAX_SUMMARY_LEN.min(256));
     let mut truncated_total = false;
     for (i, c) in caps.iter().enumerate() {

@@ -207,6 +207,12 @@ pub trait KnowledgeMapReader: Send + Sync {
 #[async_trait]
 pub trait AgentIdentityReader: Send + Sync {
     async fn agents_md_summary(&self, agent_id: &str) -> Option<String>;
+    /// Read `{workspace}/.agent/AGENTS.md` for a Child roster entry.
+    /// Default is `None` so stubs / frozen builders stay byte-identical.
+    async fn agents_md_for_workspace(&self, workspace: &std::path::Path) -> Option<String> {
+        let _ = workspace;
+        None
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

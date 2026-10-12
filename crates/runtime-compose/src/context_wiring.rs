@@ -153,17 +153,24 @@ impl DiskAgentIdentityReader {
     }
 }
 
+fn read_agents_md_file(path: &Path) -> Option<String> {
+    let raw = read_regular_capped(path, MAX_AGENTS_MD_READ_BYTES)?;
+    let document = raw.trim().to_string();
+    if document.is_empty() {
+        None
+    } else {
+        Some(document)
+    }
+}
+
 #[async_trait]
 impl AgentIdentityReader for DiskAgentIdentityReader {
     async fn agents_md_summary(&self, _agent_id: &str) -> Option<String> {
-        let path = self.identity_agent_root.join("AGENTS.md");
-        let raw = read_regular_capped(&path, MAX_AGENTS_MD_READ_BYTES)?;
-        let document = raw.trim().to_string();
-        if document.is_empty() {
-            None
-        } else {
-            Some(document)
-        }
+        read_agents_md_file(&self.identity_agent_root.join("AGENTS.md"))
+    }
+
+    async fn agents_md_for_workspace(&self, workspace: &Path) -> Option<String> {
+        read_agents_md_file(&workspace.join(".agent").join("AGENTS.md"))
     }
 }
 
@@ -2108,6 +2115,34 @@ mod tests {
         assert!(
             reader.agents_md_summary("agent:a").await.is_none(),
             "symlink AGENTS.md must not be followed"
+        );
+    }
+
+    /// IDR-4 — `agents_md_for_workspace` reads `{workspace}/.agent/AGENTS.md`.
+    #[tokio::test]
+    async fn idr4_for_workspace_reads_child_agents_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(tmp.path()).unwrap();
+        let child_ws = workspace.join("children").join("researcher");
+        std::fs::create_dir_all(child_ws.join(".agent")).unwrap();
+        std::fs::write(
+            child_ws.join(".agent").join("AGENTS.md"),
+            "# Child\n\nDo research.\n",
+        )
+        .unwrap();
+
+        let reader = DiskAgentIdentityReader::new(workspace.join(".agent"));
+        let document = reader
+            .agents_md_for_workspace(&child_ws)
+            .await
+            .expect("child AGENTS.md present → Some");
+        assert!(document.contains("Do research."));
+        assert!(
+            reader
+                .agents_md_for_workspace(&workspace.join("missing"))
+                .await
+                .is_none(),
+            "missing child workspace → None"
         );
     }
 }
