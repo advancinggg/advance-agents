@@ -201,8 +201,8 @@ pub trait KnowledgeMapReader: Send + Sync {
 }
 
 /// Stands in for the AGENTS.md identity read (MODULE-002 FS / MODULE-011).
-/// Returns the first-paragraph identity summary, or `None` when the agent has
-/// no AGENTS.md. The returned text is **untrusted** (agent-authored) — the
+/// Returns the identity document body, or `None` when the agent has no
+/// AGENTS.md. The returned text is **untrusted** (agent-authored) — the
 /// Tier 1a builder sanitizes it before injection.
 #[async_trait]
 pub trait AgentIdentityReader: Send + Sync {

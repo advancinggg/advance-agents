@@ -104,7 +104,6 @@ use advance_shared_types::capability::{McpToolEntry, ToolEntry};
 use advance_shared_types::context::ContextAssembler;
 use advance_shared_types::traits::{CallableInventoryReader, EventBusEmit};
 use cap_skills::extract_skill_summary;
-use cap_skills::summary::extract_skill_summary_capped;
 // Wave-16 Lane 2: reuse the TOCTOU-hardened file-safety helpers (made `pub(crate)`
 // in `vlm_indexer`) for the recall corpus's workspace-content walk — no duplication.
 use crate::vlm_indexer::{confine, read_capped_bytes};
@@ -123,29 +122,24 @@ impl AgentIdentityReader for StubAgentIdentity {
     }
 }
 
-/// Upper bound on the identity summary injected into Tier 1a. Matches the
-/// knowledge-map section cap so a long first paragraph cannot blow the static
-/// tier. The assembler still sanitizes the returned text in `build_tier1a`.
-const IDENTITY_SUMMARY_TOKENS: usize = 500;
-
 /// Per-file read cap for `.agent/AGENTS.md`. Matches Client API
 /// `MAX_AGENTS_MD_BYTES` / cap-lifecycle `atomic::MAX_BYTES` (64 KiB).
 const MAX_AGENTS_MD_READ_BYTES: u64 = 64 * 1024;
 
 /// Production [`AgentIdentityReader`]. Reads `<identity_agent_root>/AGENTS.md`
-/// — the same path Client API / settings write — and returns the first-paragraph
-/// identity summary (MODULE-010 Tier 1a slot).
+/// — the same path Client API / settings write — and returns the full document
+/// (MODULE-010 Tier 1a slot; market convention: inject the instruction file,
+/// do not summarize it).
 ///
 /// **Root coincidence**: `identity_agent_root` is `<workspace>/.agent`. Not
 /// capability-gated (unlike skills/memory): every agent workspace owns this
-/// document. Missing / unreadable / symlink / oversize / blank-after-extract →
-/// `None` (fail-soft, ≡ [`StubAgentIdentity`]; `build_tier1a` then emits no
+/// document. Missing / unreadable / symlink / oversize / blank → `None`
+/// (fail-soft, ≡ [`StubAgentIdentity`]; `build_tier1a` then emits no
 /// `# Agent Identity` message).
 ///
 /// **Bounded read**: `read_regular_capped` STAT-BEFORE-OPEN rejects symlink /
-/// FIFO / dir / oversize before any blocking open. The extract reuses the
-/// skill first-paragraph algorithm (frontmatter + ATX headings skipped) with
-/// [`IDENTITY_SUMMARY_TOKENS`] instead of the skill L0 100-token cap.
+/// FIFO / dir / oversize before any blocking open. `build_tier1a` sanitizes
+/// the body (Trojan-Source / cache-sentinel) while keeping Markdown newlines.
 pub struct DiskAgentIdentityReader {
     identity_agent_root: PathBuf,
 }
@@ -164,11 +158,11 @@ impl AgentIdentityReader for DiskAgentIdentityReader {
     async fn agents_md_summary(&self, _agent_id: &str) -> Option<String> {
         let path = self.identity_agent_root.join("AGENTS.md");
         let raw = read_regular_capped(&path, MAX_AGENTS_MD_READ_BYTES)?;
-        let summary = extract_skill_summary_capped(&raw, IDENTITY_SUMMARY_TOKENS);
-        if summary.trim().is_empty() {
+        let document = raw.trim().to_string();
+        if document.is_empty() {
             None
         } else {
-            Some(summary)
+            Some(document)
         }
     }
 }
@@ -2060,27 +2054,29 @@ mod tests {
 
     // ── identity satellite — DiskAgentIdentityReader unit tests ──
 
-    /// IDR-1 — first-paragraph extract from a real `.agent/AGENTS.md`, heading skipped.
+    /// IDR-1 — full `.agent/AGENTS.md` body, headings and later sections kept.
     #[tokio::test]
-    async fn idr1_reader_projects_first_paragraph() {
+    async fn idr1_reader_projects_full_document() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = std::fs::canonicalize(tmp.path()).unwrap();
         let root = workspace.join(".agent");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(
-            root.join("AGENTS.md"),
-            "# Researcher\n\nYou are a research agent that cites sources.\n\nMore guidelines below.\n",
-        )
-        .unwrap();
+        let body = "# Researcher\n\nYou are a research agent that cites sources.\n\n## Guidelines\n\nAlways cite sources.\n";
+        std::fs::write(root.join("AGENTS.md"), body).unwrap();
 
         let reader = DiskAgentIdentityReader::new(root);
-        let summary = reader
+        let document = reader
             .agents_md_summary("agent:ignored")
             .await
             .expect("AGENTS.md present → Some");
         assert_eq!(
-            summary, "You are a research agent that cites sources.",
-            "heading skipped; first prose paragraph extracted"
+            document,
+            body.trim(),
+            "full document, not a first-paragraph extract"
+        );
+        assert!(
+            document.contains("Always cite sources."),
+            "later sections must survive"
         );
     }
 

@@ -2,7 +2,7 @@
 //! assembled prompt's Tier-1a `# Agent Identity` section.
 //!
 //! IDR-4 — `build_context_assembler_for_agent_with_pack_skills(.., identity_agent_root=Some)`
-//!         folds the on-disk AGENTS.md first paragraph into `# Agent Identity`.
+//!         folds the on-disk AGENTS.md body into `# Agent Identity`.
 //!         `None` → no section (byte-identical to `_with_decomposition`).
 
 use std::sync::Arc;
@@ -74,7 +74,7 @@ async fn idr4_identity_root_some_folds_agent_identity_into_prompt() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
         root.join("AGENTS.md"),
-        "# Researcher\n\nYou are a research agent that cites sources.\n",
+        "# Researcher\n\nYou are a research agent that cites sources.\n\n## Guidelines\n\nAlways cite sources.\n",
     )
     .unwrap();
 
@@ -105,7 +105,17 @@ async fn idr4_identity_root_some_folds_agent_identity_into_prompt() {
         identity
             .content
             .contains("You are a research agent that cites sources."),
-        "Tier 1a carries the extracted first paragraph: {}",
+        "Tier 1a carries the identity prose: {}",
+        identity.content
+    );
+    assert!(
+        identity.content.contains("Always cite sources."),
+        "Tier 1a carries later AGENTS.md sections, not just the first paragraph: {}",
+        identity.content
+    );
+    assert!(
+        identity.content.contains('\n'),
+        "Tier 1a keeps Markdown line structure: {}",
         identity.content
     );
     assert!(
