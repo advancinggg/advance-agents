@@ -8,8 +8,9 @@
 //!   [`KnowledgeMapReader`] + [`crate::knowledge_map`]).
 //!
 //! Broader Tier 1a/1b population (architecture component usage, security
-//! model, capability config, mode state, runtime info, child roster ⑥, …)
-//! stays a future-slice concern. AC-05's 4-tier structural property is
+//! model, capability config, mode state, runtime info, …) stays a
+//! future-slice concern. Child roster ⑥ is [`crate::tier1_children`].
+//! AC-05's 4-tier structural property is
 //! unaffected — these builders only add content WITHIN Tier 1a/1b; the two
 //! cache-breakpoint markers and their positions are unchanged (T06 +
 //! `tier_counts_include_cache_breakpoint_marker_tokens` lock that).

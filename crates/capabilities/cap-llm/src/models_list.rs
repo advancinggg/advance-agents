@@ -4,9 +4,7 @@
 //! HTTP execute loop lives in advance-home.
 
 use advance_runtime::config::{LlmProviderConfig, ProviderBackend};
-use advance_shared_types::security_validator::{
-    HttpCapability, HttpMethod, HttpRequest,
-};
+use advance_shared_types::security_validator::{HttpCapability, HttpMethod, HttpRequest};
 use serde_json::Value;
 
 use cap_http::canonical_facade::canonical_scan_text;
@@ -160,10 +158,7 @@ pub fn build_models_list_request(
         }
     }
     let (name, value) = auth_header_for(&resolved);
-    let mut headers = vec![
-        (name, value),
-        ("Accept".into(), "application/json".into()),
-    ];
+    let mut headers = vec![(name, value), ("Accept".into(), "application/json".into())];
     if backend_of(entry) == ProviderBackend::AnthropicMessages {
         headers.push(("anthropic-version".into(), ANTHROPIC_VERSION.into()));
     }
@@ -175,9 +170,7 @@ pub fn build_models_list_request(
     })
 }
 
-pub fn build_models_list_capability(
-    entry: &LlmProviderConfig,
-) -> Result<HttpCapability, LlmError> {
+pub fn build_models_list_capability(entry: &LlmProviderConfig) -> Result<HttpCapability, LlmError> {
     let resolved = make_resolved(entry, String::new());
     build_http_cap(&resolved, entry)
 }
@@ -346,9 +339,7 @@ fn bullet_id(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use advance_runtime::config::{
-        InferenceBackendClass, ProviderAuthSource, ProviderBackend,
-    };
+    use advance_runtime::config::{InferenceBackendClass, ProviderAuthSource, ProviderBackend};
     use std::collections::HashMap;
 
     fn entry(id: &str, endpoint: &str, backend: Option<ProviderBackend>) -> LlmProviderConfig {
@@ -388,7 +379,8 @@ mod tests {
 
     #[test]
     fn am_t05_gemini_lines_and_bullets() {
-        let stdout = "Fetching available models...\nmodel-a\nmodel-b\n* also-ok\nthis line has spaces\n";
+        let stdout =
+            "Fetching available models...\nmodel-a\nmodel-b\n* also-ok\nthis line has spaces\n";
         let ids: Vec<_> = parse_cli_models_stdout(stdout)
             .into_iter()
             .map(|m| m.id)
@@ -406,8 +398,9 @@ mod tests {
 
     #[test]
     fn am_t10_anthropic_inferred_from_id() {
-        let req = build_models_list_request(&entry("anthropic", "https://api.anthropic.com", None), None)
-            .unwrap();
+        let req =
+            build_models_list_request(&entry("anthropic", "https://api.anthropic.com", None), None)
+                .unwrap();
         assert_eq!(req.url, "https://api.anthropic.com/v1/models?limit=100");
         assert!(req
             .headers
@@ -452,7 +445,10 @@ mod tests {
         let page = parse_models_catalog_page(
             br#"{"data":[{"id":"gpt-4o","display_name":"GPT"},{"id":"secret-key-xyz","display_name":"x"}]}"#,
         );
-        let CatalogPage::Parsed { models, has_more, .. } = page else {
+        let CatalogPage::Parsed {
+            models, has_more, ..
+        } = page
+        else {
             panic!("{page:?}");
         };
         assert!(!has_more);
@@ -508,6 +504,9 @@ mod tests {
     fn capability_origin_prefix() {
         let cap =
             build_models_list_capability(&entry("openai", "https://api.openai.com", None)).unwrap();
-        assert_eq!(cap.allowlist.patterns, vec!["https://api.openai.com/".to_string()]);
+        assert_eq!(
+            cap.allowlist.patterns,
+            vec!["https://api.openai.com/".to_string()]
+        );
     }
 }

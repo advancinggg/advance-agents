@@ -428,6 +428,39 @@ pub fn build_assembler_with_inventory(
 }
 
 /// Build an assembler with empty inventories + Null doubles for every port
+/// EXCEPT `agent_tree`, which is the caller-supplied snapshot. Lets a test
+/// drive the Tier-1b ⑥ child roster without changing the FROZEN
+/// `build_assembler_with` signature.
+pub fn build_assembler_with_tree(agent_tree: Arc<dyn AgentTreeSnapshot>) -> ContextAssemblerImpl {
+    ContextAssemblerImpl::new(
+        Arc::new(MockCallableInventory {
+            wasm: Mutex::new(Vec::new()),
+            mcp: Mutex::new(Vec::new()),
+        }),
+        Arc::new(MockHostFnInventory {
+            host: Mutex::new(Vec::new()),
+        }),
+        Arc::new(NullAgentIdentity),
+        Arc::new(NullKnowledgeMap),
+        agent_tree,
+        Arc::new(NullEmbedding),
+        Arc::new(NullTaskIndex),
+        Arc::new(NullLightLlm),
+        Arc::new(NullUnifiedSearch),
+        Arc::new(NullEventBus),
+        Arc::new(NullSkillSummary),
+        Arc::new(NullVectorIndex),
+        Arc::new(NullL2Digest),
+        Arc::new(NullL3Epoch),
+        Arc::new(NullL4TaskSummary),
+        Arc::new(NullL5Synthesis),
+        Arc::new(NullL6Consolidation),
+        Arc::new(NullPromptInjectionHelpers),
+        Arc::new(NullDecomposition),
+    )
+}
+
+/// Build an assembler with empty inventories + Null doubles for every port
 /// EXCEPT the Wave-12 Lane C `DecompositionReader`, which is the caller-supplied
 /// double. Lets a test drive the Tier-2 ⑭ "Active Task Decomposition" section from
 /// a fixture without changing the FROZEN `build_assembler_with` signature.

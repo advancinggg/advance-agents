@@ -1417,13 +1417,8 @@ impl AgentCliModelsProbe for ProcessModelsProbe {
 }
 
 /// List models this vendor CLI can call. Never appends `spec.args`.
-pub fn probe_models(
-    spec: &AgentCliSpec,
-    env: &AgentCliEnv,
-) -> crate::models_list::CatalogFill {
-    use crate::models_list::{
-        parse_cli_models_stdout, stdout_has_sign_in_language, CatalogFill,
-    };
+pub fn probe_models(spec: &AgentCliSpec, env: &AgentCliEnv) -> crate::models_list::CatalogFill {
+    use crate::models_list::{parse_cli_models_stdout, stdout_has_sign_in_language, CatalogFill};
 
     let argv: Vec<String> = models_list_argv(spec.vendor)
         .into_iter()
@@ -2996,7 +2991,10 @@ mod tests {
         let fill = probe_models(&grok_spec, &env);
         assert!(fill.complete);
         assert_eq!(
-            fill.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            fill.models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["grok-4.6"]
         );
         let cwd = std::fs::read_to_string(&cwd_file).unwrap();
@@ -3031,11 +3029,16 @@ mod tests {
 
         let forbid = test_env().with_process_policy(ProcessPolicy::Forbid);
         let before = spawn_counter::snapshot();
-        let fill = probe_models(&spec(AgentCliVendor::Grok, script.to_str().unwrap()), &forbid);
+        let fill = probe_models(
+            &spec(AgentCliVendor::Grok, script.to_str().unwrap()),
+            &forbid,
+        );
         assert!(fill.complete);
         assert!(fill.models.is_empty());
         assert_eq!(
-            spawn_counter::snapshot().since(&before).refused(SpawnSite::AgentCli),
+            spawn_counter::snapshot()
+                .since(&before)
+                .refused(SpawnSite::AgentCli),
             1
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3053,10 +3056,7 @@ mod tests {
             &spec(AgentCliVendor::Claude, script.to_str().unwrap()),
             &env,
         );
-        let codex = probe_models(
-            &spec(AgentCliVendor::Codex, script.to_str().unwrap()),
-            &env,
-        );
+        let codex = probe_models(&spec(AgentCliVendor::Codex, script.to_str().unwrap()), &env);
         assert!(claude.complete && claude.models.is_empty());
         assert!(codex.complete && codex.models.is_empty());
         assert!(!marker.exists());

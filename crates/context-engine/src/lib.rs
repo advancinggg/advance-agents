@@ -22,6 +22,8 @@
 //!   documented deterministic drop-order.
 //! - [`tier1`] — Tier 1a sanitized AGENTS.md identity slot + Tier 1b
 //!   knowledge-map slot.
+//! - [`tier1_children`] — Tier 1b ⑥ `# Available Children` (direct
+//!   `AgentKind::Child` only; grandchildren omitted).
 //! - [`tier2_delegates`] — AC-19 Tier 2 ⑬ "Available Delegates"
 //!   (`AgentKind::Sub` only).
 //! - [`ports`] — the 6 crate-local async dependency-inversion ports + data
@@ -46,9 +48,10 @@
 //!
 //! Every **Slice-B-introduced untrusted description / identity / capability
 //! string** entering the assembled prompt — AGENTS.md identity (Tier 1a),
-//! knowledge-map topics/syntheses (Tier 1b), Tier 2 tool-view names/args/
-//! descriptions (AC-18), Delegate name + capability summaries (Tier 2 ⑬,
-//! AC-19) — is routed through the single shared `pub(crate)`
+//! knowledge-map topics/syntheses (Tier 1b), Child roster handle + caps
+//! (Tier 1b ⑥), Tier 2 tool-view names/args/descriptions (AC-18),
+//! Delegate name + capability summaries (Tier 2 ⑬, AC-19) — is routed
+//! through the single shared `pub(crate)`
 //! `tier2::sanitize_description` Trojan-Source defense (no divergent
 //! sanitizer copy). **Scope boundary (honest)**: Tier 3 user/assistant turn
 //! content (`AssemblyContext.turn_buffer` and `AssemblyContext.prompt`) is
@@ -83,6 +86,7 @@ pub mod sanitize;
 pub mod staleness;
 pub mod task_router;
 pub mod tier1;
+pub mod tier1_children;
 pub mod tier2;
 pub mod tier2_decomposition;
 pub mod tier2_delegates;
@@ -123,6 +127,9 @@ pub use task_router::{
     ContextError, TaskRouter, TaskRoutingDecision, AMBIGUITY_GAP, TASK_MATCH_THRESHOLD,
 };
 pub use tier1::{build_tier1a, build_tier1b};
+pub use tier1_children::{
+    format_available_children_section, format_available_children_section_with_aliases,
+};
 pub use tier2::{
     assemble_unified, format_available_tools_section,
     format_available_tools_section_with_not_shown, UnifiedToolRecord,

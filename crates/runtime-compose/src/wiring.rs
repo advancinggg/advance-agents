@@ -3549,9 +3549,9 @@ pub(crate) async fn wire_capabilities_inner(
                 )),
                 processes,
                 hot_reload,
-                chatgpt_sign_in: chatgpt_sign_in.as_ref().map(|sign_in| {
-                    Arc::clone(sign_in) as Arc<dyn advance_home::ChatGptSignInPort>
-                }),
+                chatgpt_sign_in: chatgpt_sign_in
+                    .as_ref()
+                    .map(|sign_in| Arc::clone(sign_in) as Arc<dyn advance_home::ChatGptSignInPort>),
                 inference_marks_claimable,
                 llm_gateway: llm_gateway.clone(),
                 inference_claimed,

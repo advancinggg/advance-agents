@@ -1274,12 +1274,8 @@ struct ScriptedModels {
 }
 
 impl cap_llm::backend_cli::AgentCliModelsProbe for ScriptedModels {
-    fn list_models(
-        &self,
-        _spec: &advance_runtime::config::AgentCliSpec,
-    ) -> cap_llm::CatalogFill {
-        self.calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    fn list_models(&self, _spec: &advance_runtime::config::AgentCliSpec) -> cap_llm::CatalogFill {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         cap_llm::CatalogFill::complete(
             self.ids
                 .iter()
@@ -1298,22 +1294,18 @@ struct ScriptedCloudModels {
 }
 
 impl advance_home::provider_admin::CloudHttpModelsProbe for ScriptedCloudModels {
-    fn list_models(
-        &self,
-        _entry: &LlmProviderConfig,
-    ) -> advance_home::provider_admin::CatalogFill {
-        self.calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    fn list_models(&self, _entry: &LlmProviderConfig) -> advance_home::provider_admin::CatalogFill {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         advance_home::provider_admin::CatalogFill {
             models: self
                 .ids
                 .iter()
-                .map(|id| {
-                    advance_client_api::provider_admin::ClientProviderSignInModel {
+                .map(
+                    |id| advance_client_api::provider_admin::ClientProviderSignInModel {
                         id: id.clone(),
                         display_name: None,
-                    }
-                })
+                    },
+                )
                 .collect(),
             complete: true,
         }
@@ -1368,7 +1360,10 @@ async fn am_t09_scripted_cli_models_on_get() {
 
     let got: ClientProviderSummary = data(&get(&api, "/client/providers/grok-sub"));
     assert_eq!(got.available_models[0].id, "grok-4.6");
-    assert_eq!(got.model_aliases.get("fast").map(String::as_str), Some("grok-4"));
+    assert_eq!(
+        got.model_aliases.get("fast").map(String::as_str),
+        Some("grok-4")
+    );
     assert_eq!(models.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     let _ = post(
         &api,

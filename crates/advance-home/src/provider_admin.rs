@@ -53,8 +53,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -262,7 +262,9 @@ fn listed_to_client(models: Vec<ListedModel>) -> Vec<ClientProviderSignInModel> 
         .collect()
 }
 
-fn unique_local_models(aliases: &std::collections::HashMap<String, String>) -> Vec<ClientProviderSignInModel> {
+fn unique_local_models(
+    aliases: &std::collections::HashMap<String, String>,
+) -> Vec<ClientProviderSignInModel> {
     let mut ids: Vec<String> = aliases.values().cloned().collect();
     ids.sort();
     ids.dedup();
@@ -1062,7 +1064,10 @@ impl WiredProviderAdmin {
 
     fn drop_inflight_if(&self, provider_id: &str, fp: u64) {
         let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-        if inflight.get(provider_id).is_some_and(|w| w.fingerprint == fp) {
+        if inflight
+            .get(provider_id)
+            .is_some_and(|w| w.fingerprint == fp)
+        {
             inflight.remove(provider_id);
         }
     }
@@ -3956,7 +3961,11 @@ post-processor:
     fn am_t16_mesh_remote_empty() {
         let f = Fixture::new();
         let admin = f.admin();
-        assert!(admin.get_provider("mesh-a").unwrap().available_models.is_empty());
+        assert!(admin
+            .get_provider("mesh-a")
+            .unwrap()
+            .available_models
+            .is_empty());
     }
 
     #[test]
@@ -4162,7 +4171,9 @@ post-processor:
         let entry = anthropic_entry(&f.home);
         let sample = models_json(&first, true);
         match parse_models_catalog_page(&sample) {
-            CatalogPage::Parsed { models, has_more, .. } => {
+            CatalogPage::Parsed {
+                models, has_more, ..
+            } => {
                 assert_eq!(models.len(), 40, "parser dropped ids");
                 assert!(has_more);
             }
@@ -4338,7 +4349,10 @@ post-processor:
         req.model_aliases = [("sonnet".into(), "sonnet".into())].into_iter().collect();
         admin.create_provider(&req).unwrap();
         let listed = admin.get_provider("claude-a").unwrap();
-        assert_eq!(listed.model_aliases.get("sonnet").map(String::as_str), Some("sonnet"));
+        assert_eq!(
+            listed.model_aliases.get("sonnet").map(String::as_str),
+            Some("sonnet")
+        );
         assert!(listed.available_models.is_empty());
     }
 

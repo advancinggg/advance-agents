@@ -44,12 +44,12 @@ pub(crate) fn attach_live_model_probes(
     let admin = admin.with_process_agent_cli_models_probe(Arc::new(ProcessModelsProbe { env }));
     match admin.key_store() {
         Ok(store) => {
-            let (leak, ssrf, rate) = crate::channels_boot::live_security_components(Some(
-                Arc::clone(&config),
-            ));
+            let (leak, ssrf, rate) =
+                crate::channels_boot::live_security_components(Some(Arc::clone(&config)));
             let executor = crate::channels_boot::live_executor(Some(config));
-            let chain = DefaultHttpSecurityChain::new(Arc::clone(&store), leak, ssrf, rate, executor)
-                .with_event_bus(event_bus);
+            let chain =
+                DefaultHttpSecurityChain::new(Arc::clone(&store), leak, ssrf, rate, executor)
+                    .with_event_bus(event_bus);
             admin.with_process_cloud_http_models_probe(Arc::new(ProcessCloudHttpModelsProbe::new(
                 Arc::new(chain),
                 store,
@@ -79,13 +79,15 @@ pub(crate) fn compose_provider_admin(
         admin = admin.with_claimable_local_entries(true);
     }
     if let Some(gateway) = input.llm_gateway.as_ref() {
-        admin = admin.with_local_sidecar_binder(Arc::clone(gateway) as Arc<dyn cap_llm::LocalSidecarBinder>);
+        admin = admin
+            .with_local_sidecar_binder(Arc::clone(gateway) as Arc<dyn cap_llm::LocalSidecarBinder>);
     }
     let mut stopper = None;
-    if let (Some(gateway), false) = (input.llm_gateway.as_ref(), input.inference_claimed.is_empty())
-    {
-        let (port, stop) =
-            ComposedClaimedPreflight::new(gateway, input.inference_claimed);
+    if let (Some(gateway), false) = (
+        input.llm_gateway.as_ref(),
+        input.inference_claimed.is_empty(),
+    ) {
+        let (port, stop) = ComposedClaimedPreflight::new(gateway, input.inference_claimed);
         stopper = Some(stop);
         admin = admin.with_claimed_preflight(Arc::new(port));
     }
@@ -101,8 +103,8 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use advance_home::provider_admin::{ModelProbeInstallation, NoReferences};
     use advance_home::chatgpt_sign_in::STATE_SIGNED_OUT;
+    use advance_home::provider_admin::{ModelProbeInstallation, NoReferences};
     use advance_home::{
         CancelToken, ChatGptSignInPort, PreflightFail, PreflightPort, SecretBytes, SignInRefusal,
         SignInStarted, SignInStatus, SignOutOutcome, VerifyOutcome,
