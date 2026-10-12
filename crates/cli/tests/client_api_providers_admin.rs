@@ -1267,3 +1267,153 @@ async fn pv06_chatgpt_oauth_entry_over_production_wiring() {
     assert_eq!(ids(&ws), vec!["openai"]);
     assert_eq!(port.calls_of("forget"), vec![SIGN_IN_SECRET.to_string()]);
 }
+
+struct ScriptedModels {
+    calls: std::sync::atomic::AtomicUsize,
+    ids: Vec<String>,
+}
+
+impl cap_llm::backend_cli::AgentCliModelsProbe for ScriptedModels {
+    fn list_models(
+        &self,
+        _spec: &advance_runtime::config::AgentCliSpec,
+    ) -> cap_llm::CatalogFill {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        cap_llm::CatalogFill::complete(
+            self.ids
+                .iter()
+                .map(|id| cap_llm::ListedModel {
+                    id: id.clone(),
+                    display_name: None,
+                })
+                .collect(),
+        )
+    }
+}
+
+struct ScriptedCloudModels {
+    calls: std::sync::atomic::AtomicUsize,
+    ids: Vec<String>,
+}
+
+impl advance_home::provider_admin::CloudHttpModelsProbe for ScriptedCloudModels {
+    fn list_models(
+        &self,
+        _entry: &LlmProviderConfig,
+    ) -> advance_home::provider_admin::CatalogFill {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        advance_home::provider_admin::CatalogFill {
+            models: self
+                .ids
+                .iter()
+                .map(|id| {
+                    advance_client_api::provider_admin::ClientProviderSignInModel {
+                        id: id.clone(),
+                        display_name: None,
+                    }
+                })
+                .collect(),
+            complete: true,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn am_t09_scripted_cli_models_on_get() {
+    let (_g, ws, cfg) = fresh_workspace();
+    let (host, handles) = boot(&ws, &cfg).await;
+    let api = handles.client_api_server.as_ref().unwrap().api();
+    let auth = Arc::new(ScriptedProbe {
+        signed_in: std::sync::atomic::AtomicBool::new(true),
+        asked: Mutex::new(Vec::new()),
+    });
+    let models = Arc::new(ScriptedModels {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        ids: vec!["grok-4.6".into()],
+    });
+    let adapter = Arc::new(
+        WiredProviderAdmin::new(
+            ws.clone(),
+            host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
+            handles.secret_store.clone(),
+            ScriptedPreflight::passing(),
+            Arc::new(NoReferences),
+        )
+        .with_agent_cli_probe(auth.clone())
+        .with_agent_cli_models_probe(models.clone()),
+    );
+    install_provider_admin(&api, adapter);
+    mint(&api, "tok", Scope::operator_default());
+    let fake = ws.join("fake-grok.sh");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    let env = post(
+        &api,
+        "/client/providers",
+        json!({
+            "provider_id": "grok-sub",
+            "backend_class": "agent-cli",
+            "agent_cli": { "vendor": "grok", "command": fake.to_string_lossy() },
+            "model_aliases": { "fast": "grok-4" },
+            "cost": { "input_per_mtoken": 0.001, "output_per_mtoken": 0.001 },
+            "rate_limit": { "requests_per_minute": 6, "tokens_per_minute": 60000 }
+        }),
+        "k-am-create",
+    );
+    let created: ClientProviderSummary = data(&env);
+    assert!(created.available_models.is_empty());
+    assert_eq!(auth.asked.lock().unwrap().len(), 1);
+    assert_eq!(models.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let got: ClientProviderSummary = data(&get(&api, "/client/providers/grok-sub"));
+    assert_eq!(got.available_models[0].id, "grok-4.6");
+    assert_eq!(got.model_aliases.get("fast").map(String::as_str), Some("grok-4"));
+    assert_eq!(models.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let _ = post(
+        &api,
+        "/client/providers/grok-sub:preflight",
+        Value::Null,
+        "k-am-pre",
+    );
+    assert_eq!(auth.asked.lock().unwrap().len(), 2);
+    let _ = get(&api, "/client/providers/grok-sub");
+    assert_eq!(models.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn am_t12_scripted_cloud_and_pv02_stays_offline() {
+    let (_g, ws, cfg) = fresh_workspace();
+    let (host, handles) = boot(&ws, &cfg).await;
+    let api = handles.client_api_server.as_ref().unwrap().api();
+    let models = Arc::new(ScriptedCloudModels {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        ids: vec!["gpt-4o".into()],
+    });
+    let adapter = Arc::new(
+        WiredProviderAdmin::new(
+            ws.clone(),
+            host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
+            handles.secret_store.clone(),
+            ScriptedPreflight::passing(),
+            Arc::new(NoReferences),
+        )
+        .with_cloud_http_models_probe(models.clone()),
+    );
+    install_provider_admin(&api, adapter);
+    mint(&api, "tok", Scope::operator_default());
+    assert!(post(&api, "/client/providers", anthropic_body(), "k-am-c").is_ok());
+    let missing: ClientProviderSummary = data(&get(&api, "/client/providers/anthropic"));
+    assert!(missing.available_models.is_empty());
+    assert_eq!(models.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let env = post(
+        &api,
+        "/client/providers/anthropic:set-key",
+        json!({ "key": SECRET_KEY }),
+        "k-am-set",
+    );
+    assert!(!serde_json::to_string(&env).unwrap().contains(SECRET_KEY));
+    let got: ClientProviderSummary = data(&get(&api, "/client/providers/anthropic"));
+    assert_eq!(got.available_models[0].id, "gpt-4o");
+    assert!(!serde_json::to_string(&got).unwrap().contains(SECRET_KEY));
+}

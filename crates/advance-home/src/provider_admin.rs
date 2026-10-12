@@ -50,10 +50,12 @@
 //!   mutations do not answer `restart_required`. Without a binder they still do: the
 //!   registry would otherwise keep the boot-time set.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::chatgpt_sign_in::{
     ChatGptSignInPort, SignInRefusal, SignInStatus, REASON_UNAVAILABLE as SIGN_IN_UNAVAILABLE,
@@ -77,8 +79,14 @@ use advance_runtime::config::{
     ProviderBackend, RuntimeConfig, RuntimeConfigProvider, CHATGPT_OAUTH_RECORD_SUFFIX,
 };
 use advance_shared_types::process_policy::{ProcessPolicy, SpawnSite};
+use advance_shared_types::security_validator::{HttpError, HttpSecurityChain};
 use cap_llm::backend_cli::{
-    AgentCliAuthProbe, AgentCliUsageProbe, ProcessAuthProbe, ProcessUsageProbe,
+    AgentCliAuthProbe, AgentCliModelsProbe, AgentCliUsageProbe, NoopModelsProbe, ProcessAuthProbe,
+    ProcessUsageProbe,
+};
+use cap_llm::models_list::{
+    build_models_list_capability, build_models_list_request, drop_key_rows, parse_models_catalog_page,
+    CatalogPage, ListedModel,
 };
 use cap_llm::LocalSidecarBinder;
 use cap_secrets::{SecretError, SecretStore};
@@ -107,6 +115,9 @@ const REASON_NOT_PROVIDED: &str = "not-provided";
 const SIGN_IN_ID: &str = "sign-in";
 /// The `ProviderError::AlreadyExists` id of an occupied sign-in secret name (log-only).
 const SECRET_NAME_ID: &str = "api-key-secret";
+const MODELS_AGENT_ID: &str = "advance-home/provider-models";
+const MAX_MODEL_PAGES: usize = 8;
+const MAX_CATALOG_MODELS: usize = 256;
 
 /// Which agents pin a provider through their `.agent/config.yaml` `llm.provider` (lane
 /// agent-llm-policy). A delete is refused while the list is non-empty. This lane ships only
@@ -145,6 +156,271 @@ pub trait ClaimedEntryPreflight: Send + Sync {
     ) -> Result<(), PreflightFail>;
 }
 
+/// How `WiredProviderAdmin` fills agent-cli / cloud-http catalogs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelProbeInstallation {
+    Noop,
+    Scripted,
+    Process,
+}
+
+/// GET catalog fill: models for this read, and whether the result may be cached.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CatalogFill {
+    pub models: Vec<ClientProviderSignInModel>,
+    pub complete: bool,
+}
+
+impl CatalogFill {
+    fn complete(models: Vec<ClientProviderSignInModel>) -> Self {
+        Self {
+            models,
+            complete: true,
+        }
+    }
+
+    fn incomplete(models: Vec<ClientProviderSignInModel>) -> Self {
+        Self {
+            models,
+            complete: false,
+        }
+    }
+
+    fn empty_complete() -> Self {
+        Self {
+            models: Vec::new(),
+            complete: true,
+        }
+    }
+}
+
+/// Seam for cloud-http API-key catalog GET. Default noop; production injects a live chain.
+pub trait CloudHttpModelsProbe: Send + Sync {
+    fn list_models(&self, entry: &LlmProviderConfig) -> CatalogFill;
+}
+
+/// Always a complete empty catalog.
+pub struct NoopCloudHttpModelsProbe;
+
+impl CloudHttpModelsProbe for NoopCloudHttpModelsProbe {
+    fn list_models(&self, _entry: &LlmProviderConfig) -> CatalogFill {
+        CatalogFill::empty_complete()
+    }
+}
+
+/// Vendor `GET /v1/models` through an injected LLM egress chain.
+pub struct ProcessCloudHttpModelsProbe {
+    chain: Arc<dyn HttpSecurityChain>,
+    store: Arc<SecretStore>,
+    deadline: Duration,
+}
+
+impl ProcessCloudHttpModelsProbe {
+    pub fn new(
+        chain: Arc<dyn HttpSecurityChain>,
+        store: Arc<SecretStore>,
+        deadline: Duration,
+    ) -> Self {
+        Self {
+            chain,
+            store,
+            deadline,
+        }
+    }
+}
+
+impl CloudHttpModelsProbe for ProcessCloudHttpModelsProbe {
+    fn list_models(&self, entry: &LlmProviderConfig) -> CatalogFill {
+        if entry.uses_chatgpt_sign_in() {
+            return CatalogFill::empty_complete();
+        }
+        let Ok(secret) = self.store.resolve(&entry.api_key_secret) else {
+            return CatalogFill::empty_complete();
+        };
+        let key = secret.expose_secret().to_string();
+        let Ok(cap) = build_models_list_capability(entry) else {
+            return CatalogFill::incomplete(Vec::new());
+        };
+        let deadline = Instant::now() + self.deadline;
+        let chain = Arc::clone(&self.chain);
+        let entry = entry.clone();
+        crate::discovery::block_on_io(async move {
+            list_cloud_http_models(chain.as_ref(), &cap, &entry, &key, deadline).await
+        })
+    }
+}
+
+fn listed_to_client(models: Vec<ListedModel>) -> Vec<ClientProviderSignInModel> {
+    models
+        .into_iter()
+        .map(|m| ClientProviderSignInModel {
+            id: m.id,
+            display_name: m.display_name,
+        })
+        .collect()
+}
+
+fn unique_local_models(aliases: &std::collections::HashMap<String, String>) -> Vec<ClientProviderSignInModel> {
+    let mut ids: Vec<String> = aliases.values().cloned().collect();
+    ids.sort();
+    ids.dedup();
+    ids.into_iter()
+        .map(|id| ClientProviderSignInModel {
+            id,
+            display_name: None,
+        })
+        .collect()
+}
+
+fn is_cacheable_empty_status(status: u16) -> bool {
+    matches!(status, 401 | 403 | 404)
+}
+
+async fn list_cloud_http_models(
+    chain: &dyn HttpSecurityChain,
+    cap: &advance_shared_types::security_validator::HttpCapability,
+    entry: &LlmProviderConfig,
+    key: &str,
+    deadline: Instant,
+) -> CatalogFill {
+    let mut collected: Vec<ListedModel> = Vec::new();
+    let mut after_id: Option<String> = None;
+    for page in 0..MAX_MODEL_PAGES {
+        if Instant::now() >= deadline || collected.len() >= MAX_CATALOG_MODELS {
+            return CatalogFill::incomplete(listed_to_client(collected));
+        }
+        let Ok(req) = build_models_list_request(entry, after_id.as_deref()) else {
+            return CatalogFill::incomplete(listed_to_client(collected));
+        };
+        match execute_models_page(chain, cap, req, deadline).await {
+            PageOutcome::RetrySame => {
+                let Ok(req) = build_models_list_request(entry, after_id.as_deref()) else {
+                    return CatalogFill::incomplete(listed_to_client(collected));
+                };
+                match execute_models_page(chain, cap, req, deadline).await {
+                    PageOutcome::Ok(resp) => {
+                        match apply_models_page(resp, page, &mut collected, &mut after_id, key) {
+                            PageApply::Continue => {}
+                            PageApply::Done(fill) => return fill,
+                        }
+                    }
+                    _ => return CatalogFill::incomplete(listed_to_client(collected)),
+                }
+            }
+            PageOutcome::Ok(resp) => {
+                match apply_models_page(resp, page, &mut collected, &mut after_id, key) {
+                    PageApply::Continue => {}
+                    PageApply::Done(fill) => return fill,
+                }
+            }
+            PageOutcome::CacheableEmpty => return CatalogFill::empty_complete(),
+            PageOutcome::Incomplete => {
+                return CatalogFill::incomplete(listed_to_client(collected));
+            }
+        }
+    }
+    CatalogFill::incomplete(listed_to_client(collected))
+}
+
+enum PageOutcome {
+    Ok(advance_shared_types::security_validator::HttpResponse),
+    RetrySame,
+    CacheableEmpty,
+    Incomplete,
+}
+
+enum PageApply {
+    Continue,
+    Done(CatalogFill),
+}
+
+async fn execute_models_page(
+    chain: &dyn HttpSecurityChain,
+    cap: &advance_shared_types::security_validator::HttpCapability,
+    req: advance_shared_types::security_validator::HttpRequest,
+    deadline: Instant,
+) -> PageOutcome {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return PageOutcome::Incomplete;
+    }
+    match tokio::time::timeout(remaining, chain.execute(MODELS_AGENT_ID, req, cap)).await {
+        Err(_) => PageOutcome::Incomplete,
+        Ok(Err(HttpError::RateLimited { retry_after_ms })) => {
+            if retry_after_ms == 0 {
+                return PageOutcome::Incomplete;
+            }
+            let wait = Duration::from_millis(retry_after_ms)
+                .min(deadline.saturating_duration_since(Instant::now()));
+            if wait.is_zero() {
+                return PageOutcome::Incomplete;
+            }
+            tokio::time::sleep(wait).await;
+            PageOutcome::RetrySame
+        }
+        Ok(Err(_)) => PageOutcome::Incomplete,
+        Ok(Ok(resp)) if is_cacheable_empty_status(resp.status) => PageOutcome::CacheableEmpty,
+        Ok(Ok(resp)) if (200..300).contains(&resp.status) => PageOutcome::Ok(resp),
+        Ok(Ok(_)) => PageOutcome::Incomplete,
+    }
+}
+
+fn apply_models_page(
+    resp: advance_shared_types::security_validator::HttpResponse,
+    page: usize,
+    collected: &mut Vec<ListedModel>,
+    after_id: &mut Option<String>,
+    key: &str,
+) -> PageApply {
+    match parse_models_catalog_page(&resp.body) {
+        CatalogPage::EmptySuccess => {
+            if page == 0 {
+                PageApply::Done(CatalogFill::empty_complete())
+            } else {
+                PageApply::Done(CatalogFill::complete(listed_to_client(std::mem::take(
+                    collected,
+                ))))
+            }
+        }
+        CatalogPage::Unparseable => PageApply::Done(CatalogFill::incomplete(listed_to_client(
+            std::mem::take(collected),
+        ))),
+        CatalogPage::Parsed {
+            models,
+            has_more,
+            last_id,
+        } => {
+            collected.extend(drop_key_rows(models, key));
+            collected.truncate(MAX_CATALOG_MODELS);
+            if !has_more || collected.len() >= MAX_CATALOG_MODELS {
+                PageApply::Done(CatalogFill::complete(listed_to_client(std::mem::take(
+                    collected,
+                ))))
+            } else {
+                *after_id = last_id;
+                PageApply::Continue
+            }
+        }
+    }
+}
+
+struct CachedModels {
+    fingerprint: u64,
+    complete: bool,
+    models: Vec<ClientProviderSignInModel>,
+}
+
+enum WaiterState {
+    Pending,
+    Ready(CatalogFill),
+}
+
+struct Waiter {
+    fingerprint: u64,
+    state: Mutex<WaiterState>,
+    cv: Condvar,
+}
+
 /// The production `ProviderAdminProvider`.
 pub struct WiredProviderAdmin {
     home: PathBuf,
@@ -175,6 +451,14 @@ pub struct WiredProviderAdmin {
     /// When set, a sidecar-backed local entry starts in this process instead of at the next
     /// daemon start.
     sidecar_binder: Option<Arc<dyn LocalSidecarBinder>>,
+    agent_cli_models_probe: Arc<dyn AgentCliModelsProbe>,
+    cloud_http_models_probe: Arc<dyn CloudHttpModelsProbe>,
+    agent_cli_models_kind: ModelProbeInstallation,
+    cloud_http_models_kind: ModelProbeInstallation,
+    models_generation: Mutex<HashMap<String, u64>>,
+    available_models_cache: Mutex<HashMap<String, CachedModels>>,
+    inflight: Mutex<HashMap<String, Arc<Waiter>>>,
+    fallback_store: OnceLock<Result<Arc<SecretStore>, String>>,
 }
 
 impl WiredProviderAdmin {
@@ -204,6 +488,14 @@ impl WiredProviderAdmin {
             process_policy: ProcessPolicy::Allow,
             hot_reload: true,
             sidecar_binder: None,
+            agent_cli_models_probe: Arc::new(NoopModelsProbe),
+            cloud_http_models_probe: Arc::new(NoopCloudHttpModelsProbe),
+            agent_cli_models_kind: ModelProbeInstallation::Noop,
+            cloud_http_models_kind: ModelProbeInstallation::Noop,
+            models_generation: Mutex::new(HashMap::new()),
+            available_models_cache: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
+            fallback_store: OnceLock::new(),
         }
     }
 
@@ -300,6 +592,58 @@ impl WiredProviderAdmin {
         self
     }
 
+    /// Scripted agent-cli catalog probe (tests).
+    pub fn with_agent_cli_models_probe(mut self, probe: Arc<dyn AgentCliModelsProbe>) -> Self {
+        self.agent_cli_models_probe = probe;
+        self.agent_cli_models_kind = ModelProbeInstallation::Scripted;
+        self
+    }
+
+    /// Live agent-cli catalog probe (production attach).
+    pub fn with_process_agent_cli_models_probe(
+        mut self,
+        probe: Arc<dyn AgentCliModelsProbe>,
+    ) -> Self {
+        self.agent_cli_models_probe = probe;
+        self.agent_cli_models_kind = ModelProbeInstallation::Process;
+        self
+    }
+
+    /// Scripted cloud-http catalog probe (tests).
+    pub fn with_cloud_http_models_probe(mut self, probe: Arc<dyn CloudHttpModelsProbe>) -> Self {
+        self.cloud_http_models_probe = probe;
+        self.cloud_http_models_kind = ModelProbeInstallation::Scripted;
+        self
+    }
+
+    /// Live cloud-http catalog probe (production attach).
+    pub fn with_process_cloud_http_models_probe(
+        mut self,
+        probe: Arc<dyn CloudHttpModelsProbe>,
+    ) -> Self {
+        self.cloud_http_models_probe = probe;
+        self.cloud_http_models_kind = ModelProbeInstallation::Process;
+        self
+    }
+
+    pub fn model_probe_installation(&self) -> (ModelProbeInstallation, ModelProbeInstallation) {
+        (self.agent_cli_models_kind, self.cloud_http_models_kind)
+    }
+
+    #[cfg(test)]
+    pub fn models_generation_of(&self, provider_id: &str) -> u64 {
+        self.models_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(provider_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn process_policy(&self) -> ProcessPolicy {
+        self.process_policy
+    }
+
     pub fn home(&self) -> &Path {
         &self.home
     }
@@ -327,14 +671,19 @@ impl WiredProviderAdmin {
 
     /// The store keys are read from / written to: the daemon's live instance, else a fresh
     /// file-backed one over the same master-key source (only when no live store exists).
-    fn key_store(&self) -> Result<Arc<SecretStore>, ProviderError> {
+    pub fn key_store(&self) -> Result<Arc<SecretStore>, ProviderError> {
         if let Some(store) = &self.store {
             return Ok(Arc::clone(store));
         }
-        let cfg = self.config.current();
-        crate::open_home_secret_store(&self.home, &cfg)
-            .map(Arc::new)
-            .map_err(|e| ProviderError::Unavailable(format!("secret store: {e}")))
+        match self.fallback_store.get_or_init(|| {
+            let cfg = self.config.current();
+            crate::open_home_secret_store(&self.home, &cfg)
+                .map(Arc::new)
+                .map_err(|e| format!("{e}"))
+        }) {
+            Ok(store) => Ok(Arc::clone(store)),
+            Err(e) => Err(ProviderError::Unavailable(format!("secret store: {e}"))),
+        }
     }
 
     fn key_present(&self, secret_name: &str) -> bool {
@@ -410,12 +759,258 @@ impl WiredProviderAdmin {
                 )),
                 _ => None,
             },
+            available_models: self.cheap_available_models(entry),
         }
     }
 
-    fn summary_of(&self, provider_id: &str) -> Result<ClientProviderSummary, ProviderError> {
-        let (idx, entry) = self.find(provider_id)?;
-        Ok(self.summary(&entry, idx == 0))
+    fn cheap_available_models(&self, entry: &LlmProviderConfig) -> Vec<ClientProviderSignInModel> {
+        if entry.uses_chatgpt_sign_in() {
+            return match self.chatgpt_sign_in.as_ref() {
+                Some(port) => project_sign_in(port.status(&entry.api_key_secret), now_ms()).models,
+                None => Vec::new(),
+            };
+        }
+        match entry.backend_class {
+            InferenceBackendClass::Local => unique_local_models(&entry.model_aliases),
+            InferenceBackendClass::MeshRemote => Vec::new(),
+            InferenceBackendClass::AgentCli | InferenceBackendClass::CloudHttp => {
+                self.cached_available_models(entry)
+            }
+        }
+    }
+
+    fn cached_available_models(&self, entry: &LlmProviderConfig) -> Vec<ClientProviderSignInModel> {
+        let fp = self.fingerprint(entry);
+        self.available_models_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&entry.id)
+            .filter(|c| c.fingerprint == fp && c.complete)
+            .map(|c| c.models.clone())
+            .unwrap_or_default()
+    }
+
+    fn summary_for_get(&self, entry: &LlmProviderConfig, selected: bool) -> ClientProviderSummary {
+        let mut s = self.summary(entry, selected);
+        if entry.backend_class == InferenceBackendClass::AgentCli
+            || (entry.backend_class == InferenceBackendClass::CloudHttp
+                && !entry.uses_chatgpt_sign_in())
+        {
+            s.available_models = self.ensure_models_cached(entry).models;
+        }
+        s
+    }
+
+    fn fingerprint(&self, entry: &LlmProviderConfig) -> u64 {
+        let gen = self
+            .models_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&entry.id)
+            .copied()
+            .unwrap_or(0);
+        let mut hasher = DefaultHasher::new();
+        entry.id.hash(&mut hasher);
+        gen.hash(&mut hasher);
+        match entry.backend_class {
+            InferenceBackendClass::AgentCli => {
+                if let Some(spec) = &entry.agent_cli {
+                    spec.vendor.as_str().hash(&mut hasher);
+                    spec.command.hash(&mut hasher);
+                    spec.args.len().hash(&mut hasher);
+                }
+            }
+            InferenceBackendClass::CloudHttp => {
+                entry.api_key_secret.hash(&mut hasher);
+                self.key_present(&entry.api_key_secret).hash(&mut hasher);
+                entry.endpoint.hash(&mut hasher);
+                entry
+                    .backend
+                    .map(|b| backend_str(b))
+                    .unwrap_or("")
+                    .hash(&mut hasher);
+                entry
+                    .auth_scheme
+                    .map(|a| auth_scheme_str(a))
+                    .unwrap_or("")
+                    .hash(&mut hasher);
+            }
+            _ => {}
+        }
+        hasher.finish()
+    }
+
+    fn invalidate_models(&self, provider_id: &str) {
+        {
+            let mut gens = self
+                .models_generation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let slot = gens.entry(provider_id.to_string()).or_insert(0);
+            *slot = slot.saturating_add(1);
+            if *slot == 0 {
+                *slot = 1;
+            }
+        }
+        self.available_models_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(provider_id);
+        if let Some(waiter) = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(provider_id)
+            .cloned()
+        {
+            let mut state = waiter.state.lock().unwrap_or_else(|e| e.into_inner());
+            *state = WaiterState::Ready(CatalogFill::empty_complete());
+            waiter.cv.notify_all();
+        }
+    }
+
+    fn drop_models_generation(&self, provider_id: &str) {
+        self.invalidate_models(provider_id);
+        self.models_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(provider_id);
+    }
+
+    fn probe_models_entry(&self, entry: &LlmProviderConfig) -> CatalogFill {
+        match entry.backend_class {
+            InferenceBackendClass::AgentCli => {
+                if self.process_policy.is_forbid() {
+                    return CatalogFill::empty_complete();
+                }
+                match &entry.agent_cli {
+                    Some(spec) => {
+                        let fill = self.agent_cli_models_probe.list_models(spec);
+                        CatalogFill {
+                            models: listed_to_client(
+                                fill.models
+                                    .into_iter()
+                                    .map(|m| ListedModel {
+                                        id: m.id,
+                                        display_name: m.display_name,
+                                    })
+                                    .collect(),
+                            ),
+                            complete: fill.complete,
+                        }
+                    }
+                    None => CatalogFill::empty_complete(),
+                }
+            }
+            InferenceBackendClass::CloudHttp if !entry.uses_chatgpt_sign_in() => {
+                if self.key_store().is_err() || !self.key_present(&entry.api_key_secret) {
+                    return CatalogFill::empty_complete();
+                }
+                self.cloud_http_models_probe.list_models(entry)
+            }
+            _ => CatalogFill::empty_complete(),
+        }
+    }
+
+    fn ensure_models_cached(&self, entry: &LlmProviderConfig) -> CatalogFill {
+        let fp = self.fingerprint(entry);
+        {
+            let cache = self
+                .available_models_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(hit) = cache.get(&entry.id) {
+                if hit.fingerprint == fp && hit.complete {
+                    return CatalogFill::complete(hit.models.clone());
+                }
+            }
+        }
+        let (leader, waiter) = {
+            let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = inflight.get(&entry.id).cloned() {
+                let pending = matches!(
+                    *existing.state.lock().unwrap_or_else(|e| e.into_inner()),
+                    WaiterState::Pending
+                );
+                if existing.fingerprint == fp && pending {
+                    (false, existing)
+                } else {
+                    let waiter = Arc::new(Waiter {
+                        fingerprint: fp,
+                        state: Mutex::new(WaiterState::Pending),
+                        cv: Condvar::new(),
+                    });
+                    inflight.insert(entry.id.clone(), Arc::clone(&waiter));
+                    (true, waiter)
+                }
+            } else {
+                let waiter = Arc::new(Waiter {
+                    fingerprint: fp,
+                    state: Mutex::new(WaiterState::Pending),
+                    cv: Condvar::new(),
+                });
+                inflight.insert(entry.id.clone(), Arc::clone(&waiter));
+                (true, waiter)
+            }
+        };
+        if !leader {
+            let mut state = waiter.state.lock().unwrap_or_else(|e| e.into_inner());
+            while matches!(*state, WaiterState::Pending) {
+                state = waiter.cv.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+            return match &*state {
+                WaiterState::Ready(fill) => {
+                    if self.fingerprint(entry) != fp {
+                        CatalogFill::empty_complete()
+                    } else {
+                        fill.clone()
+                    }
+                }
+                WaiterState::Pending => CatalogFill::empty_complete(),
+            };
+        }
+        let fill = self.probe_models_entry(entry);
+        let still = self.fingerprint(entry) == fp;
+        let published = if still {
+            fill.clone()
+        } else {
+            CatalogFill::empty_complete()
+        };
+        {
+            let mut state = waiter.state.lock().unwrap_or_else(|e| e.into_inner());
+            *state = WaiterState::Ready(published.clone());
+            waiter.cv.notify_all();
+        }
+        if still && fill.complete {
+            let mut cache = self
+                .available_models_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.fingerprint(entry) == fp {
+                cache.insert(
+                    entry.id.clone(),
+                    CachedModels {
+                        fingerprint: fp,
+                        complete: true,
+                        models: fill.models.clone(),
+                    },
+                );
+            }
+        }
+        {
+            let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            if inflight
+                .get(&entry.id)
+                .is_some_and(|w| w.fingerprint == fp)
+            {
+                inflight.remove(&entry.id);
+            }
+        }
+        if still {
+            fill
+        } else {
+            CatalogFill::empty_complete()
+        }
     }
 
     // ── sign-in entries ──────────────────────────────────────────────────────────────────────
@@ -807,12 +1402,13 @@ impl ProviderAdminProvider for WiredProviderAdmin {
             .entries()?
             .iter()
             .enumerate()
-            .map(|(idx, entry)| self.summary(entry, idx == 0))
+            .map(|(idx, entry)| self.summary_for_get(entry, idx == 0))
             .collect())
     }
 
     fn get_provider(&self, provider_id: &str) -> Result<ClientProviderSummary, ProviderError> {
-        self.summary_of(provider_id)
+        let (idx, entry) = self.find(provider_id)?;
+        Ok(self.summary_for_get(&entry, idx == 0))
     }
 
     fn create_provider(
@@ -839,6 +1435,12 @@ impl ProviderAdminProvider for WiredProviderAdmin {
         )
         .map_err(write_error)?;
         let (idx, entry) = self.find(&request.provider_id)?;
+        if matches!(
+            entry.backend_class,
+            InferenceBackendClass::AgentCli | InferenceBackendClass::CloudHttp
+        ) {
+            self.invalidate_models(&entry.id);
+        }
         let applied = entry.clone();
         let mut outcome = self.after_yaml_write(
             ProviderAdminOutcome::new(self.summary(&entry, idx == 0)),
@@ -905,6 +1507,14 @@ impl ProviderAdminProvider for WiredProviderAdmin {
         )
         .map_err(write_error)?;
         let (idx, entry) = self.find(provider_id)?;
+        if request.agent_cli.is_some()
+            || request.endpoint.is_some()
+            || request.backend.is_some()
+            || request.auth_scheme.is_some()
+            || request.api_key_secret.is_some()
+        {
+            self.invalidate_models(provider_id);
+        }
         let applied = entry.clone();
         let mut outcome = self.after_yaml_write(
             ProviderAdminOutcome::new(self.summary(&entry, idx == 0)),
@@ -983,6 +1593,7 @@ impl ProviderAdminProvider for WiredProviderAdmin {
                 }
             }
         }
+        self.drop_models_generation(provider_id);
         let remaining = self.entries()?;
         let result = ClientProviderDeleteResult {
             provider_id: provider_id.to_string(),
@@ -1027,6 +1638,7 @@ impl ProviderAdminProvider for WiredProviderAdmin {
         store
             .store(&entry.api_key_secret, key)
             .map_err(|_| ProviderError::Unavailable("secret store write".into()))?;
+        self.invalidate_models(provider_id);
         outcome.value = ClientProviderKeyResult {
             stored: true,
             preflight,
@@ -1045,6 +1657,7 @@ impl ProviderAdminProvider for WiredProviderAdmin {
         store
             .remove(&entry.api_key_secret)
             .map_err(|_| ProviderError::Unavailable("secret store write".into()))?;
+        self.invalidate_models(provider_id);
         Ok(self.summary(&entry, idx == 0))
     }
 
@@ -1082,6 +1695,7 @@ impl ProviderAdminProvider for WiredProviderAdmin {
         {
             let verdict = self.run_agent_cli_preflight(spec);
             self.record_preflight(provider_id, &verdict);
+            self.invalidate_models(provider_id);
             return Ok(verdict);
         }
         let verdict = if entry.uses_chatgpt_sign_in() {
@@ -1110,6 +1724,10 @@ impl ProviderAdminProvider for WiredProviderAdmin {
             }
         };
         self.record_preflight(provider_id, &verdict);
+        if entry.backend_class == InferenceBackendClass::CloudHttp && !entry.uses_chatgpt_sign_in()
+        {
+            self.invalidate_models(provider_id);
+        }
         Ok(verdict)
     }
 
@@ -2028,6 +2646,18 @@ database:
                 },
             ]
         );
+        assert_eq!(summary.available_models, sign_in.models);
+        assert_eq!(
+            summary.model_aliases.get("gpt").map(String::as_str),
+            Some("gpt-5")
+        );
+
+        *f.port.status.lock().unwrap() = signed_out(None);
+        let signed_out_summary = admin.get_provider("openai-plan").unwrap();
+        let signed_out_state = signed_out_summary.sign_in.expect("projected");
+        assert_eq!(signed_out_state.state, STATE_SIGNED_OUT);
+        assert!(signed_out_state.models.is_empty());
+        assert!(signed_out_summary.available_models.is_empty());
 
         // The API-key entry carries neither, and the port is never asked about its secret.
         let listed = admin.list_providers().unwrap();
@@ -2967,5 +3597,594 @@ database:
             started.elapsed()
         );
         assert_eq!(deleted.warnings, [ProviderAdminWarning::RestartRequired]);
+    }
+
+    #[test]
+    fn am_t19_forbid_get_is_200_without_spawn_or_counter() {
+        let f = Fixture::new();
+        let admin = f
+            .admin()
+            .with_process_policy(ProcessPolicy::Forbid)
+            .with_agent_cli_probe(Arc::new(PanicAuth))
+            .with_reload_wait(Duration::from_millis(1));
+        let w0 = spawn_counter::snapshot();
+        let listed = admin.list_providers().expect("list under Forbid");
+        let cli = listed
+            .iter()
+            .find(|s| s.provider_id == "claude-sub")
+            .expect("agent-cli row");
+        assert!(cli.available_models.is_empty());
+        let got = admin.get_provider("claude-sub").expect("get under Forbid");
+        assert!(got.available_models.is_empty());
+        let delta = spawn_counter::snapshot().since(&w0);
+        assert_eq!(delta.refused(SpawnSite::AgentCli), 0);
+    }
+}
+
+#[cfg(test)]
+mod available_models_tests {
+    use super::*;
+    use advance_shared_types::security_validator::{
+        HttpCapability, HttpError, HttpRequest, HttpResponse, HttpSecurityChain,
+    };
+    use async_trait::async_trait;
+    use cap_llm::backend_cli::AgentCliModelsProbe;
+    use cap_llm::{CatalogFill as CliCatalogFill, ListedModel};
+    use cap_secrets::InMemorySecretStorage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::thread;
+    use std::time::Instant;
+    use zeroize::Zeroizing;
+
+    const HOME_YAML: &str = "\
+wasm:
+  max_memory_pages: 1024
+  epoch_interruption_ms: 100
+  fuel_enabled: false
+
+llm-providers:
+  - id: openai
+    endpoint: https://api.openai.com
+    api-key-secret: openai-api-key
+    model-aliases:
+      gpt: gpt-4o
+    cost-per-mtoken-in: 2.50
+    cost-per-mtoken-out: 10.00
+    rate-limit:
+      requests-per-minute: 1000
+      tokens-per-minute: 400000
+  - id: mesh-a
+    endpoint: ''
+    api-key-secret: mesh-a-api-key
+    model-aliases:
+      m: m
+    cost-per-mtoken-in: 0.001
+    cost-per-mtoken-out: 0.001
+    backend-class: mesh-remote
+    device-id: device-a
+    rate-limit:
+      requests-per-minute: 10
+      tokens-per-minute: 1000
+
+cron:
+  max_jitter_ratio: 0.1
+
+git:
+  gc_interval_hours: 24
+  max_tracked_file_mb: 10
+
+secrets:
+  master-key-source: env-var
+  env-var-name: ADV_HOME_AM_MK
+
+post-processor:
+  llm-model: sonnet-light
+  llm-failure-cooldown-seconds: 600
+";
+
+    struct PassPreflight;
+    impl PreflightPort for PassPreflight {
+        fn preflight(
+            &self,
+            _home: &Path,
+            _provider: &LlmProviderConfig,
+            _key: &SecretBytes,
+            _cancel: &CancelToken,
+        ) -> Result<(), crate::PreflightFail> {
+            Ok(())
+        }
+    }
+
+    struct CountingCli {
+        calls: AtomicUsize,
+        fill: Mutex<CliCatalogFill>,
+        hold: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl CountingCli {
+        fn with(models: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                fill: Mutex::new(CliCatalogFill::complete(
+                    models
+                        .iter()
+                        .map(|id| ListedModel {
+                            id: (*id).into(),
+                            display_name: None,
+                        })
+                        .collect(),
+                )),
+                hold: Mutex::new(None),
+            })
+        }
+    }
+
+    impl AgentCliModelsProbe for CountingCli {
+        fn list_models(&self, _spec: &AgentCliSpec) -> CliCatalogFill {
+            if let Some(rx) = self.hold.lock().unwrap().as_ref() {
+                let _ = rx.recv_timeout(Duration::from_secs(2));
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.fill.lock().unwrap().clone()
+        }
+    }
+
+    struct CountingHttp {
+        calls: AtomicUsize,
+        fill: Mutex<CatalogFill>,
+    }
+
+    impl CountingHttp {
+        fn with(models: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                fill: Mutex::new(CatalogFill::complete(
+                    models
+                        .iter()
+                        .map(|id| ClientProviderSignInModel {
+                            id: (*id).into(),
+                            display_name: None,
+                        })
+                        .collect(),
+                )),
+            })
+        }
+    }
+
+    impl CloudHttpModelsProbe for CountingHttp {
+        fn list_models(&self, _entry: &LlmProviderConfig) -> CatalogFill {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.fill.lock().unwrap().clone()
+        }
+    }
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        home: PathBuf,
+        store: Arc<SecretStore>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let home = dir.path().to_path_buf();
+            std::fs::create_dir_all(home.join(".advance")).unwrap();
+            std::fs::write(home.join(".advance/runtime-config.yaml"), HOME_YAML).unwrap();
+            let store = Arc::new(SecretStore::new(
+                Zeroizing::new([3u8; 32]),
+                Arc::new(InMemorySecretStorage::default()),
+            ));
+            Self {
+                _dir: dir,
+                home,
+                store,
+            }
+        }
+
+        fn admin(&self) -> WiredProviderAdmin {
+            let cfg = advance_runtime::config::load_config(
+                &self.home.join(".advance/runtime-config.yaml"),
+            )
+            .expect("fixture parses");
+            WiredProviderAdmin::new(
+                self.home.clone(),
+                Arc::new(cap_llm::StaticConfig(Arc::new(cfg))),
+                Some(Arc::clone(&self.store)),
+                Arc::new(PassPreflight),
+                Arc::new(NoReferences),
+            )
+            .with_reload_wait(Duration::from_millis(1))
+        }
+    }
+
+    fn local_req(id: &str, aliases: &[(&str, &str)]) -> ClientCreateProviderRequest {
+        ClientCreateProviderRequest {
+            provider_id: id.into(),
+            backend_class: Some("local".into()),
+            model_aliases: aliases
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            cost: ClientProviderCost {
+                input_per_mtoken: 0.001,
+                output_per_mtoken: 0.001,
+                ..Default::default()
+            },
+            rate_limit: ClientProviderRateLimit {
+                requests_per_minute: 10,
+                tokens_per_minute: 1000,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn grok_req(id: &str) -> ClientCreateProviderRequest {
+        ClientCreateProviderRequest {
+            provider_id: id.into(),
+            backend_class: Some(AGENT_CLI_BACKEND_CLASS.into()),
+            agent_cli: Some(ClientProviderAgentCli {
+                vendor: "grok".into(),
+                command: "/nonexistent/grok".into(),
+                args: Vec::new(),
+            }),
+            model_aliases: [("fast".into(), "grok-4".into())].into_iter().collect(),
+            cost: ClientProviderCost {
+                input_per_mtoken: 0.001,
+                output_per_mtoken: 0.001,
+                ..Default::default()
+            },
+            rate_limit: ClientProviderRateLimit {
+                requests_per_minute: 6,
+                tokens_per_minute: 60_000,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn cloud_req(id: &str) -> ClientCreateProviderRequest {
+        ClientCreateProviderRequest {
+            provider_id: id.into(),
+            backend_class: Some("cloud-http".into()),
+            endpoint: Some("https://api.example.com".into()),
+            model_aliases: [("m".into(), "m".into())].into_iter().collect(),
+            cost: ClientProviderCost {
+                input_per_mtoken: 1.0,
+                output_per_mtoken: 1.0,
+                ..Default::default()
+            },
+            rate_limit: ClientProviderRateLimit {
+                requests_per_minute: 10,
+                tokens_per_minute: 1000,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn am_t13_local_unique_alias_values_keep_spaces() {
+        let f = Fixture::new();
+        let admin = f.admin();
+        admin
+            .create_provider(&local_req(
+                "tiny",
+                &[("tiny", "qwen2.5-0.5b"), ("alias", "qwen2.5-0.5b")],
+            ))
+            .unwrap();
+        admin
+            .create_provider(&local_req("spaced", &[("a", "my model")]))
+            .unwrap();
+        let tiny = admin.get_provider("tiny").unwrap();
+        assert_eq!(
+            tiny.available_models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["qwen2.5-0.5b"]
+        );
+        let spaced = admin.get_provider("spaced").unwrap();
+        assert_eq!(spaced.available_models[0].id, "my model");
+    }
+
+    #[test]
+    fn am_t16_mesh_remote_empty() {
+        let f = Fixture::new();
+        let admin = f.admin();
+        assert!(admin.get_provider("mesh-a").unwrap().available_models.is_empty());
+    }
+
+    #[test]
+    fn am_t15_cache_singleflight_and_invalidate() {
+        let f = Fixture::new();
+        let probe = CountingCli::with(&["grok-4.6"]);
+        let admin = f
+            .admin()
+            .with_agent_cli_models_probe(Arc::clone(&probe) as Arc<dyn AgentCliModelsProbe>);
+        let created = admin.create_provider(&grok_req("grok-a")).unwrap();
+        assert!(created.value.available_models.is_empty());
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        let gen_after_create = admin.models_generation_of("grok-a");
+        assert!(gen_after_create >= 1);
+
+        let first = admin.get_provider("grok-a").unwrap();
+        assert_eq!(first.available_models[0].id, "grok-4.6");
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+        let _ = admin.get_provider("grok-a").unwrap();
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+
+        admin.preflight("grok-a").unwrap();
+        assert!(admin.models_generation_of("grok-a") > gen_after_create);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        *probe.hold.lock().unwrap() = Some(rx);
+        let admin = Arc::new(admin);
+        let waiter_admin = Arc::clone(&admin);
+        let join = thread::spawn(move || waiter_admin.get_provider("grok-a"));
+        thread::sleep(Duration::from_millis(30));
+        let cleared = admin.clear_key("grok-a").expect("clear-key of placeholder");
+        assert!(cleared.available_models.is_empty());
+        drop(tx);
+        let woken = join.join().expect("thread");
+        assert!(woken.unwrap().available_models.is_empty());
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn am_t12_missing_key_skips_http_probe() {
+        let f = Fixture::new();
+        let probe = CountingHttp::with(&["gpt-4o"]);
+        let admin = f
+            .admin()
+            .with_cloud_http_models_probe(Arc::clone(&probe) as Arc<dyn CloudHttpModelsProbe>);
+        admin.create_provider(&cloud_req("cloud-a")).unwrap();
+        let missing = admin.get_provider("cloud-a").unwrap();
+        assert!(missing.available_models.is_empty());
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+
+        admin.set_key("cloud-a", "sk-test-key-abcdef").unwrap();
+        let got = admin.get_provider("cloud-a").unwrap();
+        assert_eq!(got.available_models[0].id, "gpt-4o");
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+        let env = serde_json::to_string(&got).unwrap();
+        assert!(!env.contains("sk-test-key-abcdef"));
+    }
+
+    #[test]
+    fn am_t20_missing_key_is_instant() {
+        let f = Fixture::new();
+        let probe = CountingHttp::with(&["gpt-4o"]);
+        let admin = f
+            .admin()
+            .with_cloud_http_models_probe(Arc::clone(&probe) as Arc<dyn CloudHttpModelsProbe>)
+            .with_preflight_timeout(Duration::from_secs(30));
+        admin.create_provider(&cloud_req("cloud-b")).unwrap();
+        let started = Instant::now();
+        let got = admin.get_provider("cloud-b").unwrap();
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(got.available_models.is_empty());
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+    }
+
+    struct ScriptedChain {
+        pages: Mutex<Vec<Result<HttpResponse, HttpError>>>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl HttpSecurityChain for ScriptedChain {
+        async fn execute(
+            &self,
+            _agent_id: &str,
+            _req: HttpRequest,
+            _cap: &HttpCapability,
+        ) -> Result<HttpResponse, HttpError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut pages = self.pages.lock().unwrap();
+            if pages.is_empty() {
+                return Err(HttpError::Transport(
+                    advance_shared_types::security_validator::TransportErrorKind::Other,
+                ));
+            }
+            pages.remove(0)
+        }
+    }
+
+    fn models_json(ids: &[&str], has_more: bool) -> Vec<u8> {
+        let data: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| serde_json::json!({ "id": id }))
+            .collect();
+        serde_json::to_vec(&serde_json::json!({ "data": data, "has_more": has_more })).unwrap()
+    }
+
+    fn page_ok(ids: &[&str], has_more: bool) -> Result<HttpResponse, HttpError> {
+        Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: models_json(ids, has_more),
+        })
+    }
+
+    fn page_status(status: u16) -> Result<HttpResponse, HttpError> {
+        Ok(HttpResponse {
+            status,
+            headers: Vec::new(),
+            body: Vec::new(),
+        })
+    }
+
+    fn incomplete_page_pair(ids: &[&str]) -> Vec<Result<HttpResponse, HttpError>> {
+        vec![
+            page_ok(ids, true),
+            Err(HttpError::RateLimited { retry_after_ms: 0 }),
+        ]
+    }
+
+    fn openai_entry(home: &Path) -> LlmProviderConfig {
+        let cfg = advance_runtime::config::load_config(&home.join(".advance/runtime-config.yaml"))
+            .unwrap();
+        cfg.llm_providers
+            .into_iter()
+            .find(|p| p.id == "openai")
+            .expect("openai fixture")
+    }
+
+    #[test]
+    fn am_t22_incomplete_partial_is_returned_not_cached() {
+        let ids: Vec<String> = (0..40).map(|i| format!("m{i}")).collect();
+        let first: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let chain = Arc::new(ScriptedChain {
+            pages: Mutex::new(incomplete_page_pair(&first)),
+            calls: AtomicUsize::new(0),
+        });
+        let f = Fixture::new();
+        let probe = ProcessCloudHttpModelsProbe::new(
+            chain.clone(),
+            Arc::clone(&f.store),
+            Duration::from_millis(200),
+        );
+        f.store.store("openai-api-key", "sk-abcdefgh").unwrap();
+        let entry = openai_entry(&f.home);
+        let sample = models_json(&first, true);
+        match parse_models_catalog_page(&sample) {
+            CatalogPage::Parsed { models, has_more, .. } => {
+                assert_eq!(models.len(), 40, "parser dropped ids");
+                assert!(has_more);
+            }
+            other => panic!("expected parsed page, got {other:?}"),
+        }
+        let fill = probe.list_models(&entry);
+        assert!(
+            !fill.complete,
+            "expected incomplete, got {fill:?} after {} calls",
+            chain.calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            fill.models.len(),
+            40,
+            "fill={fill:?} calls={}",
+            chain.calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
+
+        {
+            let mut pages = chain.pages.lock().unwrap();
+            *pages = {
+                let mut seeded = incomplete_page_pair(&first);
+                seeded.extend(incomplete_page_pair(&first));
+                seeded
+            };
+        }
+
+        let admin = f
+            .admin()
+            .with_cloud_http_models_probe(Arc::new(probe) as Arc<dyn CloudHttpModelsProbe>);
+        let got = admin.get_provider("openai").unwrap();
+        assert_eq!(got.available_models.len(), 40);
+        let again = admin.get_provider("openai").unwrap();
+        assert_eq!(again.available_models.len(), 40);
+        assert_eq!(chain.calls.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn am_t22_first_page_401_is_complete_empty() {
+        let chain = Arc::new(ScriptedChain {
+            pages: Mutex::new(vec![page_status(401)]),
+            calls: AtomicUsize::new(0),
+        });
+        let f = Fixture::new();
+        f.store.store("openai-api-key", "sk-abcdefgh").unwrap();
+        let probe = ProcessCloudHttpModelsProbe::new(
+            chain.clone(),
+            Arc::clone(&f.store),
+            Duration::from_millis(200),
+        );
+        let fill = probe.list_models(&openai_entry(&f.home));
+        assert!(fill.complete);
+        assert!(fill.models.is_empty());
+
+        {
+            let mut pages = chain.pages.lock().unwrap();
+            *pages = vec![page_status(401)];
+        }
+        let admin = f
+            .admin()
+            .with_cloud_http_models_probe(Arc::new(probe) as Arc<dyn CloudHttpModelsProbe>);
+        let got = admin.get_provider("openai").unwrap();
+        assert!(got.available_models.is_empty());
+        let again = admin.get_provider("openai").unwrap();
+        assert!(again.available_models.is_empty());
+        assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn am_t22_first_page_503_is_incomplete_not_cached() {
+        let chain = Arc::new(ScriptedChain {
+            pages: Mutex::new(vec![page_status(503), page_status(503)]),
+            calls: AtomicUsize::new(0),
+        });
+        let f = Fixture::new();
+        f.store.store("openai-api-key", "sk-abcdefgh").unwrap();
+        let probe = ProcessCloudHttpModelsProbe::new(
+            chain.clone(),
+            Arc::clone(&f.store),
+            Duration::from_millis(200),
+        );
+        let admin = f
+            .admin()
+            .with_cloud_http_models_probe(Arc::new(probe) as Arc<dyn CloudHttpModelsProbe>);
+        let first = admin.get_provider("openai").unwrap();
+        assert!(first.available_models.is_empty());
+        assert_eq!(chain.calls.load(Ordering::SeqCst), 1);
+        let second = admin.get_provider("openai").unwrap();
+        assert!(second.available_models.is_empty());
+        assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn am_t08_claude_aliases_do_not_fill_catalog() {
+        let f = Fixture::new();
+        let admin = f.admin();
+        let mut req = grok_req("claude-a");
+        req.agent_cli = Some(ClientProviderAgentCli {
+            vendor: "claude".into(),
+            command: "/nonexistent/claude".into(),
+            args: Vec::new(),
+        });
+        req.model_aliases = [("sonnet".into(), "sonnet".into())].into_iter().collect();
+        admin.create_provider(&req).unwrap();
+        let listed = admin.get_provider("claude-a").unwrap();
+        assert_eq!(listed.model_aliases.get("sonnet").map(String::as_str), Some("sonnet"));
+        assert!(listed.available_models.is_empty());
+    }
+
+    #[test]
+    fn am_t18_key_substring_dropped_from_catalog() {
+        let key = "sk-abcdefgh";
+        let chain = Arc::new(ScriptedChain {
+            pages: Mutex::new(vec![page_ok(&[key, "gpt-4o"], false)]),
+            calls: AtomicUsize::new(0),
+        });
+        let f = Fixture::new();
+        f.store.store("openai-api-key", key).unwrap();
+        let probe = ProcessCloudHttpModelsProbe::new(
+            chain.clone(),
+            Arc::clone(&f.store),
+            Duration::from_millis(200),
+        );
+        let admin = f
+            .admin()
+            .with_cloud_http_models_probe(Arc::new(probe) as Arc<dyn CloudHttpModelsProbe>);
+        let got = admin.get_provider("openai").unwrap();
+        assert_eq!(
+            got.available_models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-4o"]
+        );
+        let env = serde_json::to_string(&got).unwrap();
+        assert!(!env.contains(key));
+        assert_eq!(chain.calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -33,6 +33,7 @@
 
 pub mod backend_cli;
 pub mod backend_local;
+pub mod models_list;
 pub mod backend_mesh;
 pub mod capability;
 pub mod catalog;
@@ -87,8 +88,13 @@ mod test_support;
 mod test_marker;
 
 pub use backend_cli::{
-    probe_auth, probe_usage, AgentCliAuthProbe, AgentCliBackend, AgentCliEnv, AgentCliUsageProbe,
-    AuthProbe, ProcessAuthProbe, ProcessUsageProbe, UsageProbe, UsageWindow,
+    models_list_argv, probe_auth, probe_models, probe_usage, AgentCliAuthProbe, AgentCliBackend,
+    AgentCliEnv, AgentCliModelsProbe, AgentCliUsageProbe, AuthProbe, NoopModelsProbe,
+    ProcessAuthProbe, ProcessModelsProbe, ProcessUsageProbe, UsageProbe, UsageWindow,
+};
+pub use models_list::{
+    build_models_list_capability, build_models_list_request, parse_models_catalog_page, CatalogFill,
+    CatalogPage, ListedModel,
 };
 pub use backend_local::{
     FailedSpawnBackend, OwnedHandoffSupervisor, ProcessSupervisor, SidecarClient,

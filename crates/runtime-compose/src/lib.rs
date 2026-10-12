@@ -197,4 +197,7 @@ pub mod vlm_indexer;
 // cap-skills SkillPersistenceCoordinator on the Initiator::AutoLoop (micro) lane. Closes
 // the Wave-17 strict-hold (no production `impl SkillRollback`). cli-only.
 pub mod skill_rollback_bridge;
+mod provider_model_probes;
+#[cfg(test)]
+mod provider_model_probes_lock;
 pub mod wiring;

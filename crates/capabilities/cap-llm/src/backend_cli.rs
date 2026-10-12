@@ -501,6 +501,14 @@ pub fn sign_in_argv(vendor: AgentCliVendor) -> Vec<&'static str> {
     }
 }
 
+/// Closed models-list argv. Empty means this vendor has no first-class list command: do not spawn.
+pub fn models_list_argv(vendor: AgentCliVendor) -> Vec<&'static str> {
+    match vendor {
+        AgentCliVendor::Grok | AgentCliVendor::Gemini => vec!["models"],
+        AgentCliVendor::Claude | AgentCliVendor::Codex => vec![],
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Output parsing (pure)
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -1372,6 +1380,101 @@ pub fn probe_auth(spec: &AgentCliSpec, env: &AgentCliEnv) -> AuthProbe {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
+// Models list probe (separate from sign-in)
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Seam for GET catalog fill. Production runs `probe_models`; tests inject a verdict.
+pub trait AgentCliModelsProbe: Send + Sync {
+    fn list_models(&self, spec: &AgentCliSpec) -> crate::models_list::CatalogFill;
+}
+
+/// Always a complete empty catalog (default `WiredProviderAdmin` seam).
+pub struct NoopModelsProbe;
+
+impl AgentCliModelsProbe for NoopModelsProbe {
+    fn list_models(&self, _spec: &AgentCliSpec) -> crate::models_list::CatalogFill {
+        crate::models_list::CatalogFill::empty_complete()
+    }
+}
+
+/// Runs `<command> models` under the allowlisted environment.
+pub struct ProcessModelsProbe {
+    pub env: AgentCliEnv,
+}
+
+impl Default for ProcessModelsProbe {
+    fn default() -> Self {
+        Self {
+            env: AgentCliEnv::from_process_env(),
+        }
+    }
+}
+
+impl AgentCliModelsProbe for ProcessModelsProbe {
+    fn list_models(&self, spec: &AgentCliSpec) -> crate::models_list::CatalogFill {
+        probe_models(spec, &self.env)
+    }
+}
+
+/// List models this vendor CLI can call. Never appends `spec.args`.
+pub fn probe_models(
+    spec: &AgentCliSpec,
+    env: &AgentCliEnv,
+) -> crate::models_list::CatalogFill {
+    use crate::models_list::{
+        parse_cli_models_stdout, stdout_has_sign_in_language, CatalogFill,
+    };
+
+    let argv: Vec<String> = models_list_argv(spec.vendor)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if argv.is_empty() {
+        return CatalogFill::empty_complete();
+    }
+    if env.process_policy().check(SpawnSite::AgentCli).is_err() {
+        return CatalogFill::empty_complete();
+    }
+    let command = Path::new(&spec.command);
+    if !command.is_absolute() || !command.is_file() {
+        return CatalogFill::empty_complete();
+    }
+    if !env.identity_complete() {
+        return CatalogFill::empty_complete();
+    }
+    let cancel = AtomicBool::new(false);
+    let abort = AtomicBool::new(false);
+    let cwd = std::env::temp_dir();
+    let run = run_supervised(
+        command,
+        &argv,
+        env,
+        spec.vendor,
+        &cwd,
+        None,
+        Instant::now() + AUTH_PROBE_TIMEOUT,
+        &cancel,
+        &abort,
+    );
+    let run = match run {
+        Ok(r) => r,
+        Err((StopReason::ProcessForbidden, _)) => return CatalogFill::empty_complete(),
+        Err(_) => return CatalogFill::empty_incomplete(),
+    };
+    if run.exit_code.is_none() {
+        return CatalogFill::empty_incomplete();
+    }
+    if run.exit_code != Some(0) {
+        return CatalogFill::empty_complete();
+    }
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    if stdout_has_sign_in_language(&stdout) {
+        return CatalogFill::empty_complete();
+    }
+    CatalogFill::complete(parse_cli_models_stdout(&stdout))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
 // Usage probe (subscription allowance)
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -2223,6 +2326,7 @@ impl InferenceBackendPort for AgentCliBackend {
 mod tests {
     use super::*;
     use advance_shared_types::inference::InferenceMessage;
+    use advance_shared_types::process_policy::{spawn_counter, ProcessPolicy, SpawnSite};
 
     fn spec(vendor: AgentCliVendor, command: &str) -> AgentCliSpec {
         AgentCliSpec {
@@ -2870,6 +2974,110 @@ mod tests {
         assert_eq!(sign_in_argv(AgentCliVendor::Claude), vec!["auth", "login"]);
         assert_eq!(sign_in_argv(AgentCliVendor::Codex), vec!["login"]);
         assert_eq!(auth_probe_argv(AgentCliVendor::Grok), vec!["models"]);
+    }
+
+    #[test]
+    fn am_t07_grok_argv_cwd_and_exit_codes() {
+        assert_eq!(models_list_argv(AgentCliVendor::Grok), vec!["models"]);
+        let dir = scratch("am-t07");
+        let marker = dir.join("ran.txt");
+        let cwd_file = dir.join("cwd.txt");
+        let argv_file = dir.join("argv.txt");
+        let script = write_fake_cli(
+            &dir,
+            &format!(
+                "pwd > {:?}\nprintf '%s\\n' \"$@\" > {:?}\necho ran > {:?}\necho 'Available models:'\necho '  * grok-4.6 (default)'\nexit 0",
+                cwd_file, argv_file, marker
+            ),
+        );
+        let mut grok_spec = spec(AgentCliVendor::Grok, script.to_str().unwrap());
+        grok_spec.args = vec!["--operator-extra".into()];
+        let env = test_env();
+        let fill = probe_models(&grok_spec, &env);
+        assert!(fill.complete);
+        assert_eq!(
+            fill.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["grok-4.6"]
+        );
+        let cwd = std::fs::read_to_string(&cwd_file).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(cwd.trim()).unwrap(),
+            std::fs::canonicalize(std::env::temp_dir()).unwrap()
+        );
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert_eq!(argv.trim(), "models");
+        assert!(!argv.contains("--operator-extra"));
+
+        let fail = write_fake_cli(
+            &dir,
+            "echo 'Available models:'\necho '  * grok-help-token'\nexit 2",
+        );
+        let fill = probe_models(&spec(AgentCliVendor::Grok, fail.to_str().unwrap()), &env);
+        assert!(fill.complete);
+        assert!(fill.models.is_empty());
+
+        let missing = probe_models(&spec(AgentCliVendor::Grok, "/no/such/grok-cli"), &env);
+        assert!(missing.complete);
+        assert!(missing.models.is_empty());
+
+        let not_exec = dir.join("not-exec");
+        std::fs::write(&not_exec, "#!/bin/sh\necho should-not-run\n").unwrap();
+        let spawn = probe_models(
+            &spec(AgentCliVendor::Grok, not_exec.to_str().unwrap()),
+            &env,
+        );
+        assert!(!spawn.complete);
+        assert!(spawn.models.is_empty());
+
+        let forbid = test_env().with_process_policy(ProcessPolicy::Forbid);
+        let before = spawn_counter::snapshot();
+        let fill = probe_models(&spec(AgentCliVendor::Grok, script.to_str().unwrap()), &forbid);
+        assert!(fill.complete);
+        assert!(fill.models.is_empty());
+        assert_eq!(
+            spawn_counter::snapshot().since(&before).refused(SpawnSite::AgentCli),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn am_t08_claude_codex_do_not_spawn() {
+        assert!(models_list_argv(AgentCliVendor::Claude).is_empty());
+        assert!(models_list_argv(AgentCliVendor::Codex).is_empty());
+        let dir = scratch("am-t08");
+        let marker = dir.join("ran.txt");
+        let script = write_fake_cli(&dir, &format!("echo ran > {marker:?}"));
+        let env = test_env();
+        let claude = probe_models(
+            &spec(AgentCliVendor::Claude, script.to_str().unwrap()),
+            &env,
+        );
+        let codex = probe_models(
+            &spec(AgentCliVendor::Codex, script.to_str().unwrap()),
+            &env,
+        );
+        assert!(claude.complete && claude.models.is_empty());
+        assert!(codex.complete && codex.models.is_empty());
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn am_t06_gemini_signed_out_probe_auth_and_models() {
+        let dir = scratch("am-t06");
+        let script = write_fake_cli(
+            &dir,
+            "echo 'Fetching available models...'\necho 'Error: Please sign in to view available models.'\nexit 0",
+        );
+        let spec = spec(AgentCliVendor::Gemini, script.to_str().unwrap());
+        let env = test_env();
+        let auth = probe_auth(&spec, &env);
+        assert!(!auth.signed_in);
+        let fill = probe_models(&spec, &env);
+        assert!(fill.complete);
+        assert!(fill.models.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

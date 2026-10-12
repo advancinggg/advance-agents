@@ -3535,48 +3535,30 @@ pub(crate) async fn wire_capabilities_inner(
     // `auth-source: chatgpt-oauth` entries are served through the gateway's own sign-in object
     // (when llm is declared); without it such an entry cannot be created here.
     let provider_admin: Arc<crate::client_api_providers::WiredProviderAdmin> = {
-        let admin = crate::client_api_providers::WiredProviderAdmin::new(
-            workspace.to_path_buf(),
-            host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
-            secret_store.clone().or(provided_key_admin_store),
-            Arc::new(advance_home::GeneratePathPreflight::default()),
-            Arc::new(crate::agent_llm_policy::WorkspaceAgentLlmPolicy::new(
-                agent_tree.clone(),
-                root_uid.as_str(),
-                workspace.to_path_buf(),
-                event_bus_dyn.clone(),
-            )),
-        )
-        .with_process_policy(processes)
-        .with_hot_reload(hot_reload);
-        let admin = match chatgpt_sign_in.as_ref() {
-            Some(sign_in) => admin.with_chatgpt_sign_in(
-                Arc::clone(sign_in) as Arc<dyn advance_home::ChatGptSignInPort>
-            ),
-            None => admin,
-        };
-        let admin = if inference_marks_claimable {
-            admin.with_claimable_local_entries(true)
-        } else {
-            admin
-        };
-        let admin = match llm_gateway.as_ref() {
-            Some(gateway) => admin.with_local_sidecar_binder(
-                Arc::clone(gateway) as Arc<dyn cap_llm::LocalSidecarBinder>
-            ),
-            None => admin,
-        };
-        let admin = match (llm_gateway.as_ref(), inference_claimed.is_empty()) {
-            (Some(gateway), false) => {
-                let (port, stopper) = crate::inference::ComposedClaimedPreflight::new(
-                    gateway,
-                    inference_claimed.clone(),
-                );
-                started.claimed_preflight = Some(stopper);
-                admin.with_claimed_preflight(Arc::new(port))
-            }
-            _ => admin,
-        };
+        let (admin, stopper) = crate::provider_model_probes::compose_provider_admin(
+            crate::provider_model_probes::ProviderAdminCompose {
+                home: workspace.to_path_buf(),
+                config: host.config_watcher() as Arc<dyn RuntimeConfigProvider>,
+                store: secret_store.clone().or(provided_key_admin_store),
+                preflight: Arc::new(advance_home::GeneratePathPreflight::default()),
+                references: Arc::new(crate::agent_llm_policy::WorkspaceAgentLlmPolicy::new(
+                    agent_tree.clone(),
+                    root_uid.as_str(),
+                    workspace.to_path_buf(),
+                    event_bus_dyn.clone(),
+                )),
+                processes,
+                hot_reload,
+                chatgpt_sign_in: chatgpt_sign_in.as_ref().map(|sign_in| {
+                    Arc::clone(sign_in) as Arc<dyn advance_home::ChatGptSignInPort>
+                }),
+                inference_marks_claimable,
+                llm_gateway: llm_gateway.clone(),
+                inference_claimed,
+                event_bus: event_bus_dyn.clone(),
+            },
+        );
+        started.claimed_preflight = stopper;
         Arc::new(admin)
     };
     let provider_admin_for_api = provider_admin.clone();

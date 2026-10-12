@@ -328,6 +328,10 @@ pub struct ClientProviderSummary {
     pub endpoint: String,
     /// Alias key → concrete model id.
     pub model_aliases: BTreeMap<String, String>,
+    /// Models this provider can call right now (probe / sign-in / configured local id).
+    /// Separate from `model_aliases` (operator alias table). Empty when unknown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_models: Vec<ClientProviderSignInModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
     /// `bearer | x-api-key | api-key`; absent = the backend's default.

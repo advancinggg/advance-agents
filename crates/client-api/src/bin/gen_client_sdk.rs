@@ -147,6 +147,15 @@ fn main() -> ExitCode {
             "wrote per-target surfaces under {}/fixtures/",
             conf_dir.display()
         );
+        let baseline = advance_client_api::compat::live_baseline_json().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("compat-baseline snapshot: {e}"),
+            )
+        })?;
+        let baseline_path = advance_client_api::schema::schema_dir().join("compat-baseline.json");
+        advance_client_api::schema::safe_write(&baseline_path, &baseline)?;
+        println!("wrote {}", baseline_path.display());
         Ok(())
     };
     if let Err(e) = write_all() {

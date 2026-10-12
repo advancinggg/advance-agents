@@ -135,6 +135,7 @@ fn summary(id: &str, selected: bool) -> ClientProviderSummary {
         last_preflight: None,
         last_usage: None,
         sign_in: None,
+        available_models: Vec::new(),
     }
 }
 
@@ -2033,4 +2034,22 @@ fn pa18_sign_in_envelopes_carry_no_token() {
         assert!(!audit.contains(secret), "audit carries {secret}");
     }
     assert!(!audit.contains(SECRET_KEY));
+}
+
+#[test]
+fn am_t01_available_models_omitted_when_empty() {
+    let empty = summary("openai", true);
+    let v = serde_json::to_value(&empty).unwrap();
+    assert!(v.get("available_models").is_none(), "{v}");
+    assert_eq!(v["model_aliases"]["fast"], "openai-fast");
+
+    let mut filled = empty;
+    filled.available_models = vec![ClientProviderSignInModel {
+        id: "gpt-4o".into(),
+        display_name: Some("GPT-4o".into()),
+    }];
+    let v = serde_json::to_value(&filled).unwrap();
+    assert_eq!(v["available_models"][0]["id"], "gpt-4o");
+    assert_eq!(v["available_models"][0]["display_name"], "GPT-4o");
+    assert_eq!(v["model_aliases"]["fast"], "openai-fast");
 }
