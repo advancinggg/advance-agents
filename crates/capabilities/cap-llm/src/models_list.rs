@@ -134,7 +134,7 @@ fn key_needles(key: &str) -> Vec<String> {
 }
 
 fn hay_echoes_needle(hay: &str, needle: &str) -> bool {
-    hay.contains(needle) || (hay.len() >= KEY_DROP_MIN && needle.starts_with(hay))
+    hay.contains(needle) || (hay.len() >= KEY_DROP_MIN && needle.contains(hay))
 }
 
 fn text_contains_key(hay: &str, key: &str) -> bool {
@@ -562,6 +562,25 @@ mod tests {
         assert!(truncated.is_empty(), "{truncated:?}");
         assert!(catalog_page_cursor(Some(&prefix), &long).is_none());
         assert!(catalog_page_cursor(Some("SK-ABCDEFGH"), "sk-abcdefgh").is_none());
+        let suffix = long[long.len() - 128..].to_string();
+        let truncated_suffix = drop_key_rows(
+            vec![ListedModel {
+                id: suffix.clone(),
+                display_name: None,
+            }],
+            &long,
+        );
+        assert!(truncated_suffix.is_empty(), "{truncated_suffix:?}");
+        assert!(catalog_page_cursor(Some(&suffix), &long).is_none());
+        let interior = drop_key_rows(
+            vec![ListedModel {
+                id: "SECRETOK".into(),
+                display_name: None,
+            }],
+            "aaSECRETOKzz",
+        );
+        assert!(interior.is_empty(), "{interior:?}");
+        assert!(catalog_page_cursor(Some("SECRETOK"), "aaSECRETOKzz").is_none());
     }
 
     #[test]
