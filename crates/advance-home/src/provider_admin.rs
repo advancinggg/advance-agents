@@ -54,6 +54,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -430,8 +431,25 @@ enum WaiterState {
 
 struct Waiter {
     fingerprint: u64,
+    pending: AtomicBool,
     state: Mutex<WaiterState>,
     cv: Condvar,
+}
+
+fn new_models_waiter(fp: u64) -> Arc<Waiter> {
+    Arc::new(Waiter {
+        fingerprint: fp,
+        pending: AtomicBool::new(true),
+        state: Mutex::new(WaiterState::Pending),
+        cv: Condvar::new(),
+    })
+}
+
+fn publish_models_waiter(waiter: &Waiter, fill: CatalogFill) {
+    waiter.pending.store(false, Ordering::Release);
+    let mut state = waiter.state.lock().unwrap_or_else(|e| e.into_inner());
+    *state = WaiterState::Ready(fill);
+    waiter.cv.notify_all();
 }
 
 /// The production `ProviderAdminProvider`.
@@ -877,9 +895,7 @@ impl WiredProviderAdmin {
             .get(provider_id)
             .cloned();
         if let Some(waiter) = waiter {
-            let mut state = waiter.state.lock().unwrap_or_else(|e| e.into_inner());
-            *state = WaiterState::Ready(CatalogFill::empty_complete());
-            waiter.cv.notify_all();
+            publish_models_waiter(&waiter, CatalogFill::empty_complete());
         }
     }
 
@@ -926,16 +942,15 @@ impl WiredProviderAdmin {
         }
     }
 
-    fn install_models_waiter(&self, provider_id: &str, fp: u64) -> (bool, Arc<Waiter>) {
-        let waiter = Arc::new(Waiter {
-            fingerprint: fp,
-            state: Mutex::new(WaiterState::Pending),
-            cv: Condvar::new(),
-        });
-        self.inflight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(provider_id.to_string(), Arc::clone(&waiter));
+    fn claim_models_waiter(&self, provider_id: &str, fp: u64) -> (bool, Arc<Waiter>) {
+        let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = inflight.get(provider_id).cloned() {
+            if existing.fingerprint == fp && existing.pending.load(Ordering::Acquire) {
+                return (false, existing);
+            }
+        }
+        let waiter = new_models_waiter(fp);
+        inflight.insert(provider_id.to_string(), Arc::clone(&waiter));
         (true, waiter)
     }
 
@@ -952,24 +967,7 @@ impl WiredProviderAdmin {
                 }
             }
         }
-        let existing = {
-            let inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-            inflight.get(&entry.id).cloned()
-        };
-        let (leader, waiter) = match existing {
-            Some(existing) if existing.fingerprint == fp => {
-                let pending = matches!(
-                    *existing.state.lock().unwrap_or_else(|e| e.into_inner()),
-                    WaiterState::Pending
-                );
-                if pending {
-                    (false, existing)
-                } else {
-                    self.install_models_waiter(&entry.id, fp)
-                }
-            }
-            _ => self.install_models_waiter(&entry.id, fp),
-        };
+        let (leader, waiter) = self.claim_models_waiter(&entry.id, fp);
         if !leader {
             let ready = {
                 let mut state = waiter.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -988,18 +986,18 @@ impl WiredProviderAdmin {
             };
         }
         let fill = self.probe_models_entry(entry);
-        let still = self.fingerprint(entry) == fp;
-        let published = if still {
+        let published = if self.fingerprint(entry) == fp {
             fill.clone()
         } else {
             CatalogFill::empty_complete()
         };
-        {
-            let mut state = waiter.state.lock().unwrap_or_else(|e| e.into_inner());
-            *state = WaiterState::Ready(published.clone());
-            waiter.cv.notify_all();
+        publish_models_waiter(&waiter, published);
+        if self.fingerprint(entry) != fp {
+            publish_models_waiter(&waiter, CatalogFill::empty_complete());
+            self.drop_inflight_if(&entry.id, fp);
+            return CatalogFill::empty_complete();
         }
-        if still && fill.complete && self.fingerprint(entry) == fp {
+        if fill.complete {
             let mut cache = self
                 .available_models_cache
                 .lock()
@@ -1013,19 +1011,18 @@ impl WiredProviderAdmin {
                 },
             );
         }
-        {
-            let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-            if inflight
-                .get(&entry.id)
-                .is_some_and(|w| w.fingerprint == fp)
-            {
-                inflight.remove(&entry.id);
-            }
-        }
-        if still {
-            fill
-        } else {
+        self.drop_inflight_if(&entry.id, fp);
+        if self.fingerprint(entry) != fp {
             CatalogFill::empty_complete()
+        } else {
+            fill
+        }
+    }
+
+    fn drop_inflight_if(&self, provider_id: &str, fp: u64) {
+        let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if inflight.get(provider_id).is_some_and(|w| w.fingerprint == fp) {
+            inflight.remove(provider_id);
         }
     }
 
@@ -3924,8 +3921,19 @@ post-processor:
         let gen_after_create = admin.models_generation_of("grok-a");
         assert!(gen_after_create >= 1);
 
-        let first = admin.get_provider("grok-a").unwrap();
+        let (tx_cold, rx_cold) = std::sync::mpsc::channel();
+        *probe.hold.lock().unwrap() = Some(rx_cold);
+        let admin = Arc::new(admin);
+        let cold_a = Arc::clone(&admin);
+        let cold_b = Arc::clone(&admin);
+        let cold_one = thread::spawn(move || cold_a.get_provider("grok-a"));
+        let cold_two = thread::spawn(move || cold_b.get_provider("grok-a"));
+        thread::sleep(Duration::from_millis(30));
+        drop(tx_cold);
+        let first = cold_one.join().expect("thread").unwrap();
+        let second = cold_two.join().expect("thread").unwrap();
         assert_eq!(first.available_models[0].id, "grok-4.6");
+        assert_eq!(second.available_models[0].id, "grok-4.6");
         assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
         let _ = admin.get_provider("grok-a").unwrap();
         assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
@@ -3935,7 +3943,6 @@ post-processor:
 
         let (tx, rx) = std::sync::mpsc::channel();
         *probe.hold.lock().unwrap() = Some(rx);
-        let admin = Arc::new(admin);
         let waiter_admin = Arc::clone(&admin);
         let join = thread::spawn(move || waiter_admin.get_provider("grok-a"));
         thread::sleep(Duration::from_millis(30));
