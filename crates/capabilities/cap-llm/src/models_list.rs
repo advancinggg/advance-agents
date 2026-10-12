@@ -9,6 +9,8 @@ use advance_shared_types::security_validator::{
 };
 use serde_json::Value;
 
+use cap_http::canonical_facade::canonical_scan_text;
+
 use crate::error::LlmError;
 use crate::gateway::build_http_cap;
 use crate::provider::{backend_of, make_resolved};
@@ -92,15 +94,42 @@ pub fn is_display_text(s: &str) -> bool {
 }
 
 pub fn drop_key_rows(models: Vec<ListedModel>, key: &str) -> Vec<ListedModel> {
-    if key.len() < KEY_DROP_MIN {
-        return models;
-    }
     models
         .into_iter()
         .filter(|m| {
-            !m.id.contains(key) && m.display_name.as_deref().map_or(true, |n| !n.contains(key))
+            !text_contains_key(&m.id, key)
+                && m.display_name
+                    .as_deref()
+                    .map_or(true, |n| !text_contains_key(n, key))
         })
         .collect()
+}
+
+fn text_contains_key(hay: &str, key: &str) -> bool {
+    if key.len() < KEY_DROP_MIN {
+        return false;
+    }
+    if hay.contains(key) {
+        return true;
+    }
+    let hay_canon = canonical_scan_text(hay);
+    let key_canon = canonical_scan_text(key);
+    hay_canon.contains(key) || (!key_canon.is_empty() && hay_canon.contains(&key_canon))
+}
+
+/// Anthropic `GET /v1/models` is the only dialect that paginates with `after_id`.
+pub fn follows_catalog_pages(entry: &LlmProviderConfig) -> bool {
+    backend_of(entry) == ProviderBackend::AnthropicMessages
+}
+
+/// Cursor for the next Anthropic page. Rejects non-vendor ids and key echoes.
+pub fn catalog_page_cursor(last_id: Option<&str>, key: &str) -> Option<String> {
+    let id = last_id.filter(|s| is_vendor_model_id(s))?;
+    if text_contains_key(id, key) {
+        None
+    } else {
+        Some(id.to_string())
+    }
 }
 
 fn dedup_preserve(models: Vec<ListedModel>) -> Vec<ListedModel> {
@@ -197,8 +226,8 @@ pub fn parse_models_catalog_page(body: &[u8]) -> CatalogPage {
             .get("display_name")
             .or_else(|| entry.get("name"))
             .and_then(Value::as_str)
-            .filter(|s| is_display_text(s))
-            .map(String::from);
+            .map(canonical_scan_text)
+            .filter(|s| is_display_text(s));
         models.push(ListedModel {
             id: id.to_string(),
             display_name,
@@ -208,11 +237,11 @@ pub fn parse_models_catalog_page(body: &[u8]) -> CatalogPage {
         .get("has_more")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let last_id = document
-        .get("last_id")
-        .and_then(Value::as_str)
-        .map(String::from)
-        .or_else(|| models.last().map(|m| m.id.clone()));
+    let last_id = match document.get("last_id").and_then(Value::as_str) {
+        Some(s) if is_vendor_model_id(s) => Some(s.to_string()),
+        Some(_) => None,
+        None => models.last().map(|m| m.id.clone()),
+    };
     CatalogPage::Parsed {
         models: dedup_preserve(models),
         has_more,
@@ -406,6 +435,16 @@ mod tests {
             .headers
             .iter()
             .any(|(k, v)| k == "Authorization" && v == "Bearer {prov-key}"));
+        assert!(!follows_catalog_pages(&entry(
+            "openai",
+            "https://api.openai.com",
+            None
+        )));
+        assert!(follows_catalog_pages(&entry(
+            "anthropic",
+            "https://api.anthropic.com",
+            None
+        )));
     }
 
     #[test]
@@ -432,6 +471,37 @@ mod tests {
             "4",
         );
         assert_eq!(short[0].id, "gpt-4o");
+        let spliced = parse_models_catalog_page(
+            br#"{"data":[{"id":"gpt-4o","display_name":"sk-\u200Babcdefgh"}]}"#,
+        );
+        let CatalogPage::Parsed {
+            models: spliced_models,
+            last_id: _,
+            ..
+        } = spliced
+        else {
+            panic!("{spliced:?}");
+        };
+        let dropped_spliced = drop_key_rows(spliced_models, "sk-abcdefgh");
+        assert!(dropped_spliced.is_empty(), "{dropped_spliced:?}");
+        let bad_cursor = parse_models_catalog_page(
+            br#"{"data":[{"id":"claude-3"}],"has_more":true,"last_id":"not a cursor"}"#,
+        );
+        let CatalogPage::Parsed {
+            last_id: rejected,
+            has_more,
+            ..
+        } = bad_cursor
+        else {
+            panic!("{bad_cursor:?}");
+        };
+        assert!(has_more);
+        assert!(rejected.is_none());
+        assert!(catalog_page_cursor(Some("sk-abcdefgh"), "sk-abcdefgh").is_none());
+        assert_eq!(
+            catalog_page_cursor(Some("claude-3-5"), "sk-abcdefgh").as_deref(),
+            Some("claude-3-5")
+        );
     }
 
     #[test]

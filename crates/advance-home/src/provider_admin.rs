@@ -87,8 +87,8 @@ use cap_llm::backend_cli::{
     ProcessUsageProbe,
 };
 use cap_llm::models_list::{
-    build_models_list_capability, build_models_list_request, drop_key_rows, parse_models_catalog_page,
-    CatalogPage, ListedModel,
+    build_models_list_capability, build_models_list_request, catalog_page_cursor, drop_key_rows,
+    follows_catalog_pages, parse_models_catalog_page, CatalogPage, ListedModel,
 };
 use cap_llm::LocalSidecarBinder;
 use cap_secrets::{SecretError, SecretStore};
@@ -295,6 +295,7 @@ async fn list_cloud_http_models(
 ) -> CatalogFill {
     let mut collected: Vec<ListedModel> = Vec::new();
     let mut after_id: Option<String> = None;
+    let follows_pages = follows_catalog_pages(entry);
     for page in 0..MAX_MODEL_PAGES {
         if Instant::now() >= deadline || collected.len() >= MAX_CATALOG_MODELS {
             return CatalogFill::incomplete(listed_to_client(collected));
@@ -309,7 +310,14 @@ async fn list_cloud_http_models(
                 };
                 match execute_models_page(chain, cap, req, deadline).await {
                     PageOutcome::Ok(resp) => {
-                        match apply_models_page(resp, page, &mut collected, &mut after_id, key) {
+                        match apply_models_page(
+                            resp,
+                            page,
+                            &mut collected,
+                            &mut after_id,
+                            follows_pages,
+                            key,
+                        ) {
                             PageApply::Continue => {}
                             PageApply::Done(fill) => return fill,
                         }
@@ -321,7 +329,14 @@ async fn list_cloud_http_models(
                 }
             }
             PageOutcome::Ok(resp) => {
-                match apply_models_page(resp, page, &mut collected, &mut after_id, key) {
+                match apply_models_page(
+                    resp,
+                    page,
+                    &mut collected,
+                    &mut after_id,
+                    follows_pages,
+                    key,
+                ) {
                     PageApply::Continue => {}
                     PageApply::Done(fill) => return fill,
                 }
@@ -385,6 +400,7 @@ fn apply_models_page(
     page: usize,
     collected: &mut Vec<ListedModel>,
     after_id: &mut Option<String>,
+    follows_pages: bool,
     key: &str,
 ) -> PageApply {
     match parse_models_catalog_page(&resp.body) {
@@ -407,12 +423,15 @@ fn apply_models_page(
         } => {
             collected.extend(drop_key_rows(models, key));
             collected.truncate(MAX_CATALOG_MODELS);
-            if !has_more || collected.len() >= MAX_CATALOG_MODELS {
+            let next = follows_pages
+                .then(|| catalog_page_cursor(last_id.as_deref(), key))
+                .flatten();
+            if !has_more || collected.len() >= MAX_CATALOG_MODELS || next.is_none() {
                 PageApply::Done(CatalogFill::complete(listed_to_client(std::mem::take(
                     collected,
                 ))))
             } else {
-                *after_id = last_id;
+                *after_id = next;
                 PageApply::Continue
             }
         }
@@ -3691,6 +3710,16 @@ llm-providers:
     rate-limit:
       requests-per-minute: 1000
       tokens-per-minute: 400000
+  - id: anthropic
+    endpoint: https://api.anthropic.com
+    api-key-secret: anthropic-api-key
+    model-aliases:
+      sonnet: claude-sonnet
+    cost-per-mtoken-in: 3.00
+    cost-per-mtoken-out: 15.00
+    rate-limit:
+      requests-per-minute: 100
+      tokens-per-minute: 1000
   - id: mesh-a
     endpoint: ''
     api-key-secret: mesh-a-api-key
@@ -4099,12 +4128,20 @@ post-processor:
     }
 
     fn openai_entry(home: &Path) -> LlmProviderConfig {
+        fixture_entry(home, "openai")
+    }
+
+    fn anthropic_entry(home: &Path) -> LlmProviderConfig {
+        fixture_entry(home, "anthropic")
+    }
+
+    fn fixture_entry(home: &Path, id: &str) -> LlmProviderConfig {
         let cfg = advance_runtime::config::load_config(&home.join(".advance/runtime-config.yaml"))
             .unwrap();
         cfg.llm_providers
             .into_iter()
-            .find(|p| p.id == "openai")
-            .expect("openai fixture")
+            .find(|p| p.id == id)
+            .unwrap_or_else(|| panic!("{id} fixture"))
     }
 
     #[test]
@@ -4121,8 +4158,8 @@ post-processor:
             Arc::clone(&f.store),
             Duration::from_millis(200),
         );
-        f.store.store("openai-api-key", "sk-abcdefgh").unwrap();
-        let entry = openai_entry(&f.home);
+        f.store.store("anthropic-api-key", "sk-abcdefgh").unwrap();
+        let entry = anthropic_entry(&f.home);
         let sample = models_json(&first, true);
         match parse_models_catalog_page(&sample) {
             CatalogPage::Parsed { models, has_more, .. } => {
@@ -4157,9 +4194,9 @@ post-processor:
         let admin = f
             .admin()
             .with_cloud_http_models_probe(Arc::new(probe) as Arc<dyn CloudHttpModelsProbe>);
-        let got = admin.get_provider("openai").unwrap();
+        let got = admin.get_provider("anthropic").unwrap();
         assert_eq!(got.available_models.len(), 40);
-        let again = admin.get_provider("openai").unwrap();
+        let again = admin.get_provider("anthropic").unwrap();
         assert_eq!(again.available_models.len(), 40);
         assert_eq!(chain.calls.load(Ordering::SeqCst), 6);
     }
@@ -4233,7 +4270,7 @@ post-processor:
             calls: AtomicUsize::new(0),
         });
         let f = Fixture::new();
-        f.store.store("openai-api-key", "sk-abcdefgh").unwrap();
+        f.store.store("anthropic-api-key", "sk-abcdefgh").unwrap();
         let probe = ProcessCloudHttpModelsProbe::new(
             chain.clone(),
             Arc::clone(&f.store),
@@ -4242,12 +4279,50 @@ post-processor:
         let admin = f
             .admin()
             .with_cloud_http_models_probe(Arc::new(probe) as Arc<dyn CloudHttpModelsProbe>);
-        let got = admin.get_provider("openai").unwrap();
+        let got = admin.get_provider("anthropic").unwrap();
         assert_eq!(got.available_models.len(), 40);
         assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
-        let again = admin.get_provider("openai").unwrap();
+        let again = admin.get_provider("anthropic").unwrap();
         assert_eq!(again.available_models.len(), 40);
         assert_eq!(chain.calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn am_t22_openai_has_more_stops_after_first_page() {
+        let ids: Vec<String> = (0..40).map(|i| format!("m{i}")).collect();
+        let first: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let chain = Arc::new(ScriptedChain {
+            pages: Mutex::new(vec![
+                page_ok(&first, true),
+                page_ok(&["should-not-run"], false),
+            ]),
+            calls: AtomicUsize::new(0),
+        });
+        let f = Fixture::new();
+        f.store.store("openai-api-key", "sk-abcdefgh").unwrap();
+        let probe = ProcessCloudHttpModelsProbe::new(
+            chain.clone(),
+            Arc::clone(&f.store),
+            Duration::from_millis(200),
+        );
+        let fill = probe.list_models(&openai_entry(&f.home));
+        assert!(fill.complete, "{fill:?}");
+        assert_eq!(fill.models.len(), 40);
+        assert_eq!(chain.calls.load(Ordering::SeqCst), 1);
+
+        {
+            let mut pages = chain.pages.lock().unwrap();
+            *pages = vec![page_ok(&first, true), page_ok(&["should-not-run"], false)];
+        }
+
+        let admin = f
+            .admin()
+            .with_cloud_http_models_probe(Arc::new(probe) as Arc<dyn CloudHttpModelsProbe>);
+        let got = admin.get_provider("openai").unwrap();
+        assert_eq!(got.available_models.len(), 40);
+        let again = admin.get_provider("openai").unwrap();
+        assert_eq!(again.available_models.len(), 40);
+        assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
