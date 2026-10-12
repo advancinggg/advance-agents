@@ -261,9 +261,12 @@ impl ContextAssembler for ContextAssemblerImpl {
         let mut tier1b = Vec::new();
         if let Some(roster) = format_available_children_section_with_aliases(
             self.agent_tree.as_ref(),
+            self.agent_identity.as_ref(),
             &ctx.agent_id,
             &self.agent_id_aliases,
-        ) {
+        )
+        .await
+        {
             tier1b.push(LlmMessage {
                 role: "system".into(),
                 content: roster,

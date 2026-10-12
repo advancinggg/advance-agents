@@ -23,7 +23,8 @@
 //! - [`tier1`] — Tier 1a sanitized AGENTS.md identity slot + Tier 1b
 //!   knowledge-map slot.
 //! - [`tier1_children`] — Tier 1b ⑥ `# Available Children` (direct
-//!   `AgentKind::Child` only; grandchildren omitted).
+//!   `AgentKind::Child` only; grandchildren omitted; status / workspace /
+//!   template / AGENTS.md).
 //! - [`tier2_delegates`] — AC-19 Tier 2 ⑬ "Available Delegates"
 //!   (`AgentKind::Sub` only).
 //! - [`ports`] — the 6 crate-local async dependency-inversion ports + data

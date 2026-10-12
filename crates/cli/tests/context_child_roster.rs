@@ -1,8 +1,9 @@
-//! Child roster satellite — production assembler tree port folds direct
-//! Child basic info into Tier 1b `# Available Children`.
+//! Child roster satellite — production assembler tree + identity ports fold
+//! direct Child info into Tier 1b `# Available Children`.
 //!
-//! CR-1 — a populated tree lists only this agent's direct Child (id + caps).
-//!         Grandchildren and Subs are excluded. Empty tree omits the section.
+//! CR-1 — a populated tree lists this agent's direct Child (status,
+//!         workspace, template, capabilities, AGENTS.md). Grandchildren
+//!         and Subs are excluded. Terminated / Failed stay visible.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,15 +36,23 @@ fn cap(id: &str) -> Capability {
     }
 }
 
-fn node(id: &str, kind: AgentKind, parent: &str, caps: Vec<Capability>) -> AgentNode {
+fn node(
+    id: &str,
+    kind: AgentKind,
+    parent: &str,
+    caps: Vec<Capability>,
+    status: AgentStatus,
+    workspace_path: PathBuf,
+    template_ref: Option<String>,
+) -> AgentNode {
     AgentNode {
         id: AgentId(id.into()),
         kind,
         parent: Some(AgentId(parent.into())),
-        workspace_path: PathBuf::from("/ws"),
+        workspace_path,
         capabilities: caps,
-        template_ref: None,
-        status: AgentStatus::Active,
+        template_ref,
+        status,
     }
 }
 
@@ -131,16 +140,70 @@ fn stub_ctx() -> AssemblyContext {
 
 #[tokio::test]
 async fn cr1_direct_children_reach_assembled_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = std::fs::canonicalize(tmp.path()).unwrap();
+    let parent_root = workspace.join(".agent");
+    std::fs::create_dir_all(&parent_root).unwrap();
+
+    let researcher_ws = workspace.join("children").join("researcher");
+    let researcher_agent = researcher_ws.join(".agent");
+    std::fs::create_dir_all(&researcher_agent).unwrap();
+    std::fs::write(
+        researcher_agent.join("AGENTS.md"),
+        "# Researcher\n\nCite sources.\n\n## Later\n\nKeep this.\n",
+    )
+    .unwrap();
+
+    let grand_ws = workspace.join("children").join("grand");
+    let grand_agent = grand_ws.join(".agent");
+    std::fs::create_dir_all(&grand_agent).unwrap();
+    std::fs::write(
+        grand_agent.join("AGENTS.md"),
+        "# Grandchild must not appear\n",
+    )
+    .unwrap();
+
+    let failed_ws = workspace.join("children").join("broken");
+    std::fs::create_dir_all(failed_ws.join(".agent")).unwrap();
+
     let tree: Arc<dyn AgentTreeSnapshot> = Arc::new(RosterTree {
         nodes: vec![
-            node("researcher", AgentKind::Child, "a", vec![cap("fs.read")]),
+            node(
+                "researcher",
+                AgentKind::Child,
+                "a",
+                vec![cap("fs.read")],
+                AgentStatus::Active,
+                researcher_ws.clone(),
+                Some("pack/research".into()),
+            ),
             node(
                 "grand",
                 AgentKind::Child,
                 "researcher",
                 vec![cap("llm.generate")],
+                AgentStatus::Active,
+                grand_ws,
+                Some("pack/grand".into()),
             ),
-            node("temp", AgentKind::Sub, "a", vec![cap("web.search")]),
+            node(
+                "broken",
+                AgentKind::Child,
+                "a",
+                vec![cap("http.fetch")],
+                AgentStatus::Failed,
+                failed_ws,
+                None,
+            ),
+            node(
+                "temp",
+                AgentKind::Sub,
+                "a",
+                vec![cap("web.search")],
+                AgentStatus::Active,
+                workspace.join(".sub").join("temp"),
+                None,
+            ),
         ],
     });
     let aliases = vec!["a".to_string(), "agent:a".to_string()];
@@ -156,26 +219,53 @@ async fn cr1_direct_children_reach_assembled_prompt() {
         None,
         Arc::new(EmptyDecomposition),
         None,
-        None,
+        Some(&parent_root),
     );
     let res = asm.assemble(stub_ctx()).await.unwrap();
     let roster = res
         .messages
         .iter()
         .find(|m| m.content.starts_with("# Available Children"))
-        .expect("direct Child basic info reaches the prompt");
+        .expect("direct Child info reaches the prompt");
     assert!(
-        roster.content.contains("- researcher — fs.read"),
+        roster.content.contains("## researcher"),
         "roster lists the direct Child: {}",
         roster.content
     );
     assert!(
-        !roster.content.contains("grand"),
+        roster.content.contains("- status: active"),
+        "active status is visible: {}",
+        roster.content
+    );
+    assert!(
+        roster.content.contains("- template: pack/research"),
+        "template_ref is loaded: {}",
+        roster.content
+    );
+    assert!(
+        roster
+            .content
+            .contains(&format!("- workspace: {}", researcher_ws.display())),
+        "workspace is loaded: {}",
+        roster.content
+    );
+    assert!(
+        roster.content.contains("Cite sources.") && roster.content.contains("Keep this."),
+        "child AGENTS.md is loaded: {}",
+        roster.content
+    );
+    assert!(
+        roster.content.contains("## broken") && roster.content.contains("- status: failed"),
+        "failed Child stays visible so the parent can see it hung: {}",
+        roster.content
+    );
+    assert!(
+        !roster.content.contains("grand") && !roster.content.contains("Grandchild must not appear"),
         "grandchild must stay out: {}",
         roster.content
     );
     assert!(
-        !roster.content.contains("temp"),
+        !roster.content.contains("## temp"),
         "Sub must stay out of the Child roster: {}",
         roster.content
     );
