@@ -105,16 +105,35 @@ pub fn drop_key_rows(models: Vec<ListedModel>, key: &str) -> Vec<ListedModel> {
         .collect()
 }
 
+fn compact_ascii(s: &str) -> String {
+    s.chars().filter(|c| !c.is_ascii_whitespace()).collect()
+}
+
+fn key_needles(key: &str) -> Vec<String> {
+    let compact = compact_ascii(key);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for candidate in [key, key.trim(), compact.as_str()] {
+        if candidate.len() < KEY_DROP_MIN {
+            continue;
+        }
+        if seen.insert(candidate.to_string()) {
+            out.push(candidate.to_string());
+        }
+        let canon = canonical_scan_text(candidate);
+        if canon.len() >= KEY_DROP_MIN && seen.insert(canon.clone()) {
+            out.push(canon);
+        }
+    }
+    out
+}
+
 fn text_contains_key(hay: &str, key: &str) -> bool {
-    if key.len() < KEY_DROP_MIN {
-        return false;
-    }
-    if hay.contains(key) {
-        return true;
-    }
     let hay_canon = canonical_scan_text(hay);
-    let key_canon = canonical_scan_text(key);
-    hay_canon.contains(key) || (!key_canon.is_empty() && hay_canon.contains(&key_canon))
+    let hay_compact = compact_ascii(hay);
+    key_needles(key).iter().any(|needle| {
+        hay.contains(needle) || hay_canon.contains(needle) || hay_compact.contains(needle)
+    })
 }
 
 /// Anthropic `GET /v1/models` is the only dialect that paginates with `after_id`.
@@ -502,6 +521,14 @@ mod tests {
             catalog_page_cursor(Some("claude-3-5"), "sk-abcdefgh").as_deref(),
             Some("claude-3-5")
         );
+        let padded = drop_key_rows(
+            vec![ListedModel {
+                id: "sk-abcdefgh".into(),
+                display_name: None,
+            }],
+            "  sk-abcdefgh  ",
+        );
+        assert!(padded.is_empty(), "{padded:?}");
     }
 
     #[test]

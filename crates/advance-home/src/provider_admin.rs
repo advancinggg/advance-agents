@@ -100,6 +100,8 @@ pub const RELOAD_WAIT: Duration = Duration::from_secs(2);
 /// Bound on one preflight, the check of a sign-in entry included (the cancel token fires at the
 /// deadline; reason `timeout`).
 pub const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on one catalog probe and on a whole `list_providers` walk.
+pub const MODELS_LIST_TIMEOUT: Duration = Duration::from_secs(8);
 
 const REASON_TIMEOUT: &str = "timeout";
 const REASON_CANCELLED: &str = "cancelled";
@@ -855,13 +857,23 @@ impl WiredProviderAdmin {
             .unwrap_or_default()
     }
 
-    fn summary_for_get(&self, entry: &LlmProviderConfig, selected: bool) -> ClientProviderSummary {
+    fn summary_for_get(
+        &self,
+        entry: &LlmProviderConfig,
+        selected: bool,
+        list_budget: Option<Instant>,
+    ) -> ClientProviderSummary {
         let mut s = self.summary(entry, selected);
         if entry.backend_class == InferenceBackendClass::AgentCli
             || (entry.backend_class == InferenceBackendClass::CloudHttp
                 && !entry.uses_chatgpt_sign_in())
         {
-            s.available_models = self.ensure_models_cached(entry).models;
+            s.available_models = if list_budget.is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                self.cheap_available_models(entry)
+            } else {
+                self.ensure_models_cached(entry).models
+            };
         }
         s
     }
@@ -1452,17 +1464,18 @@ impl WiredProviderAdmin {
 
 impl ProviderAdminProvider for WiredProviderAdmin {
     fn list_providers(&self) -> Result<Vec<ClientProviderSummary>, ProviderError> {
+        let budget = Instant::now() + MODELS_LIST_TIMEOUT;
         Ok(self
             .entries()?
             .iter()
             .enumerate()
-            .map(|(idx, entry)| self.summary_for_get(entry, idx == 0))
+            .map(|(idx, entry)| self.summary_for_get(entry, idx == 0, Some(budget)))
             .collect())
     }
 
     fn get_provider(&self, provider_id: &str) -> Result<ClientProviderSummary, ProviderError> {
         let (idx, entry) = self.find(provider_id)?;
-        Ok(self.summary_for_get(&entry, idx == 0))
+        Ok(self.summary_for_get(&entry, idx == 0, None))
     }
 
     fn create_provider(

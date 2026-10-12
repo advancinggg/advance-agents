@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use advance_home::provider_admin::{
-    ProcessCloudHttpModelsProbe, ProviderReferenceCheck, WiredProviderAdmin, PREFLIGHT_TIMEOUT,
+    ProcessCloudHttpModelsProbe, ProviderReferenceCheck, WiredProviderAdmin, MODELS_LIST_TIMEOUT,
 };
 use advance_home::{ChatGptSignInPort, PreflightPort};
 use advance_runtime::config::RuntimeConfigProvider;
@@ -53,7 +53,7 @@ pub(crate) fn attach_live_model_probes(
             admin.with_process_cloud_http_models_probe(Arc::new(ProcessCloudHttpModelsProbe::new(
                 Arc::new(chain),
                 store,
-                PREFLIGHT_TIMEOUT,
+                MODELS_LIST_TIMEOUT,
             )))
         }
         Err(_) => admin,
