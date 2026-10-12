@@ -719,6 +719,17 @@ impl WiredProviderAdmin {
             .unwrap_or_else(|e| e.into_inner())
             .get(&entry.id)
             .cloned();
+        let sign_in = match (entry.uses_chatgpt_sign_in(), self.chatgpt_sign_in.as_ref()) {
+            (true, Some(port)) => Some(project_sign_in(
+                port.status(&entry.api_key_secret),
+                now_ms(),
+            )),
+            _ => None,
+        };
+        let available_models = match sign_in.as_ref() {
+            Some(projected) => projected.models.clone(),
+            None => self.cheap_available_models(entry),
+        };
         ClientProviderSummary {
             provider_id: entry.id.clone(),
             backend_class: backend_class_str(entry.backend_class).to_string(),
@@ -764,24 +775,14 @@ impl WiredProviderAdmin {
             selected,
             last_preflight,
             last_usage,
-            // Read without touching the network; absent when no sign-in is served here.
-            sign_in: match (entry.uses_chatgpt_sign_in(), self.chatgpt_sign_in.as_ref()) {
-                (true, Some(port)) => Some(project_sign_in(
-                    port.status(&entry.api_key_secret),
-                    now_ms(),
-                )),
-                _ => None,
-            },
-            available_models: self.cheap_available_models(entry),
+            sign_in,
+            available_models,
         }
     }
 
     fn cheap_available_models(&self, entry: &LlmProviderConfig) -> Vec<ClientProviderSignInModel> {
         if entry.uses_chatgpt_sign_in() {
-            return match self.chatgpt_sign_in.as_ref() {
-                Some(port) => project_sign_in(port.status(&entry.api_key_secret), now_ms()).models,
-                None => Vec::new(),
-            };
+            return Vec::new();
         }
         match entry.backend_class {
             InferenceBackendClass::Local => unique_local_models(&entry.model_aliases),
@@ -869,13 +870,13 @@ impl WiredProviderAdmin {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(provider_id);
-        if let Some(waiter) = self
+        let waiter = self
             .inflight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(provider_id)
-            .cloned()
-        {
+            .cloned();
+        if let Some(waiter) = waiter {
             let mut state = waiter.state.lock().unwrap_or_else(|e| e.into_inner());
             *state = WaiterState::Ready(CatalogFill::empty_complete());
             waiter.cv.notify_all();
@@ -925,6 +926,19 @@ impl WiredProviderAdmin {
         }
     }
 
+    fn install_models_waiter(&self, provider_id: &str, fp: u64) -> (bool, Arc<Waiter>) {
+        let waiter = Arc::new(Waiter {
+            fingerprint: fp,
+            state: Mutex::new(WaiterState::Pending),
+            cv: Condvar::new(),
+        });
+        self.inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(provider_id.to_string(), Arc::clone(&waiter));
+        (true, waiter)
+    }
+
     fn ensure_models_cached(&self, entry: &LlmProviderConfig) -> CatalogFill {
         let fp = self.fingerprint(entry);
         {
@@ -938,48 +952,39 @@ impl WiredProviderAdmin {
                 }
             }
         }
-        let (leader, waiter) = {
-            let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(existing) = inflight.get(&entry.id).cloned() {
+        let existing = {
+            let inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            inflight.get(&entry.id).cloned()
+        };
+        let (leader, waiter) = match existing {
+            Some(existing) if existing.fingerprint == fp => {
                 let pending = matches!(
                     *existing.state.lock().unwrap_or_else(|e| e.into_inner()),
                     WaiterState::Pending
                 );
-                if existing.fingerprint == fp && pending {
+                if pending {
                     (false, existing)
                 } else {
-                    let waiter = Arc::new(Waiter {
-                        fingerprint: fp,
-                        state: Mutex::new(WaiterState::Pending),
-                        cv: Condvar::new(),
-                    });
-                    inflight.insert(entry.id.clone(), Arc::clone(&waiter));
-                    (true, waiter)
+                    self.install_models_waiter(&entry.id, fp)
                 }
-            } else {
-                let waiter = Arc::new(Waiter {
-                    fingerprint: fp,
-                    state: Mutex::new(WaiterState::Pending),
-                    cv: Condvar::new(),
-                });
-                inflight.insert(entry.id.clone(), Arc::clone(&waiter));
-                (true, waiter)
             }
+            _ => self.install_models_waiter(&entry.id, fp),
         };
         if !leader {
-            let mut state = waiter.state.lock().unwrap_or_else(|e| e.into_inner());
-            while matches!(*state, WaiterState::Pending) {
-                state = waiter.cv.wait(state).unwrap_or_else(|e| e.into_inner());
-            }
-            return match &*state {
-                WaiterState::Ready(fill) => {
-                    if self.fingerprint(entry) != fp {
-                        CatalogFill::empty_complete()
-                    } else {
-                        fill.clone()
-                    }
+            let ready = {
+                let mut state = waiter.state.lock().unwrap_or_else(|e| e.into_inner());
+                while matches!(*state, WaiterState::Pending) {
+                    state = waiter.cv.wait(state).unwrap_or_else(|e| e.into_inner());
                 }
-                WaiterState::Pending => CatalogFill::empty_complete(),
+                match &*state {
+                    WaiterState::Ready(fill) => fill.clone(),
+                    WaiterState::Pending => CatalogFill::empty_complete(),
+                }
+            };
+            return if self.fingerprint(entry) != fp {
+                CatalogFill::empty_complete()
+            } else {
+                ready
             };
         }
         let fill = self.probe_models_entry(entry);
@@ -2634,9 +2639,11 @@ database:
                 },
             ],
         };
+        let status_before = f.port.calls_of("status").len();
         let before = now_ms();
         let summary = admin.get_provider("openai-plan").unwrap();
         let after = now_ms();
+        assert_eq!(f.port.calls_of("status").len(), status_before + 1);
         let sign_in = summary.sign_in.expect("projected");
         assert_eq!(sign_in.state, STATE_SIGNED_IN);
         assert_eq!(sign_in.reason, None);
