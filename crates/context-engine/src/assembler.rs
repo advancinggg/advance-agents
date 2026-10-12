@@ -2,8 +2,8 @@
 //!
 //! Orchestrates the 4-tier assembly per MODULE-010 §1.3.7:
 //! - **Tier 1a (static)**: Slice B fills the AGENTS.md identity slot
-//!   (sanitized; [`crate::tier1::build_tier1a`]). Broader static population
-//!   (architecture/security model) still future.
+//!   (sanitized full document; [`crate::tier1::build_tier1a`]). Broader static
+//!   population (architecture/security model) still future.
 //! - **Tier 1b (dynamic)**: Slice B fills the knowledge-map section (AC-16;
 //!   [`crate::tier1::build_tier1b`]). Capability config / mode state / child
 //!   roster ⑥ still future.

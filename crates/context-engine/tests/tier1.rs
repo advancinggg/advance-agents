@@ -62,3 +62,22 @@ async fn blank_after_sanitize_yields_empty_tier1a() {
         "all-sanitized-away summary → empty Tier 1a"
     );
 }
+
+/// Full AGENTS.md keeps Markdown structure (newlines are not collapsed).
+#[tokio::test]
+async fn t_tier1a_preserves_markdown_newlines() {
+    let body = "# Researcher\n\nYou are a research agent.\n\n## Guidelines\n\nCite sources.";
+    let msgs = build_tier1a(&Identity(Some(body.into())), "agent-1").await;
+    assert_eq!(msgs.len(), 1);
+    let content = &msgs[0].content;
+    assert!(content.contains("# Researcher"));
+    assert!(content.contains("## Guidelines"));
+    assert!(
+        content.contains('\n'),
+        "identity document must keep newlines"
+    );
+    assert!(
+        content.contains("Cite sources."),
+        "later sections must survive: {content}"
+    );
+}

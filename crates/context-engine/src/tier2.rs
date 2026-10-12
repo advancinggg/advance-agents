@@ -271,7 +271,18 @@ pub(crate) fn neutralize_cache_breakpoint_markers(s: &str) -> String {
 }
 
 pub(crate) fn sanitize_description(s: &str) -> String {
-    // Descriptions are body text — preserve most characters but collapse
+    sanitize_untrusted_text(s, true)
+}
+
+/// Same Trojan-Source / cache-sentinel defense as [`sanitize_description`],
+/// but keeps Markdown line structure so a full `AGENTS.md` can be injected
+/// without collapsing into one line.
+pub(crate) fn sanitize_identity_document(s: &str) -> String {
+    sanitize_untrusted_text(s, false)
+}
+
+fn sanitize_untrusted_text(s: &str, collapse_newlines: bool) -> String {
+    // Descriptions are body text — preserve most characters; optionally collapse
     // line breaks to spaces (preserve word boundaries) and normalize Unicode
     // dashes to ASCII `-` so the ` — ` delimiter is unambiguous. Control
     // chars + zero-width + the full BiDi control family + Hangul fillers +
@@ -284,21 +295,33 @@ pub(crate) fn sanitize_description(s: &str) -> String {
     // operator-vs-LLM threat model.
     let char_sanitized: String = s
         .chars()
-        .map(|c| match c {
-            '\n' | '\r' | '\u{2028}' | '\u{2029}' => ' ',
+        .filter_map(|c| match c {
+            '\n' => Some(if collapse_newlines { ' ' } else { '\n' }),
+            '\r' => {
+                if collapse_newlines {
+                    Some(' ')
+                } else {
+                    None
+                }
+            }
+            '\u{2028}' | '\u{2029}' => Some(if collapse_newlines { ' ' } else { '\n' }),
             '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
-            | '\u{2043}' | '\u{2212}' | '\u{FE58}' | '\u{FE63}' | '\u{FF0D}' => '-',
-            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{180E}' => ' ',
+            | '\u{2043}' | '\u{2212}' | '\u{FE58}' | '\u{FE63}' | '\u{FF0D}' => Some('-'),
+            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{180E}' => {
+                Some(' ')
+            }
             // BiDi control marks (Trojan Source defense — full family
             // including LRM/RLM directional marks plus overrides + isolates).
-            '\u{200E}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => ' ',
+            '\u{200E}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => {
+                Some(' ')
+            }
             // Hangul fillers + Braille blank — render zero-width in many
             // fonts; substitute to space.
-            '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{2800}' => ' ',
+            '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{2800}' => Some(' '),
             // Tag block (U+E0000..U+E007F) — ASCII smuggling defense.
-            c if (c as u32) >= 0xE0000 && (c as u32) <= 0xE007F => ' ',
-            c if (c as u32) < 0x20 || (c as u32) == 0x7F => ' ',
-            c => c,
+            c if (c as u32) >= 0xE0000 && (c as u32) <= 0xE007F => Some(' '),
+            c if (c as u32) < 0x20 || (c as u32) == 0x7F => Some(' '),
+            c => Some(c),
         })
         .collect();
     // Final defense: neutralize the M009 gateway cache-breakpoint marker
