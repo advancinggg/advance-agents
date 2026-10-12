@@ -276,6 +276,14 @@ fn is_cacheable_empty_status(status: u16) -> bool {
     matches!(status, 401 | 403 | 404)
 }
 
+fn fill_for_cacheable_empty(page: usize, collected: Vec<ListedModel>) -> CatalogFill {
+    if page == 0 {
+        CatalogFill::empty_complete()
+    } else {
+        CatalogFill::incomplete(listed_to_client(collected))
+    }
+}
+
 async fn list_cloud_http_models(
     chain: &dyn HttpSecurityChain,
     cap: &advance_shared_types::security_validator::HttpCapability,
@@ -304,6 +312,9 @@ async fn list_cloud_http_models(
                             PageApply::Done(fill) => return fill,
                         }
                     }
+                    PageOutcome::CacheableEmpty => {
+                        return fill_for_cacheable_empty(page, collected);
+                    }
                     _ => return CatalogFill::incomplete(listed_to_client(collected)),
                 }
             }
@@ -313,7 +324,9 @@ async fn list_cloud_http_models(
                     PageApply::Done(fill) => return fill,
                 }
             }
-            PageOutcome::CacheableEmpty => return CatalogFill::empty_complete(),
+            PageOutcome::CacheableEmpty => {
+                return fill_for_cacheable_empty(page, collected);
+            }
             PageOutcome::Incomplete => {
                 return CatalogFill::incomplete(listed_to_client(collected));
             }
@@ -981,21 +994,19 @@ impl WiredProviderAdmin {
             *state = WaiterState::Ready(published.clone());
             waiter.cv.notify_all();
         }
-        if still && fill.complete {
+        if still && fill.complete && self.fingerprint(entry) == fp {
             let mut cache = self
                 .available_models_cache
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if self.fingerprint(entry) == fp {
-                cache.insert(
-                    entry.id.clone(),
-                    CachedModels {
-                        fingerprint: fp,
-                        complete: true,
-                        models: fill.models.clone(),
-                    },
-                );
-            }
+            cache.insert(
+                entry.id.clone(),
+                CachedModels {
+                    fingerprint: fp,
+                    complete: true,
+                    models: fill.models.clone(),
+                },
+            );
         }
         {
             let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
@@ -4139,6 +4150,37 @@ post-processor:
         let second = admin.get_provider("openai").unwrap();
         assert!(second.available_models.is_empty());
         assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn am_t22_later_page_401_keeps_partial_uncached() {
+        let ids: Vec<String> = (0..40).map(|i| format!("m{i}")).collect();
+        let first: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let chain = Arc::new(ScriptedChain {
+            pages: Mutex::new(vec![
+                page_ok(&first, true),
+                page_status(401),
+                page_ok(&first, true),
+                page_status(401),
+            ]),
+            calls: AtomicUsize::new(0),
+        });
+        let f = Fixture::new();
+        f.store.store("openai-api-key", "sk-abcdefgh").unwrap();
+        let probe = ProcessCloudHttpModelsProbe::new(
+            chain.clone(),
+            Arc::clone(&f.store),
+            Duration::from_millis(200),
+        );
+        let admin = f
+            .admin()
+            .with_cloud_http_models_probe(Arc::new(probe) as Arc<dyn CloudHttpModelsProbe>);
+        let got = admin.get_provider("openai").unwrap();
+        assert_eq!(got.available_models.len(), 40);
+        assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
+        let again = admin.get_provider("openai").unwrap();
+        assert_eq!(again.available_models.len(), 40);
+        assert_eq!(chain.calls.load(Ordering::SeqCst), 4);
     }
 
     #[test]
