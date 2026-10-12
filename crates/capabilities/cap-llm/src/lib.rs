@@ -33,7 +33,6 @@
 
 pub mod backend_cli;
 pub mod backend_local;
-pub mod models_list;
 pub mod backend_mesh;
 pub mod capability;
 pub mod catalog;
@@ -43,6 +42,7 @@ pub mod error;
 pub mod events;
 pub mod gateway;
 pub mod host_fn;
+pub mod models_list;
 pub mod placement;
 pub mod plan_usage;
 pub mod policy;
@@ -92,10 +92,6 @@ pub use backend_cli::{
     AgentCliEnv, AgentCliModelsProbe, AgentCliUsageProbe, AuthProbe, NoopModelsProbe,
     ProcessAuthProbe, ProcessModelsProbe, ProcessUsageProbe, UsageProbe, UsageWindow,
 };
-pub use models_list::{
-    build_models_list_capability, build_models_list_request, parse_models_catalog_page, CatalogFill,
-    CatalogPage, ListedModel,
-};
 pub use backend_local::{
     FailedSpawnBackend, OwnedHandoffSupervisor, ProcessSupervisor, SidecarClient,
     StaticHandoffSupervisor, SupervisedChild,
@@ -113,6 +109,10 @@ pub use gateway::{
 pub use host_fn::{
     register_agent_llm, register_agent_llm_with_turn_cost, AgentLlmGenerateHandler,
     AgentLlmPollStreamHandler, AgentLlmStreamHandler, AgentStreamReaper, ReapBatch,
+};
+pub use models_list::{
+    build_models_list_capability, build_models_list_request, parse_models_catalog_page,
+    CatalogFill, CatalogPage, ListedModel,
 };
 pub use placement::{PlacementRecord, PlacementTelemetry, UserHardConstraint};
 pub use plan_usage::{is_plan_usage_error, PLAN_USAGE_PREFIX};

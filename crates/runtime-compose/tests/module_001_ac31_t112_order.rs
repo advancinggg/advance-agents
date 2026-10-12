@@ -312,7 +312,7 @@ fn module_001_ac31_callback_sites_follow_composition_order() {
         "crate::data_wiring::register_data_tool_with_log(",
         "run_tools(",
         "run_client_families(",
-        "bind_runtime(",
+        "mgr.bind_runtime(",
         "bind_local_factory(",
     ] {
         at = once_and_after(&wiring, at, marker);
