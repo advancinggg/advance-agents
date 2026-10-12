@@ -107,6 +107,10 @@ fn compact_ascii(s: &str) -> String {
     s.chars().filter(|c| !c.is_ascii_whitespace()).collect()
 }
 
+fn ascii_folded(s: &str) -> String {
+    s.chars().map(|c| c.to_ascii_lowercase()).collect()
+}
+
 fn key_needles(key: &str) -> Vec<String> {
     let compact = compact_ascii(key);
     let mut seen = std::collections::HashSet::new();
@@ -115,23 +119,36 @@ fn key_needles(key: &str) -> Vec<String> {
         if candidate.len() < KEY_DROP_MIN {
             continue;
         }
-        if seen.insert(candidate.to_string()) {
-            out.push(candidate.to_string());
-        }
-        let canon = canonical_scan_text(candidate);
-        if canon.len() >= KEY_DROP_MIN && seen.insert(canon.clone()) {
-            out.push(canon);
+        for form in [
+            candidate.to_string(),
+            canonical_scan_text(candidate),
+            ascii_folded(candidate),
+            ascii_folded(&canonical_scan_text(candidate)),
+        ] {
+            if form.len() >= KEY_DROP_MIN && seen.insert(form.clone()) {
+                out.push(form);
+            }
         }
     }
     out
 }
 
+fn hay_echoes_needle(hay: &str, needle: &str) -> bool {
+    hay.contains(needle) || (hay.len() >= KEY_DROP_MIN && needle.starts_with(hay))
+}
+
 fn text_contains_key(hay: &str, key: &str) -> bool {
-    let hay_canon = canonical_scan_text(hay);
-    let hay_compact = compact_ascii(hay);
-    key_needles(key).iter().any(|needle| {
-        hay.contains(needle) || hay_canon.contains(needle) || hay_compact.contains(needle)
-    })
+    let variants = [
+        hay.to_string(),
+        canonical_scan_text(hay),
+        compact_ascii(hay),
+        ascii_folded(hay),
+        ascii_folded(&canonical_scan_text(hay)),
+        ascii_folded(&compact_ascii(hay)),
+    ];
+    key_needles(key)
+        .iter()
+        .any(|needle| variants.iter().any(|hay| hay_echoes_needle(hay, needle)))
 }
 
 /// Anthropic `GET /v1/models` is the only dialect that paginates with `after_id`.
@@ -525,6 +542,26 @@ mod tests {
             "  sk-abcdefgh  ",
         );
         assert!(padded.is_empty(), "{padded:?}");
+        let folded = drop_key_rows(
+            vec![ListedModel {
+                id: "SK-ABCDEFGH".into(),
+                display_name: None,
+            }],
+            "sk-abcdefgh",
+        );
+        assert!(folded.is_empty(), "{folded:?}");
+        let long = "k".repeat(200);
+        let prefix = long[..128].to_string();
+        let truncated = drop_key_rows(
+            vec![ListedModel {
+                id: prefix.clone(),
+                display_name: None,
+            }],
+            &long,
+        );
+        assert!(truncated.is_empty(), "{truncated:?}");
+        assert!(catalog_page_cursor(Some(&prefix), &long).is_none());
+        assert!(catalog_page_cursor(Some("SK-ABCDEFGH"), "sk-abcdefgh").is_none());
     }
 
     #[test]
