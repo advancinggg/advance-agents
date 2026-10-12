@@ -27,13 +27,16 @@
 //!   surfaces BY NAME (SYS-AC-011 stays DEFERRED only for the empty-caps WIT spawn
 //!   cap-lift gap — the "with capability summaries" clause).
 //! - HERMETIC STUBS (always, both prod + harness): `embedding`, `task_index`,
-//!   `light_llm`, `unified_search`, `agent_identity`. These feed the routing /
-//!   recall tiers that SYS-AC-008/009 (explicitly §3-deferred) require; stubbing
-//!   them keeps `assemble()` hermetic (no `/v1/embeddings` round-trip on the
-//!   witness turn) and the assembler degrades gracefully (MODULE-010 §2.8).
+//!   `light_llm`, `unified_search`. These feed the routing / recall tiers that
+//!   SYS-AC-008/009 (explicitly §3-deferred) require; stubbing them keeps
+//!   `assemble()` hermetic (no `/v1/embeddings` round-trip on the witness turn)
+//!   and the assembler degrades gracefully (MODULE-010 §2.8).
 //!   (`knowledge_map` + the L2/L3/L4 history readers became REAL in the B1 /
 //!   SAT-A slices — see MODULE-010 §3.6 — so this list is the original
-//!   backbone-Step-2 reality, kept for context.)
+//!   backbone-Step-2 reality, kept for context. `agent_identity` is now
+//!   caller-supplied: production reads `.agent/AGENTS.md`; back-compat paths
+//!   still pass [`StubAgentIdentity`].)
+
 //! - CALLER-SUPPLIED (skills-J26 satellite, 2026-06-20): `skill_summary` is the
 //!   real [`DiskSkillSummaryReader`] in production when the agent declares the
 //!   `skills` capability (root threaded via `WiringHandles.skills_root`);
@@ -101,6 +104,7 @@ use advance_shared_types::capability::{McpToolEntry, ToolEntry};
 use advance_shared_types::context::ContextAssembler;
 use advance_shared_types::traits::{CallableInventoryReader, EventBusEmit};
 use cap_skills::extract_skill_summary;
+use cap_skills::summary::extract_skill_summary_capped;
 // Wave-16 Lane 2: reuse the TOCTOU-hardened file-safety helpers (made `pub(crate)`
 // in `vlm_indexer`) for the recall corpus's workspace-content walk — no duplication.
 use crate::vlm_indexer::{confine, read_capped_bytes};
@@ -109,13 +113,63 @@ use crate::vlm_indexer::{confine, read_capped_bytes};
 // Hermetic stub ports (the 7 data ports — empty/None/safe-default).
 // ─────────────────────────────────────────────────────────────────────────
 
-/// AGENTS.md identity reader — production stub (no AGENTS.md read this slice →
-/// Tier-1a identity slot empty). A real FS-backed reader is a follow-up.
+/// AGENTS.md identity reader — back-compat / harness stub (no file read →
+/// Tier-1a identity slot empty). Production uses [`DiskAgentIdentityReader`].
 struct StubAgentIdentity;
 #[async_trait]
 impl AgentIdentityReader for StubAgentIdentity {
     async fn agents_md_summary(&self, _agent_id: &str) -> Option<String> {
         None
+    }
+}
+
+/// Upper bound on the identity summary injected into Tier 1a. Matches the
+/// knowledge-map section cap so a long first paragraph cannot blow the static
+/// tier. The assembler still sanitizes the returned text in `build_tier1a`.
+const IDENTITY_SUMMARY_TOKENS: usize = 500;
+
+/// Per-file read cap for `.agent/AGENTS.md`. Matches Client API
+/// `MAX_AGENTS_MD_BYTES` / cap-lifecycle `atomic::MAX_BYTES` (64 KiB).
+const MAX_AGENTS_MD_READ_BYTES: u64 = 64 * 1024;
+
+/// Production [`AgentIdentityReader`]. Reads `<identity_agent_root>/AGENTS.md`
+/// — the same path Client API / settings write — and returns the first-paragraph
+/// identity summary (MODULE-010 Tier 1a slot).
+///
+/// **Root coincidence**: `identity_agent_root` is `<workspace>/.agent`. Not
+/// capability-gated (unlike skills/memory): every agent workspace owns this
+/// document. Missing / unreadable / symlink / oversize / blank-after-extract →
+/// `None` (fail-soft, ≡ [`StubAgentIdentity`]; `build_tier1a` then emits no
+/// `# Agent Identity` message).
+///
+/// **Bounded read**: `read_regular_capped` STAT-BEFORE-OPEN rejects symlink /
+/// FIFO / dir / oversize before any blocking open. The extract reuses the
+/// skill first-paragraph algorithm (frontmatter + ATX headings skipped) with
+/// [`IDENTITY_SUMMARY_TOKENS`] instead of the skill L0 100-token cap.
+pub struct DiskAgentIdentityReader {
+    identity_agent_root: PathBuf,
+}
+
+impl DiskAgentIdentityReader {
+    /// `identity_agent_root` is `<workspace>/.agent`, not the workspace root.
+    pub fn new(identity_agent_root: PathBuf) -> Self {
+        Self {
+            identity_agent_root,
+        }
+    }
+}
+
+#[async_trait]
+impl AgentIdentityReader for DiskAgentIdentityReader {
+    async fn agents_md_summary(&self, _agent_id: &str) -> Option<String> {
+        let path = self.identity_agent_root.join("AGENTS.md");
+        let raw = read_regular_capped(&path, MAX_AGENTS_MD_READ_BYTES)?;
+        let summary = extract_skill_summary_capped(&raw, IDENTITY_SUMMARY_TOKENS);
+        if summary.trim().is_empty() {
+            None
+        } else {
+            Some(summary)
+        }
     }
 }
 
@@ -950,6 +1004,10 @@ fn build_with_all_ports(
     // `Arc::new(StubSkillSummary)`; now caller-supplied so production can inject
     // the real `DiskSkillSummaryReader` (every back-compat path passes the stub).
     skill_summary: Arc<dyn SkillSummaryReader>,
+    // Identity satellite: the 3rd ContextAssembler port. Production injects
+    // `DiskAgentIdentityReader` over `<ws>/.agent/AGENTS.md`; every back-compat
+    // path passes `StubAgentIdentity` (⇒ empty Tier 1a ⇒ byte-identical).
+    agent_identity: Arc<dyn AgentIdentityReader>,
     // Wave-12 Lane A: the agent-id alias set ({bare cap-id, colon msg-id}) `assemble()`
     // uses to match ⑬ delegates `node.parent` AND drain the Tier-3 WarningQueue
     // (SYS-AC-011 + SYS-AC-122). `&[]` on the hermetic / back-compat paths
@@ -965,7 +1023,7 @@ fn build_with_all_ports(
         ContextAssemblerImpl::new(
             callable_inventory,
             host_fn_inventory,
-            Arc::new(StubAgentIdentity),
+            agent_identity,
             knowledge_map,
             agent_tree,
             embedding,
@@ -1026,9 +1084,10 @@ pub fn build_context_assembler(
 /// B1 backbone (2026-06-09): assemble the real [`ContextAssemblerImpl`] with the
 /// 4 caller-supplied "real-able" ports PLUS the 4 data ports this slice can make
 /// real (`embedding` / `knowledge_map` / `unified_search` / `task_index`). The
-/// remaining 3 data ports (`agent_identity` / `light_llm` / `skill_summary`)
-/// stay hermetic stubs. `build_context_assembler` delegates here with all-stub
-/// data ports; `build_context_assembler_for_agent` supplies the real ones.
+/// remaining data ports (`agent_identity` / `light_llm` / `skill_summary`)
+/// stay hermetic stubs on this path. `build_context_assembler` delegates here
+/// with all-stub data ports; `build_context_assembler_for_agent` supplies the
+/// real ones it can.
 #[allow(clippy::too_many_arguments)]
 pub fn build_context_assembler_with_providers(
     event_bus: Arc<dyn EventBusEmit>,
@@ -1061,6 +1120,7 @@ pub fn build_context_assembler_with_providers(
         Arc::new(StubL6Consolidation),
         // Back-compat: no skills root on this path → no `# Available Skills`.
         Arc::new(StubSkillSummary),
+        Arc::new(StubAgentIdentity),
         &[], // Wave-12 Lane A: no alias bridge on the bare/back-compat path (single-id)
         // Wave-12 Lane C: no decomposition on this back-compat path → no Tier-2 ⑭
         // section (byte-identical to pre-Wave-12).
@@ -1281,11 +1341,12 @@ pub fn build_context_assembler_for_agent_with_decomposition(
         skills_agent_root,
         decomposition,
         None,
+        None, // identity_agent_root — frozen `_with_decomposition` stays stub
     )
 }
 
-/// [`build_context_assembler_for_agent_with_decomposition`] plus `pack_skills`: the skills of
-/// installed packs, listed after the agent's own in `# Available Skills`.
+/// [`build_context_assembler_for_agent_with_decomposition`] plus `pack_skills`
+/// and the production AGENTS.md identity reader.
 #[allow(clippy::too_many_arguments)]
 pub fn build_context_assembler_for_agent_with_pack_skills(
     event_bus: Arc<dyn EventBusEmit>,
@@ -1299,6 +1360,7 @@ pub fn build_context_assembler_for_agent_with_pack_skills(
     skills_agent_root: Option<&Path>,
     decomposition: Arc<dyn DecompositionReader>,
     pack_skills: Option<Arc<dyn SkillSummaryReader>>,
+    identity_agent_root: Option<&Path>,
 ) -> Arc<dyn ContextAssembler> {
     // The skill-summary reader is INDEPENDENT of the memory capability. `Some` →
     // the real DiskSkillSummaryReader over the agent's on-disk activated skills;
@@ -1306,6 +1368,13 @@ pub fn build_context_assembler_for_agent_with_pack_skills(
     let skill_summary: Arc<dyn SkillSummaryReader> = match skills_agent_root {
         Some(root) => Arc::new(DiskSkillSummaryReader::new(root.to_path_buf())),
         None => Arc::new(StubSkillSummary),
+    };
+    // Identity is independent of skills AND memory. `Some` (`<ws>/.agent`) →
+    // DiskAgentIdentityReader over AGENTS.md; `None` → StubAgentIdentity
+    // (byte-identical to pre-identity, in BOTH arms).
+    let agent_identity: Arc<dyn AgentIdentityReader> = match identity_agent_root {
+        Some(root) => Arc::new(DiskAgentIdentityReader::new(root.to_path_buf())),
+        None => Arc::new(StubAgentIdentity),
     };
     let skill_summary: Arc<dyn SkillSummaryReader> = match pack_skills {
         Some(packs) => Arc::new(ChainedSkillSummary {
@@ -1353,6 +1422,7 @@ pub fn build_context_assembler_for_agent_with_pack_skills(
                 Arc::new(StubL5Synthesis), // L5 inert (distinct synthesis surface)
                 Arc::new(StubL6Consolidation), // L6 inert (Tier-1b overlap)
                 skill_summary,
+                agent_identity.clone(),
                 query_aliases, // Wave-12 Lane A: colon/bare alias bridge (⑬ + Tier-3)
                 decomposition,
             )
@@ -1376,6 +1446,7 @@ pub fn build_context_assembler_for_agent_with_pack_skills(
             Arc::new(StubL5Synthesis),
             Arc::new(StubL6Consolidation),
             skill_summary,
+            agent_identity,
             query_aliases, // Wave-12 Lane A: colon/bare alias bridge (⑬ + Tier-3)
             decomposition,
         ),
@@ -1664,6 +1735,7 @@ pub fn build_context_assembler_for_agent_with_recall(
         Arc::new(StubL5Synthesis),
         Arc::new(StubL6Consolidation),
         Arc::new(StubSkillSummary),
+        Arc::new(StubAgentIdentity),
         query_aliases,
         Arc::new(EmptyDecomposition),
     )
@@ -1983,6 +2055,63 @@ mod tests {
         assert!(
             high.score > low.score,
             "higher version → higher score (kept first under truncation)"
+        );
+    }
+
+    // ── identity satellite — DiskAgentIdentityReader unit tests ──
+
+    /// IDR-1 — first-paragraph extract from a real `.agent/AGENTS.md`, heading skipped.
+    #[tokio::test]
+    async fn idr1_reader_projects_first_paragraph() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = workspace.join(".agent");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "# Researcher\n\nYou are a research agent that cites sources.\n\nMore guidelines below.\n",
+        )
+        .unwrap();
+
+        let reader = DiskAgentIdentityReader::new(root);
+        let summary = reader
+            .agents_md_summary("agent:ignored")
+            .await
+            .expect("AGENTS.md present → Some");
+        assert_eq!(
+            summary, "You are a research agent that cites sources.",
+            "heading skipped; first prose paragraph extracted"
+        );
+    }
+
+    /// IDR-2 — missing file → None (≡ StubAgentIdentity).
+    #[tokio::test]
+    async fn idr2_missing_agents_md_yields_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(tmp.path()).unwrap();
+        let reader = DiskAgentIdentityReader::new(workspace.join(".agent"));
+        assert!(
+            reader.agents_md_summary("agent:a").await.is_none(),
+            "no AGENTS.md → None"
+        );
+    }
+
+    /// IDR-3 — a symlink at AGENTS.md is refused (never followed).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idr3_symlink_agents_md_yields_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = workspace.join(".agent");
+        std::fs::create_dir_all(&root).unwrap();
+        let secret = workspace.join("secret.txt");
+        std::fs::write(&secret, "should never leak into identity").unwrap();
+        std::os::unix::fs::symlink(&secret, root.join("AGENTS.md")).unwrap();
+
+        let reader = DiskAgentIdentityReader::new(root);
+        assert!(
+            reader.agents_md_summary("agent:a").await.is_none(),
+            "symlink AGENTS.md must not be followed"
         );
     }
 }

@@ -1235,6 +1235,7 @@ async fn try_spawn_agent_loop(
         };
         client_api_tools =
             (tool_registry.is_some() || mcp.is_some()).then(|| Arc::clone(&callable));
+        let identity_root = workspace.join(".agent");
         let inner = crate::context_wiring::build_context_assembler_for_agent_with_pack_skills(
             assembler_bus,
             callable,
@@ -1260,6 +1261,9 @@ async fn try_spawn_agent_loop(
                     Arc::new(crate::context_wiring::PackSkillSummaryReader::new(runtime))
                         as Arc<dyn advance_context_engine::ports::SkillSummaryReader>
                 }),
+            // AGENTS.md identity: always-on for the agent workspace. Not
+            // capability-gated (unlike skills/memory). Missing file → empty Tier 1a.
+            Some(&identity_root),
         );
         // Wave-12 (SYS-AC-122): LATE-BIND THIS per-agent assembler into the
         // process-global tool-path RepetitionGuard (built at wire_capabilities
