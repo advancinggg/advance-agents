@@ -40,6 +40,7 @@ pub const RESERVED_FAMILY_FLOOR: &[&str] = &[
     "messages",
     "tools",
     "events",
+    "git",
     "grants",
     "presets",
     "tasks",
@@ -1705,7 +1706,7 @@ mod tests {
         from_oss.dedup();
         let mut floor: Vec<&str> = RESERVED_FAMILY_FLOOR.to_vec();
         floor.sort();
-        assert_eq!(floor.len(), 18);
+        assert_eq!(floor.len(), 19);
         assert_eq!(
             floor,
             from_oss.iter().map(String::as_str).collect::<Vec<_>>()

@@ -115,6 +115,7 @@ pub mod contract218_keyring;
 pub mod contract218_marker;
 pub mod contract218_roles;
 pub mod grant_adapter;
+mod lifecycle_git;
 pub mod observation_carriers;
 pub mod observation_projection;
 // Pack lane P1 — composition-root wiring of the MODULE-018 pack

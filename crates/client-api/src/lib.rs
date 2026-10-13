@@ -30,6 +30,7 @@ pub mod entities;
 pub mod envelope;
 pub mod events;
 pub mod families;
+pub mod git;
 pub mod idempotency;
 // The foreground re-verification proof of an in-process listener (transport-internal).
 mod listener_proof;
@@ -98,6 +99,11 @@ pub use families::{
     NoExtensionRouteHooks, PathDefect, PollEmit, PollStreamDefect, PollStreamSpec, ResponseScan,
     RouteBook, RouteOptions, RouteRefusal, RouteRefusalReason,
 };
+pub use git::{
+    ClientGitCheckpointEntry, ClientGitCheckpointList, ClientGitCommitEntry, ClientGitCommitPage,
+    ClientGitCreateCheckpointRequest, ClientGitFileAt, ClientGitFileHistory, ClientGitFileVersion,
+    ClientGitRollbackResult, ClientGitStatus, GitHistoryReaderProvider, ValidatedGitCommitQuery,
+};
 pub use messages::{ClientMessageAck, ClientMessageStatus, ClientSendMessageRequest};
 pub use packs::{
     ClientPackApplyRequest, ClientPackApplyResult, ClientPackDetail, ClientPackInstallRequest,
@@ -106,8 +112,8 @@ pub use packs::{
 };
 pub use pagination::{Cursor, Page};
 pub use provider::{
-    provider_or_unavailable, AgentAdminProvider, CostProvider, EntityProvider, MessagingProvider,
-    PackAdminProvider, ProviderAdminProvider, ProviderError, RunControlProvider,
+    provider_or_unavailable, AgentAdminProvider, CostProvider, EntityProvider, GitHistoryProvider,
+    MessagingProvider, PackAdminProvider, ProviderAdminProvider, ProviderError, RunControlProvider,
     SecretsAdminProvider, ToolsProvider, AUTH_SOURCE_MISMATCH_DETAIL, PROCESS_FORBIDDEN_DETAIL,
     UNKNOWN_PROVIDER_DETAIL,
 };

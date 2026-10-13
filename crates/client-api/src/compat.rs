@@ -115,6 +115,15 @@ pub const RESPONSE_COMPONENTS: &[&str] = &[
     "ClientEntityRow",
     "ClientEntityPage",
     "ClientEntityTarget",
+    "ClientGitStatus",
+    "ClientGitCheckpointEntry",
+    "ClientGitCommitEntry",
+    "ClientGitCommitPage",
+    "ClientGitCheckpointList",
+    "ClientGitFileVersion",
+    "ClientGitFileHistory",
+    "ClientGitFileAt",
+    "ClientGitRollbackResult",
 ];
 
 /// Request / filter bodies — not a response-field bag.
@@ -153,6 +162,7 @@ pub const EXCLUDED_COMPONENTS: &[&str] = &[
     "ClientEntityPatchRequest",
     "ClientEntityApplyRequest",
     "ClientEntityAgentRequest",
+    "ClientGitCreateCheckpointRequest",
 ];
 
 /// Git path of the on-disk honesty baseline, relative to the repo root.

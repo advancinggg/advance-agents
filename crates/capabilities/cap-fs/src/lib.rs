@@ -46,6 +46,7 @@ pub mod resolver;
 pub mod schema_v2;
 pub mod sqlite_sync;
 
+pub use advance_git::GitFileHistoryProvider;
 pub use atomic::{atomic_write, AtomicWriter, DefaultAtomicWriter, MAX_WRITE_BYTES};
 pub use entity_projection::{dir_of_index, project_bytes, project_entities, SchemaEntityProjector};
 pub use entry::{

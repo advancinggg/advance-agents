@@ -35,6 +35,11 @@ use crate::entities::{
 };
 use crate::envelope::{ClientError, ClientErrorCode};
 use crate::events::ClientEventProvider;
+use crate::git::{
+    ClientGitCheckpointEntry, ClientGitCheckpointList, ClientGitCommitPage,
+    ClientGitCreateCheckpointRequest, ClientGitFileAt, ClientGitFileHistory,
+    ClientGitRollbackResult, ClientGitStatus, ValidatedGitCommitQuery,
+};
 use crate::messages::{ClientMessageAck, ClientMessageStatus};
 use crate::packs::{
     ClientPackApplyResult, ClientPackDetail, ClientPackInstallRequest, ClientPackInstallResult,
@@ -448,6 +453,37 @@ pub trait ProviderAdminProvider: Send + Sync {
 /// Error projection: `keychain-sync` requested on a platform without the synchronizable
 /// data-protection keychain → `PlatformUnsupported`; a rewritten config the loader rejects →
 /// `InvalidRequest`; an unreadable config / failed write → `Unavailable`.
+/// Workspace Git history (git-family PR-2..4) behind the `git` family. The
+/// production adapter wraps [`advance_git::GitHistoryReader`] (and the named-
+/// checkpoint / rollback surfaces for writes). Every id / path / cursor it
+/// receives has already passed handler-side validation in [`crate::git`].
+///
+/// Honesty: a missing / off-`main` / unreadable repository is a **status** on
+/// the DTO (`repo: "missing"` / `"not_main"` / `"unreadable"`), never
+/// `Unavailable`. `Unavailable` is reserved for an absent slot (the handler
+/// maps that to `module_unavailable` before this trait is called) or a
+/// write that cannot open the repository.
+pub trait GitHistoryProvider: Send + Sync {
+    fn status(&self) -> Result<ClientGitStatus, ProviderError>;
+    fn commits(
+        &self,
+        query: &ValidatedGitCommitQuery,
+    ) -> Result<ClientGitCommitPage, ProviderError>;
+    fn checkpoints(&self, agent_id: Option<&str>)
+        -> Result<ClientGitCheckpointList, ProviderError>;
+    fn file_history(&self, path: &str) -> Result<ClientGitFileHistory, ProviderError>;
+    fn file_at(&self, path: &str, sha: &str) -> Result<ClientGitFileAt, ProviderError>;
+    fn create_checkpoint(
+        &self,
+        request: &ClientGitCreateCheckpointRequest,
+    ) -> Result<ClientGitCheckpointEntry, ProviderError>;
+    fn rollback_to_checkpoint(
+        &self,
+        agent_id: &str,
+        label: &str,
+    ) -> Result<ClientGitRollbackResult, ProviderError>;
+}
+
 pub trait SecretsAdminProvider: Send + Sync {
     fn mode(&self) -> Result<ClientSecretsMode, ProviderError>;
     fn set_mode(
@@ -467,6 +503,7 @@ pub type PackProviderSlot = ProviderSlot<dyn PackAdminProvider>;
 pub type EntityProviderSlot = ProviderSlot<dyn EntityProvider>;
 pub type ProviderAdminSlot = ProviderSlot<dyn ProviderAdminProvider>;
 pub type SecretsProviderSlot = ProviderSlot<dyn SecretsAdminProvider>;
+pub type GitProviderSlot = ProviderSlot<dyn GitHistoryProvider>;
 /// m020-s3: event provider / leak detector / cursor codec slots.
 pub type EventProviderSlot = ProviderSlot<dyn ClientEventProvider>;
 pub type LeakDetectorSlot = ProviderSlot<dyn LeakDetector>;

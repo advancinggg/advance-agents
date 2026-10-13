@@ -329,7 +329,7 @@ fn valid_entity_ref(s: &str) -> bool {
     })
 }
 
-// ── Exact 34-row table ────────────────────────────────────────────────────────────────────
+// ── Exact 36-row table ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
 struct LeafSpec {
@@ -382,6 +382,8 @@ const AUTO_HALTED: &[&str] = &[
     "safety-valve: max_cost_usd",
     "safety-valve: max_wall_time",
 ];
+const GIT_COMMIT_TYPE: &[&str] = &["turn", "micro", "l6"];
+const GIT_ROLLBACK_TARGET_KIND: &[&str] = &["version", "checkpoint"];
 const GENUI_CODES: &[&str] = &[
     "denied",
     "invalid_component",
@@ -408,7 +410,7 @@ pub fn leaf_names(event_type: &str) -> Option<Vec<&'static str>> {
     table_spec(event_type).map(|s| s.leaves.iter().map(|l| l.name).collect())
 }
 
-/// Exact 34 accepted literals (for tests).
+/// Exact 36 accepted literals (for tests).
 pub fn accepted_event_literals() -> &'static [&'static str] {
     &[
         "run.created",
@@ -445,6 +447,8 @@ pub fn accepted_event_literals() -> &'static [&'static str] {
         "genui.action_dispatched",
         "genui.degraded",
         "data.entity_changed",
+        "git.commit",
+        "git.rollback",
     ]
 }
 
@@ -961,6 +965,66 @@ static TABLE: &[EventSpec] = &[
             },
             LeafSpec {
                 name: "kind",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+        ],
+    },
+    EventSpec {
+        literal: "git.commit",
+        priority: ClientEventPriority::Normal,
+        leaves: &[
+            LeafSpec {
+                name: "agent_id",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "commit_type",
+                kind: LeafKind::Enum(GIT_COMMIT_TYPE),
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "initiator",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "sha",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "affected_paths_count",
+                kind: LeafKind::U64,
+                min_u32: None,
+                max_u32: None,
+            },
+        ],
+    },
+    EventSpec {
+        literal: "git.rollback",
+        priority: ClientEventPriority::Normal,
+        leaves: &[
+            LeafSpec {
+                name: "agent_id",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "target_kind",
+                kind: LeafKind::Enum(GIT_ROLLBACK_TARGET_KIND),
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "target_ref",
                 kind: LeafKind::StringScanned,
                 min_u32: None,
                 max_u32: None,

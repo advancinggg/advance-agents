@@ -129,6 +129,15 @@ pub const TPL_PROVIDER_SIGN_OUT: &str = "/client/providers/{provider_id}:sign-ou
 /// and the mode switch (POST). Its own family (`secrets`); no templated routes.
 pub const PATH_SECRETS_MODE: &str = "/client/secrets/mode";
 pub const PATH_SECRETS_SET_MODE: &str = "/client/secrets:set-mode";
+/// Git family (workspace history): status / linear commits / checkpoints (GET).
+pub const PATH_GIT_STATUS: &str = "/client/git/status";
+pub const PATH_GIT_COMMITS: &str = "/client/git/commits";
+pub const PATH_GIT_CHECKPOINTS: &str = "/client/git/checkpoints";
+pub const PATH_GIT_FILE_HISTORY: &str = "/client/git/files/history";
+pub const PATH_GIT_FILE_AT: &str = "/client/git/files/content";
+pub const PATH_GIT_CHECKPOINT_CREATE: &str = "/client/git/checkpoints:create";
+/// Rollback one `checkpoint/{agent_id}/{label}` tag (POST mutation).
+pub const TPL_GIT_CHECKPOINT_ROLLBACK: &str = "/client/git/checkpoints/{agent_id}/{label}:rollback";
 /// Schema family (entity-data lane E3): the merged meta-schema (GET). Its own family.
 pub const PATH_SCHEMA: &str = "/client/schema";
 /// Entities family: query (a POST read) and create (POST mutation).

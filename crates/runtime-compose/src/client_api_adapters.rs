@@ -11,8 +11,8 @@ use advance_client_api::{
     AgentAdminProvider, BoundGrantApprovalPort, BoundHistoryPage, BoundHistoryReadPort,
     ClientAgentTreeNode, ClientApi, ClientCursorCodec, ClientEventProvider, ClientMcpEntry,
     ClientMessageAck, ClientMessageStatus, ClientRunMutation, ClientRunSummary, ClientSkillEntry,
-    ClientToolEntry, ClientToolInventory, CostProvider, EntityProvider, LlmDeltaHub,
-    MessagingProvider, NormalizedEventFilter, PackAdminProvider, PendingGrantListPort,
+    ClientToolEntry, ClientToolInventory, CostProvider, EntityProvider, GitHistoryProvider,
+    LlmDeltaHub, MessagingProvider, NormalizedEventFilter, PackAdminProvider, PendingGrantListPort,
     ProviderAdminProvider, ProviderError, RawEventRow, RunControlProvider, SecretsAdminProvider,
     ToolsProvider, UnboundHistoryEntry, UnboundHistoryReadPort,
 };
@@ -816,6 +816,8 @@ pub struct FirstPartyClientCompose {
     /// CONTRACT-190 schema + entities families (entity-data lane E3) over the production
     /// `DataStore` (the `data` host tool's store).
     pub entities: Option<Arc<dyn EntityProvider>>,
+    /// CONTRACT-190 git family (workspace history) over `advance_git::GitHistoryReader`.
+    pub git: Option<Arc<dyn GitHistoryProvider>>,
     /// MODULE-020-AC-18: history of a home without CONTRACT-219.
     pub unbound_history: Option<Arc<dyn UnboundHistoryReadPort>>,
     /// MODULE-020-AC-18: the list-only pending-grant port of a home without a grant intake.
@@ -882,6 +884,9 @@ pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCom
     }
     if let Some(entities) = parts.entities {
         api = api.with_entity_provider(entities);
+    }
+    if let Some(git) = parts.git {
+        api = api.with_git_provider(git);
     }
     api
 }

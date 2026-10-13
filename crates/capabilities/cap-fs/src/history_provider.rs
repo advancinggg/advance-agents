@@ -15,8 +15,55 @@
 
 use std::path::Path;
 
+use advance_git::{GitFileHistoryProvider, HistoryError};
+use chrono::{DateTime, Utc};
+
 use crate::entry::VersionEntry;
 use crate::error::FsError;
+
+fn ms_to_rfc3339(ms: u64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(i64::try_from(ms).unwrap_or(0))
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+        .to_rfc3339()
+}
+
+fn map_history_err(err: HistoryError) -> FsError {
+    match err {
+        HistoryError::InvalidPath { path, .. } => FsError::InvalidPath(path),
+        HistoryError::PathNotFound { path, .. } => FsError::NotFound(path),
+        HistoryError::UnknownCommit(s) => FsError::NotFound(s),
+        HistoryError::BlobTooLarge { size, .. } => {
+            FsError::IoError(format!("blob too large: {size}"))
+        }
+        HistoryError::MalformedSha(s) => FsError::InvalidPath(s),
+        HistoryError::Repo(_) => FsError::NotFound("repository".into()),
+    }
+}
+
+impl FileHistoryProvider for GitFileHistoryProvider {
+    fn file_history(&self, physical_path: &Path) -> Result<Vec<VersionEntry>, FsError> {
+        match self.history_for_physical(physical_path) {
+            Ok(history) => Ok(history
+                .items
+                .into_iter()
+                .map(|v| VersionEntry {
+                    version: v.sha,
+                    timestamp: ms_to_rfc3339(v.committed_at_ms),
+                    message: Some(v.subject),
+                })
+                .collect()),
+            Err(HistoryError::Repo(_)) => Ok(Vec::new()),
+            Err(e) => Err(map_history_err(e)),
+        }
+    }
+
+    fn read_at(&self, physical_path: &Path, version: &str) -> Result<Vec<u8>, FsError> {
+        match self.read_physical_at(physical_path, version) {
+            Ok(at) => Ok(at.bytes),
+            Err(e) => Err(map_history_err(e)),
+        }
+    }
+}
 
 /// Trait providing git-version history for paths inside an agent's territory.
 ///

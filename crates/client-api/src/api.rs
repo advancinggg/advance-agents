@@ -317,6 +317,8 @@ pub struct ClientApi {
     secrets_provider: crate::provider::SecretsProviderSlot,
     /// Schema + entities families (entity-data lane E3) provider slot.
     entity_provider: crate::provider::EntityProviderSlot,
+    /// Git family (workspace history) provider slot.
+    git_provider: crate::provider::GitProviderSlot,
     /// m020-s3 CONTRACT-191 slots (event provider / leak detector / cursor codec).
     event_provider: EventProviderSlot,
     leak_detector: LeakDetectorSlot,
@@ -390,6 +392,7 @@ impl ClientApi {
             provider_admin: Arc::new(RwLock::new(None)),
             secrets_provider: Arc::new(RwLock::new(None)),
             entity_provider: Arc::new(RwLock::new(None)),
+            git_provider: Arc::new(RwLock::new(None)),
             event_provider: Arc::new(RwLock::new(None)),
             leak_detector: Arc::new(RwLock::new(None)),
             cursor_codec: Arc::new(RwLock::new(None)),
@@ -414,12 +417,24 @@ impl ClientApi {
     }
 
     fn register_builtin_handlers(&mut self) {
-        // GET /client/health — unauthenticated liveness probe.
+        // GET /client/health — unauthenticated liveness probe. When the git
+        // family is wired, the same status object `/client/git/status` returns
+        // is inlined under `git` (additive). An absent slot leaves the field off
+        // so existing health consumers keep seeing `{status, api_version}`.
+        let git = Arc::clone(&self.git_provider);
         self.register(
             Method::Get,
             routes::PATH_HEALTH,
-            HandlerSpec::read(false, |_ctx| {
-                Ok(json!({ "status": "ok", "api_version": API_VERSION }))
+            HandlerSpec::read(false, move |_ctx| {
+                let mut data = json!({ "status": "ok", "api_version": API_VERSION });
+                if let Ok(provider) = crate::provider::provider_or_unavailable(&git) {
+                    if let Ok(status) = provider.status() {
+                        if let Ok(value) = serde_json::to_value(status) {
+                            data["git"] = value;
+                        }
+                    }
+                }
+                Ok(data)
             }),
         );
     }
@@ -455,6 +470,9 @@ impl ClientApi {
         // Schema + entities families (entity-data lane E3) over the EntityProvider slot.
         let entity_slot = Arc::clone(&self.entity_provider);
         crate::entities::register(self, entity_slot);
+        // Git family (workspace history) over the GitHistoryProvider slot.
+        let git_slot = Arc::clone(&self.git_provider);
+        crate::git::register(self, git_slot);
         let event_slot = Arc::clone(&self.event_provider);
         let detector_slot = Arc::clone(&self.leak_detector);
         let codec_slot = Arc::clone(&self.cursor_codec);
@@ -610,6 +628,18 @@ impl ClientApi {
         *self.provider_admin.write().unwrap() = Some(provider);
     }
 
+    /// Inject the git-family provider (composition root / witness). Overwrites the slot
+    /// the git-family closures read; `None` (default) → `module_unavailable`.
+    pub fn with_git_provider(self, provider: Arc<dyn crate::provider::GitHistoryProvider>) -> Self {
+        *self.git_provider.write().unwrap() = Some(provider);
+        self
+    }
+
+    /// Late-install the git-family provider into an already-bound `Arc<ClientApi>`.
+    pub fn install_git_provider(&self, provider: Arc<dyn crate::provider::GitHistoryProvider>) {
+        *self.git_provider.write().unwrap() = Some(provider);
+    }
+
     /// Inject the secrets-family provider (composition root / witness). Overwrites the slot
     /// the secrets-family closures read; `None` (default) → `module_unavailable`.
     pub fn with_secrets_provider(
@@ -699,6 +729,7 @@ impl ClientApi {
         clear(&self.provider_admin);
         clear(&self.secrets_provider);
         clear(&self.entity_provider);
+        clear(&self.git_provider);
         clear(&self.event_provider);
         clear(&self.leak_detector);
         clear(&self.cursor_codec);

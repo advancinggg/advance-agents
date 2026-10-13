@@ -71,7 +71,7 @@ use advance_shared_types::traits::{
 };
 use cap_fs::{
     register_agent_fs_with_maintainer, Adv003GitSync, AtomicWriter, DefaultAtomicWriter,
-    DefaultVirtualPathResolver, GitSync, MetaMaintainer, MetaSchemaLoader, StubFileHistoryProvider,
+    DefaultVirtualPathResolver, GitFileHistoryProvider, GitSync, MetaMaintainer, MetaSchemaLoader,
     VirtualPathResolver,
 };
 use cap_grant::{
@@ -88,8 +88,9 @@ use cap_http::{
 };
 use cap_lifecycle::spawn::{SpawnChildConfig, SpawnerSubsetGate};
 use cap_lifecycle::{
-    register_agent_component_submit, register_agent_decomposition, register_agent_spawn,
-    AgentTreeStore, BuiltinTemplateRegistry, ComponentSubmitGate, DefaultDecompositionStore,
+    register_agent_checkpoints, register_agent_component_submit, register_agent_decomposition,
+    register_agent_spawn, AgentTreeStore, BuiltinTemplateRegistry, ComponentSubmitGate,
+    DefaultCheckpointController, DefaultDecompositionStore, DefaultRollbackController,
     DefaultSpawner, SpawnError, SpawnObserver, Spawner, WorkspaceFileResidentPolicy,
 };
 
@@ -2550,6 +2551,32 @@ pub(crate) async fn wire_capabilities_inner(
             pack_executor = Some(executor);
         }
         register_agent_spawn(&*registry, spawner);
+        // Git-family PR-4: bind DefaultCheckpointController so the checkpoint /
+        // rollback-to-checkpoint / list-checkpoints WIT fns run on the same
+        // NamedCheckpoint + WorkspaceRollback the Client API write path uses.
+        // Gated on a Ready repository (create/rollback need refs/heads/main).
+        if git_repo_status.is_ready() {
+            if let (Ok(named), Ok(rollback)) = (
+                advance_git::DefaultNamedCheckpoint::new(workspace.to_path_buf()),
+                advance_git::DefaultWorkspaceRollback::with_event_bus(
+                    workspace.to_path_buf(),
+                    event_bus_dyn.clone(),
+                ),
+            ) {
+                let gate = Arc::new(crate::lifecycle_git::NamedCheckpointAdapter::new(named));
+                let rb_gate = Arc::new(crate::lifecycle_git::WorkspaceRollbackAdapter::new(
+                    rollback,
+                ));
+                let controller = Arc::new(DefaultCheckpointController::new(
+                    (**tree).clone(),
+                    gate,
+                    Arc::clone(&rb_gate) as Arc<dyn cap_lifecycle::WorkspaceRollbackGate>,
+                ));
+                let rb_controller =
+                    Arc::new(DefaultRollbackController::new((**tree).clone(), rb_gate));
+                register_agent_checkpoints(&*registry, (**tree).clone(), controller, rb_controller);
+            }
+        }
         // Wave-12 Lane C: register the 3 decomposition host-fns over a
         // `DefaultDecompositionStore` sharing THIS tree + the real `event_bus_dyn`,
         // so `submit-decomposition` / `update-subtask-status` record state the
@@ -2706,7 +2733,7 @@ pub(crate) async fn wire_capabilities_inner(
             Arc::clone(&resolver),
             event_bus_dyn.clone(),
             Arc::clone(&schema),
-            Arc::new(StubFileHistoryProvider),
+            Arc::new(GitFileHistoryProvider::new(workspace.to_path_buf())),
             Arc::clone(&atomic_writer),
             Some(FS_PREVIEW_MAX_BYTES),
             None, // db_sync
@@ -2722,7 +2749,7 @@ pub(crate) async fn wire_capabilities_inner(
             writer: atomic_writer,
             maintainer,
             git_sync,
-            history: Arc::new(StubFileHistoryProvider),
+            history: Arc::new(GitFileHistoryProvider::new(workspace.to_path_buf())),
         });
     }
 
@@ -3744,6 +3771,9 @@ pub(crate) async fn wire_capabilities_inner(
                     Arc::new(crate::client_api_entities::WiredEntityProvider::new(store))
                         as Arc<dyn advance_client_api::EntityProvider>
                 });
+            let git_for_api: Arc<dyn advance_client_api::GitHistoryProvider> = Arc::new(
+                advance_client_api::GitHistoryReaderProvider::new(workspace.to_path_buf()),
+            );
             let tree_for_api = agent_tree_snapshot.clone();
             let root_colon_for_api = root_colon.clone();
             // The factory runs inside the bind and moves its captures, so the run-control
@@ -3798,6 +3828,7 @@ pub(crate) async fn wire_capabilities_inner(
                         as Arc<dyn advance_client_api::ProviderAdminProvider>),
                     secrets: Some(secrets_admin_for_api.clone()),
                     entities: entities_for_api.clone(),
+                    git: Some(git_for_api.clone()),
                     ..Default::default()
                 };
                 if let Some(projector) = projector_for_api.as_ref() {

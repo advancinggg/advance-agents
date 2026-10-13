@@ -188,6 +188,141 @@ pub fn register_agent_spawn(registry: &dyn HostRegistry, spawner: Arc<dyn Spawne
     }
 }
 
+/// Register the checkpoint / rollback-to-checkpoint host-fns over a
+/// [`CheckpointController`] + [`RollbackController`] + the shared tree (for
+/// `list-child-checkpoints` / `rollback-child-to-checkpoint` parent checks).
+/// Safe alongside [`register_agent_spawn`] (disjoint op names). Do NOT call
+/// this AND [`register_agent_lifecycle`] on the same registry.
+pub fn register_agent_checkpoints(
+    registry: &dyn HostRegistry,
+    tree: AgentTreeStore,
+    checkpoint: Arc<dyn CheckpointController>,
+    rollback: Arc<dyn crate::rollback::RollbackController>,
+) {
+    let cap = AGENT_LIFECYCLE_CAPABILITY.to_string();
+    let ns = AGENT_LIFECYCLE_NAMESPACE.to_string();
+    for (name, idempotent) in [
+        ("checkpoint", false),
+        ("rollback-to-checkpoint", false),
+        ("list-checkpoints", true),
+        ("list-child-checkpoints", true),
+        ("rollback-child-to-checkpoint", false),
+    ] {
+        registry.register(HostFunctionSpec {
+            capability: cap.clone(),
+            namespace: ns.clone(),
+            name: name.to_string(),
+            handler: Arc::new(CheckpointHostHandler {
+                op: name.to_string(),
+                tree: tree.clone(),
+                checkpoint: Arc::clone(&checkpoint),
+                rollback: Arc::clone(&rollback),
+            }),
+            idempotent,
+        });
+    }
+}
+
+struct CheckpointHostHandler {
+    op: String,
+    tree: AgentTreeStore,
+    checkpoint: Arc<dyn CheckpointController>,
+    rollback: Arc<dyn crate::rollback::RollbackController>,
+}
+
+impl HostFunctionHandler for CheckpointHostHandler {
+    fn call(
+        &self,
+        ctx: HostCallContext,
+        params: Vec<Val>,
+        results_len: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
+        let op = self.op.clone();
+        let tree = self.tree.clone();
+        let checkpoint = Arc::clone(&self.checkpoint);
+        let rollback = Arc::clone(&self.rollback);
+        Box::pin(async move {
+            check_results_len(&op, results_len, 1)?;
+            let caller_id = ctx.agent_id.clone();
+            cap_str(&op, &caller_id, MAX_AGENT_ID_BYTES)?;
+            let v = dispatch_checkpoints(
+                &op,
+                &tree,
+                checkpoint.as_ref(),
+                rollback.as_ref(),
+                &caller_id,
+                &params,
+            )?;
+            Ok(vec![v])
+        })
+    }
+}
+
+fn dispatch_checkpoints(
+    op: &str,
+    tree: &AgentTreeStore,
+    checkpoint: &dyn CheckpointController,
+    rollback: &dyn crate::rollback::RollbackController,
+    caller_id: &str,
+    params: &[Val],
+) -> Result<Val, HostCallError> {
+    Ok(match op {
+        "checkpoint" => {
+            let label = arg_str(params, 0, op)?;
+            cap_str(op, &label, MAX_LABEL_BYTES)?;
+            match checkpoint.checkpoint(caller_id, &label, None) {
+                Ok(()) => ok_unit(),
+                Err(e) => lower_lifecycle_err(e),
+            }
+        }
+        "rollback-to-checkpoint" => {
+            let label = arg_str(params, 0, op)?;
+            cap_str(op, &label, MAX_LABEL_BYTES)?;
+            match checkpoint.rollback_to_checkpoint(caller_id, &label) {
+                Ok(_) => ok_unit(),
+                Err(e) => lower_lifecycle_err(e),
+            }
+        }
+        "list-checkpoints" => match checkpoint.list_checkpoints(caller_id) {
+            Ok(v) => Val::Result(Ok(Some(Box::new(Val::List(
+                v.into_iter().map(|c| Val::String(c.label)).collect(),
+            ))))),
+            Err(e) => lower_lifecycle_err(e),
+        },
+        "list-child-checkpoints" => {
+            let child_id = arg_str(params, 0, op)?;
+            cap_str(op, &child_id, MAX_AGENT_ID_BYTES)?;
+            let child_id = resolve_guest_agent_ref(tree, child_id);
+            match checkpoint.list_child_checkpoints(caller_id, &child_id) {
+                Ok(v) => Val::Result(Ok(Some(Box::new(Val::List(
+                    v.into_iter().map(|c| Val::String(c.label)).collect(),
+                ))))),
+                Err(e) => lower_lifecycle_err(e),
+            }
+        }
+        "rollback-child-to-checkpoint" => {
+            let child_id = arg_str(params, 0, op)?;
+            let label = arg_str(params, 1, op)?;
+            cap_str(op, &child_id, MAX_AGENT_ID_BYTES)?;
+            cap_str(op, &label, MAX_LABEL_BYTES)?;
+            let child_id = resolve_guest_agent_ref(tree, child_id);
+            match rollback.rollback_child_to_checkpoint(
+                &AgentId(caller_id.to_string()),
+                &AgentId(child_id),
+                label,
+            ) {
+                Ok(_) => ok_unit(),
+                Err(e) => lower_lifecycle_err(e),
+            }
+        }
+        other => {
+            return Err(HostCallError::HandlerError(format!(
+                "unknown checkpoint op {other}"
+            )))
+        }
+    })
+}
+
 /// Narrow spawn-only handler (011): dispatches `spawn-child` / `spawn-sub` /
 /// `spawn-agent-from-template` over a [`Spawner`] via the shared
 /// [`dispatch_spawn`], running the SAME `check_results_len` + caller `cap_str`

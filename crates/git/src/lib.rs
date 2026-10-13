@@ -68,6 +68,7 @@ pub mod config;
 pub(crate) mod coord;
 pub mod error;
 pub mod gc;
+pub mod history;
 pub mod repo;
 pub mod rollback;
 
@@ -77,5 +78,11 @@ pub use commit_queue::{CommitRequest, CommitType, DefaultGitCommitQueue, GitComm
 pub use config::{GitConfigProvider, GitConfigSnapshot, StaticGitConfigProvider};
 pub use error::{CheckpointError, DeniedReason, GitError, RollbackError};
 pub use gc::GcTask;
+pub use history::{
+    checkpoints_by_sha, clamp_limit, validate_workspace_path, CheckpointList, CheckpointRecord,
+    CommitEntry, CommitFilter, CommitPage, FileAtVersion, FileHistory, FileVersion,
+    GitFileHistoryProvider, GitHistoryReader, HistoryError, RepoSummary, DEFAULT_PAGE_LIMIT,
+    MAX_BLOB_BYTES, MAX_PAGE_LIMIT,
+};
 pub use repo::{bootstrap_repo_at, ensure_workspace_repo, repo_status, GitRepoStatus};
 pub use rollback::{DefaultWorkspaceRollback, RollbackMode, RollbackTarget, WorkspaceRollback};

@@ -127,9 +127,9 @@ pub use terminate::{
     RunCascade, TerminateController, WorkspaceCleanup,
 };
 pub use wit_impl::{
-    register_agent_component_submit, register_agent_decomposition, register_agent_lifecycle,
-    register_agent_spawn, AgentLifecycleBundle, AGENT_LIFECYCLE_CAPABILITY,
-    AGENT_LIFECYCLE_NAMESPACE,
+    register_agent_checkpoints, register_agent_component_submit, register_agent_decomposition,
+    register_agent_lifecycle, register_agent_spawn, AgentLifecycleBundle,
+    AGENT_LIFECYCLE_CAPABILITY, AGENT_LIFECYCLE_NAMESPACE,
 };
 // sat/pack-template-bridge (2026-06-15): pack-sourced TemplateResolver.
 pub use pack_template_resolver::PackTemplateResolver;

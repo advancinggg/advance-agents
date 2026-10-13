@@ -400,6 +400,51 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
         ] {
             m.insert(name.to_string(), schema);
         }
+        // Git family (workspace history) DTOs (additive).
+        for (name, schema) in [
+            (
+                "ClientGitStatus",
+                schema_value::<crate::git::ClientGitStatus>(),
+            ),
+            (
+                "ClientGitCheckpointEntry",
+                schema_value::<crate::git::ClientGitCheckpointEntry>(),
+            ),
+            (
+                "ClientGitCommitEntry",
+                schema_value::<crate::git::ClientGitCommitEntry>(),
+            ),
+            (
+                "ClientGitCommitPage",
+                schema_value::<crate::git::ClientGitCommitPage>(),
+            ),
+            (
+                "ClientGitCheckpointList",
+                schema_value::<crate::git::ClientGitCheckpointList>(),
+            ),
+            (
+                "ClientGitFileVersion",
+                schema_value::<crate::git::ClientGitFileVersion>(),
+            ),
+            (
+                "ClientGitFileHistory",
+                schema_value::<crate::git::ClientGitFileHistory>(),
+            ),
+            (
+                "ClientGitFileAt",
+                schema_value::<crate::git::ClientGitFileAt>(),
+            ),
+            (
+                "ClientGitCreateCheckpointRequest",
+                schema_value::<crate::git::ClientGitCreateCheckpointRequest>(),
+            ),
+            (
+                "ClientGitRollbackResult",
+                schema_value::<crate::git::ClientGitRollbackResult>(),
+            ),
+        ] {
+            m.insert(name.to_string(), schema);
+        }
         // Providers family (LLM provider administration) DTOs (additive).
         for (name, schema) in [
             (

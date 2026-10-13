@@ -63,13 +63,33 @@ pub enum CommitType {
     L6,
 }
 
-impl std::fmt::Display for CommitType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
+impl CommitType {
+    /// The exact lowercase token the `Display` formatter writes into the
+    /// `[<commit_type>]` commit-message prefix.
+    pub fn as_token(&self) -> &'static str {
+        match self {
             Self::Turn => "turn",
             Self::Micro => "micro",
             Self::L6 => "l6",
-        })
+        }
+    }
+
+    /// The inverse of [`CommitType::as_token`] — the history reader's prefix
+    /// parse (git-family PR-2). Case-sensitive: the queue only ever writes the
+    /// lowercase tokens, so anything else is "not one of ours" → `None`.
+    pub fn parse_token(token: &str) -> Option<Self> {
+        match token {
+            "turn" => Some(Self::Turn),
+            "micro" => Some(Self::Micro),
+            "l6" => Some(Self::L6),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CommitType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_token())
     }
 }
 

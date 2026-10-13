@@ -102,6 +102,7 @@ dependencies = [
  "advance-database",
  "advance-event-bus",
  "advance-genui",
+ "advance-git",
  "advance-messaging",
  "advance-run-manager",
  "advance-shared-types",
