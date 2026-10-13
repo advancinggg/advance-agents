@@ -485,19 +485,36 @@ impl crate::provider::GitHistoryProvider for GitHistoryReaderProvider {
     ) -> Result<ClientGitRollbackResult, ProviderError> {
         let rollback = DefaultWorkspaceRollback::new(self.reader.workspace().to_path_buf())
             .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| ProviderError::Unavailable("no async runtime".into()))?;
-        let paths = handle
-            .block_on(rollback.rollback_to_checkpoint(agent_id, label))
-            .map_err(|e| match e {
-                advance_git::RollbackError::NotFound { .. } => {
-                    ProviderError::NotFound("checkpoint".into())
-                }
-                advance_git::RollbackError::PermissionDenied { .. } => {
-                    ProviderError::Forbidden("rollback".into())
-                }
-                other => ProviderError::Unavailable(other.to_string()),
-            })?;
+        let agent = agent_id.to_string();
+        let label_owned = label.to_string();
+        // `handle()` is sync; the git surface is async. Drive it on an owned
+        // current-thread runtime on a scoped OS thread — never `Handle::block_on`
+        // (workspace clippy bans it; it panics on a worker).
+        let paths = std::thread::scope(|s| {
+            s.spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        ProviderError::Unavailable(format!(
+                            "git rollback: failed to build the owned runtime: {e}"
+                        ))
+                    })?;
+                runtime
+                    .block_on(rollback.rollback_to_checkpoint(&agent, &label_owned))
+                    .map_err(|e| match e {
+                        advance_git::RollbackError::NotFound { .. } => {
+                            ProviderError::NotFound("checkpoint".into())
+                        }
+                        advance_git::RollbackError::PermissionDenied { .. } => {
+                            ProviderError::Forbidden("rollback".into())
+                        }
+                        other => ProviderError::Unavailable(other.to_string()),
+                    })
+            })
+            .join()
+            .map_err(|_| ProviderError::Unavailable("git rollback panicked".into()))?
+        })?;
         Ok(ClientGitRollbackResult {
             agent_id: agent_id.to_string(),
             label: label.to_string(),

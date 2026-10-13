@@ -7,7 +7,9 @@
 //! Client API tools view shows them: MODULE-020-AC-18 on an `mcp` home without `tools`), and
 //! the teardown joins the background listings and stops the server's process group
 //! (MODULE-001-AC-30 / T111 (6) on an `mcp` home). Own binary: the spawn counter is
-//! process-global.
+//! process-global. The two tests below still share that counter, so they take
+//! `SPAWN_COUNTER` for the whole compose — otherwise CI's default parallelism
+//! lets Allow's admit land in Forbid's `admitted_total()` (and the reverse).
 
 #![cfg(unix)]
 
@@ -27,6 +29,10 @@ use serde_json::Value;
 
 const WAIT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(50);
+
+/// Serializes the two tests in this binary: they both delta the process-global
+/// spawn counter and would race under `cargo test`'s default thread pool.
+static SPAWN_COUNTER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn alive_tasks() -> usize {
     tokio::runtime::Handle::current()
@@ -74,6 +80,7 @@ fn pid_alive(pid: u32) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sys_ac_338_j83_forbid_refuses_the_composed_mcp_stdio_server() {
+    let _spawn = SPAWN_COUNTER.lock().await;
     let s0 = spawn_counter::snapshot();
     let marker = McpStdioServerMarker::new().expect("marker");
     let home = mcp_home(&marker);
@@ -119,6 +126,7 @@ async fn sys_ac_338_j83_forbid_refuses_the_composed_mcp_stdio_server() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_001_ac30_t111_6_mcp_listings_are_joined_and_the_server_group_stopped() {
+    let _spawn = SPAWN_COUNTER.lock().await;
     let s0 = spawn_counter::snapshot();
     let marker = McpStdioServerMarker::new().expect("marker");
     let home = mcp_home(&marker);

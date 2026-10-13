@@ -54,7 +54,6 @@ pub struct ChildContextDeps {
     pub assembler_model: String,
     pub llm_provider: Option<String>,
     pub runtime_version: String,
-    pub runtime_handle: tokio::runtime::Handle,
     pub log: LogHandle,
 }
 
@@ -107,7 +106,7 @@ pub fn attach_child_context(
 
     let declared_refs: Vec<&str> = declared_caps.iter().map(|s| s.as_str()).collect();
     let wasm_entries = if let Some(reg) = deps.tool_registry.as_ref() {
-        let listed = list_tools_blocking(reg, &deps.runtime_handle);
+        let listed = list_tools_blocking(reg);
         let allow = deps
             .tools_grant_reader
             .as_ref()
@@ -238,20 +237,22 @@ pub fn resolve_assembler_model(
     }
 }
 
-/// `ToolRegistry::list` is async; child spawn is sync. Hop off the current
-/// worker so we never `block_on` a runtime from inside itself.
-fn list_tools_blocking(
-    reg: &Arc<dyn ToolRegistry>,
-    handle: &tokio::runtime::Handle,
-) -> Vec<cap_tools::ToolInfo> {
+/// `ToolRegistry::list` is async; child spawn is sync. Drive it on an owned
+/// current-thread runtime on a side thread — never `Handle::block_on`
+/// (workspace clippy bans it; it panics on a worker).
+fn list_tools_blocking(reg: &Arc<dyn ToolRegistry>) -> Vec<cap_tools::ToolInfo> {
     let reg = Arc::clone(reg);
-    let handle = handle.clone();
     std::thread::Builder::new()
         .name("child-tools-list".into())
-        .spawn(move || handle.block_on(cap_tools::ToolRegistry::list(reg.as_ref())))
-        .and_then(|join| {
-            join.join()
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "tools list thread"))
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .map(|rt| rt.block_on(cap_tools::ToolRegistry::list(reg.as_ref())))
+                .unwrap_or_default()
         })
+        .ok()
+        .and_then(|join| join.join().ok())
         .unwrap_or_default()
 }

@@ -269,10 +269,7 @@ impl GitHistoryReader {
             },
             None => Some(0),
         };
-        let checkpoint_count = match count_checkpoint_refs(&repo) {
-            Ok(n) => n,
-            Err(_) => None,
-        };
+        let checkpoint_count = count_checkpoint_refs(&repo).unwrap_or_default();
         RepoSummary {
             status,
             head_sha: head.map(|oid| oid.to_string()),
@@ -811,15 +808,13 @@ fn walk_file_history(
 ) -> Result<(Vec<FileVersion>, bool), git2::Error> {
     let walk = first_parent_walk(repo, tip)?;
     let mut items = Vec::new();
-    let mut scanned = 0usize;
     let mut truncated = false;
-    for oid in walk {
+    for (scanned, oid) in walk.enumerate() {
         if items.len() >= MAX_FILE_HISTORY || scanned >= MAX_FILE_HISTORY_SCAN {
             truncated = true;
             break;
         }
         let oid = oid?;
-        scanned += 1;
         let commit = repo.find_commit(oid)?;
         let tree = commit.tree()?;
         let now = blob_at(&tree, rel);

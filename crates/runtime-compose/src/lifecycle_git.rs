@@ -58,8 +58,9 @@ impl NamedCheckpointGate for NamedCheckpointAdapter {
 
 /// [`WorkspaceRollbackGate`] over [`DefaultWorkspaceRollback`].
 ///
-/// The gate is sync; the git surface is async. Called from a tokio worker via
-/// `block_in_place` so the inner `spawn_blocking` can run.
+/// The gate is sync; the git surface is async. Each call runs on an owned
+/// current-thread runtime on a scoped OS thread — never `Handle::block_on`
+/// (workspace clippy bans it; it panics on a worker).
 pub struct WorkspaceRollbackAdapter {
     inner: Arc<DefaultWorkspaceRollback>,
 }
@@ -105,14 +106,9 @@ impl WorkspaceRollbackGate for WorkspaceRollbackAdapter {
     ) -> Result<Vec<PathBuf>, LifecycleError> {
         let inner = Arc::clone(&self.inner);
         let agent = agent_id.to_string();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(inner.rollback(
-                &agent,
-                map_target(target),
-                map_mode(mode),
-            ))
-        })
-        .map_err(map_rollback_err)
+        let target = map_target(target);
+        let mode = map_mode(mode);
+        block_on_owned(inner.rollback(&agent, target, mode))?.map_err(map_rollback_err)
     }
 
     fn rollback_to_checkpoint(
@@ -123,9 +119,28 @@ impl WorkspaceRollbackGate for WorkspaceRollbackAdapter {
         let inner = Arc::clone(&self.inner);
         let agent = agent_id.to_string();
         let label = label.to_string();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(inner.rollback_to_checkpoint(&agent, &label))
-        })
-        .map_err(map_rollback_err)
+        block_on_owned(inner.rollback_to_checkpoint(&agent, &label))?.map_err(map_rollback_err)
     }
+}
+
+fn block_on_owned<F>(fut: F) -> Result<F::Output, LifecycleError>
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    LifecycleError::InvalidTarget(format!(
+                        "rollback: failed to build the owned runtime: {e}"
+                    ))
+                })?;
+            Ok(runtime.block_on(fut))
+        })
+        .join()
+        .map_err(|_| LifecycleError::InvalidTarget("rollback panicked".into()))?
+    })
 }

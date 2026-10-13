@@ -429,7 +429,6 @@ pub(crate) async fn compose_graph(
             assembler_model,
             llm_provider,
             runtime_version: env!("CARGO_PKG_VERSION").to_string(),
-            runtime_handle: tokio::runtime::Handle::current(),
             log: log.clone(),
         }));
     }
@@ -1778,7 +1777,6 @@ pub async fn spawn_test_agent_loop(
             assembler_model,
             llm_provider,
             runtime_version: env!("CARGO_PKG_VERSION").to_string(),
-            runtime_handle: tokio::runtime::Handle::current(),
             log: LogHandle::null(),
         }));
     }
