@@ -150,6 +150,9 @@ pub struct PerChildLoopManager {
     /// Where an unserved child and an undelegated grant are reported
     /// ([`Self::with_log`]; none by default).
     log: LogHandle,
+    /// Late-bound production context assembler + post-processor deps. Set
+    /// after the LLM gateway exists and before any child is served.
+    context_deps: Mutex<Option<Arc<crate::child_context::ChildContextDeps>>>,
 }
 
 impl PerChildLoopManager {
@@ -187,6 +190,7 @@ impl PerChildLoopManager {
             skip_crash: false,
             child_config_data: None,
             log: LogHandle::null(),
+            context_deps: Mutex::new(None),
         }
     }
 
@@ -251,6 +255,13 @@ impl PerChildLoopManager {
     pub fn bind_runtime(&self, runtime: Arc<ComponentRuntime>, injector: Arc<CapabilityInjector>) {
         lock(&self.runtime).get_or_insert(runtime);
         lock(&self.injector).get_or_insert(injector);
+    }
+
+    /// Late-bind the production context assembler / post-processor deps.
+    /// Call once, after the LLM gateway exists and before any child is served
+    /// (including `serve_existing_children`). The first binding wins.
+    pub fn bind_context(&self, deps: Arc<crate::child_context::ChildContextDeps>) {
+        lock(&self.context_deps).get_or_insert(deps);
     }
 
     /// Release the late-bound runtime and injector.
@@ -687,6 +698,18 @@ impl SpawnObserver for PerChildLoopManager {
             if let Some(sink) = self.crash_sink.as_ref() {
                 driver = driver.with_crash_cascade(sink.clone());
             }
+        }
+        if let Some(deps) = lock(&self.context_deps).clone() {
+            let cap_names: Vec<String> =
+                declared.iter().map(|c| c.id.as_str().to_string()).collect();
+            driver = crate::child_context::attach_child_context(
+                driver,
+                &deps,
+                child_bare,
+                &child_colon,
+                workspace,
+                &cap_names,
+            );
         }
         let cfg = ComponentConfig {
             id: child_bare.to_string(),

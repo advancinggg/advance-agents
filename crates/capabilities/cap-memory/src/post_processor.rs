@@ -484,6 +484,22 @@ impl Components {
         self
     }
 
+    /// Swap the (deterministic 8-dim stub) embedder for a real one — the
+    /// composition root installs a CONTRACT-081 `embed()` adapter when an
+    /// embedding-capable provider is configured, so `sync_turn_index` /
+    /// `sync_task_index` write semantic vectors the context assembler's recall
+    /// and task-routing read side can match against (same model, same dim).
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder + Send + Sync>) -> Self {
+        self.embedder = embedder;
+        self
+    }
+
+    /// The SQLite index this pipeline writes (shared with the context
+    /// assembler's read-side adapters so recall sees every turn-end write).
+    pub fn sqlite_index(&self) -> Arc<dyn SqliteIndex + Send + Sync> {
+        Arc::clone(&self.sqlite_index)
+    }
+
     /// SAT-C (slice satC-l6): attach the in-process L6 dispatch handler invoked
     /// by Step-9 after `emit_consolidation_due`. Consuming builder mirroring the
     /// SAT-B write-path builders. The cli composition root calls this (via
@@ -733,6 +749,15 @@ impl From<EmbedderError> for PostProcessorError {
     fn from(e: EmbedderError) -> Self {
         PostProcessorError::StorageError(e.to_string())
     }
+}
+
+/// The per-agent DEFAULT task partition Step 7 writes under when the inbound
+/// message carries no `task_id` (`_agent-{write_id}`). The context assembler's
+/// history readers use the SAME derivation so a turn with no task id reads back
+/// the history the previous no-task-id turns wrote. `None` when `write_id` is
+/// not a safe path segment (Step 7 then skips the write as well).
+pub fn default_task_partition(write_id: &str) -> Option<String> {
+    sanitize_task_segment(write_id).map(|s| format!("_agent-{s}"))
 }
 
 /// SAT-B (AC-45 / D4): validate a guest-controllable task-id path SEGMENT.
@@ -1191,8 +1216,8 @@ impl PostProcessor {
         // (derive a per-agent default partition) from a present-but-malicious
         // value (SKIP — never silently redirect under `_agent-*`).
         let task_id = match msg.context.as_ref().and_then(|c| c.task_id.clone()) {
-            None => match sanitize_task_segment(write_id) {
-                Some(s) => format!("_agent-{s}"),
+            None => match default_task_partition(write_id) {
+                Some(s) => s,
                 None => {
                     eprintln!(
                         "cap-memory post-processor Step 7: write_id {write_id:?} unsanitizable for a default task partition; skipping on-disk write"

@@ -390,6 +390,49 @@ pub(crate) async fn compose_graph(
     ) {
         mgr.set_llm_stream_reaper(reaper.clone());
     }
+    // Shared context-inspect store + durable memory index, bound onto the
+    // per-child manager BEFORE the root loop starts (a root turn can spawn a
+    // child; the child's assembler must already be constructible).
+    let context_store = Arc::new(crate::context_inspect::ContextSnapshotStore::new());
+    let memory_index =
+        crate::child_context::open_shared_memory_index(wiring_handles.memory_root.as_deref(), &log);
+    if let (Some(mgr), Some(gateway)) = (
+        wiring_handles.perchild_manager.as_ref(),
+        wiring_handles.llm_gateway.as_ref(),
+    ) {
+        let (assembler_model, llm_provider) =
+            crate::child_context::resolve_assembler_model(&host.config().llm_providers);
+        mgr.bind_context(Arc::new(crate::child_context::ChildContextDeps {
+            context_store: context_store.clone(),
+            gateway: gateway.clone(),
+            memory_store: wiring_handles.memory_store.clone(),
+            memory_index: memory_index.clone(),
+            agent_tree: wiring_handles.agent_tree_snapshot.clone(),
+            decomposition: wiring_handles.decomposition_store.clone(),
+            pack_runtime: Some(wiring_handles.pack_runtime.clone()),
+            tool_registry: wiring_handles.tool_registry.clone(),
+            tools_grant_reader: wiring_handles.tools_grant_reader.clone(),
+            web_grant: wiring_handles.web_grant.clone(),
+            mcp: wiring_handles.mcp.clone(),
+            event_bus: wiring_handles.event_bus_dyn.clone(),
+            event_bus_ss: wiring_handles.event_bus.clone(),
+            git_queue: wiring_handles
+                .git_queue
+                .clone()
+                .map(|q| -> Arc<dyn advance_git::GitCommitQueue> { q }),
+            vlm: wiring_handles.vlm_extractor.clone(),
+            host_registry: host.host_registry(),
+            embedding_posture: crate::context_inspect::EmbeddingPosture {
+                active: gateway.has_embedding_provider(),
+                model: gateway.embedding_model_id(),
+            },
+            assembler_model,
+            llm_provider,
+            runtime_version: env!("CARGO_PKG_VERSION").to_string(),
+            runtime_handle: tokio::runtime::Handle::current(),
+            log: log.clone(),
+        }));
+    }
     let agent_loop = match try_spawn_agent_loop(
         &host,
         &workspace,
@@ -456,6 +499,8 @@ pub(crate) async fn compose_graph(
             turn_gate: failpoints.turn_gate.clone(),
             #[cfg(feature = "test-support")]
             probe: failpoints.probe.clone(),
+            context_store: Some(context_store),
+            memory_index,
         },
     )
     .await
@@ -495,6 +540,10 @@ pub(crate) async fn compose_graph(
                 &wiring_handles.root_agent_id,
                 wiring_handles.skills_root.clone(),
             );
+            // `GET /client/agents/{id}/context`: the latest assembled prompt breakdown.
+            if let Some(inspect) = spawned.context_inspect.clone() {
+                server.api().install_context_provider(inspect);
+            }
         }
     }
 
@@ -1108,7 +1157,7 @@ async fn try_spawn_agent_loop(
         ),
     }
     .with_turn_observer(observer)
-    .with_model(assembler_model)
+    .with_model(assembler_model.clone())
     .with_component_error_emitter(ce_emitter)
     .with_run_bootstrap(Arc::new(RunManagerBootstrap {
         run_manager,
@@ -1135,7 +1184,7 @@ async fn try_spawn_agent_loop(
     // both Options via `.as_ref()` so the context-assembler block below — which
     // MOVES `llm_gateway` (the `if let Some(gateway)`) and `memory_store` — still
     // owns them. The bare `cap_agent_id` is the write-bucket key (colon/bare fix).
-    driver = driver.with_post_processor(build_live_post_processor(
+    let (post_processor, memory_index) = build_live_post_processor(
         memory_store.as_ref(),
         llm_gateway.as_ref(),
         workspace,
@@ -1145,7 +1194,9 @@ async fn try_spawn_agent_loop(
         vlm_extractor,
         agent_tree_snapshot.clone(),
         log,
-    ));
+        extras.memory_index.clone(),
+    );
+    driver = driver.with_post_processor(post_processor);
     // Backbone Step 2: when llm is wired, install the REAL ContextAssemblerImpl
     // (via the PublishingContextAssembler seam) so the assembled layered context
     // (a) emits `context.assembled` per real turn and (b) feeds the guest's
@@ -1156,6 +1207,7 @@ async fn try_spawn_agent_loop(
     // STUBS `callable_inventory` (empty, lands in a later slice). `None` gateway →
     // keep the default MinimalContextAssembler (no LLM, no seam).
     let mut client_api_tools = None;
+    let mut context_inspect: Option<Arc<crate::context_inspect::ContextInspectAdapter>> = None;
     if let Some(gateway) = llm_gateway {
         // Backbone Step 2 (adversarial r9 W2): probe host fns ONLY under the caps
         // THIS agent declared in `.agent/config.yaml` (the same `caps` set injected
@@ -1236,34 +1288,113 @@ async fn try_spawn_agent_loop(
         client_api_tools =
             (tool_registry.is_some() || mcp.is_some()).then(|| Arc::clone(&callable));
         let identity_root = workspace.join(".agent");
-        let inner = crate::context_wiring::build_context_assembler_for_agent_with_pack_skills(
-            assembler_bus,
-            callable,
-            Arc::new(crate::context_wiring::FixedHostFnInventory::new(
-                crate::context_wiring::host_fns_from_registry(
-                    &*host.host_registry(),
-                    &declared_caps,
-                ),
-            )),
-            agent_tree,
-            memory_store,
-            &cap_agent_id,
-            &[cap_agent_id.clone(), msg_agent_id.clone()],
-            memory_root.as_deref(),
-            // skills-J26 reader satellite: activates the real DiskSkillSummaryReader
-            // (Some iff `skills` declared — already gated in wiring.rs).
-            skills_root.as_deref(),
-            decomposition,
-            // Installed packs' skills, for an agent that can reach their tools.
-            pack_runtime
-                .filter(|_| tool_registry.is_some())
-                .map(|runtime| {
-                    Arc::new(crate::context_wiring::PackSkillSummaryReader::new(runtime))
-                        as Arc<dyn advance_context_engine::ports::SkillSummaryReader>
-                }),
-            // AGENTS.md identity: always-on for the agent workspace. Not
-            // capability-gated (unlike skills/memory). Missing file → empty Tier 1a.
-            Some(&identity_root),
+        // Live embedding: only when the provider config can embed (an OpenAI-
+        // compatible endpoint, or a local / mesh entry with an `embedding-model`).
+        // Then the assembler embeds the prompt once per turn and the recall /
+        // task-routing ports read the post-processor's SQLite index (written with
+        // the SAME gateway embedder). Otherwise the zero-vector stub stays and no
+        // `/v1/embeddings` round-trip is attempted.
+        let embedding_live = gateway.has_embedding_provider();
+        let embedding: Option<Arc<dyn advance_context_engine::EmbeddingPort>> = embedding_live
+            .then(|| {
+                Arc::new(crate::context_wiring::GatewayEmbedding::new(
+                    gateway.clone(),
+                )) as Arc<dyn advance_context_engine::EmbeddingPort>
+            });
+        let embedding_model = if embedding_live {
+            gateway.embedding_model_id()
+        } else {
+            None
+        };
+        // Per-agent latest-assembly store (the Client API context inspector).
+        // Shared with child loops when the composition root created one.
+        let context_store = extras
+            .context_store
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::context_inspect::ContextSnapshotStore::new()));
+        context_store.register_aliases(&[cap_agent_id.clone(), msg_agent_id.clone()]);
+        // Runtime facts for the Tier 1a `# Runtime Architecture` / `# Security
+        // Model` and Tier 1b `# Runtime State` sections.
+        let llm_provider = resolve_provider_and_model(&host.config().llm_providers, None)
+            .ok()
+            .map(|r| r.id);
+        let runtime_info = advance_context_engine::RuntimeInfoView {
+            runtime_version: env!("CARGO_PKG_VERSION").to_string(),
+            agent_kind: agent_tree.agent_kind(&cap_agent_id).map(|k| {
+                match k {
+                    advance_shared_types::agent_tree::AgentKind::Root => "root",
+                    advance_shared_types::agent_tree::AgentKind::Child => "child",
+                    advance_shared_types::agent_tree::AgentKind::Sub => "sub",
+                }
+                .to_string()
+            }),
+            parent_agent: agent_tree.parent_of(&cap_agent_id),
+            workspace: Some(workspace.display().to_string()),
+            capabilities: declared_cap_names.clone(),
+            mode: Some(
+                if channels_active {
+                    "channels"
+                } else if progress_loop.is_some() {
+                    "protected"
+                } else {
+                    "serve"
+                }
+                .to_string(),
+            ),
+            llm_provider,
+            llm_model: (!assembler_model.is_empty()).then(|| assembler_model.clone()),
+            memory_enabled: memory_store.is_some(),
+            skills_enabled: skills_root.is_some(),
+            embedding_enabled: embedding_live,
+        };
+        context_inspect = Some(Arc::new(
+            crate::context_inspect::ContextInspectAdapter::new(
+                context_store.clone(),
+                crate::context_inspect::EmbeddingPosture {
+                    active: embedding_live,
+                    model: embedding_model,
+                },
+                memory_index.clone(),
+                &cap_agent_id,
+            ),
+        ));
+        let inner = crate::context_wiring::build_context_assembler_for_agent_production(
+            crate::context_wiring::ProductionAssemblerParts {
+                event_bus: assembler_bus,
+                callable_inventory: callable,
+                host_fn_inventory: Arc::new(crate::context_wiring::FixedHostFnInventory::new(
+                    crate::context_wiring::host_fns_from_registry(
+                        &*host.host_registry(),
+                        &declared_caps,
+                    ),
+                )),
+                agent_tree,
+                memory: memory_store,
+                write_agent_id: &cap_agent_id,
+                query_aliases: &[cap_agent_id.clone(), msg_agent_id.clone()],
+                memory_root: memory_root.as_deref(),
+                // skills-J26 reader satellite: activates the real DiskSkillSummaryReader
+                // (Some iff `skills` declared — already gated in wiring.rs).
+                skills_agent_root: skills_root.as_deref(),
+                decomposition,
+                // Installed packs' skills, for an agent that can reach their tools.
+                pack_skills: pack_runtime
+                    .filter(|_| tool_registry.is_some())
+                    .map(|runtime| {
+                        Arc::new(crate::context_wiring::PackSkillSummaryReader::new(runtime))
+                            as Arc<dyn advance_context_engine::ports::SkillSummaryReader>
+                    }),
+                // AGENTS.md identity: always-on for the agent workspace. Not
+                // capability-gated (unlike skills/memory). Missing file → empty Tier 1a.
+                identity_agent_root: Some(&identity_root),
+                embedding,
+                sqlite_index: memory_index.clone(),
+                runtime_info: Some(runtime_info),
+                report_sink: Some(context_store),
+                light_llm: Some(Arc::new(crate::context_wiring::GatewayLightLlm::new(
+                    gateway.clone(),
+                ))),
+            },
         );
         // Wave-12 (SYS-AC-122): LATE-BIND THIS per-agent assembler into the
         // process-global tool-path RepetitionGuard (built at wire_capabilities
@@ -1411,6 +1542,7 @@ async fn try_spawn_agent_loop(
         host_pump,
         channels_active,
         tools_inventory: client_api_tools,
+        context_inspect,
     }))
 }
 
@@ -1429,6 +1561,10 @@ pub(crate) struct LoopSpawnExtras {
     /// Records the gate's installation and the `/hooks` address (test-only).
     #[cfg(feature = "test-support")]
     pub probe: Option<Arc<crate::test_support::ComposeProbe>>,
+    /// Shared latest-assembly store (root + children). `None` → the loop creates one.
+    pub context_store: Option<Arc<crate::context_inspect::ContextSnapshotStore>>,
+    /// Shared cap-memory SQLite index (root + children). `None` → open locally.
+    pub memory_index: Option<Arc<dyn cap_memory::SqliteIndex + Send + Sync>>,
 }
 
 /// The root loop's context assembler, behind the turn gate when one is configured.
@@ -1532,6 +1668,9 @@ pub(crate) struct SpawnedAgentLoop {
     channels_active: bool,
     /// Real `CallableInventory` gathered at spawn, if tools were registered.
     tools_inventory: Option<Arc<dyn CallableInventoryReader>>,
+    /// The context-inspection provider (latest assembled prompt per agent), when
+    /// the real assembler is wired (llm declared).
+    context_inspect: Option<Arc<crate::context_inspect::ContextInspectAdapter>>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1601,6 +1740,48 @@ pub async fn spawn_test_agent_loop(
     ) {
         mgr.set_llm_stream_reaper(reaper.clone());
     }
+    let context_store = Arc::new(crate::context_inspect::ContextSnapshotStore::new());
+    let memory_index = crate::child_context::open_shared_memory_index(
+        handles.memory_root.as_deref(),
+        &LogHandle::null(),
+    );
+    if let (Some(mgr), Some(gateway)) = (
+        handles.perchild_manager.as_ref(),
+        handles.llm_gateway.as_ref(),
+    ) {
+        let (assembler_model, llm_provider) =
+            crate::child_context::resolve_assembler_model(&host.config().llm_providers);
+        mgr.bind_context(Arc::new(crate::child_context::ChildContextDeps {
+            context_store: context_store.clone(),
+            gateway: gateway.clone(),
+            memory_store: handles.memory_store.clone(),
+            memory_index: memory_index.clone(),
+            agent_tree: handles.agent_tree_snapshot.clone(),
+            decomposition: handles.decomposition_store.clone(),
+            pack_runtime: Some(handles.pack_runtime.clone()),
+            tool_registry: handles.tool_registry.clone(),
+            tools_grant_reader: handles.tools_grant_reader.clone(),
+            web_grant: handles.web_grant.clone(),
+            mcp: handles.mcp.clone(),
+            event_bus: handles.event_bus_dyn.clone(),
+            event_bus_ss: handles.event_bus.clone(),
+            git_queue: handles
+                .git_queue
+                .clone()
+                .map(|q| -> Arc<dyn advance_git::GitCommitQueue> { q }),
+            vlm: handles.vlm_extractor.clone(),
+            host_registry: host.host_registry(),
+            embedding_posture: crate::context_inspect::EmbeddingPosture {
+                active: gateway.has_embedding_provider(),
+                model: gateway.embedding_model_id(),
+            },
+            assembler_model,
+            llm_provider,
+            runtime_version: env!("CARGO_PKG_VERSION").to_string(),
+            runtime_handle: tokio::runtime::Handle::current(),
+            log: LogHandle::null(),
+        }));
+    }
     try_spawn_agent_loop(
         host,
         workspace,
@@ -1633,7 +1814,11 @@ pub async fn spawn_test_agent_loop(
         handles.web_grant.clone(),
         Some(handles.pack_runtime.clone()),
         handles.mcp.clone(),
-        LoopSpawnExtras::default(),
+        LoopSpawnExtras {
+            context_store: Some(context_store),
+            memory_index,
+            ..LoopSpawnExtras::default()
+        },
     )
     .await
     .map(|spawned| spawned.map(|inner| TestServeLoop { inner }))
@@ -2123,7 +2308,7 @@ mod tests {
 /// in-memory index (the turn pipeline never fails on index-open). All
 /// store/index/file writes are keyed by the BARE `write_agent_id` (the
 /// colon-msg-id vs bare-cap-id write-bucket fix).
-fn build_live_post_processor(
+pub(crate) fn build_live_post_processor(
     memory_store: Option<&Arc<cap_memory::MemoryStore>>,
     llm_gateway: Option<&Arc<LlmGateway>>,
     workspace: &Path,
@@ -2143,12 +2328,18 @@ fn build_live_post_processor(
     // (`build_l6_stale_resolver`). `None` ⇒ `EmptyAgentTree` fallback (conservative Stale).
     agent_tree: Option<Arc<dyn AgentTreeSnapshot>>,
     log: &LogHandle,
-) -> Arc<dyn PostProcessorHook> {
+    // Shared durable index (root + children). `None` → open
+    // `<workspace>/.agent/memory/index.sqlite` locally.
+    existing_index: Option<Arc<dyn cap_memory::SqliteIndex + Send + Sync>>,
+) -> (
+    Arc<dyn PostProcessorHook>,
+    Option<Arc<dyn cap_memory::SqliteIndex + Send + Sync>>,
+) {
     let (Some(store), Some(gateway)) = (memory_store, llm_gateway) else {
         // Trace-only path (AC-44 synthetic-entry guard): an LLM-absent or
         // memory-absent config never installs the components-backed processor,
         // so no `StubBatchExtractor` / synthetic entries reach the live turn.
-        return Arc::new(cap_memory::PostProcessor::new());
+        return (Arc::new(cap_memory::PostProcessor::new()), None);
     };
     // Coerce the concrete gateway to the trait object: clone to a concrete
     // `Arc<LlmGateway>` first (so `Arc::clone`'s T is inferred as the concrete
@@ -2177,19 +2368,24 @@ fn build_live_post_processor(
     )
     .with_fs_root(mem_root.clone())
     .with_write_agent_id(write_agent_id);
-    // Durable 254 (AC-46): swap in the on-disk rusqlite index; degrade to the
-    // in-memory default (+ log) if `open` fails — never fail the turn pipeline.
-    match cap_memory::RusqliteSqliteIndex::open(mem_root.join("index.sqlite")) {
-        Ok(idx) => {
-            components = components.with_sqlite_index(Arc::new(idx));
-        }
-        Err(e) => {
-            log.err(
-                log_keys::MEMORY_INDEX_FALLBACK,
-                format!(
-                    "advance start: durable memory index open failed ({e}); using the in-memory index"
-                ),
-            );
+    // Prefer the composition-root shared index (one writer for root + children).
+    // Else open the on-disk rusqlite file; degrade to the in-memory default
+    // (+ log) if `open` fails — never fail the turn pipeline.
+    if let Some(idx) = existing_index {
+        components = components.with_sqlite_index(idx);
+    } else {
+        match cap_memory::RusqliteSqliteIndex::open(mem_root.join("index.sqlite")) {
+            Ok(idx) => {
+                components = components.with_sqlite_index(Arc::new(idx));
+            }
+            Err(e) => {
+                log.err(
+                    log_keys::MEMORY_INDEX_FALLBACK,
+                    format!(
+                        "advance start: durable memory index open failed ({e}); using the in-memory index"
+                    ),
+                );
+            }
         }
     }
     // Stage-C MAINLINE harvest pass-3 (2026-06-19): install the VLM/LLM description
@@ -2238,7 +2434,23 @@ fn build_live_post_processor(
             )),
         );
     }
-    Arc::new(cap_memory::PostProcessor::with_components(components))
+    // Context pipeline: when the gateway can embed, Step 8 (`sync_turn_index` /
+    // `sync_task_index`) stores REAL semantic vectors through the same
+    // `LlmGateway::embed` the context assembler queries with — one model on both
+    // sides, so recall + task routing match. Without an embedding-capable
+    // provider the deterministic `StubEmbedder` stays (rows the assembler's
+    // dim-checked cosine simply never matches).
+    if gateway.has_embedding_provider() {
+        components = components.with_embedder(Arc::new(
+            crate::context_wiring::GatewayMemoryEmbedder::new(Arc::clone(gateway)),
+        ));
+    }
+    // The index the pipeline writes, shared with the assembler's read side.
+    let index = components.sqlite_index();
+    (
+        Arc::new(cap_memory::PostProcessor::with_components(components)),
+        Some(index),
+    )
 }
 
 #[cfg(test)]
@@ -2282,7 +2494,7 @@ mod satb_gate_tests {
 
         // (memory present, llm absent) → trace-only, no writes.
         let log = crate::compose_log::LogHandle::null();
-        let pp = build_live_post_processor(
+        let (pp, index) = build_live_post_processor(
             Some(&store),
             None,
             &ws,
@@ -2292,7 +2504,9 @@ mod satb_gate_tests {
             None,
             None,
             &log,
+            None,
         );
+        assert!(index.is_none(), "trace-only path shares no index");
         pp.run("root", &fixture_msg(), &fixture_result())
             .await
             .expect("run Ok");
@@ -2302,7 +2516,8 @@ mod satb_gate_tests {
         );
 
         // (both absent) → trace-only, no writes.
-        let pp2 = build_live_post_processor(None, None, &ws, bus(), "root", None, None, None, &log);
+        let (pp2, _) =
+            build_live_post_processor(None, None, &ws, bus(), "root", None, None, None, &log, None);
         pp2.run("root", &fixture_msg(), &fixture_result())
             .await
             .expect("run Ok");

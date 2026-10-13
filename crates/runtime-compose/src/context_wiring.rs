@@ -50,11 +50,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use advance_context_engine::ports::{
-    AgentIdentityReader, DecompositionReader, EpochSummary, GlobalMemoryRecord, KnowledgeMap,
-    KnowledgeMapReader, L2DigestReader, L3EpochReader, L4TaskSummaryReader, L5SynthesisReader,
-    L6ConsolidationReader, LightLlmFallbackPort, PortError, SkillSummaryEntry, SkillSummaryReader,
-    SubtaskView, SynthesisView, TaskHit, TaskIndexPort, TaskSummaryView, TurnDigestForEmbed,
-    UnifiedSearchPort, UnifiedSearchResult, VectorHit, VectorIndexReader,
+    AgentIdentityReader, AssemblyReportSink, DecompositionReader, EpochSummary, GlobalMemoryRecord,
+    KnowledgeMap, KnowledgeMapReader, L2DigestReader, L3EpochReader, L4TaskSummaryReader,
+    L5SynthesisReader, L6ConsolidationReader, LightLlmFallbackPort, PortError, RuntimeInfoReader,
+    RuntimeInfoView, SkillSummaryEntry, SkillSummaryReader, SubtaskView, SynthesisView, TaskHit,
+    TaskIndexPort, TaskSummaryView, TurnDigestForEmbed, TurnHit, UnifiedSearchPort,
+    UnifiedSearchResult, VectorHit, VectorIndexReader,
 };
 // Re-exported (not just `use`) so downstream test crates that don't depend on
 // `advance-context-engine` directly (e.g. system-acceptance) can call
@@ -198,15 +199,14 @@ impl EmbeddingPort for StubEmbedding {
 
 /// Real `EmbeddingPort` wrapping cap-llm's `LlmGateway::embed` (`/v1/embeddings`).
 ///
-/// **B1 backbone (2026-06-09): built + tested, but NOT injected into the live
-/// assembler this slice.** `assemble()` runs `TaskRouter` whenever
-/// `ctx.task_id.is_none()`, and the router calls `embed()` BEFORE the task
-/// index — so a live `GatewayEmbedding` would force a real `/v1/embeddings`
-/// round-trip on every turn (breaking the hermetic witness the existing
-/// [`StubEmbedding`] preserves) for ZERO benefit: the task index is empty (no
-/// embeddings indexed yet) so routing degrades to `NewTask` regardless. This
-/// adapter goes live in the future slice that populates a real embedding index.
-/// See MODULE-010 §3.6 (B1 backbone row).
+/// **Live in production** when the gateway reports
+/// [`LlmGateway::has_embedding_provider`] (the daemon gates on it): the
+/// assembler embeds the prompt ONCE per turn (its memoizing wrapper) and
+/// shares the vector between the recall search, the L1 lookup and the task
+/// router. Without an embedding-capable provider the daemon keeps
+/// [`StubEmbedding`], so a config that cannot embed never pays a failing
+/// round-trip per turn. The SAME gateway backs [`GatewayMemoryEmbedder`] on the
+/// write side, so stored and query vectors come from one model.
 pub struct GatewayEmbedding {
     gateway: Arc<LlmGateway>,
 }
@@ -224,6 +224,248 @@ impl EmbeddingPort for GatewayEmbedding {
             .embed(text)
             .await
             .map_err(|e| PortError(e.to_string()))
+    }
+}
+
+/// The write-side twin of [`GatewayEmbedding`]: cap-memory's internal
+/// `Embedder` seam over the SAME `LlmGateway::embed`, installed into the live
+/// post-processor `Components` so `sync_turn_index` / `sync_task_index` store
+/// real semantic vectors (replacing the deterministic 8-dim `StubEmbedder`).
+/// Errors are mapped to a COARSE status string (the seam's redaction contract:
+/// never the upstream body / headers).
+pub struct GatewayMemoryEmbedder {
+    gateway: Arc<LlmGateway>,
+}
+impl GatewayMemoryEmbedder {
+    pub fn new(gateway: Arc<LlmGateway>) -> Self {
+        Self { gateway }
+    }
+}
+#[async_trait]
+impl cap_memory::Embedder for GatewayMemoryEmbedder {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, cap_memory::EmbedderError> {
+        self.gateway
+            .embed(text)
+            .await
+            .map_err(|e| cap_memory::EmbedderError::Upstream(e.variant_name().to_string()))
+    }
+}
+
+/// Rows scanned per recall read (most recent first by `updated_at`). Bounds the
+/// per-turn cosine pass over a long-lived agent's turn index.
+const MAX_INDEX_SCAN_ROWS: usize = 4096;
+/// Recall hits rendered per kind + the similarity floor below which a hit is
+/// noise rather than context (cosine over real sentence embeddings).
+const RECALL_MAX_TURNS: usize = 5;
+const RECALL_MAX_TASKS: usize = 3;
+const RECALL_MIN_SIMILARITY: f32 = 0.3;
+
+/// The context assembler's read side over the cap-memory SQLite index the
+/// live post-processor writes at every turn end (`cap_turn_index` /
+/// `cap_task_index`, BLOB embeddings). ONE struct implements the three
+/// embedding-backed ports:
+///
+/// - [`UnifiedSearchPort`] → `# Recalled Context`: cosine over the agent's
+///   turn digests (snippet = the digest) and task briefs (snippet = the
+///   brief), top-K above [`RECALL_MIN_SIMILARITY`]. The coordinator drops the
+///   current task's turns.
+/// - [`TaskIndexPort`] → task routing: cosine over the task briefs (the
+///   per-agent `_agent-*` default partitions are not routable tasks and are
+///   skipped).
+/// - [`VectorIndexReader`] → L1 hits (id + score).
+///
+/// Rows are read under the BARE `write_agent_id` (the id the post-processor
+/// writes under) whichever alias the assembler queries with; a query under an
+/// unknown id yields nothing. Rows embedded by a different model / dim than the
+/// query (e.g. legacy `StubEmbedder` rows) are skipped by `cosine_similarity`'s
+/// dim check — never ranked on a garbage score.
+pub struct SqliteIndexRecall {
+    index: Arc<dyn cap_memory::SqliteIndex + Send + Sync>,
+    write_agent_id: String,
+    query_aliases: Vec<String>,
+}
+
+impl SqliteIndexRecall {
+    pub fn new(
+        index: Arc<dyn cap_memory::SqliteIndex + Send + Sync>,
+        write_agent_id: &str,
+        query_aliases: &[String],
+    ) -> Self {
+        Self {
+            index,
+            write_agent_id: write_agent_id.to_string(),
+            query_aliases: query_aliases.to_vec(),
+        }
+    }
+
+    fn known(&self, agent_id: &str) -> bool {
+        agent_id == self.write_agent_id || self.query_aliases.iter().any(|a| a == agent_id)
+    }
+
+    /// Most recent `MAX_INDEX_SCAN_ROWS` turn rows (by `updated_at` desc).
+    fn recent_turns(&self) -> Vec<cap_memory::TurnIndexRow> {
+        let mut rows = self.index.list_turns_for_agent(&self.write_agent_id);
+        rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        rows.truncate(MAX_INDEX_SCAN_ROWS);
+        rows
+    }
+
+    fn task_hits(&self, q: &[f32], include_default_partitions: bool) -> Vec<TaskHit> {
+        let mut hits: Vec<TaskHit> = self
+            .index
+            .list_tasks_for_agent(&self.write_agent_id)
+            .into_iter()
+            .filter(|t| include_default_partitions || !t.task_id.starts_with("_agent-"))
+            .filter_map(|t| {
+                let emb = t.brief_embedding.as_deref()?;
+                let sim = advance_context_engine::cosine_similarity(q, emb)?;
+                Some(TaskHit {
+                    task_id: t.task_id,
+                    similarity: sim,
+                    last_turn_at: parse_rfc3339(&t.last_turn_at),
+                    snippet: (!t.brief_snapshot.trim().is_empty()).then_some(t.brief_snapshot),
+                })
+            })
+            .collect();
+        hits.sort_by(|a, b| {
+            b.similarity
+                .total_cmp(&a.similarity)
+                .then_with(|| a.task_id.cmp(&b.task_id))
+        });
+        hits
+    }
+}
+
+fn parse_rfc3339(s: &str) -> Option<std::time::SystemTime> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| std::time::SystemTime::from(dt.with_timezone(&chrono::Utc)))
+}
+
+#[async_trait]
+impl UnifiedSearchPort for SqliteIndexRecall {
+    async fn search(
+        &self,
+        agent_id: &str,
+        _query: &str,
+        query_embedding: &[f32],
+    ) -> Result<UnifiedSearchResult, PortError> {
+        if !self.known(agent_id) || query_embedding.is_empty() {
+            return Ok(UnifiedSearchResult::default());
+        }
+        let mut turns: Vec<TurnHit> = self
+            .recent_turns()
+            .into_iter()
+            .filter_map(|t| {
+                let sim = advance_context_engine::cosine_similarity(query_embedding, &t.embedding)?;
+                if sim < RECALL_MIN_SIMILARITY || t.digest.trim().is_empty() {
+                    return None;
+                }
+                Some(TurnHit {
+                    id: format!("{}#turn-{}", t.task_id, t.turn),
+                    task_id: t.task_id,
+                    similarity: sim,
+                    timestamp: parse_rfc3339(&t.updated_at)
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                    snippet: Some(t.digest),
+                })
+            })
+            .collect();
+        turns.sort_by(|a, b| {
+            b.similarity
+                .total_cmp(&a.similarity)
+                .then_with(|| b.timestamp.cmp(&a.timestamp))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        turns.truncate(RECALL_MAX_TURNS);
+
+        let mut tasks = self.task_hits(query_embedding, false);
+        tasks.retain(|t| t.similarity >= RECALL_MIN_SIMILARITY);
+        tasks.truncate(RECALL_MAX_TASKS);
+
+        Ok(UnifiedSearchResult {
+            tasks,
+            turns,
+            contents: Vec::new(),
+            memories: Vec::new(),
+        })
+    }
+}
+
+#[async_trait]
+impl TaskIndexPort for SqliteIndexRecall {
+    async fn top_n_by_similarity(
+        &self,
+        agent_id: &str,
+        query_embedding: &[f32],
+        n: usize,
+    ) -> Result<Vec<TaskHit>, PortError> {
+        if !self.known(agent_id) || query_embedding.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut hits = self.task_hits(query_embedding, false);
+        hits.truncate(n);
+        Ok(hits)
+    }
+}
+
+#[async_trait]
+impl VectorIndexReader for SqliteIndexRecall {
+    async fn lookup(
+        &self,
+        agent_id: &str,
+        query_embedding: &[f32],
+    ) -> Result<Vec<VectorHit>, PortError> {
+        if !self.known(agent_id) || query_embedding.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut hits: Vec<VectorHit> = self
+            .recent_turns()
+            .into_iter()
+            .filter_map(|t| {
+                let score =
+                    advance_context_engine::cosine_similarity(query_embedding, &t.embedding)?;
+                Some(VectorHit {
+                    id: format!("{}#turn-{}", t.task_id, t.turn),
+                    score,
+                })
+            })
+            .collect();
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+        hits.truncate(RECALL_MAX_TURNS);
+        Ok(hits)
+    }
+}
+
+/// The CONTRACT-031 retention scorer: forwards to MODULE-004's
+/// `advance_database::retention_score` (the formula owner) — MODULE-010 only
+/// reranks (AC-10: no local formula).
+pub struct DatabaseRetentionScorer;
+impl advance_context_engine::RetentionScorer for DatabaseRetentionScorer {
+    fn retention_score(
+        &self,
+        turn: &advance_context_engine::TurnDigestView,
+        now: std::time::SystemTime,
+    ) -> f32 {
+        let digest = advance_database::TurnDigest {
+            timestamp: chrono::DateTime::<chrono::Utc>::from(turn.timestamp),
+            importance: turn.importance.clone(),
+            reference_count: turn.reference_count,
+            has_user_instruction: turn.has_user_instruction,
+            has_user_correction: turn.has_user_correction,
+            has_tool_use: turn.has_tool_use,
+            has_decision: turn.has_decision,
+        };
+        advance_database::retention_score(&digest, chrono::DateTime::<chrono::Utc>::from(now))
+    }
+}
+
+/// Fixed runtime facts for one agent (the daemon fills the view at spawn).
+pub struct StaticRuntimeInfo(pub RuntimeInfoView);
+#[async_trait]
+impl RuntimeInfoReader for StaticRuntimeInfo {
+    async fn runtime_info(&self, _agent_id: &str) -> Option<RuntimeInfoView> {
+        Some(self.0.clone())
     }
 }
 
@@ -249,6 +491,70 @@ struct StubLightLlm;
 impl LightLlmFallbackPort for StubLightLlm {
     async fn pick_one(&self, _query: &str, candidates: &[String]) -> Result<String, PortError> {
         Ok(candidates.first().cloned().unwrap_or_default())
+    }
+}
+
+/// Production residual tie-break: a short `chat()` that must return one of
+/// the candidate task ids. Chat errors / unparseable replies fall back to
+/// the first candidate so routing never aborts the turn.
+pub struct GatewayLightLlm {
+    gateway: Arc<LlmGateway>,
+}
+
+impl GatewayLightLlm {
+    pub fn new(gateway: Arc<LlmGateway>) -> Self {
+        Self { gateway }
+    }
+}
+
+/// Prefer an exact / contained candidate id from `text`; else the first.
+pub(crate) fn pick_routing_candidate(text: &str, candidates: &[String]) -> String {
+    let trimmed = text.trim();
+    for candidate in candidates {
+        if trimmed == candidate || trimmed.split_whitespace().any(|w| w == candidate) {
+            return candidate.clone();
+        }
+    }
+    for candidate in candidates {
+        if trimmed.contains(candidate) {
+            return candidate.clone();
+        }
+    }
+    candidates.first().cloned().unwrap_or_default()
+}
+
+#[async_trait]
+impl LightLlmFallbackPort for GatewayLightLlm {
+    async fn pick_one(&self, query: &str, candidates: &[String]) -> Result<String, PortError> {
+        if candidates.len() <= 1 {
+            return Ok(candidates.first().cloned().unwrap_or_default());
+        }
+        let listed = candidates.join(", ");
+        let prompt = format!(
+            "Pick exactly one task id from this list that best continues the user query.\n\
+             Query: {query}\n\
+             Task ids: {listed}\n\
+             Reply with only the chosen task id."
+        );
+        let params = cap_llm::ChatParams {
+            max_tokens: Some(32),
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        match self
+            .gateway
+            .chat(
+                vec![cap_llm::ChatMessage {
+                    role: cap_llm::ChatRole::User,
+                    content: prompt,
+                }],
+                params,
+            )
+            .await
+        {
+            Ok(resp) => Ok(pick_routing_candidate(&resp.text, candidates)),
+            Err(_) => Ok(candidates[0].clone()),
+        }
     }
 }
 
@@ -652,8 +958,7 @@ impl L4TaskSummaryReader for StubL4TaskSummary {
     }
 }
 
-/// Empty L5 reader — inert this slice (cross-task syntheses live in a distinct
-/// `syntheses/*.md` / `Synthesis` surface, NOT `summary.yaml`).
+/// Empty L5 reader — back-compat / no-memory path.
 struct StubL5Synthesis;
 #[async_trait]
 impl L5SynthesisReader for StubL5Synthesis {
@@ -663,6 +968,98 @@ impl L5SynthesisReader for StubL5Synthesis {
         _task_id: &str,
     ) -> Result<Vec<SynthesisView>, PortError> {
         Ok(Vec::new())
+    }
+}
+
+/// Production L5 reader: L6's `_knowledge_map.yaml` + `syntheses/*.md`
+/// under `<memory_root>/<agent-slug>/`. Related briefs are other tasks'
+/// syntheses (and topic syntheses as fill) — the current task's L4 summary
+/// already covers itself.
+pub struct DiskL5SynthesisReader {
+    memory_root: PathBuf,
+    write_agent_id: String,
+}
+
+impl DiskL5SynthesisReader {
+    pub fn new(memory_root: PathBuf, write_agent_id: &str) -> Self {
+        Self {
+            memory_root,
+            write_agent_id: write_agent_id.to_string(),
+        }
+    }
+
+    fn agent_dir(&self) -> PathBuf {
+        self.memory_root
+            .join(cap_memory::agent_dir_slug(&self.write_agent_id))
+    }
+
+    fn load_map(&self) -> Option<cap_memory::KnowledgeMap> {
+        let dir = self.agent_dir();
+        let path = dir.join("_knowledge_map.yaml");
+        let raw = read_capped_under(&dir, &path, MAX_HISTORY_FILE_BYTES)?;
+        serde_yml::from_str::<cap_memory::KnowledgeMap>(&raw).ok()
+    }
+
+    fn read_body(&self, relative: &str) -> Option<String> {
+        if relative.is_empty()
+            || relative.contains("..")
+            || relative.chars().any(|c| c.is_ascii_control() || c == '\0')
+        {
+            return None;
+        }
+        let dir = self.agent_dir();
+        let path = dir.join(relative);
+        read_capped_under(&dir, &path, MAX_HISTORY_FILE_BYTES)
+    }
+}
+
+const MAX_L5_READ: usize = 5;
+
+#[async_trait]
+impl L5SynthesisReader for DiskL5SynthesisReader {
+    async fn read_syntheses(
+        &self,
+        _agent_id: &str,
+        task_id: &str,
+    ) -> Result<Vec<SynthesisView>, PortError> {
+        let Some(map) = self.load_map() else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for synth in &map.task_syntheses {
+            if !task_id.is_empty() && synth.task_id == task_id {
+                continue;
+            }
+            let Some(body) = self.read_body(&synth.synthesis_path) else {
+                continue;
+            };
+            if body.trim().is_empty() {
+                continue;
+            }
+            out.push(SynthesisView {
+                task_id: synth.task_id.clone(),
+                body,
+            });
+            if out.len() >= MAX_L5_READ {
+                return Ok(out);
+            }
+        }
+        for topic in &map.topics {
+            if out.len() >= MAX_L5_READ {
+                break;
+            }
+            let Some(body) = self.read_body(&topic.synthesis_path) else {
+                continue;
+            };
+            if body.trim().is_empty() {
+                continue;
+            }
+            out.push(SynthesisView {
+                task_id: topic.topic_slug.clone(),
+                body,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -777,14 +1174,41 @@ fn read_capped_under(root: &Path, path: &Path, max_bytes: u64) -> Option<String>
 pub struct CapMemoryHistoryReader {
     memory_root: PathBuf,
     query_aliases: Vec<String>,
+    /// The `_agent-{write_id}` partition the post-processor writes under when a
+    /// turn carries no task id. A read with an EMPTY `task_id` resolves to it, so
+    /// no-task-id turns read back the history the previous no-task-id turns
+    /// wrote (`None` ⇒ an empty task id reads nothing — the pre-fix behaviour).
+    default_task_partition: Option<String>,
 }
+
+/// L2 digests kept per read after the retention rerank (the render side caps
+/// again at `MAX_L2_RENDERED`). 12 one-sentence digests ≈ a few hundred tokens.
+const MAX_L2_DIGESTS: usize = 12;
 
 impl CapMemoryHistoryReader {
     pub fn new(memory_root: PathBuf, query_aliases: Vec<String>) -> Self {
         Self {
             memory_root,
             query_aliases,
+            default_task_partition: None,
         }
+    }
+
+    /// Resolve an empty `task_id` to the agent's default partition
+    /// (`cap_memory::default_task_partition(write_agent_id)`) — the SAME
+    /// derivation Step 7 writes under.
+    pub fn with_default_task_partition(mut self, write_agent_id: &str) -> Self {
+        self.default_task_partition = cap_memory::default_task_partition(write_agent_id);
+        self
+    }
+
+    /// The task id a read targets: the requested one, else the default
+    /// partition for an empty request.
+    fn resolve_task_id<'a>(&'a self, task_id: &'a str) -> Option<&'a str> {
+        if !task_id.is_empty() {
+            return Some(task_id);
+        }
+        self.default_task_partition.as_deref()
     }
 
     /// Cross-agent check: the record's embedded `agent_id` must be one of the
@@ -817,6 +1241,14 @@ impl CapMemoryHistoryReader {
     }
 }
 
+fn importance_tag(i: &cap_memory::turn_index::Importance) -> &'static str {
+    match i {
+        cap_memory::turn_index::Importance::Critical => "critical",
+        cap_memory::turn_index::Importance::Notable => "notable",
+        cap_memory::turn_index::Importance::Normal => "normal",
+    }
+}
+
 #[async_trait]
 impl L2DigestReader for CapMemoryHistoryReader {
     async fn read_digests(
@@ -824,23 +1256,63 @@ impl L2DigestReader for CapMemoryHistoryReader {
         _agent_id: &str,
         task_id: &str,
     ) -> Result<Vec<TurnDigestForEmbed>, PortError> {
+        let Some(task_id) = self.resolve_task_id(task_id) else {
+            return Ok(Vec::new());
+        };
         let Some(index) = self.load_turn_index(task_id) else {
             return Ok(Vec::new());
         };
         // `TurnEntry` carries both ids — reject any turn whose embedded
         // task_id ≠ requested OR whose agent_id is not an alias (cross-task /
         // cross-agent history-injection defense).
-        let out = index
+        let turns: Vec<_> = index
             .turns
             .into_iter()
             .filter(|t| t.task_id == task_id && self.agent_matches(&t.agent_id))
+            .collect();
+        // AC-10/11 live rerank: score every candidate turn with MODULE-004's
+        // retention formula (recency / type / reference / importance / user
+        // intent) at THIS read, keep the top `MAX_L2_DIGESTS`, then put the kept
+        // digests back in chronological order for rendering. The whole file is
+        // read anyway (bounded by `MAX_HISTORY_FILE_BYTES`); this bounds what
+        // reaches the prompt by retention value rather than by file position.
+        // Candidates are fed NEWEST-FIRST: the rerank is a stable sort, so turns
+        // whose scores tie (recency has fully decayed for all of them) keep the
+        // most recent ones rather than the oldest.
+        let now = std::time::SystemTime::now();
+        let items: Vec<advance_context_engine::RerankItem<cap_memory::turn_index::TurnEntry>> =
+            turns
+                .into_iter()
+                .rev()
+                .map(|t| {
+                    let digest = advance_context_engine::TurnDigestView {
+                        timestamp: parse_rfc3339(&t.timestamp)
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                        importance: importance_tag(&t.importance).to_string(),
+                        reference_count: t.reference_count,
+                        has_user_instruction: t.has_user_instruction,
+                        has_user_correction: t.has_user_correction,
+                        has_tool_use: t.has_tool_use,
+                        has_decision: t.has_decision,
+                    };
+                    advance_context_engine::RerankItem::new(t, digest)
+                })
+                .collect();
+        let mut kept: Vec<cap_memory::turn_index::TurnEntry> =
+            advance_context_engine::rerank_by_retention(items, &DatabaseRetentionScorer, now)
+                .into_iter()
+                .take(MAX_L2_DIGESTS)
+                .map(|item| item.payload)
+                .collect();
+        kept.sort_by_key(|t| t.turn);
+        Ok(kept
+            .into_iter()
             .map(|t| TurnDigestForEmbed {
                 turn_id: t.turn as u64,
                 digest: t.digest,
                 collapsed_view: t.collapsed_view,
             })
-            .collect();
-        Ok(out)
+            .collect())
     }
 }
 
@@ -851,6 +1323,9 @@ impl L3EpochReader for CapMemoryHistoryReader {
         _agent_id: &str,
         task_id: &str,
     ) -> Result<Option<EpochSummary>, PortError> {
+        let Some(task_id) = self.resolve_task_id(task_id) else {
+            return Ok(None);
+        };
         let Some(index) = self.load_turn_index(task_id) else {
             return Ok(None);
         };
@@ -879,6 +1354,9 @@ impl L4TaskSummaryReader for CapMemoryHistoryReader {
         _agent_id: &str,
         task_id: &str,
     ) -> Result<Option<TaskSummaryView>, PortError> {
+        let Some(task_id) = self.resolve_task_id(task_id) else {
+            return Ok(None);
+        };
         let Some(summary) = self.load_summary(task_id) else {
             return Ok(None);
         };
@@ -1020,36 +1498,80 @@ fn build_with_all_ports(
     // `EmptyDecomposition` (⇒ no Tier-2 ⑭ section ⇒ byte-identical).
     decomposition: Arc<dyn DecompositionReader>,
 ) -> Arc<dyn ContextAssembler> {
-    Arc::new(
-        ContextAssemblerImpl::new(
-            callable_inventory,
-            host_fn_inventory,
-            agent_identity,
-            knowledge_map,
-            agent_tree,
-            embedding,
-            task_index,
-            Arc::new(StubLightLlm),
-            unified_search,
-            event_bus,
-            skill_summary,
-            l1_vector,
-            l2_digest,
-            l3_epoch,
-            l4_summary,
-            l5_synthesis,
-            l6_consolidation,
-            // Stage-C SAT-E: 18th port — the concrete CONTRACT-114 helper. cap-http
-            // is a cli dep (the only crate where it's allowed); context-engine takes
-            // the trait object only (dep-light, AC-01).
-            Arc::new(cap_http::DefaultPromptInjectionHelpers::default()),
-            // Wave-12 Lane C: 19th port — the decomposition reader (real
-            // `CapDecompositionReader` in production, `EmptyDecomposition` on every
-            // back-compat path).
-            decomposition,
-        )
-        .with_agent_id_aliases(query_aliases.to_vec()),
+    Arc::new(build_impl_with_all_ports(
+        event_bus,
+        callable_inventory,
+        host_fn_inventory,
+        agent_tree,
+        embedding,
+        knowledge_map,
+        unified_search,
+        task_index,
+        l1_vector,
+        l2_digest,
+        l3_epoch,
+        l4_summary,
+        l5_synthesis,
+        l6_consolidation,
+        skill_summary,
+        agent_identity,
+        query_aliases,
+        decomposition,
+    ))
+}
+
+/// The concrete (un-`Arc`ed) form of [`build_with_all_ports`] so the production
+/// builder can chain the opt-in `with_runtime_info` / `with_report_sink`
+/// builders before erasing to the trait object.
+#[allow(clippy::too_many_arguments)]
+fn build_impl_with_all_ports(
+    event_bus: Arc<dyn EventBusEmit>,
+    callable_inventory: Arc<dyn CallableInventoryReader>,
+    host_fn_inventory: Arc<dyn HostFnInventoryReader>,
+    agent_tree: Arc<dyn AgentTreeSnapshot>,
+    embedding: Arc<dyn EmbeddingPort>,
+    knowledge_map: Arc<dyn KnowledgeMapReader>,
+    unified_search: Arc<dyn UnifiedSearchPort>,
+    task_index: Arc<dyn TaskIndexPort>,
+    l1_vector: Arc<dyn VectorIndexReader>,
+    l2_digest: Arc<dyn L2DigestReader>,
+    l3_epoch: Arc<dyn L3EpochReader>,
+    l4_summary: Arc<dyn L4TaskSummaryReader>,
+    l5_synthesis: Arc<dyn L5SynthesisReader>,
+    l6_consolidation: Arc<dyn L6ConsolidationReader>,
+    skill_summary: Arc<dyn SkillSummaryReader>,
+    agent_identity: Arc<dyn AgentIdentityReader>,
+    query_aliases: &[String],
+    decomposition: Arc<dyn DecompositionReader>,
+) -> ContextAssemblerImpl {
+    ContextAssemblerImpl::new(
+        callable_inventory,
+        host_fn_inventory,
+        agent_identity,
+        knowledge_map,
+        agent_tree,
+        embedding,
+        task_index,
+        Arc::new(StubLightLlm),
+        unified_search,
+        event_bus,
+        skill_summary,
+        l1_vector,
+        l2_digest,
+        l3_epoch,
+        l4_summary,
+        l5_synthesis,
+        l6_consolidation,
+        // Stage-C SAT-E: 18th port — the concrete CONTRACT-114 helper. cap-http
+        // is a cli dep (the only crate where it's allowed); context-engine takes
+        // the trait object only (dep-light, AC-01).
+        Arc::new(cap_http::DefaultPromptInjectionHelpers::default()),
+        // Wave-12 Lane C: 19th port — the decomposition reader (real
+        // `CapDecompositionReader` in production, `EmptyDecomposition` on every
+        // back-compat path).
+        decomposition,
     )
+    .with_agent_id_aliases(query_aliases.to_vec())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1347,7 +1869,10 @@ pub fn build_context_assembler_for_agent_with_decomposition(
 }
 
 /// [`build_context_assembler_for_agent_with_decomposition`] plus `pack_skills`
-/// and the production AGENTS.md identity reader.
+/// and the production AGENTS.md identity reader. Thin wrapper over
+/// [`build_context_assembler_for_agent_production`] with no live embedding, no
+/// SQLite index, no runtime info and no report sink (byte-identical to its
+/// pre-production-builder behaviour).
 #[allow(clippy::too_many_arguments)]
 pub fn build_context_assembler_for_agent_with_pack_skills(
     event_bus: Arc<dyn EventBusEmit>,
@@ -1363,6 +1888,89 @@ pub fn build_context_assembler_for_agent_with_pack_skills(
     pack_skills: Option<Arc<dyn SkillSummaryReader>>,
     identity_agent_root: Option<&Path>,
 ) -> Arc<dyn ContextAssembler> {
+    build_context_assembler_for_agent_production(ProductionAssemblerParts {
+        event_bus,
+        callable_inventory,
+        host_fn_inventory,
+        agent_tree,
+        memory,
+        write_agent_id,
+        query_aliases,
+        memory_root,
+        skills_agent_root,
+        decomposition,
+        pack_skills,
+        identity_agent_root,
+        embedding: None,
+        sqlite_index: None,
+        runtime_info: None,
+        report_sink: None,
+        light_llm: None,
+    })
+}
+
+/// Everything the production agent-level assembler build needs. A struct (not
+/// another positional argument list) so the daemon can grow the wiring without
+/// a 17-arg function.
+pub struct ProductionAssemblerParts<'a> {
+    pub event_bus: Arc<dyn EventBusEmit>,
+    pub callable_inventory: Arc<dyn CallableInventoryReader>,
+    pub host_fn_inventory: Arc<dyn HostFnInventoryReader>,
+    pub agent_tree: Arc<dyn AgentTreeSnapshot>,
+    /// The SHARED registered `MemoryStore` (`Some` iff the agent declared `memory`).
+    pub memory: Option<Arc<MemoryStore>>,
+    /// The bare cap id cap-memory writes under.
+    pub write_agent_id: &'a str,
+    /// `{bare write-id, colon routing-id}` — the ids the assembler may query with.
+    pub query_aliases: &'a [String],
+    /// `<workspace>/.agent/memory` (activates the L2/L3/L4 history readers).
+    pub memory_root: Option<&'a Path>,
+    /// `<workspace>/.agent` when `skills` is declared.
+    pub skills_agent_root: Option<&'a Path>,
+    pub decomposition: Arc<dyn DecompositionReader>,
+    pub pack_skills: Option<Arc<dyn SkillSummaryReader>>,
+    /// `<workspace>/.agent` (AGENTS.md).
+    pub identity_agent_root: Option<&'a Path>,
+    /// The LIVE query embedder ([`GatewayEmbedding`]) when the gateway has an
+    /// embedding-capable provider; `None` → [`StubEmbedding`] (no recall, no
+    /// routing call, no `/v1/embeddings` round-trip).
+    pub embedding: Option<Arc<dyn EmbeddingPort>>,
+    /// The cap-memory SQLite index the live post-processor writes (turn + task
+    /// embeddings). With `memory` + `embedding` it backs recall + task routing
+    /// through [`SqliteIndexRecall`]; `None` → the empty-corpus ports.
+    pub sqlite_index: Option<Arc<dyn cap_memory::SqliteIndex + Send + Sync>>,
+    /// Runtime facts for the Tier 1a/1b runtime sections; `None` → omitted.
+    pub runtime_info: Option<RuntimeInfoView>,
+    /// The per-turn assembly report sink (Client API context inspector).
+    pub report_sink: Option<Arc<dyn AssemblyReportSink>>,
+    /// Residual task-routing tie-break. `None` → first-candidate stub.
+    pub light_llm: Option<Arc<dyn LightLlmFallbackPort>>,
+}
+
+/// The production agent-level builder the daemon calls (every frozen
+/// `build_context_assembler_for_agent*` entry funnels here).
+pub fn build_context_assembler_for_agent_production(
+    parts: ProductionAssemblerParts<'_>,
+) -> Arc<dyn ContextAssembler> {
+    let ProductionAssemblerParts {
+        event_bus,
+        callable_inventory,
+        host_fn_inventory,
+        agent_tree,
+        memory,
+        write_agent_id,
+        query_aliases,
+        memory_root,
+        skills_agent_root,
+        decomposition,
+        pack_skills,
+        identity_agent_root,
+        embedding,
+        sqlite_index,
+        runtime_info,
+        report_sink,
+        light_llm,
+    } = parts;
     // The skill-summary reader is INDEPENDENT of the memory capability. `Some` →
     // the real DiskSkillSummaryReader over the agent's on-disk activated skills;
     // `None` → StubSkillSummary (byte-identical to pre-satellite, in BOTH arms).
@@ -1384,21 +1992,31 @@ pub fn build_context_assembler_for_agent_with_pack_skills(
         }),
         None => skill_summary,
     };
-    match memory {
+    // The query embedder: live (`GatewayEmbedding`) only when the daemon says the
+    // provider can embed; otherwise the hermetic zero-vector stub.
+    let embedding_live = embedding.is_some();
+    let embedding: Arc<dyn EmbeddingPort> = match embedding {
+        Some(e) => e,
+        None => Arc::new(StubEmbedding),
+    };
+    let assembler = match memory {
         Some(store) => {
             // Real L2/L3/L4 history readers ONLY when a memory_root is supplied
             // (capability already gated by this `Some` arm). The SAME reader Arc
-            // backs all three trait slots.
+            // backs all three trait slots. An empty `task_id` (every production
+            // inbound turn) resolves to the agent's default partition — the SAME
+            // `_agent-{write_id}` Step 7 writes under — so the history a turn
+            // produced is read back by the next.
             let (l2, l3, l4): (
                 Arc<dyn L2DigestReader>,
                 Arc<dyn L3EpochReader>,
                 Arc<dyn L4TaskSummaryReader>,
             ) = match memory_root {
                 Some(root) => {
-                    let reader = Arc::new(CapMemoryHistoryReader::new(
-                        root.to_path_buf(),
-                        query_aliases.to_vec(),
-                    ));
+                    let reader = Arc::new(
+                        CapMemoryHistoryReader::new(root.to_path_buf(), query_aliases.to_vec())
+                            .with_default_task_partition(write_agent_id),
+                    );
                     (reader.clone(), reader.clone(), reader)
                 }
                 None => (
@@ -1407,16 +2025,38 @@ pub fn build_context_assembler_for_agent_with_pack_skills(
                     Arc::new(StubL4TaskSummary),
                 ),
             };
-            build_with_all_ports(
+            // Recall + task routing read the post-processor's SQLite index when
+            // the daemon shares it AND a live embedder exists (otherwise the
+            // query vector could never match the stored ones); else the
+            // empty-corpus ports (byte-identical-behaviour to the stubs).
+            let (unified_search, task_index): (Arc<dyn UnifiedSearchPort>, Arc<dyn TaskIndexPort>) =
+                match (&sqlite_index, embedding_live) {
+                    (Some(idx), true) => {
+                        let recall = Arc::new(SqliteIndexRecall::new(
+                            idx.clone(),
+                            write_agent_id,
+                            query_aliases,
+                        ));
+                        (recall.clone(), recall)
+                    }
+                    _ => (
+                        real_unified_search(query_aliases),
+                        real_task_index(query_aliases),
+                    ),
+                };
+            build_impl_with_all_ports(
                 event_bus,
                 callable_inventory,
                 host_fn_inventory,
                 agent_tree,
-                Arc::new(StubEmbedding), // hermeticity: GatewayEmbedding built but not live
+                embedding,
                 real_knowledge_map_reader(&store, write_agent_id, query_aliases),
-                real_unified_search(query_aliases),
-                real_task_index(query_aliases),
-                Arc::new(StubVectorIndex), // L1 inert (no embedding index)
+                unified_search,
+                task_index,
+                // L1 stays inert: the recall port already carries the embedding-
+                // backed turn hits WITH their digests (a second SQLite scan per
+                // turn would only duplicate ids + scores).
+                Arc::new(StubVectorIndex),
                 l2,
                 l3,
                 l4,
@@ -1431,12 +2071,13 @@ pub fn build_context_assembler_for_agent_with_pack_skills(
         // No-memory path: the all-stub data ports (byte-identical to
         // `build_context_assembler`'s port set), PLUS the (real-or-stub)
         // skill_summary so a skills-but-no-memory agent still surfaces skills.
-        None => build_with_all_ports(
+        // The live embedder is kept so task routing still runs (no index → NewTask).
+        None => build_impl_with_all_ports(
             event_bus,
             callable_inventory,
             host_fn_inventory,
             agent_tree,
-            Arc::new(StubEmbedding),
+            embedding,
             Arc::new(StubKnowledgeMap),
             Arc::new(StubUnifiedSearch),
             Arc::new(StubTaskIndex),
@@ -1451,7 +2092,27 @@ pub fn build_context_assembler_for_agent_with_pack_skills(
             query_aliases, // Wave-12 Lane A: colon/bare alias bridge (⑬ + Tier-3)
             decomposition,
         ),
-    }
+    };
+    let assembler = match runtime_info {
+        Some(view) => assembler.with_runtime_info(Arc::new(StaticRuntimeInfo(view))),
+        None => assembler,
+    };
+    let assembler = match report_sink {
+        Some(sink) => assembler.with_report_sink(sink),
+        None => assembler,
+    };
+    let assembler = match memory_root {
+        Some(root) => assembler.with_l5_synthesis(Arc::new(DiskL5SynthesisReader::new(
+            root.to_path_buf(),
+            write_agent_id,
+        ))),
+        None => assembler,
+    };
+    let assembler = match light_llm {
+        Some(port) => assembler.with_light_llm(port),
+        None => assembler,
+    };
+    Arc::new(assembler)
 }
 
 /// skills-J26 reader satellite (2026-06-20) — the agent-level entry whose 9-arg
@@ -1748,7 +2409,227 @@ pub fn build_context_assembler_for_agent_with_recall(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cap_memory::{MemoryEntry, MemoryStatus, MemoryType};
+    use cap_memory::turn_index::{Importance, LogOffset, TurnEntry, TurnIndexMeta};
+    use cap_memory::{
+        InMemorySqliteIndex, MemoryEntry, MemoryStatus, MemoryType, SqliteIndex, TaskIndexRow,
+        TurnIndexRow,
+    };
+
+    fn turn_row(task: &str, turn: u32, digest: &str, emb: &[f32], at: &str) -> TurnIndexRow {
+        TurnIndexRow {
+            agent_id: "root".into(),
+            task_id: task.into(),
+            turn,
+            digest: digest.into(),
+            embedding: emb.to_vec(),
+            reference_count: 0,
+            updated_at: at.into(),
+        }
+    }
+
+    /// `SqliteIndexRecall` ranks the turn / task rows the post-processor wrote by
+    /// cosine, drops noise + default partitions, carries the digest / brief as the
+    /// snippet, and answers under either alias.
+    #[tokio::test]
+    async fn sqlite_index_recall_ranks_rows_with_snippets() {
+        let idx = Arc::new(InMemorySqliteIndex::default());
+        idx.upsert_turn(turn_row(
+            "_agent-root",
+            1,
+            "deployed the service",
+            &[1.0, 0.0],
+            "2026-06-16T00:00:01Z",
+        ));
+        idx.upsert_turn(turn_row(
+            "_agent-root",
+            2,
+            "unrelated chatter",
+            &[0.0, 1.0],
+            "2026-06-16T00:00:02Z",
+        ));
+        idx.upsert_turn(turn_row(
+            "_agent-root",
+            3,
+            "rolled the deploy back",
+            &[0.9, 0.1],
+            "2026-06-16T00:00:03Z",
+        ));
+        // A legacy stub-dim row (8-dim) must be skipped, never mis-ranked.
+        idx.upsert_turn(turn_row(
+            "_agent-root",
+            4,
+            "legacy",
+            &[1.0; 8],
+            "2026-06-16T00:00:04Z",
+        ));
+        idx.upsert_task(TaskIndexRow {
+            task_id: "_agent-root".into(),
+            agent_id: "root".into(),
+            last_turn_at: "2026-06-16T00:00:03Z".into(),
+            turns_total: 3,
+            updated_at: "2026-06-16T00:00:03Z".into(),
+            brief_snapshot: "default partition brief".into(),
+            brief_embedding: Some(vec![1.0, 0.0]),
+        });
+        idx.upsert_task(TaskIndexRow {
+            task_id: "deploy-task".into(),
+            agent_id: "root".into(),
+            last_turn_at: "2026-06-15T00:00:00Z".into(),
+            turns_total: 7,
+            updated_at: "2026-06-15T00:00:00Z".into(),
+            brief_snapshot: "ship the deploy pipeline".into(),
+            brief_embedding: Some(vec![0.8, 0.2]),
+        });
+        let aliases = vec!["root".to_string(), "agent:root".to_string()];
+        let recall = SqliteIndexRecall::new(idx, "root", &aliases);
+
+        let res = recall
+            .search("agent:root", "deploy", &[1.0, 0.0])
+            .await
+            .unwrap();
+        let ids: Vec<&str> = res.turns.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["_agent-root#turn-1", "_agent-root#turn-3"],
+            "orthogonal + legacy-dim rows drop; best first"
+        );
+        assert_eq!(
+            res.turns[0].snippet.as_deref(),
+            Some("deployed the service")
+        );
+        assert_eq!(
+            res.tasks.len(),
+            1,
+            "the `_agent-*` partition is not a related task"
+        );
+        assert_eq!(res.tasks[0].task_id, "deploy-task");
+        assert_eq!(
+            res.tasks[0].snippet.as_deref(),
+            Some("ship the deploy pipeline")
+        );
+        assert!(res.tasks[0].last_turn_at.is_some());
+
+        // Task routing sees the same (non-default) tasks, honoring `n`.
+        let hits = recall
+            .top_n_by_similarity("root", &[1.0, 0.0], 5)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].task_id, "deploy-task");
+
+        // Unknown alias / empty query → nothing.
+        assert!(recall
+            .search("agent:other", "x", &[1.0, 0.0])
+            .await
+            .unwrap()
+            .turns
+            .is_empty());
+        assert!(recall
+            .search("root", "x", &[])
+            .await
+            .unwrap()
+            .turns
+            .is_empty());
+    }
+
+    fn entry(task: &str, turn: u32, digest: &str, ts: &str) -> TurnEntry {
+        TurnEntry {
+            turn,
+            timestamp: ts.into(),
+            agent_id: "root".into(),
+            task_id: task.into(),
+            log_offset: LogOffset {
+                start_line: 0,
+                end_line: 0,
+            },
+            has_user_instruction: false,
+            has_user_correction: false,
+            has_tool_use: false,
+            has_decision: false,
+            importance: Importance::Normal,
+            digest: digest.into(),
+            collapsed_view: String::new(),
+            git_commit: String::new(),
+            git_diff_summary: String::new(),
+            git_checkpoints: vec![],
+            reference_count: 0,
+            content_identifiers: vec![],
+            read_file_versions: vec![],
+            tokens_digest: 0,
+            tokens_collapse_excerpt: 0,
+            tokens_l0_processed: 0,
+        }
+    }
+
+    /// An EMPTY task id resolves to the `_agent-{write_id}` default partition
+    /// (the one Step 7 writes under), and the L2 read is retention-reranked:
+    /// with more turns than `MAX_L2_DIGESTS`, a critical / user-corrected old
+    /// turn outranks the oldest normal ones, and the kept set renders in
+    /// chronological order.
+    #[tokio::test]
+    async fn history_reader_default_partition_and_retention_rerank() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let partition = cap_memory::default_task_partition("root").unwrap();
+        assert_eq!(partition, "_agent-root");
+        let mut turns = Vec::new();
+        for n in 1..=(MAX_L2_DIGESTS as u32 + 4) {
+            let mut e = entry(
+                &partition,
+                n,
+                &format!("turn {n}"),
+                &format!("2026-06-16T00:{n:02}:00Z"),
+            );
+            if n == 1 {
+                // The oldest turn — normally the first to be dropped — carries a
+                // user correction + critical importance, so retention keeps it.
+                e.importance = Importance::Critical;
+                e.has_user_correction = true;
+                e.reference_count = 9;
+            }
+            turns.push(e);
+        }
+        let index = TurnIndex {
+            meta: TurnIndexMeta {
+                last_epoch_turn: 0,
+                last_epoch_at: "2026-06-16T00:00:00Z".into(),
+            },
+            turns,
+            epochs: vec![],
+        };
+        let dir = root.join("tasks").join(&partition);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("turn-index.yaml"),
+            serde_yml::to_string(&index).unwrap(),
+        )
+        .unwrap();
+
+        let aliases = vec!["root".to_string(), "agent:root".to_string()];
+        let reader = CapMemoryHistoryReader::new(root.to_path_buf(), aliases.clone())
+            .with_default_task_partition("root");
+        let digests = reader.read_digests("agent:root", "").await.unwrap();
+        assert_eq!(digests.len(), MAX_L2_DIGESTS, "bounded by the rerank cap");
+        let ids: Vec<u64> = digests.iter().map(|d| d.turn_id).collect();
+        assert_eq!(ids[0], 1, "the critical corrected turn survives the cut");
+        assert!(
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "kept digests render chronologically: {ids:?}"
+        );
+        assert_eq!(
+            *ids.last().unwrap(),
+            MAX_L2_DIGESTS as u64 + 4,
+            "the most recent turn is kept"
+        );
+
+        // Without the default partition an empty task id reads nothing (pre-fix).
+        let bare = CapMemoryHistoryReader::new(root.to_path_buf(), aliases);
+        assert!(bare
+            .read_digests("agent:root", "")
+            .await
+            .unwrap()
+            .is_empty());
+    }
 
     fn fact(id: &str, agent: &str, content: &str) -> MemoryEntry {
         MemoryEntry {
@@ -2143,6 +3024,62 @@ mod tests {
                 .await
                 .is_none(),
             "missing child workspace → None"
+        );
+    }
+
+    #[test]
+    fn pick_routing_candidate_prefers_exact_then_contained() {
+        let cands = vec!["task-a".into(), "task-b".into()];
+        assert_eq!(pick_routing_candidate("task-b", &cands), "task-b");
+        assert_eq!(
+            pick_routing_candidate("I pick task-a thanks", &cands),
+            "task-a"
+        );
+        assert_eq!(pick_routing_candidate("no match", &cands), "task-a");
+        assert_eq!(pick_routing_candidate("", &[]), "");
+    }
+
+    #[tokio::test]
+    async fn disk_l5_reads_related_syntheses_and_skips_current_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let dir = root.join(cap_memory::agent_dir_slug("root"));
+        std::fs::create_dir_all(dir.join("syntheses")).unwrap();
+        let yaml = "\
+topics:
+  - topic_slug: pricing
+    synthesis_path: syntheses/pricing.md
+    cluster_id: cl-pricing-b0c1d2e3
+    tokens: 20
+task_syntheses:
+  - task_id: task-a
+    synthesis_path: syntheses/task-a.md
+    tokens: 10
+  - task_id: task-b
+    synthesis_path: syntheses/task-b.md
+    tokens: 10
+";
+        std::fs::write(dir.join("_knowledge_map.yaml"), yaml).unwrap();
+        std::fs::write(dir.join("syntheses/task-a.md"), "brief of A").unwrap();
+        std::fs::write(dir.join("syntheses/task-b.md"), "brief of B").unwrap();
+        std::fs::write(dir.join("syntheses/pricing.md"), "pricing topic").unwrap();
+
+        let reader = DiskL5SynthesisReader::new(root, "root");
+        let related = reader.read_syntheses("root", "task-a").await.unwrap();
+        assert!(
+            related
+                .iter()
+                .any(|s| s.task_id == "task-b" && s.body.contains("brief of B")),
+            "current task is skipped; sibling brief is kept: {related:?}"
+        );
+        assert!(
+            related.iter().all(|s| s.task_id != "task-a"),
+            "current task must not appear as a related brief"
+        );
+        let all = reader.read_syntheses("root", "").await.unwrap();
+        assert!(
+            all.len() >= 2,
+            "empty task_id returns every synthesis: {all:?}"
         );
     }
 }

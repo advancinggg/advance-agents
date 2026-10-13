@@ -302,6 +302,7 @@ pub struct ClientApi {
     /// Interior-mutable provider slots (m020-s2). Empty by default → `module_unavailable`; the
     /// composition root (Wave-25) / a witness injects a concrete adapter via a builder.
     run_provider: RunProviderSlot,
+    context_provider: crate::provider::ContextProviderSlot,
     messaging_provider: MessagingProviderSlot,
     tools_provider: ToolsProviderSlot,
     /// Agents family (CONTRACT-190 agent CRUD) provider slot. Empty by default →
@@ -384,6 +385,7 @@ impl ClientApi {
             handlers: HashMap::new(),
             routes: Vec::new(),
             run_provider: Arc::new(RwLock::new(None)),
+            context_provider: Arc::new(RwLock::new(None)),
             messaging_provider: Arc::new(RwLock::new(None)),
             tools_provider: Arc::new(RwLock::new(None)),
             agent_provider: Arc::new(RwLock::new(None)),
@@ -447,6 +449,10 @@ impl ClientApi {
     fn register_provider_families(&mut self) {
         let run_slot = Arc::clone(&self.run_provider);
         crate::runs::register(self, run_slot);
+        // Context-inspection family (the latest assembled prompt, per agent) over the
+        // ContextInspectProvider slot.
+        let context_slot = Arc::clone(&self.context_provider);
+        crate::context::register(self, context_slot);
         let msg_slot = Arc::clone(&self.messaging_provider);
         crate::messages::register(self, msg_slot);
         let tools_slot = Arc::clone(&self.tools_provider);
@@ -555,6 +561,25 @@ impl ClientApi {
 
     pub fn install_run_provider(&self, provider: Arc<dyn RunControlProvider>) {
         *self.run_provider.write().unwrap() = Some(provider);
+    }
+
+    /// Inject the context-inspection provider (composition root / witness). Overwrites the
+    /// slot the context-family closure reads; `None` (default) → `module_unavailable`.
+    pub fn with_context_provider(
+        self,
+        provider: Arc<dyn crate::context::ContextInspectProvider>,
+    ) -> Self {
+        *self.context_provider.write().unwrap() = Some(provider);
+        self
+    }
+
+    /// Late-install the context-inspection provider into an already-bound `Arc<ClientApi>`
+    /// (the daemon builds the per-agent report store after the agent loop spawns).
+    pub fn install_context_provider(
+        &self,
+        provider: Arc<dyn crate::context::ContextInspectProvider>,
+    ) {
+        *self.context_provider.write().unwrap() = Some(provider);
     }
 
     pub fn install_messaging_provider(&self, provider: Arc<dyn MessagingProvider>) {

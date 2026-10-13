@@ -82,11 +82,13 @@ pub use l6::{
     SKILL_HEALTH_FILENAME,
 };
 pub use persistence::{
-    KnowledgeJsonlStore, PersistError, DEFAULT_MAX_INACTIVE_BYTES_PER_AGENT,
-    DEFAULT_MAX_INACTIVE_PER_AGENT, KNOWLEDGE_JSONL_FILENAME, MAX_LINE_BYTES,
+    slug as agent_dir_slug, KnowledgeJsonlStore, PersistError,
+    DEFAULT_MAX_INACTIVE_BYTES_PER_AGENT, DEFAULT_MAX_INACTIVE_PER_AGENT, KNOWLEDGE_JSONL_FILENAME,
+    MAX_LINE_BYTES,
 };
 pub use post_processor::{
-    Components, DescriptionIndexer, IndexedDescription, L6Dispatch, PostProcessor,
+    default_task_partition, Components, DescriptionIndexer, IndexedDescription, L6Dispatch,
+    PostProcessor,
 };
 pub use reconcile::{
     InMemorySimilarityIndex, MemoryAction, Reconciler, SimilarityIndex, DEFAULT_THRESHOLD,

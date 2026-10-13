@@ -32,6 +32,15 @@
       <button id="refresh-runs" type="button">Refresh</button>
       <div id="runs" class="records" aria-live="polite"></div>
     </section>
+    <section aria-labelledby="context-title">
+      <h2 id="context-title">Context assembly</h2>
+      <form id="context-form">
+        <label>Agent <input id="context-agent" value="root" required></label>
+        <button type="submit">Load</button>
+      </form>
+      <button id="refresh-context" type="button">Refresh</button>
+      <div id="context" class="records" aria-live="polite"></div>
+    </section>
     <section aria-labelledby="messages-title">
       <h2 id="messages-title">Messages</h2>
       <form id="message-form">

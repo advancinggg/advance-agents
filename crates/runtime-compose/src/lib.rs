@@ -89,7 +89,9 @@ pub mod breaker_gate;
 pub mod capability_catalog;
 pub mod channel_notify_sink;
 pub mod channels_boot;
+pub mod child_context;
 pub mod component_submit_bridge;
+pub mod context_inspect;
 pub mod context_wiring;
 pub mod data_wiring;
 // Wave-25A Order-2 build-and-hold platform anchor.  This module is deliberately

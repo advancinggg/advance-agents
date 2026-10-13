@@ -22,6 +22,7 @@ pub mod auth;
 pub mod clock;
 pub mod compat;
 pub mod config;
+pub mod context;
 pub mod costs;
 pub mod cursor;
 pub mod deltas;
@@ -61,6 +62,11 @@ pub use api::{ClientApi, ClientMutationContext, HandlerCtx, HandlerResponse, Han
 pub use audit::{AuditEvent, AuditSink, NoopSink};
 pub use clock::{Clock, SystemClock};
 pub use config::{ClientApiConfig, SessionAdmission};
+pub use context::{
+    ClientContextAssembly, ClientContextEmbedding, ClientContextHistory, ClientContextIndex,
+    ClientContextRecall, ClientContextRouting, ClientContextSection, ClientContextSnapshot,
+    ClientContextTierTokens, ContextInspectProvider, CONTEXT_TOKEN_ESTIMATE,
+};
 pub use costs::{
     ClientAgentCostEntry, ClientAgentCostList, ClientAgentCostReport, ClientCostQuery,
     ClientCostTotals, ClientCostWindow, ClientProviderCostEntry, ClientProviderCostList,

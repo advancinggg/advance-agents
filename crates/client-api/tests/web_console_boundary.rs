@@ -18,6 +18,7 @@ fn console_uses_only_public_client_api_and_safe_dom_writes() {
         "/client/messages",
         "/client/tools",
         "/client/devices",
+        "/client/agents/",
         "/history",
     ] {
         assert!(

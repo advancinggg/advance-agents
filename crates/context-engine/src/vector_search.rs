@@ -176,6 +176,7 @@ impl UnifiedSearchPort for RankingUnifiedSearch {
                     task_id: t.task_id.clone(),
                     similarity: s,
                     last_turn_at: t.last_turn_at,
+                    snippet: None,
                 })
             })
             .collect();
@@ -197,6 +198,7 @@ impl UnifiedSearchPort for RankingUnifiedSearch {
                     task_id: t.task_id.clone(),
                     similarity: s,
                     timestamp: t.timestamp,
+                    snippet: None,
                 })
             })
             .collect();
@@ -214,6 +216,7 @@ impl UnifiedSearchPort for RankingUnifiedSearch {
             .map(|(id, score)| ContentHit {
                 id,
                 adjusted_score: score,
+                snippet: None,
             })
             .collect();
 
@@ -222,6 +225,7 @@ impl UnifiedSearchPort for RankingUnifiedSearch {
             .map(|(id, score)| MemoryHit {
                 id,
                 adjusted_score: score,
+                snippet: None,
             })
             .collect();
 
@@ -326,6 +330,7 @@ impl TaskIndexPort for CosineTaskIndex {
                     task_id: t.task_id.clone(),
                     similarity: s,
                     last_turn_at: t.last_turn_at,
+                    snippet: None,
                 })
             })
             .collect();

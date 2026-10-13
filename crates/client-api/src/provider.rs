@@ -495,6 +495,7 @@ pub trait SecretsAdminProvider: Send + Sync {
 /// An interior-mutable provider slot: `None` until the composition root injects a concrete adapter.
 pub type ProviderSlot<T> = Arc<RwLock<Option<Arc<T>>>>;
 pub type RunProviderSlot = ProviderSlot<dyn RunControlProvider>;
+pub type ContextProviderSlot = ProviderSlot<dyn crate::context::ContextInspectProvider>;
 pub type MessagingProviderSlot = ProviderSlot<dyn MessagingProvider>;
 pub type ToolsProviderSlot = ProviderSlot<dyn ToolsProvider>;
 pub type AgentProviderSlot = ProviderSlot<dyn AgentAdminProvider>;

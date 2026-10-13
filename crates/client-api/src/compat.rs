@@ -124,6 +124,15 @@ pub const RESPONSE_COMPONENTS: &[&str] = &[
     "ClientGitFileHistory",
     "ClientGitFileAt",
     "ClientGitRollbackResult",
+    "ClientContextTierTokens",
+    "ClientContextSection",
+    "ClientContextRouting",
+    "ClientContextRecall",
+    "ClientContextHistory",
+    "ClientContextAssembly",
+    "ClientContextEmbedding",
+    "ClientContextIndex",
+    "ClientContextSnapshot",
 ];
 
 /// Request / filter bodies — not a response-field bag.

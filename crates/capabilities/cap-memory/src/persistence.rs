@@ -588,10 +588,9 @@ fn rewrite_file_atomic(file: &Path, entries: &[MemoryEntry]) -> Result<(), Persi
 /// reproducible across builds/restarts so the same id always maps to the same
 /// dir).
 ///
-/// `pub(crate)` since rollback-memory: `L6CursorStore::with_root` derives the
-/// SAME per-agent dir for `_knowledge_cursor.yaml` (cursor file sits beside
-/// the agent's `knowledge.jsonl` — one layout, one slug).
-pub(crate) fn slug(agent_id: &str) -> String {
+/// `pub` so the context-assembler L5 reader can resolve the SAME
+/// `<memory_root>/<slug>/_knowledge_map.yaml` dir L6 writes.
+pub fn slug(agent_id: &str) -> String {
     let mut s: String = agent_id
         .chars()
         .map(|c| {

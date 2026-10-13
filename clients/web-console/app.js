@@ -84,6 +84,7 @@ document.querySelector("#login-form").addEventListener("submit", async event => 
     refreshRuns(),
     refreshTools(),
     refreshDevices(),
+    refreshContext(),
   ]);
 });
 
@@ -180,6 +181,23 @@ async function refreshTools() {
   }
 }
 document.querySelector("#refresh-tools").addEventListener("click", refreshTools);
+
+async function refreshContext() {
+  const target = document.querySelector("#context");
+  target.replaceChildren();
+  const agent = document.querySelector("#context-agent").value || "root";
+  try {
+    const data = await request(`/client/agents/${encodeURIComponent(agent)}/context`);
+    render(target, data);
+  } catch (error) {
+    render(target, { error: String(error.message || error) });
+  }
+}
+document.querySelector("#context-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  await refreshContext();
+});
+document.querySelector("#refresh-context").addEventListener("click", refreshContext);
 
 async function refreshDevices() {
   const target = document.querySelector("#devices");

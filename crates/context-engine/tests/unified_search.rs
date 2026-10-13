@@ -35,6 +35,7 @@ impl UnifiedSearchPort for Search {
                 task_id: "task-1".into(),
                 similarity: 0.8,
                 last_turn_at: Some(SystemTime::UNIX_EPOCH),
+                snippet: None,
             }],
             turns: vec![
                 TurnHit {
@@ -42,21 +43,25 @@ impl UnifiedSearchPort for Search {
                     task_id: "task-current".into(),
                     similarity: 0.7,
                     timestamp: SystemTime::UNIX_EPOCH,
+                    snippet: None,
                 },
                 TurnHit {
                     id: "turn-cross".into(),
                     task_id: "task-other".into(),
                     similarity: 0.6,
                     timestamp: SystemTime::UNIX_EPOCH,
+                    snippet: None,
                 },
             ],
             contents: vec![ContentHit {
                 id: "content-1".into(),
                 adjusted_score: 0.5,
+                snippet: None,
             }],
             memories: vec![MemoryHit {
                 id: "memory-1".into(),
                 adjusted_score: 0.4,
+                snippet: None,
             }],
         })
     }
