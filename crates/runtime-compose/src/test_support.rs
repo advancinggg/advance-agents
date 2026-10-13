@@ -195,6 +195,8 @@ pub struct ProbeRecord {
     pub event_bus: Option<Weak<EventBus>>,
     pub llm_gateway: Option<Weak<LlmGateway>>,
     pub git_queue: Option<Weak<DefaultGitCommitQueue>>,
+    /// Git-family PR-1: the workspace repository's state after the step-1b bootstrap.
+    pub git_repo_status: Option<advance_git::GitRepoStatus>,
     pub perchild_manager: Option<Weak<PerChildLoopManager>>,
     pub run_manager: Option<Weak<RunManager>>,
     /// Its last drop joins the epoch ticker thread.

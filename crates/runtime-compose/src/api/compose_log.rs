@@ -149,6 +149,11 @@ pub mod log_keys {
     pub const WALK_REGISTRY_READ_FAILED: &str = "walk.registry_read_failed";
 
     // Capability wiring.
+    /// stderr: the workspace git repository is not on the single `main` branch (reported,
+    /// never re-pointed; commits stay disabled until an operator restores it).
+    pub const GIT_REPO_NOT_MAIN: &str = "wiring.git_repo_not_main";
+    /// stderr: the workspace git repository exists but cannot be opened or read.
+    pub const GIT_REPO_UNREADABLE: &str = "wiring.git_repo_unreadable";
     /// stderr: the git half of a memory rollback failed.
     pub const ROLLBACK_MEMORY_GIT_FAILED: &str = "wiring.rollback_memory_git_failed";
     /// stderr: secrets were migrated into the synchronized keychain.
@@ -305,6 +310,8 @@ pub mod log_keys {
         PACKS_WARN,
         PACKS_RESCAN_FAILED,
         WALK_REGISTRY_READ_FAILED,
+        GIT_REPO_NOT_MAIN,
+        GIT_REPO_UNREADABLE,
         ROLLBACK_MEMORY_GIT_FAILED,
         KEYCHAIN_MIGRATED,
         ROLLBACK_MEMORY_NOT_REPO,

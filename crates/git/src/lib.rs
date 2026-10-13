@@ -77,5 +77,5 @@ pub use commit_queue::{CommitRequest, CommitType, DefaultGitCommitQueue, GitComm
 pub use config::{GitConfigProvider, GitConfigSnapshot, StaticGitConfigProvider};
 pub use error::{CheckpointError, DeniedReason, GitError, RollbackError};
 pub use gc::GcTask;
-pub use repo::bootstrap_repo_at;
+pub use repo::{bootstrap_repo_at, ensure_workspace_repo, repo_status, GitRepoStatus};
 pub use rollback::{DefaultWorkspaceRollback, RollbackMode, RollbackTarget, WorkspaceRollback};

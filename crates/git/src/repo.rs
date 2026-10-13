@@ -53,6 +53,110 @@ pub(crate) fn open_repo_internal(path: &Path) -> Result<Repository, GitError> {
     Ok(Repository::open(path)?)
 }
 
+/// The observable state of a workspace repository (git-family PR-1).
+///
+/// Produced by [`repo_status`] (read-only probe) and [`ensure_workspace_repo`]
+/// (compose-time bootstrap). The composition root exposes it on its handles
+/// and the Client API projects it (`/client/git/status`, `/client/health`), so
+/// a workspace whose history is unavailable says WHY instead of degrading
+/// silently. `observed` / `reason` are Git ref names and libgit2 messages —
+/// never user content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitRepoStatus {
+    /// `.git` exists, opens, HEAD targets `refs/heads/main` (born or unborn)
+    /// and no other local branch coexists: the commit queue can commit.
+    Ready,
+    /// No `.git` at the workspace root (the workspace was never bootstrapped).
+    Missing,
+    /// The repository exists but HEAD is not `refs/heads/main` OR a second
+    /// local branch coexists. Never "fixed" by the runtime: the commit queue
+    /// refuses every commit until an operator restores the single-`main` layout.
+    NotMain { observed: String },
+    /// `.git` exists but libgit2 could not open or read the repository.
+    Unreadable { reason: String },
+}
+
+impl GitRepoStatus {
+    /// `true` only for [`GitRepoStatus::Ready`].
+    pub fn is_ready(&self) -> bool {
+        matches!(self, GitRepoStatus::Ready)
+    }
+
+    /// The stable lowercase token the Client API carries: `ready` / `missing` /
+    /// `not_main` / `unreadable`.
+    pub fn token(&self) -> &'static str {
+        match self {
+            GitRepoStatus::Ready => "ready",
+            GitRepoStatus::Missing => "missing",
+            GitRepoStatus::NotMain { .. } => "not_main",
+            GitRepoStatus::Unreadable { .. } => "unreadable",
+        }
+    }
+}
+
+impl std::fmt::Display for GitRepoStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GitRepoStatus::Ready => f.write_str("ready"),
+            GitRepoStatus::Missing => f.write_str("missing (no .git at the workspace root)"),
+            GitRepoStatus::NotMain { observed } => {
+                write!(f, "not_main (observed {observed})")
+            }
+            GitRepoStatus::Unreadable { reason } => write!(f, "unreadable ({reason})"),
+        }
+    }
+}
+
+/// Read-only probe of the repository at `path`. Never writes, never takes the
+/// per-repo coord mutex (`coord.rs`) — safe to call from any thread at any time.
+pub fn repo_status(path: &Path) -> GitRepoStatus {
+    if !path.join(".git").exists() {
+        return GitRepoStatus::Missing;
+    }
+    let repo = match Repository::open(path) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return GitRepoStatus::Unreadable {
+                reason: e.message().to_string(),
+            }
+        }
+    };
+    match enforce_single_branch(&repo) {
+        Ok(()) => GitRepoStatus::Ready,
+        Err(GitError::NotSingleBranch { observed }) => GitRepoStatus::NotMain { observed },
+        Err(e) => GitRepoStatus::Unreadable {
+            reason: e.to_string(),
+        },
+    }
+}
+
+/// Compose-time bootstrap of the workspace repository.
+///
+/// - `path` is not a directory → [`GitRepoStatus::Unreadable`] (nothing is created:
+///   the runtime never conjures a workspace).
+/// - No `.git` → [`bootstrap_repo_at`] (single-branch `main`, `.gitignore`
+///   installed; idempotent) → `Ready`.
+/// - `.git` exists → [`repo_status`] only. An existing repository is NEVER
+///   rewritten: a HEAD off `main` is reported as [`GitRepoStatus::NotMain`], not
+///   re-pointed; `.gitignore` is left as the operator keeps it.
+pub fn ensure_workspace_repo(path: &Path) -> GitRepoStatus {
+    if !path.is_dir() {
+        return GitRepoStatus::Unreadable {
+            reason: format!("workspace {} is not a directory", path.display()),
+        };
+    }
+    if path.join(".git").exists() {
+        return repo_status(path);
+    }
+    match bootstrap_repo_at(path) {
+        Ok(()) => GitRepoStatus::Ready,
+        Err(GitError::NotSingleBranch { observed }) => GitRepoStatus::NotMain { observed },
+        Err(e) => GitRepoStatus::Unreadable {
+            reason: e.to_string(),
+        },
+    }
+}
+
 fn enforce_single_branch(repo: &Repository) -> Result<(), GitError> {
     // (a) HEAD must symbolically target refs/heads/main. Detached HEAD or a non-
     //     main target is rejected. Unborn branch (fresh init) is accepted if the
@@ -120,4 +224,77 @@ fn ensure_gitignore(path: &Path) -> Result<(), GitError> {
         std::fs::write(&gi, out)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_status_missing_without_dot_git() {
+        let td = tempfile::TempDir::new().unwrap();
+        assert_eq!(repo_status(td.path()), GitRepoStatus::Missing);
+        assert_eq!(GitRepoStatus::Missing.token(), "missing");
+    }
+
+    #[test]
+    fn ensure_bootstraps_an_empty_directory_once() {
+        let td = tempfile::TempDir::new().unwrap();
+        assert_eq!(ensure_workspace_repo(td.path()), GitRepoStatus::Ready);
+        assert!(td.path().join(".git").is_dir());
+        let head = std::fs::read_to_string(td.path().join(".git/HEAD")).unwrap();
+        assert_eq!(head.trim(), "ref: refs/heads/main");
+        assert!(td.path().join(".gitignore").is_file());
+        // Idempotent: a second call opens, never re-inits.
+        assert_eq!(ensure_workspace_repo(td.path()), GitRepoStatus::Ready);
+        assert_eq!(repo_status(td.path()), GitRepoStatus::Ready);
+    }
+
+    #[test]
+    fn ensure_refuses_a_missing_directory() {
+        let td = tempfile::TempDir::new().unwrap();
+        let gone = td.path().join("nope");
+        assert!(matches!(
+            ensure_workspace_repo(&gone),
+            GitRepoStatus::Unreadable { .. }
+        ));
+        assert!(!gone.exists(), "nothing is created for a missing workspace");
+    }
+
+    #[test]
+    fn ensure_reports_not_main_without_rewriting() {
+        let td = tempfile::TempDir::new().unwrap();
+        let mut opts = RepositoryInitOptions::new();
+        opts.initial_head("other");
+        Repository::init_opts(td.path(), &opts).unwrap();
+        let before = std::fs::read_to_string(td.path().join(".git/HEAD")).unwrap();
+        let status = ensure_workspace_repo(td.path());
+        assert_eq!(
+            status,
+            GitRepoStatus::NotMain {
+                observed: "refs/heads/other".to_string()
+            }
+        );
+        assert_eq!(status.token(), "not_main");
+        let after = std::fs::read_to_string(td.path().join(".git/HEAD")).unwrap();
+        assert_eq!(before, after, "HEAD is reported, never re-pointed");
+        assert!(
+            !td.path().join(".gitignore").exists(),
+            "an existing repository is not rewritten"
+        );
+    }
+
+    #[test]
+    fn repo_status_unreadable_for_a_corrupt_dot_git() {
+        let td = tempfile::TempDir::new().unwrap();
+        std::fs::write(td.path().join(".git"), "gitdir: /nonexistent/elsewhere\n").unwrap();
+        assert!(matches!(
+            repo_status(td.path()),
+            GitRepoStatus::Unreadable { .. }
+        ));
+        assert!(matches!(
+            ensure_workspace_repo(td.path()),
+            GitRepoStatus::Unreadable { .. }
+        ));
+    }
 }

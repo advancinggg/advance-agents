@@ -40,7 +40,7 @@ use advance_run_manager::{RepetitionGuard, RepetitionGuardConfig, RunConfig, Run
 // await-leg B-2 (2026-06-22) — the production messaging-chain registration entry +
 // the suspend-sink port type, consumed by the `declares_messaging` block below.
 use crate::api::ProcessPolicy;
-use advance_git::{DefaultGitCommitQueue, GitCommitQueue};
+use advance_git::{DefaultGitCommitQueue, GitCommitQueue, GitRepoStatus};
 use advance_reply_tracker::{
     register_reply_tracker_host_fns_with_suspend_sink,
     register_send_host_fn_with_turn_reply_routing, AwaitSessionManagerImpl,
@@ -734,6 +734,11 @@ pub struct WiringHandles {
     /// workspace is not a git repo (cap-fs registered without git_sync → degraded,
     /// no turn commits — same as pre-BS-3).
     pub git_queue: Option<Arc<DefaultGitCommitQueue>>,
+    /// Git-family PR-1: the workspace repository's state after the compose-time
+    /// bootstrap (`advance_git::ensure_workspace_repo`). `Ready` on every initialized
+    /// workspace (a missing `.git` is created); `NotMain` / `Unreadable` are reported
+    /// (log + `/client/git/status` + `/client/health`), never "fixed".
+    pub git_repo_status: GitRepoStatus,
     /// Phase-3 kickoff (2026-06-06): the live per-session `RunManager`, wired to
     /// the EventBus's `CostTracker` (`with_cost_tracker(bus.cost_tracker_query())`).
     /// Its `budget()` handle is already inside the cap-llm gateway; this handle is
@@ -1430,6 +1435,19 @@ impl From<CliWiringError> for WiringFailure {
     }
 }
 
+/// Whether `workspace` is an initialized advance home — the only kind of directory the
+/// wiring bootstraps a git repository in (step 1b). `advance init` writes both
+/// `.advance/runtime-config.yaml` and `.agent/config.yaml`; either marker (a real
+/// directory, never a symlink) qualifies, so a test home that carries only the agent
+/// config is bootstrapped too, while an arbitrary directory is only probed.
+fn is_initialized_workspace(workspace: &Path) -> bool {
+    [".advance", ".agent"].iter().any(|marker| {
+        std::fs::symlink_metadata(workspace.join(marker))
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false)
+    })
+}
+
 /// Wire the production capability graph. Its diagnostics are not reported. On a
 /// failure, whatever the wiring had started is stopped before the error returns.
 pub async fn wire_capabilities(
@@ -1545,6 +1563,46 @@ pub(crate) async fn wire_capabilities_inner(
     // residual window is documented in the Slice-AG history and bounded by the
     // workspace 0o700 perms.)
     let agent_yaml: Option<Vec<u8>> = crate::agent_config::read_agent_yaml(workspace);
+
+    // Step 1b (git-family PR-1) — the workspace git repository (MODULE-003).
+    // An initialized workspace (an `advance init` home: `.advance/` or `.agent/`)
+    // without `.git` is bootstrapped HERE, before anything below opens the repo
+    // (the auto-loop driver in 4b, the commit queue in 5b, the rollback-memory git
+    // half, the L6 committer): single-branch `main`, `.gitignore` installed,
+    // idempotent — so a fresh home gets history from its first turn instead of
+    // the silent "not a repo → no commits, no events" degrade. An EXISTING
+    // repository is never rewritten: a HEAD off `main` (or a second local branch)
+    // is reported and exposed (`WiringHandles::git_repo_status` →
+    // `/client/git/status`, `/client/health`), and the commit queue's own
+    // single-branch guard keeps refusing commits until an operator restores it.
+    // A directory that is not an initialized workspace is only probed.
+    //
+    // `GcTask` (`advance_git::gc`) is deliberately NOT spawned here: its `run_gc`
+    // builds the pack into an in-memory buffer and never writes
+    // `.git/objects/pack/` (gc.rs §3.8 caveat), so a 24h tick would only burn CPU
+    // without compacting anything. Revisit when the pack is persisted; the
+    // read-only history reader goes through libgit2 and already reads packed
+    // objects, so spawning it later needs no reader change.
+    let git_repo_status = if is_initialized_workspace(workspace) {
+        advance_git::ensure_workspace_repo(workspace)
+    } else {
+        advance_git::repo_status(workspace)
+    };
+    match &git_repo_status {
+        GitRepoStatus::NotMain { observed } => log.err(
+            log_keys::GIT_REPO_NOT_MAIN,
+            format!(
+                "advance: workspace git repository is not on the single main branch (observed {observed}); commits stay disabled until HEAD is refs/heads/main and no other local branch exists"
+            ),
+        ),
+        GitRepoStatus::Unreadable { reason } => log.err(
+            log_keys::GIT_REPO_UNREADABLE,
+            format!("advance: workspace git repository is unreadable: {reason}"),
+        ),
+        GitRepoStatus::Ready | GitRepoStatus::Missing => {}
+    }
+    probe_record!(probe, |record| record.git_repo_status =
+        Some(git_repo_status.clone()));
 
     // Per-capability active gate. `None` yaml (no `.agent/config.yaml`) → every
     // capability inactive → graceful degradation (preserves Slice-AG T-AG-04).
@@ -3838,6 +3896,7 @@ pub(crate) async fn wire_capabilities_inner(
             contract219_projector,
             client_api_server,
             git_queue: git_queue_handle,
+            git_repo_status,
             run_manager,
             await_manager: await_manager_handle,
             auto_loop_driver,
