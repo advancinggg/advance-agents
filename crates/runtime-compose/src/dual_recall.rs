@@ -72,6 +72,7 @@ fn map_task(t: advance_database::TaskHit) -> TaskHit {
         task_id: t.task_id,
         similarity: t.similarity,
         last_turn_at: t.last_turn_at.map(SystemTime::from),
+        snippet: None,
     }
 }
 
@@ -81,15 +82,18 @@ fn map_turn(t: advance_database::TurnHit) -> TurnHit {
         task_id: t.task_id,
         similarity: t.similarity,
         timestamp: SystemTime::from(t.timestamp),
+        snippet: None,
     }
 }
 
 fn map_content(c: advance_database::ContentHit) -> ContentHit {
-    // ce::ContentHit is the slim source-separation carrier — only id + score reach
-    // the prompt (the file_path / preview / access_count are MODULE-004-internal).
+    // ce::ContentHit keeps id + score + the producer's bounded preview (the
+    // recall renderer byte-caps + sanitizes it); `access_count` and the host
+    // `file_path` are MODULE-004-internal and never reach the prompt.
     ContentHit {
         id: c.id,
         adjusted_score: c.adjusted_score,
+        snippet: c.content_preview.filter(|p| !p.trim().is_empty()),
     }
 }
 
@@ -97,6 +101,7 @@ fn map_memory(m: advance_database::MemoryHit) -> MemoryHit {
     MemoryHit {
         id: m.id,
         adjusted_score: m.adjusted_score,
+        snippet: (!m.content.trim().is_empty()).then_some(m.content),
     }
 }
 

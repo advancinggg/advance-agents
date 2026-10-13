@@ -25,6 +25,10 @@ use crate::tier2::{neutralize_cache_breakpoint_markers, sanitize_description};
 /// truncation, no suffix.
 const MAX_FIELD_LEN: usize = 128;
 
+/// Byte cap for a producer-supplied snippet (digest / brief / preview). A turn
+/// digest is a one-sentence summary; this bounds an adversarial producer.
+const MAX_SNIPPET_LEN: usize = 320;
+
 /// CONTRACT-114 boundary `source` tag for the recall section.
 const RECALL_SOURCE: &str = "memory:recall";
 
@@ -50,37 +54,25 @@ pub(crate) fn format_recall_section(
     if !result.contents.is_empty() {
         body.push_str("## Files\n");
         for h in &result.contents {
-            body.push_str(&format!(
-                "- {} ({:.3})\n",
-                clean_id(&h.id),
-                h.adjusted_score
-            ));
+            body.push_str(&line(&h.id, h.adjusted_score, h.snippet.as_deref()));
         }
     }
     if !result.memories.is_empty() {
         body.push_str("## Memory\n");
         for h in &result.memories {
-            body.push_str(&format!(
-                "- {} ({:.3})\n",
-                clean_id(&h.id),
-                h.adjusted_score
-            ));
+            body.push_str(&line(&h.id, h.adjusted_score, h.snippet.as_deref()));
         }
     }
     if !result.tasks.is_empty() {
         body.push_str("## Related Tasks\n");
         for h in &result.tasks {
-            body.push_str(&format!(
-                "- {} ({:.3})\n",
-                clean_id(&h.task_id),
-                h.similarity
-            ));
+            body.push_str(&line(&h.task_id, h.similarity, h.snippet.as_deref()));
         }
     }
     if !result.turns.is_empty() {
         body.push_str("## Related Turns\n");
         for h in &result.turns {
-            body.push_str(&format!("- {} ({:.3})\n", clean_id(&h.id), h.similarity));
+            body.push_str(&line(&h.id, h.similarity, h.snippet.as_deref()));
         }
     }
 
@@ -93,6 +85,22 @@ pub(crate) fn format_recall_section(
         helpers,
     ));
     Some(wrapped)
+}
+
+/// One recall line: `- {id} ({score:.3})`, plus ` — {snippet}` when the
+/// producer supplied a non-blank snippet (byte-capped + sanitized; the shared
+/// sanitizer flattens newlines so a multi-line digest stays one list item).
+fn line(id: &str, score: f32, snippet: Option<&str>) -> String {
+    let mut s = format!("- {} ({:.3})", clean_id(id), score);
+    if let Some(text) = snippet {
+        let cleaned = sanitize_description(&truncate_to(text, MAX_SNIPPET_LEN));
+        if !cleaned.trim().is_empty() {
+            s.push_str(" — ");
+            s.push_str(cleaned.trim());
+        }
+    }
+    s.push('\n');
+    s
 }
 
 /// Byte-cap then sanitize a producer-derived id (defense-in-depth).
@@ -149,20 +157,24 @@ mod tests {
                 task_id: "task-1".into(),
                 similarity: 0.5,
                 last_turn_at: None,
+                snippet: None,
             }],
             turns: vec![TurnHit {
                 id: "turn-1".into(),
                 task_id: "task-9".into(),
                 similarity: 0.4,
                 timestamp: SystemTime::UNIX_EPOCH,
+                snippet: None,
             }],
             contents: vec![ContentHit {
                 id: "file-1".into(),
                 adjusted_score: 0.91,
+                snippet: None,
             }],
             memories: vec![MemoryHit {
                 id: "mem-1".into(),
                 adjusted_score: 0.88,
+                snippet: None,
             }],
         };
         let s = format_recall_section(&result, &FakeWrapHelper).expect("non-empty ⇒ Some");
@@ -183,11 +195,50 @@ mod tests {
     }
 
     #[test]
+    fn renders_snippets_single_line_and_capped() {
+        let result = UnifiedSearchResult {
+            turns: vec![TurnHit {
+                id: "turn-7".into(),
+                task_id: "t".into(),
+                similarity: 0.73,
+                timestamp: SystemTime::UNIX_EPOCH,
+                snippet: Some("deployed the\nservice".into()),
+            }],
+            tasks: vec![TaskHit {
+                task_id: "task-2".into(),
+                similarity: 0.6,
+                last_turn_at: None,
+                snippet: Some("x".repeat(MAX_SNIPPET_LEN + 40)),
+            }],
+            ..Default::default()
+        };
+        let s = format_recall_section(&result, &FakeWrapHelper).expect("Some");
+        assert!(
+            s.contains("- turn-7 (0.730) — deployed the service"),
+            "snippet is appended single-line: {s}"
+        );
+        assert!(!s.contains(&"x".repeat(MAX_SNIPPET_LEN + 1)));
+        assert!(s.contains(&"x".repeat(MAX_SNIPPET_LEN)));
+        // A blank snippet adds nothing after the score.
+        let blank = UnifiedSearchResult {
+            memories: vec![MemoryHit {
+                id: "m".into(),
+                adjusted_score: 0.5,
+                snippet: Some("   ".into()),
+            }],
+            ..Default::default()
+        };
+        let s = format_recall_section(&blank, &FakeWrapHelper).expect("Some");
+        assert!(s.contains("- m (0.500)\n"));
+    }
+
+    #[test]
     fn sanitizes_trojan_source_in_id() {
         let result = UnifiedSearchResult {
             memories: vec![MemoryHit {
                 id: "evil\u{202E}id\u{200B}".into(),
                 adjusted_score: 0.5,
+                snippet: None,
             }],
             ..Default::default()
         };
@@ -202,6 +253,7 @@ mod tests {
             memories: vec![MemoryHit {
                 id: "mem-1".into(),
                 adjusted_score: 0.7,
+                snippet: None,
             }],
             ..Default::default()
         };

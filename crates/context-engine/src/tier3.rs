@@ -100,28 +100,94 @@ pub fn recent_l0_turns(mode: ProgressiveMode) -> usize {
 /// **no test-only entries** in this production table; tests drive behavior
 /// via the exported pure functions + the fail-safe default.
 pub fn model_context_window(model: &str) -> usize {
+    let model = normalize_model_id(model);
+    let m = model.as_str();
     // Real model families (documented public context windows). Prefix match
-    // tolerates dated/suffixed variants (e.g. `gpt-4o-2024-11-20`).
-    if model.starts_with("claude-") {
+    // tolerates dated/suffixed variants (e.g. `gpt-4o-2024-11-20`). Where a
+    // family ships several windows the SMALLER documented one is used (a
+    // budget guard must never over-estimate).
+    let has = |p: &str| m.starts_with(p);
+    if has("claude-") {
         200_000
-    } else if model.starts_with("o1") || model.starts_with("o3") {
-        200_000
-    } else if model.starts_with("gpt-4o") || model.starts_with("gpt-4.1") {
-        128_000
-    } else if model.starts_with("gpt-4-turbo") {
-        128_000
-    } else if model.starts_with("gpt-4-32k") {
-        32_768
-    } else if model.starts_with("gpt-4") {
-        8_192
-    } else if model.starts_with("gpt-3.5-turbo") {
-        16_385
-    } else if model.starts_with("gemini-1.5") || model.starts_with("gemini-2") {
+    } else if has("gpt-5") {
+        400_000
+    } else if has("gpt-4.1") {
         1_000_000
+    } else if has("o1") || has("o3") || has("o4") {
+        200_000
+    } else if has("gpt-4o") || has("gpt-4-turbo") || has("chatgpt-4o") {
+        128_000
+    } else if has("gpt-4-32k") {
+        32_768
+    } else if has("gpt-4") {
+        8_192
+    } else if has("gpt-3.5-turbo") {
+        16_385
+    } else if has("gemini-1.5") || has("gemini-2") || has("gemini-3") {
+        1_000_000
+    } else if has("deepseek") {
+        128_000
+    } else if has("qwen3") || has("qwen-max") || has("qwen-plus") || has("qwen-turbo") {
+        128_000
+    } else if has("qwen") {
+        32_768
+    } else if has("llama-3.1") || has("llama-3.2") || has("llama-3.3") || has("llama3.1") {
+        128_000
+    } else if has("llama-4") || has("llama4") {
+        256_000
+    } else if has("llama") {
+        8_192
+    } else if has("mistral-large") || has("mistral-medium") || has("mistral-small") {
+        128_000
+    } else if has("mixtral") || has("mistral") {
+        32_768
+    } else if has("kimi-k2") || has("moonshot") {
+        128_000
+    } else if has("glm-4.5") || has("glm-4.6") || has("glm-5") {
+        128_000
+    } else if has("glm-4") {
+        128_000
+    } else if has("grok-4") {
+        256_000
+    } else if has("grok-3") {
+        131_072
+    } else if has("command-a") || has("command-r") {
+        128_000
+    } else if has("phi-4") {
+        16_384
+    } else if has("gemma-3") || has("gemma3") {
+        128_000
+    } else if has("gemma") {
+        8_192
     } else {
         // Unknown / unrecognized / spoofed → fail-safe-small.
         SMALL_MODEL_WINDOW
     }
+}
+
+/// Canonicalize a model id for the window table: lower-case, trimmed, with a
+/// vendor / route prefix (`anthropic/claude-…`, `openai:gpt-4o`, `models/gemini-…`)
+/// and a `-latest` / `:latest` suffix stripped. Pure.
+pub fn normalize_model_id(model: &str) -> String {
+    let mut m = model.trim().to_ascii_lowercase();
+    if let Some(idx) = m.rfind('/') {
+        m = m[idx + 1..].to_string();
+    }
+    if let Some(idx) = m.rfind(':') {
+        // `openai:gpt-4o` (route prefix) or `llama3.1:70b` (tag suffix). Only treat
+        // the colon as a prefix separator when the LEFT side has no digit — a tag
+        // like `:70b` / `:latest` is dropped instead.
+        let (left, right) = m.split_at(idx);
+        if left.chars().any(|c| c.is_ascii_digit()) {
+            m = left.to_string();
+        } else {
+            m = right[1..].to_string();
+        }
+    }
+    if let Some(stripped) = m.strip_suffix("-latest") {
+        m = stripped.to_string();
+    }
+    m
 }
 
 /// §1.3.7 response reservation: `min(model_limit * 0.15, 30_000)`. Integer

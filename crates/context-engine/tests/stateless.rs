@@ -101,21 +101,32 @@ fn assembler_has_no_session_id_shaped_fields() {
     // inverted-dependency port; the `Vec<String>` is construction config, NOT
     // per-call/session/provider state — the AC-01 stateless invariant (no
     // mutation across `assemble()` calls) is preserved).
+    // Runtime-info slice: `runtime_info: Arc<dyn RuntimeInfoReader>` (the 20th
+    // read-only port), `report_sink: Option<Arc<dyn AssemblyReportSink>>` (an
+    // inverted-dependency SINK the composition root installs — it receives the
+    // per-turn report; the assembler never reads it back, so no state crosses
+    // `assemble()` calls through it) and `model_window_override: Option<usize>`
+    // (immutable construction config, like the alias set).
     let fat = size_of::<Arc<dyn CallableInventoryReader>>();
     let thin = size_of::<Arc<WarningQueue>>();
-    let expected_size = 19 * fat + thin + size_of::<Vec<String>>();
+    let expected_size = 20 * fat
+        + size_of::<Option<Arc<dyn CallableInventoryReader>>>()
+        + size_of::<Option<usize>>()
+        + thin
+        + size_of::<Vec<String>>();
 
     assert_eq!(
         size_of_val(&asm),
         expected_size,
         "ContextAssemblerImpl field-set changed — possible provider-state \
-         addition. AC-01 requires the struct hold ONLY 19 Arc<dyn _> \
+         addition. AC-01 requires the struct hold ONLY 20 Arc<dyn _> \
          inverted-dependency ports (incl. the canonical EventBusEmit, the \
          Slice-V1-c SkillSummaryReader, the Stage-C SAT-A 6 L1-L6 reader \
-         ports, the Stage-C SAT-E PromptInjectionHelpers, and the Wave-12 \
-         Lane C DecompositionReader) + 1 Arc<WarningQueue> + 1 Vec<String> \
-         agent-id alias config (Wave-12 Lane A, immutable construction config — \
-         not session/provider state); no session map, connection pool, or \
-         provider handle."
+         ports, the Stage-C SAT-E PromptInjectionHelpers, the Wave-12 \
+         Lane C DecompositionReader and the RuntimeInfoReader) + 1 optional \
+         AssemblyReportSink + 1 Option<usize> model-window override + 1 \
+         Arc<WarningQueue> + 1 Vec<String> agent-id alias config (immutable \
+         construction config — not session/provider state); no session map, \
+         connection pool, or provider handle."
     );
 }

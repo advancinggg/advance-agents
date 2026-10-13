@@ -54,6 +54,7 @@ fn hit(id: &str, sim: f32, lta: Option<SystemTime>) -> TaskHit {
         task_id: id.into(),
         similarity: sim,
         last_turn_at: lta,
+        snippet: None,
     }
 }
 

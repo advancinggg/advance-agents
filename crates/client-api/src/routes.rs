@@ -100,6 +100,9 @@ pub const TPL_AGENT_DELETE: &str = "/client/agents/{agent_id}:delete";
 pub const TPL_AGENT_AGENTS_MD: &str = "/client/agents/{agent_id}/agents-md";
 /// Replace the agent's `.agent/AGENTS.md` (POST mutation).
 pub const TPL_AGENT_SET_AGENTS_MD: &str = "/client/agents/{agent_id}:set-agents-md";
+/// The agent's latest assembled context (tiers / sections / budget / recall), GET. Same
+/// segment count as `TPL_AGENT_AGENTS_MD`; the literal third segment disambiguates.
+pub const TPL_AGENT_CONTEXT: &str = "/client/agents/{agent_id}/context";
 /// Packs family templated routes: one installed pack (`{name}@{version}`), uninstall it.
 pub const TPL_PACK_GET: &str = "/client/packs/{pack_id}";
 pub const TPL_PACK_UNINSTALL: &str = "/client/packs/{pack_id}:uninstall";

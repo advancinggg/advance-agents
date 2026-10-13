@@ -162,6 +162,47 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
             "LlmDeltaStreamRequest".to_string(),
             schema_value::<crate::deltas::LlmDeltaStreamRequest>(),
         );
+        // Context-inspection family (the latest assembled prompt per agent) DTOs (additive).
+        for (name, value) in [
+            (
+                "ClientContextTierTokens",
+                schema_value::<crate::context::ClientContextTierTokens>(),
+            ),
+            (
+                "ClientContextSection",
+                schema_value::<crate::context::ClientContextSection>(),
+            ),
+            (
+                "ClientContextRouting",
+                schema_value::<crate::context::ClientContextRouting>(),
+            ),
+            (
+                "ClientContextRecall",
+                schema_value::<crate::context::ClientContextRecall>(),
+            ),
+            (
+                "ClientContextHistory",
+                schema_value::<crate::context::ClientContextHistory>(),
+            ),
+            (
+                "ClientContextAssembly",
+                schema_value::<crate::context::ClientContextAssembly>(),
+            ),
+            (
+                "ClientContextEmbedding",
+                schema_value::<crate::context::ClientContextEmbedding>(),
+            ),
+            (
+                "ClientContextIndex",
+                schema_value::<crate::context::ClientContextIndex>(),
+            ),
+            (
+                "ClientContextSnapshot",
+                schema_value::<crate::context::ClientContextSnapshot>(),
+            ),
+        ] {
+            m.insert(name.to_string(), value);
+        }
         // Agents family (CONTRACT-190 agent CRUD) DTOs (additive).
         m.insert(
             "ClientAgentSummary".to_string(),

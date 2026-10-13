@@ -115,6 +115,15 @@ pub const RESPONSE_COMPONENTS: &[&str] = &[
     "ClientEntityRow",
     "ClientEntityPage",
     "ClientEntityTarget",
+    "ClientContextTierTokens",
+    "ClientContextSection",
+    "ClientContextRouting",
+    "ClientContextRecall",
+    "ClientContextHistory",
+    "ClientContextAssembly",
+    "ClientContextEmbedding",
+    "ClientContextIndex",
+    "ClientContextSnapshot",
 ];
 
 /// Request / filter bodies — not a response-field bag.

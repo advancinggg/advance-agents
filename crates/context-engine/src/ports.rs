@@ -73,6 +73,11 @@ pub struct TaskHit {
     /// `None` carries tie-break semantics: `Some(t)` precedes `None`
     /// (mirrors upstream `rank_task_rows` "newer first; None goes after Some").
     pub last_turn_at: Option<SystemTime>,
+    /// Producer-supplied text (the task brief) rendered in `# Recalled Context`
+    /// so the model sees what the task was about, not only its id. Untrusted;
+    /// the renderer byte-caps + sanitizes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
 }
 
 /// One cross-task turn hit. Mirrors
@@ -83,6 +88,10 @@ pub struct TurnHit {
     pub task_id: String,
     pub similarity: f32,
     pub timestamp: SystemTime,
+    /// Producer-supplied text (the turn digest) rendered in `# Recalled Context`.
+    /// Untrusted; the renderer byte-caps + sanitizes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
 }
 
 /// One content-index hit. Minimal mirror — only the fields Slice B needs for
@@ -91,6 +100,9 @@ pub struct TurnHit {
 pub struct ContentHit {
     pub id: String,
     pub adjusted_score: f32,
+    /// Producer-supplied preview rendered in `# Recalled Context`. Untrusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
 }
 
 /// One memory-index hit (with epistemic boost folded into `adjusted_score` by
@@ -99,6 +111,9 @@ pub struct ContentHit {
 pub struct MemoryHit {
     pub id: String,
     pub adjusted_score: f32,
+    /// Producer-supplied memory text rendered in `# Recalled Context`. Untrusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
 }
 
 /// Source-separated unified search result. Mirrors
@@ -545,4 +560,133 @@ pub struct SubtaskView {
 pub trait DecompositionReader: Send + Sync {
     async fn read_active_subtasks(&self, agent_id: &str, task_id: Option<&str>)
         -> Vec<SubtaskView>;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Runtime info — Tier 1a ②/③ (architecture / security model) + Tier 1b ⑦/⑧
+// (capability config / mode state / runtime info).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The runtime facts the Tier 1a `# Runtime Architecture` / `# Security Model`
+/// and the Tier 1b `# Runtime State` sections render. Category-(B1) carrier —
+/// no upstream struct; the composition root fills it from what it already
+/// knows (declared capabilities, workspace, resolved model, agent-tree kind).
+/// Every string is **untrusted** at render (sanitized + byte-capped).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeInfoView {
+    /// Runtime crate version (e.g. `0.1.40`).
+    pub runtime_version: String,
+    /// `root` | `child` | `sub` (lower-case tag), when the tree knows the agent.
+    pub agent_kind: Option<String>,
+    /// Parent handle for a non-root agent.
+    pub parent_agent: Option<String>,
+    /// Display form of the agent workspace (never an absolute host path on the
+    /// client side; the composition root decides what to show).
+    pub workspace: Option<String>,
+    /// Declared capability names (`.agent/config.yaml`), sorted at render.
+    pub capabilities: Vec<String>,
+    /// Serving mode: `serve` (POST /msg), `channels`, `auto`, …
+    pub mode: Option<String>,
+    /// The provider entry id the turn's model resolves to.
+    pub llm_provider: Option<String>,
+    /// The resolved model id fed to `AssemblyContext.model`.
+    pub llm_model: Option<String>,
+    /// Persistent memory (cap-memory) is wired for this agent.
+    pub memory_enabled: bool,
+    /// Skills reader is wired for this agent.
+    pub skills_enabled: bool,
+    /// A real embedding provider backs semantic recall / task routing.
+    pub embedding_enabled: bool,
+}
+
+/// Tier 1a/1b runtime-info source. Read-only; `None` ⇒ the three runtime
+/// sections are omitted (byte-identical to the pre-runtime-info prompt).
+#[async_trait]
+pub trait RuntimeInfoReader: Send + Sync {
+    async fn runtime_info(&self, agent_id: &str) -> Option<RuntimeInfoView>;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Assembly report — the per-turn inspection record the composition root
+// exposes through the Client API (`GET /client/agents/{id}/context`).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One assembled message, attributed to its tier. `tokens` uses the same
+/// estimator as `TierTokenCounts`, so the per-tier sums match.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssemblySection {
+    /// `1a` | `1b` | `2` | `3`.
+    pub tier: String,
+    /// The section heading (`# Agent Identity`, …) or a role-derived label
+    /// (`history turn`, `warning`, `user prompt`, `cache breakpoint`).
+    pub label: String,
+    pub role: String,
+    pub tokens: u32,
+    pub bytes: u32,
+}
+
+/// Recall hit counts for one assembly.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssemblyRecallReport {
+    /// A query embedding was requested (non-blank prompt + embedding port).
+    pub attempted: bool,
+    pub tasks: u32,
+    pub turns: u32,
+    pub contents: u32,
+    pub memories: u32,
+}
+
+/// History / multi-level digest usage for one assembly.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssemblyHistoryReport {
+    /// `AssemblyContext.turn_buffer` entries received.
+    pub turn_buffer_in: u32,
+    /// Entries kept after L0 compression + progressive-mode bounding.
+    pub turn_buffer_kept: u32,
+    /// Entries L0 dropped (superseded / invalidated) or collapsed to a skeleton.
+    pub l0_compressed: u32,
+    pub l2_digests: u32,
+    pub l3_epoch: bool,
+    pub l4_task_summary: bool,
+    pub l5_related_briefs: u32,
+}
+
+/// The full per-turn assembly report. Emitted once per successful `assemble()`
+/// through [`AssemblyReportSink`] AFTER the result is built.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssemblyReport {
+    pub agent_id: String,
+    pub task_id: Option<String>,
+    pub message_id: String,
+    pub trace_id: Option<String>,
+    pub model: String,
+    pub model_context_window: u32,
+    pub response_reserve: u32,
+    pub budget_tokens: u32,
+    /// `tier1a + tier1b + tier2 + tier3`.
+    pub used_tokens: u32,
+    /// `budget_tokens - used_tokens` (saturating).
+    pub remaining_tokens: u32,
+    /// `wide` | `medium` | `compact` | `extreme`.
+    pub progressive_mode: String,
+    /// The budget-overflow guard produced the degraded (identity + prompt) set.
+    pub degraded: bool,
+    pub tier1a_tokens: u32,
+    pub tier1b_tokens: u32,
+    pub tier2_tokens: u32,
+    pub tier3_tokens: u32,
+    pub sections: Vec<AssemblySection>,
+    pub routing_method: String,
+    pub routing_confidence: f32,
+    pub is_new_task: bool,
+    pub recall: AssemblyRecallReport,
+    pub history: AssemblyHistoryReport,
+    pub prompt_bytes: u32,
+    pub warnings: u32,
+}
+
+/// Sink for [`AssemblyReport`]s. Sync + non-blocking (the implementer stores
+/// the latest report per agent; never does I/O on the turn path).
+pub trait AssemblyReportSink: Send + Sync {
+    fn record(&self, report: AssemblyReport);
 }

@@ -1264,6 +1264,34 @@ impl advance_shared_types::inference::LocalInferenceResolve for LlmGateway {
 }
 
 impl LlmGateway {
+    /// Whether the CURRENT provider config has at least one embedding-capable
+    /// entry (an OpenAI-compatible cloud endpoint, or a local / mesh entry with
+    /// an `embedding-model`; Anthropic, agent-cli and ChatGPT sign-in entries
+    /// never embed). The composition root gates the context assembler's live
+    /// embedding + the memory pipeline's real embedder on this, so a config
+    /// without an embedding provider never pays a failing `/v1/embeddings`
+    /// round-trip per turn.
+    pub fn has_embedding_provider(&self) -> bool {
+        let cfg = self.config_provider.current();
+        cfg.llm_providers.iter().any(is_embedding_capable)
+    }
+
+    /// The model id `embed()` would send, when an embedding-capable provider is
+    /// configured (the entry's `embedding-model`, else the adapter default).
+    pub fn embedding_model_id(&self) -> Option<String> {
+        let cfg = self.config_provider.current();
+        let resolved = select_embedding_provider(&cfg.llm_providers).ok()?;
+        resolved
+            .embedding_model
+            .clone()
+            .or_else(|| {
+                crate::providers::select_adapter(resolved.backend)
+                    .embedding_model()
+                    .map(str::to_string)
+            })
+            .or_else(|| (!resolved.model.is_empty()).then(|| resolved.model.clone()))
+    }
+
     pub async fn embed_recorded(&self, text: &str) -> Result<(Vec<f32>, String), LlmError> {
         let cfg = self.config_provider.current();
         let resolved = select_embedding_provider(&cfg.llm_providers)?;

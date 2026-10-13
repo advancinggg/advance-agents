@@ -77,6 +77,7 @@ pub mod corpus_ingest;
 pub mod inventory;
 pub mod knowledge_map;
 pub mod knowledge_map_reader;
+pub mod l0_bridge;
 pub mod l0_compress;
 pub mod ports;
 pub mod processing_pipeline;
@@ -88,6 +89,7 @@ pub mod staleness;
 pub mod task_router;
 pub mod tier1;
 pub mod tier1_children;
+pub mod tier1_runtime;
 pub mod tier2;
 pub mod tier2_decomposition;
 pub mod tier2_delegates;
@@ -103,12 +105,18 @@ pub use inventory::{HostFnEntry, HostFnInventoryReader};
 pub use knowledge_map::{
     build_knowledge_map_section, KNOWLEDGE_MAP_MAX_TOKENS, MAX_TASK_SYNTHESES, MAX_TOPICS,
 };
+pub use l0_bridge::{compress_turn_buffer, l0_entries_from_messages};
 pub use l0_compress::{l0_compress, L0Action, L0Entry, L0Kind};
 pub use ports::{
     AgentIdentityReader, ContentHit, DecompositionReader, EmbeddingPort, KnowledgeMap,
     KnowledgeMapReader, KnowledgeTopic, LightLlmFallbackPort, MemoryHit, PortError,
     SkillSummaryEntry, SkillSummaryReader, SubtaskView, TaskHit, TaskIndexPort, TaskSynthesis,
     TurnHit, UnifiedSearchPort, UnifiedSearchResult,
+};
+// Runtime-info sections + the per-turn assembly report (Client API inspector).
+pub use ports::{
+    AssemblyHistoryReport, AssemblyRecallReport, AssemblyReport, AssemblyReportSink,
+    AssemblySection, RuntimeInfoReader, RuntimeInfoView,
 };
 // Slice D — new ports + carriers (AC-06 / AC-08 / AC-17).
 pub use ports::{
@@ -125,11 +133,16 @@ pub use retention_rerank::{rerank_by_retention, RerankItem, RetentionScorer, Tur
 pub use sanitize::{attach_flags_to_record, layer1_flag};
 pub use staleness::{check_and_demote, is_turn_stale, StalenessCheckError, MAX_TRACKED_PATHS};
 pub use task_router::{
-    ContextError, TaskRouter, TaskRoutingDecision, AMBIGUITY_GAP, TASK_MATCH_THRESHOLD,
+    ContextError, TaskRouter, TaskRoutingDecision, TaskRoutingOutcome, AMBIGUITY_GAP,
+    ROUTING_METHOD_LLM, ROUTING_METHOD_SEARCH, TASK_MATCH_THRESHOLD,
 };
 pub use tier1::{build_tier1a, build_tier1b};
 pub use tier1_children::{
     format_available_children_section, format_available_children_section_with_aliases,
+};
+pub use tier1_runtime::{
+    format_runtime_architecture_section, format_runtime_state_section,
+    format_security_model_section,
 };
 pub use tier2::{
     assemble_unified, format_available_tools_section,
@@ -141,7 +154,7 @@ pub use tier2_delegates::{
 };
 pub use tier2_skills::{format_available_skills_section, SKILL_BUDGET_TOKENS_DEFAULT};
 pub use tier3::{
-    bound_tier3_turns, model_context_window, recent_l0_turns, response_reserve,
+    bound_tier3_turns, model_context_window, normalize_model_id, recent_l0_turns, response_reserve,
     select_progressive_mode, ProgressiveMode, COMPACT_MIN, MEDIUM_MIN, RETENTION_HIGH_THRESHOLD,
     RETENTION_LOW_THRESHOLD, SMALL_MODEL_WINDOW, WIDE_MIN,
 };

@@ -86,7 +86,8 @@ pub use persistence::{
     DEFAULT_MAX_INACTIVE_PER_AGENT, KNOWLEDGE_JSONL_FILENAME, MAX_LINE_BYTES,
 };
 pub use post_processor::{
-    Components, DescriptionIndexer, IndexedDescription, L6Dispatch, PostProcessor,
+    default_task_partition, Components, DescriptionIndexer, IndexedDescription, L6Dispatch,
+    PostProcessor,
 };
 pub use reconcile::{
     InMemorySimilarityIndex, MemoryAction, Reconciler, SimilarityIndex, DEFAULT_THRESHOLD,

@@ -126,6 +126,32 @@ fn t_model_window_prefix_match_is_documented_behavior() {
     assert!(SMALL_MODEL_WINDOW <= 200_000);
 }
 
+/// The extended table: current model families + vendor / route prefixes and
+/// tag suffixes normalize onto the same rows.
+#[test]
+fn t_model_window_extended_families_and_normalization() {
+    assert_eq!(model_context_window("gpt-5"), 400_000);
+    assert_eq!(model_context_window("gpt-5-mini-2026-01-01"), 400_000);
+    assert_eq!(model_context_window("gpt-4.1-mini"), 1_000_000);
+    assert_eq!(model_context_window("o4-mini"), 200_000);
+    assert_eq!(model_context_window("claude-sonnet-4-5"), 200_000);
+    assert_eq!(model_context_window("gemini-2.5-pro"), 1_000_000);
+    assert_eq!(model_context_window("deepseek-chat"), 128_000);
+    assert_eq!(model_context_window("qwen3-235b"), 128_000);
+    assert_eq!(model_context_window("qwen2.5-7b-instruct"), 32_768);
+    assert_eq!(model_context_window("llama-3.1-8b"), 128_000);
+    assert_eq!(model_context_window("kimi-k2-0905"), 128_000);
+    assert_eq!(model_context_window("glm-4.6"), 128_000);
+    assert_eq!(model_context_window("grok-4"), 256_000);
+    // Vendor / route prefixes + tags normalize.
+    assert_eq!(model_context_window("anthropic/claude-3-7-sonnet"), 200_000);
+    assert_eq!(model_context_window("openai:gpt-4o"), 128_000);
+    assert_eq!(model_context_window("models/gemini-2.0-flash"), 1_000_000);
+    assert_eq!(model_context_window("llama3.1:70b"), 128_000);
+    assert_eq!(model_context_window("GPT-4O-LATEST"), 128_000);
+    assert_eq!(model_context_window("mistral-large-latest"), 128_000);
+}
+
 // ── t_assembler_mode_select — Integration: assemble() bounds Tier-3 ────────
 
 /// Count Tier-3 turn-portion entries (markers `TURN-…`) in the assembled

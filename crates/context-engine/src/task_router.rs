@@ -100,12 +100,25 @@ impl TaskRouter {
     }
 
     /// Route `query` for `agent_id`. See module docs for the finite-value
-    /// hardening contract.
+    /// hardening contract. Thin wrapper over [`Self::route_task_detailed`]
+    /// that drops the method / confidence telemetry.
     pub async fn route_task(
         &self,
         agent_id: &str,
         query: &str,
     ) -> Result<TaskRoutingDecision, ContextError> {
+        Ok(self.route_task_detailed(agent_id, query).await?.decision)
+    }
+
+    /// Route `query` for `agent_id`, also reporting HOW the decision was made
+    /// (`method`) and the top-1 cosine similarity behind it (`confidence`) —
+    /// the values `AssemblyResult.routing_method` / `routing_confidence` and
+    /// the `context.assembled` event carry.
+    pub async fn route_task_detailed(
+        &self,
+        agent_id: &str,
+        query: &str,
+    ) -> Result<TaskRoutingOutcome, ContextError> {
         // Round-10 ADVERSARIAL Warning 3 — defensive `agent_id` whitelist guard.
         // The in-tree caller (`assembler.rs::assemble`) validates per
         // CONTRACT-090 invariant 4 before invoking the router; this guard is
@@ -114,7 +127,7 @@ impl TaskRouter {
         // so the safe degraded outcome is `NewTask` (no panic, no propagation
         // of an unvalidated id into the `TaskIndexPort`).
         if !is_valid_agent_id(agent_id) {
-            return Ok(TaskRoutingDecision::NewTask);
+            return Ok(TaskRoutingOutcome::new_task(0.0));
         }
         // 1. Embed. A hard error propagates as EmbeddingFailed (§1.3.2 `?`,
         //    §2.8 keyword-only path) — NOT NewTask.
@@ -156,8 +169,14 @@ impl TaskRouter {
         });
 
         // No confident match → new task. (The ONLY legitimate NewTask path.)
-        if hits.is_empty() || hits[0].similarity < TASK_MATCH_THRESHOLD {
-            return Ok(TaskRoutingDecision::NewTask);
+        // `confidence` = the top-1 similarity (0.0 when the index had no hit),
+        // so a caller can tell "empty index" from "near miss".
+        if hits.is_empty() {
+            return Ok(TaskRoutingOutcome::new_task(0.0));
+        }
+        let top = hits[0].similarity;
+        if top < TASK_MATCH_THRESHOLD {
+            return Ok(TaskRoutingOutcome::new_task(top));
         }
 
         // 6. Ambiguity: top1 - top2 < AMBIGUITY_GAP → tie-break.
@@ -187,13 +206,61 @@ impl TaskRouter {
                     .pick_one(query, &ids)
                     .await
                     .map_err(|e| ContextError::Fallback(e.0))?;
-                return Ok(TaskRoutingDecision::Existing(picked));
+                return Ok(TaskRoutingOutcome {
+                    decision: TaskRoutingDecision::Existing(picked),
+                    method: ROUTING_METHOD_LLM,
+                    confidence: clamp_unit(top),
+                });
             }
-            return Ok(TaskRoutingDecision::Existing(tied[0].task_id.clone()));
+            return Ok(TaskRoutingOutcome::existing(tied[0].task_id.clone(), top));
         }
 
         // 7. Unambiguous top hit.
-        Ok(TaskRoutingDecision::Existing(hits[0].task_id.clone()))
+        Ok(TaskRoutingOutcome::existing(hits[0].task_id.clone(), top))
+    }
+}
+
+/// `AssemblyResult.routing_method` value when the decision came from the task
+/// index similarity search (incl. the deterministic `last_turn_at` tie-break).
+pub const ROUTING_METHOD_SEARCH: &str = "search";
+/// `AssemblyResult.routing_method` value when the residual tie was broken by
+/// the light-LLM fallback.
+pub const ROUTING_METHOD_LLM: &str = "llm";
+
+/// The detailed routing outcome: the decision plus the telemetry behind it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskRoutingOutcome {
+    pub decision: TaskRoutingDecision,
+    /// [`ROUTING_METHOD_SEARCH`] | [`ROUTING_METHOD_LLM`].
+    pub method: &'static str,
+    /// Top-1 cosine similarity behind the decision, clamped to `[0, 1]`
+    /// (`0.0` when the task index returned no hit at all).
+    pub confidence: f32,
+}
+
+impl TaskRoutingOutcome {
+    fn new_task(top_similarity: f32) -> Self {
+        Self {
+            decision: TaskRoutingDecision::NewTask,
+            method: ROUTING_METHOD_SEARCH,
+            confidence: clamp_unit(top_similarity),
+        }
+    }
+
+    fn existing(task_id: String, top_similarity: f32) -> Self {
+        Self {
+            decision: TaskRoutingDecision::Existing(task_id),
+            method: ROUTING_METHOD_SEARCH,
+            confidence: clamp_unit(top_similarity),
+        }
+    }
+}
+
+fn clamp_unit(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 

@@ -495,6 +495,10 @@ pub(crate) async fn compose_graph(
                 &wiring_handles.root_agent_id,
                 wiring_handles.skills_root.clone(),
             );
+            // `GET /client/agents/{id}/context`: the latest assembled prompt breakdown.
+            if let Some(inspect) = spawned.context_inspect.clone() {
+                server.api().install_context_provider(inspect);
+            }
         }
     }
 
@@ -1108,7 +1112,7 @@ async fn try_spawn_agent_loop(
         ),
     }
     .with_turn_observer(observer)
-    .with_model(assembler_model)
+    .with_model(assembler_model.clone())
     .with_component_error_emitter(ce_emitter)
     .with_run_bootstrap(Arc::new(RunManagerBootstrap {
         run_manager,
@@ -1135,7 +1139,7 @@ async fn try_spawn_agent_loop(
     // both Options via `.as_ref()` so the context-assembler block below — which
     // MOVES `llm_gateway` (the `if let Some(gateway)`) and `memory_store` — still
     // owns them. The bare `cap_agent_id` is the write-bucket key (colon/bare fix).
-    driver = driver.with_post_processor(build_live_post_processor(
+    let (post_processor, memory_index) = build_live_post_processor(
         memory_store.as_ref(),
         llm_gateway.as_ref(),
         workspace,
@@ -1145,7 +1149,8 @@ async fn try_spawn_agent_loop(
         vlm_extractor,
         agent_tree_snapshot.clone(),
         log,
-    ));
+    );
+    driver = driver.with_post_processor(post_processor);
     // Backbone Step 2: when llm is wired, install the REAL ContextAssemblerImpl
     // (via the PublishingContextAssembler seam) so the assembled layered context
     // (a) emits `context.assembled` per real turn and (b) feeds the guest's
@@ -1156,6 +1161,7 @@ async fn try_spawn_agent_loop(
     // STUBS `callable_inventory` (empty, lands in a later slice). `None` gateway →
     // keep the default MinimalContextAssembler (no LLM, no seam).
     let mut client_api_tools = None;
+    let mut context_inspect: Option<Arc<crate::context_inspect::ContextInspectAdapter>> = None;
     if let Some(gateway) = llm_gateway {
         // Backbone Step 2 (adversarial r9 W2): probe host fns ONLY under the caps
         // THIS agent declared in `.agent/config.yaml` (the same `caps` set injected
@@ -1236,34 +1242,106 @@ async fn try_spawn_agent_loop(
         client_api_tools =
             (tool_registry.is_some() || mcp.is_some()).then(|| Arc::clone(&callable));
         let identity_root = workspace.join(".agent");
-        let inner = crate::context_wiring::build_context_assembler_for_agent_with_pack_skills(
-            assembler_bus,
-            callable,
-            Arc::new(crate::context_wiring::FixedHostFnInventory::new(
-                crate::context_wiring::host_fns_from_registry(
-                    &*host.host_registry(),
-                    &declared_caps,
-                ),
-            )),
-            agent_tree,
-            memory_store,
-            &cap_agent_id,
-            &[cap_agent_id.clone(), msg_agent_id.clone()],
-            memory_root.as_deref(),
-            // skills-J26 reader satellite: activates the real DiskSkillSummaryReader
-            // (Some iff `skills` declared — already gated in wiring.rs).
-            skills_root.as_deref(),
-            decomposition,
-            // Installed packs' skills, for an agent that can reach their tools.
-            pack_runtime
-                .filter(|_| tool_registry.is_some())
-                .map(|runtime| {
-                    Arc::new(crate::context_wiring::PackSkillSummaryReader::new(runtime))
-                        as Arc<dyn advance_context_engine::ports::SkillSummaryReader>
-                }),
-            // AGENTS.md identity: always-on for the agent workspace. Not
-            // capability-gated (unlike skills/memory). Missing file → empty Tier 1a.
-            Some(&identity_root),
+        // Live embedding: only when the provider config can embed (an OpenAI-
+        // compatible endpoint, or a local / mesh entry with an `embedding-model`).
+        // Then the assembler embeds the prompt once per turn and the recall /
+        // task-routing ports read the post-processor's SQLite index (written with
+        // the SAME gateway embedder). Otherwise the zero-vector stub stays and no
+        // `/v1/embeddings` round-trip is attempted.
+        let embedding_live = gateway.has_embedding_provider();
+        let embedding: Option<Arc<dyn advance_context_engine::EmbeddingPort>> = embedding_live
+            .then(|| {
+                Arc::new(crate::context_wiring::GatewayEmbedding::new(
+                    gateway.clone(),
+                )) as Arc<dyn advance_context_engine::EmbeddingPort>
+            });
+        let embedding_model = if embedding_live {
+            gateway.embedding_model_id()
+        } else {
+            None
+        };
+        // Per-agent latest-assembly store (the Client API context inspector).
+        let context_store = Arc::new(crate::context_inspect::ContextSnapshotStore::new());
+        context_store.register_aliases(&[cap_agent_id.clone(), msg_agent_id.clone()]);
+        // Runtime facts for the Tier 1a `# Runtime Architecture` / `# Security
+        // Model` and Tier 1b `# Runtime State` sections.
+        let llm_provider = resolve_provider_and_model(&host.config().llm_providers, None)
+            .ok()
+            .map(|r| r.id);
+        let runtime_info = advance_context_engine::RuntimeInfoView {
+            runtime_version: env!("CARGO_PKG_VERSION").to_string(),
+            agent_kind: agent_tree.agent_kind(&cap_agent_id).map(|k| {
+                match k {
+                    advance_shared_types::agent_tree::AgentKind::Root => "root",
+                    advance_shared_types::agent_tree::AgentKind::Child => "child",
+                    advance_shared_types::agent_tree::AgentKind::Sub => "sub",
+                }
+                .to_string()
+            }),
+            parent_agent: agent_tree.parent_of(&cap_agent_id),
+            workspace: Some(workspace.display().to_string()),
+            capabilities: declared_cap_names.clone(),
+            mode: Some(
+                if channels_active {
+                    "channels"
+                } else if progress_loop.is_some() {
+                    "protected"
+                } else {
+                    "serve"
+                }
+                .to_string(),
+            ),
+            llm_provider,
+            llm_model: (!assembler_model.is_empty()).then(|| assembler_model.clone()),
+            memory_enabled: memory_store.is_some(),
+            skills_enabled: skills_root.is_some(),
+            embedding_enabled: embedding_live,
+        };
+        context_inspect = Some(Arc::new(
+            crate::context_inspect::ContextInspectAdapter::new(
+                context_store.clone(),
+                crate::context_inspect::EmbeddingPosture {
+                    active: embedding_live,
+                    model: embedding_model,
+                },
+                memory_index.clone(),
+                &cap_agent_id,
+            ),
+        ));
+        let inner = crate::context_wiring::build_context_assembler_for_agent_production(
+            crate::context_wiring::ProductionAssemblerParts {
+                event_bus: assembler_bus,
+                callable_inventory: callable,
+                host_fn_inventory: Arc::new(crate::context_wiring::FixedHostFnInventory::new(
+                    crate::context_wiring::host_fns_from_registry(
+                        &*host.host_registry(),
+                        &declared_caps,
+                    ),
+                )),
+                agent_tree,
+                memory: memory_store,
+                write_agent_id: &cap_agent_id,
+                query_aliases: &[cap_agent_id.clone(), msg_agent_id.clone()],
+                memory_root: memory_root.as_deref(),
+                // skills-J26 reader satellite: activates the real DiskSkillSummaryReader
+                // (Some iff `skills` declared — already gated in wiring.rs).
+                skills_agent_root: skills_root.as_deref(),
+                decomposition,
+                // Installed packs' skills, for an agent that can reach their tools.
+                pack_skills: pack_runtime
+                    .filter(|_| tool_registry.is_some())
+                    .map(|runtime| {
+                        Arc::new(crate::context_wiring::PackSkillSummaryReader::new(runtime))
+                            as Arc<dyn advance_context_engine::ports::SkillSummaryReader>
+                    }),
+                // AGENTS.md identity: always-on for the agent workspace. Not
+                // capability-gated (unlike skills/memory). Missing file → empty Tier 1a.
+                identity_agent_root: Some(&identity_root),
+                embedding,
+                sqlite_index: memory_index.clone(),
+                runtime_info: Some(runtime_info),
+                report_sink: Some(context_store),
+            },
         );
         // Wave-12 (SYS-AC-122): LATE-BIND THIS per-agent assembler into the
         // process-global tool-path RepetitionGuard (built at wire_capabilities
@@ -1411,6 +1489,7 @@ async fn try_spawn_agent_loop(
         host_pump,
         channels_active,
         tools_inventory: client_api_tools,
+        context_inspect,
     }))
 }
 
@@ -1532,6 +1611,9 @@ pub(crate) struct SpawnedAgentLoop {
     channels_active: bool,
     /// Real `CallableInventory` gathered at spawn, if tools were registered.
     tools_inventory: Option<Arc<dyn CallableInventoryReader>>,
+    /// The context-inspection provider (latest assembled prompt per agent), when
+    /// the real assembler is wired (llm declared).
+    context_inspect: Option<Arc<crate::context_inspect::ContextInspectAdapter>>,
 }
 
 #[cfg(feature = "test-support")]
@@ -2143,12 +2225,15 @@ fn build_live_post_processor(
     // (`build_l6_stale_resolver`). `None` ⇒ `EmptyAgentTree` fallback (conservative Stale).
     agent_tree: Option<Arc<dyn AgentTreeSnapshot>>,
     log: &LogHandle,
-) -> Arc<dyn PostProcessorHook> {
+) -> (
+    Arc<dyn PostProcessorHook>,
+    Option<Arc<dyn cap_memory::SqliteIndex + Send + Sync>>,
+) {
     let (Some(store), Some(gateway)) = (memory_store, llm_gateway) else {
         // Trace-only path (AC-44 synthetic-entry guard): an LLM-absent or
         // memory-absent config never installs the components-backed processor,
         // so no `StubBatchExtractor` / synthetic entries reach the live turn.
-        return Arc::new(cap_memory::PostProcessor::new());
+        return (Arc::new(cap_memory::PostProcessor::new()), None);
     };
     // Coerce the concrete gateway to the trait object: clone to a concrete
     // `Arc<LlmGateway>` first (so `Arc::clone`'s T is inferred as the concrete
@@ -2238,7 +2323,23 @@ fn build_live_post_processor(
             )),
         );
     }
-    Arc::new(cap_memory::PostProcessor::with_components(components))
+    // Context pipeline: when the gateway can embed, Step 8 (`sync_turn_index` /
+    // `sync_task_index`) stores REAL semantic vectors through the same
+    // `LlmGateway::embed` the context assembler queries with — one model on both
+    // sides, so recall + task routing match. Without an embedding-capable
+    // provider the deterministic `StubEmbedder` stays (rows the assembler's
+    // dim-checked cosine simply never matches).
+    if gateway.has_embedding_provider() {
+        components = components.with_embedder(Arc::new(
+            crate::context_wiring::GatewayMemoryEmbedder::new(Arc::clone(gateway)),
+        ));
+    }
+    // The index the pipeline writes, shared with the assembler's read side.
+    let index = components.sqlite_index();
+    (
+        Arc::new(cap_memory::PostProcessor::with_components(components)),
+        Some(index),
+    )
 }
 
 #[cfg(test)]
@@ -2282,7 +2383,7 @@ mod satb_gate_tests {
 
         // (memory present, llm absent) → trace-only, no writes.
         let log = crate::compose_log::LogHandle::null();
-        let pp = build_live_post_processor(
+        let (pp, index) = build_live_post_processor(
             Some(&store),
             None,
             &ws,
@@ -2293,6 +2394,7 @@ mod satb_gate_tests {
             None,
             &log,
         );
+        assert!(index.is_none(), "trace-only path shares no index");
         pp.run("root", &fixture_msg(), &fixture_result())
             .await
             .expect("run Ok");
@@ -2302,7 +2404,8 @@ mod satb_gate_tests {
         );
 
         // (both absent) → trace-only, no writes.
-        let pp2 = build_live_post_processor(None, None, &ws, bus(), "root", None, None, None, &log);
+        let (pp2, _) =
+            build_live_post_processor(None, None, &ws, bus(), "root", None, None, None, &log);
         pp2.run("root", &fixture_msg(), &fixture_result())
             .await
             .expect("run Ok");
