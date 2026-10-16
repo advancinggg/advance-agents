@@ -45,6 +45,11 @@ url = { workspace = true }
 # Phase-3 kickoff: `Event::observability` mints a v4 uuid event id (the repo
 # idiom — cap-grant/run-manager build events with `Uuid::new_v4()`).
 uuid = { workspace = true }
+# Vault files lane (ADR 2026-10-15): `workspace_path` / `natural_order` need
+# NFC/NFKD, and the policy skeleton drops General_Category=Mn exactly
+# (icu_properties is already in this crate's graph via url → idna).
+icu_properties = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 # Cargo builds integration tests as ordinary dependants.  A self dev-dependency

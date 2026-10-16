@@ -126,6 +126,24 @@
 //! inversion through this crate — only the data types are hoisted here
 //! per ARCHITECTURE.md §4.2 / §6.1 split.
 //!
+//! **Vault files lane** (ADR 2026-10-15; CONTRACT-246 path policy and raw route,
+//! CONTRACT-247 user commit lane) adds the pure, I/O-free foundations that
+//! client-api's `files` family, advance-git's user lane and the cap-fs operator
+//! core share, so every layer accepts, hides and orders exactly the same names:
+//!
+//! - [`workspace_path`]: the lexical validator (NFC; ≤ 1024 bytes, ≤ 255 per
+//!   name, ≤ 32 components), the policy skeleton, the Private / Junk /
+//!   ReadOnly / Normal classifier, the lexical gate per
+//!   [`workspace_path::PathUse`], the portable collision key and the shared
+//!   NFC normalizer.
+//! - [`media_type`]: the raw route's real `Content-Type` table and its active
+//!   types.
+//! - [`natural_order`]: the locale-free natural name order, the listing order
+//!   (folders first in both directions) and the golden cases behind
+//!   `conformance/files-natural-order.json`.
+//! - [`FileIdentity`] (`file_identity`): the `(dev, ino, size, mtime_ns)` stat
+//!   identity for caches, tickets and ETags.
+//!
 //! See `docs/ARCHITECTURE.md` §4.2 for the full dependency-inversion rationale.
 
 #![forbid(unsafe_code)]
@@ -141,10 +159,13 @@ pub mod contract218_previsible;
 pub mod cost;
 pub mod entity;
 pub mod event;
+pub mod file_identity;
 pub mod inference;
 pub mod mailbox;
 pub mod mcp;
+pub mod media_type;
 pub mod memory;
+pub mod natural_order;
 pub mod observation_identity;
 pub mod outbound;
 pub mod process_policy;
@@ -163,9 +184,13 @@ pub mod token_estimate;
 pub mod traits;
 pub mod turn_attribution;
 pub mod web_search;
+pub mod workspace_path;
 pub mod yaml_guard;
 
 pub use component::ComponentType;
+// Vault files lane: the stat identity is a crate-root type (ADR 2026-10-15;
+// client-api's `FilesProvider` port and advance-git's `PathState` re-export it).
+pub use file_identity::FileIdentity;
 
 // Crate-root re-exports for identifier types (per Slice AC v2 plan §3.13b:
 // identifier types get crate-root `pub use` for ergonomic cross-module use;

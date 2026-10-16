@@ -336,6 +336,11 @@ regex = "=1.11.1"
 # regexes in INJECTION_PATTERNS / LEAK_PATTERNS unless normalized at scan time. Pure-Rust,
 # no_std-capable, ~200 KB. Pinned per Slice A' supply-chain discipline.
 unicode-normalization = "=0.1.25"
+# Vault files lane (ADR 2026-10-15, shared-types `workspace_path`): the policy skeleton drops
+# General_Category=Mn exactly (unicode-normalization only exposes GC=Mark). icu_properties is
+# already locked and already in shared-types' graph (url → idna → idna_adapter, `compiled_data`),
+# so the direct edge adds no package. Unicode-3.0 (deny.toml allow-list).
+icu_properties = { version = "=2.2.0", default-features = false, features = ["compiled_data"] }
 # Slice m012-C (2026-04-27): cap-http HttpSecurityChain + SsrfGuard deps.
 # url — RFC 3986 URL parsing for SSRF host extraction + percent-encoding for
 # QueryParam credential injection. Pinned =2.5.8 (matches Cargo.lock-resolved
