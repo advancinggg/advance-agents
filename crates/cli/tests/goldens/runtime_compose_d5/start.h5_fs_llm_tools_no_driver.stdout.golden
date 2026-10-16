@@ -1,5 +1,6 @@
 # MODULE-001-T111 (1) `advance start` stdout on H5 (capabilities: fs, llm, tools; NO deployed driver; no git repository) — normalised, spawn to EOF after SIGTERM
 # captured on the pre-lane OSS tree (main 84a82451, plus the read-only ClientApi::route_table accessor), before the runtime-compose move
 advance: runtime ready (workspace="<ROOT>/ws")
+advance: auto-mode scheduler tick loop running (interval=1s)
 advance: continuous component reconciliation wired (component-type breaker gate active)
 advance: shutting down

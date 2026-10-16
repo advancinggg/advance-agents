@@ -8,6 +8,9 @@
 //! `provider-error("streaming transport not wired")`. Before this test, that
 //! one-line regression broke nothing in CI.
 
+#[path = "support/unbind_on_drop.rs"]
+mod unbind_on_drop;
+
 use std::sync::Arc;
 
 use advance_shared_types::security_validator::{HttpStreamingChain, LeakDetector};
@@ -235,6 +238,8 @@ mod t120 {
     use tempfile::TempDir;
     use wasmtime::component::Val;
     use wit_component::ComponentEncoder;
+
+    use crate::unbind_on_drop::UnbindOnDrop;
 
     const SKELETON_CORE: &[u8] =
         include_bytes!("../../runtime/tests/fixtures/guest-rust-j01-skeleton.core.wasm");
@@ -618,6 +623,9 @@ database:
         let (host, mut handles) = wire_capabilities(builder, &workspace)
             .await
             .expect("production wire_capabilities");
+        // `fs` + `messaging`: unbind the per-child manager before the graph drops (see
+        // `UnbindOnDrop`), or this runtime's drop waits forever on the git commit worker.
+        let _unbind = UnbindOnDrop::new(handles.perchild_manager.as_ref());
         // Tee T2 delivered: the production wiring now injects the REAL LlmDeltaHub
         // as the gateway's delta_sink (CONTRACT-234 Provider = MODULE-020).
         assert!(
@@ -1091,6 +1099,8 @@ database:
         let (_host, handles) = wire_capabilities(builder, &workspace)
             .await
             .expect("production wire_capabilities");
+        // As in case 1: unbind the per-child manager before the graph drops.
+        let _unbind = UnbindOnDrop::new(handles.perchild_manager.as_ref());
         let gateway = handles
             .llm_gateway
             .as_ref()

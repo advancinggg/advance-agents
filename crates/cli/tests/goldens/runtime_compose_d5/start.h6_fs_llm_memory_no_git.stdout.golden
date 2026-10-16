@@ -3,5 +3,6 @@
 advance: runtime ready (workspace="<ROOT>/ws")
 advance: agent loop wired (component loaded; serving inbound messages)
 advance: msg listener on http://127.0.0.1:<PORT>/msg
+advance: auto-mode scheduler tick loop running (interval=1s)
 advance: continuous component reconciliation wired (component-type breaker gate active)
 advance: shutting down

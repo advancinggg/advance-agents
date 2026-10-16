@@ -80,6 +80,20 @@ struct ProdHarness {
     _tmp: TempDir,
 }
 
+/// The harness drops the wiring without the composition's teardown, so it unbinds the
+/// per-child manager first. With `messaging` declared, the manager (the spawner's observer in
+/// the host registry) holds the capability injector, which holds that registry: the two keep
+/// each other, and the `fs` handlers' git commit queue sender, alive until the manager is
+/// unbound. The wiring bootstraps a git repository in this workspace (32cff619), so that
+/// queue's worker would keep the test runtime's drop waiting forever.
+impl Drop for ProdHarness {
+    fn drop(&mut self) {
+        if let Some(manager) = self._handles.perchild_manager.as_ref() {
+            manager.unbind();
+        }
+    }
+}
+
 struct CancelAfterRunHook {
     inner: Arc<dyn RunnableHook>,
     cancel: CancellationToken,

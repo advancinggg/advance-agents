@@ -5,7 +5,8 @@
 //!
 //! In its own test binary: the composition reads the master key from the process environment,
 //! which this binary sets once (`std::env::set_var`); no other test of this binary calls into C
-//! code that reads the environment concurrently (both homes are plain directories, no git).
+//! code that reads the environment concurrently (each test sets it, through one `Once`, before
+//! it composes).
 //!
 //! The goldens, their sha256 pins and the update mode are shared with
 //! `runtime_compose_d5_goldens.rs` (see `runtime_compose_d5_common`).
@@ -14,6 +15,8 @@
 // Shared with `runtime_compose_d5_goldens.rs`; each binary uses a different part of it.
 #[allow(dead_code)]
 mod runtime_compose_d5_common;
+#[path = "support/unbind_on_drop.rs"]
+mod unbind_on_drop;
 
 use std::fmt::Write as _;
 use std::sync::Once;
@@ -24,6 +27,7 @@ use runtime_compose_d5_common::{
     declares, describe, make_home, method_name, probe_route_table, Goldens, HomeSpec, CAPTURED_ON,
     H1, H2, MASTER_KEY_ENV, MASTER_KEY_HEX,
 };
+use unbind_on_drop::UnbindOnDrop;
 
 fn scope_name(scope: &Scope) -> String {
     serde_json::to_value(scope)
@@ -92,12 +96,16 @@ async fn composed_route_table(spec: &HomeSpec) -> Vec<RouteTableEntry> {
             .await
             .expect("wire_capabilities")
     };
+    // The composition's teardown is not run here: with `messaging` declared, the per-child
+    // manager has to be unbound before the graph can be dropped (see `UnbindOnDrop`).
+    let unbind = UnbindOnDrop::new(handles.perchild_manager.as_ref());
     let table = handles
         .client_api_server
         .as_ref()
         .expect("the composition binds the Client API")
         .api()
         .route_table();
+    drop(unbind);
     drop(handles);
     drop(host);
     table
@@ -127,9 +135,9 @@ async fn module_001_t111_ac30_route_table_h1_fs_llm() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_001_t111_ac30_route_table_h2_all_capabilities() {
-    // Same declarations as the binary H2, minus the git repository: with `messaging` on a git
-    // repository the composition's git commit worker outlives the runtime it was spawned on
-    // (see `H2_SIGTERM_AFTER_READINESS`), which would hang this test's runtime drop. The route
-    // table does not depend on the repository.
+    // Same declarations as the binary H2, minus the committed git repository (the route table
+    // does not depend on it). The wiring bootstraps one anyway (32cff619), so the composition's
+    // git commit worker would outlive this test's runtime, and hang its drop, if the per-child
+    // manager stayed bound: `composed_route_table` unbinds it.
     route_table_golden(&HomeSpec { git: false, ..H2 }).await;
 }

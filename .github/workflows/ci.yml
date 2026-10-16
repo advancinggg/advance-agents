@@ -106,12 +106,14 @@ jobs:
   # (SanDisk) volume TCC throttle that makes concurrent workspace tests unsafe on
   # the maintainer's machine. That is a LOCAL constraint only; GitHub's Linux
   # runners have no such limit, so this job is the first time `cargo test
-  # --workspace` runs end to end. Timeout is intentionally generous.
+  # --workspace` runs end to end. Timeout is intentionally generous: the run
+  # (pack build, workspace tests, doc-tests, the reply-tracker suite) has to fit
+  # with room to spare, so a slow runner is not mistaken for a hung test.
   # ---------------------------------------------------------------------------
   test:
     name: test (--workspace --locked)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:

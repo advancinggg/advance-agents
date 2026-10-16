@@ -25,6 +25,14 @@
 //! (so a messaging-declaring guest links it), but shipped agents stay dormant; these
 //! tests drive `wire_capabilities` directly over a `messaging:true` config and read the
 //! registry — they do not depend on `KNOWN_CAPABILITIES`.
+//!
+//! The `messaging` + `fs` tests (T-B2-01, T-B2-04) drop the wiring without the
+//! composition's teardown, so they unbind the per-child manager themselves
+//! (`UnbindOnDrop`); without it their runtime's drop waits forever on the git commit
+//! worker.
+
+#[path = "support/unbind_on_drop.rs"]
+mod unbind_on_drop;
 
 use advance_cli::wiring::wire_capabilities_with_home_for_test;
 use advance_run_manager::RunConfig;
@@ -33,6 +41,7 @@ use advance_runtime::host_registry::HostCallContext;
 use advance_shared_types::run::{RoundDecision, RoundResult, TaskRunStatus};
 use std::path::PathBuf;
 use std::time::Duration;
+use unbind_on_drop::UnbindOnDrop;
 use wasmtime::component::Val;
 
 const MINIMAL_RUNTIME_YAML: &str = "\
@@ -148,9 +157,10 @@ async fn t_b2_01_messaging_registration_is_live() {
     let (_g, _home_td, ws, home, cfg) =
         fresh_workspace("capabilities:\n  messaging: true\n  fs: true\n");
     let builder = RuntimeHostBuilder::new(&cfg, &ws).await.expect("builder");
-    let (host, _handles) = wire_capabilities_with_home_for_test(builder, &ws, &home)
+    let (host, handles) = wire_capabilities_with_home_for_test(builder, &ws, &home)
         .await
         .expect("wire");
+    let _unbind = UnbindOnDrop::new(handles.perchild_manager.as_ref());
 
     let specs = host.host_registry().lookup("messaging");
     let await_spec = specs.iter().find(|s| {
@@ -290,6 +300,7 @@ agents:
     let (_host, handles) = wire_capabilities_with_home_for_test(builder, &ws, &home)
         .await
         .expect("wire");
+    let _unbind = UnbindOnDrop::new(handles.perchild_manager.as_ref());
 
     // Runs are keyed by tree ids (the root's per-boot UUID; the declared child's minted id),
     // and the cascade walks the SAME shared tree.

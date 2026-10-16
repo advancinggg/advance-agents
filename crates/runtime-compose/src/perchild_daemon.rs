@@ -151,7 +151,8 @@ pub struct PerChildLoopManager {
     /// ([`Self::with_log`]; none by default).
     log: LogHandle,
     /// Late-bound production context assembler + post-processor deps. Set
-    /// after the LLM gateway exists and before any child is served.
+    /// after the LLM gateway exists and before any child is served; released by
+    /// [`Self::unbind`] (they hold the host registry).
     context_deps: Mutex<Option<Arc<crate::child_context::ChildContextDeps>>>,
 }
 
@@ -264,23 +265,25 @@ impl PerChildLoopManager {
         lock(&self.context_deps).get_or_insert(deps);
     }
 
-    /// Release the late-bound runtime and injector.
+    /// Release the late-bound runtime, injector and context deps.
     ///
-    /// The injector holds the host registry, and the registry's spawn handler holds
-    /// this manager (it is the spawner's observer): while both are bound, the manager
-    /// and the registry keep each other — and every handler the registry holds, with
-    /// the event bus and the git commit queue they reach — alive after their owners
-    /// let go. Unbinding breaks that cycle. A child spawned afterwards is not served
-    /// (it is reported as unbound). Idempotent.
+    /// The injector holds the host registry, and so do the context deps
+    /// ([`Self::bind_context`]); the registry's spawn handler holds this manager (it
+    /// is the spawner's observer): while either is bound, the manager and the
+    /// registry keep each other — and every handler the registry holds, with the
+    /// event bus and the git commit queue they reach — alive after their owners let
+    /// go. Unbinding breaks that cycle. A child spawned afterwards is not served (it
+    /// is reported as unbound, before the context deps would be read). Idempotent.
     pub fn unbind(&self) {
         let runtime = lock(&self.runtime).take();
         let injector = lock(&self.injector).take();
-        drop((runtime, injector));
+        let context_deps = lock(&self.context_deps).take();
+        drop((runtime, injector, context_deps));
     }
 
     /// Stop serving children, for an ordered shutdown: no child is served from now
-    /// on, every child serve loop is aborted and awaited, then the runtime and
-    /// injector are released ([`Self::unbind`]). Idempotent.
+    /// on, every child serve loop is aborted and awaited, then the runtime, injector
+    /// and context deps are released ([`Self::unbind`]). Idempotent.
     pub async fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
         let loops = std::mem::take(&mut *lock(&self.loops));

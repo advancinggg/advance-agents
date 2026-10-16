@@ -220,31 +220,31 @@ pub const BASELINE_GOLDEN_SHA256: &[(&str, &str)] = &[
     ),
     (
         "route_probe.h1_fs_llm.golden",
-        "1cc3c572c60be69b6a9f79aeef9948f480c2d534eb1c4e1fec04809a84e4d30a",
+        "e588763d8f1b2d291571db5d14a846b8a3479e0dc5d0b8544cd3240573a21d89",
     ),
     (
         "route_probe.h2_all_capabilities.golden",
-        "485a1ae41dba24cc8c894202fad2f266bc9e9f3eb7eab4d4661a0d3965137412",
+        "29a743c8e0e3cc36c8cc77b774839493ed5a116838f146b06da603bc7cfd48d9",
     ),
     (
         "route_probe.h3_fs_llm_lifecycle.golden",
-        "4fd7e1a128b3793005f8200d1c56100b4b3a5e5fd89b3517cbfbebf81233c032",
+        "6b0285a45763143fc9eb76e3040a95ab376b8fd7a61c9c81f8cc77360ab95a31",
     ),
     (
         "route_probe.h4_fs_llm_grant.golden",
-        "51207898c8cc0027be6d716daf288ed090ec7800636e87cfabfb428b6a6e2d98",
+        "38a0efbaae42e10f3f9b6ea19d9f637f4389f92e99234e825eae9fad56015eee",
     ),
     (
         "route_probe.h5_fs_llm_tools_no_driver.golden",
-        "a2626563f7371ee3bac353eaa11dfd56ec33c45c70b391785d7ab8da5d1aed61",
+        "8a4433bc6792c2c20f48074f92d7c122854c9b8e2458c7078d7a691114cd4ab6",
     ),
     (
         "route_table.h1_fs_llm.golden",
-        "760f74630584197a40fd92a24d7088efe88aa36a29bd09d973484bb748218b7f",
+        "b96f039c5d5bc98be52d73f5bf79fca73e11866ba58d9c86c31ee136d627c936",
     ),
     (
         "route_table.h2_all_capabilities.golden",
-        "ea6b7c287bbec12a22740c97129a6edf83b0b7f3b1bee8b006a8c06630cc2cc4",
+        "c8bf42fa6a68c7ba69301a314e2c3aeb0ac40c4fec4f836aae1b988ff1bf84c3",
     ),
     (
         "runtime_files.h1_fs_llm.golden",
@@ -256,7 +256,7 @@ pub const BASELINE_GOLDEN_SHA256: &[(&str, &str)] = &[
     ),
     (
         "start.h1_fs_llm.merged.golden",
-        "7388bdeb144392afa2258feed36c55aa47dee7977cc5c301f4ebf58bdbda50e4",
+        "ac3c2717a232a877040e80dfc6b82fe5005d6b144319a38925607d0ea2772719",
     ),
     (
         "start.h1_fs_llm.stderr.golden",
@@ -264,11 +264,11 @@ pub const BASELINE_GOLDEN_SHA256: &[(&str, &str)] = &[
     ),
     (
         "start.h1_fs_llm.stdout.golden",
-        "9e5442316f51dcb1fdb10ffedb33e0eb93a819f2b80585863273e044137a340f",
+        "064e9dad361d0a661beb6b3d0c1dea7d61e398c9c3a2078dd3e880c61998a8b3",
     ),
     (
         "start.h2_all_capabilities.stderr.golden",
-        "36ebf25496e5b5d5b3253c42a5009958337d8b7088115753e377958a04f86606",
+        "916eabc6c927dde3203759730aec551addc0e29c12e47dd9f29829f76ed01d8f",
     ),
     (
         "start.h2_all_capabilities.stdout.golden",
@@ -280,7 +280,7 @@ pub const BASELINE_GOLDEN_SHA256: &[(&str, &str)] = &[
     ),
     (
         "start.h3_fs_llm_lifecycle.stdout.golden",
-        "7e42acf63e2ee25e5b61aa99c127deaa9d2250ecc7791598186f80b04ee1a6fa",
+        "1bb89ffc5182a58a8f9854fbbbfd2b355b3f812caa7bab7e5347de8bfc5eb6d5",
     ),
     (
         "start.h4_fs_llm_grant.stderr.golden",
@@ -288,7 +288,7 @@ pub const BASELINE_GOLDEN_SHA256: &[(&str, &str)] = &[
     ),
     (
         "start.h4_fs_llm_grant.stdout.golden",
-        "6a639eb50088e1143c58bbce063a82f213385104526874eea8f72b7b905c01ef",
+        "509c5d0958b35fec8716491b4ab240d8af89d7072696e5193bcec27bbe93e3f7",
     ),
     (
         "start.h5_fs_llm_tools_no_driver.stderr.golden",
@@ -296,15 +296,15 @@ pub const BASELINE_GOLDEN_SHA256: &[(&str, &str)] = &[
     ),
     (
         "start.h5_fs_llm_tools_no_driver.stdout.golden",
-        "ccf69ebfe218f0c3368d25084f36e70671e432e762f342a8e1c6e2cb3d3f24f5",
+        "9e6565830e91e009edb210f8f7ea8ef96e9b6eb8f1bb3ba0663178125e772a5e",
     ),
     (
         "start.h6_fs_llm_memory_no_git.stderr.golden",
-        "59a48e475cc4e381f1805905decce6a6d09e0499b308da8206101bdcc2f91f1c",
+        "5d6ab44b3041fd360e0234e643f8aa616f6d6c41ece6a6007d97ec795c307334",
     ),
     (
         "start.h6_fs_llm_memory_no_git.stdout.golden",
-        "b883d6a2045c6d9838d35cf734b67c08bfa18514a8684403b446b50742b2292e",
+        "f7802602a4f348c7b7e3393cead91209276824a1ba0d4b818da1e2f86ad392db",
     ),
 ];
 
@@ -601,8 +601,16 @@ fn component_bytes() -> Vec<u8> {
         .expect("encode component")
 }
 
+/// The branch a `git: true` home's repository (H2's) is created on: `master`, libgit2's built-in
+/// default, which the runtime reports as `not_main` (`/client/git/status`, `/client/health` and a
+/// stderr line of `advance start`). Naming it keeps a machine whose git config sets
+/// `init.defaultBranch` from building a different repository, and so different goldens.
+const GIT_HOME_INITIAL_BRANCH: &str = "master";
+
 fn init_git_repo(dir: &Path) {
-    let repo = git2::Repository::init(dir).expect("git init");
+    let mut opts = git2::RepositoryInitOptions::new();
+    opts.initial_head(GIT_HOME_INITIAL_BRANCH);
+    let repo = git2::Repository::init_opts(dir, &opts).expect("git init");
     let mut cfg = repo.config().expect("repo config");
     cfg.set_str("user.name", "d5-golden").expect("user.name");
     cfg.set_str("user.email", "d5-golden@example.invalid")
