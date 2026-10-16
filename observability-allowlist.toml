@@ -239,6 +239,18 @@ struct = "SpawnHandler"
 reason = "011 narrow spawn-only handler: dispatches spawn-child / spawn-sub / spawn-agent-from-template via the shared `dispatch_spawn` free fn (the lint walks only the handler call body). These spawn ops emit no per-op observability events yet (agent.spawned is pending), identical to the spawn ops the sibling LifecycleHandler row already documents — and SpawnHandler carries no EventBus (register_agent_spawn takes only a Spawner). The per-op spawn emit wiring is the same MODULE-005 observability follow-up that covers LifecycleHandler's spawn ops."
 pending_wiring_slice = "MODULE-005 observability follow-up (remaining ops: agent.spawned / checkpoint.created / rollback.applied per-op emits)"
 
+# 351eafc3 (2026-10-12) split checkpoint / rollback-to-checkpoint / list-checkpoints /
+# list-child-checkpoints / rollback-child-to-checkpoint out of the shared LifecycleHandler
+# into the narrow `CheckpointHostHandler`. Its `fn call` body dispatches via the shared
+# `dispatch_checkpoints` free fn (the lint walks only the handler call body), which emits
+# nothing per op: the same pending checkpoint.created / rollback.applied status the
+# sibling LifecycleHandler and SpawnHandler rows document. Same pending_wiring_slice.
+[[handler]]
+crate = "cap-lifecycle"
+struct = "CheckpointHostHandler"
+reason = "351eafc3 narrow checkpoint-only handler: dispatches checkpoint / rollback-to-checkpoint / list-checkpoints / list-child-checkpoints / rollback-child-to-checkpoint via the shared `dispatch_checkpoints` free fn (the lint walks only the handler call body). The per-op checkpoint.created / rollback.applied emits are still pending, identical to the checkpoint ops the sibling LifecycleHandler row documents; the list ops are read-only queries."
+pending_wiring_slice = "MODULE-005 observability follow-up (remaining ops: agent.spawned / checkpoint.created / rollback.applied per-op emits)"
+
 # Legacy-3 CONTRACT-217 split the production v0.2 component surface out of the
 # shared LifecycleHandler into this narrow handler. The handler intentionally
 # owns only WIT lifting/lowering and delegates the admitted production write to
