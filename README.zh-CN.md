@@ -39,7 +39,7 @@
 依赖单一门面 crate [`crates/advance-core`](crates/advance-core)：
 
 ```toml
-advance-core = { git = "https://github.com/advancinggg/advance-agents", tag = "v0.1.44" }
+advance-core = { git = "https://github.com/advancinggg/advance-agents", tag = "v0.1.45" }
 ```
 
 ## 架构一览
