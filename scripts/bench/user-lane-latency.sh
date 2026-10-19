@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 # OSS-7 user-lane latency witness (MODULE-003 §2.13). Recorded, not a CI gate.
-# Run on the external APFS volume: ADVANCE_BENCH_DIR=/Volumes/Sandisk/... ./scripts/bench/user-lane-latency.sh
+# Measures: 10 KiB commit_user; 50-commit backlog; save-version; 1k/10k loose-object
+# corpus; 10 000-path restore_tree; 2 GiB untracked-folder delete.
+# Run on the external APFS volume. If ADVANCE_BENCH_DIR is unset and
+# /Volumes/Sandisk/Advance is writable, tempfile lands there.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}"
-export ADVANCE_BENCH_DIR="${ADVANCE_BENCH_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/advance-bench.XXXXXX")}"
+if [ -z "${ADVANCE_BENCH_DIR:-}" ]; then
+  if [ -d /Volumes/Sandisk/Advance ] && [ -w /Volumes/Sandisk/Advance ]; then
+    ADVANCE_BENCH_DIR="$(mktemp -d /Volumes/Sandisk/Advance/advance-bench.XXXXXX)"
+  else
+    ADVANCE_BENCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/advance-bench.XXXXXX")"
+  fi
+fi
+export ADVANCE_BENCH_DIR
 mkdir -p "$ADVANCE_BENCH_DIR"
 # OperatorHarness uses tempfile::TempDir::new(), which honors TMPDIR.
 export TMPDIR="$ADVANCE_BENCH_DIR"
