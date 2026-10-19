@@ -20,6 +20,8 @@ crates/embedded-runtime-bridge/src/supervise.rs	let mut command = Command::new(&
 crates/embedded-runtime-bridge/src/handle.rs	*	0	types-only	holds the v1 supervise tokio::process::Child
 crates/capabilities/cap-fs/src/meta_schema.rs	let status = std::process::Command::new("mkfifo")	1	test-only	unit-test fixture
 crates/capabilities/cap-fs/src/meta_schema.rs	assert!(std::process::Command::new("mkfifo")	1	test-only	unit-test fixture
+crates/git/src/journal.rs	let status = std::process::Command::new("mkfifo")	1	test-only	unit-test fixture
+crates/git/src/safe_fs.rs	let status = std::process::Command::new("mkfifo")	1	test-only	unit-test fixture
 crates/capabilities/cap-lifecycle/src/producer_boundary.rs	let made = std::process::Command::new("mkfifo")	1	test-only	unit-test fixture
 crates/runtime-compose/src/vlm_indexer.rs	let made_fifo = std::process::Command::new("mkfifo")	1	test-only	unit-test fixture
 crates/runtime-compose/src/mcp_wiring.rs	let made = std::process::Command::new("mkfifo")	1	test-only	unit-test fixture

@@ -57,6 +57,15 @@ pub struct MetaFile {
 /// `.meta.yaml` filename (always `.meta.yaml` at the directory level).
 const META_YAML_NAME: &str = ".meta.yaml";
 
+/// Result of [`MetaMaintainer::ensure_dir_meta_locked`].
+#[derive(Debug, Clone)]
+pub struct DirMetaWrite {
+    /// `true` when this call created `dir/.meta.yaml`.
+    pub created: bool,
+    /// Bytes written for the child sidecar; empty when it already existed.
+    pub child_yaml: Vec<u8>,
+}
+
 /// Per-field bounds on guest-supplied metadata. The cap is intentionally small
 /// relative to MAX_WRITE_BYTES (64 MiB): a guest can otherwise persist a
 /// near-MAX_WRITE_BYTES `.meta.yaml` inside their own territory and force
@@ -72,7 +81,7 @@ const MAX_TAG_BYTES: usize = 128;
 /// past hundreds of MiB. Subsequent `load`/`scan` would then read+parse the
 /// whole file. 4 MiB caps the directory at ~400 max-sized entries, well
 /// above realistic per-dir entry counts but far below DoS amplification.
-const MAX_META_YAML_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_META_YAML_BYTES: usize = 4 * 1024 * 1024;
 
 /// Adversarial-round-1 W6: per-field cap on schema-optional default
 /// values that flow into `entry.extra`. The schema loader itself is
@@ -144,6 +153,23 @@ pub struct MetaMaintainer {
 #[async_trait::async_trait]
 pub trait RecordObserver: Send + Sync {
     async fn record_file_changed(&self, agent_id: &str, path: &str);
+
+    /// Provided method (C3): the operator path attributes the index event to
+    /// `event_agent` / `op` (`user:<h>` / `user_write|user_delete`). The default
+    /// forwards to [`record_file_changed`] so existing observers compile.
+    async fn record_file_changed_from(&self, change: RecordChange<'_>) {
+        self.record_file_changed(change.index_agent, change.index_path)
+            .await;
+    }
+}
+
+/// Arguments for [`RecordObserver::record_file_changed_from`].
+#[derive(Debug, Clone, Copy)]
+pub struct RecordChange<'a> {
+    pub index_agent: &'a str,
+    pub index_path: &'a str,
+    pub event_agent: &'a str,
+    pub op: &'a str,
 }
 
 impl MetaMaintainer {
@@ -154,11 +180,22 @@ impl MetaMaintainer {
 
     /// Report a committed raw write or delete of `path` to the bound observer, if any.
     pub async fn notify_record_file_changed(&self, agent_id: &str, path: &str) {
-        if !crate::meta_schema::is_markdown_name(path) {
+        self.notify_record_change(RecordChange {
+            index_agent: agent_id,
+            index_path: path,
+            event_agent: agent_id,
+            op: "fs_write",
+        })
+        .await;
+    }
+
+    /// C3: notify with attribution (`event_agent` / `op`).
+    pub async fn notify_record_change(&self, change: RecordChange<'_>) {
+        if !crate::meta_schema::is_markdown_name(change.index_path) {
             return;
         }
         if let Some(observer) = self.record_observer.get() {
-            observer.record_file_changed(agent_id, path).await;
+            observer.record_file_changed_from(change).await;
         }
     }
 
@@ -192,28 +229,43 @@ impl MetaMaintainer {
         self.meta_lock.lock().await
     }
 
+    /// Non-blocking L1 probe (C3 / R-c tests).
+    pub fn try_acquire(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.meta_lock.try_lock().ok()
+    }
+
     /// Load `.meta.yaml` from `dir`. Returns `Ok(None)` if missing,
     /// `Err` for parse / IO errors. Reads are bounded by `MAX_META_YAML_BYTES`
     /// to prevent aggregate-DoS: even with per-field caps, a guest could
     /// otherwise create thousands of files in one dir → an unbounded
     /// `.meta.yaml` that subsequent scan/load reads + parses on every call.
+    /// A symlinked `.meta.yaml` is refused (C3).
     pub async fn load(&self, dir: &Path) -> Result<Option<MetaFile>, FsError> {
         let path = Self::meta_path(dir);
-        let metadata = match tokio::fs::metadata(&path).await {
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(FsError::IoError(sanitize_io_error(&e))),
         };
+        if metadata.file_type().is_symlink() {
+            return Err(FsError::IoError("symlinked .meta.yaml refused".to_string()));
+        }
         if metadata.len() > MAX_META_YAML_BYTES as u64 {
             return Err(FsError::IoError(format!(
                 ".meta.yaml exceeds MAX_META_YAML_BYTES ({MAX_META_YAML_BYTES} bytes)"
             )));
         }
-        match tokio::fs::read_to_string(&path).await {
-            Ok(yaml) => parse_meta_yaml(&yaml).map(Some),
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => parse_meta_bytes(&bytes).map(Some),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(FsError::IoError(sanitize_io_error(&e))),
         }
+    }
+
+    /// Guarded event-level YAML parse (C3): refuses anchors, aliases and a
+    /// second document. Descriptions may contain `&` / `*`.
+    pub fn parse_meta_bytes(bytes: &[u8]) -> Result<MetaFile, FsError> {
+        parse_meta_bytes(bytes)
     }
 
     /// Unified add-entry-on-write: takes Option<MetaFile> (None = no .meta.yaml
@@ -229,6 +281,9 @@ impl MetaMaintainer {
         let mut meta = meta_pre.unwrap_or_default();
         let mut changed_fields = Vec::new();
 
+        if file_name == "_scope" {
+            return Ok((meta, Vec::new()));
+        }
         if !meta.entries.contains_key(file_name) {
             // New entry — auto-populate required fields.
             let name = schema
@@ -435,7 +490,20 @@ impl MetaMaintainer {
         dir: &Path,
         parent_for_entry: Option<&Path>,
     ) -> Result<bool, FsError> {
-        let _guard = self.acquire().await;
+        let guard = self.acquire().await;
+        self.ensure_dir_meta_locked(&guard, dir, parent_for_entry)
+            .await
+            .map(|w| w.created)
+    }
+
+    /// Guard-taking variant (git R4 / C3): L1 is already held. Returns the
+    /// bytes written for the child sidecar (empty if it already existed).
+    pub async fn ensure_dir_meta_locked(
+        &self,
+        _guard: &tokio::sync::MutexGuard<'_, ()>,
+        dir: &Path,
+        parent_for_entry: Option<&Path>,
+    ) -> Result<DirMetaWrite, FsError> {
         let dir_name = dir
             .file_name()
             .and_then(|s| s.to_str())
@@ -444,9 +512,10 @@ impl MetaMaintainer {
 
         // Step 1: child leg — ensure dir/.meta.yaml exists with auto-scope.
         let child_existed = self.load(dir).await?.is_some();
+        let mut child_yaml = Vec::new();
         if !child_existed {
             let meta = self.build_default_meta(&dir_name);
-            self.write(dir, &meta).await?;
+            child_yaml = self.write(dir, &meta).await?;
         }
 
         // Step 2: parent leg — ensure parent's .meta.yaml lists this dir as
@@ -486,14 +555,15 @@ impl MetaMaintainer {
             }
         }
 
-        Ok(!child_existed)
+        Ok(DirMetaWrite {
+            created: !child_existed,
+            child_yaml,
+        })
     }
 
     /// Build a fresh `MetaFile` with auto-populated `_scope` for `dir_name`,
-    /// no entries. Internal helper for `ensure_dir_meta`'s child + parent
-    /// bootstrap legs (kept private — callers go through `ensure_dir_meta`
-    /// which owns the meta_lock acquisition + idempotency contract).
-    fn build_default_meta(&self, dir_name: &str) -> MetaFile {
+    /// no entries. Used by `ensure_dir_meta` and operator quarantine-rebuild.
+    pub fn build_default_meta(&self, dir_name: &str) -> MetaFile {
         let schema = self.schema.current();
         let mut scope = ScopeMeta::default();
         scope.slug = schema.auto_generate("slug", dir_name, b"");
@@ -626,8 +696,11 @@ fn serialize_meta_yaml(meta: &MetaFile) -> Result<String, FsError> {
         serde_yml::Value::String("_scope".to_string()),
         serde_yml::Value::Mapping(scope_map),
     );
-    // entries
+    // entries — never emit a key `_scope` (C3); the scope block already owns it.
     for (name, entry) in &meta.entries {
+        if name == "_scope" {
+            continue;
+        }
         let mut em = serde_yml::Mapping::new();
         em.insert(
             serde_yml::Value::String("name".to_string()),
@@ -679,10 +752,45 @@ fn serialize_meta_yaml(meta: &MetaFile) -> Result<String, FsError> {
         .map_err(|e| FsError::IoError(format!("serialize meta.yaml: {e}")))
 }
 
-fn parse_meta_yaml(yaml: &str) -> Result<MetaFile, FsError> {
-    let v: serde_yml::Value = serde_yml::from_str(yaml).map_err(|_| {
-        FsError::IoError("malformed .meta.yaml: invalid yaml structure".to_string())
-    })?;
+fn parse_meta_bytes(bytes: &[u8]) -> Result<MetaFile, FsError> {
+    if bytes.len() > MAX_META_YAML_BYTES {
+        return Err(FsError::IoError(format!(
+            ".meta.yaml exceeds MAX_META_YAML_BYTES ({MAX_META_YAML_BYTES} bytes)"
+        )));
+    }
+    let mut loader = serde_yml::loader::Loader::new(serde_yml::de::Progress::Slice(bytes))
+        .map_err(|_| FsError::IoError("malformed .meta.yaml: invalid yaml structure".into()))?;
+    let document = loader
+        .next_document()
+        .ok_or_else(|| FsError::IoError("malformed .meta.yaml: empty document".to_string()))?;
+    if document.error.is_some() {
+        return Err(FsError::IoError(
+            "malformed .meta.yaml: invalid yaml structure".to_string(),
+        ));
+    }
+    if !document.anchor_event_map.is_empty()
+        || document
+            .events
+            .iter()
+            .any(|(ev, _)| matches!(ev, serde_yml::de::Event::Alias(_)))
+    {
+        return Err(FsError::IoError(
+            "malformed .meta.yaml: anchors and aliases are refused".to_string(),
+        ));
+    }
+    if loader.next_document().is_some() {
+        return Err(FsError::IoError(
+            "malformed .meta.yaml: multiple documents".to_string(),
+        ));
+    }
+    let v: serde_yml::Value = serde_yml::Value::deserialize(serde_yml::Deserializer {
+        progress: serde_yml::de::Progress::Document(document),
+    })
+    .map_err(|_| FsError::IoError("malformed .meta.yaml: invalid yaml structure".to_string()))?;
+    parse_meta_value(v)
+}
+
+fn parse_meta_value(v: serde_yml::Value) -> Result<MetaFile, FsError> {
     let map = match v {
         serde_yml::Value::Mapping(m) => m,
         _ => {
@@ -1017,5 +1125,128 @@ mod tests {
             meta2.entries.get("x.md").unwrap().tags,
             vec!["a".to_string()]
         );
+    }
+
+    #[test]
+    fn scope_named_entry_never_written() {
+        let mm = maintainer();
+        let (meta, fields) = mm.add_entry_for_write(None, "_scope", b"x").unwrap();
+        assert!(fields.is_empty());
+        assert!(!meta.entries.contains_key("_scope"));
+        let yaml = serialize_meta_yaml(&{
+            let mut m = MetaFile::default();
+            m.entries.insert(
+                "_scope".into(),
+                EntryMetaValues {
+                    name: "stolen".into(),
+                    slug: String::new(),
+                    description: "x".into(),
+                    r#type: String::new(),
+                    tags: vec![],
+                    lifecycle: None,
+                    extra: BTreeMap::new(),
+                },
+            );
+            m
+        })
+        .unwrap();
+        assert!(
+            !yaml.contains("stolen"),
+            "serialize must drop an entry keyed _scope: {yaml}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_anchors_and_aliases_event_level() {
+        let ok = parse_meta_bytes(
+            b"_scope:\n  description: notes with &amp and *star*\nnotes.md:\n  name: n\n  slug: n\n  description: ok\n",
+        )
+        .unwrap();
+        assert!(ok.scope.description.contains('&'));
+        assert!(ok.scope.description.contains('*'));
+        let bomb = b"a: &id001\n  k: *id001\n";
+        let err = parse_meta_bytes(bomb).unwrap_err();
+        match err {
+            FsError::IoError(s) => assert!(s.contains("alias") || s.contains("anchor")),
+            other => panic!("expected IoError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_multi_document() {
+        let err = parse_meta_bytes(b"_scope:\n  description: a\n---\n_scope:\n  description: b\n")
+            .unwrap_err();
+        match err {
+            FsError::IoError(s) => assert!(s.contains("multiple")),
+            other => panic!("expected IoError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_refuses_symlinked_meta() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("real.yaml");
+        std::fs::write(&real, "_scope:\n  description: x\n").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join(".meta.yaml")).unwrap();
+        let mm = maintainer();
+        let err = mm.load(dir.path()).await.unwrap_err();
+        match err {
+            FsError::IoError(s) => assert!(s.contains("symlink")),
+            other => panic!("expected IoError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_dir_meta_locked_returns_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let child = dir.path().join("folder");
+        std::fs::create_dir(&child).unwrap();
+        let mm = maintainer();
+        let guard = mm.acquire().await;
+        let wrote = mm
+            .ensure_dir_meta_locked(&guard, &child, Some(dir.path()))
+            .await
+            .unwrap();
+        assert!(wrote.created);
+        assert!(!wrote.child_yaml.is_empty());
+        drop(guard);
+        assert!(child.join(".meta.yaml").is_file());
+    }
+
+    struct ForwardObserver {
+        hits: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RecordObserver for ForwardObserver {
+        async fn record_file_changed(&self, agent_id: &str, path: &str) {
+            self.hits
+                .lock()
+                .unwrap()
+                .push((agent_id.to_string(), path.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn record_observer_default_forwards() {
+        let obs = ForwardObserver {
+            hits: std::sync::Mutex::new(Vec::new()),
+        };
+        obs.record_file_changed_from(RecordChange {
+            index_agent: "root",
+            index_path: "n.md",
+            event_agent: "user:advance",
+            op: "user_write",
+        })
+        .await;
+        let hits = obs.hits.lock().unwrap().clone();
+        assert_eq!(hits, vec![("root".into(), "n.md".into())]);
+    }
+
+    #[tokio::test]
+    async fn try_acquire_is_non_blocking() {
+        let mm = maintainer();
+        let _g = mm.acquire().await;
+        assert!(mm.try_acquire().is_none());
     }
 }

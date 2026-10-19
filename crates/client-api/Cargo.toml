@@ -52,10 +52,12 @@ chrono = { workspace = true, features = ["clock"] }
 # Wave-25 public transport.  Every HTTP/WebSocket request is adapted back into
 # `ClientApi::handle`; axum owns sockets only and has no provider access.
 axum = { workspace = true, features = ["ws"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync", "fs", "io-util"] }
 # Cancellation + tracking of the upgraded WebSocket tasks for the bounded ingress shutdown.
 tokio-util = { workspace = true, features = ["rt"] }
+futures-core = { workspace = true }
 url = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 # Self dev-dep: unifies `test-support` onto this crate's own test builds (in-crate `#[cfg(test)]`
@@ -84,6 +86,7 @@ tokio-tungstenite = { workspace = true }
 # Tee T2 witnesses: `#[tokio::test(start_paused = true)]` (T24 push-latency discipline) needs
 # tokio's test-util clock. Dev-only (resolver-2 keeps it off production builds).
 tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true }
 
 [lints]
 workspace = true

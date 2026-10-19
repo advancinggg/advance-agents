@@ -952,7 +952,9 @@ fn handle_stream(ctx: &HandlerCtx, slots: &EventSlots) -> Result<Value, ClientEr
                     // Tee T2 delta cursors NEVER resume an event stream: explicit reject (the
                     // AAD domain split makes this unreachable via `AeadClientCursorCodec`, but
                     // the event path must fail closed for ANY codec impl).
-                    OpenedSeal::DeltaCursor { .. } => return Err(err_cursor_not_found()),
+                    OpenedSeal::DeltaCursor { .. } | OpenedSeal::FileTicket(_) => {
+                        return Err(err_cursor_not_found())
+                    }
                 }
             }
             _ => return Err(err_cursor_incomplete()),

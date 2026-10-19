@@ -19,8 +19,9 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use advance_client_api::schema::{
-    enforce_compat_gate, generate_schema_artifact, manifest_path, platform_surface_json,
-    schema_path, shared_sdk_dir, vectors_path,
+    enforce_compat_gate, files_natural_order_json, generate_schema_artifact,
+    labels_conformance_json, manifest_path, platform_surface_json, schema_path, shared_sdk_dir,
+    vectors_path,
 };
 
 fn check_one(path: &Path, fresh: &str, label: &str, drifted: &mut Vec<String>) {
@@ -106,6 +107,19 @@ fn main() -> ExitCode {
                 &mut drifted,
             );
         }
+        let conf = shared_sdk_dir().join("conformance");
+        check_one(
+            &conf.join("labels.json"),
+            &labels_conformance_json(),
+            "labels",
+            &mut drifted,
+        );
+        check_one(
+            &conf.join("files-natural-order.json"),
+            &files_natural_order_json(),
+            "files-natural-order",
+            &mut drifted,
+        );
         match enforce_compat_gate() {
             Ok(()) => println!("COMPAT  OK"),
             Err(e) => {
@@ -147,6 +161,16 @@ fn main() -> ExitCode {
             "wrote per-target surfaces under {}/fixtures/",
             conf_dir.display()
         );
+        advance_client_api::schema::safe_write(
+            &conf_dir.join("labels.json"),
+            &labels_conformance_json(),
+        )?;
+        println!("wrote {}/labels.json", conf_dir.display());
+        advance_client_api::schema::safe_write(
+            &conf_dir.join("files-natural-order.json"),
+            &files_natural_order_json(),
+        )?;
+        println!("wrote {}/files-natural-order.json", conf_dir.display());
         let baseline = advance_client_api::compat::live_baseline_json().map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,

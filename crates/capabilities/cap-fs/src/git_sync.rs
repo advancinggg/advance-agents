@@ -40,6 +40,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::oneshot;
 
 /// Transparent error newtype returned by [`GitSync::submit_fs_commit`]. The
 /// cap-fs handler wraps the inner string in a
@@ -56,6 +57,59 @@ impl std::fmt::Display for GitSyncError {
 }
 
 impl std::error::Error for GitSyncError {}
+
+/// A commit that has already been submitted to the queue (R-c / R10).
+///
+/// [`GitSync::enqueue_fs_commit`] returns this while still holding L1; the
+/// caller drops the meta lock and then [`PendingFsCommit::wait`]s.
+pub struct PendingFsCommit {
+    inner: PendingInner,
+}
+
+enum PendingInner {
+    Ready(Result<Option<String>, GitSyncError>),
+    Rx(oneshot::Receiver<Result<git2::Oid, advance_git::GitError>>),
+}
+
+impl PendingFsCommit {
+    /// Already finished (the default lazy wrapper).
+    pub fn ready(result: Result<(), GitSyncError>) -> Self {
+        Self::ready_commit(result.map(|()| None))
+    }
+
+    /// Already finished, carrying the commit id when the backend reported one.
+    pub fn ready_commit(result: Result<Option<String>, GitSyncError>) -> Self {
+        Self {
+            inner: PendingInner::Ready(result),
+        }
+    }
+
+    /// A oneshot from `GitCommitQueue::submit`.
+    pub fn from_rx(rx: oneshot::Receiver<Result<git2::Oid, advance_git::GitError>>) -> Self {
+        Self {
+            inner: PendingInner::Rx(rx),
+        }
+    }
+
+    /// Await the worker. Safe to call after L1 is released.
+    pub async fn wait(self) -> Result<(), GitSyncError> {
+        self.wait_commit().await.map(|_| ())
+    }
+
+    /// Await the worker and return the commit id when the backend reported one.
+    pub async fn wait_commit(self) -> Result<Option<String>, GitSyncError> {
+        match self.inner {
+            PendingInner::Ready(r) => r,
+            PendingInner::Rx(rx) => match rx.await {
+                Ok(Ok(oid)) => Ok(Some(format!("{oid}"))),
+                Ok(Err(e)) => Err(GitSyncError(format!("{e:?}"))),
+                Err(_) => Err(GitSyncError(
+                    "commit queue worker closed (oneshot canceled)".into(),
+                )),
+            },
+        }
+    }
+}
 
 /// Operation kind passed into [`GitSync::submit_fs_commit`]. Influences the
 /// commit-message verb (`write` vs `delete`) but otherwise routes through the
@@ -118,6 +172,41 @@ pub trait GitSync: Send + Sync {
         self.submit_fs_commit(agent_id, op, vpath, a, b).await?;
         Ok(None)
     }
+
+    /// R-c / R10: submit the commit **now** (while the caller still holds L1)
+    /// and return a waiter. The default is the existing lazy wrapper — it
+    /// calls [`submit_fs_commit`] immediately — so `MockGitSync` and Along's
+    /// `RepoGitSync` compile unchanged.
+    async fn enqueue_fs_commit(
+        &self,
+        agent_id: &str,
+        op: GitSyncOp,
+        vpath: &str,
+        physical_path: PathBuf,
+        meta_yaml_path: PathBuf,
+    ) -> Result<PendingFsCommit, GitSyncError> {
+        Ok(PendingFsCommit::ready(
+            self.submit_fs_commit(agent_id, op, vpath, physical_path, meta_yaml_path)
+                .await,
+        ))
+    }
+
+    /// R-c: submit a caller-supplied message **now** (while the caller still
+    /// holds L1) and return a waiter. The default awaits
+    /// [`submit_commit_with_message`](Self::submit_commit_with_message).
+    async fn enqueue_commit_with_message(
+        &self,
+        agent_id: &str,
+        op: GitSyncOp,
+        vpath: &str,
+        paths: Vec<PathBuf>,
+        message: &str,
+    ) -> Result<PendingFsCommit, GitSyncError> {
+        Ok(PendingFsCommit::ready_commit(
+            self.submit_commit_with_message(agent_id, op, vpath, paths, message)
+                .await,
+        ))
+    }
 }
 
 /// Production [`GitSync`] adapter wrapping
@@ -148,6 +237,20 @@ impl GitSync for Adv003GitSync {
         physical_path: PathBuf,
         meta_yaml_path: PathBuf,
     ) -> Result<(), GitSyncError> {
+        self.enqueue_fs_commit(agent_id, op, vpath, physical_path, meta_yaml_path)
+            .await?
+            .wait()
+            .await
+    }
+
+    async fn enqueue_fs_commit(
+        &self,
+        agent_id: &str,
+        op: GitSyncOp,
+        vpath: &str,
+        physical_path: PathBuf,
+        meta_yaml_path: PathBuf,
+    ) -> Result<PendingFsCommit, GitSyncError> {
         let req = advance_git::CommitRequest::new(
             agent_id,
             format!("{} {}", op.message_verb(), vpath),
@@ -155,24 +258,17 @@ impl GitSync for Adv003GitSync {
             advance_git::CommitType::Turn,
             format!("agent:{agent_id}"),
         );
-        let rx = self.queue.submit(req);
-        match rx.await {
-            Ok(Ok(_oid)) => Ok(()),
-            Ok(Err(e)) => Err(GitSyncError(format!("{e:?}"))),
-            Err(_) => Err(GitSyncError(
-                "commit queue worker closed (oneshot canceled)".into(),
-            )),
-        }
+        Ok(PendingFsCommit::from_rx(self.queue.submit(req)))
     }
 
-    async fn submit_commit_with_message(
+    async fn enqueue_commit_with_message(
         &self,
         agent_id: &str,
         _op: GitSyncOp,
         _vpath: &str,
         paths: Vec<PathBuf>,
         message: &str,
-    ) -> Result<Option<String>, GitSyncError> {
+    ) -> Result<PendingFsCommit, GitSyncError> {
         let req = advance_git::CommitRequest::new(
             agent_id,
             message.to_string(),
@@ -180,13 +276,20 @@ impl GitSync for Adv003GitSync {
             advance_git::CommitType::Turn,
             format!("agent:{agent_id}"),
         );
-        let rx = self.queue.submit(req);
-        match rx.await {
-            Ok(Ok(oid)) => Ok(Some(format!("{oid}"))),
-            Ok(Err(e)) => Err(GitSyncError(format!("{e:?}"))),
-            Err(_) => Err(GitSyncError(
-                "commit queue worker closed (oneshot canceled)".into(),
-            )),
-        }
+        Ok(PendingFsCommit::from_rx(self.queue.submit(req)))
+    }
+
+    async fn submit_commit_with_message(
+        &self,
+        agent_id: &str,
+        op: GitSyncOp,
+        vpath: &str,
+        paths: Vec<PathBuf>,
+        message: &str,
+    ) -> Result<Option<String>, GitSyncError> {
+        self.enqueue_commit_with_message(agent_id, op, vpath, paths, message)
+            .await?
+            .wait_commit()
+            .await
     }
 }

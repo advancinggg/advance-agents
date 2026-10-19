@@ -9,8 +9,16 @@
 //! current blob WITHOUT the cli crate naming `git2` (whose cli dependency is dev-only).
 //!
 //! This is an internal utility, NOT a §6.1 CONTRACT.
+//!
+//! [`BlobHasher`] (ADR 2026-10-15; MODULE-002 §1.4.9) is the streaming form: callers that
+//! must never hash by path (the fs core hashes an already-opened `O_NOFOLLOW|O_NONBLOCK`
+//! descriptor after an `S_ISREG` `fstat`; a staged upload is verified as it streams) feed
+//! the bytes themselves and get the same `git hash-object` id, with no repository and no
+//! object written.
 
 use std::path::Path;
+
+use sha1::{Digest, Sha1};
 
 /// Compute the git blob OID (`git hash-object` semantics) of the file at `path`.
 ///
@@ -28,10 +36,161 @@ pub fn blob_oid_of_file(path: &Path) -> Option<String> {
         .map(|oid| oid.to_string())
 }
 
+/// The git blob id (`git hash-object` semantics, 40 lowercase hex) of `bytes`.
+pub fn blob_oid_of_bytes(bytes: &[u8]) -> String {
+    let mut hasher = BlobHasher::new(bytes.len() as u64);
+    hasher.update(bytes);
+    // The declared length is the slice's own, so the length check cannot fail.
+    hasher.finish().unwrap_or_default()
+}
+
+/// A streaming git blob id: `sha1("blob <len>\0" ‖ content)`, the id `git hash-object`
+/// prints, computed without a repository and without writing an object.
+///
+/// The content length is part of the header, so it is declared up front (the `fstat` size
+/// of the file being read, or an upload's `Content-Length`); [`BlobHasher::finish`]
+/// refuses a stream that delivered a different number of bytes, because the id would then
+/// name content other than what was declared (a file that changed while it was read).
+/// `std::io::Write` is implemented, so `std::io::copy` streams a reader into it.
+#[derive(Clone)]
+pub struct BlobHasher {
+    sha: Sha1,
+    declared: u64,
+    fed: u64,
+}
+
+impl BlobHasher {
+    /// Start hashing a blob of `len` bytes.
+    pub fn new(len: u64) -> Self {
+        let mut sha = Sha1::new();
+        sha.update(format!("blob {len}\0").as_bytes());
+        Self {
+            sha,
+            declared: len,
+            fed: 0,
+        }
+    }
+
+    /// Feed the next bytes of the content.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.sha.update(bytes);
+        self.fed = self.fed.saturating_add(bytes.len() as u64);
+    }
+
+    /// Bytes fed so far.
+    pub fn fed(&self) -> u64 {
+        self.fed
+    }
+
+    /// The blob id, or [`BlobLengthMismatch`] when the stream did not deliver exactly the
+    /// declared length.
+    pub fn finish(self) -> Result<String, BlobLengthMismatch> {
+        if self.fed != self.declared {
+            return Err(BlobLengthMismatch {
+                declared: self.declared,
+                fed: self.fed,
+            });
+        }
+        let digest = self.sha.finalize();
+        let mut hex = String::with_capacity(40);
+        for byte in digest.iter() {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        Ok(hex)
+    }
+}
+
+impl std::fmt::Debug for BlobHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobHasher")
+            .field("declared", &self.declared)
+            .field("fed", &self.fed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::io::Write for BlobHasher {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A [`BlobHasher`] stream that did not deliver the declared length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobLengthMismatch {
+    pub declared: u64,
+    pub fed: u64,
+}
+
+impl std::fmt::Display for BlobLengthMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "blob declared {} bytes but {} were fed",
+            self.declared, self.fed
+        )
+    }
+}
+
+impl std::error::Error for BlobLengthMismatch {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    // ADR 2026-10-15 (MODULE-002 §1.4.9): chunked == one-shot == libgit2's own hash.
+    #[test]
+    fn blob_hasher_matches_git_hash_object() {
+        let mut big = Vec::with_capacity(1 << 20);
+        let mut x: u32 = 0x1234_5678;
+        for _ in 0..(1 << 20) {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            big.push((x >> 16) as u8);
+        }
+        for content in [&b""[..], b"hello world\n", b"a\r\nb\0c", &big[..]] {
+            let expected = git2::Oid::hash_object(git2::ObjectType::Blob, content)
+                .unwrap()
+                .to_string();
+            assert_eq!(blob_oid_of_bytes(content), expected);
+            let mut hasher = BlobHasher::new(content.len() as u64);
+            for chunk in content.chunks(4093) {
+                hasher.write_all(chunk).unwrap();
+            }
+            assert_eq!(hasher.fed(), content.len() as u64);
+            assert_eq!(hasher.finish().unwrap(), expected);
+            let mut hasher = BlobHasher::new(content.len() as u64);
+            std::io::copy(&mut &content[..], &mut hasher).unwrap();
+            assert_eq!(hasher.finish().unwrap(), expected);
+        }
+        assert_eq!(
+            blob_oid_of_bytes(b"hello world\n"),
+            "3b18e512dba79e4c8300dd08aeb37f8e728b8dad"
+        );
+    }
+
+    #[test]
+    fn blob_hasher_refuses_length_mismatch() {
+        let mut short = BlobHasher::new(5);
+        short.update(b"four");
+        assert_eq!(
+            short.finish(),
+            Err(BlobLengthMismatch {
+                declared: 5,
+                fed: 4
+            })
+        );
+        let mut long = BlobHasher::new(3);
+        long.update(b"four");
+        let err = long.finish().unwrap_err();
+        assert_eq!(err.fed, 4);
+        assert_eq!(err.to_string(), "blob declared 3 bytes but 4 were fed");
+    }
 
     // W0: an existing file hashes to the deterministic git blob OID — equal to git2's
     // own hash and to the well-known `git hash-object` value, proving genuine

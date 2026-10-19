@@ -32,7 +32,9 @@ use git2::{ObjectType, Oid, Repository, Sort};
 
 use crate::checkpoint::parse_tag_message;
 use crate::commit_queue::CommitType;
+use crate::label::{label_of, CommitLabel, OP_SAVE_VERSION};
 use crate::repo::{repo_status, GitRepoStatus};
+use crate::user_lane::USER_NAMESPACE;
 
 /// Hard cap on one commits page (`limit` above it is clamped, never refused).
 pub const MAX_PAGE_LIMIT: usize = 200;
@@ -79,14 +81,19 @@ pub struct CommitEntry {
     /// Paths the commit changed against its first parent (every path for a root
     /// commit).
     pub affected_paths_count: u32,
+    /// Parsed only from commits that carry the lane signatures (`label_of`).
+    pub label: Option<CommitLabel>,
 }
 
-/// Which commits a page keeps. Both dimensions are exact matches; `None` keeps all.
+/// Which commits a page keeps. Every dimension is an exact match; `None` keeps all.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommitFilter {
     /// Keep commits whose [`CommitEntry::agent_id`] is this id.
     pub agent_id: Option<String>,
     pub commit_type: Option<CommitType>,
+    /// Keep commits whose [`CommitEntry::initiator`] is exactly this token
+    /// (`agent:<id>`, `user:<handle>`, `runtime:adopt`, …; ADR 2026-10-15).
+    pub initiator: Option<String>,
 }
 
 impl CommitFilter {
@@ -98,6 +105,11 @@ impl CommitFilter {
         }
         if let Some(kind) = self.commit_type {
             if entry.commit_type != Some(kind) {
+                return false;
+            }
+        }
+        if let Some(initiator) = &self.initiator {
+            if entry.initiator.as_deref() != Some(initiator.as_str()) {
                 return false;
             }
         }
@@ -121,6 +133,10 @@ pub struct CheckpointRecord {
     /// ref grammar is off (`a/b/c` label, a non-commit target). Such tags are
     /// LISTED, never dropped — the client shows them as corrupt.
     pub valid: bool,
+    /// The marker's `Advance-Title` when this tag is a user version
+    /// (`checkpoint/user/<label>` peeling to a lane-signed `save-version` commit).
+    /// `None` for agent checkpoints, including a legacy agent named `user`.
+    pub title: Option<String>,
 }
 
 /// One page of [`GitHistoryReader::commits`].
@@ -169,6 +185,8 @@ pub struct FileVersion {
     pub subject: String,
     /// `true` when the commit deleted the path (no blob to read at this version).
     pub deleted: bool,
+    /// Parsed only from commits that carry the lane signatures (`label_of`).
+    pub label: Option<CommitLabel>,
 }
 
 /// The result of [`GitHistoryReader::file_history`].
@@ -467,8 +485,9 @@ pub fn clamp_limit(limit: usize) -> usize {
 
 /// Parse the `[<type>] [<initiator>] <subject>` prefix the commit queue writes.
 /// Returns `(commit_type, initiator, subject)`; a message without the exact prefix
-/// (or with a type token that is not `turn` / `micro` / `l6`) yields
-/// `(None, None, first_line)`.
+/// (or with a type token that is not `turn` / `micro` / `l6` / `user`) yields
+/// `(None, None, first_line)`. Only the first line is read, so a user-lane commit's
+/// `Advance-*` trailer block never reaches the subject.
 pub fn parse_commit_subject(message: &str) -> (Option<CommitType>, Option<String>, String) {
     let first_line = message.lines().next().unwrap_or("").trim_end();
     let parsed = (|| {
@@ -608,6 +627,7 @@ fn commit_entry(repo: &Repository, commit: &git2::Commit<'_>) -> Result<CommitEn
         agent_id: agent_of(commit),
         subject,
         affected_paths_count: u32::try_from(diff.deltas().len()).unwrap_or(u32::MAX),
+        label: label_of(commit),
     })
 }
 
@@ -710,6 +730,7 @@ fn list_checkpoints(
             },
         };
         let valid = valid && grammar_ok;
+        let title = user_version_title(repo, agent, &sha);
         items.push(CheckpointRecord {
             agent_id: agent.to_string(),
             label: label.to_string(),
@@ -725,10 +746,25 @@ fn list_checkpoints(
                 None
             },
             valid,
+            title,
         });
     }
     items.sort_by(|a, b| (&a.agent_id, &a.label).cmp(&(&b.agent_id, &b.label)));
     Ok(items)
+}
+
+/// A `checkpoint/user/<label>` tag is a user version iff it peels to a commit
+/// whose `label_of` is `op: save-version` (MODULE-003 §1.4.3).
+fn user_version_title(repo: &Repository, agent: &str, sha: &str) -> Option<String> {
+    if !agent.eq_ignore_ascii_case(USER_NAMESPACE) {
+        return None;
+    }
+    let oid = Oid::from_str(sha).ok()?;
+    let commit = repo.find_commit(oid).ok()?;
+    match label_of(&commit) {
+        Some(label) if label.op == OP_SAVE_VERSION => label.title,
+        _ => None,
+    }
 }
 
 /// Production file-history adapter (PR-3). Wraps [`GitHistoryReader`] and maps a
@@ -835,6 +871,7 @@ fn walk_file_history(
             agent_id: agent_of(&commit),
             subject,
             deleted: now.is_none(),
+            label: label_of(&commit),
         });
     }
     Ok((items, truncated))
@@ -859,6 +896,67 @@ mod tests {
         assert_eq!(kind, Some(CommitType::Micro));
         assert_eq!(initiator.as_deref(), Some("runtime:rollback"));
         assert_eq!(subject, "");
+    }
+
+    // ADR 2026-10-15 (MODULE-003-AC-26): a user-lane message parses like the queue's own,
+    // and the trailer block stays out of the subject.
+    #[test]
+    fn prefix_parse_round_trips_user_type() {
+        let (kind, initiator, subject) =
+            parse_commit_subject("[user] [user:advance] Edit a.md (+1 −0)\n\nAdvance-Op: edit");
+        assert_eq!(kind, Some(CommitType::User));
+        assert_eq!(initiator.as_deref(), Some("user:advance"));
+        assert_eq!(subject, "Edit a.md (+1 −0)");
+    }
+
+    // ADR 2026-10-15 (the git family's `?initiator=`): an exact match, combined with
+    // the other dimensions.
+    #[test]
+    fn commit_filter_initiator_exact_match() {
+        let entry = |initiator: Option<&str>, kind: Option<CommitType>| CommitEntry {
+            sha: "a".repeat(40),
+            committed_at_ms: 0,
+            commit_type: kind,
+            initiator: initiator.map(str::to_string),
+            agent_id: None,
+            subject: String::new(),
+            affected_paths_count: 0,
+            label: None,
+        };
+        let user = entry(Some("user:advance"), Some(CommitType::User));
+        let adopt = entry(Some("runtime:adopt"), Some(CommitType::Micro));
+        let foreign = entry(None, None);
+
+        let all = CommitFilter::default();
+        assert!(all.keeps(&user) && all.keeps(&adopt) && all.keeps(&foreign));
+
+        let by_user = CommitFilter {
+            initiator: Some("user:advance".into()),
+            ..Default::default()
+        };
+        assert!(by_user.keeps(&user));
+        assert!(!by_user.keeps(&adopt));
+        assert!(!by_user.keeps(&foreign));
+        for near in ["user:advanc", "user:advance ", "USER:advance", "user"] {
+            let filter = CommitFilter {
+                initiator: Some(near.into()),
+                ..Default::default()
+            };
+            assert!(!filter.keeps(&user), "{near:?} must not match user:advance");
+        }
+
+        let combined = CommitFilter {
+            initiator: Some("runtime:adopt".into()),
+            commit_type: Some(CommitType::User),
+            ..Default::default()
+        };
+        assert!(!combined.keeps(&adopt), "every dimension must match");
+        let combined = CommitFilter {
+            initiator: Some("runtime:adopt".into()),
+            commit_type: Some(CommitType::Micro),
+            ..Default::default()
+        };
+        assert!(combined.keeps(&adopt));
     }
 
     #[test]

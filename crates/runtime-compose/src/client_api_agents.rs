@@ -47,6 +47,22 @@ use advance_shared_types::agent_tree::{derive_agent_id, MAX_AGENT_ID_LEN};
 
 /// Bound on the `-n` suffix search when a derived handle collides.
 const MAX_HANDLE_SUFFIX: u32 = 1000;
+
+/// Skip a handle that folds to the reserved `user` namespace (`user-2`, then `user-3`…).
+fn skip_reserved_user_handle(base: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
+    let reserved_user = base.eq_ignore_ascii_case("user");
+    if !reserved_user && !taken(base) && base != "agent" {
+        return Some(base.to_string());
+    }
+    let stem = if reserved_user { "user" } else { base };
+    for n in 2..=MAX_HANDLE_SUFFIX {
+        let candidate = format!("{}-{n}", &stem[..stem.len().min(MAX_AGENT_ID_LEN - 4)]);
+        if !taken(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
 use advance_messaging::MailboxStore;
 use advance_run_manager::RunManager;
 use advance_runtime::config::RuntimeConfigProvider;
@@ -154,16 +170,8 @@ impl AgentAdminAdapter {
             .as_deref()
             .and_then(derive_agent_id)
             .unwrap_or_else(|| "agent".to_string());
-        if self.tree.node_by_handle(&base).is_none() && base != "agent" {
-            return Ok(base);
-        }
-        for n in 2..=MAX_HANDLE_SUFFIX {
-            let candidate = format!("{}-{n}", &base[..base.len().min(MAX_AGENT_ID_LEN - 4)]);
-            if self.tree.node_by_handle(&candidate).is_none() {
-                return Ok(candidate);
-            }
-        }
-        Err(ProviderError::AlreadyExists("agent id".into()))
+        skip_reserved_user_handle(&base, |h| self.tree.node_by_handle(h).is_some())
+            .ok_or_else(|| ProviderError::AlreadyExists("agent id".into()))
     }
 
     fn relative_path(&self, workspace: &Path) -> String {
@@ -1377,5 +1385,140 @@ mod tests {
             assert!(find_decl_mut(seq, "b").is_none());
             assert!(find_decl_mut(seq, "a").is_some());
         }
+    }
+
+    #[test]
+    fn create_agent_skips_reserved_handle() {
+        assert_eq!(derive_agent_id("User").as_deref(), Some("user"));
+        assert_eq!(
+            skip_reserved_user_handle("user", |_| false).as_deref(),
+            Some("user-2")
+        );
+        assert_eq!(
+            skip_reserved_user_handle("User", |_| false).as_deref(),
+            Some("user-2")
+        );
+        assert_eq!(
+            skip_reserved_user_handle("writer", |_| false).as_deref(),
+            Some("writer")
+        );
+        assert_eq!(
+            skip_reserved_user_handle("user", |h| h == "user-2").as_deref(),
+            Some("user-3")
+        );
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let tree = AgentTreeStore::new(tmp.path().to_path_buf()).expect("tree");
+        let adapter = adapter_for_settle(tree.clone());
+        let req = ClientCreateAgentRequest {
+            agent_id: None,
+            parent: None,
+            workspace_path: None,
+            template_ref: "default".into(),
+            capabilities: Vec::new(),
+            display_name: Some("User".into()),
+            config_yaml: None,
+            llm: None,
+        };
+        assert_eq!(adapter.settle_handle(&req).expect("empty tree"), "user-2");
+
+        let root_dir = tmp.path().join("root");
+        let taken_dir = root_dir.join("taken");
+        std::fs::create_dir_all(&taken_dir).expect("dirs");
+        let root_id = AgentId("root".into());
+        tree.insert_root(AgentNode {
+            id: root_id.clone(),
+            kind: AgentKind::Root,
+            parent: None,
+            workspace_path: root_dir,
+            capabilities: Vec::new(),
+            template_ref: None,
+            status: AgentStatus::Active,
+        })
+        .expect("root");
+        tree.insert_child_with_handle(
+            &root_id,
+            AgentNode {
+                id: AgentId("taken".into()),
+                kind: AgentKind::Child,
+                parent: Some(root_id.clone()),
+                workspace_path: taken_dir,
+                capabilities: Vec::new(),
+                template_ref: None,
+                status: AgentStatus::Active,
+            },
+            Some("user-2".into()),
+        )
+        .expect("user-2 taken");
+        assert_eq!(adapter.settle_handle(&req).expect("collision"), "user-3");
+    }
+
+    fn adapter_for_settle(tree: AgentTreeStore) -> AgentAdminAdapter {
+        use advance_runtime::config::{RuntimeConfig, RuntimeConfigProvider};
+        use cap_lifecycle::templates::BuiltinTemplateRegistry;
+
+        struct NoopSpawn;
+        impl Spawner for NoopSpawn {
+            fn spawn_child(&self, _: SpawnChildConfig) -> Result<AgentId, SpawnError> {
+                Err(SpawnError::InvalidConfig("test".into()))
+            }
+            fn spawn_sub(
+                &self,
+                _: cap_lifecycle::spawn::SpawnSubConfig,
+            ) -> Result<AgentId, SpawnError> {
+                Err(SpawnError::InvalidConfig("test".into()))
+            }
+        }
+        struct NoopTerm;
+        impl TerminateController for NoopTerm {
+            fn terminate_child(&self, _: &str, _: &str) -> Result<(), LifecycleError> {
+                Ok(())
+            }
+            fn terminate_agent(&self, _: &str, _: &str) -> Result<(), LifecycleError> {
+                Ok(())
+            }
+            fn handle_crash(&self, _: &str, _: &str) -> Result<(), LifecycleError> {
+                Ok(())
+            }
+        }
+        struct Cfg(std::sync::Arc<RuntimeConfig>);
+        impl RuntimeConfigProvider for Cfg {
+            fn current(&self) -> std::sync::Arc<RuntimeConfig> {
+                std::sync::Arc::clone(&self.0)
+            }
+            fn subscribe(&self) -> tokio::sync::mpsc::Receiver<std::sync::Arc<RuntimeConfig>> {
+                tokio::sync::mpsc::channel(1).1
+            }
+            fn last_error(&self) -> Option<String> {
+                None
+            }
+        }
+        const BOOT: &str = r#"
+wasm:
+  max_memory_pages: 1024
+  epoch_interruption_ms: 100
+  fuel_enabled: false
+llm-providers: []
+cron:
+  max_jitter_ratio: 0.1
+git:
+  gc_interval_hours: 24
+  max_tracked_file_mb: 10
+secrets:
+  master-key-source: keychain
+  env-var-name: SECRETS_MASTER_KEY
+post-processor:
+  llm-model: sonnet-light
+  llm-failure-cooldown-seconds: 600
+"#;
+        let cfg: RuntimeConfig = serde_yml::from_str(BOOT).expect("runtime config");
+        AgentAdminAdapter::new(
+            tree,
+            Arc::new(NoopSpawn),
+            Arc::new(NoopTerm),
+            Arc::new(BuiltinTemplateRegistry::default()),
+            AgentId("root".into()),
+            Arc::new(Cfg(std::sync::Arc::new(cfg))),
+        )
     }
 }

@@ -25,7 +25,9 @@ use crate::durable_idempotency::{
 };
 use crate::envelope::{ClientEnvelope, ClientError, ClientErrorCode, ClientWarning, API_VERSION};
 use crate::events::{ClientEventProvider, EventConcurrency};
+use crate::files_raw::RawSlotTable;
 use crate::idempotency::{Begin, IdempotencyOutcome, IdempotencyScope, IdempotencyStore};
+use crate::provider::FilesProviderSlot;
 use crate::provider::{
     AgentAdminProvider, AgentProviderSlot, BoundGrantProviderSlot, BoundHistoryProviderSlot,
     CursorCodecSlot, EventProviderSlot, LeakDetectorSlot, MessagingProvider, MessagingProviderSlot,
@@ -59,6 +61,10 @@ pub struct HandlerCtx {
     /// composition extension may mark any other request as loopback. Remote peers have no
     /// principal of their own until one is defined.
     pub is_loopback_peer: bool,
+    /// Live session id after auth (files family provenance + ticket binding).
+    pub session_id: Option<String>,
+    /// Declared client platform after auth.
+    pub platform: Option<Platform>,
 }
 
 /// Stable provider correlation for one admitted mutating request.
@@ -173,6 +179,14 @@ impl HandlerResponse {
     pub fn with_warnings(data: serde_json::Value, warnings: Vec<ClientWarning>) -> Self {
         Self { data, warnings }
     }
+}
+
+/// Outcome of [`ClientApi::pre_auth_gate`] (handle() steps 1–4).
+pub struct PreAuthOk {
+    pub request_id: String,
+    pub family: String,
+    pub method_str: String,
+    pub now: u64,
 }
 
 pub(crate) type HandlerFn =
@@ -320,6 +334,12 @@ pub struct ClientApi {
     entity_provider: crate::provider::EntityProviderSlot,
     /// Git family (workspace history) provider slot.
     git_provider: crate::provider::GitProviderSlot,
+    /// Files family (vault working tree) provider slot.
+    files_provider: FilesProviderSlot,
+    /// Dedicated write-ticket store (TTL 120 s, cap 4096). Separate from the JSON-mutation store.
+    files_raw_idempotency: IdempotencyStore,
+    /// Raw GET/PUT slot table.
+    raw_slots: Arc<RawSlotTable>,
     /// m020-s3 CONTRACT-191 slots (event provider / leak detector / cursor codec).
     event_provider: EventProviderSlot,
     leak_detector: LeakDetectorSlot,
@@ -375,6 +395,9 @@ impl ClientApi {
         let max_reads = config
             .max_concurrent_event_reads
             .clamp(1, crate::events::MAX_CONCURRENT_EVENT_READS_HARD);
+        let files_raw_ttl = config.files_raw_idempotency_ttl_ms;
+        let files_raw_cap = config.files_raw_idempotency_cap;
+        let raw_slots = Arc::new(RawSlotTable::new(&config));
         let mut api = Self {
             config,
             auth,
@@ -395,6 +418,9 @@ impl ClientApi {
             secrets_provider: Arc::new(RwLock::new(None)),
             entity_provider: Arc::new(RwLock::new(None)),
             git_provider: Arc::new(RwLock::new(None)),
+            files_provider: Arc::new(RwLock::new(None)),
+            files_raw_idempotency: IdempotencyStore::new(files_raw_ttl, files_raw_cap),
+            raw_slots,
             event_provider: Arc::new(RwLock::new(None)),
             leak_detector: Arc::new(RwLock::new(None)),
             cursor_codec: Arc::new(RwLock::new(None)),
@@ -479,6 +505,10 @@ impl ClientApi {
         // Git family (workspace history) over the GitHistoryProvider slot.
         let git_slot = Arc::clone(&self.git_provider);
         crate::git::register(self, git_slot);
+        let files_slot = Arc::clone(&self.files_provider);
+        let files_codec = Arc::clone(&self.cursor_codec);
+        let files_clock = Arc::clone(&self.clock);
+        crate::files::register(self, files_slot, files_codec, files_clock);
         let event_slot = Arc::clone(&self.event_provider);
         let detector_slot = Arc::clone(&self.leak_detector);
         let codec_slot = Arc::clone(&self.cursor_codec);
@@ -665,6 +695,15 @@ impl ClientApi {
         *self.git_provider.write().unwrap() = Some(provider);
     }
 
+    pub fn with_files_provider(self, provider: Arc<dyn crate::provider::FilesProvider>) -> Self {
+        *self.files_provider.write().unwrap() = Some(provider);
+        self
+    }
+
+    pub fn install_files_provider(&self, provider: Arc<dyn crate::provider::FilesProvider>) {
+        *self.files_provider.write().unwrap() = Some(provider);
+    }
+
     /// Inject the secrets-family provider (composition root / witness). Overwrites the slot
     /// the secrets-family closures read; `None` (default) → `module_unavailable`.
     pub fn with_secrets_provider(
@@ -746,6 +785,8 @@ impl ClientApi {
             *slot.write().unwrap_or_else(|e| e.into_inner()) = None;
         }
         clear(&self.run_provider);
+        clear(&self.context_provider);
+        clear(&self.files_provider);
         clear(&self.messaging_provider);
         clear(&self.tools_provider);
         clear(&self.agent_provider);
@@ -1083,6 +1124,53 @@ impl ClientApi {
     pub fn idempotency(&self) -> &IdempotencyStore {
         &self.idempotency
     }
+
+    pub fn files_raw_idempotency(&self) -> &IdempotencyStore {
+        &self.files_raw_idempotency
+    }
+
+    pub(crate) fn files_provider_slot(&self) -> &FilesProviderSlot {
+        &self.files_provider
+    }
+
+    pub(crate) fn raw_slots(&self) -> Arc<RawSlotTable> {
+        Arc::clone(&self.raw_slots)
+    }
+}
+
+/// Occupies one raw-read slot until dropped (test-support).
+#[cfg(feature = "test-support")]
+pub struct RawReadHold {
+    _guard: crate::files_raw::SlotGuard,
+}
+
+impl ClientApi {
+    /// Test helper: occupy one raw-read slot for `session_id` so a later GET can observe 429.
+    #[cfg(feature = "test-support")]
+    pub fn hold_raw_read_slot(
+        &self,
+        session_id: &str,
+    ) -> Result<RawReadHold, crate::envelope::ClientError> {
+        Ok(RawReadHold {
+            _guard: self
+                .raw_slots()
+                .acquire(crate::session::session_digest(session_id), false)?,
+        })
+    }
+
+    pub(crate) fn emit_audit(&self, event: AuditEvent) {
+        self.audit.emit(event);
+    }
+
+    pub fn denied_for(
+        &self,
+        request_id: &str,
+        family: &str,
+        method_str: &str,
+        err: ClientError,
+    ) -> ClientEnvelope<serde_json::Value> {
+        self.denied_err(request_id, family, method_str, err)
+    }
     pub fn config(&self) -> &ClientApiConfig {
         &self.config
     }
@@ -1201,9 +1289,12 @@ impl ClientApi {
 
     // ── Request handling ────────────────────────────────────────────────────────────────
 
-    /// Handle a client request, returning a versioned envelope. Never panics; never re-executes
-    /// an idempotent mutation; never calls a handler when a gate fails.
-    pub fn handle(&self, req: ClientRequest) -> ClientEnvelope<serde_json::Value> {
+    /// Shared pre-auth for JSON `handle()` and the transport-owned raw route.
+    /// Over-long paths still audit as family `"root"`.
+    pub fn pre_auth_gate(
+        &self,
+        req: &ClientRequest,
+    ) -> Result<PreAuthOk, ClientEnvelope<serde_json::Value>> {
         let request_id = new_request_id();
         let now = self.clock.now_millis();
         let method_str = format!("{:?}", req.method);
@@ -1211,13 +1302,13 @@ impl ClientApi {
         // Bound the path length before deriving the family / audit label (uniform with the
         // api_version and idempotency-key bounds), rejecting an over-long path at the very front.
         if req.path.len() > self.config.max_path_len {
-            return self.denied(
+            return Err(self.denied(
                 &request_id,
                 "root",
                 &method_str,
                 ClientErrorCode::RequestTooLarge,
                 "path exceeds max length",
-            );
+            ));
         }
         let family = routes::family_of(&req.path);
 
@@ -1230,32 +1321,51 @@ impl ClientApi {
 
         // 1. Admission — loopback-only default bind.
         if let Err(code) = ClientSessionAuth::check_admission(&self.config, req.is_loopback_peer) {
-            return self.denied(&request_id, &family, &method_str, code, "non-loopback peer");
+            return Err(self.denied(&request_id, &family, &method_str, code, "non-loopback peer"));
         }
         // 2. Version — fail closed before any handler/provider.
         if let Err(e) = crate::version::check_version(&req.api_version) {
-            return self.denied_err(&request_id, &family, &method_str, e);
+            return Err(self.denied_err(&request_id, &family, &method_str, e));
         }
         // 3. Body size cap.
         if req.body_size() > self.config.max_body_bytes {
-            return self.denied(
+            return Err(self.denied(
                 &request_id,
                 &family,
                 &method_str,
                 ClientErrorCode::RequestTooLarge,
                 "body exceeds max",
-            );
+            ));
         }
         // 4. CORS/origin (fail-closed for a disallowed browser Origin).
         if let Err(code) = ClientSessionAuth::check_origin(&self.config, req.origin.as_deref()) {
-            return self.denied(
+            return Err(self.denied(
                 &request_id,
                 &family,
                 &method_str,
                 code,
                 "origin not allowed",
-            );
+            ));
         }
+        Ok(PreAuthOk {
+            request_id,
+            family,
+            method_str,
+            now,
+        })
+    }
+
+    /// Handle a client request, returning a versioned envelope. Never panics; never re-executes
+    /// an idempotent mutation; never calls a handler when a gate fails.
+    pub fn handle(&self, req: ClientRequest) -> ClientEnvelope<serde_json::Value> {
+        let pre = match self.pre_auth_gate(&req) {
+            Ok(p) => p,
+            Err(env) => return env,
+        };
+        let request_id = pre.request_id;
+        let family = pre.family;
+        let method_str = pre.method_str;
+        let now = pre.now;
         // 5. Session-family ops.
         if let Some(op) = routes::session_op(req.method, &req.path) {
             return self.handle_session_op(&request_id, &family, &method_str, op, &req, now);
@@ -1344,6 +1454,8 @@ impl ClientApi {
             path_params,
             mutation: None,
             is_loopback_peer: req.is_loopback_peer,
+            session_id: session.as_ref().map(|s| s.session_id.clone()),
+            platform: session.as_ref().map(|s| s.platform),
         };
 
         // 8. Mutation gating (idempotency + CSRF + reserve-before-execute).

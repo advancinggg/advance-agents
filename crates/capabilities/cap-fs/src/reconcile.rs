@@ -55,8 +55,8 @@
 //!
 //! **Asymmetry with the per-call resolver hidden-name filter** (Adversarial
 //! Round 1 W2): `is_reconciler_skipped_name` is case-SENSITIVE and intentionally
-//! includes `.runtime` / `.sub` / `.agent` (which the resolver's per-call
-//! `is_workspace_hidden_name` does NOT include) AND OMITS the
+//! includes `.sub` / `.agent` (the resolver's per-call `is_workspace_hidden_name`
+//! now also hides `.runtime`, C7) AND OMITS the
 //! `eq_ignore_ascii_case` check the resolver applies for its own subset.
 //! That asymmetry is BY DESIGN: the goal of slice C's reconciler is parity
 //! with M004's BULK rebuild scanner (which is also case-sensitive and uses

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 const LANE_BASE: &str = include_str!("fixtures/sdk_artifacts_lane_base.sha256");
-const SCHEMA_HASH: &str = "48431e5d7c37c0fb06d5f6169fcf566bf9dcd35b92ed11b6022026d77692d58e";
+const SCHEMA_HASH: &str = "5f8d7d86474a829bde9c5c5f26e19e7534e502d67d2d7cebf48f8cfea1fb96f1";
 const API_VERSION: &str = "2026-09-17";
 
 fn artifacts_dir() -> PathBuf {
@@ -52,7 +52,7 @@ fn module_001_ac30_t111_3_sdk_artifacts_byte_identical_to_lane_base() {
             (path.to_owned(), hash.to_owned())
         })
         .collect();
-    assert_eq!(expected.len(), 11, "the lane base has 11 artifact files");
+    assert_eq!(expected.len(), 13, "the lane base has 13 artifact files");
 
     let root = artifacts_dir();
     let mut actual = BTreeMap::new();

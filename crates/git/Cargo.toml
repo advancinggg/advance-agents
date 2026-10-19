@@ -18,9 +18,18 @@ advance-shared-types = { path = "../shared-types" }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 git2 = { workspace = true }
+# User commit lane (ADR 2026-10-15, MODULE-003 §1.4.1 item 1, AC-35): fd-relative
+# O_NOFOLLOW walks and O_NONBLOCK leaf opens for every worker disk read (`safe_fs`).
+# Workspace pin =0.38.44.
+rustix = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
+# Streaming git blob ids without a repository (`blob::BlobHasher`). Workspace pin =0.10.6.
+sha1 = { workspace = true }
 tokio = { workspace = true }
+# User commit lane (ADR 2026-10-15): the version-label slug is NFKD-folded
+# (`label::version_label`). Workspace pin =0.1.25, already locked.
+unicode-normalization = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

@@ -133,6 +133,17 @@ pub const RESPONSE_COMPONENTS: &[&str] = &[
     "ClientContextEmbedding",
     "ClientContextIndex",
     "ClientContextSnapshot",
+    "ClientFileEntry",
+    "ClientFileList",
+    "ClientFileStat",
+    "ClientFileSearchResult",
+    "ClientFileTicket",
+    "ClientGitCommitLabel",
+    "ClientFileCommit",
+    "ClientFileChange",
+    "ClientFileWriteResult",
+    "ClientFileMutationResult",
+    "ClientFileVersionResult",
 ];
 
 /// Request / filter bodies — not a response-field bag.
@@ -172,6 +183,21 @@ pub const EXCLUDED_COMPONENTS: &[&str] = &[
     "ClientEntityApplyRequest",
     "ClientEntityAgentRequest",
     "ClientGitCreateCheckpointRequest",
+    "ClientFileReadTicketRequest",
+    "ClientFileWriteTicketRequest",
+    "ClientFileCommitBatchRequest",
+    "ClientFileMkdirRequest",
+    "ClientFileMoveItem",
+    "ClientFileMoveRequest",
+    "ClientFileDeleteItem",
+    "ClientFileDeleteRequest",
+    "ClientFileRestoreItem",
+    "ClientFileRestoreRequest",
+    "ClientFileSaveVersionRequest",
+    "ClientFileExternalItem",
+    "ClientFileCommitExternalRequest",
+    "ClientFileCopyItem",
+    "ClientFileCopyRequest",
 ];
 
 /// Git path of the on-disk honesty baseline, relative to the repo root.

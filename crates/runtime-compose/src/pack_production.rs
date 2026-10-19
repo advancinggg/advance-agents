@@ -39,7 +39,8 @@ use advance_shared_types::agent_tree::AgentId;
 use advance_shared_types::component::ComponentType;
 use async_trait::async_trait;
 use cap_lifecycle::{
-    validate_agent_id, AgentTreeStore, SpawnChildConfig, Spawner, TerminateController,
+    validate_agent_id, validate_new_agent_id, AgentTreeStore, SpawnChildConfig, Spawner,
+    TerminateController,
 };
 use secrecy::ExposeSecret;
 
@@ -433,6 +434,12 @@ impl SchedulerWorkflowExecutor {
             })?
             .to_string();
         validate_agent_id(&id).map_err(|e| {
+            PackError::InvalidWorkflow(format!(
+                "spawn-child target-path {}: child id {id:?} rejected: {e}",
+                target_path.display()
+            ))
+        })?;
+        validate_new_agent_id(&id).map_err(|e| {
             PackError::InvalidWorkflow(format!(
                 "spawn-child target-path {}: child id {id:?} rejected: {e}",
                 target_path.display()

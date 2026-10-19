@@ -6,12 +6,20 @@
 //! the top-level alias and the sub-module source-of-truth constant.
 
 use advance_event_bus::taxonomy::{
-    self, COMPONENT_SPAWNED, FS_READ_ENTRY, LLM_RESPONSE, RUNTIME_STARTED, TASK_CREATED,
-    TRIGGER_BUS_WHITELIST,
+    self, ALL_EVENT_TYPES, COMPONENT_SPAWNED, FS_READ_ENTRY, LLM_RESPONSE, RUNTIME_STARTED,
+    TASK_CREATED, TRIGGER_BUS_WHITELIST,
 };
 
 #[test]
 fn whitelist_has_12_entries() {
+    assert_eq!(TRIGGER_BUS_WHITELIST.len(), 12);
+}
+
+#[test]
+fn files_changed_is_documented_extension_not_a_trigger() {
+    assert_eq!(taxonomy::files::CHANGED, "files.changed");
+    assert!(ALL_EVENT_TYPES.contains(&taxonomy::files::CHANGED));
+    assert!(!TRIGGER_BUS_WHITELIST.contains(&taxonomy::files::CHANGED));
     assert_eq!(TRIGGER_BUS_WHITELIST.len(), 12);
 }
 

@@ -293,6 +293,10 @@ zeroize = "=1.8.1"
 # HKDF-SHA256 key derivation (per-secret key from master + salt).
 hkdf = "=0.12.4"
 sha2 = "=0.10.8"
+# Vault files lane (ADR 2026-10-15, MODULE-002 §1.4.9): advance-git's streaming `BlobHasher`
+# computes git blob ids without a repository (sha1 over "blob <len>\0" + content). Already
+# locked through axum / tungstenite / zbus, so the direct edge adds no package.
+sha1 = "=0.10.6"
 # AES-256-GCM AEAD (confidentiality + authenticity for stored secrets).
 aes-gcm = "=0.10.3"
 # rsa — RS256 verification of the Sign in with ChatGPT ID token against the issuer's published

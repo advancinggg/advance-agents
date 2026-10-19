@@ -681,6 +681,16 @@ fn ag07_create_validation_rejects_bad_input_before_provider() {
     let ir = ClientErrorCode::InvalidRequest;
     expect(&|b| b["agent_id"] = json!(""), ir.clone(), "empty id");
     expect(
+        &|b| b["agent_id"] = json!("user"),
+        ir.clone(),
+        "reserved user id",
+    );
+    expect(
+        &|b| b["agent_id"] = json!("User"),
+        ir.clone(),
+        "reserved User id",
+    );
+    expect(
         &|b| b["agent_id"] = json!("bad id"),
         ir.clone(),
         "space in id",
@@ -829,6 +839,25 @@ fn ag07_create_validation_rejects_bad_input_before_provider() {
     // Validation failures release the reservation: the same key is usable afterwards.
     let env = api.handle(post(routes::PATH_AGENTS, create_body(), "k-bad-1"));
     assert!(env.is_ok(), "{:?}", env.error);
+}
+
+#[test]
+fn reserved_agent_id_on_explicit_user() {
+    let provider = MemoryAgentAdmin::new();
+    let (api, _) = api_with(provider.clone());
+    operator(&api);
+    for (id, key) in [("user", "k-user"), ("User", "k-User")] {
+        let mut body = create_body();
+        body["agent_id"] = json!(id);
+        let env = api.handle(post(routes::PATH_AGENTS, body, key));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{id}");
+        assert_eq!(
+            env.error.as_ref().unwrap().details,
+            vec!["reserved_agent_id".to_string()],
+            "{id}"
+        );
+    }
+    assert_eq!(provider.calls.create.load(Ordering::SeqCst), 0);
 }
 
 // ── AG-08: provider-side outcomes project to stable codes with fixed messages ─────────────────

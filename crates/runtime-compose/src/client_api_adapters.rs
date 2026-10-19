@@ -11,10 +11,10 @@ use advance_client_api::{
     AgentAdminProvider, BoundGrantApprovalPort, BoundHistoryPage, BoundHistoryReadPort,
     ClientAgentTreeNode, ClientApi, ClientCursorCodec, ClientEventProvider, ClientMcpEntry,
     ClientMessageAck, ClientMessageStatus, ClientRunMutation, ClientRunSummary, ClientSkillEntry,
-    ClientToolEntry, ClientToolInventory, CostProvider, EntityProvider, GitHistoryProvider,
-    LlmDeltaHub, MessagingProvider, NormalizedEventFilter, PackAdminProvider, PendingGrantListPort,
-    ProviderAdminProvider, ProviderError, RawEventRow, RunControlProvider, SecretsAdminProvider,
-    ToolsProvider, UnboundHistoryEntry, UnboundHistoryReadPort,
+    ClientToolEntry, ClientToolInventory, CostProvider, EntityProvider, FilesProvider,
+    GitHistoryProvider, LlmDeltaHub, MessagingProvider, NormalizedEventFilter, PackAdminProvider,
+    PendingGrantListPort, ProviderAdminProvider, ProviderError, RawEventRow, RunControlProvider,
+    SecretsAdminProvider, ToolsProvider, UnboundHistoryEntry, UnboundHistoryReadPort,
 };
 use advance_event_bus::{EventFilter, ObservabilityReadApi, ReadApiError, ReadCursor, ReadEvent};
 use advance_messaging::{MailboxStore, Message, MessageKind, MsgError};
@@ -818,6 +818,8 @@ pub struct FirstPartyClientCompose {
     pub entities: Option<Arc<dyn EntityProvider>>,
     /// CONTRACT-190 git family (workspace history) over `advance_git::GitHistoryReader`.
     pub git: Option<Arc<dyn GitHistoryProvider>>,
+    /// CONTRACT-246 files family over `OperatorFiles`.
+    pub files: Option<Arc<dyn FilesProvider>>,
     /// MODULE-020-AC-18: history of a home without CONTRACT-219.
     pub unbound_history: Option<Arc<dyn UnboundHistoryReadPort>>,
     /// MODULE-020-AC-18: the list-only pending-grant port of a home without a grant intake.
@@ -887,6 +889,9 @@ pub fn compose_first_party_client(mut api: ClientApi, parts: FirstPartyClientCom
     }
     if let Some(git) = parts.git {
         api = api.with_git_provider(git);
+    }
+    if let Some(files) = parts.files {
+        api = api.with_files_provider(files);
     }
     api
 }

@@ -117,6 +117,9 @@ fn module_001_ac30_all_capabilities_git_wiring_graph_is_freed_after_unbind() {
         let census = Census(vec![
             track("event_bus", Arc::downgrade(&handles.event_bus)),
             some("git_queue", &handles.git_queue),
+            some("git_queue_owner", &handles.git_queue_owner),
+            some("files_core", &handles.files_core),
+            some("meta_maintainer", &handles.meta_maintainer),
             manager,
             track("run_manager", Arc::downgrade(&handles.run_manager)),
             track("grant_store", Arc::downgrade(&handles.cap_grant.store)),

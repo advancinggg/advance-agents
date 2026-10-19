@@ -220,31 +220,31 @@ pub const BASELINE_GOLDEN_SHA256: &[(&str, &str)] = &[
     ),
     (
         "route_probe.h1_fs_llm.golden",
-        "e588763d8f1b2d291571db5d14a846b8a3479e0dc5d0b8544cd3240573a21d89",
+        "c563c9c1eb09c9472c48cfebc89b0db0dd36883adfc1a595c03ef93e2363693b",
     ),
     (
         "route_probe.h2_all_capabilities.golden",
-        "29a743c8e0e3cc36c8cc77b774839493ed5a116838f146b06da603bc7cfd48d9",
+        "f2690c0d6a17f68d988fab14181f219a4ccb33bf7a6970ccd12defed9d3fdc8b",
     ),
     (
         "route_probe.h3_fs_llm_lifecycle.golden",
-        "6b0285a45763143fc9eb76e3040a95ab376b8fd7a61c9c81f8cc77360ab95a31",
+        "47b6db990c57f78bf9956d416776634afa3dbf3688c52e4e47a9db00414b278d",
     ),
     (
         "route_probe.h4_fs_llm_grant.golden",
-        "38a0efbaae42e10f3f9b6ea19d9f637f4389f92e99234e825eae9fad56015eee",
+        "eb970a90c87624c161a5724c8dc891413852872469b6ac62a3594e11dc573f89",
     ),
     (
         "route_probe.h5_fs_llm_tools_no_driver.golden",
-        "8a4433bc6792c2c20f48074f92d7c122854c9b8e2458c7078d7a691114cd4ab6",
+        "60129d134a158f9bfb7b0ee8bf192acebc403d0c8fc4daa924c3863de8f1e81a",
     ),
     (
         "route_table.h1_fs_llm.golden",
-        "b96f039c5d5bc98be52d73f5bf79fca73e11866ba58d9c86c31ee136d627c936",
+        "748a8041c4edfeba85a2a04a46984d0941d58e609c4e6f2e99c0978b4f952c35",
     ),
     (
         "route_table.h2_all_capabilities.golden",
-        "c8bf42fa6a68c7ba69301a314e2c3aeb0ac40c4fec4f836aae1b988ff1bf84c3",
+        "6391096313e259a0136751195f6cb96b7b61dfbdfa6ca2a0e7a48f8fa5bd3ea6",
     ),
     (
         "runtime_files.h1_fs_llm.golden",
@@ -377,6 +377,10 @@ pub const H5: HomeSpec = HomeSpec {
 
 /// `memory` on a home that is not a git repository (the memory git half is not wired and
 /// `advance start` says so on stderr). Start-run goldens only.
+///
+/// Document, do not rename: every initialized home has had a repo since `32cff619`, so the
+/// `h6_fs_llm_memory_no_git` label is historical. Start goldens and `BASELINE_GOLDEN_SHA256`
+/// keys stay under this name.
 pub const H6: HomeSpec = HomeSpec {
     label: "h6_fs_llm_memory_no_git",
     name: "H6",

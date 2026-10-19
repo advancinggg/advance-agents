@@ -75,8 +75,8 @@ pub const LISTENER_CHALLENGE_HEADER: &str = "x-advance-listener-challenge";
 pub const LISTENER_PROOF_HEADER: &str = "x-advance-listener-proof";
 
 #[derive(Clone)]
-struct TransportState {
-    api: Arc<ClientApi>,
+pub(crate) struct TransportState {
+    pub(crate) api: Arc<ClientApi>,
     max_body_bytes: usize,
     /// Bounds concurrent blocking-pool dispatches (HTTP requests + WS seeds) so a caller cannot
     /// pin the pool / grow an unbounded queue; excess fails closed with `module_unavailable`.
@@ -86,6 +86,8 @@ struct TransportState {
     /// The listener's re-verification key: only a router a [`ClientApiServer`] serves under
     /// [`SessionAdmission::InProcessOnly`] has one (and answers [`LISTENER_CHALLENGE_HEADER`]).
     listener_key: Option<Arc<ListenerKey>>,
+    /// Listener bind address when known (Host allowlist for the raw route).
+    pub(crate) local_addr: Option<SocketAddr>,
 }
 
 /// Cancellation and tracking of a router's upgraded WebSocket tasks: every `on_upgrade` task
@@ -119,7 +121,7 @@ fn dispatch_permits(api: &ClientApi) -> u32 {
 /// ConnectInfo is required so the core can enforce loopback admission from the real peer address.
 pub fn client_api_router(api: Arc<ClientApi>) -> Router {
     let dispatch = Arc::new(Semaphore::new(dispatch_permits(&api) as usize));
-    router_with(api, WsTracking::new(), dispatch, None)
+    router_with(api, WsTracking::new(), dispatch, None, None)
 }
 
 fn router_with(
@@ -127,6 +129,7 @@ fn router_with(
     ws: WsTracking,
     dispatch: Arc<Semaphore>,
     listener_key: Option<Arc<ListenerKey>>,
+    local_addr: Option<SocketAddr>,
 ) -> Router {
     let console = api.config().serves_web_console();
     let max_body_bytes = api.config().max_body_bytes;
@@ -136,6 +139,7 @@ fn router_with(
         dispatch,
         ws,
         listener_key,
+        local_addr,
     };
     let mut router = Router::new();
     if console {
@@ -148,6 +152,12 @@ fn router_with(
     router
         .route(routes::PATH_EVENTS_STREAM, get(event_stream_transport))
         .route(routes::PATH_LLM_DELTAS_STREAM, get(delta_stream_transport))
+        .route(
+            routes::TPL_FILES_RAW,
+            get(crate::files_raw::raw_get)
+                .head(crate::files_raw::raw_head)
+                .put(crate::files_raw::raw_put),
+        )
         .route(
             "/client/{*path}",
             get(http_client_request).post(http_client_request),
@@ -259,6 +269,7 @@ impl ClientApiServer {
             ws.clone(),
             Arc::clone(&dispatch),
             listener_key.clone(),
+            Some(local_addr),
         );
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -1751,7 +1762,7 @@ async fn send_envelope(socket: &mut WebSocket, envelope: &ClientEnvelope<Value>)
         .map_err(|_| ())
 }
 
-fn envelope_response(envelope: ClientEnvelope<Value>) -> Response {
+pub(crate) fn envelope_response(envelope: ClientEnvelope<Value>) -> Response {
     let status = envelope
         .error
         .as_ref()

@@ -186,6 +186,10 @@ fn extract_leaf(leaf: &LeafSpec, raw: &Value, detector: &dyn LeakDetector) -> Le
             Some(s) => scan_string_leaf(s, detector),
             _ => LeafExtract::Omit,
         },
+        LeafKind::PathScanned => match raw.as_str() {
+            Some(s) => scan_path_leaf(s, detector),
+            _ => LeafExtract::Omit,
+        },
     }
 }
 
@@ -196,6 +200,18 @@ fn scan_string_leaf(s: &str, detector: &dyn LeakDetector) -> LeafExtract {
             LeafExtract::Keep(ClientScalar::String(redacted), true)
         }
         ScanResult::Blocked { .. } | ScanResult::Warned { .. } => LeafExtract::RejectEvent,
+    }
+}
+
+fn scan_path_leaf(s: &str, detector: &dyn LeakDetector) -> LeafExtract {
+    match detector.scan(s, ScanContext::LogOutput) {
+        ScanResult::Clean | ScanResult::Warned { .. } => {
+            LeafExtract::Keep(ClientScalar::String(s.to_string()), false)
+        }
+        ScanResult::Redacted { redacted, .. } => {
+            LeafExtract::Keep(ClientScalar::String(redacted), true)
+        }
+        ScanResult::Blocked { .. } => LeafExtract::RejectEvent,
     }
 }
 
@@ -329,7 +345,7 @@ fn valid_entity_ref(s: &str) -> bool {
     })
 }
 
-// ── Exact 36-row table ────────────────────────────────────────────────────────────────────
+// ── Exact 37-row table ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
 struct LeafSpec {
@@ -348,6 +364,7 @@ enum LeafKind {
     SessionId,
     EntityRef,
     StringScanned,
+    PathScanned,
 }
 
 struct EventSpec {
@@ -382,7 +399,24 @@ const AUTO_HALTED: &[&str] = &[
     "safety-valve: max_cost_usd",
     "safety-valve: max_wall_time",
 ];
-const GIT_COMMIT_TYPE: &[&str] = &["turn", "micro", "l6"];
+const GIT_COMMIT_TYPE: &[&str] = &["turn", "micro", "l6", "user"];
+const GIT_COMMIT_OP: &[&str] = &[
+    "edit",
+    "create",
+    "create-folder",
+    "rename",
+    "move",
+    "copy",
+    "delete",
+    "restore",
+    "upload",
+    "save-version",
+    "edit-external",
+    "adopt",
+];
+const FILES_KIND: &[&str] = &["file", "dir"];
+const FILES_CHANGE: &[&str] = &["added", "modified", "deleted", "renamed"];
+const VERSIONED_YN: &[&str] = &["yes", "no"];
 const GIT_ROLLBACK_TARGET_KIND: &[&str] = &["version", "checkpoint"];
 const GENUI_CODES: &[&str] = &[
     "denied",
@@ -410,7 +444,7 @@ pub fn leaf_names(event_type: &str) -> Option<Vec<&'static str>> {
     table_spec(event_type).map(|s| s.leaves.iter().map(|l| l.name).collect())
 }
 
-/// Exact 36 accepted literals (for tests).
+/// Exact 37 accepted literals (for tests).
 pub fn accepted_event_literals() -> &'static [&'static str] {
     &[
         "run.created",
@@ -447,6 +481,7 @@ pub fn accepted_event_literals() -> &'static [&'static str] {
         "genui.action_dispatched",
         "genui.degraded",
         "data.entity_changed",
+        "files.changed",
         "git.commit",
         "git.rollback",
     ]
@@ -972,6 +1007,78 @@ static TABLE: &[EventSpec] = &[
         ],
     },
     EventSpec {
+        literal: "files.changed",
+        priority: ClientEventPriority::Normal,
+        leaves: &[
+            LeafSpec {
+                name: "path",
+                kind: LeafKind::PathScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "kind",
+                kind: LeafKind::Enum(FILES_KIND),
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "change",
+                kind: LeafKind::Enum(FILES_CHANGE),
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "from_path",
+                kind: LeafKind::PathScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "blob_oid",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "versioned",
+                kind: LeafKind::Enum(VERSIONED_YN),
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "sha",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "commit_type",
+                kind: LeafKind::Enum(GIT_COMMIT_TYPE),
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "initiator",
+                kind: LeafKind::StringScanned,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "seq",
+                kind: LeafKind::U32,
+                min_u32: None,
+                max_u32: None,
+            },
+            LeafSpec {
+                name: "total",
+                kind: LeafKind::U32,
+                min_u32: None,
+                max_u32: None,
+            },
+        ],
+    },
+    EventSpec {
         literal: "git.commit",
         priority: ClientEventPriority::Normal,
         leaves: &[
@@ -1005,6 +1112,12 @@ static TABLE: &[EventSpec] = &[
                 min_u32: None,
                 max_u32: None,
             },
+            LeafSpec {
+                name: "op",
+                kind: LeafKind::Enum(GIT_COMMIT_OP),
+                min_u32: None,
+                max_u32: None,
+            },
         ],
     },
     EventSpec {
@@ -1032,3 +1145,170 @@ static TABLE: &[EventSpec] = &[
         ],
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::ClientScalar;
+    use advance_shared_types::security_validator::{LeakDetector, ScanContext, ScanResult};
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    struct Scripted {
+        warn: &'static str,
+        block: &'static str,
+    }
+
+    impl LeakDetector for Scripted {
+        fn scan(&self, text: &str, _context: ScanContext) -> ScanResult {
+            if text.contains(self.block) {
+                return ScanResult::Blocked { findings: vec![] };
+            }
+            if text.contains(self.warn) {
+                return ScanResult::Warned { findings: vec![] };
+            }
+            ScanResult::Clean
+        }
+
+        fn scan_headers(&self, _headers: &[(String, String)]) -> ScanResult {
+            ScanResult::Clean
+        }
+    }
+
+    fn ts() -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000, 0).unwrap()
+    }
+
+    fn project(event: &str, payload: Value, detector: &Scripted) -> ProjectOutcome {
+        project_raw(
+            event,
+            &ts(),
+            "root",
+            None,
+            "00000000-0000-4000-8000-000000000001",
+            &payload,
+            detector,
+        )
+    }
+
+    #[test]
+    fn files_changed_projects_scalar_leaves() {
+        let detector = Scripted {
+            warn: "WARN_PATH",
+            block: "BLOCK_PATH",
+        };
+        let outcome = project(
+            "files.changed",
+            json!({
+                "path": "notes/a.md",
+                "kind": "file",
+                "change": "modified",
+                "from_path": "notes/old.md",
+                "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "versioned": "yes",
+                "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "commit_type": "user",
+                "initiator": "operator",
+                "seq": 1,
+                "total": 3
+            }),
+            &detector,
+        );
+        let ProjectOutcome::Deliver { data, .. } = outcome else {
+            panic!("expected deliver, got {outcome:?}");
+        };
+        assert_eq!(
+            data.get("path"),
+            Some(&ClientScalar::String("notes/a.md".into()))
+        );
+        assert_eq!(data.get("kind"), Some(&ClientScalar::String("file".into())));
+        assert_eq!(
+            data.get("change"),
+            Some(&ClientScalar::String("modified".into()))
+        );
+        assert_eq!(
+            data.get("versioned"),
+            Some(&ClientScalar::String("yes".into()))
+        );
+        assert_eq!(
+            data.get("commit_type"),
+            Some(&ClientScalar::String("user".into()))
+        );
+        assert_eq!(data.get("seq"), Some(&ClientScalar::Unsigned(1)));
+        assert_eq!(data.get("total"), Some(&ClientScalar::Unsigned(3)));
+    }
+
+    #[test]
+    fn git_commit_user_type_and_op_kept() {
+        let detector = Scripted {
+            warn: "WARN_PATH",
+            block: "BLOCK_PATH",
+        };
+        let outcome = project(
+            "git.commit",
+            json!({
+                "agent_id": "root",
+                "commit_type": "user",
+                "initiator": "operator",
+                "sha": "cccccccccccccccccccccccccccccccccccccccc",
+                "affected_paths_count": 2,
+                "op": "edit"
+            }),
+            &detector,
+        );
+        let ProjectOutcome::Deliver { data, .. } = outcome else {
+            panic!("expected deliver, got {outcome:?}");
+        };
+        assert_eq!(
+            data.get("commit_type"),
+            Some(&ClientScalar::String("user".into()))
+        );
+        assert_eq!(data.get("op"), Some(&ClientScalar::String("edit".into())));
+        assert_eq!(
+            data.get("affected_paths_count"),
+            Some(&ClientScalar::Unsigned(2))
+        );
+    }
+
+    #[test]
+    fn path_scanned_keeps_warned_long_path_rejects_key() {
+        let detector = Scripted {
+            warn: "WARN_PATH",
+            block: "sk-secret",
+        };
+        let kept = project(
+            "files.changed",
+            json!({
+                "path": "notes/WARN_PATH/very/long/name.md",
+                "kind": "file",
+                "change": "added",
+                "versioned": "no"
+            }),
+            &detector,
+        );
+        let ProjectOutcome::Deliver { data, .. } = kept else {
+            panic!("warned path must be kept, got {kept:?}");
+        };
+        assert_eq!(
+            data.get("path"),
+            Some(&ClientScalar::String(
+                "notes/WARN_PATH/very/long/name.md".into()
+            ))
+        );
+
+        let rejected = project(
+            "files.changed",
+            json!({
+                "path": "notes/sk-secret.md",
+                "kind": "file",
+                "change": "added",
+                "versioned": "no"
+            }),
+            &detector,
+        );
+        assert!(
+            matches!(rejected, ProjectOutcome::Reject),
+            "blocked path key must reject, got {rejected:?}"
+        );
+    }
+}

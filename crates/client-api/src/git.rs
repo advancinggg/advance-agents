@@ -46,7 +46,7 @@ pub const MAX_CHECKPOINT_LABEL_LEN: usize = 128;
 /// Bound on path-scoped checkpoint `paths` entries.
 pub const MAX_CHECKPOINT_PATHS: usize = 256;
 /// Bound on one workspace-relative path string.
-pub const MAX_GIT_PATH_LEN: usize = 512;
+pub const MAX_GIT_PATH_LEN: usize = 1024;
 
 // ── DTOs (CONTRACT-192 schema components) ────────────────────────────────────────────────────
 
@@ -76,6 +76,8 @@ pub struct ClientGitCheckpointEntry {
     /// `null` = full-directory; a list = path-scoped. Always `null` when `valid` is false.
     pub paths: Option<Vec<String>>,
     pub valid: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// One linear `main` commit, with the checkpoints that point at it inlined.
@@ -88,6 +90,35 @@ pub struct ClientGitCommitEntry {
     pub subject: String,
     pub affected_paths_count: u32,
     pub checkpoints: Vec<ClientGitCheckpointEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<ClientGitCommitLabel>,
+}
+
+/// Structured commit label shared with the files family (R5 `change?`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientGitCommitLabel {
+    pub op: String,
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines_added: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines_removed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versioned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// `added` | `modified` | `deleted` | `replaced`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<String>,
 }
 
 /// `GET /client/git/commits`.
@@ -112,6 +143,8 @@ pub struct ClientGitFileVersion {
     pub initiator: Option<String>,
     pub subject: String,
     pub deleted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<ClientGitCommitLabel>,
 }
 
 /// `GET /client/git/files/history`.
@@ -147,6 +180,8 @@ pub struct ClientGitRollbackResult {
     pub agent_id: String,
     pub label: String,
     pub restored_path_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
 }
 
 /// Query of `GET /client/git/commits` after handler-side validation.
@@ -247,8 +282,36 @@ pub fn validate_commit_query(body: &Value) -> Result<ValidatedGitCommitQuery, Cl
         filter: CommitFilter {
             agent_id,
             commit_type,
+            initiator: match obj.get("initiator") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => {
+                    validate_initiator(s)?;
+                    Some(s.clone())
+                }
+                Some(_) => return Err(invalid("invalid initiator")),
+            },
         },
     })
+}
+
+/// `^(agent|user|runtime):[A-Za-z0-9._:-]{1,256}$`
+fn validate_initiator(raw: &str) -> Result<(), ClientError> {
+    let (kind, rest) = raw
+        .split_once(':')
+        .ok_or_else(|| invalid("invalid initiator"))?;
+    if !matches!(kind, "agent" | "user" | "runtime") {
+        return Err(invalid("invalid initiator"));
+    }
+    if rest.is_empty() || rest.len() > 256 {
+        return Err(invalid("invalid initiator"));
+    }
+    if !rest
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(invalid("invalid initiator"));
+    }
+    Ok(())
 }
 
 fn query_string_field<'a>(
@@ -304,6 +367,30 @@ fn mark_provider_entry(ctx: &HandlerCtx) -> Result<(), ClientError> {
     }
 }
 
+fn refuse_reserved_namespace(id: &str) -> Result<(), ClientError> {
+    if id.eq_ignore_ascii_case("user") {
+        return Err(crate::files::detail::reserved_namespace());
+    }
+    Ok(())
+}
+
+fn client_label(label: &advance_git::CommitLabel) -> ClientGitCommitLabel {
+    ClientGitCommitLabel {
+        op: label.op.clone(),
+        paths: label.paths.clone(),
+        to: label.to.clone(),
+        count: label.count,
+        lines_added: label.lines_added,
+        lines_removed: label.lines_removed,
+        size_bytes: label.size_bytes,
+        versioned: label.versioned,
+        from_sha: label.from_sha.clone(),
+        checkpoint: label.checkpoint.clone(),
+        title: label.title.clone(),
+        change: label.change.clone(),
+    }
+}
+
 fn checkpoint_dto(r: CheckpointRecord) -> ClientGitCheckpointEntry {
     ClientGitCheckpointEntry {
         agent_id: r.agent_id,
@@ -312,6 +399,7 @@ fn checkpoint_dto(r: CheckpointRecord) -> ClientGitCheckpointEntry {
         tagged_at_ms: r.tagged_at_ms,
         paths: r.paths,
         valid: r.valid,
+        title: r.title,
     }
 }
 
@@ -395,6 +483,7 @@ impl crate::provider::GitHistoryProvider for GitHistoryReaderProvider {
                     subject: c.subject,
                     affected_paths_count: c.affected_paths_count,
                     checkpoints: checkpoints.into_iter().map(checkpoint_dto).collect(),
+                    label: c.label.as_ref().map(client_label),
                 }
             })
             .collect();
@@ -427,6 +516,7 @@ impl crate::provider::GitHistoryProvider for GitHistoryReaderProvider {
                     initiator: v.initiator,
                     subject: v.subject,
                     deleted: v.deleted,
+                    label: v.label.as_ref().map(client_label),
                 })
                 .collect(),
             truncated: history.truncated,
@@ -482,6 +572,7 @@ impl crate::provider::GitHistoryProvider for GitHistoryReaderProvider {
         &self,
         agent_id: &str,
         label: &str,
+        _principal: &crate::session::Principal,
     ) -> Result<ClientGitRollbackResult, ProviderError> {
         let rollback = DefaultWorkspaceRollback::new(self.reader.workspace().to_path_buf())
             .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
@@ -519,6 +610,7 @@ impl crate::provider::GitHistoryProvider for GitHistoryReaderProvider {
             agent_id: agent_id.to_string(),
             label: label.to_string(),
             restored_path_count: u32::try_from(paths.len()).unwrap_or(u32::MAX),
+            commit_sha: None,
         })
     }
 }
@@ -619,6 +711,7 @@ pub(crate) fn register(api: &mut ClientApi, slot: GitProviderSlot) {
         routes::PATH_GIT_CHECKPOINT_CREATE,
         HandlerSpec::mutation(true, move |ctx| {
             let req = parse_create_request(&ctx.body)?;
+            refuse_reserved_namespace(&req.agent_id)?;
             mark_provider_entry(ctx)?;
             let provider = provider_or_unavailable(&s)?;
             let created = provider
@@ -637,11 +730,15 @@ pub(crate) fn register(api: &mut ClientApi, slot: GitProviderSlot) {
             let agent_id = ctx.path_param("agent_id")?;
             let label = ctx.path_param("label")?;
             validate_agent_id(&agent_id)?;
+            refuse_reserved_namespace(&agent_id)?;
             validate_checkpoint_label(&label)?;
+            let principal = ctx.principal.clone().ok_or_else(|| {
+                ClientError::new(ClientErrorCode::Unauthenticated, "missing session")
+            })?;
             mark_provider_entry(ctx)?;
             let provider = provider_or_unavailable(&s)?;
             let result = provider
-                .rollback_to_checkpoint(&agent_id, &label)
+                .rollback_to_checkpoint(&agent_id, &label, &principal)
                 .map_err(ProviderError::into_client_error)?;
             Ok(serde_json::to_value(result).expect("ClientGitRollbackResult serializes"))
         })
@@ -673,6 +770,14 @@ mod tests {
         assert_eq!(q.filter.commit_type, Some(CommitType::Turn));
         assert_eq!(q.filter.agent_id.as_deref(), Some("alice"));
         assert!(validate_commit_query(&serde_json::json!({"commit_type": "fix"})).is_err());
+        let q = validate_commit_query(&serde_json::json!({"initiator": "user:advance"})).unwrap();
+        assert_eq!(q.filter.initiator.as_deref(), Some("user:advance"));
+        for bad in ["bad id", "x:", "other:alice", ""] {
+            assert!(
+                validate_commit_query(&serde_json::json!({"initiator": bad})).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

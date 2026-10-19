@@ -5,8 +5,9 @@
 //! "NOT in PRD §15.3" doc comments. Coverage tests T71/T72 lock the alignment.
 //!
 //! Canonical entries: 130 across 22 PRD-aligned sub-modules (31 distinct top-level
-//! prefixes). Enumerated extensions: 7 — 4 in `extensions::` plus the 3 MODULE-018
-//! `pack::` lifecycle events (Pack lane P1). `runtime.degraded.{reason}`
+//! prefixes). Enumerated extensions: 8 — 4 in `extensions::` plus the 3 MODULE-018
+//! `pack::` lifecycle events (Pack lane P1) plus `files::CHANGED` (ADR 2026-10-15).
+//! `runtime.degraded.{reason}`
 //! is documented as a dynamic prefix via `extensions::RUNTIME_DEGRADED_PREFIX` but is
 //! NOT a fixed-string entry in `ALL_EVENT_TYPES` — concrete strings are runtime-formed.
 //!
@@ -454,6 +455,16 @@ pub mod data {
     pub const ENTITY_CHANGED: &str = "data.entity_changed";
 }
 
+/// Vault files family (ADR 2026-10-15). In `ALL_EVENT_TYPES` and `KNOWN_EXTENSIONS`,
+/// deliberately ABSENT from `TRIGGER_BUS_WHITELIST` (PRD §15.4 stays at 12; `git.commit`
+/// remains the trigger source). Equals `advance_git::FILES_CHANGED_EVENT`.
+pub mod files {
+    /// One batch of listing-refresh rows from the commit worker (payload: `path`, `kind`,
+    /// `change`, `from_path`, `blob_oid`, `versioned`, `sha`, `commit_type`, `initiator`,
+    /// `seq`, `total`). MODULE-019 T71's canonical PRD list stays 130.
+    pub const CHANGED: &str = "files.changed";
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // 12-event Trigger Bus whitelist (MODULE-019 §1.3.2a / PRD §15.4).
 // Locked by `whitelist_has_12_entries` regression test.
@@ -651,6 +662,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     pack::REGISTRY_RELOADED,
     // Entity-data lane E1 (1)
     data::ENTITY_CHANGED,
+    // Vault files family (ADR 2026-10-15). Documented EXTENSION; never a trigger.
+    files::CHANGED,
     // NOTE: extensions::RUNTIME_DEGRADED_PREFIX is intentionally NOT enumerated —
     // concrete strings are dynamic (`runtime.degraded.{reason}`); T72 prefix-exempts.
 ];

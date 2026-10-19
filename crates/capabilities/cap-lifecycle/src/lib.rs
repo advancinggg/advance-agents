@@ -119,7 +119,10 @@ pub use decomposition::{
     MAX_TASK_ID_BYTES,
 };
 pub use error::{DecompositionError, LifecycleError, SpawnError};
-pub use identifier::{is_workspace_hidden_name, sub_uuid_v4, validate_agent_id, MAX_AGENT_ID_LEN};
+pub use identifier::{
+    is_workspace_hidden_name, sub_uuid_v4, validate_agent_id, validate_new_agent_id,
+    MAX_AGENT_ID_LEN, RESERVED_AGENT_IDS,
+};
 pub use sqlite_agent_stats_reader::SqliteAgentStatsReader;
 pub use stats::{AgentStats, AgentStatsReader, DefaultStatsController, StatsController};
 pub use terminate::{

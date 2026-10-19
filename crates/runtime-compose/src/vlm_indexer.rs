@@ -99,6 +99,15 @@ impl VlmDescriptionIndexer {
         self
     }
 
+    /// Share the composition-root `MetaMaintainer` (OSS-6). `None` keeps the
+    /// adapter-local maintainer [`Self::new`] created for tests.
+    pub fn with_meta(mut self, meta: Option<Arc<MetaMaintainer>>) -> Self {
+        if let Some(meta) = meta {
+            self.meta = meta;
+        }
+        self
+    }
+
     /// Reference to the adapter's `MetaMaintainer` (tests read back `.meta.yaml`).
     pub fn meta(&self) -> &Arc<MetaMaintainer> {
         &self.meta
@@ -110,7 +119,8 @@ impl VlmDescriptionIndexer {
     /// and does NOT call `ensure_dir_meta` (which re-acquires the same
     /// non-reentrant mutex → self-deadlock); `load` returns `Ok(None)` for an
     /// absent `.meta.yaml` and `add_entry_for_write(None, ..)` creates a fresh
-    /// `MetaFile`, so the missing-file case is handled.
+    /// `MetaFile`, so the missing-file case is handled. A load `Err` fails closed
+    /// (no rewrite from an empty file).
     async fn writeback_meta(&self, abs: &Path, bytes: &[u8], description: &str) {
         let (Some(parent), Some(file_name)) =
             (abs.parent(), abs.file_name().and_then(|n| n.to_str()))
@@ -118,7 +128,16 @@ impl VlmDescriptionIndexer {
             return;
         };
         let _guard = self.meta.acquire().await;
-        let meta_pre = self.meta.load(parent).await.ok().flatten();
+        let meta_pre = match self.meta.load(parent).await {
+            Ok(file) => file,
+            Err(e) => {
+                self.log.err(
+                    log_keys::VLM_META_LOAD_FAILED,
+                    format!("vlm-indexer: .meta.yaml load failed ({e:?})"),
+                );
+                return;
+            }
+        };
         let meta_file = match self.meta.add_entry_for_write(meta_pre, file_name, bytes) {
             Ok((mf, _)) => mf,
             Err(e) => {

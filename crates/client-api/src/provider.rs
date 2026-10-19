@@ -35,6 +35,13 @@ use crate::entities::{
 };
 use crate::envelope::{ClientError, ClientErrorCode};
 use crate::events::ClientEventProvider;
+use crate::files::{
+    ClientFileMutationResult, ClientFileSearchResult, ClientFileStat, ClientFileVersionResult,
+    ClientFileWriteResult, FileReadSource, FileReadVersion, FileUploadHandle, FileUploadSink,
+    FileWriteTarget, FilesActor, FilesCommitBatch, FilesCopyItem, FilesDelete, FilesExternalItem,
+    FilesFailure, FilesListPage, FilesListQuery, FilesMkdir, FilesMoveItem, FilesPath,
+    FilesReadQuery, FilesRestore, FilesSaveVersion, FilesSearchQuery, FilesStatQuery, WriteCheck,
+};
 use crate::git::{
     ClientGitCheckpointEntry, ClientGitCheckpointList, ClientGitCommitPage,
     ClientGitCreateCheckpointRequest, ClientGitFileAt, ClientGitFileHistory,
@@ -55,6 +62,7 @@ use crate::providers::grants::{BoundGrantApprovalPort, PendingGrantListPort};
 use crate::providers::history::{BoundHistoryReadPort, UnboundHistoryReadPort};
 use crate::runs::{ClientAgentTreeNode, ClientRunMutation, ClientRunSummary};
 use crate::secrets_admin::{ClientSecretsMode, ClientSetSecretsModeRequest};
+use crate::session::Principal;
 use crate::tools::ClientToolInventory;
 
 /// The `ClientError.details` token carried by an `invalid_request` whose cause is an agent
@@ -65,6 +73,11 @@ pub const UNKNOWN_PROVIDER_DETAIL: &str = "unknown_provider";
 /// that does not apply to the provider entry's credential source: a sign-in route on an
 /// API-key entry, or a key route on a `chatgpt-oauth` entry.
 pub const AUTH_SOURCE_MISMATCH_DETAIL: &str = "auth_source_mismatch";
+
+/// The `ClientError.details` token of an `invalid_state` whose cause is an operator
+/// restore plan over the compose cap (10 000 paths / 256 MiB). Inner string is the
+/// same token; adapters construct [`ProviderError::InvalidState`] with it.
+pub const TOO_MANY_ENTRIES_DETAIL: &str = "too_many_entries";
 
 /// The `ClientError.details` token of a `module_unavailable` whose cause is a child process the
 /// host's `ProcessPolicy::Forbid` refused (ADR 2026-10-03 D3).
@@ -112,6 +125,8 @@ pub enum ProviderError {
     /// `git` pack source). → `module_unavailable` with details `["process_forbidden"]`; the inner
     /// string is log-only.
     ProcessForbidden(String),
+    /// A typed files-family failure (CONTRACT-246 detail registry).
+    Files(FilesFailure),
 }
 
 impl ProviderError {
@@ -122,6 +137,9 @@ impl ProviderError {
     /// leak a raw provider reason string into `ClientError.message` even by mistake. Clients switch
     /// on the stable code, not the message (§2.12).
     pub fn into_client_error(self) -> ClientError {
+        if let ProviderError::Files(failure) = self {
+            return failure.into_client_error();
+        }
         if let ProviderError::PlatformUnsupported(_) = self {
             return ClientError::new(ClientErrorCode::InvalidRequest, "invalid request")
                 .with_details(vec!["platform_unsupported".to_string()]);
@@ -130,6 +148,13 @@ impl ProviderError {
             ProviderError::NotFound(_) => (ClientErrorCode::NotFound, "resource not found"),
             ProviderError::NotAuthorized(_) => {
                 (ClientErrorCode::ReplyNotAuthorized, "reply not authorized")
+            }
+            ProviderError::InvalidState(msg) if msg == TOO_MANY_ENTRIES_DETAIL => {
+                return ClientError::new(
+                    ClientErrorCode::InvalidState,
+                    "operation not valid for the resource's current state",
+                )
+                .with_details(vec![TOO_MANY_ENTRIES_DETAIL.to_string()]);
             }
             ProviderError::InvalidState(_) => (
                 ClientErrorCode::InvalidState,
@@ -150,6 +175,7 @@ impl ProviderError {
                 return ClientError::new(ClientErrorCode::InvalidRequest, "invalid request")
                     .with_details(vec![UNKNOWN_PROVIDER_DETAIL.to_string()]);
             }
+            ProviderError::Files(_) => unreachable!("Files is returned above"),
             ProviderError::AuthSourceMismatch(_) => {
                 return ClientError::new(
                     ClientErrorCode::InvalidState,
@@ -481,7 +507,87 @@ pub trait GitHistoryProvider: Send + Sync {
         &self,
         agent_id: &str,
         label: &str,
+        principal: &Principal,
     ) -> Result<ClientGitRollbackResult, ProviderError>;
+}
+
+/// Vault working-tree provider (CONTRACT-246) behind the `files` family. The production
+/// adapter is OSS-6 (`WiredFilesProvider`); a method body may answer `Unavailable` until then.
+pub trait FilesProvider: Send + Sync {
+    fn list(&self, q: &FilesListQuery) -> Result<FilesListPage, ProviderError>;
+    fn stat(&self, q: &FilesStatQuery) -> Result<ClientFileStat, ProviderError>;
+    fn search(&self, q: &FilesSearchQuery) -> Result<ClientFileSearchResult, ProviderError>;
+    fn prepare_read(&self, q: &FilesReadQuery) -> Result<FileReadVersion, ProviderError>;
+    fn open_read(
+        &self,
+        path: &FilesPath,
+        v: &FileReadVersion,
+    ) -> Result<FileReadSource, ProviderError>;
+    fn check_write(
+        &self,
+        actor: &FilesActor,
+        t: &FileWriteTarget,
+    ) -> Result<WriteCheck, ProviderError>;
+    fn begin_upload(
+        &self,
+        actor: &FilesActor,
+        t: &FileWriteTarget,
+    ) -> Result<FileUploadSink, ProviderError>;
+    fn finish_upload(
+        &self,
+        actor: &FilesActor,
+        t: &FileWriteTarget,
+        h: FileUploadHandle,
+    ) -> Result<ClientFileWriteResult, ProviderError>;
+    fn abort_upload(&self, h: FileUploadHandle);
+    fn mkdir(
+        &self,
+        actor: &FilesActor,
+        r: &FilesMkdir,
+    ) -> Result<ClientFileMutationResult, ProviderError>;
+    fn move_items(
+        &self,
+        actor: &FilesActor,
+        items: &[FilesMoveItem],
+    ) -> Result<ClientFileMutationResult, ProviderError>;
+    fn delete(
+        &self,
+        actor: &FilesActor,
+        r: &FilesDelete,
+    ) -> Result<ClientFileMutationResult, ProviderError>;
+    fn restore(
+        &self,
+        actor: &FilesActor,
+        r: &FilesRestore,
+    ) -> Result<ClientFileMutationResult, ProviderError>;
+    fn save_version(
+        &self,
+        actor: &FilesActor,
+        r: &FilesSaveVersion,
+    ) -> Result<ClientFileVersionResult, ProviderError>;
+    fn commit_external(
+        &self,
+        actor: &FilesActor,
+        items: &[FilesExternalItem],
+    ) -> Result<ClientFileMutationResult, ProviderError>;
+    /// R6: disk/operator body is OSS-5. Default answers unavailable so the route stays registered.
+    fn copy_items(
+        &self,
+        actor: &FilesActor,
+        items: &[FilesCopyItem],
+    ) -> Result<ClientFileMutationResult, ProviderError> {
+        let _ = (actor, items);
+        Err(ProviderError::Unavailable("copy".into()))
+    }
+    /// R2b: operator body is OSS-8. Default answers unavailable so the route stays registered.
+    fn commit_batch(
+        &self,
+        actor: &FilesActor,
+        r: &FilesCommitBatch,
+    ) -> Result<ClientFileMutationResult, ProviderError> {
+        let _ = (actor, r);
+        Err(ProviderError::Unavailable("commit-batch".into()))
+    }
 }
 
 pub trait SecretsAdminProvider: Send + Sync {
@@ -505,6 +611,7 @@ pub type EntityProviderSlot = ProviderSlot<dyn EntityProvider>;
 pub type ProviderAdminSlot = ProviderSlot<dyn ProviderAdminProvider>;
 pub type SecretsProviderSlot = ProviderSlot<dyn SecretsAdminProvider>;
 pub type GitProviderSlot = ProviderSlot<dyn GitHistoryProvider>;
+pub type FilesProviderSlot = ProviderSlot<dyn FilesProvider>;
 /// m020-s3: event provider / leak detector / cursor codec slots.
 pub type EventProviderSlot = ProviderSlot<dyn ClientEventProvider>;
 pub type LeakDetectorSlot = ProviderSlot<dyn LeakDetector>;
@@ -548,5 +655,16 @@ mod module_001_ac32_tests {
         assert_eq!(err.message, "provider unavailable");
         assert_eq!(err.details, [PROCESS_FORBIDDEN_DETAIL]);
         assert!(!err.message.contains(inner));
+    }
+
+    #[test]
+    fn too_many_entries_is_invalid_state_with_detail() {
+        let err = ProviderError::InvalidState(TOO_MANY_ENTRIES_DETAIL.into()).into_client_error();
+        assert_eq!(err.code, ClientErrorCode::InvalidState);
+        assert_eq!(
+            err.message,
+            "operation not valid for the resource's current state"
+        );
+        assert_eq!(err.details, [TOO_MANY_ENTRIES_DETAIL]);
     }
 }

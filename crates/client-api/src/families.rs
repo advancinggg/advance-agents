@@ -25,7 +25,7 @@ use crate::envelope::{ClientError, ClientErrorCode, ClientWarning};
 use crate::idempotency::IdempotencyStore;
 use crate::providers::grants::scan_client_text;
 use crate::request::Method;
-use crate::routes::{family_of, RouteTableEntry, TRANSPORT_STREAM_PATHS};
+use crate::routes::{family_of, RouteTableEntry, TRANSPORT_OWNED_ROUTES, TRANSPORT_STREAM_PATHS};
 use crate::session::Scope;
 
 /// `family_of` of a path with no first segment.
@@ -53,6 +53,7 @@ pub const RESERVED_FAMILY_FLOOR: &[&str] = &[
     "secrets",
     "schema",
     "entities",
+    "files",
 ];
 
 /// A mutation route must require at least one of these (the full operator set contains all four).
@@ -1004,9 +1005,14 @@ impl RouteBook {
         for p in TRANSPORT_STREAM_PATHS {
             reserved_labels.insert(family_of(p));
         }
+        for (_, path) in TRANSPORT_OWNED_ROUTES {
+            reserved_labels.insert(family_of(path));
+        }
         let reserved_paths = TRANSPORT_STREAM_PATHS
             .iter()
-            .map(|p| (*p).to_string())
+            .copied()
+            .chain(TRANSPORT_OWNED_ROUTES.iter().map(|(_, p)| *p))
+            .map(|p| p.to_string())
             .collect();
         Self {
             max_path_len: config.max_path_len,
@@ -1706,11 +1712,19 @@ mod tests {
         from_oss.dedup();
         let mut floor: Vec<&str> = RESERVED_FAMILY_FLOOR.to_vec();
         floor.sort();
-        assert_eq!(floor.len(), 19);
+        assert_eq!(floor.len(), 20);
         assert_eq!(
             floor,
             from_oss.iter().map(String::as_str).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn files_label_and_raw_template_are_reserved() {
+        assert!(RESERVED_FAMILY_FLOOR.contains(&"files"));
+        let (book, _, _) = book();
+        assert!(book.reserved_labels.contains("files"));
+        assert!(book.reserved_paths.contains(crate::routes::TPL_FILES_RAW));
     }
 
     #[test]
@@ -2041,6 +2055,7 @@ mod tests {
             ProviderError::NotFound("x".into()),
             ProviderError::NotAuthorized("x".into()),
             ProviderError::InvalidState("x".into()),
+            ProviderError::InvalidState(crate::provider::TOO_MANY_ENTRIES_DETAIL.into()),
             ProviderError::Forbidden("x".into()),
             ProviderError::TooLarge("x".into()),
             ProviderError::Unavailable("x".into()),

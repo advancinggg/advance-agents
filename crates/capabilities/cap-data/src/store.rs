@@ -620,6 +620,66 @@ impl DataStore {
         }
     }
 
+    /// C5: re-read under the per-path lock through `read` (never bytes captured
+    /// before the commit wait). Skips projected ids whose existing row belongs
+    /// to a different path. `event_agent` / `op` become the `data.entity_changed`
+    /// attribution (`user:<h>` / `user_write|user_delete`).
+    pub async fn sync_path_with<F>(
+        &self,
+        index_agent: &str,
+        path: &str,
+        event_agent: &str,
+        op: &str,
+        read: F,
+    ) where
+        F: Fn() -> Option<Vec<u8>>,
+    {
+        let path = advance_shared_types::workspace_path::to_nfc(path.trim_start_matches('/'));
+        let _guard = self.lock_for(&path);
+        let _guard = _guard.lock().await;
+        let bytes = read();
+        let rows = match &bytes {
+            Some(bytes) => match parse_frontmatter(bytes) {
+                Ok(Some((doc, _))) => {
+                    project_entities(&doc, &self.schema(), index_agent, &path, self.clock.now())
+                }
+                _ => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        let mut kept = Vec::new();
+        for row in rows {
+            match self.index.get(index_agent, &row.id).await {
+                Ok(Some(existing)) if existing.path != path => {
+                    if let Some(bus) = &self.events {
+                        bus.emit(Event::observability(
+                            "runtime.degraded.entity_duplicate_id",
+                            event_agent,
+                            json!({
+                                "path": path,
+                                "id": row.id.0,
+                                "existing_path": existing.path,
+                            }),
+                            None,
+                        ));
+                    }
+                }
+                _ => kept.push(row),
+            }
+        }
+        let ids: Vec<EntityId> = kept.iter().map(|r| r.id.clone()).collect();
+        let outcome = if kept.is_empty() && bytes.is_none() {
+            self.index.delete_path(index_agent, &path).await
+        } else if kept.is_empty() {
+            self.index.delete_path(index_agent, &path).await
+        } else {
+            self.index.replace_path(index_agent, &path, kept).await
+        };
+        if outcome.is_ok() {
+            self.emit(event_agent, &path, op, &ids, None);
+        }
+    }
+
     fn emit(&self, agent: &str, path: &str, op: &str, touched: &[EntityId], commit: Option<&str>) {
         let Some(bus) = &self.events else { return };
         let ids: Vec<&str> = touched.iter().map(|t| t.0.as_str()).collect();

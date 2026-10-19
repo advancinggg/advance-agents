@@ -30,6 +30,9 @@ walkdir = { workspace = true }
 # schema hash (`describe` / `GET /client/schema`).
 ulid = { workspace = true }
 sha2 = { workspace = true }
+rustix = { workspace = true }
+unicode-normalization = { workspace = true }
+git2 = { workspace = true }
 
 # Hotreload pre-build (2026-06-10) — `O_NOFOLLOW | O_NONBLOCK` constants for
 # MetaSchemaWatcher's hardened schema-file open (`OpenOptionsExt::custom_flags`
@@ -41,7 +44,6 @@ libc = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 rusqlite = { workspace = true }
-git2 = { workspace = true }
 
 [lints]
 workspace = true

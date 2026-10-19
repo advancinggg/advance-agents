@@ -43,7 +43,7 @@ fn module_001_ac30_perchild_unbind_breaks_registry_cycle() {
         let builder = RuntimeHostBuilder::new(&home.config_path(), &home.ws)
             .await
             .expect("RuntimeHostBuilder::new");
-        let (host, handles) = advance_cli::wiring::wire_capabilities_with_home_for_test(
+        let (host, mut handles) = advance_cli::wiring::wire_capabilities_with_home_for_test(
             builder,
             &home.ws,
             &home.home_dir(),
@@ -53,10 +53,19 @@ fn module_001_ac30_perchild_unbind_breaks_registry_cycle() {
         let manager = handles
             .perchild_manager
             .as_ref()
-            .expect("messaging + lifecycle: the per-child manager exists");
-        let weak_manager = Arc::downgrade(manager);
+            .expect("messaging + lifecycle: the per-child manager exists")
+            .clone();
+        let weak_manager = Arc::downgrade(&manager);
         let weak_bus = Arc::downgrade(&handles.event_bus);
         let held_bus = Arc::clone(&handles.event_bus);
+        // Every initialized home now has a repo; the commit worker holds the
+        // EventBus until close_and_join. Dropping the Arc alone does not join it.
+        if let Some(queue) = handles.git_queue.clone() {
+            queue.close_and_join().await;
+        }
+        if let Some(server) = handles.client_api_server.take() {
+            let _ = server.shutdown().await;
+        }
         manager.unbind();
         drop(handles);
         drop(host);

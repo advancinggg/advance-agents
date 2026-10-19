@@ -22,6 +22,9 @@ GET /client/costs/providers/{provider_id} -> 200 data {"by_agent":[],"provider_i
 GET /client/entities/{agent_id}/{entity_id} -> 400 error invalid_request "invalid entity id"
 GET /client/events -> 503 error module_unavailable "event provider not wired"
 GET /client/events/stream -> 503 error module_unavailable "event provider not wired"
+GET /client/files/entries -> 400 error invalid_request "invalid request" details=["invalid_path","reason:missing"]
+GET /client/files/search -> 400 error invalid_request "invalid request" details=["invalid_query"]
+GET /client/files/stat -> 400 error invalid_request "invalid request" details=["invalid_path","reason:missing"]
 GET /client/git/checkpoints -> 200 data {"items":[]}
 GET /client/git/commits -> 200 data {"items":[],"next_cursor":null}
 GET /client/git/files/content -> 400 error invalid_request "invalid path"
@@ -46,6 +49,8 @@ GET /client/tasks/{task_id}/history -> 503 error module_unavailable "provider no
 GET /client/tools -> 503 error module_unavailable "provider not wired"
 == POST reads
 POST /client/entities:query -> 400 error invalid_request "invalid entity request body"
+POST /client/files:read-ticket -> 400 error invalid_request "invalid files request body"
+POST /client/files:write-ticket -> 400 error invalid_request "invalid files request body"
 == POST mutations
 POST /client/agents -> 400 error invalid_request "invalid agent request body"
 POST /client/agents/{agent_id}:delete -> 404 error not_found "resource not found"
@@ -56,6 +61,14 @@ POST /client/entities/{entity_id}:demote -> 400 error invalid_request "invalid e
 POST /client/entities/{entity_id}:patch -> 400 error invalid_request "invalid entity id"
 POST /client/entities/{entity_id}:promote -> 400 error invalid_request "invalid entity id"
 POST /client/entities:create -> 400 error invalid_request "invalid entity request body"
+POST /client/files:commit-batch -> 400 error invalid_request "invalid files request body"
+POST /client/files:commit-external -> 400 error invalid_request "invalid files request body"
+POST /client/files:copy -> 400 error invalid_request "invalid files request body"
+POST /client/files:delete -> 400 error invalid_request "invalid files request body"
+POST /client/files:mkdir -> 400 error invalid_request "invalid files request body"
+POST /client/files:move -> 400 error invalid_request "invalid files request body"
+POST /client/files:restore -> 400 error invalid_request "invalid files request body"
+POST /client/files:save-version -> 400 error invalid_request "invalid files request body"
 POST /client/git/checkpoints/{agent_id}/{label}:rollback -> 404 error not_found "resource not found"
 POST /client/git/checkpoints:create -> 400 error invalid_request "invalid git request body"
 POST /client/grants/pending/{request_id}:approve -> 422 error projection_rejected "invalid grant approval body"
@@ -84,6 +97,8 @@ POST /client/secrets:set-mode -> 400 error invalid_request "invalid secrets requ
 == router (not in the route table)
 GET /client/golden-probe-unknown -> 404 error unknown_route "no route"
 POST /client/health -> 404 error unknown_route "no route"
+GET /client/files/raw/golden-probe-ticket -> 404 error not_found "file ticket not found" details=["ticket_invalid"]
+PUT /client/files/raw/golden-probe-ticket -> 404 error not_found "file ticket not found" details=["ticket_invalid"]
 GET /golden-probe-unknown (Client API address) -> 404 content-type=<none> body=""
 POST /msg (Client API address) -> 404 content-type=<none> body=""
 == Web Console assets

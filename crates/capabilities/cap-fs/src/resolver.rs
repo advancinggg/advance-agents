@@ -102,14 +102,16 @@ pub const MAX_PATH_DEPTH: usize = 32;
 ///     entries even though `fs.read(".git/HEAD")` rejects — fingerprinting
 ///     bypass.
 ///
-/// Also includes `.advance` so that `fs.list` of the workspace root never
-/// reveals the runtime control plane directory. The `.agent/_*` subset of
+/// Also includes `.advance` and `.runtime` (C7: journal / staging / trash live
+/// under `<home>/.runtime/files`) so that `fs.list` of the workspace root never
+/// reveals the runtime control plane. The `.agent/_*` subset of
 /// `HiddenScope::AgentDir` is genuinely deferred to slice B+ (needs agent-tree
 /// to know each agent's `.agent` dir).
 pub fn is_workspace_hidden_name(name: &str) -> bool {
     if name.eq_ignore_ascii_case(".git")
         || name.eq_ignore_ascii_case(".meta.yaml")
         || name.eq_ignore_ascii_case(".advance")
+        || name.eq_ignore_ascii_case(".runtime")
     {
         return true;
     }
@@ -604,4 +606,18 @@ fn symlink_walk(target_workspace: &Path, physical: &Path) -> Result<(), FsError>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_workspace_hidden_name;
+
+    #[test]
+    fn is_workspace_hidden_name_includes_runtime() {
+        assert!(is_workspace_hidden_name(".runtime"));
+        assert!(is_workspace_hidden_name(".RUNTIME"));
+        assert!(is_workspace_hidden_name(".Runtime"));
+        assert!(!is_workspace_hidden_name(".obsidian"));
+        assert!(!is_workspace_hidden_name("runtime"));
+    }
 }

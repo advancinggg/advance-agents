@@ -173,6 +173,57 @@ jobs:
         run: cargo test -p advance-reply-tracker --features test-helpers --locked
 
   # ---------------------------------------------------------------------------
+  # Operator file core on macOS (OSS-7). APFS on the runner disk is the gate.
+  # HFS+ / exFAT / FAT32 images are attached with hdiutil and recorded only.
+  # ---------------------------------------------------------------------------
+  operator-fs-macos:
+    name: operator-fs (macos-15 APFS gate)
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: operator-fs-macos
+      - name: APFS operator suite (gate)
+        run: |
+          set -euo pipefail
+          args=()
+          for f in crates/capabilities/cap-fs/tests/operator_*.rs; do
+            args+=(--test "$(basename "$f" .rs)")
+          done
+          cargo test -p cap-fs --locked "${args[@]}" -- --test-threads=1
+          cargo test -p advance-runtime-compose --test files_family_wiring --locked -- --test-threads=1
+      - name: HFS+/exFAT/FAT32 images (record-only)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d /tmp/operator-fs-images.XXXXXX)"
+          cleanup() {
+            hdiutil detach "$work/hfs" -quiet -force || true
+            hdiutil detach "$work/exfat" -quiet -force || true
+            hdiutil detach "$work/fat32" -quiet -force || true
+          }
+          trap cleanup EXIT
+          mkdir -p "$work/hfs" "$work/exfat" "$work/fat32"
+          hdiutil create -size 128m -fs HFS+ -volname vfHFS "$work/hfs.dmg"
+          hdiutil create -size 128m -fs ExFAT -volname vfExFAT "$work/exfat.dmg"
+          hdiutil create -size 128m -fs "MS-DOS FAT32" -volname VFFAT "$work/fat32.dmg"
+          hdiutil attach "$work/hfs.dmg" -mountpoint "$work/hfs" -nobrowse
+          hdiutil attach "$work/exfat.dmg" -mountpoint "$work/exfat" -nobrowse
+          hdiutil attach "$work/fat32.dmg" -mountpoint "$work/fat32" -nobrowse
+          export OPERATOR_FS_ROOTS="$work/hfs:$work/exfat:$work/fat32"
+          echo "OPERATOR_FS_ROOTS=$OPERATOR_FS_ROOTS"
+          diskutil info "$work/hfs" | tee "$work/hfs.info" || true
+          diskutil info "$work/exfat" | tee "$work/exfat.info" || true
+          diskutil info "$work/fat32" | tee "$work/fat32.info" || true
+          cargo test -p cap-fs --test operator_paths --test operator_symlinks --locked -- --test-threads=1
+
+  # ---------------------------------------------------------------------------
   # iOS bridge build — MODULE-001-T113 (8), ADR 2026-10-03 D3.
   # Builds the CONTRACT-210 bridge (rlib + cdylib + staticlib, so the iOS link step runs)
   # for aarch64-apple-ios. The bridge depends on advance-runtime-compose, so this

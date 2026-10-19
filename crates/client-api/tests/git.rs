@@ -61,6 +61,23 @@ fn ready_status() -> ClientGitStatus {
     }
 }
 
+fn sample_label() -> advance_client_api::ClientGitCommitLabel {
+    advance_client_api::ClientGitCommitLabel {
+        op: "edit".into(),
+        paths: vec!["a.md".into()],
+        to: None,
+        count: 1,
+        lines_added: Some(1),
+        lines_removed: Some(0),
+        size_bytes: Some(4),
+        versioned: Some(true),
+        from_sha: None,
+        checkpoint: None,
+        title: Some("wire title".into()),
+        change: Some("modified".into()),
+    }
+}
+
 fn commit_entry() -> ClientGitCommitEntry {
     ClientGitCommitEntry {
         sha: "a".repeat(40),
@@ -70,6 +87,20 @@ fn commit_entry() -> ClientGitCommitEntry {
         subject: "write a.md".into(),
         affected_paths_count: 1,
         checkpoints: vec![checkpoint("alice", "snap", true, None)],
+        label: Some(sample_label()),
+    }
+}
+
+fn user_commit_entry() -> ClientGitCommitEntry {
+    ClientGitCommitEntry {
+        sha: "b".repeat(40),
+        committed_at_ms: 1_700_000_000_100,
+        commit_type: Some("user".into()),
+        initiator: Some("user:advance".into()),
+        subject: "save a.md".into(),
+        affected_paths_count: 1,
+        checkpoints: vec![],
+        label: Some(sample_label()),
     }
 }
 
@@ -86,6 +117,7 @@ fn checkpoint(
         tagged_at_ms: 1_700_000_000_000,
         paths,
         valid,
+        title: Some("saved version".into()),
     }
 }
 
@@ -94,7 +126,7 @@ impl MemoryGit {
         Arc::new(Self {
             calls: Calls::default(),
             status: Mutex::new(ready_status()),
-            commits: Mutex::new(vec![commit_entry()]),
+            commits: Mutex::new(vec![commit_entry(), user_commit_entry()]),
             checkpoints: Mutex::new(vec![checkpoint("alice", "snap", true, None)]),
             file_history: Mutex::new(ClientGitFileHistory {
                 items: vec![ClientGitFileVersion {
@@ -104,6 +136,7 @@ impl MemoryGit {
                     initiator: Some("agent:alice".into()),
                     subject: "write a.md".into(),
                     deleted: false,
+                    label: None,
                 }],
                 truncated: false,
             }),
@@ -141,12 +174,16 @@ impl GitHistoryProvider for MemoryGit {
     }
     fn commits(
         &self,
-        _query: &ValidatedGitCommitQuery,
+        query: &ValidatedGitCommitQuery,
     ) -> Result<ClientGitCommitPage, ProviderError> {
         self.calls.commits.fetch_add(1, Ordering::SeqCst);
         self.gate()?;
+        let mut items = self.commits.lock().unwrap().clone();
+        if let Some(initiator) = &query.filter.initiator {
+            items.retain(|c| c.initiator.as_deref() == Some(initiator.as_str()));
+        }
         Ok(ClientGitCommitPage {
-            items: self.commits.lock().unwrap().clone(),
+            items,
             next_cursor: None,
         })
     }
@@ -193,6 +230,7 @@ impl GitHistoryProvider for MemoryGit {
         &self,
         agent_id: &str,
         label: &str,
+        _principal: &Principal,
     ) -> Result<ClientGitRollbackResult, ProviderError> {
         self.calls.rollback.fetch_add(1, Ordering::SeqCst);
         self.gate()?;
@@ -200,6 +238,7 @@ impl GitHistoryProvider for MemoryGit {
             agent_id: agent_id.into(),
             label: label.into(),
             restored_path_count: 1,
+            commit_sha: Some("b".repeat(40)),
         })
     }
 }
@@ -316,11 +355,15 @@ fn git_commits_ready_inlines_checkpoints() {
     let (api, _) = api_with(MemoryGit::ready());
     operator(&api);
     let page: ClientGitCommitPage = data(&api.handle(get(routes::PATH_GIT_COMMITS)));
-    assert_eq!(page.items.len(), 1);
-    assert_eq!(page.items[0].commit_type.as_deref(), Some("turn"));
-    assert_eq!(page.items[0].initiator.as_deref(), Some("agent:alice"));
-    assert_eq!(page.items[0].checkpoints.len(), 1);
-    assert_eq!(page.items[0].checkpoints[0].label, "snap");
+    assert_eq!(page.items.len(), 2);
+    let turn = page
+        .items
+        .iter()
+        .find(|c| c.initiator.as_deref() == Some("agent:alice"))
+        .expect("turn commit");
+    assert_eq!(turn.commit_type.as_deref(), Some("turn"));
+    assert_eq!(turn.checkpoints.len(), 1);
+    assert_eq!(turn.checkpoints[0].label, "snap");
     assert!(page.next_cursor.is_none());
 }
 
@@ -489,6 +532,95 @@ fn git_health_inlines_status_when_wired() {
     assert!(env.is_ok());
     let git = env.data.unwrap()["git"].clone();
     assert_eq!(git["repo"], "ready");
+}
+
+#[test]
+fn git_path_cap_raised_to_1024() {
+    let git = MemoryGit::ready();
+    let (api, _) = api_with(git.clone());
+    operator(&api);
+    let ok = vec!["n".repeat(204); 5].join("/");
+    assert_eq!(ok.len(), 1024);
+    let env = api.handle(get_query(
+        routes::PATH_GIT_FILE_HISTORY,
+        json!({ "path": ok }),
+    ));
+    assert!(env.is_ok(), "{:?}", env.error);
+    assert_eq!(git.calls.file_history.load(Ordering::SeqCst), 1);
+    let too_long = format!("{ok}x");
+    assert_eq!(too_long.len(), 1025);
+    let env = api.handle(get_query(
+        routes::PATH_GIT_FILE_HISTORY,
+        json!({ "path": too_long }),
+    ));
+    assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest));
+    assert_eq!(git.calls.file_history.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn git_reserved_namespace_is_invalid_request() {
+    let (api, _) = api_with(MemoryGit::ready());
+    operator(&api);
+    for id in ["user", "User"] {
+        let env = api.handle(post(
+            routes::PATH_GIT_CHECKPOINT_CREATE,
+            json!({"agent_id": id, "label": "snap"}),
+            &format!("create-{id}"),
+        ));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{id}");
+        assert_eq!(
+            env.error.as_ref().unwrap().details,
+            vec!["reserved_namespace".to_string()],
+            "{id}"
+        );
+        let env = api.handle(post(
+            &format!("/client/git/checkpoints/{id}/snap:rollback"),
+            json!({}),
+            &format!("rb-{id}"),
+        ));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{id}");
+        assert_eq!(
+            env.error.as_ref().unwrap().details,
+            vec!["reserved_namespace".to_string()],
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn git_commits_accept_initiator_and_user_type() {
+    let (api, _) = api_with(MemoryGit::ready());
+    operator(&api);
+    let env = api.handle(get_query(
+        routes::PATH_GIT_COMMITS,
+        json!({ "initiator": "user:advance", "commit_type": "user" }),
+    ));
+    assert!(env.is_ok(), "{:?}", env.error);
+    let items = env.data.as_ref().unwrap()["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["initiator"], "user:advance");
+    assert_eq!(items[0]["label"]["title"], "wire title");
+    assert_eq!(items[0]["label"]["change"], "modified");
+    let env = api.handle(ClientRequest::get(routes::PATH_GIT_CHECKPOINTS).with_session("tok"));
+    assert!(env.is_ok(), "{:?}", env.error);
+    assert_eq!(
+        env.data.as_ref().unwrap()["items"][0]["title"],
+        "saved version"
+    );
+    let env = api.handle(post(
+        "/client/git/checkpoints/alice/snap:rollback",
+        json!({}),
+        "rb-sha",
+    ));
+    assert!(env.is_ok(), "{:?}", env.error);
+    assert_eq!(env.data.as_ref().unwrap()["commit_sha"], "b".repeat(40));
+    for bad in ["bad id", "x:", "other:ok"] {
+        let env = api.handle(get_query(
+            routes::PATH_GIT_COMMITS,
+            json!({ "initiator": bad }),
+        ));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{bad}");
+    }
 }
 
 #[test]

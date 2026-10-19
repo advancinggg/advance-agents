@@ -2425,6 +2425,8 @@ fn probe_home(spec: &HomeSpec) -> String {
     for (method, path) in [
         ("GET", "/client/golden-probe-unknown"),
         ("POST", "/client/health"),
+        ("GET", "/client/files/raw/golden-probe-ticket"),
+        ("PUT", "/client/files/raw/golden-probe-ticket"),
     ] {
         let key = format!("{method} {path}");
         let response = p.call(method, path, false);

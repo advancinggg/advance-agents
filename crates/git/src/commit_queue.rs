@@ -3,29 +3,27 @@
 //! Signature byte-matches MODULE-003 §1.4.1 line 110 and §2.3 line 509:
 //! `submit(&self, CommitRequest) -> oneshot::Receiver<Result<Oid, GitError>>`.
 
+use crate::autoignore;
 use crate::config::{GitConfigProvider, StaticGitConfigProvider};
-use crate::error::GitError;
-use crate::repo::open_repo_internal;
-use advance_shared_types::event::Event;
+use crate::emit::{self, EmitPlan};
+use crate::error::{GitError, UserOpRefusal};
+use crate::git_log::{self, GitLog, GitLogLevel};
+use crate::journal;
+use crate::lane::{effective_max_tracked, LaneCtx, LaneOverrides};
+use crate::repo::{ensure_lane_policy_on, open_repo_internal, Precompose};
+use crate::user_lane::{
+    agent_authorship, signature_time_now, PrepareOutcome, PrepareRequest, RestoreOutcome,
+    RestoreTreeRequest, SaveVersionOutcome, SaveVersionRequest, UserCommitLane, UserCommitOutcome,
+    UserCommitRequest,
+};
 use advance_shared_types::traits::EventBusEmit;
-use git2::{Oid, Repository, Signature};
+use git2::{Oid, Repository};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-
-/// Bucket caps for the `git.commit` event's `affected_paths` payload field
-/// (MODULE-003-AC-25, lifecycle-harvest 2026-06-12). Mirrors the cap-fs
-/// schema-event bucket discipline: a bounded name list + full-count fields,
-/// keeping the serialized payload well under MODULE-019's 64 KiB event cap
-/// (64 × 256 B = 16 KiB worst-case for the path bucket). Truncation is
-/// silent in the list; `affected_paths_count` / `files_changed` always carry
-/// the full staged-path count.
-const GIT_COMMIT_EVENT_MAX_PATHS: usize = 64;
-const GIT_COMMIT_EVENT_MAX_PATH_BYTES: usize = 256;
 
 /// Process-wide set of canonical repo paths that currently have an active
 /// `DefaultGitCommitQueue`. Protects against the adversarial scenario where
@@ -61,6 +59,11 @@ pub enum CommitType {
     Turn,
     Micro,
     L6,
+    /// A commit the operator made through the user commit lane (ADR 2026-10-15,
+    /// CONTRACT-247): runtime-rendered label, exact content, user author. Only the
+    /// lane writes it; the legacy [`GitCommitQueue::submit`] refuses it with
+    /// `GitError::InvalidUserOp { reason: UserOpRefusal::OpShape, .. }`.
+    User,
 }
 
 impl CommitType {
@@ -71,6 +74,7 @@ impl CommitType {
             Self::Turn => "turn",
             Self::Micro => "micro",
             Self::L6 => "l6",
+            Self::User => "user",
         }
     }
 
@@ -82,6 +86,7 @@ impl CommitType {
             "turn" => Some(Self::Turn),
             "micro" => Some(Self::Micro),
             "l6" => Some(Self::L6),
+            "user" => Some(Self::User),
             _ => None,
         }
     }
@@ -137,6 +142,66 @@ impl CommitRequest {
     }
 }
 
+/// One item of the worker's single FIFO (ADR 2026-10-15, CONTRACT-247): a legacy
+/// CONTRACT-020 commit or a user-lane request, each carrying its reply. Both lanes share the
+/// order, the worker and the coord mutex.
+pub(crate) enum QueueItem {
+    Commit(CommitRequest),
+    Prepare(
+        PrepareRequest,
+        oneshot::Sender<Result<PrepareOutcome, GitError>>,
+    ),
+    User(
+        UserCommitRequest,
+        oneshot::Sender<Result<UserCommitOutcome, GitError>>,
+    ),
+    SaveVersion(
+        SaveVersionRequest,
+        oneshot::Sender<Result<SaveVersionOutcome, GitError>>,
+    ),
+    Restore(
+        RestoreTreeRequest,
+        oneshot::Sender<Result<RestoreOutcome, GitError>>,
+    ),
+}
+
+impl QueueItem {
+    /// Answer the item with `error` instead of running it.
+    fn refuse(self, error: GitError) {
+        match self {
+            QueueItem::Commit(mut req) => {
+                if let Some(reply) = req.reply.take() {
+                    let _ = reply.send(Err(error));
+                }
+            }
+            QueueItem::Prepare(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            QueueItem::User(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            QueueItem::SaveVersion(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            QueueItem::Restore(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+
+    /// A `prepare`, `save_version` or `restore_tree` whose caller stopped waiting before the
+    /// worker reached it (R1): skipped with no effects. A `commit_user` item is never skipped:
+    /// its disk change already happened.
+    fn abandoned(&self) -> bool {
+        match self {
+            QueueItem::Prepare(_, reply) => reply.is_closed(),
+            QueueItem::SaveVersion(_, reply) => reply.is_closed(),
+            QueueItem::Restore(_, reply) => reply.is_closed(),
+            QueueItem::Commit(_) | QueueItem::User(_, _) => false,
+        }
+    }
+}
+
 /// CONTRACT-020 — single method returning the oneshot Receiver matched with the
 /// in-request Sender allocated by the impl.
 ///
@@ -154,7 +219,7 @@ pub trait GitCommitQueue: Send + Sync {
 /// relying on the drop.
 pub struct DefaultGitCommitQueue {
     /// `None` once [`DefaultGitCommitQueue::close_and_join`] closed the channel.
-    tx: Mutex<Option<mpsc::UnboundedSender<CommitRequest>>>,
+    tx: Mutex<Option<mpsc::UnboundedSender<QueueItem>>>,
     /// Awaited in place by [`DefaultGitCommitQueue::close_and_join`] and cleared only
     /// once it has resolved; the async lock makes a concurrent second call wait for
     /// the first call's join.
@@ -164,6 +229,10 @@ pub struct DefaultGitCommitQueue {
     released: AtomicBool,
     registered_path: PathBuf,
     _config: Arc<dyn GitConfigProvider>,
+    /// The user lane's bounds and test seams the worker reads per item; only the
+    /// test-support `set_lane_test_hooks` writes them (production keeps the defaults).
+    #[cfg(feature = "test-support")]
+    lane_overrides: Arc<Mutex<LaneOverrides>>,
 }
 
 impl DefaultGitCommitQueue {
@@ -184,6 +253,7 @@ impl DefaultGitCommitQueue {
         Self::spawn_inner(
             repo_path,
             Arc::new(StaticGitConfigProvider::defaults()),
+            None,
             None,
         )
     }
@@ -208,6 +278,7 @@ impl DefaultGitCommitQueue {
             repo_path,
             Arc::new(StaticGitConfigProvider::defaults()),
             Some(event_bus),
+            None,
         )
     }
 
@@ -219,13 +290,39 @@ impl DefaultGitCommitQueue {
         repo_path: PathBuf,
         config: Arc<dyn GitConfigProvider>,
     ) -> Result<Self, GitError> {
-        Self::spawn_inner(repo_path, config, None)
+        Self::spawn_inner(repo_path, config, None, None)
+    }
+
+    /// Additive constructor (R11 / MODULE-003-AC-34): the caller's
+    /// [`GitConfigProvider`] (so `git.max_tracked_file_mb` is honoured, clamped
+    /// by [`crate::lane::effective_max_tracked`]) plus an observability sink.
+    /// Production wiring is OSS-6. [`Self::spawn_with_event_bus`] keeps the
+    /// historic defaults.
+    pub fn spawn_with_config_and_event_bus(
+        repo_path: PathBuf,
+        config: Arc<dyn GitConfigProvider>,
+        event_bus: Arc<dyn EventBusEmit>,
+    ) -> Result<Self, GitError> {
+        Self::spawn_inner(repo_path, config, Some(event_bus), None)
+    }
+
+    /// Same as [`Self::spawn_with_config_and_event_bus`] plus the MODULE-003
+    /// §2.14 log channel (`git.user_lane.head_moved_swept`,
+    /// `git.repo.lane_policy_failed`, `git.repo.precompose_disabled`).
+    pub fn spawn_with_config_and_event_bus_and_log(
+        repo_path: PathBuf,
+        config: Arc<dyn GitConfigProvider>,
+        event_bus: Arc<dyn EventBusEmit>,
+        log: Arc<dyn GitLog>,
+    ) -> Result<Self, GitError> {
+        Self::spawn_inner(repo_path, config, Some(event_bus), Some(log))
     }
 
     fn spawn_inner(
         repo_path: PathBuf,
         config: Arc<dyn GitConfigProvider>,
         event_bus: Option<Arc<dyn EventBusEmit>>,
+        log: Option<Arc<dyn GitLog>>,
     ) -> Result<Self, GitError> {
         let _sanity = open_repo_internal(&repo_path)?;
         drop(_sanity);
@@ -259,13 +356,23 @@ impl DefaultGitCommitQueue {
             }
         }
 
-        let (tx, rx) = mpsc::unbounded_channel::<CommitRequest>();
+        let (tx, rx) = mpsc::unbounded_channel::<QueueItem>();
         // Worker opens the repo via the canonical path so `git_repo_lock` key
         // matches the one `rollback` / `checkpoint` use in the same process.
         let path_for_worker = registered_path.clone();
         let config_for_worker = Arc::clone(&config);
+        let lane_overrides = Arc::new(Mutex::new(LaneOverrides::default()));
+        #[cfg(feature = "test-support")]
+        let hooks_slot = Arc::clone(&lane_overrides);
         let worker = tokio::task::spawn_blocking(move || {
-            worker_loop(path_for_worker, rx, config_for_worker, event_bus)
+            worker_loop(
+                path_for_worker,
+                rx,
+                config_for_worker,
+                event_bus,
+                log,
+                lane_overrides,
+            )
         });
         Ok(Self {
             tx: Mutex::new(Some(tx)),
@@ -273,7 +380,46 @@ impl DefaultGitCommitQueue {
             released: AtomicBool::new(false),
             registered_path,
             _config: config,
+            #[cfg(feature = "test-support")]
+            lane_overrides: hooks_slot,
         })
+    }
+
+    /// Hand `item` to the worker; a closed queue answers it with `GitError::WorkerClosed`.
+    fn enqueue(&self, item: QueueItem) {
+        let rejected = match self.tx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(sender) => sender.send(item).err().map(|e| e.0),
+            None => Some(item),
+        };
+        if let Some(item) = rejected {
+            item.refuse(GitError::WorkerClosed);
+        }
+    }
+
+    /// Test-only: override the user lane's bounds and install a seam the worker calls right
+    /// before each ref compare-and-swap (MODULE-003 T60, T71, T72, T74). Production builds
+    /// cannot call it.
+    #[cfg(feature = "test-support")]
+    pub fn set_lane_test_hooks(&self, hooks: LaneTestHooks) {
+        let mut overrides = self
+            .lane_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides.before_ref_cas = hooks.before_ref_cas;
+        overrides.max_user_changes = hooks.max_user_changes;
+        overrides.max_restore_paths = hooks.max_restore_paths;
+        match hooks.adopt_budget {
+            Some(budget) => {
+                overrides.max_adopt_bytes = Some(budget.max_bytes);
+                overrides.adopt_time_budget = Some(budget.time);
+                overrides.adopt_clock = budget.clock;
+            }
+            None => {
+                overrides.max_adopt_bytes = None;
+                overrides.adopt_time_budget = None;
+                overrides.adopt_clock = None;
+            }
+        }
     }
 
     /// Close the queue and join its worker, then release the repo's process-wide
@@ -316,32 +462,88 @@ impl Drop for DefaultGitCommitQueue {
     }
 }
 
+/// Test-only overrides of the user lane (MODULE-003 §3.3: T60, T71, T72, T74): a seam right
+/// before each ref compare-and-swap and smaller bounds.
+#[cfg(feature = "test-support")]
+#[derive(Default)]
+pub struct LaneTestHooks {
+    /// Called with the workdir right before each `main` compare-and-swap of a lane item.
+    pub before_ref_cas: Option<Box<dyn Fn(&Path) + Send>>,
+    /// Replaces `MAX_USER_CHANGES`.
+    pub max_user_changes: Option<usize>,
+    /// Replaces `MAX_RESTORE_PATHS` (also the agent-territory walk bound).
+    pub max_restore_paths: Option<usize>,
+    /// Replaces the adopt budget (R1).
+    pub adopt_budget: Option<AdoptBudget>,
+}
+
+/// Test-only adopt budget of one `prepare` item (R1).
+#[cfg(feature = "test-support")]
+pub struct AdoptBudget {
+    /// Replaces `MAX_ADOPT_BYTES`.
+    pub max_bytes: u64,
+    /// Replaces `ADOPT_TIME_BUDGET`.
+    pub time: std::time::Duration,
+    /// Elapsed time since any origin, read when the item starts and before each file is
+    /// hashed; `None` keeps the monotonic clock.
+    pub clock: Option<Box<dyn Fn() -> std::time::Duration + Send>>,
+}
+
 impl GitCommitQueue for DefaultGitCommitQueue {
     fn submit(&self, mut req: CommitRequest) -> oneshot::Receiver<Result<Oid, GitError>> {
         let (tx, rx) = oneshot::channel();
         req.reply = Some(tx);
-        let sent = match self.tx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            Some(sender) => sender.send(req).is_ok(),
-            None => false,
-        };
-        if !sent {
-            // Worker died, or the queue was closed — fabricate a pre-resolved receiver
-            // carrying WorkerClosed.
-            let (etx, erx) = oneshot::channel();
-            let _ = etx.send(Err(GitError::WorkerClosed));
-            return erx;
-        }
+        // A dead worker or a closed queue answers WorkerClosed on the same receiver.
+        self.enqueue(QueueItem::Commit(req));
+        rx
+    }
+}
+
+/// CONTRACT-247: the user lane on the same worker, FIFO and coord mutex as `submit`.
+impl UserCommitLane for DefaultGitCommitQueue {
+    fn prepare(&self, req: PrepareRequest) -> oneshot::Receiver<Result<PrepareOutcome, GitError>> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue(QueueItem::Prepare(req, tx));
+        rx
+    }
+
+    fn commit_user(
+        &self,
+        req: UserCommitRequest,
+    ) -> oneshot::Receiver<Result<UserCommitOutcome, GitError>> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue(QueueItem::User(req, tx));
+        rx
+    }
+
+    fn save_version(
+        &self,
+        req: SaveVersionRequest,
+    ) -> oneshot::Receiver<Result<SaveVersionOutcome, GitError>> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue(QueueItem::SaveVersion(req, tx));
+        rx
+    }
+
+    fn restore_tree(
+        &self,
+        req: RestoreTreeRequest,
+    ) -> oneshot::Receiver<Result<RestoreOutcome, GitError>> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue(QueueItem::Restore(req, tx));
         rx
     }
 }
 
 fn worker_loop(
     repo_path: PathBuf,
-    mut rx: mpsc::UnboundedReceiver<CommitRequest>,
+    mut rx: mpsc::UnboundedReceiver<QueueItem>,
     config: Arc<dyn GitConfigProvider>,
     event_bus: Option<Arc<dyn EventBusEmit>>,
+    log: Option<Arc<dyn GitLog>>,
+    lane_overrides: Arc<Mutex<LaneOverrides>>,
 ) {
-    let repo = match open_repo_internal(&repo_path) {
+    let mut repo = match open_repo_internal(&repo_path) {
         Ok(r) => r,
         Err(_) => {
             drain_with_err(rx);
@@ -349,118 +551,220 @@ fn worker_loop(
         }
     };
     let coord = crate::coord::git_repo_lock(&repo_path);
-    while let Some(mut req) = rx.blocking_recv() {
-        let reply = req.reply.take();
-        // Slice C+D: read the auto-gitignore threshold from the provider
-        // snapshot per commit iteration so hot-reload of
-        // `max_tracked_file_mb` takes effect without a restart. `snapshot()`
-        // is cheap (Arc clone under RwLock::read in the runtime impl).
-        //
-        // Defense-in-depth clamp to ≥1 MiB: the production
-        // `StaticGitConfigProvider::new` validates `max_tracked_file_mb ∈
-        // (0, 4096]` matching MODULE-001, but a malicious/buggy trait
-        // implementation could publish 0 — which would silently make
-        // every non-empty file auto-gitignored, breaking tracking for
-        // every future commit with no error surface (R1 adversarial C1
-        // fix). 1 MiB is the minimum representable in MODULE-001's `u64
-        // MB` schema so the clamp is semantically tight.
-        let max_tracked_bytes = config
-            .snapshot()
-            .max_tracked_file_mb
-            .saturating_mul(1024 * 1024)
-            .max(1024 * 1024);
-        // Per-commit failures propagate as typed `GitError`. If `do_commit`
-        // panics (e.g. allocation failure in `format!`), the worker unwinds
-        // and the JoinHandle resolves to an error — the next caller's
-        // `tx.send()` will fail (channel closed after worker exits), which
-        // `submit()` catches and fabricates a pre-resolved
-        // `Err(GitError::WorkerClosed)` receiver. We deliberately do NOT use
-        // `catch_unwind` + `AssertUnwindSafe(&repo)` because libgit2 state
-        // may be mid-mutation at panic time — continuing with the same `repo`
-        // handle risks poisoned internal state (Warning #5 in R1 adversarial).
-        //
-        // Slice B: acquire the per-repo-path coord mutex so a concurrent
-        // `DefaultWorkspaceRollback::rollback` or `DefaultNamedCheckpoint::*`
-        // on the same repo can't race on `.git/index` or `refs/*` mutations.
-        // Unwrap on poisoned mutex: we have no safe way to continue after a
-        // prior holder panicked mid-mutation — fail closed.
+    // The user lane's repository policy (`.git/info/attributes`, `core.autocrlf`, precompose on
+    // Apple; MODULE-003-AC-35). While it cannot be applied, user-lane items fail with
+    // `Libgit2 { code: "Policy" }` and retry it first; legacy items proceed as before.
+    let first_policy = {
+        let _guard = coord.lock().expect("git coord mutex poisoned mid-commit");
+        ensure_lane_policy_on(&repo)
+    };
+    log_lane_policy(log.as_deref(), &repo_path, &first_policy);
+    let mut lane_policy = first_policy.map(drop);
+    while let Some(item) = rx.blocking_recv() {
+        // R1: a `prepare` / `save_version` / `restore_tree` nobody waits for is skipped.
+        if item.abandoned() {
+            continue;
+        }
+        let snapshot = config.snapshot();
+        let max_tracked_bytes = effective_max_tracked(&snapshot);
         let guard = coord.lock().expect("git coord mutex poisoned mid-commit");
-        let outcome = do_commit(&repo, &repo_path, &req, max_tracked_bytes);
-        drop(guard);
-        // MODULE-003-AC-25: emit AFTER the coord guard is dropped (rollback.rs
-        // emit-after-guard precedent) and BEFORE the oneshot reply, so an
-        // acked `submit()` implies the event is visible to the bus.
-        let reply_outcome = match outcome {
-            Ok((oid, staged_paths)) => {
-                if let Some(bus) = &event_bus {
-                    emit_commit_event(bus.as_ref(), &req, oid, &staged_paths);
+        let healed = journal::heal(&repo).map(drop);
+        let mut refresh = false;
+        match item {
+            QueueItem::Commit(mut req) => {
+                let reply = req.reply.take();
+                let outcome =
+                    healed.and_then(|()| do_commit(&repo, &repo_path, &req, max_tracked_bytes));
+                drop(guard);
+                let reply_outcome = match outcome {
+                    Ok(done) => {
+                        refresh = done.refresh;
+                        if let Some(bus) = &event_bus {
+                            emit::emit_plan(bus.as_ref(), &repo, done.emit);
+                        }
+                        Ok(done.oid)
+                    }
+                    Err(e) => Err(e),
+                };
+                if let Some(tx) = reply {
+                    let _ = tx.send(reply_outcome);
                 }
-                Ok(oid)
             }
-            Err(e) => Err(e),
-        };
-        if let Some(tx) = reply {
-            let _ = tx.send(reply_outcome);
+            QueueItem::Prepare(req, reply) => {
+                let outcome = healed
+                    .and_then(|()| lane_gate(&repo, &mut lane_policy, log.as_deref(), &repo_path))
+                    .and_then(|()| {
+                        let ctx = LaneCtx::new(&repo, &snapshot, &lane_overrides)?;
+                        crate::lane_prepare::exec_prepare(&ctx, &req)
+                    });
+                drop(guard);
+                match outcome {
+                    Ok(result) => {
+                        refresh = result.refresh_repo;
+                        if let Some(bus) = &event_bus {
+                            emit::emit_plan(bus.as_ref(), &repo, result.emit);
+                        }
+                        let _ = reply.send(Ok(result.outcome));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            QueueItem::User(req, reply) => {
+                let outcome = healed
+                    .and_then(|()| lane_gate(&repo, &mut lane_policy, log.as_deref(), &repo_path))
+                    .and_then(|()| {
+                        let ctx = LaneCtx::new(&repo, &snapshot, &lane_overrides)?;
+                        crate::lane_commit::exec_commit_user(&ctx, &req)
+                    });
+                drop(guard);
+                match outcome {
+                    Ok(result) => {
+                        refresh = result.refresh_repo;
+                        if let Some(swept) = result.swept {
+                            let attempts = swept.attempts.to_string();
+                            git_log::emit(
+                                log.as_deref(),
+                                GitLogLevel::Warn,
+                                git_log::HEAD_MOVED_SWEPT,
+                                &[("sha", swept.sha.as_str()), ("attempts", attempts.as_str())],
+                            );
+                        }
+                        if let Some(bus) = &event_bus {
+                            emit::emit_plan(bus.as_ref(), &repo, result.emit);
+                        }
+                        let _ = reply.send(Ok(result.outcome));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            QueueItem::SaveVersion(req, reply) => {
+                let outcome = healed
+                    .and_then(|()| lane_gate(&repo, &mut lane_policy, log.as_deref(), &repo_path))
+                    .and_then(|()| {
+                        let ctx = LaneCtx::new(&repo, &snapshot, &lane_overrides)?;
+                        crate::lane_version::exec_save_version(&ctx, &req)
+                    });
+                drop(guard);
+                match outcome {
+                    Ok(result) => {
+                        refresh = result.refresh_repo;
+                        if let Some(sha) = result.tag_failed_sha.as_deref() {
+                            git_log::emit(
+                                log.as_deref(),
+                                GitLogLevel::Warn,
+                                git_log::VERSION_TAG_FAILED,
+                                &[("sha", sha)],
+                            );
+                            // Whole item is silent: no adopt `git.commit` either.
+                        } else if let Some(bus) = &event_bus {
+                            emit::emit_plans(bus.as_ref(), &repo, result.emit);
+                        }
+                        let _ = reply.send(result.answer);
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            QueueItem::Restore(req, reply) => {
+                let outcome = healed
+                    .and_then(|()| lane_gate(&repo, &mut lane_policy, log.as_deref(), &repo_path))
+                    .and_then(|()| {
+                        let ctx = LaneCtx::new(&repo, &snapshot, &lane_overrides)?;
+                        crate::lane_restore::exec_restore_tree(&ctx, &req)
+                    });
+                drop(guard);
+                match outcome {
+                    Ok(result) => {
+                        refresh = result.refresh_repo;
+                        if let Some(bus) = &event_bus {
+                            emit::emit_plans(bus.as_ref(), &repo, result.emit);
+                        }
+                        let _ = reply.send(Ok(result.outcome));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+        }
+        if refresh {
+            if let Ok(fresh) = open_repo_internal(&repo_path) {
+                repo = fresh;
+            }
         }
     }
-    // Channel closed (queue dropped). No further submissions possible.
 }
 
-/// Truncate `s` to at most `max` bytes on a char boundary (payload-cap
-/// helper; path components are typically ASCII but vpaths are
-/// guest-influenced, so the boundary walk keeps this panic-free).
-fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
+/// User-lane items need the lane policy (filter-free blobs, MODULE-003-AC-35): retry it while it
+/// has not been applied; until it is, the item fails with `Libgit2 { code: "Policy" }`.
+fn lane_gate(
+    repo: &Repository,
+    policy: &mut Result<(), GitError>,
+    log: Option<&dyn GitLog>,
+    repo_path: &Path,
+) -> Result<(), GitError> {
+    if policy.is_err() {
+        let applied = ensure_lane_policy_on(repo);
+        if applied.is_err() {
+            log_lane_policy(log, repo_path, &applied);
+        }
+        *policy = applied.map(drop);
     }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+    match policy {
+        Ok(()) => Ok(()),
+        Err(e) => Err(GitError::Libgit2 {
+            code: "Policy".to_string(),
+            message: e.to_string(),
+        }),
     }
-    &s[..end]
 }
 
-/// Construct + dispatch the `git.commit` event (PRD §15.3.17 +
-/// MODULE-003-AC-25). Payload fields: `agent_id`, `commit_type`
-/// (`turn|micro|l6`), `initiator`, `message`, `sha`, `affected_paths`
-/// (the staged repo-relative normalized paths returned by `do_commit` —
-/// never the caller-raw/absolute `req.affected_paths`; bucket-capped),
-/// `affected_paths_count` + `files_changed` (full staged count), and
-/// `correlation_id` (sanitized, present when set). All FOUR audit-influenced
-/// string fields (`agent_id`, `initiator`, `message`, `correlation_id`) go
-/// through the same `sanitize_audit_field` boundary the commit message uses,
-/// so the event surface cannot carry forged audit lines either; the
-/// `affected_paths` entries are repo-relative (never absolute — `do_commit`
-/// normalized + ignore-filtered them) and char-boundary-truncated.
-fn emit_commit_event(bus: &dyn EventBusEmit, req: &CommitRequest, oid: Oid, staged: &[String]) {
-    let paths: Vec<&str> = staged
-        .iter()
-        .take(GIT_COMMIT_EVENT_MAX_PATHS)
-        .map(|p| truncate_on_char_boundary(p, GIT_COMMIT_EVENT_MAX_PATH_BYTES))
-        .collect();
-    let safe_agent_id = sanitize_audit_field(&req.agent_id);
-    let mut payload = serde_json::json!({
-        "agent_id": safe_agent_id,
-        "commit_type": req.commit_type.to_string(),
-        "initiator": sanitize_audit_field(&req.initiator),
-        "message": sanitize_audit_field(&req.message),
-        "sha": oid.to_string(),
-        "affected_paths": paths,
-        "affected_paths_count": staged.len(),
-        "files_changed": staged.len(),
-    });
-    if let Some(cid) = &req.correlation_id {
-        payload["correlation_id"] = serde_json::Value::String(sanitize_audit_field(cid));
+fn log_lane_policy(
+    log: Option<&dyn GitLog>,
+    repo_path: &Path,
+    policy: &Result<crate::repo::LanePolicy, GitError>,
+) {
+    let path = repo_path.display().to_string();
+    match policy {
+        Ok(p) if p.precompose == Precompose::Disabled => {
+            git_log::emit(
+                log,
+                GitLogLevel::Info,
+                git_log::PRECOMPOSE_DISABLED,
+                &[("repo", path.as_str())],
+            );
+        }
+        Err(e) => {
+            git_log::emit(
+                log,
+                GitLogLevel::Warn,
+                git_log::LANE_POLICY_FAILED,
+                &[("repo", path.as_str()), ("step", policy_step_of(e))],
+            );
+        }
+        _ => {}
     }
-    bus.emit(Event::observability(
-        "git.commit",
-        safe_agent_id,
-        payload,
-        None,
-    ));
 }
 
-fn drain_with_err(mut rx: mpsc::UnboundedReceiver<CommitRequest>) {
+fn policy_step_of(err: &GitError) -> &'static str {
+    let text = err.to_string();
+    if text.contains("`attributes`") {
+        "attributes"
+    } else if text.contains("`autocrlf`") {
+        "autocrlf"
+    } else if text.contains("`precompose`") {
+        "precompose"
+    } else {
+        "unknown"
+    }
+}
+
+fn drain_with_err(mut rx: mpsc::UnboundedReceiver<QueueItem>) {
     // Called only on the initial `open_repo_internal` failure path before
     // entering the receive loop. After entering the loop, reply closure happens
     // per-iteration via the `catch_unwind` branch.
@@ -472,13 +776,11 @@ fn drain_with_err(mut rx: mpsc::UnboundedReceiver<CommitRequest>) {
     // leaving the caller observing an anonymous `RecvError` on their oneshot
     // instead of the typed `GitError::WorkerClosed`. After `close()`, subsequent
     // `UnboundedSender::send` calls return `Err(SendError(...))`, which
-    // `submit()` catches and fabricates a pre-resolved
-    // `Err(GitError::WorkerClosed)` receiver.
+    // `enqueue()` catches and answers with `Err(GitError::WorkerClosed)` on the
+    // caller's receiver.
     rx.close();
-    while let Ok(mut req) = rx.try_recv() {
-        if let Some(reply) = req.reply.take() {
-            let _ = reply.send(Err(GitError::WorkerClosed));
-        }
+    while let Ok(item) = rx.try_recv() {
+        item.refuse(GitError::WorkerClosed);
     }
 }
 
@@ -670,7 +972,10 @@ fn normalize_workdir_rel(workdir: &Path, p: &Path) -> Result<PathBuf, GitError> 
 /// `[<initiator>]` bracket boundary OR the `author:email<>` pair. Replace any
 /// such character with `_`; preserves ASCII-printable and common unicode while
 /// stripping metacharacters. See lib.rs Security Posture §4.
-fn sanitize_audit_field(s: &str) -> String {
+///
+/// The user lane's subjects are built to be invariant under it
+/// (`label::render_subject`, MODULE-003-AC-29).
+pub(crate) fn sanitize_audit_field(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             '[' | ']' | '<' | '>' | '"' | '\n' | '\r' | '\0' => '_',
@@ -680,58 +985,55 @@ fn sanitize_audit_field(s: &str) -> String {
         .collect()
 }
 
+struct LegacyDone {
+    oid: Oid,
+    emit: EmitPlan,
+    refresh: bool,
+}
+
 fn do_commit(
     repo: &Repository,
     repo_path: &Path,
     req: &CommitRequest,
     max_tracked_bytes: u64,
-) -> Result<(Oid, Vec<String>), GitError> {
-    // Commit-time single-branch guard (AC-02, PRD §7.2 "no per-agent branches").
-    // `bootstrap_repo_at` enforces the invariant at open time, but a long-lived
-    // queue must re-verify on every commit that (a) HEAD still points at
-    // `refs/heads/main` and (b) no side branch has appeared in `refs/heads/`
-    // since bootstrap. Both checks are O(refs/heads/*) which is O(1) for the
-    // intended single-branch workspace.
-    match repo.head() {
-        Ok(h) => {
-            let name = h.name().unwrap_or("<unnamed>");
-            if name != "refs/heads/main" {
-                return Err(GitError::NotSingleBranch {
-                    observed: name.to_string(),
-                });
-            }
-        }
-        Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
-            let sym = repo.find_reference("HEAD")?;
-            let target = sym.symbolic_target().unwrap_or("<unknown>");
-            if target != "refs/heads/main" {
-                return Err(GitError::NotSingleBranch {
-                    observed: target.to_string(),
-                });
-            }
-        }
-        Err(e) => return Err(GitError::from(e)),
+) -> Result<LegacyDone, GitError> {
+    // User lane (ADR 2026-10-15, MODULE-003-AC-26): a `[user]` commit must carry a
+    // runtime-rendered label, the user author and exact content, which only the
+    // `UserCommitLane` provides. Refused before any index mutation, so nothing is
+    // staged and no commit (and no `git.commit` event) is made.
+    if req.commit_type == CommitType::User {
+        return Err(GitError::InvalidUserOp {
+            reason: UserOpRefusal::OpShape,
+            path: None,
+        });
     }
-    // Branches iteration: the only acceptable local branch name is "main".
-    for b in repo.branches(Some(git2::BranchType::Local))? {
-        let (branch, _) = b?;
-        let name = branch.name()?.unwrap_or("<unnamed>").to_string();
-        if name != "main" {
-            return Err(GitError::NotSingleBranch {
-                observed: format!("refs/heads/{name}"),
-            });
+    branch_guard(repo)?;
+
+    let mut refresh = false;
+    let workdir_path = repo.workdir().unwrap_or(repo_path).to_path_buf();
+    for raw_p in &req.affected_paths {
+        let rel = normalize_workdir_rel(&workdir_path, raw_p)?;
+        let Some(rel_str) = rel.to_str() else {
+            continue;
+        };
+        if !autoignore::contains(repo, rel_str)? {
+            continue;
+        }
+        let size = std::fs::metadata(workdir_path.join(&rel))
+            .ok()
+            .map(|m| m.len());
+        if size.is_some_and(|n| n <= max_tracked_bytes) && autoignore::shrink(repo, rel_str)? {
+            refresh = true;
         }
     }
+    let owned = if refresh {
+        Some(open_repo_internal(repo_path)?)
+    } else {
+        None
+    };
+    let repo = owned.as_ref().unwrap_or(repo);
 
     let workdir = repo.workdir().unwrap_or(repo_path);
-    let mut index = repo.index()?;
-    // Resync the in-memory index with what's on disk. Otherwise a prior
-    // iteration that errored AFTER `index.add_path` but BEFORE `index.write`
-    // leaves staged paths cached in this handle; the next iteration would
-    // silently commit those leaked paths alongside its own declared
-    // `affected_paths` (R1 adversarial Warning #3).
-    index.read(true)?;
-    let mut gitignore_touched = false;
     let mut to_autoignore: Vec<PathBuf> = Vec::new();
     // MODULE-003-AC-25: the staged repo-relative normalized paths actually
     // recorded by this commit (add OR delete arms; excludes ignored/
@@ -739,6 +1041,10 @@ fn do_commit(
     // Surfaced to the worker for the `git.commit` event payload — the
     // `do_rollback → Vec<PathBuf>` precedent.
     let mut staged: Vec<String> = Vec::new();
+    // What to stage, decided once before the index is touched: the index write is retried on
+    // `GIT_ELOCKED` (MODULE-003 §1.4.1 item 2), and every attempt re-reads `.git/index` and
+    // re-stages these.
+    let mut stage: Vec<LegacyStage> = Vec::new();
 
     // First pass: check ignore + size, defer any large-file .gitignore
     // appends to a batched second pass so libgit2's per-repo attr cache
@@ -793,14 +1099,14 @@ fn do_commit(
                         continue;
                     }
                 }
-                index.add_path(&rel)?;
                 staged.push(rel.to_string_lossy().into_owned());
+                stage.push(LegacyStage::Add(rel));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Slice D: stage the deletion. Silent no-op for never-tracked
                 // paths (libgit2 swallows GIT_ENOTFOUND internally).
-                index.remove_path(&rel)?;
                 staged.push(rel.to_string_lossy().into_owned());
+                stage.push(LegacyStage::Remove(rel));
             }
             Err(e) => {
                 return Err(GitError::Io(std::io::Error::new(
@@ -811,31 +1117,47 @@ fn do_commit(
         }
     }
 
-    // Second pass: batch-write all autoignore entries in one .gitignore
-    // mutation, then flush libgit2's ignore matcher so any downstream
-    // operation (rollback slice, post-commit hooks) observes the update.
-    if !to_autoignore.is_empty() {
-        for rel in &to_autoignore {
-            append_gitignore_entry(workdir, rel)?;
+    // Resync with what's on disk on every attempt (`update_index_with_retry` re-reads
+    // `.git/index`), so a prior iteration that errored after staging never leaks its
+    // paths into this commit (R1 adversarial Warning #3), and a writer that held
+    // `index.lock` keeps what it wrote. Everything below runs in the original order on every
+    // attempt; the `.gitignore` appends are idempotent, so a retry adds nothing twice.
+    let tree_id = journal::update_index_with_retry(repo, |index| {
+        for op in &stage {
+            match op {
+                LegacyStage::Add(rel) => index.add_path(rel)?,
+                LegacyStage::Remove(rel) => index.remove_path(rel)?,
+            }
         }
-        gitignore_touched = true;
-    }
 
-    // Stage `.gitignore` only when it is not already in sync with HEAD — either
-    // because `bootstrap_repo_at` wrote it and no commit has recorded it yet
-    // (i.e. the first-ever commit on this repo), or because this commit's
-    // oversized-file branch just auto-appended to it. This keeps the commit
-    // scope aligned with caller-declared `affected_paths` when the gitignore
-    // policy is already persisted in HEAD, while still guaranteeing AC-12's
-    // "durable in history" property when it isn't.
-    if workdir.join(".gitignore").exists()
-        && (gitignore_touched || gitignore_diverges_from_head(repo)?)
-    {
-        index.add_path(Path::new(".gitignore"))?;
-    }
+        // Second pass: batch-write all autoignore entries in one .gitignore
+        // mutation, then flush libgit2's ignore matcher so any downstream
+        // operation (rollback slice, post-commit hooks) observes the update.
+        let mut gitignore_touched = false;
+        if !to_autoignore.is_empty() {
+            for rel in &to_autoignore {
+                autoignore::append(repo, rel)?;
+            }
+            gitignore_touched = true;
+        }
 
-    index.write()?;
-    let tree_id = index.write_tree()?;
+        // Stage `.gitignore` only when it is not already in sync with HEAD — either
+        // because `bootstrap_repo_at` wrote it and no commit has recorded it yet
+        // (i.e. the first-ever commit on this repo), or because this commit's
+        // oversized-file branch just auto-appended to it. This keeps the commit
+        // scope aligned with caller-declared `affected_paths` when the gitignore
+        // policy is already persisted in HEAD, while still guaranteeing AC-12's
+        // "durable in history" property when it isn't.
+        if workdir.join(".gitignore").exists()
+            && (gitignore_touched || gitignore_diverges_from_head(repo)?)
+        {
+            index.add_path(Path::new(".gitignore"))?;
+        }
+        Ok(index.write_tree()?)
+    })?;
+    if !to_autoignore.is_empty() {
+        refresh = true;
+    }
     let tree = repo.find_tree(tree_id)?;
 
     // Parent commit (if any). Unborn branch → no parents. Corrupt HEAD (target
@@ -873,16 +1195,12 @@ fn do_commit(
     // tooling that splits on newlines would attribute to another agent).
     // This sanitizer is the single trust-boundary point for ALL audit
     // surfaces; callers in cap-fs deliberately do not duplicate it.
-    let safe_agent_id = sanitize_audit_field(&req.agent_id);
-    let safe_initiator = sanitize_audit_field(&req.initiator);
+    // `agent_authorship` sanitizes `agent_id` (author name) and `initiator`
+    // (prefix) the same way; the signature is byte-identical to the one this
+    // lane always wrote (author == committer == `agent:<id>
+    // <runtime@advance-agents>`, UTC offset 0).
     let safe_message = sanitize_audit_field(&req.message);
-    let author_name = format!("agent:{}", safe_agent_id);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let when = git2::Time::new(now, 0);
-    let sig = Signature::new(&author_name, "runtime@advance-agents", &when)?;
+    let authorship = agent_authorship(req, &signature_time_now())?;
 
     // Prefix format: `[<type>] [<initiator>] <message>` (MODULE-003 §1.4.1; PRD §7.2).
     // All three interpolated fields are sanitized so structural metacharacters
@@ -893,11 +1211,80 @@ fn do_commit(
     // round 1).
     let full_msg = format!(
         "[{}] [{}] {}",
-        req.commit_type, safe_initiator, safe_message
+        authorship.commit_type, authorship.initiator, safe_message
     );
 
-    let oid = repo.commit(Some("HEAD"), &sig, &sig, &full_msg, &tree, &parents)?;
-    Ok((oid, staged))
+    let oid = repo.commit(
+        Some("HEAD"),
+        &authorship.author,
+        &authorship.committer,
+        &full_msg,
+        &tree,
+        &parents,
+    )?;
+    let parent_tree = parent_commit.as_ref().map(|c| c.tree_id());
+    let autoignored: Vec<(String, bool)> = to_autoignore
+        .iter()
+        .filter_map(|rel| {
+            let path = rel.to_str()?.to_string();
+            let parent_had = parent_commit
+                .as_ref()
+                .and_then(|c| c.tree().ok())
+                .and_then(|t| t.get_path(rel).ok())
+                .is_some();
+            Some((path, parent_had))
+        })
+        .collect();
+    Ok(LegacyDone {
+        oid,
+        emit: EmitPlan::legacy(req, oid, &staged, parent_tree, tree.id(), autoignored),
+        refresh,
+    })
+}
+
+/// One legacy staging operation, re-applied on every index-write attempt.
+enum LegacyStage {
+    Add(PathBuf),
+    Remove(PathBuf),
+}
+
+/// Commit-time single-branch guard (AC-02, PRD §7.2 "no per-agent branches"), shared by both
+/// lanes. `bootstrap_repo_at` enforces the invariant at open time, but a long-lived queue must
+/// re-verify on every commit that (a) HEAD still points at `refs/heads/main` and (b) no side
+/// branch has appeared in `refs/heads/` since bootstrap. Both checks are O(refs/heads/*) which
+/// is O(1) for the intended single-branch workspace.
+pub(crate) fn branch_guard(repo: &Repository) -> Result<(), GitError> {
+    match repo.head() {
+        Ok(h) => {
+            let name = h.name().unwrap_or("<unnamed>");
+            if name != "refs/heads/main" {
+                return Err(GitError::NotSingleBranch {
+                    observed: name.to_string(),
+                });
+            }
+        }
+        Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
+            let sym = repo.find_reference("HEAD")?;
+            let target = sym.symbolic_target().unwrap_or("<unknown>");
+            if target != "refs/heads/main" {
+                return Err(GitError::NotSingleBranch {
+                    observed: target.to_string(),
+                });
+            }
+        }
+        Err(e) => return Err(GitError::from(e)),
+    }
+    // Branches iteration: the only acceptable local branch name is "main".
+    for b in repo.branches(Some(git2::BranchType::Local))? {
+        let (branch, _) = b?;
+        let name = branch.name()?.unwrap_or("<unnamed>").to_string();
+        if name != "main" {
+            return Err(GitError::NotSingleBranch {
+                observed: format!("refs/heads/{name}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Check whether the on-disk `.gitignore` differs from the version recorded in
@@ -944,104 +1331,12 @@ fn gitignore_diverges_from_head(repo: &Repository) -> Result<bool, GitError> {
     Ok(head_blob.content() != on_disk.as_slice())
 }
 
-/// Escape a filename for use as a literal `.gitignore` pattern. Git's
-/// gitignore grammar treats `*`, `?`, `[`, `!`, `#`, `\` as metacharacters
-/// (plus trailing `/` meaning directory-only, and trailing spaces stripped
-/// unless escaped as `\ `). A large-binary file named e.g. `report*.bin`
-/// would otherwise generate an overmatching pattern that hides unrelated
-/// siblings, breaking AC-12's "excluded from tracking" guarantee for the
-/// intended file and spuriously hiding others.
-///
-/// Escape strategy:
-/// - Prepend `\` to every metacharacter so Git treats it as a literal.
-/// - Escape a leading `#` or `!` (sentinels for comment and negation).
-/// - Escape trailing spaces (Git strips unescaped trailing spaces, so a
-///   filename ending in space would silently not match).
-fn escape_gitignore_literal(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    // Find the index of the last non-space char (to identify trailing-space run).
-    let last_non_space = chars.iter().rposition(|c| *c != ' ');
-    let mut out = String::with_capacity(s.len() + 4);
-    for (i, c) in chars.iter().enumerate() {
-        let is_trailing_space = *c == ' ' && last_non_space.is_none_or(|ns| i > ns);
-        let needs_escape = matches!(c, '*' | '?' | '[' | ']' | '\\')
-            || (i == 0 && (*c == '#' || *c == '!'))
-            || is_trailing_space;
-        if needs_escape {
-            out.push('\\');
-        }
-        out.push(*c);
-    }
-    out
-}
-
-fn append_gitignore_entry(workdir: &Path, rel: &Path) -> Result<(), GitError> {
-    // Reject non-UTF8 paths via `GitError::Io(InvalidInput)` — a lossy pattern
-    // would not match the actual file in Git's gitignore matcher, silently
-    // degrading AC-12's "auto-append large binaries" guarantee on exotic paths.
-    // `PathOutsideWorkdir` would be semantically misleading here because the
-    // path IS inside the workdir — it simply cannot be written as a gitignore
-    // pattern.
-    let rel_str = rel.to_str().ok_or_else(|| {
-        GitError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "non-UTF8 path cannot be written to .gitignore: {}",
-                rel.display()
-            ),
-        ))
-    })?;
-    // Reject control characters outright. `escape_gitignore_literal` protects
-    // against glob metacharacters, but a filename containing `\n` or `\r` would
-    // split the .gitignore write into multiple lines, letting an attacker
-    // inject additional ignore rules. Filesystems generally reject these in
-    // path components anyway, but we defend in depth at the write boundary.
-    if rel_str.chars().any(|c| c.is_control()) {
-        return Err(GitError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "path contains control character; cannot write to .gitignore: {}",
-                rel.display()
-            ),
-        )));
-    }
-    let gi = workdir.join(".gitignore");
-    // Reject symlinked `.gitignore`. `std::fs::read_to_string` / `write`
-    // follow symlinks by default, which lets a local attacker place
-    // `ln -s /etc/passwd workdir/.gitignore` before any commit and have the
-    // runtime-uid process overwrite the symlink target (R1 adversarial
-    // Critical #1). `symlink_metadata` does NOT follow; it reports the
-    // symlink itself.
-    reject_if_symlink(&gi)?;
-    let existing = if gi.exists() {
-        std::fs::read_to_string(&gi)?
-    } else {
-        String::new()
-    };
-    // Prepend `/` so the pattern is anchored at workdir root (avoids matching
-    // the file name anywhere in the tree); escape metacharacters so the entry
-    // is a literal exact-match pattern.
-    let entry = format!("/{}", escape_gitignore_literal(rel_str));
-    if existing.lines().any(|l| l.trim() == entry) {
-        return Ok(());
-    }
-    let mut out = existing;
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(&entry);
-    out.push('\n');
-    std::fs::write(&gi, out)?;
-    Ok(())
-}
-
-/// Reject a path that exists as a symlink. Used at `.gitignore` read/write
-/// boundaries in `commit_queue::append_gitignore_entry` and
-/// `repo::ensure_gitignore` to prevent symlink-follow arbitrary-file-overwrite
-/// attacks. NotFound is accepted (file doesn't exist yet — legitimate first
-/// write). Any other error (EACCES on parent, ELOOP, ENOTDIR mid-path) fails
-/// closed so an attacker cannot induce a metadata-read failure and then race
-/// a symlink into place.
+/// Reject a path that exists as a symlink. Used at `.gitignore` / registry
+/// read/write boundaries (`autoignore`, `repo::ensure_gitignore`) to prevent
+/// symlink-follow arbitrary-file-overwrite attacks. NotFound is accepted (file
+/// doesn't exist yet — legitimate first write). Any other error (EACCES on
+/// parent, ELOOP, ENOTDIR mid-path) fails closed so an attacker cannot induce
+/// a metadata-read failure and then race a symlink into place.
 pub(crate) fn reject_if_symlink(path: &Path) -> Result<(), GitError> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => Err(GitError::Io(std::io::Error::new(
@@ -1065,9 +1360,27 @@ mod tests {
     //! catches above-workdir escapes (defense-in-depth), but locking in
     //! the helper's own contract here prevents future direct callers from
     //! relying on the gate alone.
-    use super::canonicalize_existing_ancestor;
+    use super::{canonicalize_existing_ancestor, CommitType};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    // ADR 2026-10-15 (MODULE-003-AC-26): the user token round-trips and parsing stays
+    // case-sensitive.
+    #[test]
+    fn commit_type_user_token_round_trips() {
+        assert_eq!(CommitType::User.as_token(), "user");
+        assert_eq!(CommitType::User.to_string(), "user");
+        assert_eq!(CommitType::parse_token("user"), Some(CommitType::User));
+        assert_eq!(CommitType::parse_token("User"), None);
+        for kind in [
+            CommitType::Turn,
+            CommitType::Micro,
+            CommitType::L6,
+            CommitType::User,
+        ] {
+            assert_eq!(CommitType::parse_token(kind.as_token()), Some(kind));
+        }
+    }
 
     #[test]
     fn returns_some_when_leaf_missing_under_workdir() {

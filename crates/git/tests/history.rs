@@ -47,6 +47,7 @@ impl Fixture {
             CommitType::Turn => format!("agent:{agent}"),
             CommitType::Micro => "runtime:rollback".to_string(),
             CommitType::L6 => "runtime:l6".to_string(),
+            CommitType::User => "user:advance".to_string(),
         };
         let req = CommitRequest::new(
             agent,
@@ -291,6 +292,7 @@ async fn commits_page_with_cursor_and_filters() {
             &CommitFilter {
                 agent_id: Some("alice".into()),
                 commit_type: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -306,6 +308,7 @@ async fn commits_page_with_cursor_and_filters() {
             &CommitFilter {
                 agent_id: None,
                 commit_type: Some(CommitType::L6),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -318,6 +321,7 @@ async fn commits_page_with_cursor_and_filters() {
             &CommitFilter {
                 agent_id: Some("carol".into()),
                 commit_type: None,
+                ..Default::default()
             },
         )
         .unwrap();

@@ -551,6 +551,12 @@ async fn sd_t50_real_write_sanitizes_vpath_newline_audit_forgery() {
     unwrap_ok_none(out);
 
     let repo = open_repo(&workspace_root);
+    // Newline is a Cc control: the git lane refuses the path, so the write may
+    // land on disk without minting HEAD. That still prevents a forged second
+    // audit line. When a commit *is* minted, the sanitizer must hold.
+    let Ok(_) = repo.head() else {
+        return;
+    };
     let msg = head_commit_message(&repo);
 
     // (1) NO raw newline in the commit message — the sanitizer replaced `\n`

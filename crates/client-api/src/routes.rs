@@ -141,6 +141,29 @@ pub const PATH_GIT_FILE_AT: &str = "/client/git/files/content";
 pub const PATH_GIT_CHECKPOINT_CREATE: &str = "/client/git/checkpoints:create";
 /// Rollback one `checkpoint/{agent_id}/{label}` tag (POST mutation).
 pub const TPL_GIT_CHECKPOINT_ROLLBACK: &str = "/client/git/checkpoints/{agent_id}/{label}:rollback";
+/// Files family (vault working tree): browse / stat / search (GET).
+pub const PATH_FILES_ENTRIES: &str = "/client/files/entries";
+pub const PATH_FILES_STAT: &str = "/client/files/stat";
+pub const PATH_FILES_SEARCH: &str = "/client/files/search";
+/// Files family ticket mints (explicit POST reads).
+pub const PATH_FILES_READ_TICKET: &str = "/client/files:read-ticket";
+pub const PATH_FILES_WRITE_TICKET: &str = "/client/files:write-ticket";
+/// Files family mutations (one user commit per call).
+pub const PATH_FILES_MKDIR: &str = "/client/files:mkdir";
+pub const PATH_FILES_MOVE: &str = "/client/files:move";
+pub const PATH_FILES_DELETE: &str = "/client/files:delete";
+pub const PATH_FILES_RESTORE: &str = "/client/files:restore";
+pub const PATH_FILES_SAVE_VERSION: &str = "/client/files:save-version";
+pub const PATH_FILES_COMMIT_EXTERNAL: &str = "/client/files:commit-external";
+/// R6: copy / duplicate (disk/operator body is OSS-5; the port may answer unavailable).
+pub const PATH_FILES_COPY: &str = "/client/files:copy";
+pub const PATH_FILES_COMMIT_BATCH: &str = "/client/files:commit-batch";
+/// Transport-owned raw byte route (GET/HEAD/PUT). NOT a `ClientApi` route: `handle()` answers
+/// `unknown_route` for it and `route_table()` does not list it. Its audit path is the template
+/// itself, so a ticket never reaches an audit label.
+pub const TPL_FILES_RAW: &str = "/client/files/raw/{ticket}";
+/// Transport-owned routes that are not `ClientApi` routes: (methods, template).
+pub const TRANSPORT_OWNED_ROUTES: &[(&[&str], &str)] = &[(&["GET", "HEAD", "PUT"], TPL_FILES_RAW)];
 /// Schema family (entity-data lane E3): the merged meta-schema (GET). Its own family.
 pub const PATH_SCHEMA: &str = "/client/schema";
 /// Entities family: query (a POST read) and create (POST mutation).

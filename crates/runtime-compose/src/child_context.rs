@@ -17,6 +17,7 @@ use advance_shared_types::context::ContextAssembler;
 use advance_shared_types::traits::{
     CallableInventoryReader, EventBusEmit, GrantCheck, ToolsGrantReader,
 };
+use cap_fs::MetaMaintainer;
 use cap_lifecycle::DefaultDecompositionStore;
 use cap_llm::{resolve_provider_and_model, LlmGateway, VlmExtractor};
 use cap_memory::MemoryStore;
@@ -49,6 +50,7 @@ pub struct ChildContextDeps {
     pub event_bus_ss: Arc<dyn EventBusEmit + Send + Sync>,
     pub git_queue: Option<Arc<dyn advance_git::GitCommitQueue>>,
     pub vlm: Option<Arc<dyn VlmExtractor>>,
+    pub meta_maintainer: Option<Arc<MetaMaintainer>>,
     pub host_registry: Arc<dyn HostRegistry>,
     pub embedding_posture: EmbeddingPosture,
     pub assembler_model: String,
@@ -86,6 +88,7 @@ pub fn attach_child_context(
         deps.agent_tree.clone(),
         &deps.log,
         deps.memory_index.clone(),
+        deps.meta_maintainer.clone(),
     );
     driver = driver.with_post_processor(post_processor);
 

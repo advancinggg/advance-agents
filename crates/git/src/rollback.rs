@@ -32,9 +32,11 @@
 //! handle. `memory_rollback_paths` is synchronous and acquires the lock
 //! directly at method entry.
 
+use crate::checkpoint::refuse_reserved_namespace;
 use crate::coord::git_repo_lock;
 use crate::error::{DeniedReason, RollbackError};
 use crate::repo::open_repo_internal;
+use crate::user_lane::USER_NAMESPACE;
 use advance_shared_types::event::Event;
 use advance_shared_types::traits::EventBusEmit;
 use async_trait::async_trait;
@@ -128,6 +130,15 @@ fn emit_rollback_event(
 /// of a root config.yaml (test fixtures), the sentinel `"root"` falls back
 /// to `<workdir>` directly.
 const ROOT_AGENT_SENTINEL: &str = "root";
+
+/// Generic rollback of the reserved `user` namespace is refused: named versions
+/// are restored by forward commits (`restore_tree`), MODULE-003-AC-30.
+fn refuse_user_namespace(agent_id: &str) -> Result<(), RollbackError> {
+    refuse_reserved_namespace(agent_id).map_err(|_| RollbackError::InvalidTarget {
+        target: format!("checkpoint/{USER_NAMESPACE}"),
+        reason: "user versions are restored by forward commits".to_string(),
+    })
+}
 
 /// Target of a rollback operation. Public API carries opaque strings — no
 /// `git2::Oid` crosses the crate boundary per §1.1.
@@ -526,6 +537,51 @@ impl DefaultWorkspaceRollback {
         Ok(())
     }
 
+    /// Tree-read restore plan (no disk). Compose (OSS-6) uses the summary to
+    /// refuse over-budget operator rollbacks outside L1 (R3).
+    pub fn plan_restore(
+        &self,
+        req: &crate::user_lane::RestoreTreeRequest,
+    ) -> Result<RestorePlanSummary, crate::error::GitError> {
+        let repo = open_repo_internal(&self.canonical_repo)?;
+        crate::lane_restore::summarize_restore(&repo, &self.canonical_repo, req)
+    }
+
+    /// Direct, non-queue restore (hosts without a commit queue). Runs under
+    /// `spawn_blocking` and the coord guard; events fire after the guard drops.
+    pub async fn restore_committed(
+        &self,
+        req: crate::user_lane::RestoreTreeRequest,
+        bus: Option<Arc<dyn EventBusEmit>>,
+    ) -> Result<crate::user_lane::RestoreOutcome, crate::error::GitError> {
+        let canonical = self.canonical_repo.clone();
+        tokio::task::spawn_blocking(move || {
+            let coord = git_repo_lock(&canonical);
+            let guard = coord
+                .lock()
+                .expect("git coord mutex poisoned in restore_committed");
+            let repo = open_repo_internal(&canonical)?;
+            crate::journal::heal(&repo).map(drop)?;
+            let snapshot = crate::config::GitConfigProvider::snapshot(
+                &crate::config::StaticGitConfigProvider::defaults(),
+            );
+            let overrides = std::sync::Mutex::new(crate::lane::LaneOverrides::default());
+            let ctx = crate::lane::LaneCtx::new(&repo, &snapshot, &overrides)?;
+            let result = crate::lane_restore::exec_restore_tree(&ctx, &req)?;
+            drop(guard);
+            if let Some(bus) = bus.as_ref() {
+                crate::emit::emit_plans(bus.as_ref(), &repo, result.emit);
+            }
+            Ok(result.outcome)
+        })
+        .await
+        .map_err(|e| {
+            crate::error::GitError::Io(std::io::Error::other(format!(
+                "restore_committed worker join error: {e}"
+            )))
+        })?
+    }
+
     /// rollback-memory slice (2026-06-12) — the MODULE-011 AC-18 git half,
     /// timestamp-addressed: restore the agent's Git-tracked memory files
     /// **excluding `knowledge.jsonl`** (the `MemoryStore` owns that file's
@@ -705,6 +761,7 @@ impl WorkspaceRollback for DefaultWorkspaceRollback {
         // libgit2's Oid::from_str parser inside do_rollback; malformed
         // hex already yields InvalidTarget before any emit — no
         // additional validation needed for that arm.
+        refuse_user_namespace(agent_id)?;
         if let RollbackTarget::Checkpoint(label) = &target {
             crate::checkpoint::validate_ref_component(label, "label")
                 .map_err(RollbackError::Checkpoint)?;
@@ -782,6 +839,7 @@ impl WorkspaceRollback for DefaultWorkspaceRollback {
         // accepts unicode control chars + bidi overrides that could
         // otherwise reach JSONL/SQLite consumers via payload.target_ref).
         // Adversarial round 17 fix.
+        refuse_user_namespace(agent_id)?;
         crate::checkpoint::validate_ref_component(agent_id, "agent_id")
             .map_err(RollbackError::Checkpoint)?;
         crate::checkpoint::validate_ref_component(label, "label")
@@ -931,7 +989,7 @@ impl WorkspaceRollback for DefaultWorkspaceRollback {
 /// target commit Oid and parsed paths. Returns `(valid, paths)` with
 /// `valid=false` when the tag message schema is violated (rollback rejects
 /// invalid checkpoints fail-closed per AC-10).
-fn resolve_checkpoint(
+pub(crate) fn resolve_checkpoint(
     repo: &Repository,
     agent_id: &str,
     label: &str,
@@ -959,16 +1017,70 @@ fn resolve_checkpoint(
     }
 }
 
-/// Internal rollback driver — runs inside the blocking closure after the
-/// coord mutex has been acquired.
-fn do_rollback(
+/// Path-count and blob-byte totals of a restore plan (R3: compose checks these
+/// outside L1; the git crate itself bounds by [`crate::user_lane::MAX_RESTORE_PATHS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestorePlanSummary {
+    pub path_count: usize,
+    pub blob_bytes: u64,
+}
+
+/// The path lists of one rollback / restore, built from trees with no disk writes.
+pub(crate) struct RollbackPlan {
+    pub target_oid: Oid,
+    pub checkout_paths: Vec<PathBuf>,
+    pub removal_paths: Vec<PathBuf>,
+    pub workdir: PathBuf,
+    pub agent_root_abs: PathBuf,
+    pub agent_root_rel: String,
+    pub child_territories_rel: Vec<PathBuf>,
+    pub ignorecase: bool,
+}
+
+impl RollbackPlan {
+    #[allow(dead_code)] // OSS-6 compose cap reads this from the plan hook.
+    pub(crate) fn summary(&self, repo: &Repository) -> RestorePlanSummary {
+        let path_count = self
+            .checkout_paths
+            .len()
+            .saturating_add(self.removal_paths.len());
+        let mut blob_bytes = 0u64;
+        if let Ok(commit) = repo.find_commit(self.target_oid) {
+            if let Ok(tree) = commit.tree() {
+                for p in &self.checkout_paths {
+                    if let Ok(entry) = tree.get_path(p) {
+                        if entry.kind() == Some(ObjectType::Blob) {
+                            if let Ok(blob) = repo.find_blob(entry.id()) {
+                                blob_bytes = blob_bytes
+                                    .saturating_add(u64::try_from(blob.size()).unwrap_or(u64::MAX));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        RestorePlanSummary {
+            path_count,
+            blob_bytes,
+        }
+    }
+
+    /// Files on disk that are strict prefixes of a checkout path (the entries
+    /// [`clear_workdir_shape_conflicts`] would unlink).
+    pub(crate) fn shape_prefixes(&self, workdir: &Path) -> Vec<PathBuf> {
+        collect_shape_prefixes(workdir, &self.checkout_paths)
+    }
+}
+
+/// Plan phase of [`do_rollback`]: tree reads only.
+pub(crate) fn plan_rollback(
     repo: &Repository,
     canonical_repo: &Path,
     agent_id: &str,
     target: RollbackTarget,
     mode: RollbackMode,
-) -> Result<Vec<PathBuf>, RollbackError> {
-    // Validate agent_id up front.
+) -> Result<RollbackPlan, RollbackError> {
+    refuse_user_namespace(agent_id)?;
     crate::checkpoint::validate_ref_component(agent_id, "agent_id")
         .map_err(RollbackError::Checkpoint)?;
 
@@ -1118,9 +1230,37 @@ fn do_rollback(
         }
     };
 
+    Ok(RollbackPlan {
+        target_oid,
+        checkout_paths,
+        removal_paths,
+        workdir: canonical_repo.to_path_buf(),
+        agent_root_abs,
+        agent_root_rel,
+        child_territories_rel,
+        ignorecase,
+    })
+}
+
+/// Apply phase of [`do_rollback`]. `update_index: false` is the restore_tree
+/// path (it writes the index from the forward commit's tree itself).
+pub(crate) fn apply_rollback(
+    repo: &Repository,
+    plan: &RollbackPlan,
+    update_index: bool,
+) -> Result<Vec<PathBuf>, RollbackError> {
+    let checkout_paths = plan.checkout_paths.clone();
+    let removal_paths = plan.removal_paths.clone();
+    let agent_root_abs = &plan.agent_root_abs;
+    let agent_root_rel = &plan.agent_root_rel;
+    let child_territories_rel = &plan.child_territories_rel;
+    let ignorecase = plan.ignorecase;
+    let workdir = plan.workdir.as_path();
     if checkout_paths.is_empty() && removal_paths.is_empty() {
         return Ok(Vec::new());
     }
+    let target_commit = repo.find_commit(plan.target_oid)?;
+    let target_tree = target_commit.tree()?;
 
     // Check out each path from the target commit FIRST. `CheckoutBuilder::path`
     // restricts the checkout to the declared paths only — other workdir entries
@@ -1150,6 +1290,7 @@ fn do_rollback(
 
         let mut builder = CheckoutBuilder::new();
         builder.force();
+        builder.update_index(update_index);
         // CRITICAL (Slice B adversarial R16 C1): `CheckoutBuilder::path` feeds
         // libgit2 a PATHSPEC, not an exact path — by default `*`/`?`/`[..]` are
         // glob metacharacters. A validated literal like `worker/*` (a file
@@ -1271,6 +1412,41 @@ fn do_rollback(
     let mut affected = checkout_paths;
     affected.extend(removed);
     Ok(affected)
+}
+
+fn do_rollback(
+    repo: &Repository,
+    canonical_repo: &Path,
+    agent_id: &str,
+    target: RollbackTarget,
+    mode: RollbackMode,
+) -> Result<Vec<PathBuf>, RollbackError> {
+    let plan = plan_rollback(repo, canonical_repo, agent_id, target, mode)?;
+    apply_rollback(repo, &plan, true)
+}
+
+fn collect_shape_prefixes(workdir: &Path, checkout_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for p in checkout_paths {
+        let mut prefix = PathBuf::new();
+        let comps: Vec<_> = p.components().collect();
+        for (idx, comp) in comps.iter().enumerate() {
+            prefix.push(comp.as_os_str());
+            if idx.saturating_add(1) == comps.len() {
+                break;
+            }
+            let abs = workdir.join(&prefix);
+            match std::fs::symlink_metadata(&abs) {
+                Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {
+                    out.push(prefix.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Read the current HEAD commit's tree, or `None` when HEAD is unborn / the
@@ -1507,7 +1683,7 @@ fn expand_pathscoped_subtree(
 /// Whether a path is excluded from the writable domain per PRD §7.2.
 /// `agent_prefix` is the root-relative agent root with trailing `/`, or
 /// empty for the root agent.
-fn is_excluded_from_writable_domain(
+pub(crate) fn is_excluded_from_writable_domain(
     path: &str,
     agent_prefix: &str,
     child_territories: &[PathBuf],

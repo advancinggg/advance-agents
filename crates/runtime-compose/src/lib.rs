@@ -103,6 +103,8 @@ pub mod client_api_adapters;
 pub mod client_api_agents;
 pub mod client_api_costs;
 pub mod client_api_entities;
+pub mod client_api_files;
+pub mod client_api_git;
 pub mod client_api_packs;
 // CONTRACT-190 providers family (lane providers-family, 2026-09-16): the production
 // `ProviderAdminProvider` over the shared `llm-providers` writer, the daemon's live

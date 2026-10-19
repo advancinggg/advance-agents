@@ -19,7 +19,8 @@ use advance_client_api::{
     BoundHistoryPage, BoundHistoryReadPort, BoundMutationOutcome, ClientAgentCostEntry,
     ClientAgentCostReport, ClientAgentDeleteResult, ClientAgentDetail, ClientAgentSummary,
     ClientAgentTemplate, ClientAgentTreeNode, ClientAgentsMd, ClientApi, ClientApiConfig,
-    ClientApiServer, ClientCreateAgentRequest, ClientCreateProviderRequest, ClientCursorCodec,
+    ClientApiServer, ClientContextEmbedding, ClientContextIndex, ClientContextSnapshot,
+    ClientCreateAgentRequest, ClientCreateProviderRequest, ClientCursorCodec,
     ClientDeleteAgentRequest, ClientEntityApplyRequest, ClientEntityCreateRequest,
     ClientEntityPage, ClientEntityPatchRequest, ClientEntityQueryRequest, ClientEntityRow,
     ClientEntityTarget, ClientErrorCode, ClientEventProvider, ClientMessageAck,
@@ -29,13 +30,13 @@ use advance_client_api::{
     ClientProviderPreflightResult, ClientProviderSummary, ClientRequest, ClientRunMutation,
     ClientRunSummary, ClientSchema, ClientSecretsMode, ClientSession, ClientSetAgentsMdRequest,
     ClientSetSecretsModeRequest, ClientToolInventory, ClientUpdateAgentRequest,
-    ClientUpdateProviderRequest, CostProvider, DeltaHoldSplit, DeltaPumpExit,
-    DeltaPumpExitObserver, EntityProvider, HandlerSpec, LlmDeltaHub, MemoryCursorKeyCustody,
-    MessagingProvider, Method, NormalizedEventFilter, OsCursorEntropy, PackAdminProvider, Platform,
-    Principal, ProviderAdminOutcome, ProviderAdminProvider, ProviderClientDoneReceipt,
-    ProviderError, ProviderMutationRecovery, ProviderPrepareOutcome, RawEventRow,
-    RunControlProvider, Scope, SecretsAdminProvider, SystemCursorClock, ToolsProvider,
-    ValidatedCostWindow, API_VERSION, CLIENT_WS_PROTOCOL,
+    ClientUpdateProviderRequest, ContextInspectProvider, CostProvider, DeltaHoldSplit,
+    DeltaPumpExit, DeltaPumpExitObserver, EntityProvider, HandlerSpec, LlmDeltaHub,
+    MemoryCursorKeyCustody, MessagingProvider, Method, NormalizedEventFilter, OsCursorEntropy,
+    PackAdminProvider, Platform, Principal, ProviderAdminOutcome, ProviderAdminProvider,
+    ProviderClientDoneReceipt, ProviderError, ProviderMutationRecovery, ProviderPrepareOutcome,
+    RawEventRow, RunControlProvider, Scope, SecretsAdminProvider, SystemCursorClock, ToolsProvider,
+    ValidatedCostWindow, API_VERSION, CLIENT_WS_PROTOCOL, CONTEXT_TOKEN_ESTIMATE,
 };
 use advance_shared_types::security_validator::LeakDetector;
 use advance_shared_types::sensitive_observation::{
@@ -672,6 +673,23 @@ fn probe<T: ?Sized + 'static>(
     (name, Box::new(move || weak.strong_count() > 0))
 }
 
+struct ContextSentinel;
+
+impl ContextInspectProvider for ContextSentinel {
+    fn snapshot(&self, agent_id: &str) -> Result<ClientContextSnapshot, ProviderError> {
+        Ok(ClientContextSnapshot {
+            agent_id: agent_id.to_string(),
+            estimate: CONTEXT_TOKEN_ESTIMATE.to_string(),
+            latest: None,
+            embedding: ClientContextEmbedding {
+                active: false,
+                model: None,
+            },
+            index: ClientContextIndex { turns: 0, tasks: 0 },
+        })
+    }
+}
+
 /// `clear_providers` empties every provider slot: each provider installed through its builder
 /// (and held by nothing else) is dropped, and the families answer `module_unavailable`.
 #[test]
@@ -694,6 +712,7 @@ fn module_001_ac30_client_api_clear_providers() {
         let redactor = Arc::new(sentinel_redactor());
         let hub = delta_hub();
         let observer: DeltaPumpExitObserver = Arc::new(|_| {});
+        let context = Arc::new(ContextSentinel);
         let probes = vec![
             probe("run", &run),
             probe("messaging", &messaging),
@@ -712,6 +731,7 @@ fn module_001_ac30_client_api_clear_providers() {
             probe("observation_redactor", &redactor),
             probe("llm_delta_hub", &hub),
             probe("delta_pump_observer", &observer),
+            probe("context", &context),
         ];
         let api = ClientApi::new(ClientApiConfig::default())
             .with_run_provider(run)
@@ -730,7 +750,8 @@ fn module_001_ac30_client_api_clear_providers() {
             .with_bound_history_provider(bound_history)
             .with_observation_redactor(redactor)
             .with_llm_delta_hub(hub)
-            .with_delta_pump_observer(observer);
+            .with_delta_pump_observer(observer)
+            .with_context_provider(context);
         (api, probes)
     };
     install_session(&api);
@@ -749,12 +770,24 @@ fn module_001_ac30_client_api_clear_providers() {
 
     let before = api.handle(events_request());
     assert!(before.is_ok(), "events family served before: {before:?}");
+    let context_before =
+        api.handle(ClientRequest::get("/client/agents/root/context").with_session(TOKEN));
+    assert!(
+        context_before.is_ok(),
+        "context family served before: {context_before:?}"
+    );
 
     api.clear_providers();
 
     let after = api.handle(events_request());
     let error = after.error.as_ref().expect("events family refused after");
     assert_eq!(error.code, ClientErrorCode::ModuleUnavailable);
+    let context_after =
+        api.handle(ClientRequest::get("/client/agents/root/context").with_session(TOKEN));
+    assert_eq!(
+        context_after.error_code(),
+        Some(ClientErrorCode::ModuleUnavailable)
+    );
     assert_eq!(
         alive(&probes),
         Vec::<&str>::new(),

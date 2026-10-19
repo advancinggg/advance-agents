@@ -25,6 +25,7 @@
 use crate::coord::git_repo_lock;
 use crate::error::{CheckpointError, DeniedReason};
 use crate::repo::open_repo_internal;
+use crate::user_lane::USER_NAMESPACE;
 use git2::{Repository, Signature};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
@@ -92,6 +93,7 @@ impl NamedCheckpoint for DefaultNamedCheckpoint {
             .lock()
             .expect("git coord mutex poisoned in checkpoint::create");
         let repo = open_repo_internal(&self.canonical_repo)?;
+        refuse_reserved_namespace(agent_id)?;
         validate_ref_component(agent_id, "agent_id")?;
         validate_ref_component(label, "label")?;
         let tag_name = format!("checkpoint/{agent_id}/{label}");
@@ -259,6 +261,7 @@ impl NamedCheckpoint for DefaultNamedCheckpoint {
             .lock()
             .expect("git coord mutex poisoned in checkpoint::delete");
         let repo = open_repo_internal(&self.canonical_repo)?;
+        refuse_reserved_namespace(agent_id)?;
         validate_ref_component(agent_id, "agent_id")?;
         validate_ref_component(label, "label")?;
         let tag_name = format!("checkpoint/{agent_id}/{label}");
@@ -270,6 +273,18 @@ impl NamedCheckpoint for DefaultNamedCheckpoint {
             Err(e) => Err(CheckpointError::from(e)),
         }
     }
+}
+
+/// `user` (any ASCII case) is reserved for named versions (MODULE-003-AC-30).
+/// Generic create/delete refuse it; list stays allowed.
+pub(crate) fn refuse_reserved_namespace(agent_id: &str) -> Result<(), CheckpointError> {
+    if agent_id.eq_ignore_ascii_case(USER_NAMESPACE) {
+        return Err(CheckpointError::InvalidLabel {
+            label: agent_id.to_string(),
+            reason: "reserved checkpoint namespace".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Parse a tag message byte slice, returning `(valid, paths)` per §1.4.3.
@@ -804,5 +819,20 @@ mod tests {
     #[test]
     fn validate_create_path_accepts_stripped_dotslash() {
         assert!(validate_create_path(Path::new("./data/report.md")).is_ok());
+    }
+
+    #[test]
+    fn reserved_user_namespace_refused() {
+        for id in ["user", "USER", "User"] {
+            let err = refuse_reserved_namespace(id).unwrap_err();
+            match err {
+                CheckpointError::InvalidLabel { label, reason } => {
+                    assert_eq!(label, id);
+                    assert_eq!(reason, "reserved checkpoint namespace");
+                }
+                other => panic!("expected InvalidLabel, got {other:?}"),
+            }
+        }
+        assert!(refuse_reserved_namespace("writer").is_ok());
     }
 }

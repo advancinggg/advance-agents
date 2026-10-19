@@ -131,6 +131,8 @@ pub mod log_keys {
     pub const REAP_DEFERRED_SETTLE_PANICKED: &str = "reap.deferred_settle_panicked";
     /// stderr: a turn-end stream reap panicked.
     pub const REAP_TURN_END_PANICKED: &str = "reap.turn_end_reap_panicked";
+    /// stderr: a `.meta.yaml` could not be loaded, so VLM writeback stopped.
+    pub const VLM_META_LOAD_FAILED: &str = "vlm.meta_load_failed";
     /// stderr: a `.meta.yaml` entry could not be ensured for a described file.
     pub const VLM_META_ENSURE_FAILED: &str = "vlm.meta_ensure_failed";
     /// stderr: a `.meta.yaml` description update failed.
@@ -175,6 +177,8 @@ pub mod log_keys {
     pub const CLIENT_API_LISTENING_IN_PROCESS: &str = "wiring.client_api_listening_in_process";
     /// stderr: the Client API is unavailable (loopback bind failed).
     pub const CLIENT_API_UNAVAILABLE: &str = "wiring.client_api_unavailable";
+    /// stderr: the files core did not start; `/client/files/*` answers `module_unavailable`.
+    pub const FILES_CORE_UNAVAILABLE: &str = "wiring.files_core_unavailable";
     /// stderr: the Client API listener was bound again on its previous port.
     pub const CLIENT_API_REBOUND: &str = "compose.client_api_rebound";
     /// stderr: the Client API listener moved to a new port.
@@ -263,6 +267,9 @@ pub mod log_keys {
     pub const ROLLBACK_COMPENSATING_COMMIT_FAILED: &str = "rollback.compensating_commit_failed";
     /// stderr: an in-process launch through `InProcessLauncher` failed.
     pub const ATTACH_LAUNCH_FAILED: &str = "attach.launch_failed";
+    /// stderr: a declared agent alias folds to the reserved `user` namespace;
+    /// the agent still boots (MODULE-003-AC-30).
+    pub const AGENT_ALIAS_RESERVED: &str = "compose.agent_alias_reserved";
 
     /// Every key above, in catalogue order.
     pub const ALL: &[&str] = &[
@@ -303,6 +310,7 @@ pub mod log_keys {
         MCP_TOOLS_NOT_SHOWN,
         REAP_DEFERRED_SETTLE_PANICKED,
         REAP_TURN_END_PANICKED,
+        VLM_META_LOAD_FAILED,
         VLM_META_ENSURE_FAILED,
         VLM_META_UPDATE_FAILED,
         VLM_META_WRITE_FAILED,
@@ -322,6 +330,7 @@ pub mod log_keys {
         CLIENT_API_LISTENING,
         CLIENT_API_LISTENING_IN_PROCESS,
         CLIENT_API_UNAVAILABLE,
+        FILES_CORE_UNAVAILABLE,
         CLIENT_API_REBOUND,
         CLIENT_API_MOVED,
         CLIENT_API_REBIND_FAILED,
@@ -360,6 +369,7 @@ pub mod log_keys {
         ROLLBACK_SIDECAR_REMOVE_FAILED,
         ROLLBACK_COMPENSATING_COMMIT_FAILED,
         ATTACH_LAUNCH_FAILED,
+        AGENT_ALIAS_RESERVED,
     ];
 }
 

@@ -920,12 +920,16 @@ async fn t26_commit_with_event_bus_emits_complete_redacted_payload() {
     let oid = queue.submit(req).await.unwrap().unwrap();
 
     let events = bus.drain();
+    let commits: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "git.commit")
+        .collect();
     assert_eq!(
-        events.len(),
+        commits.len(),
         1,
-        "exactly one git.commit per successful commit"
+        "exactly one git.commit per successful commit (files.changed rows are T44)"
     );
-    let e = &events[0];
+    let e = commits[0];
     assert_eq!(e.event_type, "git.commit");
     assert_eq!(e.agent_id, "tester");
     assert_eq!(e.payload["agent_id"], "tester");
@@ -1022,6 +1026,10 @@ async fn t26_event_visible_before_submit_ack_and_micro_type_tagged() {
     queue.submit(req).await.unwrap().unwrap();
     // No sleeps/yields: the ack itself is the ordering guarantee.
     let events = bus.drain();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].payload["commit_type"], "micro");
+    let commits: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "git.commit")
+        .collect();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].payload["commit_type"], "micro");
 }

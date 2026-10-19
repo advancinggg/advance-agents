@@ -617,3 +617,354 @@ pub async fn bootstrap_real_git_sync(repo_dir: &std::path::Path) -> RealGitFixtu
         repo_path: repo_dir.to_path_buf(),
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OSS-5e operator harness.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use advance_git::{
+    AdoptPolicy, CommitLabel, DefaultGitCommitQueue, GitError, PrepareOutcome, PrepareRequest,
+    PrepareTarget, RestoreOutcome, RestoreTreeRequest, SaveVersionOutcome, SaveVersionRequest,
+    StaticGitConfigProvider, UserCommitLane, UserCommitOutcome, UserCommitRequest,
+    UserCommitStatus,
+};
+use cap_fs::operator::{
+    FileUploadHandle, FileWriteTarget, FilesActor, GitVcsReadPort, OperatorFiles,
+    OperatorFilesConfig, OperatorLimits, VcsReadPort, WriteIntent, WriteResult,
+};
+use cap_fs::{DefaultAtomicWriter, MetaMaintainer, MetaSchemaLoader};
+use tokio::sync::oneshot;
+
+pub fn operator_actor() -> FilesActor {
+    FilesActor {
+        principal_id: "advance".into(),
+        os_user: "advance".into(),
+        platform: "macos".into(),
+        session_ref: "sess-oss5e".into(),
+    }
+}
+
+pub fn empty_prepare() -> PrepareOutcome {
+    PrepareOutcome {
+        head_sha: None,
+        adopted_sha: None,
+        adopted_paths: Vec::new(),
+        adopted_count: 0,
+        states: Vec::new(),
+        tree_states: Vec::new(),
+        unversioned: Vec::new(),
+        unversioned_count: 0,
+        unversioned_bytes: 0,
+        agent_territory: false,
+        adopt_incomplete: false,
+    }
+}
+
+/// Records prepare/commit and optionally forwards to a real queue.
+pub struct RecordingLane {
+    pub prepares: Mutex<Vec<PrepareRequest>>,
+    pub commits: Mutex<Vec<UserCommitRequest>>,
+    pub saves: Mutex<Vec<SaveVersionRequest>>,
+    inner: Option<Arc<DefaultGitCommitQueue>>,
+    forced_prepare: Mutex<Option<PrepareOutcome>>,
+    maintainer: Mutex<Option<Arc<MetaMaintainer>>>,
+    pub lock_free_after_enqueue: Arc<Mutex<Vec<bool>>>,
+}
+
+impl RecordingLane {
+    pub fn mock() -> Arc<Self> {
+        Arc::new(Self {
+            prepares: Mutex::new(Vec::new()),
+            commits: Mutex::new(Vec::new()),
+            saves: Mutex::new(Vec::new()),
+            inner: None,
+            forced_prepare: Mutex::new(None),
+            maintainer: Mutex::new(None),
+            lock_free_after_enqueue: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    pub fn wrapping(
+        queue: Arc<DefaultGitCommitQueue>,
+        maintainer: Arc<MetaMaintainer>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            prepares: Mutex::new(Vec::new()),
+            commits: Mutex::new(Vec::new()),
+            saves: Mutex::new(Vec::new()),
+            inner: Some(queue),
+            forced_prepare: Mutex::new(None),
+            maintainer: Mutex::new(Some(maintainer)),
+            lock_free_after_enqueue: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    pub fn force_prepare(&self, outcome: PrepareOutcome) {
+        *self.forced_prepare.lock().unwrap() = Some(outcome);
+    }
+
+    pub fn last_prepare(&self) -> PrepareRequest {
+        self.prepares
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("prepare")
+    }
+
+    pub fn sidecar_always_in_last_prepare(&self) -> bool {
+        self.last_prepare().targets.iter().any(|t| match t {
+            PrepareTarget::File { path, adopt } => {
+                path.is_sidecar() && *adopt == AdoptPolicy::Always
+            }
+            PrepareTarget::Tree { .. } => false,
+        })
+    }
+}
+
+impl UserCommitLane for RecordingLane {
+    fn prepare(&self, req: PrepareRequest) -> oneshot::Receiver<Result<PrepareOutcome, GitError>> {
+        self.prepares.lock().unwrap().push(req.clone());
+        if let Some(forced) = self.forced_prepare.lock().unwrap().clone() {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Ok(forced));
+            return rx;
+        }
+        if let Some(inner) = &self.inner {
+            return inner.prepare(req);
+        }
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Ok(empty_prepare()));
+        rx
+    }
+
+    fn commit_user(
+        &self,
+        req: UserCommitRequest,
+    ) -> oneshot::Receiver<Result<UserCommitOutcome, GitError>> {
+        self.commits.lock().unwrap().push(req.clone());
+        if let Some(m) = self.maintainer.lock().unwrap().clone() {
+            let flag = self.lock_free_after_enqueue.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let free = m.try_acquire().is_some();
+                flag.lock().unwrap().push(free);
+            });
+        }
+        if let Some(inner) = &self.inner {
+            return inner.commit_user(req);
+        }
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Ok(UserCommitOutcome {
+            status: UserCommitStatus::Committed,
+            sha: Some("aa".repeat(20)),
+            head_sha: Some("aa".repeat(20)),
+            subject: String::new(),
+            label: CommitLabel::default(),
+            items: Vec::new(),
+            max_tracked_bytes: 10 * 1024 * 1024,
+        }));
+        rx
+    }
+
+    fn save_version(
+        &self,
+        req: SaveVersionRequest,
+    ) -> oneshot::Receiver<Result<SaveVersionOutcome, GitError>> {
+        self.saves.lock().unwrap().push(req.clone());
+        if let Some(inner) = &self.inner {
+            return inner.save_version(req);
+        }
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Ok(SaveVersionOutcome {
+            sha: "bb".repeat(20),
+            label: "20261017-000000".into(),
+            tag: "checkpoint/user/20261017-000000".into(),
+            title: req.title,
+            paths: None,
+            adopted_sha: None,
+            adopt_incomplete: false,
+            unversioned_count: 0,
+        }));
+        rx
+    }
+
+    fn restore_tree(
+        &self,
+        req: RestoreTreeRequest,
+    ) -> oneshot::Receiver<Result<RestoreOutcome, GitError>> {
+        if let Some(inner) = &self.inner {
+            return inner.restore_tree(req);
+        }
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Err(GitError::WorkerClosed));
+        rx
+    }
+}
+
+pub struct OperatorHarness {
+    pub _td: tempfile::TempDir,
+    pub home: PathBuf,
+    pub core: Arc<OperatorFiles>,
+    pub emitter: Arc<TestEmitter>,
+    pub maintainer: Arc<MetaMaintainer>,
+    pub lane: Arc<RecordingLane>,
+    pub queue: Option<Arc<DefaultGitCommitQueue>>,
+}
+
+impl OperatorHarness {
+    pub async fn open_list() -> Self {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let home = std::fs::canonicalize(td.path()).expect("canon");
+        let emitter = Arc::new(TestEmitter::new());
+        let schema_path = home.join(".runtime").join("schema-list.yaml");
+        let _ = std::fs::create_dir_all(schema_path.parent().unwrap());
+        let maintainer = Arc::new(MetaMaintainer::new(
+            Arc::new(MetaSchemaLoader::new_with_default(schema_path)),
+            Arc::new(DefaultAtomicWriter),
+        ));
+        let lane = RecordingLane::mock();
+        let core = OperatorFiles::open(OperatorFilesConfig {
+            home: home.clone(),
+            files_state: home.join(".runtime").join("files"),
+            limits: OperatorLimits::default(),
+            vcs: None,
+            maintainer: Some(Arc::clone(&maintainer)),
+            lane: Some(lane.clone()),
+        })
+        .await
+        .expect("open list operator");
+        Self {
+            _td: td,
+            home,
+            core,
+            emitter,
+            maintainer,
+            lane,
+            queue: None,
+        }
+    }
+
+    pub async fn open() -> Self {
+        Self::open_with_mb(10).await
+    }
+
+    pub async fn open_with_mb(max_tracked_file_mb: u64) -> Self {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let home = std::fs::canonicalize(td.path()).expect("canon");
+        advance_git::bootstrap_repo_at(&home).expect("bootstrap_repo_at");
+        let emitter = Arc::new(TestEmitter::new());
+        let config =
+            Arc::new(StaticGitConfigProvider::new(24, max_tracked_file_mb).expect("git config"));
+        let queue = Arc::new(
+            DefaultGitCommitQueue::spawn_with_config_and_event_bus(
+                home.clone(),
+                config,
+                emitter.clone(),
+            )
+            .expect("queue"),
+        );
+        let schema_path = home.join(".runtime").join("schema-op.yaml");
+        let _ = std::fs::create_dir_all(schema_path.parent().unwrap());
+        let maintainer = Arc::new(MetaMaintainer::new(
+            Arc::new(MetaSchemaLoader::new_with_default(schema_path)),
+            Arc::new(DefaultAtomicWriter),
+        ));
+        let lane = RecordingLane::wrapping(queue.clone(), Arc::clone(&maintainer));
+        let vcs: Arc<dyn VcsReadPort> = Arc::new(GitVcsReadPort::new(home.clone()));
+        let core = OperatorFiles::open(OperatorFilesConfig {
+            home: home.clone(),
+            files_state: home.join(".runtime").join("files"),
+            limits: OperatorLimits::default(),
+            vcs: Some(vcs),
+            maintainer: Some(Arc::clone(&maintainer)),
+            lane: Some(lane.clone()),
+        })
+        .await
+        .expect("open operator");
+        Self {
+            _td: td,
+            home,
+            core,
+            emitter,
+            maintainer,
+            lane,
+            queue: Some(queue),
+        }
+    }
+
+    pub async fn open_mock() -> Self {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let home = std::fs::canonicalize(td.path()).expect("canon");
+        let emitter = Arc::new(TestEmitter::new());
+        let schema_path = home.join(".runtime").join("schema-mock.yaml");
+        let _ = std::fs::create_dir_all(schema_path.parent().unwrap());
+        let maintainer = Arc::new(MetaMaintainer::new(
+            Arc::new(MetaSchemaLoader::new_with_default(schema_path)),
+            Arc::new(DefaultAtomicWriter),
+        ));
+        let lane = RecordingLane::mock();
+        *lane.maintainer.lock().unwrap() = Some(Arc::clone(&maintainer));
+        let core = OperatorFiles::open(OperatorFilesConfig {
+            home: home.clone(),
+            files_state: home.join(".runtime").join("files"),
+            limits: OperatorLimits::default(),
+            vcs: None,
+            maintainer: Some(Arc::clone(&maintainer)),
+            lane: Some(lane.clone()),
+        })
+        .await
+        .expect("open mock operator");
+        Self {
+            _td: td,
+            home,
+            core,
+            emitter,
+            maintainer,
+            lane,
+            queue: None,
+        }
+    }
+
+    pub async fn upload(
+        &self,
+        path: &str,
+        intent: WriteIntent,
+        base_oid: Option<String>,
+        bytes: &[u8],
+    ) -> Result<WriteResult, cap_fs::FilesError> {
+        let actor = operator_actor();
+        let target = FileWriteTarget {
+            path: path.into(),
+            intent,
+            base_oid,
+            expected_bytes: Some(bytes.len() as u64),
+            batch: None,
+        };
+        let sink = self.core.begin_upload(&actor, &target)?;
+        std::fs::write(&sink.staging_path, bytes).expect("stage bytes");
+        self.core
+            .finish_upload(
+                &actor,
+                &target,
+                FileUploadHandle {
+                    token: sink.handle.token,
+                },
+            )
+            .await
+    }
+
+    pub fn names(&self, dir: &str) -> Vec<String> {
+        let listing = self
+            .core
+            .list(&cap_fs::operator::ListQuery {
+                dir: dir.into(),
+                ..cap_fs::operator::ListQuery::default()
+            })
+            .expect("list");
+        listing.entries.into_iter().map(|e| e.name).collect()
+    }
+}

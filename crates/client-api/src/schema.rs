@@ -483,6 +483,114 @@ pub fn generate_schema_artifact() -> SchemaArtifact {
                 "ClientGitRollbackResult",
                 schema_value::<crate::git::ClientGitRollbackResult>(),
             ),
+            (
+                "ClientGitCommitLabel",
+                schema_value::<crate::git::ClientGitCommitLabel>(),
+            ),
+        ] {
+            m.insert(name.to_string(), schema);
+        }
+        for (name, schema) in [
+            (
+                "ClientFileEntry",
+                schema_value::<crate::files::ClientFileEntry>(),
+            ),
+            (
+                "ClientFileList",
+                schema_value::<crate::files::ClientFileList>(),
+            ),
+            (
+                "ClientFileStat",
+                schema_value::<crate::files::ClientFileStat>(),
+            ),
+            (
+                "ClientFileSearchResult",
+                schema_value::<crate::files::ClientFileSearchResult>(),
+            ),
+            (
+                "ClientFileTicket",
+                schema_value::<crate::files::ClientFileTicket>(),
+            ),
+            (
+                "ClientFileCommit",
+                schema_value::<crate::files::ClientFileCommit>(),
+            ),
+            (
+                "ClientFileChange",
+                schema_value::<crate::files::ClientFileChange>(),
+            ),
+            (
+                "ClientFileWriteResult",
+                schema_value::<crate::files::ClientFileWriteResult>(),
+            ),
+            (
+                "ClientFileMutationResult",
+                schema_value::<crate::files::ClientFileMutationResult>(),
+            ),
+            (
+                "ClientFileVersionResult",
+                schema_value::<crate::files::ClientFileVersionResult>(),
+            ),
+            (
+                "ClientFileReadTicketRequest",
+                schema_value::<crate::files::ClientFileReadTicketRequest>(),
+            ),
+            (
+                "ClientFileWriteTicketRequest",
+                schema_value::<crate::files::ClientFileWriteTicketRequest>(),
+            ),
+            (
+                "ClientFileCommitBatchRequest",
+                schema_value::<crate::files::ClientFileCommitBatchRequest>(),
+            ),
+            (
+                "ClientFileMkdirRequest",
+                schema_value::<crate::files::ClientFileMkdirRequest>(),
+            ),
+            (
+                "ClientFileMoveItem",
+                schema_value::<crate::files::ClientFileMoveItem>(),
+            ),
+            (
+                "ClientFileMoveRequest",
+                schema_value::<crate::files::ClientFileMoveRequest>(),
+            ),
+            (
+                "ClientFileDeleteItem",
+                schema_value::<crate::files::ClientFileDeleteItem>(),
+            ),
+            (
+                "ClientFileDeleteRequest",
+                schema_value::<crate::files::ClientFileDeleteRequest>(),
+            ),
+            (
+                "ClientFileRestoreItem",
+                schema_value::<crate::files::ClientFileRestoreItem>(),
+            ),
+            (
+                "ClientFileRestoreRequest",
+                schema_value::<crate::files::ClientFileRestoreRequest>(),
+            ),
+            (
+                "ClientFileSaveVersionRequest",
+                schema_value::<crate::files::ClientFileSaveVersionRequest>(),
+            ),
+            (
+                "ClientFileExternalItem",
+                schema_value::<crate::files::ClientFileExternalItem>(),
+            ),
+            (
+                "ClientFileCommitExternalRequest",
+                schema_value::<crate::files::ClientFileCommitExternalRequest>(),
+            ),
+            (
+                "ClientFileCopyItem",
+                schema_value::<crate::files::ClientFileCopyItem>(),
+            ),
+            (
+                "ClientFileCopyRequest",
+                schema_value::<crate::files::ClientFileCopyRequest>(),
+            ),
         ] {
             m.insert(name.to_string(), schema);
         }
@@ -1068,9 +1176,54 @@ pub fn platform_surface_json(target: &str) -> String {
             "Idempotency keys are scoped to (principal, method, family, key).",
             "Unknown error codes must be tolerated (forward-compat catch-all).",
             crate::deltas::LLM_DELTA_ABSENT_NOTE
-        ]
+        ],
+        "files": {
+            "family": "files",
+            "json_routes": 13,
+            "raw_route": "/client/files/raw/{ticket}",
+            "detail_registry": crate::files::detail::registry_json(),
+            "note": "Raw GET/HEAD/PUT is transport-owned and is not a ClientApi route."
+        }
     });
     canonical_json(&surface)
+}
+
+/// `conformance/labels.json` from `advance_git::label::golden_cases`.
+pub fn labels_conformance_json() -> String {
+    let rows: Vec<Value> = advance_git::label::golden_cases()
+        .into_iter()
+        .map(|g| {
+            json!({
+                "id": g.id,
+                "template": format!("{:?}", g.template),
+                "subject": g.subject,
+                "message": g.message,
+                "label": {
+                    "op": g.label.op,
+                    "paths": g.label.paths,
+                    "to": g.label.to,
+                    "count": g.label.count,
+                    "lines_added": g.label.lines_added,
+                    "lines_removed": g.label.lines_removed,
+                    "size_bytes": g.label.size_bytes,
+                    "versioned": g.label.versioned,
+                    "from_sha": g.label.from_sha,
+                    "checkpoint": g.label.checkpoint,
+                    "title": g.label.title,
+                    "change": g.label.change,
+                }
+            })
+        })
+        .collect();
+    canonical_json(&Value::Array(rows))
+}
+
+/// `conformance/files-natural-order.json` (H4 includes `descending`).
+pub fn files_natural_order_json() -> String {
+    canonical_json(
+        &serde_json::to_value(advance_shared_types::natural_order::golden_cases())
+            .expect("natural-order golden serializes"),
+    )
 }
 
 /// Extract sorted property keys from a schemars Value (for Cursor-like objects).

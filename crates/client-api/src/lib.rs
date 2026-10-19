@@ -31,6 +31,9 @@ pub mod entities;
 pub mod envelope;
 pub mod events;
 pub mod families;
+pub mod file_ticket;
+pub mod files;
+pub(crate) mod files_raw;
 pub mod git;
 pub mod idempotency;
 // The foreground re-verification proof of an in-process listener (transport-internal).
@@ -75,7 +78,7 @@ pub use costs::{
 pub use cursor::{
     AeadClientCursorCodec, ClientCursorCodec, CursorClock, CursorEntropy, CursorKeyCustody,
     ExtensionSealDomain, MemoryCursorKeyCustody, OpenedSeal, OsCursorEntropy, SealPurpose,
-    SystemCursorClock,
+    SystemCursorClock, SEAL_TAG_FILE_TICKET,
 };
 pub use deltas::{
     open_delta_cursor, resolve_stream_request, seal_delta_cursor, DeltaHoldSplit, DeltaObserver,
@@ -105,10 +108,21 @@ pub use families::{
     NoExtensionRouteHooks, PathDefect, PollEmit, PollStreamDefect, PollStreamSpec, ResponseScan,
     RouteBook, RouteOptions, RouteRefusal, RouteRefusalReason,
 };
+pub use files::{
+    ClientFileChange, ClientFileCommit, ClientFileCommitBatchRequest,
+    ClientFileCommitExternalRequest, ClientFileCopyItem, ClientFileCopyRequest,
+    ClientFileDeleteItem, ClientFileDeleteRequest, ClientFileEntry, ClientFileExternalItem,
+    ClientFileList, ClientFileMkdirRequest, ClientFileMoveItem, ClientFileMoveRequest,
+    ClientFileMutationResult, ClientFileReadTicketRequest, ClientFileRestoreItem,
+    ClientFileRestoreRequest, ClientFileSaveVersionRequest, ClientFileSearchResult, ClientFileStat,
+    ClientFileTicket, ClientFileVersionResult, ClientFileWriteResult, ClientFileWriteTicketRequest,
+    FilesPath, PathUse,
+};
 pub use git::{
-    ClientGitCheckpointEntry, ClientGitCheckpointList, ClientGitCommitEntry, ClientGitCommitPage,
-    ClientGitCreateCheckpointRequest, ClientGitFileAt, ClientGitFileHistory, ClientGitFileVersion,
-    ClientGitRollbackResult, ClientGitStatus, GitHistoryReaderProvider, ValidatedGitCommitQuery,
+    ClientGitCheckpointEntry, ClientGitCheckpointList, ClientGitCommitEntry, ClientGitCommitLabel,
+    ClientGitCommitPage, ClientGitCreateCheckpointRequest, ClientGitFileAt, ClientGitFileHistory,
+    ClientGitFileVersion, ClientGitRollbackResult, ClientGitStatus, GitHistoryReaderProvider,
+    ValidatedGitCommitQuery,
 };
 pub use messages::{ClientMessageAck, ClientMessageStatus, ClientSendMessageRequest};
 pub use packs::{
@@ -118,10 +132,10 @@ pub use packs::{
 };
 pub use pagination::{Cursor, Page};
 pub use provider::{
-    provider_or_unavailable, AgentAdminProvider, CostProvider, EntityProvider, GitHistoryProvider,
-    MessagingProvider, PackAdminProvider, ProviderAdminProvider, ProviderError, RunControlProvider,
-    SecretsAdminProvider, ToolsProvider, AUTH_SOURCE_MISMATCH_DETAIL, PROCESS_FORBIDDEN_DETAIL,
-    UNKNOWN_PROVIDER_DETAIL,
+    provider_or_unavailable, AgentAdminProvider, CostProvider, EntityProvider, FilesProvider,
+    GitHistoryProvider, MessagingProvider, PackAdminProvider, ProviderAdminProvider, ProviderError,
+    RunControlProvider, SecretsAdminProvider, ToolsProvider, AUTH_SOURCE_MISMATCH_DETAIL,
+    PROCESS_FORBIDDEN_DETAIL, TOO_MANY_ENTRIES_DETAIL, UNKNOWN_PROVIDER_DETAIL,
 };
 pub use provider_admin::{
     ClientCreateProviderRequest, ClientProviderCost, ClientProviderDeleteResult, ClientProviderKey,

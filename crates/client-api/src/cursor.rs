@@ -24,6 +24,8 @@ pub const SEAL_TAG_EMPTY_JOIN: u8 = 0x01;
 pub const SEAL_TAG_RAW_ID: u8 = 0x02;
 /// Typed seal tag: tee T2 delta cursor body `{stream_key, seq}` (both-or-neither).
 pub const SEAL_TAG_DELTA_CURSOR: u8 = 0x03;
+/// Typed seal tag: file-ticket binary body (X28).
+pub const SEAL_TAG_FILE_TICKET: u8 = 0x04;
 
 const TOKEN_VERSION: &str = "c1";
 const AAD_DOMAIN_CURSOR: &str = "advance/client-event-cursor";
@@ -32,11 +34,13 @@ const AAD_DOMAIN_EVENT_ID: &str = "advance/client-event-id";
 /// cursors are mutually non-replayable — a token sealed under one domain cannot open under the
 /// other, whatever its tag.
 const AAD_DOMAIN_DELTA_CURSOR: &str = "advance/client-llm-delta-cursor";
+/// File-ticket AAD domain: tickets cannot open as event or delta cursors.
+const AAD_DOMAIN_FILE_TICKET: &str = "advance/client-file-ticket";
 /// Max sealed `stream_key` length inside a delta-cursor body.
 const MAX_DELTA_STREAM_KEY_LEN: usize = 256;
 const MAX_CURSOR_KEYS: usize = 4;
 const MAX_SEALS_PER_KEY: u64 = 4_294_967_295;
-const MAX_TOKEN_LEN: usize = 512;
+const MAX_TOKEN_LEN: usize = 2048;
 const MAX_RAW_ID_LEN: usize = 256;
 const FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
 
@@ -49,6 +53,8 @@ pub enum SealPurpose {
     EventId,
     /// Tee T2 LLM delta reconnect cursor (`{stream_key, seq}`, both-or-neither).
     DeltaCursor,
+    /// Vault file raw-route ticket (binary body, tag `0x04`).
+    FileTicket,
     /// Internal: an extension-scoped raw id. AAD domain `advance/ext/<id>`; only the raw-id tag
     /// seals or opens. Constructed only inside client-api (`ExtensionSealDomain` has a
     /// crate-private constructor), so outside code cannot mint another extension's tokens even
@@ -84,6 +90,8 @@ pub enum OpenedSeal {
     /// Tee T2 delta cursor: the sealed body carries BOTH fields (both-or-neither — the body
     /// encoding is structurally complete or the open rejects; no half state exists).
     DeltaCursor { stream_key: String, seq: u64 },
+    /// File-ticket binary body (X28).
+    FileTicket(Vec<u8>),
 }
 
 /// Injectable wall clock (milliseconds since Unix epoch).
@@ -215,6 +223,7 @@ impl AeadClientCursorCodec {
             SealPurpose::Cursor => Cow::Borrowed(AAD_DOMAIN_CURSOR),
             SealPurpose::EventId => Cow::Borrowed(AAD_DOMAIN_EVENT_ID),
             SealPurpose::DeltaCursor => Cow::Borrowed(AAD_DOMAIN_DELTA_CURSOR),
+            SealPurpose::FileTicket => Cow::Borrowed(AAD_DOMAIN_FILE_TICKET),
             SealPurpose::Extension(domain) => {
                 Cow::Owned(format!("advance/ext/{}", domain.extension()))
             }
@@ -317,6 +326,8 @@ impl AeadClientCursorCodec {
             if decode_delta_cursor_body(body).is_none() {
                 return Err(Self::err_unavailable());
             }
+        } else if tag == SEAL_TAG_FILE_TICKET {
+            // Binary X28 body; length is checked by the files ticket codec.
         } else {
             // Plaintext must be valid UTF-8 for open (raw id / watermark body).
             if std::str::from_utf8(body).is_err() {
@@ -379,10 +390,17 @@ impl AeadClientCursorCodec {
         tag: u8,
         body: &[u8],
     ) -> Result<String, ClientError> {
-        if tag != SEAL_TAG_EMPTY_JOIN && tag != SEAL_TAG_RAW_ID && tag != SEAL_TAG_DELTA_CURSOR {
+        if tag != SEAL_TAG_EMPTY_JOIN
+            && tag != SEAL_TAG_RAW_ID
+            && tag != SEAL_TAG_DELTA_CURSOR
+            && tag != SEAL_TAG_FILE_TICKET
+        {
             return Err(Self::err_unavailable());
         }
         if (tag == SEAL_TAG_DELTA_CURSOR) != (purpose == SealPurpose::DeltaCursor) {
+            return Err(Self::err_unavailable());
+        }
+        if (tag == SEAL_TAG_FILE_TICKET) != (purpose == SealPurpose::FileTicket) {
             return Err(Self::err_unavailable());
         }
         self.seal_after_purpose_tag(purpose, stream_id, tag, body, false)
@@ -397,12 +415,19 @@ impl ClientCursorCodec for AeadClientCursorCodec {
         tag: u8,
         body: &[u8],
     ) -> Result<String, ClientError> {
-        if tag != SEAL_TAG_EMPTY_JOIN && tag != SEAL_TAG_RAW_ID && tag != SEAL_TAG_DELTA_CURSOR {
+        if tag != SEAL_TAG_EMPTY_JOIN
+            && tag != SEAL_TAG_RAW_ID
+            && tag != SEAL_TAG_DELTA_CURSOR
+            && tag != SEAL_TAG_FILE_TICKET
+        {
             return Err(Self::err_unavailable());
         }
         // Purpose↔tag consistency: the delta tag seals ONLY under the delta purpose and vice
         // versa (belt-and-braces on top of the AAD domain split).
         if (tag == SEAL_TAG_DELTA_CURSOR) != (purpose == SealPurpose::DeltaCursor) {
+            return Err(Self::err_unavailable());
+        }
+        if (tag == SEAL_TAG_FILE_TICKET) != (purpose == SealPurpose::FileTicket) {
             return Err(Self::err_unavailable());
         }
         self.seal_after_purpose_tag(purpose, stream_id, tag, body, true)
@@ -471,6 +496,7 @@ impl ClientCursorCodec for AeadClientCursorCodec {
         match tag {
             SEAL_TAG_EMPTY_JOIN => {
                 if purpose == SealPurpose::DeltaCursor
+                    || purpose == SealPurpose::FileTicket
                     || matches!(purpose, SealPurpose::Extension(_))
                 {
                     return Err(Self::err_not_found());
@@ -481,7 +507,7 @@ impl ClientCursorCodec for AeadClientCursorCodec {
                 Ok(OpenedSeal::EmptyJoin)
             }
             SEAL_TAG_RAW_ID => {
-                if purpose == SealPurpose::DeltaCursor {
+                if purpose == SealPurpose::DeltaCursor || purpose == SealPurpose::FileTicket {
                     return Err(Self::err_not_found());
                 }
                 if body.len() > MAX_RAW_ID_LEN {
@@ -499,6 +525,12 @@ impl ClientCursorCodec for AeadClientCursorCodec {
                 let (stream_key, seq) =
                     decode_delta_cursor_body(body).ok_or_else(Self::err_not_found)?;
                 Ok(OpenedSeal::DeltaCursor { stream_key, seq })
+            }
+            SEAL_TAG_FILE_TICKET => {
+                if purpose != SealPurpose::FileTicket {
+                    return Err(Self::err_not_found());
+                }
+                Ok(OpenedSeal::FileTicket(body.to_vec()))
             }
             _ => Err(Self::err_not_found()),
         }

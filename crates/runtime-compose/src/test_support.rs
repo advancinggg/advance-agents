@@ -15,6 +15,7 @@ use advance_run_manager::RunManager;
 use advance_runtime::capability_injector::{CapabilityInjector, ComponentCtx};
 use advance_runtime::host_registry::HostRegistry;
 use advance_runtime::ComponentRuntime;
+use cap_fs::{MetaMaintainer, OperatorFiles};
 use cap_grant::{GrantApprovalIntake, GrantStore};
 use cap_llm::{LlmGateway, ModelProfileCatalog};
 use cap_tools::{LazyToolRegistry, ToolRegistry};
@@ -195,6 +196,10 @@ pub struct ProbeRecord {
     pub event_bus: Option<Weak<EventBus>>,
     pub llm_gateway: Option<Weak<LlmGateway>>,
     pub git_queue: Option<Weak<DefaultGitCommitQueue>>,
+    pub files_core: Option<Weak<OperatorFiles>>,
+    pub meta_maintainer: Option<Weak<MetaMaintainer>>,
+    /// `Some(true)` when pack_runtime received the workspace meta-schema (fs homes).
+    pub pack_schema_attached: Option<bool>,
     /// Git-family PR-1: the workspace repository's state after the step-1b bootstrap.
     pub git_repo_status: Option<advance_git::GitRepoStatus>,
     pub perchild_manager: Option<Weak<PerChildLoopManager>>,
@@ -258,6 +263,8 @@ impl ProbeRecord {
             ("event_bus", alive(&self.event_bus)),
             ("llm_gateway", alive(&self.llm_gateway)),
             ("git_queue", alive(&self.git_queue)),
+            ("files_core", alive(&self.files_core)),
+            ("meta_maintainer", alive(&self.meta_maintainer)),
             ("perchild_manager", alive(&self.perchild_manager)),
             ("run_manager", alive(&self.run_manager)),
             ("component_runtime", alive(&self.component_runtime)),

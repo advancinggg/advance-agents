@@ -84,6 +84,26 @@ pub struct ClientApiConfig {
     pub llm_deltas_enabled: bool,
     /// Login admission. Default [`SessionAdmission::SameUserLoopback`].
     pub session_admission: SessionAdmission,
+    /// Raw PUT body cap (default 1 GiB).
+    pub max_upload_bytes: u64,
+    /// Concurrent raw GET/HEAD streams per listener (default 16).
+    pub raw_read_slots: usize,
+    /// Concurrent raw PUT streams per listener (default 4).
+    pub raw_upload_slots: usize,
+    /// Concurrent raw GET/HEAD streams per session (default 8).
+    pub raw_session_read_slots: usize,
+    /// Concurrent raw PUT streams per session (default 2).
+    pub raw_session_upload_slots: usize,
+    /// Raw GET idle without consumer progress (default 5 minutes).
+    pub raw_idle_ms: u64,
+    /// Raw PUT stall with no bytes (default 60 s).
+    pub raw_stall_ms: u64,
+    /// Raw PUT minimum sustained rate (default 256 KiB/s).
+    pub raw_min_rate_bps: u64,
+    /// Dedicated `files.raw` idempotency TTL (default 120 s).
+    pub files_raw_idempotency_ttl_ms: u64,
+    /// Dedicated `files.raw` idempotency cap (default 4096).
+    pub files_raw_idempotency_cap: usize,
 }
 
 impl Default for ClientApiConfig {
@@ -115,6 +135,16 @@ impl Default for ClientApiConfig {
             max_concurrent_dispatch: 64,
             llm_deltas_enabled: true,
             session_admission: SessionAdmission::SameUserLoopback,
+            max_upload_bytes: 1 << 30,
+            raw_read_slots: 16,
+            raw_upload_slots: 4,
+            raw_session_read_slots: 8,
+            raw_session_upload_slots: 2,
+            raw_idle_ms: 5 * MINUTE_MS,
+            raw_stall_ms: 60_000,
+            raw_min_rate_bps: 256 * 1024,
+            files_raw_idempotency_ttl_ms: 120_000,
+            files_raw_idempotency_cap: 4096,
         }
     }
 }

@@ -497,7 +497,12 @@ pub fn validate_create_request_with(
     admits: &dyn Fn(&str) -> bool,
 ) -> Result<(), ClientError> {
     match &req.agent_id {
-        Some(id) => validate_agent_id(id)?,
+        Some(id) => {
+            validate_agent_id(id)?;
+            if id.eq_ignore_ascii_case("user") {
+                return Err(crate::files::detail::reserved_agent_id());
+            }
+        }
         None if req.display_name.is_none() => {
             return Err(invalid("agent_id or display_name is required"));
         }

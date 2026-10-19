@@ -135,6 +135,17 @@ pub fn is_event_whitelisted(event_type: &str) -> bool {
     WHITELIST.contains(&event_type)
 }
 
+/// INTEGRATED R4: skip Trigger Bus fan-out for `git.commit` when
+/// `commit_type=user` or `op=adopt`. Payload keys match `advance_git::emit`.
+fn skip_git_commit_trigger(event: &Event) -> bool {
+    if event.event_type != "git.commit" {
+        return false;
+    }
+    let commit_type = event.payload.get("commit_type").and_then(|v| v.as_str());
+    let op = event.payload.get("op").and_then(|v| v.as_str());
+    commit_type == Some("user") || op == Some("adopt")
+}
+
 /// Caller-side admission validation — pure helper.
 ///
 /// **Why this exists as a separate helper**: the canonical CONTRACT-131
@@ -1000,6 +1011,11 @@ impl TriggerBusDispatch for TriggerBusDispatchImpl {
             });
             return;
         }
+        // INTEGRATED R4: user-lane and adopt `git.commit` still reach the
+        // EventBus / projection, but they must not fire Trigger Bus watchers.
+        if skip_git_commit_trigger(&event) {
+            return;
+        }
         // 3. Chain-id extraction
         let chain_id = match extract_chain_id(&event) {
             Ok(c) => c,
@@ -1408,6 +1424,57 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].subscription_id, sub_id);
         assert_eq!(drained[0].next_depth, 1);
+    }
+
+    #[test]
+    fn git_commit_user_skipped_by_trigger_dispatch() {
+        let bus = TriggerBusDispatchImpl::new();
+        let sub_id = bus.subscribe(sub("git.commit"));
+        let mut event = make_event("git.commit", "evt-user");
+        event.payload = serde_json::json!({"commit_type": "user", "op": "edit"});
+        bus.dispatch(event);
+        assert!(bus.drain_for_subscription(sub_id).is_empty());
+        assert!(bus.cycle_rejected_log().is_empty());
+        assert_eq!(bus.pending_total(), 0);
+    }
+
+    #[test]
+    fn git_commit_adopt_skipped_by_trigger_dispatch() {
+        let bus = TriggerBusDispatchImpl::new();
+        let sub_id = bus.subscribe(sub("git.commit"));
+        let mut event = make_event("git.commit", "evt-adopt");
+        event.payload = serde_json::json!({"commit_type": "micro", "op": "adopt"});
+        bus.dispatch(event);
+        assert!(bus.drain_for_subscription(sub_id).is_empty());
+        assert!(bus.cycle_rejected_log().is_empty());
+        assert_eq!(bus.pending_total(), 0);
+    }
+
+    #[test]
+    fn git_commit_agent_still_dispatched() {
+        let bus = TriggerBusDispatchImpl::new();
+        let sub_id = bus.subscribe(sub("git.commit"));
+        let mut event = make_event("git.commit", "evt-turn");
+        event.payload = serde_json::json!({"commit_type": "turn", "op": "write"});
+        bus.dispatch(event);
+        let drained = bus.drain_for_subscription(sub_id);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].event.payload["commit_type"], "turn");
+    }
+
+    #[test]
+    fn files_changed_is_registered_never_a_trigger() {
+        assert!(!is_event_whitelisted("files.changed"));
+        let bus = TriggerBusDispatchImpl::new();
+        let id = bus.subscribe(sub("files.changed"));
+        assert_eq!(id, SubscriptionId::REJECTED);
+        bus.dispatch(make_event("files.changed", "evt-fc"));
+        assert!(matches!(
+            &bus.cycle_rejected_log()[0],
+            CycleRejection::EventTypeNotWhitelisted { event_type }
+                if event_type == "files.changed"
+        ));
+        assert_eq!(bus.pending_total(), 0);
     }
 
     #[test]

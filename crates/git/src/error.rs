@@ -164,6 +164,20 @@ impl From<GitError> for RollbackError {
                 target: format!("{field}={value}"),
                 reason,
             },
+            // User lane (ADR 2026-10-15, MODULE-003 §2.8): the refusal token is the
+            // reason; the target names the refused path when there is one.
+            GitError::InvalidUserOp { reason, path } => Self::InvalidTarget {
+                target: user_op_target(path.as_deref()),
+                reason: reason.as_token().to_string(),
+            },
+            GitError::ContentChanged { .. } => Self::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            )),
+            GitError::HeadMoved { .. } => Self::Libgit2 {
+                code: HEAD_MOVED_CODE.to_string(),
+                message: e.to_string(),
+            },
         }
     }
 }
@@ -202,7 +216,149 @@ impl From<GitError> for CheckpointError {
                 label: format!("{field}={value}"),
                 reason,
             },
+            // User lane (ADR 2026-10-15, MODULE-003 §2.8): same mapping shape as the
+            // rollback boundary above.
+            GitError::InvalidUserOp { reason, path } => Self::InvalidLabel {
+                label: user_op_target(path.as_deref()),
+                reason: reason.as_token().to_string(),
+            },
+            GitError::ContentChanged { .. } => Self::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            )),
+            GitError::HeadMoved { .. } => Self::Libgit2 {
+                code: HEAD_MOVED_CODE.to_string(),
+                message: e.to_string(),
+            },
         }
+    }
+}
+
+/// The `code` a [`GitError::HeadMoved`] carries across the rollback and checkpoint
+/// boundaries (MODULE-003 §2.8).
+const HEAD_MOVED_CODE: &str = "HeadMoved";
+
+/// The `target` / `label` of a converted [`GitError::InvalidUserOp`]: the refused path,
+/// or `user-lane` when the refusal names none.
+fn user_op_target(path: Option<&std::path::Path>) -> String {
+    path.map_or_else(|| "user-lane".to_string(), |p| p.display().to_string())
+}
+
+/// Why the user commit lane refused a request (ADR 2026-10-15, CONTRACT-247,
+/// MODULE-003 §2.8). A closed set of tokens that never carry user content.
+///
+/// The Client API maps five of them to their own registry entries (MODULE-020 §2.8):
+/// `TargetExists` → `already_exists ["target_exists"]`, `PrivatePath` → `not_found`,
+/// `ReadOnlyPath` → `forbidden ["read_only","reason:agent_system|vcs_control"]`,
+/// `AgentTerritory` → `forbidden ["read_only","reason:contains_territory"]`,
+/// `ReservedNamespace` → `invalid_request ["reserved_namespace"]`. Any other reason is a
+/// provider bug on the files routes and `invalid_request [<token>]` on the git rollback
+/// route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UserOpRefusal {
+    /// The op's changes do not have the op's shape (MODULE-003 §1.4.1), or a user-lane-only
+    /// commit type reached the legacy `submit`.
+    OpShape,
+    /// A path failed the shared-types `workspace_path` grammar.
+    InvalidPath,
+    /// A path is Private or Junk (never addressable by the user).
+    PrivatePath,
+    /// A path is read-only for the user (`.agent/**`, `.gitignore`, `.gitattributes`,
+    /// `.gitmodules`).
+    ReadOnlyPath,
+    /// A version title is empty or longer than 80 scalars after normalization.
+    InvalidTitle,
+    /// More than `MAX_USER_CHANGES` changes in one request.
+    TooManyChanges,
+    /// More than `MAX_USER_BYTES` of `Bytes` content in one request.
+    TooManyBytes,
+    /// The same tree path appears twice.
+    DuplicatePath,
+    /// A change sits under a folder the same request removes, moves or copies.
+    NestedChange,
+    /// Two paths fold equal under `core.ignorecase`.
+    CaseCollision,
+    /// A file would replace a folder (or the reverse) without the explicit form.
+    TypeConflict,
+    /// A create or destination path already exists.
+    TargetExists,
+    /// A source path does not exist.
+    SourceMissing,
+    /// A symbolic link sits where the op writes.
+    Symlink,
+    /// A folder op would carry an agent territory (`.agent`).
+    AgentTerritory,
+    /// A tree walk or plan exceeded its bound.
+    TreeTooLarge,
+    /// The `user` checkpoint namespace is reserved.
+    ReservedNamespace,
+    /// A `checkpoint/user/*` tag that is not a user version.
+    NotAUserVersion,
+    /// Every version label candidate up to `-99` is taken.
+    VersionLabelExhausted,
+    /// A restore source names no commit, version or checkpoint.
+    UnknownRestoreSource,
+    /// A version was requested on an unborn `main`.
+    NothingToVersion,
+}
+
+impl UserOpRefusal {
+    /// Every refusal, in registry order.
+    pub const ALL: [UserOpRefusal; 21] = [
+        UserOpRefusal::OpShape,
+        UserOpRefusal::InvalidPath,
+        UserOpRefusal::PrivatePath,
+        UserOpRefusal::ReadOnlyPath,
+        UserOpRefusal::InvalidTitle,
+        UserOpRefusal::TooManyChanges,
+        UserOpRefusal::TooManyBytes,
+        UserOpRefusal::DuplicatePath,
+        UserOpRefusal::NestedChange,
+        UserOpRefusal::CaseCollision,
+        UserOpRefusal::TypeConflict,
+        UserOpRefusal::TargetExists,
+        UserOpRefusal::SourceMissing,
+        UserOpRefusal::Symlink,
+        UserOpRefusal::AgentTerritory,
+        UserOpRefusal::TreeTooLarge,
+        UserOpRefusal::ReservedNamespace,
+        UserOpRefusal::NotAUserVersion,
+        UserOpRefusal::VersionLabelExhausted,
+        UserOpRefusal::UnknownRestoreSource,
+        UserOpRefusal::NothingToVersion,
+    ];
+
+    /// The stable snake_case token (MODULE-003 §2.8).
+    pub const fn as_token(self) -> &'static str {
+        match self {
+            UserOpRefusal::OpShape => "op_shape",
+            UserOpRefusal::InvalidPath => "invalid_path",
+            UserOpRefusal::PrivatePath => "private_path",
+            UserOpRefusal::ReadOnlyPath => "read_only_path",
+            UserOpRefusal::InvalidTitle => "invalid_title",
+            UserOpRefusal::TooManyChanges => "too_many_changes",
+            UserOpRefusal::TooManyBytes => "too_many_bytes",
+            UserOpRefusal::DuplicatePath => "duplicate_path",
+            UserOpRefusal::NestedChange => "nested_change",
+            UserOpRefusal::CaseCollision => "case_collision",
+            UserOpRefusal::TypeConflict => "type_conflict",
+            UserOpRefusal::TargetExists => "target_exists",
+            UserOpRefusal::SourceMissing => "source_missing",
+            UserOpRefusal::Symlink => "symlink",
+            UserOpRefusal::AgentTerritory => "agent_territory",
+            UserOpRefusal::TreeTooLarge => "tree_too_large",
+            UserOpRefusal::ReservedNamespace => "reserved_namespace",
+            UserOpRefusal::NotAUserVersion => "not_a_user_version",
+            UserOpRefusal::VersionLabelExhausted => "version_label_exhausted",
+            UserOpRefusal::UnknownRestoreSource => "unknown_restore_source",
+            UserOpRefusal::NothingToVersion => "nothing_to_version",
+        }
+    }
+}
+
+impl fmt::Display for UserOpRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_token())
     }
 }
 
@@ -309,6 +465,27 @@ pub enum GitError {
         value: u64,
         reason: String,
     },
+    /// A user-lane request broke the lane grammar (ADR 2026-10-15, MODULE-003 §2.8), or a
+    /// [`crate::commit_queue::CommitType::User`] request reached the legacy `submit`. The
+    /// reason is a closed token; `path` names the refused operand when there is one.
+    InvalidUserOp {
+        reason: UserOpRefusal,
+        path: Option<PathBuf>,
+    },
+    /// A `BlobSource::Disk { oid }` (or an adopt read) did not hash to `expected`, or the
+    /// path was not a plain file reached without symlinks. `actual` is the oid read, `None`
+    /// when no regular file was there.
+    ContentChanged {
+        path: PathBuf,
+        expected: String,
+        actual: Option<String>,
+    },
+    /// `main` moved between building a user-lane tree and the ref compare-and-swap, three
+    /// times in a row (MODULE-003 §1.4.1 item 3). `None` stands for an unborn `main`.
+    HeadMoved {
+        expected: Option<String>,
+        actual: Option<String>,
+    },
 }
 
 impl fmt::Display for GitError {
@@ -336,6 +513,30 @@ impl fmt::Display for GitError {
                 value,
                 reason,
             } => write!(f, "git invalid-config {field}={value}: {reason}"),
+            Self::InvalidUserOp { reason, path } => match path {
+                Some(path) => write!(
+                    f,
+                    "user-lane request refused ({reason}): {}",
+                    path.display()
+                ),
+                None => write!(f, "user-lane request refused ({reason})"),
+            },
+            Self::ContentChanged {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "content of {} changed: expected {expected}, found {}",
+                path.display(),
+                actual.as_deref().unwrap_or("no regular file")
+            ),
+            Self::HeadMoved { expected, actual } => write!(
+                f,
+                "main moved during a user-lane commit: expected {}, found {}",
+                expected.as_deref().unwrap_or("unborn"),
+                actual.as_deref().unwrap_or("unborn")
+            ),
         }
     }
 }
@@ -361,5 +562,91 @@ impl From<git2::Error> for GitError {
 impl From<std::io::Error> for GitError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    // ADR 2026-10-15 (MODULE-003 §2.8): the refusal set is closed and snake_case, and the
+    // three user-lane variants render and cross the rollback / checkpoint boundaries
+    // as typed values.
+    #[test]
+    fn user_lane_errors_display_and_convert() {
+        let tokens: HashSet<&str> = UserOpRefusal::ALL.iter().map(|r| r.as_token()).collect();
+        assert_eq!(tokens.len(), UserOpRefusal::ALL.len(), "tokens are unique");
+        for token in &tokens {
+            assert!(
+                token.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                    && !token.starts_with('_')
+                    && !token.ends_with('_'),
+                "snake_case token: {token}"
+            );
+        }
+        assert_eq!(UserOpRefusal::OpShape.as_token(), "op_shape");
+        assert_eq!(UserOpRefusal::OpShape.to_string(), "op_shape");
+        assert_eq!(
+            UserOpRefusal::NotAUserVersion.as_token(),
+            "not_a_user_version"
+        );
+
+        let refused = GitError::InvalidUserOp {
+            reason: UserOpRefusal::TargetExists,
+            path: Some(PathBuf::from("notes/a.md")),
+        };
+        assert_eq!(
+            refused.to_string(),
+            "user-lane request refused (target_exists): notes/a.md"
+        );
+        match RollbackError::from(refused) {
+            RollbackError::InvalidTarget { target, reason } => {
+                assert_eq!(target, "notes/a.md");
+                assert_eq!(reason, "target_exists");
+            }
+            other => panic!("expected InvalidTarget, got {other:?}"),
+        }
+        let shape = GitError::InvalidUserOp {
+            reason: UserOpRefusal::OpShape,
+            path: None,
+        };
+        assert_eq!(shape.to_string(), "user-lane request refused (op_shape)");
+        match CheckpointError::from(shape) {
+            CheckpointError::InvalidLabel { label, reason } => {
+                assert_eq!(label, "user-lane");
+                assert_eq!(reason, "op_shape");
+            }
+            other => panic!("expected InvalidLabel, got {other:?}"),
+        }
+
+        let changed = || GitError::ContentChanged {
+            path: PathBuf::from("a.md"),
+            expected: "e".repeat(40),
+            actual: None,
+        };
+        assert!(changed().to_string().contains("found no regular file"));
+        match RollbackError::from(changed()) {
+            RollbackError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+            other => panic!("expected Io(InvalidData), got {other:?}"),
+        }
+        match CheckpointError::from(changed()) {
+            CheckpointError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+            other => panic!("expected Io(InvalidData), got {other:?}"),
+        }
+
+        let moved = || GitError::HeadMoved {
+            expected: None,
+            actual: Some("a".repeat(40)),
+        };
+        assert!(moved().to_string().contains("expected unborn"));
+        match RollbackError::from(moved()) {
+            RollbackError::Libgit2 { code, .. } => assert_eq!(code, "HeadMoved"),
+            other => panic!("expected Libgit2, got {other:?}"),
+        }
+        match CheckpointError::from(moved()) {
+            CheckpointError::Libgit2 { code, .. } => assert_eq!(code, "HeadMoved"),
+            other => panic!("expected Libgit2, got {other:?}"),
+        }
     }
 }

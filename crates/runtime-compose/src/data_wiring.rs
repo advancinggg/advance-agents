@@ -23,8 +23,8 @@ use cap_data::{
     WorkspaceFs, WriteReceipt,
 };
 use cap_fs::{
-    AtomicWriter, FileHistoryProvider, FsError, GitSync, GitSyncOp, MetaMaintainer,
-    MetaSchemaLoader, SchemaEntityProjector, VirtualPathResolver,
+    AtomicWriter, FileHistoryProvider, FsError, GitSync, GitSyncError, GitSyncOp, MetaMaintainer,
+    MetaSchemaLoader, PendingFsCommit, SchemaEntityProjector, VirtualPathResolver,
 };
 use cap_tools::{DeterministicCtx, LazyToolRegistry, ToolError, ToolRegistry};
 
@@ -77,24 +77,33 @@ impl ChainedWorkspaceFs {
         Self { parts }
     }
 
-    async fn commit(
+    /// R-c: submit while the caller still holds L1; `None` when git is unwired.
+    async fn enqueue(
         &self,
         agent: &str,
         op: GitSyncOp,
         vpath: &str,
         paths: Vec<PathBuf>,
         message: &str,
-    ) -> WriteReceipt {
-        let Some(git) = &self.parts.git_sync else {
+    ) -> Option<Result<PendingFsCommit, GitSyncError>> {
+        let git = self.parts.git_sync.as_ref()?;
+        Some(
+            git.enqueue_commit_with_message(agent, op, vpath, paths, message)
+                .await,
+        )
+    }
+
+    async fn finish(pending: Option<Result<PendingFsCommit, GitSyncError>>) -> WriteReceipt {
+        let Some(result) = pending else {
             return WriteReceipt { commit: None };
         };
         // Git is best-effort audit (same posture as fs.write): a queue failure never fails
         // the data write, whose source of truth is already on disk.
-        match git
-            .submit_commit_with_message(agent, op, vpath, paths, message)
-            .await
-        {
-            Ok(commit) => WriteReceipt { commit },
+        match result {
+            Ok(pending) => match pending.wait_commit().await {
+                Ok(commit) => WriteReceipt { commit },
+                Err(_) => WriteReceipt { commit: None },
+            },
             Err(_) => WriteReceipt { commit: None },
         }
     }
@@ -129,7 +138,8 @@ impl WorkspaceFs for ChainedWorkspaceFs {
             .map_err(fs_err)?;
         let (parent_dir, file_name) = split(&physical)?;
         let maintainer = &self.parts.maintainer;
-        {
+        let meta_path = MetaMaintainer::meta_path(&parent_dir);
+        let pending = {
             // Meta-first commit under the shared `.meta.yaml` lock (mirrors FsWriteHandler).
             let _guard = maintainer.acquire().await;
             let meta_pre = maintainer.load(&parent_dir).await.map_err(fs_err)?;
@@ -147,17 +157,20 @@ impl WorkspaceFs for ChainedWorkspaceFs {
                 };
                 return Err(fs_err(e));
             }
-        }
-        let meta_path = MetaMaintainer::meta_path(&parent_dir);
-        Ok(self
-            .commit(
-                agent,
-                GitSyncOp::Write,
-                path,
-                vec![physical, meta_path],
-                message,
-            )
-            .await)
+            // R-c: enqueue under L1, then drop the guard (same as cap-fs host_fn).
+            let pending = self
+                .enqueue(
+                    agent,
+                    GitSyncOp::Write,
+                    path,
+                    vec![physical.clone(), meta_path],
+                    message,
+                )
+                .await;
+            drop(_guard);
+            pending
+        };
+        Ok(Self::finish(pending).await)
     }
 
     async fn remove(
@@ -173,7 +186,8 @@ impl WorkspaceFs for ChainedWorkspaceFs {
             .map_err(fs_err)?;
         let (parent_dir, file_name) = split(&physical)?;
         let maintainer = &self.parts.maintainer;
-        {
+        let meta_path = MetaMaintainer::meta_path(&parent_dir);
+        let pending = {
             let _guard = maintainer.acquire().await;
             if let Some(meta) = maintainer.load(&parent_dir).await.map_err(fs_err)? {
                 let (meta_new, changed) = maintainer.remove_entry(meta, &file_name);
@@ -189,17 +203,19 @@ impl WorkspaceFs for ChainedWorkspaceFs {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(DataError::Io(e.to_string())),
             }
-        }
-        let meta_path = MetaMaintainer::meta_path(&parent_dir);
-        Ok(self
-            .commit(
-                agent,
-                GitSyncOp::Delete,
-                path,
-                vec![physical, meta_path],
-                message,
-            )
-            .await)
+            let pending = self
+                .enqueue(
+                    agent,
+                    GitSyncOp::Delete,
+                    path,
+                    vec![physical.clone(), meta_path],
+                    message,
+                )
+                .await;
+            drop(_guard);
+            pending
+        };
+        Ok(Self::finish(pending).await)
     }
 
     async fn rename(
@@ -433,6 +449,7 @@ pub async fn seed_entity_index(
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
+        let rel = cap_fs::operator::stored_nfc(&rel);
         let Ok(rows) = projector.project(agent_id, &rel, &bytes, now) else {
             continue;
         };

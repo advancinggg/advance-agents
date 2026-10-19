@@ -40,7 +40,10 @@ use advance_run_manager::{RepetitionGuard, RepetitionGuardConfig, RunConfig, Run
 // await-leg B-2 (2026-06-22) — the production messaging-chain registration entry +
 // the suspend-sink port type, consumed by the `declares_messaging` block below.
 use crate::api::ProcessPolicy;
-use advance_git::{DefaultGitCommitQueue, GitCommitQueue, GitRepoStatus};
+use advance_git::{
+    DefaultGitCommitQueue, GitCommitQueue, GitConfigProvider, GitHistoryReader, GitRepoStatus,
+    StaticGitConfigProvider, UserCommitLane,
+};
 use advance_reply_tracker::{
     register_reply_tracker_host_fns_with_suspend_sink,
     register_send_host_fn_with_turn_reply_routing, AwaitSessionManagerImpl,
@@ -71,8 +74,8 @@ use advance_shared_types::traits::{
 };
 use cap_fs::{
     register_agent_fs_with_maintainer, Adv003GitSync, AtomicWriter, DefaultAtomicWriter,
-    DefaultVirtualPathResolver, GitFileHistoryProvider, GitSync, MetaMaintainer, MetaSchemaLoader,
-    VirtualPathResolver,
+    DefaultVirtualPathResolver, GitFileHistoryProvider, GitSync, GitVcsReadPort, MetaMaintainer,
+    MetaSchemaLoader, OperatorFiles, OperatorFilesConfig, OperatorLimits, VirtualPathResolver,
 };
 use cap_grant::{
     register_agent_grant, register_cap_grant, AgentGrantBundle, AutoDenyResolver,
@@ -92,6 +95,7 @@ use cap_lifecycle::{
     register_agent_spawn, AgentTreeStore, BuiltinTemplateRegistry, ComponentSubmitGate,
     DefaultCheckpointController, DefaultDecompositionStore, DefaultRollbackController,
     DefaultSpawner, SpawnError, SpawnObserver, Spawner, WorkspaceFileResidentPolicy,
+    RESERVED_AGENT_IDS,
 };
 
 use crate::api::{log_keys, Admission, ClientApiOptions, ComposeError};
@@ -730,11 +734,15 @@ pub struct WiringHandles {
     /// the exact C219 history/grant adapters and exposes its OS-selected address
     /// for local discovery and acceptance witnesses.
     pub client_api_server: Option<advance_client_api::ClientApiServer>,
-    /// Slice BS-3: the cap-fs git commit-queue, held alive for the runtime
-    /// lifetime (its `Drop` drains + closes the worker). `None` when the
-    /// workspace is not a git repo (cap-fs registered without git_sync → degraded,
-    /// no turn commits — same as pre-BS-3).
+    /// Teardown owner of the one per-repo queue. `Some` when `fs ∨ skills ∨ files_served`
+    /// and the workspace is a git repo.
+    pub git_queue_owner: Option<Arc<DefaultGitCommitQueue>>,
+    /// Agent-facing queue (L6 / child contexts). `Some` iff `fs ∨ skills` (today's gate).
     pub git_queue: Option<Arc<DefaultGitCommitQueue>>,
+    /// Operator files core. `Some` when files are served and `OperatorFiles::open` succeeded.
+    pub files_core: Option<Arc<OperatorFiles>>,
+    /// Shared `.meta.yaml` maintainer. Hoisted for fs homes and for files-served non-fs homes.
+    pub meta_maintainer: Option<Arc<MetaMaintainer>>,
     /// Git-family PR-1: the workspace repository's state after the compose-time
     /// bootstrap (`advance_git::ensure_workspace_repo`). `Ready` on every initialized
     /// workspace (a missing `.git` is created); `NotMain` / `Unreadable` are reported
@@ -1107,6 +1115,29 @@ pub fn materialize_config_tree(
     )
 }
 
+/// A declared alias that folds to a reserved id (`user`) still boots; the
+/// composition logs [`log_keys::AGENT_ALIAS_RESERVED`] (MODULE-003-AC-30).
+pub(crate) fn warn_reserved_agent_aliases(
+    log: &LogHandle,
+    decls: &[crate::agent_config::AgentDecl],
+) {
+    for decl in decls {
+        if RESERVED_AGENT_IDS
+            .iter()
+            .any(|reserved| decl.alias.eq_ignore_ascii_case(reserved))
+        {
+            log.err(
+                log_keys::AGENT_ALIAS_RESERVED,
+                format!(
+                    "advance: WARN reserved agent alias {:?} boots; the `user` namespace is reserved for named versions",
+                    decl.alias
+                ),
+            );
+        }
+        warn_reserved_agent_aliases(log, &decl.children);
+    }
+}
+
 /// Pack lane P1: [`materialize_config_tree`] over an explicit
 /// [`TemplateResolver`]. `wire_capabilities` passes the composition-root chained
 /// resolver (built-ins ∪ pack FQ refs) so a config-declared `template:` may name an
@@ -1390,6 +1421,8 @@ pub(crate) struct HoldStoppers {
     pub cap_grant_sweeper_arc: Option<Arc<cap_grant::TtlSweeper>>,
     pub perchild_manager: Option<Arc<PerChildLoopManager>>,
     pub git_queue: Option<Arc<DefaultGitCommitQueue>>,
+    /// Operator files core whose retry pump is aborted inside `holds.git_queue`.
+    pub files_retry: Option<Arc<OperatorFiles>>,
     pub chatgpt_sign_in: Option<Arc<advance_home::ChatGptSignIn>>,
     pub packs_watcher: Option<tokio::task::JoinHandle<()>>,
     pub breaker_subscriber: Option<advance_messaging::BreakerSubscriber>,
@@ -1882,6 +1915,7 @@ pub(crate) async fn wire_capabilities_inner(
     if let Some(tree) = agent_tree.as_ref() {
         let decls = crate::agent_config::parse_agents_config_with(yaml, &effective)
             .map_err(|e| CliWiringError::ConfigTree(format!("{e}")))?;
+        warn_reserved_agent_aliases(&log, &decls);
         materialize_config_tree_with_capabilities(
             tree,
             &AgentId(root_uid.clone()),
@@ -1911,6 +1945,7 @@ pub(crate) async fn wire_capabilities_inner(
             Arc::clone(&schema),
             workspace.join(".agent/meta-schema.yaml"),
         );
+        probe_record!(probe, |record| record.pack_schema_attached = Some(true));
         Some((resolver, schema))
     } else {
         None
@@ -2059,6 +2094,8 @@ pub(crate) async fn wire_capabilities_inner(
     // SAME wired bus. `read_api()` returns a handle over internal clones (pool /
     // broadcaster / clock), NOT an `Arc<EventBus>`. `Some` for the production async bus.
     let observability_read_api = bus_concrete.read_api();
+    let files_served = matches!(client_api_options, ClientApiOptions::Loopback { .. })
+        && observability_read_api.is_some();
     // Lane cost-attribution: the durable per-agent / per-provider cost ledger over the SAME
     // bus's `events` table. Like `read_api()`, a pool clone — no strong ref to `bus_concrete`.
     let cost_ledger_for_api: Arc<dyn advance_shared_types::traits::CostLedgerQuery> =
@@ -2688,9 +2725,18 @@ pub(crate) async fn wire_capabilities_inner(
     // → degrade (no commits), identical to pre-Wave-10. Built AFTER the earlier
     // auto-notify error path (so only the `builder.build()` error path sees it
     // live + drops it).
-    let git_queue_handle: Option<Arc<DefaultGitCommitQueue>> = if declares_fs || declares_skills {
-        match DefaultGitCommitQueue::spawn_with_event_bus(
+    let wants_git_queue = declares_fs || declares_skills || files_served;
+    let git_config: Arc<dyn GitConfigProvider> = {
+        let git = &builder.config().git;
+        match StaticGitConfigProvider::new(git.gc_interval_hours, git.max_tracked_file_mb) {
+            Ok(provider) => Arc::new(provider),
+            Err(_) => Arc::new(StaticGitConfigProvider::defaults()),
+        }
+    };
+    let git_queue_owner: Option<Arc<DefaultGitCommitQueue>> = if wants_git_queue {
+        match DefaultGitCommitQueue::spawn_with_config_and_event_bus(
             workspace.to_path_buf(),
+            git_config,
             event_bus_dyn.clone(),
         ) {
             Ok(queue) => Some(Arc::new(queue)),
@@ -2699,7 +2745,12 @@ pub(crate) async fn wire_capabilities_inner(
     } else {
         None
     };
-    started.git_queue = git_queue_handle.clone();
+    let git_queue_handle: Option<Arc<DefaultGitCommitQueue>> = if declares_fs || declares_skills {
+        git_queue_owner.clone()
+    } else {
+        None
+    };
+    started.git_queue = git_queue_owner.clone();
     probe_record!(probe, |record| record.git_queue =
         git_queue_handle.as_ref().map(Arc::downgrade));
     #[cfg(feature = "test-support")]
@@ -2717,6 +2768,7 @@ pub(crate) async fn wire_capabilities_inner(
     let mut data_fs_parts: Option<crate::data_wiring::DataFsParts> = None;
     // Lane E3: the built `DataStore`, handed to the Client API's entities family below.
     let mut data_store_for_api: Option<Arc<cap_data::DataStore>> = None;
+    let mut meta_maintainer: Option<Arc<MetaMaintainer>> = None;
     if let Some((resolver, schema)) = fs_handles {
         // cap-fs git_sync consumes the SHARED queue handle (clone) when present.
         let git_sync: Option<Arc<dyn GitSync>> = git_queue_handle.clone().map(|queue| {
@@ -2728,6 +2780,7 @@ pub(crate) async fn wire_capabilities_inner(
             Arc::clone(&schema),
             Arc::clone(&atomic_writer),
         ));
+        meta_maintainer = Some(Arc::clone(&maintainer));
         register_agent_fs_with_maintainer(
             &*registry,
             Arc::clone(&resolver),
@@ -2751,7 +2804,55 @@ pub(crate) async fn wire_capabilities_inner(
             git_sync,
             history: Arc::new(GitFileHistoryProvider::new(workspace.to_path_buf())),
         });
+    } else if files_served {
+        let schema_path = workspace.join(".agent/meta-schema.yaml");
+        let schema = match MetaSchemaLoader::load_from_disk(&schema_path) {
+            Ok(loader) => Arc::new(loader),
+            Err(_) => Arc::new(MetaSchemaLoader::new_with_default(schema_path)),
+        };
+        let atomic_writer: Arc<dyn AtomicWriter> = Arc::new(DefaultAtomicWriter);
+        meta_maintainer = Some(Arc::new(MetaMaintainer::new(schema, atomic_writer)));
     }
+    let files_core: Option<Arc<OperatorFiles>> = if files_served {
+        if let Some(maintainer) = meta_maintainer.as_ref() {
+            let files_state = crate::client_api_files::files_state_path(state_root, workspace);
+            let vcs: Arc<dyn cap_fs::operator::VcsReadPort> =
+                Arc::new(GitVcsReadPort::new(workspace.to_path_buf()));
+            let lane: Option<Arc<dyn UserCommitLane>> = git_queue_owner
+                .clone()
+                .map(|queue| queue as Arc<dyn UserCommitLane>);
+            match OperatorFiles::open(OperatorFilesConfig {
+                home: workspace.to_path_buf(),
+                files_state,
+                limits: OperatorLimits::default(),
+                vcs: Some(vcs),
+                maintainer: Some(Arc::clone(maintainer)),
+                lane,
+            })
+            .await
+            {
+                Ok(core) => Some(core),
+                Err(error) => {
+                    log.err(
+                        log_keys::FILES_CORE_UNAVAILABLE,
+                        format!("advance: WARN files core not started: {error}"),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if git_queue_owner.is_some() {
+        started.files_retry = files_core.clone();
+    }
+    probe_record!(probe, |record| {
+        record.files_core = files_core.as_ref().map(Arc::downgrade);
+        record.meta_maintainer = meta_maintainer.as_ref().map(Arc::downgrade);
+    });
 
     // 5c — cap-skills (single-agent provider rooted at `<workspace>/.agent`).
     // skills-J26 reader satellite: SINGLE-SOURCE the skills root. One
@@ -3771,9 +3872,21 @@ pub(crate) async fn wire_capabilities_inner(
                     Arc::new(crate::client_api_entities::WiredEntityProvider::new(store))
                         as Arc<dyn advance_client_api::EntityProvider>
                 });
-            let git_for_api: Arc<dyn advance_client_api::GitHistoryProvider> = Arc::new(
-                advance_client_api::GitHistoryReaderProvider::new(workspace.to_path_buf()),
-            );
+            let git_for_api: Arc<dyn advance_client_api::GitHistoryProvider> =
+                Arc::new(crate::client_api_git::WiredGitHistoryProvider::new(
+                    workspace.to_path_buf(),
+                    meta_maintainer.clone(),
+                    git_queue_owner
+                        .clone()
+                        .map(|queue| queue as Arc<dyn UserCommitLane>),
+                ));
+            let files_for_api: Option<Arc<dyn advance_client_api::FilesProvider>> =
+                files_core.as_ref().map(|core| {
+                    Arc::new(crate::client_api_files::WiredFilesProvider::new(
+                        Arc::clone(core),
+                        GitHistoryReader::new(workspace.to_path_buf()),
+                    )) as Arc<dyn advance_client_api::FilesProvider>
+                });
             let tree_for_api = agent_tree_snapshot.clone();
             let root_colon_for_api = root_colon.clone();
             // The factory runs inside the bind and moves its captures, so the run-control
@@ -3829,6 +3942,7 @@ pub(crate) async fn wire_capabilities_inner(
                     secrets: Some(secrets_admin_for_api.clone()),
                     entities: entities_for_api.clone(),
                     git: Some(git_for_api.clone()),
+                    files: files_for_api.clone(),
                     ..Default::default()
                 };
                 if let Some(projector) = projector_for_api.as_ref() {
@@ -3926,7 +4040,10 @@ pub(crate) async fn wire_capabilities_inner(
             observation_carrier_store,
             contract219_projector,
             client_api_server,
+            git_queue_owner,
             git_queue: git_queue_handle,
+            files_core,
+            meta_maintainer,
             git_repo_status,
             run_manager,
             await_manager: await_manager_handle,
@@ -4117,3 +4234,7 @@ fn build_skill_turn_persistence(
 
 #[cfg(test)]
 mod build_llm_gateway_tests;
+
+#[cfg(test)]
+#[path = "reserved_user_tests.rs"]
+mod reserved_user_tests;

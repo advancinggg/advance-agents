@@ -421,6 +421,7 @@ pub(crate) async fn compose_graph(
                 .clone()
                 .map(|q| -> Arc<dyn advance_git::GitCommitQueue> { q }),
             vlm: wiring_handles.vlm_extractor.clone(),
+            meta_maintainer: wiring_handles.meta_maintainer.clone(),
             host_registry: host.host_registry(),
             embedding_posture: crate::context_inspect::EmbeddingPosture {
                 active: gateway.has_embedding_provider(),
@@ -500,6 +501,7 @@ pub(crate) async fn compose_graph(
             probe: failpoints.probe.clone(),
             context_store: Some(context_store),
             memory_index,
+            meta_maintainer: wiring_handles.meta_maintainer.clone(),
         },
     )
     .await
@@ -1194,6 +1196,7 @@ async fn try_spawn_agent_loop(
         agent_tree_snapshot.clone(),
         log,
         extras.memory_index.clone(),
+        extras.meta_maintainer.clone(),
     );
     driver = driver.with_post_processor(post_processor);
     // Backbone Step 2: when llm is wired, install the REAL ContextAssemblerImpl
@@ -1564,6 +1567,8 @@ pub(crate) struct LoopSpawnExtras {
     pub context_store: Option<Arc<crate::context_inspect::ContextSnapshotStore>>,
     /// Shared cap-memory SQLite index (root + children). `None` → open locally.
     pub memory_index: Option<Arc<dyn cap_memory::SqliteIndex + Send + Sync>>,
+    /// Hoisted `.meta.yaml` maintainer shared with the VLM indexer (OSS-6).
+    pub meta_maintainer: Option<Arc<cap_fs::MetaMaintainer>>,
 }
 
 /// The root loop's context assembler, behind the turn gate when one is configured.
@@ -1769,6 +1774,7 @@ pub async fn spawn_test_agent_loop(
                 .clone()
                 .map(|q| -> Arc<dyn advance_git::GitCommitQueue> { q }),
             vlm: handles.vlm_extractor.clone(),
+            meta_maintainer: handles.meta_maintainer.clone(),
             host_registry: host.host_registry(),
             embedding_posture: crate::context_inspect::EmbeddingPosture {
                 active: gateway.has_embedding_provider(),
@@ -2306,6 +2312,7 @@ mod tests {
 /// in-memory index (the turn pipeline never fails on index-open). All
 /// store/index/file writes are keyed by the BARE `write_agent_id` (the
 /// colon-msg-id vs bare-cap-id write-bucket fix).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_live_post_processor(
     memory_store: Option<&Arc<cap_memory::MemoryStore>>,
     llm_gateway: Option<&Arc<LlmGateway>>,
@@ -2329,6 +2336,9 @@ pub(crate) fn build_live_post_processor(
     // Shared durable index (root + children). `None` → open
     // `<workspace>/.agent/memory/index.sqlite` locally.
     existing_index: Option<Arc<dyn cap_memory::SqliteIndex + Send + Sync>>,
+    // OSS-6: the hoisted MetaMaintainer. `Some` ⇒ VLM writeback shares L1 with
+    // files/fs. `None` ⇒ the indexer keeps the adapter-local maintainer.
+    meta_maintainer: Option<Arc<cap_fs::MetaMaintainer>>,
 ) -> (
     Arc<dyn PostProcessorHook>,
     Option<Arc<dyn cap_memory::SqliteIndex + Send + Sync>>,
@@ -2399,6 +2409,7 @@ pub(crate) fn build_live_post_processor(
         let gw_vlm: Arc<dyn cap_llm::LlmGatewayInternal> = gw_vlm_concrete;
         components = components.with_description_indexer(Arc::new(
             crate::vlm_indexer::VlmDescriptionIndexer::new(gw_vlm, vlm, workspace.to_path_buf())
+                .with_meta(meta_maintainer)
                 .with_log(log.clone()),
         ));
     }
@@ -2503,6 +2514,7 @@ mod satb_gate_tests {
             None,
             &log,
             None,
+            None,
         );
         assert!(index.is_none(), "trace-only path shares no index");
         pp.run("root", &fixture_msg(), &fixture_result())
@@ -2514,8 +2526,19 @@ mod satb_gate_tests {
         );
 
         // (both absent) → trace-only, no writes.
-        let (pp2, _) =
-            build_live_post_processor(None, None, &ws, bus(), "root", None, None, None, &log, None);
+        let (pp2, _) = build_live_post_processor(
+            None,
+            None,
+            &ws,
+            bus(),
+            "root",
+            None,
+            None,
+            None,
+            &log,
+            None,
+            None,
+        );
         pp2.run("root", &fixture_msg(), &fixture_result())
             .await
             .expect("run Ok");

@@ -197,6 +197,25 @@ impl IdempotencyStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Drop a recorded outcome so a retry re-enters the handler (test-support).
+    #[cfg(feature = "test-support")]
+    pub fn evict_done(&self, scope: &IdempotencyScope) -> bool {
+        let mut map = self.inner.map.lock().expect("idempotency map lock");
+        match map.get(scope) {
+            Some(Entry::Done { .. }) => map.remove(scope).is_some(),
+            _ => false,
+        }
+    }
+
+    /// Drop every recorded outcome (test-support lost-record retry).
+    #[cfg(feature = "test-support")]
+    pub fn evict_all_done(&self) -> usize {
+        let mut map = self.inner.map.lock().expect("idempotency map lock");
+        let before = map.len();
+        map.retain(|_, e| matches!(e, Entry::Pending { .. }));
+        before.saturating_sub(map.len())
+    }
 }
 
 /// RAII reservation guard. Dropping it without [`Reservation::commit`] releases the pending

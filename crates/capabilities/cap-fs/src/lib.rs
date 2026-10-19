@@ -41,6 +41,7 @@ pub mod history_provider;
 pub mod host_fn;
 pub mod meta_maintainer;
 pub mod meta_schema;
+pub mod operator;
 pub mod reconcile;
 pub mod resolver;
 pub mod schema_v2;
@@ -62,7 +63,7 @@ pub use frontmatter::{
     canonicalize, normalize, normalize_doc, parse_frontmatter, FrontmatterDoc, FrontmatterError,
     IdSource, UlidIdSource, MAX_FRONTMATTER_BLOCK_BYTES, MAX_ITEMS_PER_FILE,
 };
-pub use git_sync::{Adv003GitSync, GitSync, GitSyncError, GitSyncOp};
+pub use git_sync::{Adv003GitSync, GitSync, GitSyncError, GitSyncOp, PendingFsCommit};
 pub use history_provider::{FileHistoryProvider, StubFileHistoryProvider};
 pub use host_fn::{
     list_over_limit_msg, register_agent_fs, register_agent_fs_default,
@@ -73,13 +74,19 @@ pub use host_fn::{
     FsUpdateScopeHandler, FsWriteHandler, DEFAULT_FS_CONCURRENCY, DEFAULT_MAX_LIST_ENTRIES,
     MAX_PATH_BYTES, MAX_READ_BYTES,
 };
-pub use meta_maintainer::{EntryMetaValues, MetaFile, MetaMaintainer, RecordObserver};
+pub use meta_maintainer::{
+    DirMetaWrite, EntryMetaValues, MetaFile, MetaMaintainer, RecordChange, RecordObserver,
+    MAX_META_YAML_BYTES,
+};
 pub use meta_schema::{
     schema_changes, AspectDisplay, AspectSpec, AutoRule, Cmp, DeriveElse, DeriveRule,
     DisplayFormat, EnsureRule, FieldDisplay, FieldSpec, FieldType, MetaSchema, MetaSchemaError,
     MetaSchemaLoader, MetaSchemaWatcher, OperationBinding, QuerySpec, SchemaChanges, Tone,
     ValueDisplay, ValueExpr, ViewDisplay, ViewKind, ViewSpec, WhereClause,
     DEFAULT_SCHEMA_POLL_INTERVAL, MAX_META_SCHEMA_SIZE,
+};
+pub use operator::{
+    FilesError, GitVcsReadPort, OperatorFiles, OperatorFilesConfig, OperatorLimits,
 };
 pub use reconcile::{
     is_reconciler_skipped_name, ReconcileReport, WorkspaceReconciler, MAX_RECONCILE_ERRORS,

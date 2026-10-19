@@ -236,6 +236,8 @@ const KNOWN_EXTENSIONS: &[&str] = &[
     // Entity-data lane E1 (`taxonomy::data::ENTITY_CHANGED`): one per committed `data` write.
     // Never a trigger (PRD §15.4 stays at 12 entries).
     "data.entity_changed",
+    // Vault files family (ADR 2026-10-15; `taxonomy::files::CHANGED`). Never a trigger.
+    "files.changed",
 ];
 
 /// Events whose concrete strings are formed at the call site (not enumerated in

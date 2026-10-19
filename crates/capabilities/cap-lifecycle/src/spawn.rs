@@ -9,7 +9,7 @@ use std::sync::Arc;
 use advance_shared_types::agent_tree::{AgentId, AgentKind, AgentNode, AgentStatus, Capability};
 
 use crate::error::SpawnError;
-use crate::identifier::{sub_uuid_v4, validate_agent_id};
+use crate::identifier::{sub_uuid_v4, validate_agent_id, validate_new_agent_id};
 use crate::templates::{apply_template, TemplateError, TemplateResolver};
 use crate::tree::{AgentTreeStore, MAX_AGENTS_PER_STORE};
 use crate::workspace::{init_child_workspace, resolve_under_parent, symlink_check};
@@ -307,14 +307,19 @@ impl Spawner for DefaultSpawner {
             return Err(SpawnError::ParentNotFound(format!("{:?}", cfg.parent_id)));
         }
         validate_agent_id(&cfg.child_id.0)?;
+        // Reserved `user` is refused on creation paths only (MODULE-003-AC-30). A
+        // fresh UUID child id cannot collide with it; pack path-derived ids can.
+        if uuid::Uuid::parse_str(&cfg.child_id.0).is_err() {
+            validate_new_agent_id(&cfg.child_id.0)?;
+        }
         if self.tree.contains(&cfg.child_id) {
             return Err(SpawnError::AlreadyExists(format!("{:?}", cfg.child_id)));
         }
         // Handle pre-flight (the tree's `bind_handle` is the race-safe authority): reject a
-        // taken or malformed handle BEFORE any filesystem work. A colliding handle would
-        // otherwise be served on another agent's mailbox key (`agent:<handle>`).
+        // taken, malformed, or reserved handle BEFORE any filesystem work. A colliding
+        // handle would otherwise be served on another agent's mailbox key (`agent:<handle>`).
         if let Some(handle) = cfg.handle.as_deref() {
-            validate_agent_id(handle)
+            validate_new_agent_id(handle)
                 .map_err(|e| SpawnError::InvalidConfig(format!("handle {handle:?}: {e}")))?;
             if self.tree.node_by_handle(handle).is_some() {
                 return Err(SpawnError::AlreadyExists(format!("handle {handle:?}")));

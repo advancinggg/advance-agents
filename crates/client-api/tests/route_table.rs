@@ -185,3 +185,15 @@ fn route_pattern_template_round_trips() {
         assert_eq!(RoutePattern::parse(template).template(), template);
     }
 }
+
+#[test]
+fn raw_route_is_not_a_client_api_route() {
+    let api = ClientApi::new(ClientApiConfig::default());
+    let table = api.route_table();
+    assert!(table.iter().all(|e| !e.path.contains("/client/files/raw")));
+    let env = api.handle(ClientRequest::get("/client/files/raw/not-a-real-ticket"));
+    assert_eq!(
+        env.error.as_ref().map(|e| e.code.clone()),
+        Some(ClientErrorCode::UnknownRoute)
+    );
+}

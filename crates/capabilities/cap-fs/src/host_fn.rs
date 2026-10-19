@@ -45,7 +45,7 @@ use crate::entry::{
 };
 use crate::error::{fs_error_to_val, sanitize_io_error, FsError};
 use crate::events::{emit_fs_event, emit_runtime_degraded, FsEvent, FsSource, MetaSource};
-use crate::git_sync::{GitSync, GitSyncError, GitSyncOp};
+use crate::git_sync::{GitSync, GitSyncError, GitSyncOp, PendingFsCommit};
 use crate::history_provider::FileHistoryProvider;
 use crate::meta_maintainer::{MetaFile, MetaMaintainer};
 use crate::meta_schema::MetaSchemaLoader;
@@ -594,28 +594,41 @@ async fn sqlite_sync_after_delete(
 /// `runtime.degraded.git_sync_failed` but propagate as a no-op so the caller
 /// continues to event emission. fs.write returns `Ok(())` regardless of the
 /// git leg outcome (FS source-of-truth is committed before the git leg runs).
-async fn git_sync_after_write(
+async fn git_enqueue_write(
     git_sync: &Option<Arc<dyn GitSync>>,
-    emitter: &dyn EventBusEmit,
     ctx: &HostCallContext,
     vpath: &str,
     physical: &std::path::Path,
     parent_dir: &std::path::Path,
-) {
-    let Some(sync) = git_sync.as_ref() else {
-        return;
-    };
-    let meta_yaml = parent_dir.join(".meta.yaml");
-    if let Err(GitSyncError(msg)) = sync
-        .submit_fs_commit(
+) -> Option<Result<PendingFsCommit, GitSyncError>> {
+    let sync = git_sync.as_ref()?;
+    Some(
+        sync.enqueue_fs_commit(
             &ctx.agent_id,
             GitSyncOp::Write,
             vpath,
             physical.to_path_buf(),
-            meta_yaml,
+            parent_dir.join(".meta.yaml"),
         )
-        .await
-    {
+        .await,
+    )
+}
+
+async fn git_finish(
+    pending: Option<Result<PendingFsCommit, GitSyncError>>,
+    emitter: &dyn EventBusEmit,
+    ctx: &HostCallContext,
+    vpath: &str,
+    op: &str,
+) {
+    let Some(result) = pending else {
+        return;
+    };
+    let outcome = match result {
+        Ok(p) => p.wait().await,
+        Err(e) => Err(e),
+    };
+    if let Err(GitSyncError(msg)) = outcome {
         emit_runtime_degraded(
             emitter,
             &ctx.agent_id,
@@ -623,7 +636,7 @@ async fn git_sync_after_write(
             "git_sync_failed",
             serde_json::json!({
                 "vpath": vpath,
-                "op": "write",
+                "op": op,
                 "error": msg,
             }),
         );
@@ -635,40 +648,24 @@ async fn git_sync_after_write(
 /// leg removed it — advance-git's `do_commit` (slice D enhancement) detects
 /// the missing path via `symlink_metadata` and routes to `index.remove_path`
 /// to stage the deletion in the resulting commit's tree.
-async fn git_sync_after_delete(
+async fn git_enqueue_delete(
     git_sync: &Option<Arc<dyn GitSync>>,
-    emitter: &dyn EventBusEmit,
     ctx: &HostCallContext,
     vpath: &str,
     physical: &std::path::Path,
     parent_dir: &std::path::Path,
-) {
-    let Some(sync) = git_sync.as_ref() else {
-        return;
-    };
-    let meta_yaml = parent_dir.join(".meta.yaml");
-    if let Err(GitSyncError(msg)) = sync
-        .submit_fs_commit(
+) -> Option<Result<PendingFsCommit, GitSyncError>> {
+    let sync = git_sync.as_ref()?;
+    Some(
+        sync.enqueue_fs_commit(
             &ctx.agent_id,
             GitSyncOp::Delete,
             vpath,
             physical.to_path_buf(),
-            meta_yaml,
+            parent_dir.join(".meta.yaml"),
         )
-        .await
-    {
-        emit_runtime_degraded(
-            emitter,
-            &ctx.agent_id,
-            &ctx.trace_id,
-            "git_sync_failed",
-            serde_json::json!({
-                "vpath": vpath,
-                "op": "delete",
-                "error": msg,
-            }),
-        );
-    }
+        .await,
+    )
 }
 
 /// Convert an `std::io::Error` into a typed `FsError` variant. Crucially,
@@ -1095,10 +1092,14 @@ impl HostFunctionHandler for FsWriteHandler {
             // serialization or a last_modified compare-and-swap in
             // CONTRACT-030 to close this window without re-introducing
             // the global lock contention.
+            // R-c: enqueue the git commit WHILE L1 is still held, then drop.
+            let pending_git =
+                git_enqueue_write(&git_sync, &ctx, &path, &physical, &parent_dir).await;
             drop(_meta_guard);
 
             // Slice C: SQLite triple sync. Runs BEFORE event emission (matches
-            // §2.7 sequence diagram: meta-first → data → SQLite → events).
+            // INTEGRATED R-c: meta-first → data → git enqueue → unlock → SQLite
+            // → await git → events).
             // The SQL leg is awaited inline (NEVER spawned) so fs.write returns
             // Ok() only after the SQL leg has either succeeded or emitted a
             // runtime.degraded event. SQL failures emit
@@ -1121,14 +1122,7 @@ impl HostFunctionHandler for FsWriteHandler {
             )
             .await;
 
-            // Slice D: git audit-trail commit. Runs AFTER the SQL leg, BEFORE
-            // event emission. Submits a `[turn] [agent:<id>] write <vpath>`
-            // commit covering the data file + parent's `.meta.yaml`. Failure
-            // emits `runtime.degraded.git_sync_failed` but fs.write still
-            // returns Ok() — FS source-of-truth is committed; git is
-            // best-effort audit. Same await-not-spawn invariant as the SQL
-            // leg.
-            git_sync_after_write(&git_sync, &*emitter, &ctx, &path, &physical, &parent_dir).await;
+            git_finish(pending_git, &*emitter, &ctx, &path, "write").await;
 
             // A raw Markdown write changes records too: let the entity index follow it.
             maintainer
@@ -1458,6 +1452,9 @@ impl HostFunctionHandler for FsDeleteHandler {
             // awaits would collapse fs.delete effective concurrency to 1
             // and stall every concurrent fs.write/fs.delete in the runtime
             // when SQLite contends. Mirror of FsWriteHandler's release.
+            // R-c: enqueue under L1, then drop.
+            let pending_git =
+                git_enqueue_delete(&git_sync, &ctx, &path, &physical, &parent_dir).await;
             drop(_meta_guard);
 
             // Slice C: SQLite triple-sync delete leg. Runs BEFORE event emission.
@@ -1484,7 +1481,7 @@ impl HostFunctionHandler for FsDeleteHandler {
             // symlink_metadata and routes to index.remove_path to stage the
             // deletion. Failure emits runtime.degraded.git_sync_failed but
             // fs.delete still returns Ok().
-            git_sync_after_delete(&git_sync, &*emitter, &ctx, &path, &physical, &parent_dir).await;
+            git_finish(pending_git, &*emitter, &ctx, &path, "delete").await;
 
             maintainer
                 .notify_record_file_changed(&ctx.agent_id, &path)

@@ -328,12 +328,19 @@ impl Composition {
             auto_tick,
             readiness_walk,
         } = graph;
+        let git_queue = wiring_handles.git_queue_owner.take();
+        let files_retry = if git_queue.is_some() {
+            wiring_handles.files_core.clone()
+        } else {
+            None
+        };
         let stoppers = HoldStoppers {
             event_bus: Some(Arc::clone(&wiring_handles.event_bus)),
             cap_grant_sweeper_handle: wiring_handles.cap_grant.sweeper_handle.take(),
             cap_grant_sweeper_arc: wiring_handles.cap_grant.sweeper.take(),
             perchild_manager: wiring_handles.perchild_manager.take(),
-            git_queue: wiring_handles.git_queue.take(),
+            git_queue,
+            files_retry,
             chatgpt_sign_in: wiring_handles.chatgpt_sign_in.take(),
             packs_watcher: wiring_handles.packs_watcher.take(),
             breaker_subscriber: wiring_handles.breaker_subscriber.take(),
@@ -656,10 +663,15 @@ impl Composition {
             close_sign_in(sign_in, &log).await;
             self.steps.record("holds.chatgpt_sign_in");
         }
-        if let Some(queue) = self.stoppers.git_queue.as_ref() {
-            // The worker commits what is queued, then exits; only then is the repo's
-            // queue registration released.
-            queue.close_and_join().await;
+        if self.stoppers.files_retry.is_some() || self.stoppers.git_queue.is_some() {
+            if let Some(core) = self.stoppers.files_retry.as_ref() {
+                core.abort_retry_pump();
+            }
+            if let Some(queue) = self.stoppers.git_queue.as_ref() {
+                // The worker commits what is queued, then exits; only then is the repo's
+                // queue registration released.
+                queue.close_and_join().await;
+            }
             self.steps.record("holds.git_queue");
         }
         let adapter_workers = std::mem::take(&mut self.stoppers.adapter_workers);
@@ -711,6 +723,7 @@ impl HoldStoppers {
             cap_grant_sweeper_arc,
             perchild_manager,
             git_queue,
+            files_retry,
             chatgpt_sign_in,
             packs_watcher,
             breaker_subscriber,
@@ -726,6 +739,7 @@ impl HoldStoppers {
             && cap_grant_sweeper_arc.is_none()
             && perchild_manager.is_none()
             && git_queue.is_none()
+            && files_retry.is_none()
             && chatgpt_sign_in.is_none()
             && packs_watcher.is_none()
             && breaker_subscriber.is_none()

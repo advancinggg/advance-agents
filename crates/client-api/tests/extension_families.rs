@@ -329,6 +329,8 @@ fn module_001_ac31_closing_answers_module_unavailable_before_auth_and_replay() {
         path_params: vec![],
         mutation: None,
         is_loopback_peer: true,
+        session_id: None,
+        platform: None,
     };
     let err = match spec.invoke_for_test(&ctx) {
         Err(e) => e,
