@@ -123,6 +123,7 @@ pub(crate) fn decode_llm_request(params: &[Val]) -> Result<LlmRequest, String> {
                                         "stop-sequences" => {
                                             cp.stop_sequences = decode_optional_list_string(v)
                                         }
+                                        "tools" => cp.tools = decode_optional_tools(v),
                                         _ => { /* forward-compat: silently drop unknown sub-fields */
                                         }
                                     }
@@ -242,6 +243,71 @@ fn decode_optional_list_string(val: &Val) -> Option<Vec<String>> {
     }
 }
 
+/// Decode `option<list<tool-definition>>` for `llm-params.tools`.
+///
+/// Each `tool-definition` is `{name, description, parameters}` where
+/// `parameters` is a JSON-schema string. Invalid JSON / empty names are
+/// skipped. Caps: 32 tools, 64-byte names, 4 KiB parameters.
+fn decode_optional_tools(val: &Val) -> Option<Vec<crate::gateway::ToolDefinition>> {
+    const MAX_TOOLS: usize = 32;
+    const MAX_NAME: usize = 64;
+    const MAX_DESC: usize = 1024;
+    const MAX_PARAMS: usize = 4096;
+    let list_val = match val {
+        Val::Option(Some(boxed)) => boxed.as_ref(),
+        Val::List(_) => val,
+        _ => return None,
+    };
+    let Val::List(items) = list_val else {
+        return None;
+    };
+    let mut out = Vec::new();
+    for item in items.iter().take(MAX_TOOLS) {
+        let Val::Record(fields) = item else {
+            continue;
+        };
+        let mut name = String::new();
+        let mut description = String::new();
+        let mut parameters = serde_json::Value::Null;
+        for (n, v) in fields {
+            match n.as_str() {
+                "name" => {
+                    if let Val::String(s) = v {
+                        name = s.clone();
+                    }
+                }
+                "description" => {
+                    if let Val::String(s) = v {
+                        description = s.clone();
+                    }
+                }
+                "parameters" => {
+                    if let Val::String(s) = v {
+                        if s.len() <= MAX_PARAMS {
+                            if let Ok(p) = serde_json::from_str(s) {
+                                parameters = p;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if name.is_empty() || name.len() > MAX_NAME {
+            continue;
+        }
+        if description.len() > MAX_DESC {
+            description.truncate(MAX_DESC);
+        }
+        out.push(crate::gateway::ToolDefinition {
+            name,
+            description,
+            parameters,
+        });
+    }
+    Some(out)
+}
+
 /// Encode a successful `ChatResponse` as a WIT `llm-response` record `Val`.
 /// Field names match MODULE-009 §1.4.1 exactly: `text` (NOT `content`),
 /// `input-tokens`, `output-tokens`, `finish-reason`, `parsed-output`.
@@ -293,7 +359,14 @@ pub(crate) fn truncate_text_at_char_boundary(s: &str, max_bytes: usize) -> Strin
 }
 
 pub(crate) fn encode_llm_response(response: &ChatResponse) -> Val {
-    let parsed_output_val = match &response.parsed_output {
+    let parsed_owned;
+    let parsed_bytes = if let Some(bytes) = &response.parsed_output {
+        Some(bytes.as_slice())
+    } else {
+        parsed_owned = crate::gateway::tool_calls_parsed_output(&response.tool_calls);
+        parsed_owned.as_deref()
+    };
+    let parsed_output_val = match parsed_bytes {
         Some(bytes) => {
             let capped: &[u8] = if bytes.len() > MAX_ENCODED_PARSED_BYTES {
                 &bytes[..MAX_ENCODED_PARSED_BYTES]
@@ -1873,6 +1946,7 @@ mod tests {
             output_tokens: 1,
             finish_reason: "stop".into(),
             parsed_output: Some(huge_bytes),
+            tool_calls: Vec::new(),
         };
         let encoded = encode_llm_response(&resp);
         match encoded {
@@ -1914,6 +1988,7 @@ mod tests {
             output_tokens: 1,
             finish_reason: "stop".into(),
             parsed_output: None,
+            tool_calls: Vec::new(),
         };
         let encoded = encode_llm_response(&resp);
         match encoded {
@@ -1953,6 +2028,7 @@ mod tests {
             output_tokens: 1,
             finish_reason: "stop".into(),
             parsed_output: None,
+            tool_calls: Vec::new(),
         };
         let encoded = encode_llm_response(&resp);
         match encoded {
@@ -1993,6 +2069,7 @@ mod tests {
             output_tokens: 1,
             finish_reason: "stop".into(),
             parsed_output: None,
+            tool_calls: Vec::new(),
         };
         let encoded = encode_llm_response(&resp);
         match encoded {
@@ -2023,6 +2100,7 @@ mod tests {
             output_tokens: 1,
             finish_reason: "stop".into(),
             parsed_output: Some(small_bytes),
+            tool_calls: Vec::new(),
         };
         let encoded = encode_llm_response(&resp);
         match encoded {

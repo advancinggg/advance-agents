@@ -219,7 +219,9 @@ pub(crate) fn write_0600_nofollow(path: &Path, bytes: &[u8]) -> Result<(), std::
 }
 
 /// CONTRACT-243 create-only driver bytes. Copied from
-/// `crates/runtime/tests/fixtures/guest-rust-hello-llm.core.wasm` (wasm32 core).
+/// `crates/runtime/tests/fixtures/guest-rust-llm-tools.core.wasm` (wasm32 core).
+/// hello-llm stays the SYS-AC one-shot generate fixture; this driver runs the
+/// generate → tool_calls → agent-fs loop.
 const CREATE_DRIVER: &[u8] = include_bytes!("fixtures/behavior.core.wasm");
 
 /// Materialize `<home>/.agent/behavior.wasm` for a new-home `create`.

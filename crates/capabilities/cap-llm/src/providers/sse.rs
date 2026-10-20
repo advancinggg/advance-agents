@@ -77,6 +77,19 @@ pub struct SseEvent {
     pub finish_reason: Option<String>,
     /// True exactly when this frame ends the stream.
     pub terminal: bool,
+    /// Incremental native tool-call fragments for this frame (OpenAI
+    /// `delta.tool_calls`). `None` on frames that carry no tool-call delta.
+    pub tool_call_deltas: Option<Vec<SseToolCallDelta>>,
+}
+
+/// One streamed `delta.tool_calls[i]` fragment. `id` / `name` arrive on the
+/// opening chunk; `arguments` is concatenated across subsequent chunks.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SseToolCallDelta {
+    pub index: usize,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments: Option<String>,
 }
 
 impl SseEvent {
@@ -86,6 +99,7 @@ impl SseEvent {
         usage: None,
         finish_reason: None,
         terminal: false,
+        tool_call_deltas: None,
     };
 
     pub fn is_ignore(&self) -> bool {
@@ -106,6 +120,43 @@ pub struct SseUsageFold {
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
     pub cache_write_1h_tokens: Option<u64>,
+}
+
+/// Accumulates streamed `delta.tool_calls` fragments by `index`.
+#[derive(Debug, Default)]
+pub struct ToolCallFold {
+    slots: Vec<crate::gateway::ToolCall>,
+}
+
+impl ToolCallFold {
+    pub fn apply(&mut self, event: &SseEvent) {
+        let Some(deltas) = event.tool_call_deltas.as_ref() else {
+            return;
+        };
+        for d in deltas {
+            if self.slots.len() <= d.index {
+                self.slots
+                    .resize(d.index + 1, crate::gateway::ToolCall::default());
+            }
+            let slot = &mut self.slots[d.index];
+            if let Some(id) = d.id.as_ref().filter(|s| !s.is_empty()) {
+                slot.id = id.clone();
+            }
+            if let Some(name) = d.name.as_ref().filter(|s| !s.is_empty()) {
+                slot.name = name.clone();
+            }
+            if let Some(args) = &d.arguments {
+                slot.arguments.push_str(args);
+            }
+        }
+    }
+
+    pub fn finish(self) -> Vec<crate::gateway::ToolCall> {
+        self.slots
+            .into_iter()
+            .filter(|c| !c.name.is_empty())
+            .collect()
+    }
 }
 
 impl SseUsageFold {

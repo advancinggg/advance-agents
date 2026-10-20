@@ -42,7 +42,7 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
 use crate::cost::{compute_cost, CacheUsage};
-use crate::providers::sse::SseUsageFold;
+use crate::providers::sse::{SseUsageFold, ToolCallFold};
 
 use crate::events::{emit_llm_error, emit_llm_request, emit_llm_response, emit_llm_retry};
 use crate::executor::{ExecutionOutcome, BASE_DELAY_MS_FLOOR, MAX_DELAY_MS_HARD_CAP};
@@ -100,13 +100,21 @@ pub struct ChatParams {
     pub tools: Option<Vec<ToolDefinition>>,
 }
 
-/// Tool definition for function-calling. Slice B-2 ships the type but does
-/// NOT yet exercise it through OpenAi/Anthropic adapters (Slice C concern).
+/// Tool definition for function-calling. OpenAI-chat adapters serialize this
+/// as `tools[].function` when `ChatParams.tools` is non-empty.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+}
+
+/// One native function call returned by the model (`message.tool_calls`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
 }
 
 /// Chat response (non-streaming).
@@ -118,7 +126,21 @@ pub struct ChatResponse {
     pub output_tokens: u64,
     pub finish_reason: String,
     /// Set when the call carried an `output_schema` and validation passed.
+    /// When `tool_calls` is non-empty and no schema ran, this is the JSON
+    /// envelope `{"tool_calls":[...]}` so WIT guests can read calls without
+    /// a new `llm-response` field (hello-llm keeps linking).
     pub parsed_output: Option<Vec<u8>>,
+    /// Native tool calls. Empty when the model returned text only.
+    pub tool_calls: Vec<ToolCall>,
+}
+
+/// JSON envelope WIT guests parse from `parsed-output` when
+/// `finish-reason` is `tool_calls`.
+pub fn tool_calls_parsed_output(calls: &[ToolCall]) -> Option<Vec<u8>> {
+    if calls.is_empty() {
+        return None;
+    }
+    serde_json::to_vec(&serde_json::json!({ "tool_calls": calls })).ok()
 }
 
 /// Streaming-delta record. Carried by the trait `LlmGatewayInternal::stream()`
@@ -1104,6 +1126,7 @@ impl LlmGateway {
                 output_tokens: clamped_out,
                 finish_reason: resp.finish_reason,
                 parsed_output,
+                tool_calls: Vec::new(),
             };
             return Ok(DispatchOutcome {
                 response: chat_response,
@@ -1210,6 +1233,7 @@ impl LlmGateway {
             output_tokens: 0,
             finish_reason: "embed".into(),
             parsed_output: None,
+            tool_calls: Vec::new(),
         };
         emit_llm_response(
             self.event_bus.as_ref(),
@@ -2019,6 +2043,9 @@ impl LlmGateway {
                                     break 'consume;
                                 }
                             }
+                            if ev.tool_call_deltas.is_some() {
+                                progressed = true;
+                            }
                             if let Some(fr) = &ev.finish_reason {
                                 finish_reason = Some(fr.clone());
                                 progressed = true;
@@ -2731,6 +2758,7 @@ impl LlmGateway {
 
         let mut splitter = crate::providers::sse::FrameSplitter::new();
         let mut fold = SseUsageFold::default();
+        let mut tool_fold = ToolCallFold::default();
         let mut pipeline = crate::stream::DecodedPipeline::new();
         let mut text = String::new();
         let mut saw_text = false;
@@ -2773,6 +2801,10 @@ impl LlmGateway {
                 let ev = adapter.parse_sse_frame(&frame)?;
                 let mut progressed = ev.usage.is_some() || ev.terminal;
                 fold.apply(&ev);
+                tool_fold.apply(&ev);
+                if ev.tool_call_deltas.is_some() {
+                    progressed = true;
+                }
                 if let Some(reason) = &ev.finish_reason {
                     finish_reason = Some(reason.clone());
                     progressed = true;
@@ -2832,9 +2864,11 @@ impl LlmGateway {
         }
         text.push_str(&released);
 
-        // Usage must not coerce to 0, and an answer without any text part is a shape error.
+        // Usage must not coerce to 0, and an answer without any text part is a shape error
+        // unless the model returned native tool_calls (content may be empty).
         let invalid_shape = || LlmError::ProviderError("invalid response shape".into());
-        if !saw_text {
+        let tool_calls = tool_fold.finish();
+        if !saw_text && tool_calls.is_empty() {
             return Err(invalid_shape().into());
         }
         let input_tokens = fold.input_tokens.ok_or_else(invalid_shape)?;
@@ -2846,6 +2880,7 @@ impl LlmGateway {
             output_tokens,
             cache: fold.cache().clamped_to(input_tokens),
             finish_reason: finish_reason.unwrap_or_else(|| "stop".to_string()),
+            tool_calls,
         })
     }
 
@@ -3247,6 +3282,7 @@ impl LlmGateway {
                     output_tokens: clamped_out,
                     finish_reason: outcome.finish_reason,
                     parsed_output,
+                    tool_calls: outcome.tool_calls,
                 };
                 return Ok(DispatchOutcome {
                     response: chat_response,
@@ -3295,6 +3331,7 @@ impl LlmGateway {
                         output_tokens: clamped_out,
                         finish_reason: outcome.finish_reason,
                         parsed_output,
+                        tool_calls: outcome.tool_calls,
                     };
                     return Ok(DispatchOutcome {
                         response: chat_response,
@@ -3536,6 +3573,7 @@ impl LlmGatewayInternal for LlmGateway {
                             output_tokens: 0,
                             finish_reason: "embed".into(),
                             parsed_output: None,
+                            tool_calls: Vec::new(),
                         };
                         let latency_ms = start.elapsed().as_millis() as u64;
                         emit_llm_response(
@@ -3853,6 +3891,7 @@ impl LlmGateway {
                     output_tokens: resp.output_tokens,
                     cache: CacheUsage::NONE,
                     finish_reason: resp.finish_reason,
+                    tool_calls: Vec::new(),
                 },
                 1,
                 start,
@@ -3996,7 +4035,7 @@ impl LlmGateway {
             outcome.cache.clamp_each(MAX_TOKENS_PER_ATTEMPT),
         );
 
-        let (parsed_output, schema_validation): (Option<Vec<u8>>, Option<&'static str>) =
+        let (mut parsed_output, schema_validation): (Option<Vec<u8>>, Option<&'static str>) =
             match &ctx.output_schema {
                 Some(schema) => match try_parse_and_validate(&outcome.text, schema) {
                     Ok(bytes) => (Some(bytes), Some("pass")),
@@ -4005,6 +4044,9 @@ impl LlmGateway {
                 },
                 None => (None, None),
             };
+        if parsed_output.is_none() {
+            parsed_output = crate::gateway::tool_calls_parsed_output(&outcome.tool_calls);
+        }
 
         let is_empty_normalized = outcome.text.chars().all(|c| c.is_whitespace());
         if !is_empty_normalized {
@@ -4048,6 +4090,7 @@ impl LlmGateway {
             output_tokens: clamped_out,
             finish_reason: outcome.finish_reason,
             parsed_output,
+            tool_calls: outcome.tool_calls,
         };
         Ok(ReadyStream {
             ctx,
@@ -4441,6 +4484,24 @@ mod tests {
         budget: Arc<MockRunBudget>,
         bus: Arc<MockEventBusEmit>,
         cfg_provider: Arc<MockRuntimeConfigProvider>,
+    }
+
+    #[test]
+    fn t_tool_calls_parsed_output_envelope() {
+        let bytes = tool_calls_parsed_output(&[ToolCall {
+            id: "call_1".into(),
+            name: "write".into(),
+            arguments: r#"{"path":"a.md","content":"hi"}"#.into(),
+        }])
+        .expect("non-empty calls serialize");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["tool_calls"][0]["id"], "call_1");
+        assert_eq!(v["tool_calls"][0]["name"], "write");
+        assert_eq!(
+            v["tool_calls"][0]["arguments"],
+            r#"{"path":"a.md","content":"hi"}"#
+        );
+        assert!(tool_calls_parsed_output(&[]).is_none());
     }
 
     fn harness() -> Harness {

@@ -46,6 +46,9 @@ pub(crate) struct ExecutionOutcome {
     /// Cached share of `input_tokens`, split by kind for pricing.
     pub cache: crate::cost::CacheUsage,
     pub finish_reason: String,
+    /// Native tool calls from `message.tool_calls` / streamed `delta.tool_calls`.
+    /// Empty when the model returned text only.
+    pub tool_calls: Vec<crate::gateway::ToolCall>,
 }
 
 /// Executor seam over a single `(provider, prompt) → outcome` HTTP call.
@@ -206,6 +209,7 @@ mod tests {
             output_tokens: 1,
             cache: Default::default(),
             finish_reason: "stop".into(),
+            tool_calls: Vec::new(),
         }
     }
 

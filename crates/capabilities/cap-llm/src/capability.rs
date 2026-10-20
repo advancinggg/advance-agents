@@ -27,7 +27,7 @@ pub struct CapabilityDescriptor {
 impl CapabilityDescriptor {
     pub fn unbound_cloud_http() -> Self {
         Self {
-            tool_calling: ToolCallingLevel::Disabled,
+            tool_calling: ToolCallingLevel::Native,
             structured_output: true,
             embeddings: true,
             image: true,
@@ -38,7 +38,7 @@ impl CapabilityDescriptor {
 
     pub fn unbound_local(has_embedding_model: bool) -> Self {
         Self {
-            tool_calling: ToolCallingLevel::Disabled,
+            tool_calling: ToolCallingLevel::Native,
             structured_output: true,
             embeddings: has_embedding_model,
             image: false,
@@ -94,14 +94,6 @@ pub fn descriptor_for(
         if p.capabilities.image && cfg.backend_class.uses_inference_port() {
             return Err(LlmError::ModelNotAvailable(
                 "catalog profile claims image on a text-only local sidecar".into(),
-            ));
-        }
-        if p.capabilities.tool_calling != ToolCallingLevel::Disabled
-            && cfg.backend_class == InferenceBackendClass::CloudHttp
-        {
-            return Err(LlmError::ModelNotAvailable(
-                "catalog profile claims native tools on cloud-http OpenAI-chat before websearch-s1"
-                    .into(),
             ));
         }
         return Ok(responses_route_only(cfg, p.capabilities.clone()));
@@ -245,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn t129_unbound_tools_unsupported() {
+    fn t129_unbound_tools_supported_on_local_and_cloud() {
         let local = cfg("local", InferenceBackendClass::Local, &[("llama", "llama")]);
         let cat = ModelProfileCatalog::new();
         let need = CapabilityNeed {
@@ -255,7 +247,22 @@ mod tests {
             prompt_tokens_est: None,
             max_tokens: None,
         };
-        let err = walk_eligible(&[local], Some("llama"), &cat, &need).unwrap_err();
+        let resolved = walk_eligible(&[local], Some("llama"), &cat, &need).unwrap();
+        assert_eq!(resolved.model, "llama");
+    }
+
+    #[test]
+    fn t129_agent_cli_tools_unsupported() {
+        let cli = cfg("cli", InferenceBackendClass::AgentCli, &[("opus", "opus")]);
+        let cat = ModelProfileCatalog::new();
+        let need = CapabilityNeed {
+            tools: true,
+            output_schema: false,
+            image: false,
+            prompt_tokens_est: None,
+            max_tokens: None,
+        };
+        let err = walk_eligible(&[cli], Some("opus"), &cat, &need).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("unsupported capability"), "{msg}");
     }
@@ -280,9 +287,10 @@ mod tests {
             prompt_tokens_est: None,
             max_tokens: None,
         };
-        // tools disabled on both unbound → no eligible, not "llama" sent to cloud
-        let err = walk_eligible(&[local, cloud], Some("llama"), &cat, &need).unwrap_err();
-        assert!(format!("{err}").contains("unsupported capability"));
+        // hint "llama" must not fall through onto the cloud provider.
+        let resolved = walk_eligible(&[local, cloud], Some("llama"), &cat, &need).unwrap();
+        assert_eq!(resolved.id, "local");
+        assert_eq!(resolved.model, "llama-7b");
     }
 
     #[test]

@@ -1055,6 +1055,7 @@ impl Settlement {
                             output_tokens: billed_out,
                             finish_reason: finish_reason.clone(),
                             parsed_output: parsed_output.clone(),
+                            tool_calls: Vec::new(),
                         };
                         crate::events::emit_llm_response(
                             bus.as_ref(),
@@ -2102,6 +2103,7 @@ impl StreamRegistry {
                 output_tokens: out_t,
                 finish_reason: finish,
                 parsed_output: parsed,
+                tool_calls: Vec::new(),
             },
             cost_usd: cost,
             latency_ms,
@@ -2792,6 +2794,7 @@ mod tests {
                 output_tokens: 1,
                 finish_reason: "stop".into(),
                 parsed_output: None,
+                tool_calls: Vec::new(),
             },
             cost_usd: 0.0,
             latency_ms: 0,

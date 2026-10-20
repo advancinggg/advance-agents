@@ -256,6 +256,40 @@ impl ScriptedResponse {
         }
     }
 
+    /// A 200 whose assistant message is a native Chat Completions `tool_calls`
+    /// payload (`content` JSON-null, `finish_reason` = `tool_calls`). The OpenAI
+    /// adapter lifts this into `ExecutionOutcome.tool_calls` and the WIT
+    /// `parsed-output` envelope `{"tool_calls":[...]}`.
+    pub fn ok_tool_calls(
+        id: &str,
+        name: &str,
+        arguments: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) -> Self {
+        let body = serde_json::to_string(&serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": serde_json::Value::Null,
+                    "tool_calls": [{
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
+            "model": "harness-llm-mock",
+        }))
+        .expect("ok_tool_calls body serializes");
+        Self {
+            status: 200,
+            body: ScriptedBody::Json(body),
+            gate: None,
+        }
+    }
+
     /// A bare `(status, body)` pair (e.g. `err(429, "{\"error\":\"slow down\"}")`).
     pub fn err(status: u16, body: &str) -> Self {
         Self {

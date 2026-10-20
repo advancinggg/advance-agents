@@ -9,9 +9,9 @@ use serde_json::{json, Value};
 use crate::cost::CacheUsage;
 use crate::error::LlmError;
 use crate::executor::ExecutionOutcome;
-use crate::gateway::{ChatMessage, ChatParams};
+use crate::gateway::{ChatMessage, ChatParams, ToolCall};
 use crate::provider::ResolvedProvider;
-use crate::providers::sse::{SseEvent, SseFrame, SseUsage};
+use crate::providers::sse::{SseEvent, SseFrame, SseToolCallDelta, SseUsage};
 use crate::providers::{auth_header_for, ProviderAdapter};
 
 pub struct OpenAiAdapter;
@@ -39,7 +39,87 @@ impl OpenAiAdapter {
         if let Some(stop) = &params.stop_sequences {
             body["stop"] = json!(stop);
         }
+        if let Some(tools) = params.tools.as_ref().filter(|t| !t.is_empty()) {
+            body["tools"] = json!(tools
+                .iter()
+                .map(|t| json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    }
+                }))
+                .collect::<Vec<_>>());
+        }
         body
+    }
+}
+
+fn parse_message_tool_calls(message: &Value) -> Vec<ToolCall> {
+    let Some(arr) = message.get("tool_calls").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let name = item["function"]["name"]
+            .as_str()
+            .or_else(|| item["name"].as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let arguments = match &item["function"]["arguments"] {
+            Value::String(s) => s.clone(),
+            Value::Null => item["arguments"].as_str().unwrap_or("{}").to_string(),
+            other => other.to_string(),
+        };
+        out.push(ToolCall {
+            id: item["id"].as_str().unwrap_or("").to_string(),
+            name,
+            arguments,
+        });
+    }
+    out
+}
+
+fn parse_sse_tool_call_deltas(value: &Value) -> Option<Vec<SseToolCallDelta>> {
+    let arr = value["choices"][0]["delta"]
+        .get("tool_calls")
+        .and_then(Value::as_array)?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for item in arr {
+        let index = item["index"].as_u64().unwrap_or(0) as usize;
+        let name = item["function"]["name"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let arguments = item["function"]["arguments"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let id = item["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if name.is_none() && arguments.is_none() && id.is_none() {
+            continue;
+        }
+        out.push(SseToolCallDelta {
+            index,
+            id,
+            name,
+            arguments,
+        });
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
     }
 }
 
@@ -143,7 +223,12 @@ impl ProviderAdapter for OpenAiAdapter {
                 cache_write_tokens: None,
                 cache_write_1h_tokens: None,
             });
-        if delta.is_none() && finish_reason.is_none() && usage.is_none() {
+        let tool_call_deltas = parse_sse_tool_call_deltas(&value);
+        if delta.is_none()
+            && finish_reason.is_none()
+            && usage.is_none()
+            && tool_call_deltas.is_none()
+        {
             // Role-only first chunk / keep-alive → Ignore, never Some("").
             return Ok(SseEvent::IGNORE);
         }
@@ -152,6 +237,7 @@ impl ProviderAdapter for OpenAiAdapter {
             usage,
             finish_reason,
             terminal: false,
+            tool_call_deltas,
         })
     }
 
@@ -159,10 +245,17 @@ impl ProviderAdapter for OpenAiAdapter {
         if status == 200 {
             let value: Value = serde_json::from_slice(body)
                 .map_err(|_| LlmError::ProviderError("invalid response shape".into()))?;
-            let text = value["choices"][0]["message"]["content"]
-                .as_str()
-                .ok_or_else(|| LlmError::ProviderError("invalid response shape".into()))?
-                .to_string();
+            let message = &value["choices"][0]["message"];
+            let tool_calls = parse_message_tool_calls(message);
+            // `content` is JSON null when the model returns only tool_calls.
+            let text = if tool_calls.is_empty() {
+                message["content"]
+                    .as_str()
+                    .ok_or_else(|| LlmError::ProviderError("invalid response shape".into()))?
+                    .to_string()
+            } else {
+                message["content"].as_str().unwrap_or("").to_string()
+            };
             let model = value["model"].as_str().unwrap_or("").to_string();
             // Round-AUDIT-5 C1 fix: missing usage fields MUST NOT silently
             // coerce to 0. The earlier `unwrap_or(0)` would let a malformed
@@ -198,6 +291,7 @@ impl ProviderAdapter for OpenAiAdapter {
                 output_tokens,
                 cache,
                 finish_reason,
+                tool_calls,
             });
         }
         Err(map_status_to_llm_err(status, body))
@@ -628,6 +722,80 @@ mod tests {
             .headers
             .iter()
             .any(|(n, v)| n == "Content-Type" && v == "application/json"));
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert!(body.get("tools").is_none(), "empty params must omit tools");
+    }
+
+    #[test]
+    fn t_openai_chat_body_serializes_tools() {
+        let adapter = OpenAiAdapter;
+        let p = provider("https://api.openai.com");
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "hi".into(),
+        }];
+        let params = ChatParams {
+            tools: Some(vec![crate::gateway::ToolDefinition {
+                name: "write".into(),
+                description: "Write a file".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }),
+            }]),
+            ..ChatParams::default()
+        };
+        let req = adapter.build_chat_request(&p, &messages, &params).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "write");
+        assert_eq!(body["tools"][0]["function"]["description"], "Write a file");
+    }
+
+    #[test]
+    fn t_openai_parse_chat_response_tool_calls_null_content() {
+        let adapter = OpenAiAdapter;
+        let body = br#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"write","arguments":"{\"path\":\"roadmap.md\",\"content\":\"hi\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":8},"model":"deepseek-flash"}"#;
+        let outcome = adapter.parse_chat_response(200, body).unwrap();
+        assert_eq!(outcome.text, "");
+        assert_eq!(outcome.finish_reason, "tool_calls");
+        assert_eq!(outcome.tool_calls.len(), 1);
+        assert_eq!(outcome.tool_calls[0].name, "write");
+        assert!(outcome.tool_calls[0].arguments.contains("roadmap.md"));
+    }
+
+    #[test]
+    fn t_openai_parse_sse_tool_call_deltas() {
+        let adapter = OpenAiAdapter;
+        let open = adapter
+            .parse_sse_frame(&data_frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write","arguments":""}}]}}]}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            open.tool_call_deltas.as_ref().unwrap()[0].name.as_deref(),
+            Some("write")
+        );
+        let args = adapter
+            .parse_sse_frame(&data_frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a.md\"}"}}]}}]}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            args.tool_call_deltas.as_ref().unwrap()[0]
+                .arguments
+                .as_deref(),
+            Some("{\"path\":\"a.md\"}")
+        );
+        let mut fold = crate::providers::sse::ToolCallFold::default();
+        fold.apply(&open);
+        fold.apply(&args);
+        let calls = fold.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "write");
+        assert_eq!(calls[0].arguments, "{\"path\":\"a.md\"}");
     }
 
     /// MODULE-009-T70 — OpenAi parse_chat_response status mapping.

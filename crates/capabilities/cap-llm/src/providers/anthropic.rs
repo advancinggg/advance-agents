@@ -226,6 +226,7 @@ impl ProviderAdapter for AnthropicAdapter {
                 output_tokens,
                 cache,
                 finish_reason,
+                tool_calls: Vec::new(),
             });
         }
         Err(map_anthropic_status(status, body))

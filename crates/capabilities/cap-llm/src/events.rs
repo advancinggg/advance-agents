@@ -238,6 +238,7 @@ mod tests {
             output_tokens: 5,
             finish_reason: "stop".into(),
             parsed_output: None,
+            tool_calls: Vec::new(),
         }
     }
 

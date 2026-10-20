@@ -314,6 +314,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                 output_tokens,
                 cache,
                 finish_reason,
+                tool_calls: Vec::new(),
             });
         }
         Err(map_status_static(status, body))
@@ -438,6 +439,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                         .then_some(usage),
                     finish_reason: Some(finish),
                     terminal: true,
+                    tool_call_deltas: None,
                 })
             }
             "response.failed" => {

@@ -1,0 +1,27 @@
+[package]
+name = "guest-rust-llm-tools"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Reference LLM+tools guest: imports `agent-llm` and `agent-fs`, and on
+# handle-message runs a bounded generate → tool_calls → host-fn → generate
+# loop. First-open CREATE_DRIVER (`behavior.core.wasm`) is this guest.
+# hello-llm stays the SYS-AC one-shot generate fixture. Excluded from the
+# workspace (built for wasm32-unknown-unknown).
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -68,11 +68,18 @@ interface runnable {
 /// host-side encoder/decoder in `cap-llm/src/host_fn.rs` produces / consumes
 /// `Val` values matching the type shapes declared here.
 interface agent-llm {
+    record tool-definition {
+        name: string,
+        description: string,
+        parameters: string,
+    }
+
     record llm-params {
         model: option<string>,
         temperature: option<f64>,
         max-tokens: option<u32>,
         stop-sequences: option<list<string>>,
+        tools: option<list<tool-definition>>,
     }
 
     record llm-request {
