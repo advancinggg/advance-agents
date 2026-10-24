@@ -370,6 +370,43 @@ fn module_009_t01_agent_llm_interface_declared_in_wit_package() {
     }
 }
 
+/// ADR 2026-10-24 D2 — `agent-callables` is package-level, not imported by
+/// `world advance-host` (T42). Two functions, both `result<_, callable-error>`.
+#[test]
+fn agent_callables_interface_declared_in_wit_package() {
+    let mut resolve = Resolve::default();
+    let pkg = resolve
+        .push_str(WIT_PACKAGE_PATH, WIT_PACKAGE)
+        .expect("WIT parses");
+    let pkg_data = &resolve.packages[pkg];
+    let id = pkg_data
+        .interfaces
+        .get("agent-callables")
+        .copied()
+        .expect("agent-callables interface declared in advance.wit at package level");
+    let iface = &resolve.interfaces[id];
+    let fn_names: std::collections::BTreeSet<&str> =
+        iface.functions.keys().map(|s| s.as_str()).collect();
+    let expected: std::collections::BTreeSet<&str> =
+        ["list-callables", "invoke-callable"].into_iter().collect();
+    assert_eq!(fn_names, expected, "got {fn_names:?}");
+    use wit_parser::{Type, TypeDefKind};
+    for name in ["list-callables", "invoke-callable"] {
+        let func = iface.functions.get(name).expect("function present");
+        let ret_ty = func
+            .result
+            .as_ref()
+            .unwrap_or_else(|| panic!("agent-callables/{name} must return a result"));
+        let Type::Id(ret_id) = ret_ty else {
+            panic!("agent-callables/{name} return type must be a TypeId");
+        };
+        assert!(
+            matches!(resolve.types[*ret_id].kind, TypeDefKind::Result(_)),
+            "agent-callables/{name} must return result<_, _>"
+        );
+    }
+}
+
 // =====================================================================
 // T41 — Bindgen rejects component with no advance-host exports
 // =====================================================================

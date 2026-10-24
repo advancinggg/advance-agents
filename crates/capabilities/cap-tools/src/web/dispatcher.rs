@@ -11,7 +11,7 @@ use advance_shared_types::web_search::{
     WEB_EXTRACT_TOOL_ID, WEB_SEARCH_TOOL_ID,
 };
 
-use crate::inventory::tool_entries_from_infos;
+use crate::inventory::method_tool_entries_from_infos;
 use crate::lazy_registry::{compile_method_schemas, json_check, CompiledSchema, GateFail};
 use crate::registry::{MethodInfo, ToolError, ToolInfo};
 
@@ -67,20 +67,23 @@ pub fn project_callable_tool_entries(
     web_grant: Option<&dyn GrantCheck>,
     agent_id: &str,
 ) -> Vec<ToolEntry> {
-    let mut entries = tool_entries_from_infos(listed)
+    // Filter by **tool id** (allowlist + web split) BEFORE expanding methods,
+    // so `tools.ids = ["data"]` still admits `data__describe`.
+    let filtered: Vec<ToolInfo> = listed
         .into_iter()
-        .filter(|e| {
-            if is_web_tool_id(&e.name) {
+        .filter(|info| {
+            if is_web_tool_id(&info.id) {
                 false
             } else {
                 tools_allowlist
-                    .map(|s| s.iter().any(|a| a == &e.name))
+                    .map(|s| s.iter().any(|a| a == &info.id))
                     .unwrap_or(true)
             }
         })
-        .collect::<Vec<_>>();
+        .collect();
+    let mut entries = method_tool_entries_from_infos(filtered);
     if web_tool_visible(web_grant, agent_id) {
-        entries.extend(tool_entries_from_infos(agent_tool_infos()));
+        entries.extend(method_tool_entries_from_infos(agent_tool_infos()));
     }
     entries
 }

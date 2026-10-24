@@ -54,7 +54,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::boundary_marker::layer2_wrap;
-use crate::inventory::HostFnInventoryReader;
+use crate::inventory::{HostFnInventoryReader, NativeToolsPort, NeverNativeTools};
 use crate::knowledge_map::KNOWLEDGE_MAP_MAX_TOKENS;
 use crate::l0_bridge::compress_turn_buffer;
 use crate::ports::{
@@ -74,8 +74,9 @@ use crate::tier1_runtime::{
     format_security_model_section,
 };
 use crate::tier2::{
-    assemble_unified, format_available_tools_section_with_not_shown,
-    neutralize_cache_breakpoint_markers, sanitize_description, UnifiedToolRecord,
+    assemble_unified, format_available_tools_section_compact_with_not_shown,
+    format_available_tools_section_with_not_shown, neutralize_cache_breakpoint_markers,
+    sanitize_description, UnifiedToolRecord,
 };
 use crate::tier2_decomposition::format_active_decomposition_section;
 use crate::tier2_delegates::format_available_delegates_section_with_aliases;
@@ -152,6 +153,9 @@ pub struct ContextAssemblerImpl {
     // byte-identical; the composition root installs the real one via
     // `with_runtime_info`.
     runtime_info: Arc<dyn RuntimeInfoReader>,
+    // ADR 2026-10-24 D6 — compact `# Available Tools` when the placement
+    // serializes a native `tools` array. Default NeverNativeTools (full form).
+    native_tools: Arc<dyn NativeToolsPort>,
     // Optional per-turn inspection sink (`with_report_sink`).
     report_sink: Option<Arc<dyn AssemblyReportSink>>,
     // Optional explicit model window (`with_model_context_window`) — wins over
@@ -278,11 +282,19 @@ impl ContextAssemblerImpl {
             prompt_injection,
             decomposition,
             runtime_info: Arc::new(NoRuntimeInfo),
+            native_tools: Arc::new(NeverNativeTools),
             report_sink: None,
             model_window_override: None,
             warnings: Arc::new(WarningQueue::new()),
             agent_id_aliases: Vec::new(),
         }
+    }
+
+    /// Compact `# Available Tools` when the agent's placement supports native
+    /// tools (ADR 2026-10-24 D6). Default is full form.
+    pub fn with_native_tools_port(mut self, port: Arc<dyn NativeToolsPort>) -> Self {
+        self.native_tools = port;
+        self
     }
 
     /// Wave-12 — set the agent-id alias set ({bare cap-id, colon msg-id}) used
@@ -473,7 +485,11 @@ impl ContextAssembler for ContextAssemblerImpl {
         let mcp = self.callable_inventory.mcp_tools_shown(&ctx.agent_id);
         let mcp_entries = mcp.tools.len();
         let unified = assemble_unified(host_fns, wasm_tools, mcp.tools);
-        let tier2_tools = format_available_tools_section_with_not_shown(&unified, mcp.not_shown);
+        let tier2_tools = if self.native_tools.supports_native_tools(&ctx.agent_id) {
+            format_available_tools_section_compact_with_not_shown(&unified, mcp.not_shown)
+        } else {
+            format_available_tools_section_with_not_shown(&unified, mcp.not_shown)
+        };
         // Wave-12: match the ⑬ delegates `node.parent` against the agent's full
         // id-alias set ({ctx.agent_id} ∪ agent_id_aliases) so a Sub recorded
         // under the BARE cap-id surfaces for this COLON-keyed assemble turn.

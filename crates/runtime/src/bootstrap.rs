@@ -25,6 +25,7 @@ use advance_database::{
 use advance_shared_types::capability::{CapParams, GrantDecision};
 use advance_shared_types::traits::GrantCheck;
 
+use crate::callable_registry::{CallableRegistry, InMemoryCallableRegistry};
 use crate::capability_injector::CapabilityInjector;
 use crate::circuit_breaker::{
     BreakerState, CircuitBreaker, CircuitBreakerBus, DefaultCircuitBreakerBus,
@@ -239,6 +240,8 @@ pub struct RuntimeHost {
     /// dim reads through `recall.current_embedding_dim()`.
     unified_search: Arc<dyn UnifiedSearch>,
     host_registry: Arc<dyn HostRegistry>,
+    /// ADR 2026-10-24 D3 — model-facing host-fn catalog (sibling of HostRegistry).
+    callable_registry: Arc<dyn CallableRegistry>,
     breaker: Arc<dyn CircuitBreakerBus>,
     grant_check: Arc<dyn GrantCheck>,
     injector: Arc<CapabilityInjector>,
@@ -291,6 +294,7 @@ pub struct RuntimeHostBuilder {
     recall: Arc<dyn Recall>,
     unified_search: Arc<dyn UnifiedSearch>,
     host_registry: Arc<dyn HostRegistry>,
+    callable_registry: Arc<dyn CallableRegistry>,
     breaker: Arc<dyn CircuitBreakerBus>,
     workspace_root: PathBuf,
     /// The WAL-mode reload observer task, until an owner takes it
@@ -459,6 +463,8 @@ impl RuntimeHostBuilder {
 
         // 4. Host registry (empty — host fns registered by downstream slices).
         let host_registry: Arc<dyn HostRegistry> = Arc::new(InMemoryHostRegistry::new());
+        let callable_registry: Arc<dyn CallableRegistry> =
+            Arc::new(InMemoryCallableRegistry::new());
 
         // 5. Circuit-breaker bus, seeded with configured Open breakers.
         let breaker_concrete = Arc::new(DefaultCircuitBreakerBus::new());
@@ -480,6 +486,7 @@ impl RuntimeHostBuilder {
             recall,
             unified_search,
             host_registry,
+            callable_registry,
             breaker,
             workspace_root: workspace_root.to_path_buf(),
             wal_observer: Mutex::new(wal_observer),
@@ -546,6 +553,7 @@ impl RuntimeHostBuilder {
             recall: self.recall,
             unified_search: self.unified_search,
             host_registry: self.host_registry,
+            callable_registry: self.callable_registry,
             breaker: self.breaker,
             grant_check,
             injector,
@@ -592,6 +600,12 @@ impl RuntimeHostBuilder {
     /// [`HostRegistry::register`] BEFORE calling [`Self::build`].
     pub fn host_registry(&self) -> Arc<dyn HostRegistry> {
         self.host_registry.clone()
+    }
+
+    /// Model-facing host-fn catalog (ADR 2026-10-24 D3). Empty at builder
+    /// construction; wiring registers opt-in specs BEFORE [`Self::build`].
+    pub fn callable_registry(&self) -> Arc<dyn CallableRegistry> {
+        self.callable_registry.clone()
     }
 
     /// Circuit-breaker bus (CONTRACT-002), seeded from
@@ -667,6 +681,11 @@ impl RuntimeHost {
     /// downstream slices populate via `HostRegistry::register`.
     pub fn host_registry(&self) -> Arc<dyn HostRegistry> {
         self.host_registry.clone()
+    }
+
+    /// Model-facing host-fn catalog (ADR 2026-10-24 D3).
+    pub fn callable_registry(&self) -> Arc<dyn CallableRegistry> {
+        self.callable_registry.clone()
     }
 
     /// Circuit-breaker bus (CONTRACT-002), seeded from

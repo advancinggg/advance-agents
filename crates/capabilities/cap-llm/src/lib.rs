@@ -34,6 +34,7 @@
 pub mod backend_cli;
 pub mod backend_local;
 pub mod backend_mesh;
+pub mod callables;
 pub mod capability;
 pub mod catalog;
 pub mod cost;
@@ -100,6 +101,10 @@ pub use backend_local::{
     StaticHandoffSupervisor, SupervisedChild,
 };
 pub use backend_mesh::MeshRemoteAdapter;
+pub use callables::{
+    apply_callables, ApplyCallablesResult, CallableCatalogPort, CallableSelection,
+    DEFAULT_MAX_NATIVE_TOOLS,
+};
 pub use catalog::ModelProfileCatalog;
 pub use cost::compute_cost;
 pub use credential::{CredentialFailure, ProviderCredentialSource};

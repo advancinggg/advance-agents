@@ -498,6 +498,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "jsonschema",
  "libc",
  "rand 0.8.5",
  "reqwest",

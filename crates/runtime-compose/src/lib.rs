@@ -86,6 +86,7 @@ pub mod channel_egress;
 // egress (OutboundTransport::send → channel.raw_sent), replacing the best-effort
 // EventBusNotifySink (auto.notify). cli-only (cap-channel src untouched); flips ZERO SYS-AC.
 pub mod breaker_gate;
+pub mod callables;
 pub mod capability_catalog;
 pub mod channel_notify_sink;
 pub mod channels_boot;

@@ -52,7 +52,10 @@ pub use validator::{
 
 // Slice J (V1-b) — production CONTRACT-165 CallableInventoryReader + WASM
 // mapping/gather helpers.
-pub use inventory::{tool_entries_from_infos, wasm_tool_entries, CallableInventory};
+pub use inventory::{
+    method_tool_entries_from_infos, normalize_callable_name, tool_entries_from_infos,
+    wasm_tool_entries, CallableInventory,
+};
 
 pub mod host_fn;
 pub mod inventory;

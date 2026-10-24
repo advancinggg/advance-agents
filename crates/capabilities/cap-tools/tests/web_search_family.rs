@@ -819,14 +819,14 @@ fn inv_01_closed_tools_ids_does_not_drop_web() {
     let entries =
         project_callable_tool_entries(listed.clone(), Some(&closed), Some(&AllowAll), "agent");
     let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-    assert!(names.contains(&"skill::echo"));
-    assert!(names.contains(&WEB_SEARCH_TOOL_ID));
-    assert!(names.contains(&WEB_EXTRACT_TOOL_ID));
+    assert!(names.contains(&"skill::echo__echo"));
+    assert!(names.contains(&"web.search__search"));
+    assert!(names.contains(&"web.extract__extract"));
 
     let hidden = project_callable_tool_entries(listed, Some(&closed), Some(&DenyAll), "agent");
     let hidden_names: Vec<_> = hidden.iter().map(|e| e.name.as_str()).collect();
-    assert!(hidden_names.contains(&"skill::echo"));
-    assert!(!hidden_names.iter().any(|n| *n == WEB_SEARCH_TOOL_ID));
+    assert!(hidden_names.contains(&"skill::echo__echo"));
+    assert!(!hidden_names.iter().any(|n| n.starts_with("web.search")));
 }
 
 #[tokio::test]

@@ -82,6 +82,13 @@ interface agent-llm {
         fresh,
     }
 
+    /// Catalog selection for the native `tools` array (ADR 2026-10-24 D5).
+    /// Absent on `llm-params` = none (opt-in; one-shot guests unchanged).
+    variant callable-selection {
+        all,
+        only(list<string>),
+    }
+
     record llm-params {
         model: option<string>,
         temperature: option<f64>,
@@ -89,7 +96,9 @@ interface agent-llm {
         stop-sequences: option<list<string>>,
         tools: option<list<tool-definition>>,
         /// Guest-defined behavior tools remain `tools` (v0.1.47).
+        /// `callables` names catalog entries the host expands (absent = none).
         /// `transcript` is host-owned conversation state for this turn.
+        callables: option<callable-selection>,
         transcript: option<transcript-mode>,
     }
 
@@ -130,6 +139,43 @@ interface agent-llm {
     generate: func(request: llm-request) -> result<llm-response, llm-error>;
     %stream: func(request: llm-request) -> result<stream-handle, llm-error>;
     poll-stream: func(handle: stream-handle) -> result<stream-chunk, llm-error>;
+}
+
+/// Layer 3 dispatch — the inverse of the Layer 3 view (ARCH §8 Decision 15
+/// addendum, ADR 2026-10-24 D2). Model-facing names in, Layer 2 execution
+/// objects out. NOT a Layer 2 ABI. Registered under capability `llm` (linked
+/// iff the agent declares `llm`). NOT imported by `world advance-host` —
+/// MODULE-001-T42's "advance-host has zero function-bearing imports" invariant
+/// must hold.
+interface agent-callables {
+    enum callable-source { host-fn, wasm-tool, mcp-tool }
+
+    record callable-definition {
+        name: string,
+        description: string,
+        parameters: string,
+        source: callable-source,
+        idempotent: option<bool>,
+    }
+
+    record callable-result {
+        call-id: string,
+        content: string,
+        is-error: bool,
+    }
+
+    variant callable-error {
+        not-found(string),
+        permission-denied(string),
+        invalid-arguments(string),
+        repetition-terminated(string),
+        budget-exceeded(string),
+        internal(string),
+    }
+
+    list-callables: func() -> result<list<callable-definition>, callable-error>;
+    invoke-callable: func(call-id: string, name: string, arguments: string)
+        -> result<callable-result, callable-error>;
 }
 
 /// Local / WASM-tool ABI per MODULE-017 §1.3.4 + PRD §9.8. Slice m017-A

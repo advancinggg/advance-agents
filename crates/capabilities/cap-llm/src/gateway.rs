@@ -300,6 +300,8 @@ pub(crate) struct LlmRequestContext {
     pub guest_prompt: String,
     /// WIT `llm-params.transcript`; default continue.
     pub transcript: TranscriptMode,
+    /// True when the guest set `llm-params.callables` (ADR 2026-10-24 D10).
+    pub callables_selected: bool,
     /// When true, `generate` / `generate_via_local` bind `TeeState` (guest WIT
     /// generate). Host `chat()` / extractors leave this false.
     pub tee_live: bool,
@@ -458,6 +460,10 @@ pub struct LlmGateway {
     /// Optional Client API note for a guest-visible subscription-usage failure.
     /// `None` (every plain `new`) records nothing.
     failure_note: Mutex<Option<Arc<dyn crate::error::FailureClassNote>>>,
+    /// Layer 3 catalog expanded into `ChatParams.tools` (ADR 2026-10-24 D5).
+    callable_catalog: Mutex<Option<Arc<dyn crate::callables::CallableCatalogPort>>>,
+    max_native_tools: usize,
+    last_dropped_unknown: Mutex<Vec<String>>,
     /// Lane agent-llm-policy: the per-agent policy source consulted before placement on every
     /// generate / stream request. `None` = not wired (byte-identical to the pre-lane gateway).
     agent_policy: Option<Arc<dyn crate::policy::AgentLlmPolicySource>>,
@@ -572,9 +578,75 @@ impl LlmGateway {
             placement_telemetry: crate::placement::default_telemetry(),
             generate_timeout: None,
             failure_note: Mutex::new(None),
+            callable_catalog: Mutex::new(None),
+            max_native_tools: crate::callables::DEFAULT_MAX_NATIVE_TOOLS,
+            last_dropped_unknown: Mutex::new(Vec::new()),
             agent_policy: None,
             credential_source: None,
         }
+    }
+
+    /// Late-bind the Layer 3 catalog (gateway is already `Arc` before tools exist).
+    pub fn set_callable_catalog(&self, catalog: Arc<dyn crate::callables::CallableCatalogPort>) {
+        *self
+            .callable_catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(catalog);
+    }
+
+    /// Override the native `tools` array cap (default 128).
+    pub fn with_max_native_tools(mut self, max_tools: usize) -> Self {
+        self.max_native_tools = max_tools;
+        self
+    }
+
+    /// Names dropped from the last `only(...)` expansion (test-visible).
+    pub fn last_dropped_unknown(&self) -> Vec<String> {
+        self.last_dropped_unknown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Expand `llm-params.callables` into `params.tools`. Returns whether a
+    /// selection was present (D10).
+    pub fn expand_callables(
+        &self,
+        agent_id: &str,
+        selection: Option<&crate::callables::CallableSelection>,
+        params: &mut ChatParams,
+    ) -> Result<bool, LlmError> {
+        let catalog = self
+            .callable_catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let catalog_tools = catalog
+            .as_ref()
+            .map(|c| c.list_for_agent(agent_id))
+            .unwrap_or_default();
+        let guest_tools = params.tools.take();
+        let applied = crate::callables::apply_callables(
+            selection,
+            guest_tools,
+            &catalog_tools,
+            self.max_native_tools,
+        )?;
+        *self
+            .last_dropped_unknown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = applied.dropped_unknown.clone();
+        if !applied.dropped_unknown.is_empty() {
+            self.event_bus
+                .emit(advance_shared_types::event::Event::observability(
+                    "callable.unknown-dropped",
+                    agent_id,
+                    serde_json::json!({ "names": applied.dropped_unknown }),
+                    None,
+                ));
+        }
+        params.tools = applied.tools;
+        Ok(selection.is_some())
     }
 
     /// Install the Client API note for subscription-usage failures. The note stores
@@ -2653,6 +2725,15 @@ impl LlmGateway {
         deadline: Instant,
     ) -> Result<DispatchOutcome, DispatchError> {
         let messages_snapshot = ctx.messages.clone();
+        let tools_snapshot = ctx.params.tools.clone();
+        if ctx.callables_selected {
+            let native = crate::capability::descriptor_for(provider_cfg, &self.catalog)
+                .map(|d| d.tool_calling == crate::capability::ToolCallingLevel::Native)
+                .unwrap_or(false);
+            if !native {
+                ctx.params.tools = None;
+            }
+        }
         let result = if resolved.backend_class.uses_inference_port() {
             self.dispatch_port(ctx, resolved, deadline, tee, tee_armed)
                 .await
@@ -2674,6 +2755,7 @@ impl LlmGateway {
             result
         };
         ctx.messages = messages_snapshot;
+        ctx.params.tools = tools_snapshot;
         result
     }
 

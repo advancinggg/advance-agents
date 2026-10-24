@@ -61,6 +61,7 @@ cap-http = { path = "../capabilities/cap-http" }
 cap-lifecycle = { path = "../capabilities/cap-lifecycle" }
 cap-channel = { path = "../capabilities/cap-channel" }
 cap-mcp = { path = "../capabilities/cap-mcp" }
+jsonschema = { workspace = true }
 async-trait = { workspace = true }
 # `BoxFuture` (the extension shutdown hook) and `FutureExt::catch_unwind`.
 futures = { workspace = true }

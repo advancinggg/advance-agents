@@ -27,6 +27,7 @@ use advance_shared_types::turn_attribution::{
 };
 use wasmtime::component::Val;
 
+use crate::callables::CallableSelection;
 use crate::error::LlmError;
 use crate::gateway::{ChatParams, ChatResponse, LlmGateway, LlmRequestContext, TranscriptMode};
 use crate::stream::{PollOutcome, StreamRegistry};
@@ -53,6 +54,8 @@ pub(crate) struct LlmRequest {
     pub output_schema: Option<String>,
     /// WIT `llm-params.transcript`; default continue when absent.
     pub transcript: TranscriptMode,
+    /// WIT `llm-params.callables`; absent = catalog stays out (opt-in).
+    pub callables: Option<CallableSelection>,
 }
 
 /// Decode the first parameter as a WIT `llm-request` record. Slice B-2 ships
@@ -105,6 +108,7 @@ pub(crate) fn decode_llm_request(params: &[Val]) -> Result<LlmRequest, String> {
                                             cp.stop_sequences = decode_optional_list_string(v)
                                         }
                                         "tools" => cp.tools = decode_optional_tools(v),
+                                        "callables" => req.callables = decode_optional_callables(v),
                                         "transcript" => {
                                             req.transcript = decode_optional_transcript(v)
                                         }
@@ -234,9 +238,9 @@ fn decode_optional_list_string(val: &Val) -> Option<Vec<String>> {
 ///
 /// Each `tool-definition` is `{name, description, parameters}` where
 /// `parameters` is a JSON-schema string. Invalid JSON / empty names are
-/// skipped. Caps: 32 tools, 64-byte names, 4 KiB parameters.
+/// skipped. Caps: 128 tools, 64-byte names, 4 KiB parameters.
 fn decode_optional_tools(val: &Val) -> Option<Vec<crate::gateway::ToolDefinition>> {
-    const MAX_TOOLS: usize = 32;
+    const MAX_TOOLS: usize = crate::callables::DEFAULT_MAX_NATIVE_TOOLS;
     const MAX_NAME: usize = 64;
     const MAX_DESC: usize = 1024;
     const MAX_PARAMS: usize = 4096;
@@ -293,6 +297,39 @@ fn decode_optional_tools(val: &Val) -> Option<Vec<crate::gateway::ToolDefinition
         });
     }
     Some(out)
+}
+
+/// Decode `option<callable-selection>` (`all` / `only(list<string>)`).
+fn decode_optional_callables(val: &Val) -> Option<CallableSelection> {
+    let inner = match val {
+        Val::Option(Some(boxed)) => boxed.as_ref(),
+        Val::Variant(_, _) => val,
+        _ => return None,
+    };
+    match inner {
+        Val::Variant(tag, _) if tag == "all" => Some(CallableSelection::All),
+        Val::Variant(tag, payload) if tag == "only" => {
+            let names = payload.as_ref().and_then(|p| match p.as_ref() {
+                Val::List(items) => {
+                    let mut out = Vec::new();
+                    for item in items
+                        .iter()
+                        .take(crate::callables::DEFAULT_MAX_NATIVE_TOOLS)
+                    {
+                        if let Val::String(s) = item {
+                            if !s.is_empty() && s.len() <= 256 {
+                                out.push(s.clone());
+                            }
+                        }
+                    }
+                    Some(out)
+                }
+                _ => None,
+            });
+            Some(CallableSelection::Only(names.unwrap_or_default()))
+        }
+        _ => None,
+    }
 }
 
 /// Decode `option<transcript-mode>`. Absent / unknown → continue.
@@ -580,6 +617,15 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
                     "empty-messages".into(),
                 )))]);
             }
+            let mut params = req.params.unwrap_or_default();
+            let callables_selected = match gateway.expand_callables(
+                &ctx.agent_id,
+                req.callables.as_ref(),
+                &mut params,
+            ) {
+                Ok(sel) => sel,
+                Err(e) => return Ok(vec![encode_llm_result(Err(e))]),
+            };
             let llm_ctx = LlmRequestContext {
                 agent_id: ctx.agent_id.clone(),
                 task_id: attribution.task_id,
@@ -587,7 +633,7 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
                 iteration: ctx.iteration,
                 trace_id: Some(ctx.trace_id.clone()),
                 messages,
-                params: req.params.unwrap_or_default(),
+                params,
                 output_schema: req.output_schema,
                 tee_live: true,
                 user_constraints: Vec::new(),
@@ -597,6 +643,7 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
                 turn_id: ctx.turn_id.clone(),
                 guest_prompt: req.prompt,
                 transcript: req.transcript,
+                callables_selected,
             };
             let result = gateway.generate(llm_ctx).await;
             gateway.observe_guest_visible_error(&ctx.agent_id, result.as_ref().err());
@@ -631,6 +678,15 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
                     "empty-messages".into(),
                 )))]);
             }
+            let mut params = req.params.unwrap_or_default();
+            let callables_selected = match gateway.expand_callables(
+                &ctx.agent_id,
+                req.callables.as_ref(),
+                &mut params,
+            ) {
+                Ok(sel) => sel,
+                Err(e) => return Ok(vec![encode_stream_result(Err(e))]),
+            };
             let llm_ctx = LlmRequestContext {
                 agent_id: ctx.agent_id.clone(),
                 task_id: attribution.task_id,
@@ -638,7 +694,7 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
                 iteration: ctx.iteration,
                 trace_id: Some(ctx.trace_id.clone()),
                 messages,
-                params: req.params.unwrap_or_default(),
+                params,
                 output_schema: req.output_schema,
                 tee_live: false,
                 user_constraints: Vec::new(),
@@ -648,6 +704,7 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
                 turn_id: ctx.turn_id.clone(),
                 guest_prompt: req.prompt,
                 transcript: req.transcript,
+                callables_selected,
             };
             // S4 final: a WIRED gateway takes the live path ONLY — no silent
             // buffered fallback on any live error (plan §1). An UNWIRED gateway

@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use advance_context_engine::DecompositionReader;
+use advance_runtime::callable_registry::CallableRegistry;
 use advance_runtime::host_registry::HostRegistry;
 use advance_scheduler::agent_loop::AgentLoopDriverImpl;
 use advance_shared_types::agent_tree::AgentTreeSnapshot;
@@ -25,12 +26,10 @@ use cap_tools::ToolRegistry;
 
 use crate::agent_loop::PublishingContextAssembler;
 use crate::api::log_keys;
+use crate::callables::CatalogHostFnInventory;
 use crate::compose_log::LogHandle;
 use crate::context_inspect::{ContextSnapshotStore, EmbeddingPosture};
-use crate::context_wiring::{
-    host_fns_from_registry, FixedHostFnInventory, GatewayEmbedding, GatewayLightLlm,
-    PackSkillSummaryReader,
-};
+use crate::context_wiring::{GatewayEmbedding, GatewayLightLlm, PackSkillSummaryReader};
 
 /// Shared production deps late-bound onto [`crate::perchild_daemon::PerChildLoopManager`]
 /// after the LLM gateway exists and before any child loop is served.
@@ -52,6 +51,7 @@ pub struct ChildContextDeps {
     pub vlm: Option<Arc<dyn VlmExtractor>>,
     pub meta_maintainer: Option<Arc<MetaMaintainer>>,
     pub host_registry: Arc<dyn HostRegistry>,
+    pub callable_registry: Arc<dyn CallableRegistry>,
     pub embedding_posture: EmbeddingPosture,
     pub assembler_model: String,
     pub llm_provider: Option<String>,
@@ -107,7 +107,6 @@ pub fn attach_child_context(
         None => Arc::new(crate::context_wiring::EmptyDecomposition),
     };
 
-    let declared_refs: Vec<&str> = declared_caps.iter().map(|s| s.as_str()).collect();
     let wasm_entries = if let Some(reg) = deps.tool_registry.as_ref() {
         let listed = list_tools_blocking(reg);
         let allow = deps
@@ -170,10 +169,10 @@ pub fn attach_child_context(
         crate::context_wiring::ProductionAssemblerParts {
             event_bus: deps.event_bus.clone(),
             callable_inventory: callable,
-            host_fn_inventory: Arc::new(FixedHostFnInventory::new(host_fns_from_registry(
-                deps.host_registry.as_ref(),
-                &declared_refs,
-            ))),
+            host_fn_inventory: Arc::new(CatalogHostFnInventory::new(
+                Arc::clone(&deps.callable_registry),
+                declared_caps.to_vec(),
+            )),
             agent_tree,
             memory: child_memory,
             write_agent_id: cap_agent_id,

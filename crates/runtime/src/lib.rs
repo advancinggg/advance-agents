@@ -15,6 +15,7 @@
 
 pub mod agent_genui;
 pub mod bootstrap;
+pub mod callable_registry;
 pub mod capability_injector;
 pub mod circuit_breaker;
 pub mod component_loader;
@@ -38,6 +39,10 @@ pub use component_loader::{
 };
 // Slice m001-slice-bootstrap (2026-05-28) — sibling bindgen exports for the new
 // `advance-host-with-capabilities` world.
+pub use callable_registry::{
+    CallableDefinition, CallableError, CallableHandler, CallableOutcome, CallableRegistry,
+    CallableSource, CallableSpec, InMemoryCallableRegistry,
+};
 pub use component_spec::ComponentSpec;
 pub use host_registry::{
     HostCallContext, HostCallError, HostFunctionHandler, HostFunctionSpec, HostRegistry,

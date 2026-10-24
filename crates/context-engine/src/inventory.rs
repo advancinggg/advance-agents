@@ -40,3 +40,27 @@ pub struct HostFnEntry {
 pub trait HostFnInventoryReader: Send + Sync {
     fn list_host_fns(&self, agent_id: &str) -> Vec<HostFnEntry>;
 }
+
+/// Whether the agent's resolved placement serializes a native `tools` array
+/// (ADR 2026-10-24 D6). Compact `# Available Tools` when true; full
+/// `- name(args) — desc` lines when false. A per-request model override does
+/// not re-render.
+pub trait NativeToolsPort: Send + Sync {
+    fn supports_native_tools(&self, agent_id: &str) -> bool;
+}
+
+/// Default: full form. Loopback / SYS-J-04 / MODULE-010-AC-18 witnesses.
+pub struct NeverNativeTools;
+impl NativeToolsPort for NeverNativeTools {
+    fn supports_native_tools(&self, _agent_id: &str) -> bool {
+        false
+    }
+}
+
+/// Compact form for every agent.
+pub struct AlwaysNativeTools;
+impl NativeToolsPort for AlwaysNativeTools {
+    fn supports_native_tools(&self, _agent_id: &str) -> bool {
+        true
+    }
+}

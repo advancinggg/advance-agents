@@ -779,6 +779,8 @@ pub struct WiringHandles {
     /// `PublishingContextAssembler` seam so the assembled layered context feeds the
     /// guest's `generate`. `None` → no LLM, no seam (MinimalContextAssembler default).
     pub llm_gateway: Option<Arc<LlmGateway>>,
+    /// Layer 3 dispatcher (ADR 2026-10-24 S2). `Some` iff `llm` is declared.
+    pub callable_dispatcher: Option<Arc<crate::callables::CallableDispatcher>>,
     /// Stage-C MAINLINE harvest pass-3 (2026-06-19): the REAL `cap_llm::LlmGatewayVlm`
     /// (Step-3 VLM/image description extractor), sharing the SAME `HttpSecurityChain` +
     /// `RuntimeConfigProvider` as `llm_gateway`. `Some` iff `.agent/config.yaml` declares
@@ -2405,6 +2407,7 @@ pub(crate) async fn wire_capabilities_inner(
     let cfg = builder.config();
     if cfg.genui.enabled {
         register_agent_genui(&*registry, cfg.genui.max_document_bytes);
+        crate::callables::register_genui_callables(&*builder.callable_registry(), &*registry);
     }
 
     // 5-spawn — 011 (Wave-11 Lane B, 2026-06-23): register the cap-lifecycle spawn
@@ -2795,6 +2798,7 @@ pub(crate) async fn wire_capabilities_inner(
             git_sync.clone(),
             Arc::clone(&maintainer),
         );
+        crate::callables::register_fs_callables(&*builder.callable_registry(), &*registry);
         data_fs_parts = Some(crate::data_wiring::DataFsParts {
             workspace_root: workspace.to_path_buf(),
             resolver,
@@ -3025,6 +3029,7 @@ pub(crate) async fn wire_capabilities_inner(
             git_restore,
             Some(producer_boundary_policy),
         );
+        crate::callables::register_memory_callables(&*builder.callable_registry(), &*registry);
     }
 
     // 5e — cap-grant agent-grant WIT host fns. The global default resolver
@@ -3084,6 +3089,7 @@ pub(crate) async fn wire_capabilities_inner(
     // when llm is not declared (no seam, no assembler — the loop keeps the
     // MinimalContextAssembler default).
     let mut llm_gateway: Option<Arc<LlmGateway>> = None;
+    let mut callable_dispatcher: Option<Arc<crate::callables::CallableDispatcher>> = None;
     let mut llm_delta_hub_opt: Option<Arc<advance_client_api::deltas::LlmDeltaHub>> = None;
     let mut llm_stream_reaper: Option<Arc<cap_llm::AgentStreamReaper>> = None;
     // Stage-C MAINLINE harvest pass-3 (2026-06-19): the REAL Step-3 VLM description
@@ -3324,6 +3330,47 @@ pub(crate) async fn wire_capabilities_inner(
         // moves one into the host-fn handlers (all clones share the one gateway,
         // so its per-agent assembled-context store is the same on both sides).
         llm_gateway = Some(gateway.clone());
+        {
+            let mut fallback = Vec::new();
+            for name in [
+                "llm",
+                "fs",
+                "memory",
+                "tools",
+                "mcp",
+                "genui",
+                "skills",
+                "grant",
+                "web",
+                "secrets",
+                "messaging",
+                "lifecycle",
+            ] {
+                if declares(name) {
+                    fallback.push(name.to_string());
+                }
+            }
+            if builder.config().genui.enabled && !fallback.iter().any(|c| c == "genui") {
+                fallback.push("genui".into());
+            }
+            let dispatcher = Arc::new(crate::callables::CallableDispatcher::new(
+                builder.callable_registry(),
+                Arc::new(crate::callables::TreeCapsLookup::new(
+                    agent_tree_snapshot.clone(),
+                    fallback,
+                )),
+                cap_grant.grant_check.clone(),
+                builder.circuit_breaker_bus(),
+                Arc::new(NotWiredRepetitionGuard),
+                event_bus_dyn.clone(),
+            ));
+            crate::callables::register_agent_callables(&*registry, Arc::clone(&dispatcher));
+            gateway.set_callable_catalog(
+                Arc::clone(&dispatcher) as Arc<dyn cap_llm::CallableCatalogPort>
+            );
+            dispatcher.bind_gateway(gateway.clone());
+            callable_dispatcher = Some(dispatcher);
+        }
         probe_record!(probe, |record| record.llm_gateway =
             Some(Arc::downgrade(&gateway)));
         #[cfg(feature = "test-support")]
@@ -3573,6 +3620,14 @@ pub(crate) async fn wire_capabilities_inner(
             );
         }
         repetition_guard_handle = Some(guard);
+        if let Some(disp) = callable_dispatcher.as_ref() {
+            if let Some(reg) = tool_registry_handle.as_ref() {
+                disp.bind_wasm(Arc::clone(reg));
+            }
+            if let Some(g) = repetition_guard_handle.as_ref() {
+                disp.bind_repetition(g.clone());
+            }
+        }
     }
 
     // The MCP client, for a root that declares `mcp`: the `mcp-client` host functions
@@ -3601,6 +3656,9 @@ pub(crate) async fn wire_capabilities_inner(
     if let Some(runtime) = mcp_runtime.as_ref() {
         mcp_sink.bind_runtime(Arc::clone(runtime));
         pack_runtime.attach_mcp(Arc::clone(runtime));
+        if let Some(disp) = callable_dispatcher.as_ref() {
+            disp.bind_mcp(Arc::clone(runtime.client()), runtime.gate().clone());
+        }
     }
     // A pack uninstalled while the daemon was down left its server files behind (the CLI
     // touches none): swept now that the runtime that would serve them is attached, before
@@ -4050,6 +4108,7 @@ pub(crate) async fn wire_capabilities_inner(
             auto_loop_driver,
             run_config,
             llm_gateway,
+            callable_dispatcher,
             llm_stream_reaper,
             vlm_extractor,
             memory_store,

@@ -3433,7 +3433,7 @@ impl SystemUnderTestBuilder {
                 build_context_assembler_for_agent_with_skills(
                     assembler_bus,
                     callable,
-                    Arc::new(FixedHostFnInventory::from_names(&["generate"])),
+                    Arc::new(FixedHostFnInventory::from_names(&["write"])),
                     agent_tree,
                     shared_memory_store.clone(),
                     &self.agent_id,
@@ -3449,7 +3449,7 @@ impl SystemUnderTestBuilder {
                 build_context_assembler_for_agent_with_history(
                     assembler_bus,
                     callable,
-                    Arc::new(FixedHostFnInventory::from_names(&["generate"])),
+                    Arc::new(FixedHostFnInventory::from_names(&["write"])),
                     agent_tree,
                     shared_memory_store.clone(),
                     &self.agent_id,
@@ -3484,7 +3484,7 @@ impl SystemUnderTestBuilder {
                 build_context_assembler_for_agent_with_decomposition(
                     assembler_bus,
                     callable,
-                    Arc::new(FixedHostFnInventory::from_names(&["generate"])),
+                    Arc::new(FixedHostFnInventory::from_names(&["write"])),
                     agent_tree,
                     shared_memory_store.clone(),
                     &self.agent_id,
@@ -3516,7 +3516,7 @@ impl SystemUnderTestBuilder {
                 build_context_assembler_for_agent_with_recall(
                     assembler_bus,
                     callable,
-                    Arc::new(FixedHostFnInventory::from_names(&["generate"])),
+                    Arc::new(FixedHostFnInventory::from_names(&["write"])),
                     agent_tree,
                     &assembler_aliases,
                     search,
@@ -3546,7 +3546,7 @@ impl SystemUnderTestBuilder {
                 build_context_assembler_for_agent_with_recall(
                     assembler_bus,
                     callable,
-                    Arc::new(FixedHostFnInventory::from_names(&["generate"])),
+                    Arc::new(FixedHostFnInventory::from_names(&["write"])),
                     agent_tree,
                     &assembler_aliases,
                     search,
@@ -3556,7 +3556,7 @@ impl SystemUnderTestBuilder {
                 build_context_assembler_for_agent(
                     assembler_bus,
                     callable,
-                    Arc::new(FixedHostFnInventory::from_names(&["generate"])),
+                    Arc::new(FixedHostFnInventory::from_names(&["write"])),
                     agent_tree,
                     shared_memory_store.clone(),
                     &self.agent_id,

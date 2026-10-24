@@ -97,6 +97,51 @@ pub fn format_available_tools_section(records: &[UnifiedToolRecord]) -> String {
     format_available_tools_section_with_not_shown(records, 0)
 }
 
+/// Compact form (ADR 2026-10-24 D6): header + one comma-separated line of
+/// names. Used when the agent's placement supports native tools (schemas
+/// travel in the `tools` array).
+pub fn format_available_tools_section_compact(records: &[UnifiedToolRecord]) -> String {
+    format_available_tools_section_compact_with_not_shown(records, 0)
+}
+
+/// Compact form with the MCP "N more not shown" closer.
+pub fn format_available_tools_section_compact_with_not_shown(
+    records: &[UnifiedToolRecord],
+    mcp_not_shown: usize,
+) -> String {
+    let mut s = String::from("# Available Tools\n\n");
+    let mut seen = BTreeSet::new();
+    let mut names = Vec::new();
+    for r in records {
+        let name = sanitize_tool_name(&r.name());
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+    if !names.is_empty() {
+        s.push_str(&names.join(", "));
+        s.push('\n');
+    }
+    if mcp_not_shown > 0 {
+        let tools = if mcp_not_shown == 1 { "tool" } else { "tools" };
+        s.push_str(&format!("… {mcp_not_shown} more MCP {tools} not shown\n"));
+    }
+    s
+}
+
+/// Names in catalog order after sanitizer + collision skip (host → wasm → mcp).
+pub fn catalog_tool_names(records: &[UnifiedToolRecord]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut names = Vec::new();
+    for r in records {
+        let name = sanitize_tool_name(&r.name());
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 /// [`format_available_tools_section`], closed by one line that says how many MCP tools
 /// the agent may call the section leaves out, `… N more MCP tools not shown`, when
 /// `mcp_not_shown` (N) is not zero: an inventory bounds the MCP tools one prompt shows

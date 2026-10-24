@@ -101,7 +101,9 @@ pub mod vector_search;
 pub mod warning_queue;
 
 pub use assembler::{ContextAssemblerImpl, INPUT_VALIDATION_PREFIX};
-pub use inventory::{HostFnEntry, HostFnInventoryReader};
+pub use inventory::{
+    AlwaysNativeTools, HostFnEntry, HostFnInventoryReader, NativeToolsPort, NeverNativeTools,
+};
 pub use knowledge_map::{
     build_knowledge_map_section, KNOWLEDGE_MAP_MAX_TOKENS, MAX_TASK_SYNTHESES, MAX_TOPICS,
 };
@@ -145,7 +147,8 @@ pub use tier1_runtime::{
     format_security_model_section,
 };
 pub use tier2::{
-    assemble_unified, format_available_tools_section,
+    assemble_unified, catalog_tool_names, format_available_tools_section,
+    format_available_tools_section_compact, format_available_tools_section_compact_with_not_shown,
     format_available_tools_section_with_not_shown, UnifiedToolRecord,
 };
 pub use tier2_decomposition::format_active_decomposition_section;

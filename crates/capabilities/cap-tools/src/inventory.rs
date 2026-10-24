@@ -72,6 +72,58 @@ pub fn tool_entries_from_infos(infos: Vec<ToolInfo>) -> Vec<ToolEntry> {
         .collect()
 }
 
+/// ADR 2026-10-24 D3 — one catalog entry per **method**: `<tool-id>__<method>`
+/// with the method's `input-schema` (empty object when the method has none).
+/// Fixes F5's dropped methods. The dotted alias `<tool-id>.<method>` is a
+/// dispatch concern (`normalize_callable_name`), not a second list entry.
+pub fn method_tool_entries_from_infos(infos: Vec<ToolInfo>) -> Vec<ToolEntry> {
+    let mut out = Vec::new();
+    for info in infos {
+        if info.methods.is_empty() {
+            out.push(ToolEntry {
+                name: info.id,
+                description: info.description,
+                params_schema: serde_json::json!({"type": "object"}),
+            });
+            continue;
+        }
+        for method in info.methods {
+            let name = format!("{}__{}", info.id, method.name);
+            let description = method
+                .description
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| info.description.clone());
+            let params_schema = method
+                .input_schema
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+            out.push(ToolEntry {
+                name,
+                description,
+                params_schema,
+            });
+        }
+    }
+    out
+}
+
+/// Dispatch alias: `<tool-id>.<method>` → `<tool-id>__<method>` by rewriting
+/// the last `.` when the name has no `__` yet (agenda SKILL.md `data.describe`).
+pub fn normalize_callable_name(name: &str) -> String {
+    if name.contains("__") {
+        return name.to_string();
+    }
+    if let Some(idx) = name.rfind('.') {
+        let mut out = String::with_capacity(name.len() + 1);
+        out.push_str(&name[..idx]);
+        out.push_str("__");
+        out.push_str(&name[idx + 1..]);
+        return out;
+    }
+    name.to_string()
+}
+
 /// Gather a snapshot of WASM tool entries from a live [`ToolRegistry`].
 ///
 /// Does NOT force-`load()` each tool — `ToolRegistry::list()` returns
@@ -178,6 +230,28 @@ mod tests {
                 idempotent: None,
             }],
         }
+    }
+
+    #[test]
+    fn method_entries_use_id_method_and_input_schema() {
+        let info = ToolInfo {
+            id: "data".into(),
+            description: "Structured data".into(),
+            methods: vec![MethodInfo {
+                name: "describe".into(),
+                description: Some("The merged schema".into()),
+                input_schema: Some(r#"{"type":"object","properties":{}}"#.into()),
+                output_schema: None,
+                idempotent: Some(true),
+            }],
+        };
+        let out = method_tool_entries_from_infos(vec![info]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "data__describe");
+        assert_eq!(out[0].description, "The merged schema");
+        assert_eq!(out[0].params_schema["type"], "object");
+        assert_eq!(normalize_callable_name("data.describe"), "data__describe");
+        assert_eq!(normalize_callable_name("data__describe"), "data__describe");
     }
 
     // TJ-01 — id->name, description passthrough, empty-object params_schema.

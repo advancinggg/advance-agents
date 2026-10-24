@@ -423,6 +423,7 @@ pub(crate) async fn compose_graph(
             vlm: wiring_handles.vlm_extractor.clone(),
             meta_maintainer: wiring_handles.meta_maintainer.clone(),
             host_registry: host.host_registry(),
+            callable_registry: host.callable_registry(),
             embedding_posture: crate::context_inspect::EmbeddingPosture {
                 active: gateway.has_embedding_provider(),
                 model: gateway.embedding_model_id(),
@@ -491,6 +492,7 @@ pub(crate) async fn compose_graph(
         wiring_handles.web_grant.clone(),
         Some(wiring_handles.pack_runtime.clone()),
         wiring_handles.mcp.clone(),
+        wiring_handles.callable_dispatcher.clone(),
         LoopSpawnExtras {
             log: log.clone(),
             hooks_shutdown: CancellationToken::new(),
@@ -977,6 +979,7 @@ async fn try_spawn_agent_loop(
     web_grant: Option<Arc<dyn advance_shared_types::traits::GrantCheck>>,
     pack_runtime: Option<Arc<crate::pack_runtime::PackRuntime>>,
     mcp: Option<Arc<crate::mcp_wiring::McpRuntime>>,
+    callable_dispatcher: Option<Arc<crate::callables::CallableDispatcher>>,
     extras: LoopSpawnExtras,
 ) -> Result<Option<SpawnedAgentLoop>, SpawnLoopError> {
     let log = &extras.log;
@@ -1221,7 +1224,6 @@ async fn try_spawn_agent_loop(
         // `# Available Tools` section never advertises host fns outside the agent's
         // own capability set. (Full dynamic L1 grant-filtering is the satellite
         // tools-inv slice / SYS-AC-012.)
-        let declared_caps: Vec<&str> = declared_cap_names.iter().map(|s| s.as_str()).collect();
         // B1 backbone (2026-06-09, ADVERSARIAL-r7 fix): the real Tier-1b
         // KnowledgeMapReader reads the SHARED registered `MemoryStore` (the SAME
         // `Arc` the WIT handlers use, threaded via `WiringHandles.memory_store`),
@@ -1293,6 +1295,9 @@ async fn try_spawn_agent_loop(
         };
         client_api_tools =
             (tool_registry.is_some() || mcp.is_some()).then(|| Arc::clone(&callable));
+        if let Some(disp) = callable_dispatcher.as_ref() {
+            disp.bind_inventory(Arc::clone(&callable));
+        }
         let identity_root = workspace.join(".agent");
         // Live embedding: only when the provider config can embed (an OpenAI-
         // compatible endpoint, or a local / mesh entry with an `embedding-model`).
@@ -1368,11 +1373,9 @@ async fn try_spawn_agent_loop(
             crate::context_wiring::ProductionAssemblerParts {
                 event_bus: assembler_bus,
                 callable_inventory: callable,
-                host_fn_inventory: Arc::new(crate::context_wiring::FixedHostFnInventory::new(
-                    crate::context_wiring::host_fns_from_registry(
-                        &*host.host_registry(),
-                        &declared_caps,
-                    ),
+                host_fn_inventory: Arc::new(crate::callables::CatalogHostFnInventory::new(
+                    host.callable_registry(),
+                    declared_cap_names.clone(),
                 )),
                 agent_tree,
                 memory: memory_store,
@@ -1780,6 +1783,7 @@ pub async fn spawn_test_agent_loop(
             vlm: handles.vlm_extractor.clone(),
             meta_maintainer: handles.meta_maintainer.clone(),
             host_registry: host.host_registry(),
+            callable_registry: host.callable_registry(),
             embedding_posture: crate::context_inspect::EmbeddingPosture {
                 active: gateway.has_embedding_provider(),
                 model: gateway.embedding_model_id(),
@@ -1822,6 +1826,7 @@ pub async fn spawn_test_agent_loop(
         handles.web_grant.clone(),
         Some(handles.pack_runtime.clone()),
         handles.mcp.clone(),
+        handles.callable_dispatcher.clone(),
         LoopSpawnExtras {
             context_store: Some(context_store),
             memory_index,

@@ -102,7 +102,7 @@ async fn sys_ac_010_assembled_prompt_has_single_merged_available_tools_section()
 
     // The merge contains all three sources' names (host fn + WASM + MCP) the
     // harness populated, proving the homogeneous merge reached the LLM.
-    for name in ["generate", "wasmtool", "mcptool"] {
+    for name in ["write", "wasmtool", "mcptool"] {
         assert!(
             body.contains(name),
             "the merged '# Available Tools' section must list '{name}'; body = {body}"

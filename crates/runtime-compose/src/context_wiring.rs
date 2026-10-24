@@ -15,7 +15,7 @@
 //! **Port reality for THIS slice** (see MODULE-001/009/010 §3.6/§3.7):
 //! - CALLER-SUPPLIED (real-able): `event_bus`, `callable_inventory`,
 //!   `host_fn_inventory`, `agent_tree`. PRODUCTION (start.rs) passes REAL
-//!   `event_bus` + `host_fn_inventory` (a `HostRegistry` capability-probe) + the
+//!   `event_bus` + `host_fn_inventory` (`CatalogHostFnInventory` from the callable catalog) + the
 //!   REAL `agent_tree` snapshot (SAT-A; the cap-lifecycle spawn host-fns record
 //!   `Sub` nodes into it — 011), and STILL STUBS `callable_inventory` (empty,
 //!   lands in a later slice). The HARNESS passes a real `event_bus` (CapturingBus)
@@ -97,7 +97,7 @@ use cap_memory::{memory_search_docs, MemoryStore, MemoryType};
 // reuses cap-skills' first-paragraph summary extractor unchanged. The READ itself is
 // a local bounded directory walk (NOT cap-skills `list_active`, which is unbounded /
 // FIFO-unsafe on the hot turn path — ADVERSARIAL-r9 W1/W2).
-use advance_runtime::host_registry::HostRegistry;
+
 use advance_shared_types::agent_tree::{
     AgentKind, AgentTreeReader, AgentTreeSnapshot, AgentTreeSnapshotData, Capability,
 };
@@ -846,9 +846,9 @@ impl CallableInventoryReader for EmptyCallableInventory {
 }
 
 /// A `HostFnInventoryReader` backed by a fixed list of [`HostFnEntry`] — usable
-/// by both production (built from a [`HostRegistry`] capability-probe via
-/// [`host_fns_from_registry`]) and the harness (a hand-built list). Returns the
-/// same list for every agent (per-agent grant filtering is a future concern).
+/// by the harness (a hand-built list). Production uses
+/// [`crate::callables::CatalogHostFnInventory`]. Returns the same list for
+/// every agent.
 pub struct FixedHostFnInventory {
     entries: Vec<HostFnEntry>,
 }
@@ -877,28 +877,6 @@ impl HostFnInventoryReader for FixedHostFnInventory {
     fn list_host_fns(&self, _agent_id: &str) -> Vec<HostFnEntry> {
         self.entries.clone()
     }
-}
-
-/// Build a `HostFnEntry` list by PROBING a [`HostRegistry`] for a fixed
-/// capability allowlist (the registry has no generic enumerate — only
-/// `lookup(cap)`). Each registered spec under a probed capability becomes a
-/// `HostFnEntry { name, description: "", params_schema: null }` (the registry
-/// carries no description/schema). De-duplicated by name. Production wiring.
-pub fn host_fns_from_registry(registry: &dyn HostRegistry, caps: &[&str]) -> Vec<HostFnEntry> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
-    for cap in caps {
-        for spec in registry.lookup(cap) {
-            if seen.insert(spec.name.clone()) {
-                out.push(HostFnEntry {
-                    name: spec.name,
-                    description: String::new(),
-                    params_schema: serde_json::Value::Null,
-                });
-            }
-        }
-    }
-    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────
