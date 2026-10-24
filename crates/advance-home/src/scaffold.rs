@@ -1,8 +1,10 @@
 //! Shared recognizable-home writer used by CONTRACT-243 create and `advance init`.
 
 use std::fs;
-use std::io::Write;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -219,10 +221,40 @@ pub(crate) fn write_0600_nofollow(path: &Path, bytes: &[u8]) -> Result<(), std::
 }
 
 /// CONTRACT-243 create-only driver bytes. Copied from
-/// `crates/runtime/tests/fixtures/guest-rust-llm-tools.core.wasm` (wasm32 core).
-/// hello-llm stays the SYS-AC one-shot generate fixture; this driver runs the
-/// generate → tool_calls → agent-fs loop.
+/// `crates/runtime/tests/fixtures/guest-rust-callables.core.wasm` (wasm32 core).
+/// hello-llm stays the SYS-AC one-shot generate fixture; guest-rust-llm-tools
+/// stays the guest-defined `tools` fixture. This driver runs generate →
+/// invoke-callable → generate against the host catalog.
 const CREATE_DRIVER: &[u8] = include_bytes!("fixtures/behavior.core.wasm");
+
+/// Sha256 of every CREATE_DRIVER ever shipped (ADR 2026-10-24 D8).
+///
+/// Full 64-char hex, or an 8-char prefix when the original blob is gone
+/// (`d431c8bf` is the ADR hello-llm CREATE_DRIVER; on-disk hello-llm is
+/// `7cc5eaf7…`). A `.agent/behavior.wasm` whose hash matches an entry (or
+/// the current driver) and is not current is replaced at start/compose; any
+/// other hash is a custom driver and is never touched.
+pub const DEFAULT_DRIVER_LINEAGE: &[&str] = &[
+    "d431c8bf",
+    "7cc5eaf7467258f6ca4f832dd32018bc8edd83c6d179565cdd83862e6d9162be",
+    "0b0a3cceedaa2e00926e910727f7373af9d2860ef8db5d759ebf2c8a0c9664de",
+    "88a90243514df75ff2045d79b8f4a49e1f2c3d97e2294aa67b23a94b0a1809b4",
+];
+
+/// Outcome of [`maybe_upgrade_default_driver`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriverUpgrade {
+    /// No `.agent/behavior.wasm` — create still owns first materialization.
+    Missing,
+    /// Hash equals the current CREATE_DRIVER; left in place.
+    Current,
+    /// Hash was in [`DEFAULT_DRIVER_LINEAGE`] and was replaced.
+    Upgraded { from: String },
+    /// Hash is not in the lineage; never touched.
+    Custom { sha256: String },
+    /// Read or atomic replace failed; the existing file is left in place.
+    Failed { error: String },
+}
 
 /// Materialize `<home>/.agent/behavior.wasm` for a new-home `create`.
 /// Not used by `write_recognizable_home` / `advance init`.
@@ -261,4 +293,151 @@ fn write_new_0600(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     let mut file = opts.open(path)?;
     file.write_all(bytes)?;
     Ok(())
+}
+
+/// Sha256 hex of the CREATE_DRIVER bytes this build embeds.
+pub fn current_create_driver_sha256() -> String {
+    sha256_hex(CREATE_DRIVER)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn in_lineage(hex: &str) -> bool {
+    DEFAULT_DRIVER_LINEAGE.iter().any(|entry| {
+        if entry.len() == 64 {
+            hex.eq_ignore_ascii_case(entry)
+        } else {
+            hex.len() == 64
+                && hex
+                    .get(..entry.len())
+                    .is_some_and(|p| p.eq_ignore_ascii_case(entry))
+        }
+    })
+}
+
+fn sha256_file_nofollow(path: &Path) -> Result<String, std::io::Error> {
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = opts.open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn replace_driver_atomic(dest: &Path) -> Result<(), std::io::Error> {
+    let dir = dest.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "driver path has no parent",
+        )
+    })?;
+    let tmp = dir.join(format!(".behavior.wasm.{}.tmp", std::process::id()));
+    if crate::recognize::is_real_file(&tmp) {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_0600_nofollow(&tmp, CREATE_DRIVER)?;
+    fs::rename(&tmp, dest).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        e
+    })?;
+    Ok(())
+}
+
+/// Replace `<workspace>/.agent/behavior.wasm` when its hash is a previous
+/// CREATE_DRIVER and is not current. Missing files and custom hashes are left
+/// alone. Fail-open: IO errors return [`DriverUpgrade::Failed`] and do not
+/// change the file.
+pub fn maybe_upgrade_default_driver(workspace: &Path) -> DriverUpgrade {
+    let dest = workspace.join(".agent").join("behavior.wasm");
+    if !crate::recognize::is_real_file(&dest) {
+        return if fs::symlink_metadata(&dest).is_ok() {
+            DriverUpgrade::Custom {
+                sha256: "not-regular".into(),
+            }
+        } else {
+            DriverUpgrade::Missing
+        };
+    }
+    let hex = match sha256_file_nofollow(&dest) {
+        Ok(h) => h,
+        Err(e) => {
+            return DriverUpgrade::Failed {
+                error: e.to_string(),
+            }
+        }
+    };
+    if hex.eq_ignore_ascii_case(&current_create_driver_sha256()) {
+        return DriverUpgrade::Current;
+    }
+    if !in_lineage(&hex) {
+        return DriverUpgrade::Custom { sha256: hex };
+    }
+    match replace_driver_atomic(&dest) {
+        Ok(()) => DriverUpgrade::Upgraded { from: hex },
+        Err(e) => DriverUpgrade::Failed {
+            error: e.to_string(),
+        },
+    }
+}
+
+const UPGRADE_WALK_MAX_DEPTH: usize = 8;
+const UPGRADE_WALK_MAX_FILES: usize = 64;
+
+/// Upgrade the root workspace driver and every child `*/.agent/behavior.wasm`
+/// under `home` with the same lineage rule.
+pub fn upgrade_default_drivers_under(home: &Path) -> Vec<(PathBuf, DriverUpgrade)> {
+    let mut workspaces = Vec::new();
+    collect_agent_workspaces(home, 0, &mut workspaces);
+    workspaces
+        .into_iter()
+        .map(|ws| {
+            let outcome = maybe_upgrade_default_driver(&ws);
+            (ws, outcome)
+        })
+        .collect()
+}
+
+fn collect_agent_workspaces(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > UPGRADE_WALK_MAX_DEPTH || out.len() >= UPGRADE_WALK_MAX_FILES {
+        return;
+    }
+    if !crate::recognize::is_real_dir(dir) {
+        return;
+    }
+    if dir.join(".agent").join("behavior.wasm").exists() {
+        out.push(dir.to_path_buf());
+        if out.len() >= UPGRADE_WALK_MAX_FILES {
+            return;
+        }
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= UPGRADE_WALK_MAX_FILES {
+            return;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "target" || name == "node_modules" {
+            continue;
+        }
+        let path = entry.path();
+        if crate::recognize::is_real_dir(&path) {
+            collect_agent_workspaces(&path, depth + 1, out);
+        }
+    }
 }

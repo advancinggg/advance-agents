@@ -72,6 +72,10 @@ pub mod log_keys {
     pub const SHUTTING_DOWN: &str = "start.shutting_down";
     /// stdout: the deployed agent component is loaded and its loop serves messages.
     pub const AGENT_LOOP_WIRED: &str = "start.agent_loop_wired";
+    /// stdout: a lineage CREATE_DRIVER was replaced with the current default driver.
+    pub const DRIVER_UPGRADED: &str = "start.driver_upgraded";
+    /// stderr: replacing a lineage CREATE_DRIVER failed; the existing file was kept.
+    pub const DRIVER_UPGRADE_FAILED: &str = "start.driver_upgrade_failed";
     /// stdout: the `POST /msg` listener address.
     pub const MSG_LISTENER: &str = "start.msg_listener";
     /// stderr: the `POST /msg` listener stopped with an error.
@@ -283,6 +287,8 @@ pub mod log_keys {
         READINESS_WALK_TIMEOUT,
         SHUTTING_DOWN,
         AGENT_LOOP_WIRED,
+        DRIVER_UPGRADED,
+        DRIVER_UPGRADE_FAILED,
         MSG_LISTENER,
         MSG_LISTENER_STOPPED,
         MEMORY_INDEX_FALLBACK,

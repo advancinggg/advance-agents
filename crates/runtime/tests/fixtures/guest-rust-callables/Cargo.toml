@@ -1,0 +1,27 @@
+[package]
+name = "guest-rust-callables"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Default CREATE_DRIVER: imports `agent-llm` + `agent-callables` and on
+# handle-message runs generate → invoke-callable → generate against the host
+# catalog. hello-llm stays the SYS-AC one-shot generate fixture;
+# guest-rust-llm-tools stays the guest-defined `tools` fixture. Excluded from
+# the workspace (built for wasm32-unknown-unknown).
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.53.1"
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

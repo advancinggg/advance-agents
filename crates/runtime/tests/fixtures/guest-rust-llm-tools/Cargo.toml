@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 
 # Reference LLM+tools guest: imports `agent-llm` and `agent-fs`, and on
 # handle-message runs a bounded generate → tool_calls → host-fn → generate
-# loop. First-open CREATE_DRIVER (`behavior.core.wasm`) is this guest.
+# loop with guest-defined `params.tools`. CREATE_DRIVER is `guest-rust-callables`.
 # hello-llm stays the SYS-AC one-shot generate fixture. Excluded from the
 # workspace (built for wasm32-unknown-unknown).
 

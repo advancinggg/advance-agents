@@ -402,6 +402,7 @@ pub fn start_or_attach_via(
             if !source.claim_launch(home) {
                 wait_until_running(home, cancel, false, wait_bound, source)?;
             } else {
+                let _ = crate::maybe_upgrade_default_driver(home);
                 let started = launcher.start(home, cancel);
                 if started.is_err() {
                     source.release_launch(home);

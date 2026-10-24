@@ -22,6 +22,7 @@ pub use advance_runtime_compose::auto_tick_extension;
 pub use advance_runtime_compose::auto_wiring;
 pub use advance_runtime_compose::await_wiring;
 pub use advance_runtime_compose::breaker_gate;
+pub use advance_runtime_compose::callables;
 pub use advance_runtime_compose::channel_egress;
 pub use advance_runtime_compose::channel_notify_sink;
 pub use advance_runtime_compose::channels_boot;

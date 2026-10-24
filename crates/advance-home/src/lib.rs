@@ -53,8 +53,9 @@ pub use provider::{
 };
 pub use runtime_state::{write_selected_provider, SelectedProvider};
 pub use scaffold::{
-    starter_for_mode, write_recognizable_home, write_recognizable_home_with_mode, SecretsMode,
-    AGENT_CONFIG_STARTER, MINIMAL_STARTER,
+    current_create_driver_sha256, maybe_upgrade_default_driver, starter_for_mode,
+    upgrade_default_drivers_under, write_recognizable_home, write_recognizable_home_with_mode,
+    DriverUpgrade, SecretsMode, AGENT_CONFIG_STARTER, DEFAULT_DRIVER_LINEAGE, MINIMAL_STARTER,
 };
 pub use secret_bytes::SecretBytes;
 pub use secrets_mode::{

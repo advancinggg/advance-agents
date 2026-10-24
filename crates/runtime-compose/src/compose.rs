@@ -16,9 +16,9 @@ use advance_runtime::{BootstrapError, RuntimeHostBuilder};
 use tokio::sync::watch;
 
 use crate::api::{
-    Admission, ClientApiOptions, ComposeError, ComposeExtension, ComposeOptions, ComposeProfile,
-    ComposedRuntime, HostPlatform, InstanceGuard, LockFailure, MasterKeyInput, PlatformRule,
-    ProcessPolicy, RuntimeHealthView, ShutdownHandle, Unsupported, WasmEngine,
+    log_keys, Admission, ClientApiOptions, ComposeError, ComposeExtension, ComposeOptions,
+    ComposeProfile, ComposedRuntime, HostPlatform, InstanceGuard, LockFailure, MasterKeyInput,
+    PlatformRule, ProcessPolicy, RuntimeHealthView, ShutdownHandle, Unsupported, WasmEngine,
 };
 use crate::client_ingress::IngressFromGraph;
 use crate::compose_log::LogHandle;
@@ -182,6 +182,7 @@ pub async fn compose(
         #[cfg(feature = "test-support")]
         probe: failpoints.probe.clone(),
     };
+    upgrade_default_drivers(&plan.home, &log);
     match compose_graph(builder, &plan.home, opts).await {
         Ok(graph) => {
             let wasm_engine = engine_of(&graph.host.component_runtime().engine_report());
@@ -266,6 +267,33 @@ pub async fn compose(
             let composition = composition.with_probe(failpoints.probe.clone());
             composition.teardown(TeardownReason::StartupFailed).await;
             Err(error)
+        }
+    }
+}
+
+fn upgrade_default_drivers(home: &Path, log: &LogHandle) {
+    let current = advance_home::current_create_driver_sha256();
+    for (ws, outcome) in advance_home::upgrade_default_drivers_under(home) {
+        match outcome {
+            advance_home::DriverUpgrade::Upgraded { from } => {
+                log.out(
+                    log_keys::DRIVER_UPGRADED,
+                    format!(
+                        "advance: default driver upgraded (workspace=\"{}\", from={from}, to={current})",
+                        ws.display()
+                    ),
+                );
+            }
+            advance_home::DriverUpgrade::Failed { error } => {
+                log.err(
+                    log_keys::DRIVER_UPGRADE_FAILED,
+                    format!(
+                        "advance: default driver upgrade failed (workspace=\"{}\"): {error}",
+                        ws.display()
+                    ),
+                );
+            }
+            _ => {}
         }
     }
 }

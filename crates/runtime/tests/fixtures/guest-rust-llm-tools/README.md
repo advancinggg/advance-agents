@@ -17,8 +17,9 @@ Targets the `advance-host-llm-fs` world (imports `agent-llm` + `agent-fs`, expor
 
 `run` is a trivial `Completed`.
 
-`guest-rust-hello-llm` stays the one-shot generate fixture used by SYS-AC. This
-guest is the first-open CREATE_DRIVER (`crates/advance-home/src/fixtures/behavior.core.wasm`).
+`guest-rust-hello-llm` stays the one-shot generate fixture used by SYS-AC.
+`guest-rust-callables` is the first-open CREATE_DRIVER. This guest stays the
+fixture for the guest-defined `params.tools` path.
 
 The committed `../guest-rust-llm-tools.core.wasm` artifact is wrapped to a Component
 at test time via `wit_component::ComponentEncoder` / `build_agent::encode_core_to_component`.
@@ -54,8 +55,9 @@ is already on the canonical `agent-llm` interface. `llm-response` is **not** ext
 3. First-time bootstrap (no Cargo.lock): `cargo generate-lockfile`.
 4. Build: `cargo build --target wasm32-unknown-unknown --release --locked`.
 5. Copy artifact:
-   `cp target/wasm32-unknown-unknown/release/guest_rust_llm_tools.wasm ../guest-rust-llm-tools.core.wasm`
-   and `cp ../guest-rust-llm-tools.core.wasm ../../../advance-home/src/fixtures/behavior.core.wasm`.
+   `cp target/wasm32-unknown-unknown/release/guest_rust_llm_tools.wasm ../guest-rust-llm-tools.core.wasm`.
+   Do not copy this artifact onto CREATE_DRIVER (`behavior.core.wasm`); that file
+   is produced by `guest-rust-callables`.
 6. Verify size < 500 KiB: `wc -c ../guest-rust-llm-tools.core.wasm`.
 7. `cargo clean`. Do NOT commit `target/`.
-8. Commit atomically: the `.wasm` artifact, `Cargo.lock`, WIT, and the CREATE_DRIVER copy.
+8. Commit atomically: the `.wasm` artifact, `Cargo.lock`, and any WIT change.
