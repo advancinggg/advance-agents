@@ -16,39 +16,39 @@ publish = false
 
 [dependencies]
 # ── seam layer (dependency-inversion home) ─────────────────────────────────
-advance-shared-types = { path = "../shared-types", version = "0.1.49" }
+advance-shared-types = { path = "../shared-types", version = "0.1.50" }
 # ── runtime host ───────────────────────────────────────────────────────────
-advance-runtime = { path = "../runtime", version = "0.1.49" }
-advance-home = { path = "../advance-home", version = "0.1.49" }
-advance-embedded-runtime-bridge = { path = "../embedded-runtime-bridge", version = "0.1.49" }
+advance-runtime = { path = "../runtime", version = "0.1.50" }
+advance-home = { path = "../advance-home", version = "0.1.50" }
+advance-embedded-runtime-bridge = { path = "../embedded-runtime-bridge", version = "0.1.50" }
 # The runtime composition (`runtime_compose`): its CONTRACT-244 API only.
-advance-runtime-compose = { path = "../runtime-compose", version = "0.1.49" }
+advance-runtime-compose = { path = "../runtime-compose", version = "0.1.50" }
 # ── capability crates (11) ─────────────────────────────────────────────────
-cap-channel = { path = "../capabilities/cap-channel", version = "0.1.49" }
-cap-fs = { path = "../capabilities/cap-fs", version = "0.1.49" }
-cap-grant = { path = "../capabilities/cap-grant", version = "0.1.49" }
-cap-http = { path = "../capabilities/cap-http", version = "0.1.49" }
-cap-lifecycle = { path = "../capabilities/cap-lifecycle", version = "0.1.49" }
-cap-llm = { path = "../capabilities/cap-llm", version = "0.1.49" }
-cap-mcp = { path = "../capabilities/cap-mcp", version = "0.1.49" }
-cap-memory = { path = "../capabilities/cap-memory", version = "0.1.49" }
-cap-secrets = { path = "../capabilities/cap-secrets", version = "0.1.49" }
-cap-skills = { path = "../capabilities/cap-skills", version = "0.1.49" }
-cap-tools = { path = "../capabilities/cap-tools", version = "0.1.49" }
+cap-channel = { path = "../capabilities/cap-channel", version = "0.1.50" }
+cap-fs = { path = "../capabilities/cap-fs", version = "0.1.50" }
+cap-grant = { path = "../capabilities/cap-grant", version = "0.1.50" }
+cap-http = { path = "../capabilities/cap-http", version = "0.1.50" }
+cap-lifecycle = { path = "../capabilities/cap-lifecycle", version = "0.1.50" }
+cap-llm = { path = "../capabilities/cap-llm", version = "0.1.50" }
+cap-mcp = { path = "../capabilities/cap-mcp", version = "0.1.50" }
+cap-memory = { path = "../capabilities/cap-memory", version = "0.1.50" }
+cap-secrets = { path = "../capabilities/cap-secrets", version = "0.1.50" }
+cap-skills = { path = "../capabilities/cap-skills", version = "0.1.50" }
+cap-tools = { path = "../capabilities/cap-tools", version = "0.1.50" }
 # ── subsystem crates ───────────────────────────────────────────────────────
-advance-client-api = { path = "../client-api", version = "0.1.49" }
-advance-genui = { path = "../genui", version = "0.1.49" }
-advance-context-engine = { path = "../context-engine", version = "0.1.49" }
-advance-cost-tracker = { path = "../cost-tracker", version = "0.1.49" }
-advance-database = { path = "../database", version = "0.1.49" }
-advance-event-bus = { path = "../event-bus", version = "0.1.49" }
-advance-git = { path = "../git", version = "0.1.49" }
-advance-messaging = { path = "../messaging", version = "0.1.49" }
-advance-pack-manager = { path = "../services/pack-manager", version = "0.1.49" }
-advance-reply-tracker = { path = "../messaging/reply-tracker", version = "0.1.49" }
-advance-run-manager = { path = "../run-manager", version = "0.1.49" }
-advance-scheduler = { path = "../scheduler", version = "0.1.49" }
-advance-scheduler-auto-loop = { path = "../scheduler/auto-loop", version = "0.1.49" }
+advance-client-api = { path = "../client-api", version = "0.1.50" }
+advance-genui = { path = "../genui", version = "0.1.50" }
+advance-context-engine = { path = "../context-engine", version = "0.1.50" }
+advance-cost-tracker = { path = "../cost-tracker", version = "0.1.50" }
+advance-database = { path = "../database", version = "0.1.50" }
+advance-event-bus = { path = "../event-bus", version = "0.1.50" }
+advance-git = { path = "../git", version = "0.1.50" }
+advance-messaging = { path = "../messaging", version = "0.1.50" }
+advance-pack-manager = { path = "../services/pack-manager", version = "0.1.50" }
+advance-reply-tracker = { path = "../messaging/reply-tracker", version = "0.1.50" }
+advance-run-manager = { path = "../run-manager", version = "0.1.50" }
+advance-scheduler = { path = "../scheduler", version = "0.1.50" }
+advance-scheduler-auto-loop = { path = "../scheduler/auto-loop", version = "0.1.50" }
 
 [lints]
 workspace = true
