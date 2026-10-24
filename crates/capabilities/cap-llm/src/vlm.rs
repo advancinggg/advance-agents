@@ -381,6 +381,8 @@ pub async fn dispatch_for_indexing(
         let messages = vec![ChatMessage {
             role: ChatRole::User,
             content: prompt,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }];
         let resp = gateway.chat(messages, ChatParams::default()).await?;
         return Ok(Some(resp.text));

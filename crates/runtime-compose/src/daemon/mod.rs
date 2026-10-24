@@ -1033,8 +1033,8 @@ async fn try_spawn_agent_loop(
     // SAME bare `cap_agent_id`, so the bootstrap's run is exactly the run the
     // producer sets on `ComponentCtx`.
     let session_cell: SessionRunCell = Arc::new(std::sync::OnceLock::new());
-    let handler: Arc<dyn MessageHandler> = Arc::new(
-        WasmMessageHandler::new(
+    let handler: Arc<dyn MessageHandler> = {
+        let mut h = WasmMessageHandler::new(
             runtime,
             loaded,
             injector,
@@ -1046,8 +1046,12 @@ async fn try_spawn_agent_loop(
             run_manager: run_manager.clone(),
             cell: session_cell.clone(),
         })
-        .with_log(log.clone()),
-    );
+        .with_log(log.clone());
+        if let Some(gw) = llm_gateway.as_ref() {
+            h = h.with_llm_gateway(gw.clone());
+        }
+        Arc::new(h)
+    };
     // Hold the shared store at this scope and clone the Arc into the loop: the
     // SAME store is returned to `run_async`, which hands it to the `POST /msg`
     // listener. `Mailbox::deliver` (listener side) → `notify_one` wakes the

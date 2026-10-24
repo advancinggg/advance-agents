@@ -650,8 +650,8 @@ impl SpawnObserver for PerChildLoopManager {
             }
         };
         // BARE cap-id (the L1 grant grantee + `send` `from` body), COLON serve key.
-        let handler: Arc<dyn MessageHandler> = Arc::new(
-            WasmMessageHandler::new(
+        let handler: Arc<dyn MessageHandler> = {
+            let mut h = WasmMessageHandler::new(
                 runtime,
                 loaded,
                 injector,
@@ -659,8 +659,12 @@ impl SpawnObserver for PerChildLoopManager {
                 child_bare.to_string(),
                 format!("trace-child-{child_bare}"),
             )
-            .with_log(self.log.clone()),
-        );
+            .with_log(self.log.clone());
+            if let Some(deps) = lock(&self.context_deps).clone() {
+                h = h.with_llm_gateway(deps.gateway.clone());
+            }
+            Arc::new(h)
+        };
         // Tee slice T3, observer path (ii): fan out to the recording observer AND
         // the turn-end reap. Recording runs first so existing MODULE-001-AC-22
         // witnesses observe the same counts they always did.

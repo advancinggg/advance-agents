@@ -61,12 +61,22 @@ use crate::LlmError;
 // Public types (CONTRACT-081 trait surface — frozen)
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Chat message role (system / user / assistant). Matches MODULE-009 §2.3.
+/// One native function call returned by the model (`message.tool_calls`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Chat message role (system / user / assistant / tool). Matches MODULE-009 §2.3
+/// plus ADR 2026-10-24 D4 (`ChatRole::Tool` for host-owned turn transcripts).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatRole {
     System,
     User,
     Assistant,
+    Tool,
 }
 
 impl ChatRole {
@@ -76,15 +86,87 @@ impl ChatRole {
             Self::System => "system",
             Self::User => "user",
             Self::Assistant => "assistant",
+            Self::Tool => "tool",
         }
     }
 }
 
-/// Chat message envelope: role + content text.
+/// Host-owned turn transcript mode (WIT `llm-params.transcript`). Absent on the
+/// wire = [`Self::Continue`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TranscriptMode {
+    #[default]
+    Continue,
+    Fresh,
+}
+
+/// Chat message envelope: role + content, plus native tool-call fields.
+///
+/// ADR 2026-10-24 D4: assistant messages may carry `tool_calls`; tool-role
+/// messages carry `tool_call_id`. Callers that only need role+content use
+/// [`ChatMessage::new`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    pub tool_call_id: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+}
+
+impl ChatMessage {
+    pub fn new(role: ChatRole, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Tool,
+            content: content.into(),
+            tool_call_id: Some(call_id.into()),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    pub fn assistant_with_calls(content: impl Into<String>, calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: ChatRole::Assistant,
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls: calls,
+        }
+    }
+}
+
+struct AgentTranscript {
+    turn_id: String,
+    messages: Vec<ChatMessage>,
+}
+
+fn assembled_to_chat(m: &LlmMessage) -> ChatMessage {
+    let role = match m.role.as_str() {
+        "user" => ChatRole::User,
+        "assistant" => ChatRole::Assistant,
+        "tool" => ChatRole::Tool,
+        _ => ChatRole::System,
+    };
+    ChatMessage::new(role, m.content.clone())
+}
+
+fn pending_tool_call(messages: &[ChatMessage], call_id: &str) -> bool {
+    let Some(idx) = messages.iter().rposition(|m| m.role == ChatRole::Assistant) else {
+        return false;
+    };
+    if !messages[idx].tool_calls.iter().any(|c| c.id == call_id) {
+        return false;
+    }
+    !messages[idx + 1..]
+        .iter()
+        .any(|m| m.role == ChatRole::Tool && m.tool_call_id.as_deref() == Some(call_id))
 }
 
 /// Per-call chat parameters per CONTRACT-081 / MODULE-009 §2.3.
@@ -107,14 +189,6 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
-}
-
-/// One native function call returned by the model (`message.tool_calls`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
 }
 
 /// Chat response (non-streaming).
@@ -218,6 +292,14 @@ pub(crate) struct LlmRequestContext {
     pub messages: Vec<ChatMessage>,
     pub params: ChatParams,
     pub output_schema: Option<String>,
+    /// Trusted-turn id from `HostCallContext`. `None` = no transcript recording
+    /// (one-shot `chat()` / hello-llm / preflight).
+    pub turn_id: Option<String>,
+    /// The guest's raw `llm-request.prompt` (may be empty). Used to record the
+    /// user turn; omitted from `messages` when empty.
+    pub guest_prompt: String,
+    /// WIT `llm-params.transcript`; default continue.
+    pub transcript: TranscriptMode,
     /// When true, `generate` / `generate_via_local` bind `TeeState` (guest WIT
     /// generate). Host `chat()` / extractors leave this false.
     pub tee_live: bool,
@@ -334,11 +416,17 @@ pub struct LlmGateway {
     default_agent_id: String,
     /// Backbone Step 2 (2026-06-07) — per-agent host-assembled layered context
     /// (MODULE-010). The composition root publishes a turn's `AssemblyResult.messages`
-    /// here (keyed by the agent's bare cap id); `AgentLlmGenerateHandler` reads +
-    /// prepends them. NON-trait inherent side channel (CONTRACT-081 frozen).
+    /// here (keyed by the agent's bare cap id); `AgentLlmGenerateHandler` peeks
+    /// them as the stable seed of every `generate` / `stream` of the turn
+    /// (ADR 2026-10-24 D4 — `take_assembled` is gone so rounds 2..n keep the
+    /// identity prefix). NON-trait inherent side channel (CONTRACT-081 frozen).
     /// `std::sync::Mutex` — only ever lock-copy(Arc-clone)-release, never held
     /// across an await. Default-empty so this is back-compat for all `new` callers.
     assembled: Arc<Mutex<HashMap<String, Arc<[LlmMessage]>>>>,
+    /// Per-agent host-owned turn transcript (ADR 2026-10-24 D4). Keyed by
+    /// `agent_id`; `turn_id` inside the slot detects a new turn and resets.
+    /// Dropped by [`LlmGateway::end_turn`] at `clear_trusted_turn`.
+    transcripts: Arc<Mutex<HashMap<String, AgentTranscript>>>,
     /// Small-witness 2026-06-11 — the §1.4.3c AGENT-TIER retry overrides,
     /// installed via [`Self::with_retry_overrides`] (non-trait inherent;
     /// CONTRACT-081 frozen). `None` (every plain `new` caller) keeps all three
@@ -471,6 +559,7 @@ impl LlmGateway {
             repetition_guard,
             default_agent_id,
             assembled: Arc::new(Mutex::new(HashMap::new())),
+            transcripts: Arc::new(Mutex::new(HashMap::new())),
             retry_overrides: None,
             streaming_chain: None,
             delta_sink: Arc::new(advance_shared_types::traits::NotWiredDeltaSink),
@@ -1093,14 +1182,14 @@ impl LlmGateway {
                         } else {
                             msg
                         };
-                        ctx.messages.push(ChatMessage {
-                            role: ChatRole::User,
-                            content: format!(
+                        ctx.messages.push(ChatMessage::new(
+                            ChatRole::User,
+                            format!(
                                 "Your previous response failed schema validation \
                                  (error truncated): {truncated_msg}. Please return \
                                  valid JSON matching the original schema."
                             ),
-                        });
+                        ));
                         continue;
                     }
                     Err(e) => {
@@ -1170,6 +1259,7 @@ impl LlmGateway {
             hard_task_class: false,
             placement,
             policy_source: Default::default(),
+            ..Default::default()
         };
         emit_llm_request(self.event_bus.as_ref(), &placeholder_ctx, &model);
         let req = advance_shared_types::inference::InferenceEmbedRequest {
@@ -1638,6 +1728,7 @@ impl LlmGateway {
         let agent_owner = agent_id.clone();
         let model_owner = resolved.model.clone();
         let schema_owner = ctx.output_schema.clone();
+        let record_ctx = ctx.clone();
         // Carried into the owner so it can type a refused head of a ChatGPT sign-in entry
         // and report a rejected sign-in after the gateway borrow has ended.
         let plan_entry = resolved.uses_chatgpt_sign_in();
@@ -1678,6 +1769,7 @@ impl LlmGateway {
                 poll_gate: Arc::new(tokio::sync::Mutex::new(())),
                 settlement: settlement_owner.clone(),
                 task: my_task,
+                record_ctx,
             };
             let handle = match registry_owner.insert_live(live) {
                 Ok(h) => h,
@@ -2280,8 +2372,9 @@ impl LlmGateway {
     /// Backbone Step 2 — PEEK the published assembled context for `agent_id`
     /// (non-consuming; `None` when nothing was published). Lock-copy-release;
     /// returns a cheap `Arc` clone so the guard is dropped before the caller
-    /// awaits. Used for inspection/tests; the generate path uses
-    /// [`take_assembled`](Self::take_assembled).
+    /// awaits. The generate / stream path peeks this as the turn's stable seed
+    /// (ADR 2026-10-24 D4). The next `assemble` overwrites; [`Self::end_turn`]
+    /// drops the matching transcript.
     pub fn assembled_for(&self, agent_id: &str) -> Option<Arc<[LlmMessage]>> {
         let guard = self
             .assembled
@@ -2290,21 +2383,145 @@ impl LlmGateway {
         guard.get(agent_id).cloned()
     }
 
-    /// Backbone Step 2 — CONSUME the published assembled context for `agent_id`
-    /// (removes the entry and returns it). The generate handler calls this so a
-    /// turn's assembled context is used by exactly the generate the turn's
-    /// `assemble` produced it for, then dropped from the store. This (a) prevents
-    /// a later turn/run from reading a STALE entry if a generate ever runs without
-    /// a preceding fresh `assemble` (defense-in-depth — adversarial r9 W1), and
-    /// (b) bounds the store: consumed entries are removed rather than retained
-    /// (the next turn for the same agent re-publishes). `None` → back-compat:
-    /// generate sends just the guest prompt, byte-identical to pre-Step-2.
-    pub fn take_assembled(&self, agent_id: &str) -> Option<Arc<[LlmMessage]>> {
+    /// ADR 2026-10-24 D4 — request messages for a guest `generate` / `stream`.
+    ///
+    /// `continue` (default): seed ++ transcript ++ `[user: prompt]` (prompt omitted
+    /// when empty). `fresh`: seed ++ `[user: prompt]`; nothing is recorded.
+    /// A missing `turn_id` yields seed ++ prompt (hello-llm / one-shot).
+    pub fn build_guest_messages(
+        &self,
+        agent_id: &str,
+        turn_id: Option<&str>,
+        prompt: &str,
+        mode: TranscriptMode,
+    ) -> Vec<ChatMessage> {
+        let mut messages = self.seed_messages(agent_id);
+        match mode {
+            TranscriptMode::Fresh => {}
+            TranscriptMode::Continue => {
+                if let Some(tid) = turn_id {
+                    messages.extend(self.transcript_messages(agent_id, tid));
+                }
+            }
+        }
+        if !prompt.is_empty() {
+            messages.push(ChatMessage::new(ChatRole::User, prompt));
+        }
+        messages
+    }
+
+    /// Append the guest prompt (if any) and the assistant reply to the turn
+    /// transcript. No-op for `fresh`, missing `turn_id`, or empty (agent, turn).
+    pub fn record_generate(
+        &self,
+        agent_id: &str,
+        turn_id: &str,
+        prompt: &str,
+        response: &ChatResponse,
+    ) {
+        if turn_id.is_empty() {
+            return;
+        }
         let mut guard = self
-            .assembled
+            .transcripts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.remove(agent_id)
+        let slot = guard
+            .entry(agent_id.to_string())
+            .or_insert_with(|| AgentTranscript {
+                turn_id: turn_id.to_string(),
+                messages: Vec::new(),
+            });
+        if slot.turn_id != turn_id {
+            slot.turn_id = turn_id.to_string();
+            slot.messages.clear();
+        }
+        if !prompt.is_empty() {
+            slot.messages.push(ChatMessage::new(ChatRole::User, prompt));
+        }
+        slot.messages.push(ChatMessage::assistant_with_calls(
+            response.text.clone(),
+            response.tool_calls.clone(),
+        ));
+    }
+
+    /// ADR 2026-10-24 D4 — append a callable result. Matching `call-id` on the
+    /// last assistant's `tool_calls` becomes a tool-role message; otherwise a
+    /// user message so no provider sees an orphan tool result.
+    pub fn record_tool_result(
+        &self,
+        agent_id: &str,
+        turn_id: &str,
+        call_id: &str,
+        name: &str,
+        content: &str,
+    ) {
+        if turn_id.is_empty() {
+            return;
+        }
+        let mut guard = self
+            .transcripts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = guard
+            .entry(agent_id.to_string())
+            .or_insert_with(|| AgentTranscript {
+                turn_id: turn_id.to_string(),
+                messages: Vec::new(),
+            });
+        if slot.turn_id != turn_id {
+            slot.turn_id = turn_id.to_string();
+            slot.messages.clear();
+        }
+        let msg = if pending_tool_call(&slot.messages, call_id) {
+            ChatMessage::tool(call_id, content)
+        } else {
+            ChatMessage::new(ChatRole::User, format!("[tool result: {name}]\n{content}"))
+        };
+        slot.messages.push(msg);
+    }
+
+    /// Drop the transcript for `(agent_id, turn_id)` if it is the active slot.
+    pub fn end_turn(&self, agent_id: &str, turn_id: &str) {
+        let mut guard = self
+            .transcripts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard
+            .get(agent_id)
+            .is_some_and(|slot| slot.turn_id == turn_id)
+        {
+            guard.remove(agent_id);
+        }
+    }
+
+    fn seed_messages(&self, agent_id: &str) -> Vec<ChatMessage> {
+        match self.assembled_for(agent_id) {
+            Some(msgs) => msgs.iter().map(assembled_to_chat).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn transcript_messages(&self, agent_id: &str, turn_id: &str) -> Vec<ChatMessage> {
+        let guard = self
+            .transcripts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.get(agent_id) {
+            Some(slot) if slot.turn_id == turn_id => slot.messages.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Record a successful guest generate/stream onto the turn transcript.
+    pub(crate) fn maybe_record_generate(&self, ctx: &LlmRequestContext, response: &ChatResponse) {
+        if ctx.transcript != TranscriptMode::Continue {
+            return;
+        }
+        let Some(turn_id) = ctx.turn_id.as_deref() else {
+            return;
+        };
+        self.record_generate(&ctx.agent_id, turn_id, &ctx.guest_prompt, response);
     }
 
     /// Round-4 C1 — public verification surface for AC-15 (RunBudget integration).
@@ -2334,6 +2551,7 @@ impl LlmGateway {
             hard_task_class: false,
             placement: None,
             policy_source: Default::default(),
+            ..Default::default()
         })
         .await
     }
@@ -2357,6 +2575,8 @@ impl LlmGateway {
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "ping".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             }],
             params: ChatParams {
                 model: None,
@@ -2406,6 +2626,7 @@ impl LlmGateway {
                 cost_usd: outcome.event_cost,
             }),
         );
+        self.maybe_record_generate(ctx, &outcome.response);
         Ok(outcome.response)
     }
 
@@ -3154,14 +3375,14 @@ impl LlmGateway {
                             } else {
                                 msg.clone()
                             };
-                            ctx.messages.push(ChatMessage {
-                                role: ChatRole::User,
-                                content: format!(
+                            ctx.messages.push(ChatMessage::new(
+                                ChatRole::User,
+                                format!(
                                     "Your previous response failed schema validation \
                                      (error truncated): {truncated_msg}. Please return \
                                      valid JSON matching the original schema."
                                 ),
-                            });
+                            ));
                             last_err = Some(LlmError::StructuredOutputFailed(msg));
                             continue;
                         }
@@ -3402,6 +3623,7 @@ impl LlmGatewayInternal for LlmGateway {
             hard_task_class: false,
             placement: None,
             policy_source: Default::default(),
+            ..Default::default()
         })
         .await
     }
@@ -3502,6 +3724,7 @@ impl LlmGatewayInternal for LlmGateway {
             hard_task_class: false,
             placement: Some(rec),
             policy_source: Default::default(),
+            ..Default::default()
         };
         emit_llm_request(self.event_bus.as_ref(), &placeholder_ctx, &embed_model);
 
@@ -3733,6 +3956,7 @@ impl LlmGateway {
             hard_task_class: false,
             placement: None,
             policy_source: Default::default(),
+            ..Default::default()
         };
         match self.generate(ctx).await {
             Ok(mut response) => {
@@ -4092,6 +4316,7 @@ impl LlmGateway {
             parsed_output,
             tool_calls: outcome.tool_calls,
         };
+        self.maybe_record_generate(&ctx, &response);
         Ok(ReadyStream {
             ctx,
             response,
@@ -4147,6 +4372,7 @@ impl LlmGateway {
             hard_task_class: false,
             placement: None,
             policy_source: Default::default(),
+            ..Default::default()
         })
         .await
     }
@@ -4194,9 +4420,29 @@ fn to_inference_chat_req(
         messages: ctx
             .messages
             .iter()
-            .map(|m| InferenceMessage {
-                role: m.role.as_str().into(),
-                content: m.content.clone(),
+            .map(|m| match m.role {
+                ChatRole::Tool => InferenceMessage {
+                    role: "user".into(),
+                    content: match m.tool_call_id.as_deref() {
+                        Some(id) => format!("[tool result: {id}]\n{}", m.content),
+                        None => m.content.clone(),
+                    },
+                },
+                ChatRole::Assistant if !m.tool_calls.is_empty() && m.content.is_empty() => {
+                    InferenceMessage {
+                        role: "assistant".into(),
+                        content: m
+                            .tool_calls
+                            .iter()
+                            .map(|c| format!("{}({})", c.name, c.arguments))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    }
+                }
+                _ => InferenceMessage {
+                    role: m.role.as_str().into(),
+                    content: m.content.clone(),
+                },
             })
             .collect(),
         temperature: ctx.params.temperature,
@@ -4596,6 +4842,7 @@ mod tests {
             hard_task_class: false,
             placement: None,
             policy_source: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -4663,6 +4910,8 @@ mod tests {
         ChatMessage {
             role: ChatRole::User,
             content: content.into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -4774,6 +5023,7 @@ mod tests {
             hard_task_class: false,
             placement: None,
             policy_source: Default::default(),
+            ..Default::default()
         };
         let result = h.gateway.generate(ctx).await.expect("retry path success");
         assert!(result.parsed_output.is_some());
@@ -5125,6 +5375,7 @@ mod tests {
                 hard_task_class: false,
                 placement: None,
                 policy_source: Default::default(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -5231,6 +5482,7 @@ mod tests {
                 hard_task_class: false,
                 placement: None,
                 policy_source: Default::default(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -5280,6 +5532,7 @@ mod tests {
                 hard_task_class: false,
                 placement: None,
                 policy_source: Default::default(),
+                ..Default::default()
             })
             .await;
         assert!(matches!(result, Err(LlmError::StructuredOutputFailed(_))));
@@ -5434,6 +5687,7 @@ mod tests {
                     hard_task_class: false,
                     placement: None,
                     policy_source: Default::default(),
+                    ..Default::default()
                 })
                 .await
             }
@@ -5925,6 +6179,7 @@ mod tests {
             hard_task_class: false,
             placement: None,
             policy_source: Default::default(),
+            ..Default::default()
         };
         let result = h.gateway.generate(ctx).await.expect("retry should succeed");
         assert_eq!(result.parsed_output.is_some(), true);
@@ -6129,6 +6384,7 @@ mod tests {
             hard_task_class: false,
             placement: None,
             policy_source: Default::default(),
+            ..Default::default()
         };
         // tokio::time::advance to skip backoff sleeps
         let fut = gateway.generate(ctx);
@@ -6188,6 +6444,7 @@ mod tests {
             hard_task_class: false,
             placement: None,
             policy_source: Default::default(),
+            ..Default::default()
         };
         let fut = gateway.generate(ctx);
         tokio::pin!(fut);
@@ -6296,6 +6553,7 @@ mod tests {
             hard_task_class: false,
             placement: None,
             policy_source: Default::default(),
+            ..Default::default()
         };
         let fut = gateway.generate(ctx);
         tokio::pin!(fut);

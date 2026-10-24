@@ -167,16 +167,18 @@ impl BatchExtractor for LlmBatchExtractor {
         ctx: &ExtractionContext<'_>,
     ) -> Result<Extraction, BatchExtractorError> {
         let messages = vec![
-            ChatMessage {
-                role: ChatRole::System,
-                content: format!(
+            ChatMessage::new(
+                ChatRole::System,
+                format!(
                     "You are a memory-extraction assistant. Read the turn and respond ONLY with \
                      JSON matching this schema:\n{EXTRACTION_SCHEMA}"
                 ),
-            },
+            ),
             ChatMessage {
                 role: ChatRole::User,
                 content: Self::build_user_prompt(ctx),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             },
         ];
         let params = ChatParams {
@@ -283,6 +285,7 @@ mod tests {
                     output_tokens: 0,
                     finish_reason: "stop".into(),
                     parsed_output: None,
+                    tool_calls: Vec::new(),
                 }),
                 Err(e) => Err(e.clone()),
             }

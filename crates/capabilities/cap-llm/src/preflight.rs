@@ -90,6 +90,8 @@ pub async fn chat_preflight(
     let messages = vec![ChatMessage {
         role: ChatRole::User,
         content: "ping".into(),
+        tool_call_id: None,
+        tool_calls: Vec::new(),
     }];
     if is_cancelled.load(Ordering::SeqCst) {
         return Err(LlmError::ProviderError("cancelled".into()));

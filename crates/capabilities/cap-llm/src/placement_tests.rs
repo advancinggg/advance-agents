@@ -313,6 +313,8 @@ fn user_msg(s: &str) -> ChatMessage {
     ChatMessage {
         role: ChatRole::User,
         content: s.into(),
+        tool_call_id: None,
+        tool_calls: Vec::new(),
     }
 }
 

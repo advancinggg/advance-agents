@@ -454,6 +454,8 @@ async fn sys_ac_140_141_142_232_stats_via_agent_lifecycle_over_real_agent_stats(
                 vec![ChatMessage {
                     role: ChatRole::User,
                     content: "hi".into(),
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
                 }],
                 ChatParams::default(),
             )

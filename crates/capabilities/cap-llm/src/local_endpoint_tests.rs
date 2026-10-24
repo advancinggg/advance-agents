@@ -74,6 +74,8 @@ async fn t128_local_chat_skips_chain() {
             vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             }],
             ChatParams {
                 model: Some("llama".into()),
@@ -140,6 +142,8 @@ async fn generate_via_local_tee_live_one_begin() {
         messages: vec![ChatMessage {
             role: ChatRole::User,
             content: "hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }],
         params: ChatParams {
             model: Some("llama".into()),
@@ -218,6 +222,8 @@ async fn generate_via_local_budget_deny_before_open_is_silent() {
         messages: vec![ChatMessage {
             role: ChatRole::User,
             content: "hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }],
         params: ChatParams {
             model: Some("llama".into()),
@@ -316,6 +322,8 @@ async fn t128_local_live_stream_skips_chain() {
         messages: vec![ChatMessage {
             role: ChatRole::User,
             content: "hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }],
         params: ChatParams {
             model: Some("llama".into()),
@@ -372,6 +380,8 @@ async fn t128_local_buffered_stream_skips_chain() {
         messages: vec![ChatMessage {
             role: ChatRole::User,
             content: "hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }],
         params: ChatParams {
             model: Some("llama".into()),
@@ -425,6 +435,8 @@ async fn t132_local_live_stream_blocks_secret() {
         messages: vec![ChatMessage {
             role: ChatRole::User,
             content: "hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }],
         params: ChatParams {
             model: Some("llama".into()),

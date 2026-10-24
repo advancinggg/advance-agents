@@ -174,8 +174,31 @@ impl OpenAiResponsesAdapter {
         for m in messages {
             match m.role {
                 ChatRole::System => instructions.push(&m.content),
-                ChatRole::User | ChatRole::Assistant => {
-                    input.push(json!({ "role": m.role.as_str(), "content": m.content }));
+                ChatRole::User => {
+                    input.push(json!({ "role": "user", "content": m.content }));
+                }
+                ChatRole::Assistant if m.tool_calls.is_empty() => {
+                    input.push(json!({ "role": "assistant", "content": m.content }));
+                }
+                ChatRole::Assistant => {
+                    if !m.content.is_empty() {
+                        input.push(json!({ "role": "assistant", "content": m.content }));
+                    }
+                    for c in &m.tool_calls {
+                        input.push(json!({
+                            "type": "function_call",
+                            "call_id": c.id,
+                            "name": c.name,
+                            "arguments": c.arguments,
+                        }));
+                    }
+                }
+                ChatRole::Tool => {
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": m.tool_call_id.as_deref().unwrap_or(""),
+                        "output": m.content,
+                    }));
                 }
             }
         }
@@ -704,10 +727,14 @@ mod tests {
             ChatMessage {
                 role: ChatRole::System,
                 content: "be brief".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             },
             ChatMessage {
                 role: ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             },
         ];
         let req = adapter
@@ -761,10 +788,14 @@ mod tests {
             ChatMessage {
                 role: ChatRole::System,
                 content: "be brief".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             },
             ChatMessage {
                 role: ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             },
         ]
     }

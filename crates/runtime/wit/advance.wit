@@ -74,12 +74,23 @@ interface agent-llm {
         parameters: string,
     }
 
+    /// Host-owned turn transcript (ADR 2026-10-24 D4 / D5). Absent = continue.
+    /// `continue` reuses seed ++ transcript ++ prompt; `fresh` is seed ++ prompt
+    /// and records nothing (side queries).
+    enum transcript-mode {
+        %continue,
+        fresh,
+    }
+
     record llm-params {
         model: option<string>,
         temperature: option<f64>,
         max-tokens: option<u32>,
         stop-sequences: option<list<string>>,
         tools: option<list<tool-definition>>,
+        /// Guest-defined behavior tools remain `tools` (v0.1.47).
+        /// `transcript` is host-owned conversation state for this turn.
+        transcript: option<transcript-mode>,
     }
 
     record llm-request {

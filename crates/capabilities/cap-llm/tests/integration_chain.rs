@@ -261,6 +261,8 @@ async fn t89_generate_through_real_chain() {
             vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             }],
             ChatParams::default(),
         )
@@ -288,6 +290,8 @@ async fn t90_generate_real_chain_step_trace() {
             vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             }],
             ChatParams::default(),
         )

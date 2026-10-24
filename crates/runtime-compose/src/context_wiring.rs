@@ -547,6 +547,8 @@ impl LightLlmFallbackPort for GatewayLightLlm {
                 vec![cap_llm::ChatMessage {
                     role: cap_llm::ChatRole::User,
                     content: prompt,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
                 }],
                 params,
             )

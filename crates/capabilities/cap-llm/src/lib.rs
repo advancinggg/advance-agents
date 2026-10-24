@@ -84,6 +84,9 @@ mod policy_tests;
 #[cfg(test)]
 mod test_support;
 
+#[cfg(test)]
+mod transcript_tests;
+
 #[cfg(all(test, unix))]
 mod test_marker;
 
@@ -104,7 +107,7 @@ pub use error::{FailureClassNote, LlmError, SUBSCRIPTION_USAGE_LIMIT_CLASS};
 pub use events::{LLM_ERROR, LLM_REQUEST, LLM_RESPONSE, LLM_RETRY};
 pub use gateway::{
     ChatDelta, ChatMessage, ChatParams, ChatResponse, ChatRole, LlmGateway, LlmGatewayInternal,
-    LocalSidecarBinder, ToolDefinition,
+    LocalSidecarBinder, ToolCall, ToolDefinition, TranscriptMode,
 };
 pub use host_fn::{
     register_agent_llm, register_agent_llm_with_turn_cost, AgentLlmGenerateHandler,

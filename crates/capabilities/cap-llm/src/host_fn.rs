@@ -28,29 +28,8 @@ use advance_shared_types::turn_attribution::{
 use wasmtime::component::Val;
 
 use crate::error::LlmError;
-use crate::gateway::{
-    ChatMessage, ChatParams, ChatResponse, ChatRole, LlmGateway, LlmRequestContext,
-};
+use crate::gateway::{ChatParams, ChatResponse, LlmGateway, LlmRequestContext, TranscriptMode};
 use crate::stream::{PollOutcome, StreamRegistry};
-
-use advance_shared_types::context::LlmMessage;
-
-/// Backbone Step 2 — map a host-assembled `LlmMessage` (role: String) to a
-/// gateway `ChatMessage` (role: enum). The assembler emits "system"/"user"
-/// roles; an unrecognized role falls back to `System` (assembled context is
-/// system-level scaffolding, so System is the safe default — it never
-/// impersonates the user's turn).
-fn assembled_to_chat(m: &LlmMessage) -> ChatMessage {
-    let role = match m.role.as_str() {
-        "user" => ChatRole::User,
-        "assistant" => ChatRole::Assistant,
-        _ => ChatRole::System,
-    };
-    ChatMessage {
-        role,
-        content: m.content.clone(),
-    }
-}
 
 // Versioned (`@0.1.0`) to match the canonical WIT package `advance:runtime@0.1.0`: a wit-bindgen
 // guest emits versioned import paths (`advance:runtime/agent-llm@0.1.0`) which Wasmtime's component
@@ -72,6 +51,8 @@ pub(crate) struct LlmRequest {
     pub prompt: String,
     pub params: Option<ChatParams>,
     pub output_schema: Option<String>,
+    /// WIT `llm-params.transcript`; default continue when absent.
+    pub transcript: TranscriptMode,
 }
 
 /// Decode the first parameter as a WIT `llm-request` record. Slice B-2 ships
@@ -79,23 +60,23 @@ pub(crate) struct LlmRequest {
 /// strings) until the WIT interface is wired into
 /// `crates/runtime/wit/advance.wit` (AC-01 deferred — see MODULE-009 §3.6).
 ///
-/// Round-AUDIT-5 W2 fix: the decoder REJECTS missing or empty `prompt`
-/// fields with an explicit error. Earlier behaviour fell back to
-/// `prompt = ""` which would route a billable empty-prompt LLM request
-/// through the WIT path on ABI mismatch / malformed host calls; the
-/// decoder now fails closed at the boundary.
+/// Round-AUDIT-5 W2 fix: the decoder REJECTS a missing `prompt` field.
+/// An explicit empty prompt is allowed (ADR 2026-10-24 D4: `generate("")`
+/// continues the host-owned transcript and omits the user message).
 pub(crate) fn decode_llm_request(params: &[Val]) -> Result<LlmRequest, String> {
     let first = params
         .first()
         .ok_or_else(|| "llm-request missing".to_string())?;
 
     let mut req = LlmRequest::default();
+    let mut saw_prompt = false;
     match first {
         Val::Record(fields) => {
             for (name, val) in fields {
                 match name.as_str() {
                     "task-id" => req.task_id = decode_optional_string(val),
                     "prompt" => {
+                        saw_prompt = true;
                         if let Val::String(s) = val {
                             req.prompt = s.clone();
                         }
@@ -104,7 +85,7 @@ pub(crate) fn decode_llm_request(params: &[Val]) -> Result<LlmRequest, String> {
                         // Slice C (2026-05-09): real WIT `option<llm-params>` decoder.
                         // WIT-typed input is `Val::Option(None)` → req.params = None
                         // (gateway falls through to ChatParams::default()), or
-                        // `Val::Option(Some(Val::Record(four-sub-options)))` →
+                        // `Val::Option(Some(Val::Record(sub-options)))` →
                         // populate ChatParams from the sub-options. The decoder is
                         // tolerant to non-WIT-typed Records too (test infra / future
                         // ABI bridges may produce records with subset of fields or
@@ -124,6 +105,9 @@ pub(crate) fn decode_llm_request(params: &[Val]) -> Result<LlmRequest, String> {
                                             cp.stop_sequences = decode_optional_list_string(v)
                                         }
                                         "tools" => cp.tools = decode_optional_tools(v),
+                                        "transcript" => {
+                                            req.transcript = decode_optional_transcript(v)
+                                        }
                                         _ => { /* forward-compat: silently drop unknown sub-fields */
                                         }
                                     }
@@ -139,13 +123,16 @@ pub(crate) fn decode_llm_request(params: &[Val]) -> Result<LlmRequest, String> {
         }
         Val::String(prompt) => {
             // Convenience path for non-WIT call sites — accept a bare prompt.
+            saw_prompt = true;
             req.prompt = prompt.clone();
         }
         _ => return Err("expected llm-request record or string".into()),
     }
-    if req.prompt.is_empty() {
-        return Err("llm-request: prompt is required and must be non-empty".into());
+    if !saw_prompt {
+        return Err("llm-request: prompt is required".into());
     }
+    // Empty prompt is allowed: ADR 2026-10-24 D4 omits the user message and
+    // continues the host-owned transcript (`generate("")` after a tool call).
     Ok(req)
 }
 
@@ -306,6 +293,19 @@ fn decode_optional_tools(val: &Val) -> Option<Vec<crate::gateway::ToolDefinition
         });
     }
     Some(out)
+}
+
+/// Decode `option<transcript-mode>`. Absent / unknown → continue.
+fn decode_optional_transcript(val: &Val) -> TranscriptMode {
+    let inner = match val {
+        Val::Option(Some(boxed)) => boxed.as_ref(),
+        Val::Enum(_) | Val::String(_) => val,
+        _ => return TranscriptMode::Continue,
+    };
+    match inner {
+        Val::Enum(s) | Val::String(s) if s == "fresh" => TranscriptMode::Fresh,
+        _ => TranscriptMode::Continue,
+    }
 }
 
 /// Encode a successful `ChatResponse` as a WIT `llm-response` record `Val`.
@@ -565,22 +565,21 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
             // Producer-side wiring (M008 setting ComponentCtx.run_id at WASM
             // Store construction) is still deferred — until then, public-surface
             // WIT calls carry None for both, matching prior behavior.
-            // Backbone Step 2 — prepend the host-assembled layered context
-            // (MODULE-010) published for this agent ahead of the guest's prompt.
-            // CONSUME it (take, not peek) so it is used by exactly this turn's
-            // generate and removed from the store (no stale-read on a later turn,
-            // bounded retention — adversarial r9 W1). `None`/empty → just the
-            // prompt (byte-identical to pre-Step-2). The guest still drives
-            // generate; the host only enriches `messages`.
-            let assembled = gateway.take_assembled(&ctx.agent_id);
-            let mut messages: Vec<ChatMessage> = match &assembled {
-                Some(msgs) => msgs.iter().map(assembled_to_chat).collect(),
-                None => Vec::new(),
-            };
-            messages.push(ChatMessage {
-                role: ChatRole::User,
-                content: req.prompt,
-            });
+            // ADR 2026-10-24 D4 — seed (peek assembled) ++ transcript ++ prompt.
+            // Empty prompt omits the user message. `fresh` skips the transcript
+            // and records nothing. The first continue-generate of a turn is
+            // byte-identical to the pre-D4 seed+prompt body.
+            let messages = gateway.build_guest_messages(
+                &ctx.agent_id,
+                ctx.turn_id.as_deref(),
+                &req.prompt,
+                req.transcript,
+            );
+            if messages.is_empty() {
+                return Ok(vec![encode_llm_result(Err(LlmError::ProviderError(
+                    "empty-messages".into(),
+                )))]);
+            }
             let llm_ctx = LlmRequestContext {
                 agent_id: ctx.agent_id.clone(),
                 task_id: attribution.task_id,
@@ -595,6 +594,9 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
                 hard_task_class: false,
                 placement: None,
                 policy_source: Default::default(),
+                turn_id: ctx.turn_id.clone(),
+                guest_prompt: req.prompt,
+                transcript: req.transcript,
             };
             let result = gateway.generate(llm_ctx).await;
             gateway.observe_guest_visible_error(&ctx.agent_id, result.as_ref().err());
@@ -617,18 +619,25 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
             // Decode error is a host-ABI fault (HandlerError), not an llm-error.
             let req = decode_llm_request(&params).map_err(HostCallError::HandlerError)?;
             let attribution = freeze_request_attribution(&ctx, req.task_id, turn_cost.as_deref())?;
-            // Same context construction as AgentLlmGenerateHandler: run_id /
-            // iteration / trace_id / task_id / agent_id from HostCallContext.
+            // Same seed ++ transcript ++ prompt as generate (ADR 2026-10-24 D4).
+            let messages = gateway.build_guest_messages(
+                &ctx.agent_id,
+                ctx.turn_id.as_deref(),
+                &req.prompt,
+                req.transcript,
+            );
+            if messages.is_empty() {
+                return Ok(vec![encode_stream_result(Err(LlmError::ProviderError(
+                    "empty-messages".into(),
+                )))]);
+            }
             let llm_ctx = LlmRequestContext {
                 agent_id: ctx.agent_id.clone(),
                 task_id: attribution.task_id,
                 run_id: attribution.run_id,
                 iteration: ctx.iteration,
                 trace_id: Some(ctx.trace_id.clone()),
-                messages: vec![ChatMessage {
-                    role: ChatRole::User,
-                    content: req.prompt,
-                }],
+                messages,
                 params: req.params.unwrap_or_default(),
                 output_schema: req.output_schema,
                 tee_live: false,
@@ -636,6 +645,9 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
                 hard_task_class: false,
                 placement: None,
                 policy_source: Default::default(),
+                turn_id: ctx.turn_id.clone(),
+                guest_prompt: req.prompt,
+                transcript: req.transcript,
             };
             // S4 final: a WIRED gateway takes the live path ONLY — no silent
             // buffered fallback on any live error (plan §1). An UNWIRED gateway
@@ -700,6 +712,10 @@ impl HostFunctionHandler for AgentLlmPollStreamHandler {
                     // S4 live: terminal llm.response + phase already emitted by settlement winner (plan Δ3).
                     // The Done carries the full buffer text + metadata for the WIT terminal chunk.
                     // (Buffered legacy path would call stream_finish here; live path does not.)
+                    // ADR 2026-10-24 D4: the live stream records onto the turn
+                    // transcript at Done (buffered streams record in
+                    // `finish_buffered_stream`).
+                    gateway.maybe_record_generate(&ready.ctx, &ready.response);
                     encode_stream_chunk(None, true, Some(&ready.response))
                 }
                 // S4: a live stream's Failed phase surfaces its REAL enum-coded
@@ -2123,8 +2139,9 @@ mod tests {
         }
     }
 
-    /// Round-AUDIT-5 W2 — empty / missing prompt must reject at the
-    /// boundary, NOT fall through as an empty-string billable request.
+    /// Round-AUDIT-5 W2 — a missing prompt field is still an ABI fault.
+    /// An explicit empty prompt is allowed (ADR 2026-10-24 D4: `generate("")`
+    /// continues the host-owned transcript).
     #[test]
     fn t_decode_llm_request_missing_prompt_rejected() {
         let result = decode_llm_request(&[Val::Record(vec![(
@@ -2141,24 +2158,35 @@ mod tests {
     }
 
     #[test]
-    fn t_decode_llm_request_empty_prompt_rejected() {
-        let result = decode_llm_request(&[Val::Record(vec![(
+    fn t_decode_llm_request_empty_prompt_allowed() {
+        let req = decode_llm_request(&[Val::Record(vec![(
             "prompt".into(),
             Val::String(String::new()),
-        )])]);
-        match result {
-            Err(msg) => assert!(msg.contains("prompt is required"), "got {msg:?}"),
-            Ok(req) => panic!("expected error for empty prompt, got Ok({req:?})"),
-        }
+        )])])
+        .expect("empty prompt is a valid continue turn");
+        assert!(req.prompt.is_empty());
+        assert_eq!(req.transcript, TranscriptMode::Continue);
     }
 
     #[test]
-    fn t_decode_llm_request_bare_empty_string_rejected() {
-        let result = decode_llm_request(&[Val::String(String::new())]);
-        match result {
-            Err(msg) => assert!(msg.contains("prompt is required"), "got {msg:?}"),
-            Ok(req) => panic!("expected error for bare empty string, got Ok({req:?})"),
-        }
+    fn t_decode_llm_request_bare_empty_string_allowed() {
+        let req = decode_llm_request(&[Val::String(String::new())])
+            .expect("bare empty string is a valid continue turn");
+        assert!(req.prompt.is_empty());
+    }
+
+    #[test]
+    fn t_decode_llm_request_transcript_fresh() {
+        let llm_params = Val::Option(Some(Box::new(Val::Record(vec![(
+            "transcript".into(),
+            Val::Option(Some(Box::new(Val::Enum("fresh".into())))),
+        )]))));
+        let req = decode_llm_request(&[Val::Record(vec![
+            ("prompt".into(), Val::String("side".into())),
+            ("params".into(), llm_params),
+        ])])
+        .expect("decode ok");
+        assert_eq!(req.transcript, TranscriptMode::Fresh);
     }
 
     /// MODULE-009-T56 — error encoding: each LlmError variant produces a
@@ -3032,6 +3060,8 @@ mod live_gated_tests {
             messages: vec![crate::ChatMessage {
                 role: crate::ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             }],
             params: Default::default(),
             output_schema: None,
@@ -3040,6 +3070,7 @@ mod live_gated_tests {
             hard_task_class: false,
             placement: None,
             policy_source: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -4137,6 +4168,7 @@ mod live_gated_tests {
                 poll_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 settlement: stl,
                 task: tokio::spawn(async {}),
+                record_ctx: Default::default(),
             };
             r.registry.insert_live(live).ok().expect("fill");
         }

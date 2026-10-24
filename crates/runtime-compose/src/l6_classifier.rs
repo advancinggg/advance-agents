@@ -201,16 +201,18 @@ impl L6Classifier for LlmL6Classifier {
         input: &L6ClassificationInput,
     ) -> Result<L6ClassificationOutput, L6Error> {
         let messages = vec![
-            ChatMessage {
-                role: ChatRole::System,
-                content: format!(
+            ChatMessage::new(
+                ChatRole::System,
+                format!(
                     "You are an L6 memory-consolidation classifier. Read the clusters and \
                      respond ONLY with JSON matching this schema:\n{L6_SCHEMA}"
                 ),
-            },
+            ),
             ChatMessage {
                 role: ChatRole::User,
                 content: Self::build_user_prompt(input),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             },
         ];
         let params = ChatParams {
@@ -309,6 +311,7 @@ mod tests {
                     output_tokens: 0,
                     finish_reason: "stop".into(),
                     parsed_output: None,
+                    tool_calls: Vec::new(),
                 }),
                 Err(e) => Err(e.clone()),
             }

@@ -28,6 +28,8 @@ async fn deterministic_llm_turn_through_loopback_seam() {
             vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             }],
             ChatParams::default(),
         )

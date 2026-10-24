@@ -3892,6 +3892,8 @@ async fn the_sign_in_feeds_the_gateway_the_token_it_just_renewed() {
             vec![cap_llm::ChatMessage {
                 role: cap_llm::ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             }],
             cap_llm::ChatParams {
                 model: Some("plan".into()),

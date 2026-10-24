@@ -27,6 +27,8 @@ fn user_msg() -> Vec<ChatMessage> {
     vec![ChatMessage {
         role: ChatRole::User,
         content: "hi".into(),
+        tool_call_id: None,
+        tool_calls: Vec::new(),
     }]
 }
 

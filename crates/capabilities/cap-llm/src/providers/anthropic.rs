@@ -37,8 +37,38 @@ impl AnthropicAdapter {
         for m in messages {
             match m.role {
                 ChatRole::System => system_parts.push(&m.content),
-                ChatRole::User | ChatRole::Assistant => {
-                    convo.push(json!({ "role": m.role.as_str(), "content": m.content }));
+                ChatRole::User => {
+                    convo.push(json!({ "role": "user", "content": m.content }));
+                }
+                ChatRole::Assistant if m.tool_calls.is_empty() => {
+                    convo.push(json!({ "role": "assistant", "content": m.content }));
+                }
+                ChatRole::Assistant => {
+                    let mut content: Vec<Value> = Vec::new();
+                    if !m.content.is_empty() {
+                        content.push(json!({ "type": "text", "text": m.content }));
+                    }
+                    for c in &m.tool_calls {
+                        let input: Value =
+                            serde_json::from_str(&c.arguments).unwrap_or_else(|_| json!({}));
+                        content.push(json!({
+                            "type": "tool_use",
+                            "id": c.id,
+                            "name": c.name,
+                            "input": input,
+                        }));
+                    }
+                    convo.push(json!({ "role": "assistant", "content": content }));
+                }
+                ChatRole::Tool => {
+                    convo.push(json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": m.tool_call_id.as_deref().unwrap_or(""),
+                            "content": m.content,
+                        }]
+                    }));
                 }
             }
         }
@@ -282,6 +312,8 @@ mod tests {
         let messages = vec![ChatMessage {
             role: ChatRole::User,
             content: "hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }];
         let params = ChatParams {
             max_tokens: Some(100),
@@ -423,14 +455,20 @@ mod tests {
             ChatMessage {
                 role: ChatRole::System,
                 content: "You are a helpful assistant.".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             },
             ChatMessage {
                 role: ChatRole::User,
                 content: "Hello".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             },
             ChatMessage {
                 role: ChatRole::System,
                 content: "Schema validation failed: foo. Please return valid JSON.".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             },
         ];
         let req = adapter
@@ -456,6 +494,8 @@ mod tests {
         let messages = vec![ChatMessage {
             role: ChatRole::User,
             content: "Hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }];
         let req = adapter
             .build_chat_request(&p, &messages, &ChatParams::default())
@@ -963,6 +1003,8 @@ mod stream_tests {
                 &[ChatMessage {
                     role: ChatRole::User,
                     content: "hi".into(),
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
                 }],
                 &ChatParams::default(),
             )

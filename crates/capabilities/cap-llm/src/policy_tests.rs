@@ -107,6 +107,8 @@ fn user(content: &str) -> ChatMessage {
     ChatMessage {
         role: ChatRole::User,
         content: content.into(),
+        tool_call_id: None,
+        tool_calls: Vec::new(),
     }
 }
 

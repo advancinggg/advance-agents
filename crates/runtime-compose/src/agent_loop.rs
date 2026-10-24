@@ -189,6 +189,10 @@ pub struct WasmMessageHandler {
     /// Where a failed `complete_round` or fresh instance is reported
     /// ([`Self::with_log`]; none by default).
     log: LogHandle,
+    /// Host-owned turn transcript (ADR 2026-10-24 D4). `end_turn` drops the
+    /// slot at `clear_trusted_turn` / `destroy_trusted_turn`. `None` on the
+    /// harness path that never wires llm.
+    llm_gateway: Option<Arc<LlmGateway>>,
 }
 
 impl WasmMessageHandler {
@@ -217,6 +221,7 @@ impl WasmMessageHandler {
             init_config: StdMutex::new(None),
             fresh_instance_due: AtomicBool::new(false),
             log: LogHandle::null(),
+            llm_gateway: None,
         }
     }
 
@@ -234,6 +239,18 @@ impl WasmMessageHandler {
     pub fn with_log(mut self, log: LogHandle) -> Self {
         self.log = log;
         self
+    }
+
+    /// Drop the host-owned turn transcript when the trusted turn ends.
+    pub fn with_llm_gateway(mut self, gateway: Arc<LlmGateway>) -> Self {
+        self.llm_gateway = Some(gateway);
+        self
+    }
+
+    fn drop_transcript(&self, turn_id: &str) {
+        if let Some(gw) = &self.llm_gateway {
+            gw.end_turn(&self.agent_id, turn_id);
+        }
     }
 }
 
@@ -544,6 +561,7 @@ impl MessageHandler for WasmMessageHandler {
             }
             *active = None;
         }
+        self.drop_transcript(turn_id);
         self.store_epoch
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
                 epoch.checked_add(1)
@@ -583,6 +601,7 @@ impl MessageHandler for WasmMessageHandler {
             }
             *active = None;
         }
+        self.drop_transcript(turn_id);
         Ok(())
     }
 
@@ -715,7 +734,8 @@ impl ContextAssembler for MinimalContextAssembler {
 /// and, on each `assemble`, PUBLISHES the assembled `AssemblyResult.messages` into
 /// the [`LlmGateway`]'s per-agent assembled-context store (keyed by the bare cap
 /// `agent_id` that also seeds `ComponentCtx.agent_id`). The guest's
-/// `agent-llm/generate` later reads + prepends them (cap-llm `AgentLlmGenerateHandler`).
+/// `agent-llm/generate` later peeks them as the stable seed of every generate /
+/// stream of the turn (cap-llm `AgentLlmGenerateHandler`; ADR 2026-10-24 D4).
 ///
 /// Why publish here (a side channel) rather than thread the result through the
 /// scheduler: the scheduler's `run_turn_once` is dependency-inverted and must not

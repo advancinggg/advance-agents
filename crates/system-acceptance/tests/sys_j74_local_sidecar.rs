@@ -64,6 +64,8 @@ fn user_msg(text: &str) -> Vec<ChatMessage> {
     vec![ChatMessage {
         role: ChatRole::User,
         content: text.into(),
+        tool_call_id: None,
+        tool_calls: Vec::new(),
     }]
 }
 

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::gateway::{ChatParams, ChatResponse, LlmRequestContext, ReadyStream};
+use crate::gateway::{ChatResponse, LlmRequestContext, ReadyStream};
 
 // S4: use consolidated from host_fn::STREAM_HANDLE_TTL (single definition)
 /// Max concurrent buffered stream handles (DoS bound). 256 × 256 KiB ≈ 64 MiB
@@ -1040,6 +1040,7 @@ impl Settlement {
                     hard_task_class: false,
                     placement: None,
                     policy_source: Default::default(),
+                    ..Default::default()
                 };
                 match &terminal {
                     LivePhase::Done {
@@ -1255,6 +1256,10 @@ pub(crate) struct LiveStream {
     pub poll_gate: Arc<TokioMutex<()>>, // held across await to serialize polls (Δ4)
     pub settlement: Arc<Settlement>,
     pub task: JoinHandle<()>,
+    /// Original guest request envelope (turn_id / guest_prompt / transcript).
+    /// `claim_done` copies this onto `ReadyStream.ctx` so live poll-Done can
+    /// record onto the host-owned turn transcript (ADR 2026-10-24 D4).
+    pub record_ctx: LlmRequestContext,
 }
 
 impl Drop for LiveStream {
@@ -2077,25 +2082,13 @@ impl StreamRegistry {
             st.terminal_claimed = true;
         }
         let _ = self.claim_remove(handle); // housekeeping
+        let mut ctx = live.record_ctx.clone();
+        ctx.agent_id = agent_id.to_string();
+        if ctx.run_id.is_none() {
+            ctx.run_id = run_id;
+        }
         PollOutcome::Done(ReadyStream {
-            ctx: LlmRequestContext {
-                agent_id: agent_id.to_string(),
-                task_id: None,
-                run_id,
-                iteration: None,
-                trace_id: None,
-                messages: vec![],
-                params: ChatParams {
-                    model: Some(model.clone()),
-                    ..Default::default()
-                },
-                output_schema: None,
-                tee_live: false,
-                user_constraints: Vec::new(),
-                hard_task_class: false,
-                placement: None,
-                policy_source: Default::default(),
-            },
+            ctx,
             response: ChatResponse {
                 text,
                 model,
@@ -2786,6 +2779,7 @@ mod tests {
                 hard_task_class: false,
                 placement: None,
                 policy_source: Default::default(),
+                ..Default::default()
             },
             response: ChatResponse {
                 text: text.into(),
@@ -3029,6 +3023,7 @@ mod tests {
             poll_gate: Arc::new(TokioMutex::new(())),
             settlement,
             task: tokio::spawn(async {}),
+            record_ctx: Default::default(),
         }
     }
 
@@ -3421,6 +3416,7 @@ mod tests {
                 poll_gate: Arc::new(TokioMutex::new(())),
                 settlement: settlement.clone(),
                 task,
+                record_ctx: Default::default(),
             };
             let h = match reg.insert_live(live) {
                 Ok(h) => h,
@@ -3538,6 +3534,7 @@ mod tests {
                         poll_gate: e.poll_gate.clone(),
                         settlement: e.settlement.clone(),
                         task: tokio::spawn(async {}),
+                        record_ctx: e.record_ctx.clone(),
                     });
                     *e = expired;
                 }
@@ -3617,6 +3614,7 @@ mod tests {
                         poll_gate: e.poll_gate.clone(),
                         settlement: e.settlement.clone(),
                         task: tokio::spawn(async {}),
+                        record_ctx: e.record_ctx.clone(),
                     });
                     *e = expired;
                 }

@@ -196,6 +196,8 @@ async fn t135_snapshot_chat_one_invocation() {
             vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             }],
             ChatParams {
                 model: Some("llama".into()),
@@ -274,6 +276,8 @@ async fn t135_unwired_typed_refuse() {
             vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             }],
             ChatParams {
                 model: Some("llama".into()),
@@ -436,6 +440,8 @@ async fn t135_snapshot_stream_one_invocation() {
         messages: vec![ChatMessage {
             role: ChatRole::User,
             content: "hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }],
         params: ChatParams {
             model: Some("llama".into()),
@@ -565,6 +571,8 @@ async fn t135_negotiated_live_sse() {
         messages: vec![ChatMessage {
             role: ChatRole::User,
             content: "hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }],
         params: ChatParams {
             model: Some("llama".into()),
@@ -735,6 +743,8 @@ async fn t135_caller_budget_target_lease_only() {
             vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             }],
             ChatParams {
                 model: Some("llama".into()),
@@ -841,6 +851,8 @@ async fn t135_mesh_connection_refused_failovers() {
             vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             }],
             ChatParams {
                 model: Some("llama".into()),
@@ -908,6 +920,8 @@ async fn t135_mesh_connection_refused_failovers() {
                 vec![ChatMessage {
                     role: ChatRole::User,
                     content: "hi".into(),
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
                 }],
                 ChatParams {
                     model: Some("llama".into()),

@@ -258,6 +258,8 @@ fn ctx(alias: &str) -> LlmRequestContext {
         messages: vec![ChatMessage {
             role: ChatRole::User,
             content: "hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }],
         params: ChatParams {
             model: Some(alias.into()),

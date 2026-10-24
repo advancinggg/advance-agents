@@ -18,6 +18,7 @@ use advance_shared_types::agent_tree::{
     AgentTreeSnapshotData,
 };
 use advance_shared_types::capability::{CapParams, CapRequest, CapabilityId, GrantDecision};
+use advance_shared_types::context::LlmMessage;
 use advance_shared_types::event::Event;
 use advance_shared_types::traits::{EventBusEmit, GrantCheck};
 
@@ -106,6 +107,7 @@ const LLM_TOOLS_CORE: &[u8] =
 const AGENT_ID: &str = "agent:tools";
 const FINAL_REPLY: &str = "created-roadmap";
 const WRITE_ARGS: &str = r##"{"path":"roadmap.md","content":"# Roadmap\n"}"##;
+const IDENTITY: &str = "IDENTITY-PREFIX-TOOLS";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn llm_tools_guest_loops_generate_write_generate() {
@@ -134,6 +136,13 @@ async fn llm_tools_guest_loops_generate_write_generate() {
     ));
     let schema = Arc::new(MetaSchemaLoader::new_with_default(PathBuf::new()));
     let registry: Arc<dyn HostRegistry> = Arc::new(InMemoryHostRegistry::new());
+    loopback.gateway.publish_assembled(
+        AGENT_ID,
+        Arc::from(vec![LlmMessage {
+            role: "system".into(),
+            content: IDENTITY.into(),
+        }]),
+    );
     register_agent_llm(&*registry, loopback.gateway.clone());
     register_agent_fs(
         &*registry,
@@ -175,11 +184,12 @@ async fn llm_tools_guest_loops_generate_write_generate() {
             capability: CapabilityId::from("fs"),
         },
     ];
-    let ctx = ComponentCtx::new(
+    let mut ctx = ComponentCtx::new(
         AGENT_ID.to_string(),
         "trace-llm-tools".to_string(),
         Vec::new(),
     );
+    ctx.stamp_trusted_turn("turn-tools-1".to_string());
     let (bindings, mut store) = runtime
         .instantiate_advance_host_with_capabilities_async(&loaded, ctx, &caps, &injector)
         .await
@@ -220,6 +230,15 @@ async fn llm_tools_guest_loops_generate_write_generate() {
         2,
         "guest generate loop: tool_calls then text"
     );
+    let bodies = loopback.all_chat_request_bodies();
+    assert_eq!(bodies.len(), 2);
+    for (i, body) in bodies.iter().enumerate() {
+        assert!(
+            body.contains(IDENTITY),
+            "generate {} must keep the identity seed (F3 peek): {body}",
+            i + 1
+        );
+    }
 
     let wrote = agent_workspace.join("roadmap.md");
     let body = std::fs::read_to_string(&wrote)

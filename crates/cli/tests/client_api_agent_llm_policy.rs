@@ -332,6 +332,8 @@ async fn lp02_pin_to_vanished_provider_fails_closed_without_leaving_the_process(
             vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             }],
             ChatParams::default(),
         )

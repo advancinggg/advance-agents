@@ -383,6 +383,7 @@ mod tests {
                 output_tokens: 0,
                 finish_reason: "stop".into(),
                 parsed_output: None,
+                tool_calls: Vec::new(),
             })
         }
         async fn stream(

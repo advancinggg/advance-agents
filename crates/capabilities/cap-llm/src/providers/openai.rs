@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use crate::cost::CacheUsage;
 use crate::error::LlmError;
 use crate::executor::ExecutionOutcome;
-use crate::gateway::{ChatMessage, ChatParams, ToolCall};
+use crate::gateway::{ChatMessage, ChatParams, ChatRole, ToolCall};
 use crate::provider::ResolvedProvider;
 use crate::providers::sse::{SseEvent, SseFrame, SseToolCallDelta, SseUsage};
 use crate::providers::{auth_header_for, ProviderAdapter};
@@ -124,11 +124,38 @@ fn parse_sse_tool_call_deltas(value: &Value) -> Option<Vec<SseToolCallDelta>> {
 }
 
 fn json_messages(messages: &[ChatMessage]) -> Value {
-    let arr: Vec<Value> = messages
-        .iter()
-        .map(|m| json!({ "role": m.role.as_str(), "content": m.content }))
-        .collect();
+    let arr: Vec<Value> = messages.iter().map(chat_message_to_json).collect();
     Value::Array(arr)
+}
+
+fn chat_message_to_json(m: &ChatMessage) -> Value {
+    match m.role {
+        ChatRole::Tool => {
+            let mut obj = json!({
+                "role": "tool",
+                "content": m.content,
+            });
+            if let Some(id) = &m.tool_call_id {
+                obj["tool_call_id"] = json!(id);
+            }
+            obj
+        }
+        ChatRole::Assistant if !m.tool_calls.is_empty() => {
+            json!({
+                "role": "assistant",
+                "content": if m.content.is_empty() { Value::Null } else { json!(m.content) },
+                "tool_calls": m.tool_calls.iter().map(|c| json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": {
+                        "name": c.name,
+                        "arguments": c.arguments,
+                    }
+                })).collect::<Vec<_>>(),
+            })
+        }
+        _ => json!({ "role": m.role.as_str(), "content": m.content }),
+    }
 }
 
 impl ProviderAdapter for OpenAiAdapter {
@@ -710,6 +737,8 @@ mod tests {
         let messages = vec![ChatMessage {
             role: ChatRole::User,
             content: "hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }];
         let params = ChatParams::default();
         let req = adapter.build_chat_request(&p, &messages, &params).unwrap();
@@ -733,6 +762,8 @@ mod tests {
         let messages = vec![ChatMessage {
             role: ChatRole::User,
             content: "hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }];
         let params = ChatParams {
             tools: Some(vec![crate::gateway::ToolDefinition {
@@ -903,6 +934,8 @@ mod tests {
         let messages = vec![ChatMessage {
             role: ChatRole::User,
             content: "hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }];
         let req = adapter
             .build_stream_request(&p, &messages, &ChatParams::default())

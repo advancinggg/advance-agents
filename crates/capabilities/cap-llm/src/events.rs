@@ -227,6 +227,7 @@ mod tests {
             hard_task_class: false,
             placement: None,
             policy_source: Default::default(),
+            ..Default::default()
         }
     }
 

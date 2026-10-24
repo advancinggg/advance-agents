@@ -376,6 +376,8 @@ async fn module_001_ac31_claimed_port_and_mesh_dispatch_reach_the_registry() {
         vec![ChatMessage {
             role: ChatRole::User,
             content: "hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }],
         ChatParams {
             model: Some("llama".into()),
@@ -407,6 +409,8 @@ async fn module_001_ac31_claimed_port_and_mesh_dispatch_reach_the_registry() {
         vec![ChatMessage {
             role: ChatRole::User,
             content: "hi".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }],
         ChatParams {
             model: Some("llama".into()),

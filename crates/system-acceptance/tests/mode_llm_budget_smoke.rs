@@ -60,6 +60,8 @@ async fn budget_knob_denies_before_dialing_provider() {
             vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hi".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
             }],
             ChatParams::default(),
             run_id.to_string(),
