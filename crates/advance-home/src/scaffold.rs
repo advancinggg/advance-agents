@@ -239,6 +239,7 @@ pub const DEFAULT_DRIVER_LINEAGE: &[&str] = &[
     "7cc5eaf7467258f6ca4f832dd32018bc8edd83c6d179565cdd83862e6d9162be",
     "0b0a3cceedaa2e00926e910727f7373af9d2860ef8db5d759ebf2c8a0c9664de",
     "88a90243514df75ff2045d79b8f4a49e1f2c3d97e2294aa67b23a94b0a1809b4",
+    "81ea832ec7215dd47b68facdfc3a41651aa25aa6c87a739752d6853d9882c697",
 ];
 
 /// Outcome of [`maybe_upgrade_default_driver`].

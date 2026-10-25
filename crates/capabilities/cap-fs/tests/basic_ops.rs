@@ -7,9 +7,9 @@ use std::sync::Arc;
 use advance_runtime::host_registry::{HostCallContext, HostFunctionHandler};
 use advance_shared_types::traits::{AgentTreeSnapshot, EventBusEmit};
 use cap_fs::{
-    DefaultAtomicWriter, DefaultVirtualPathResolver, FsDeleteHandler, FsListHandler, FsReadHandler,
-    FsWriteHandler, MetaMaintainer, MetaSchemaLoader, DEFAULT_MAX_LIST_ENTRIES, MAX_PATH_BYTES,
-    MAX_READ_BYTES, MAX_WRITE_BYTES,
+    DefaultAtomicWriter, DefaultVirtualPathResolver, FsDeleteHandler, FsListHandler,
+    FsMkdirHandler, FsReadHandler, FsWriteHandler, MetaMaintainer, MetaSchemaLoader,
+    DEFAULT_MAX_LIST_ENTRIES, MAX_PATH_BYTES, MAX_READ_BYTES, MAX_WRITE_BYTES,
 };
 use wasmtime::component::Val;
 
@@ -105,6 +105,13 @@ fn delete_handler(f: &Fixture) -> FsDeleteHandler {
         workspace_root: None,
         agent_tree: None,
         git_sync: None,
+    }
+}
+fn mkdir_handler(f: &Fixture) -> FsMkdirHandler {
+    FsMkdirHandler {
+        resolver: f.resolver.clone(),
+        emitter: f.emitter.clone() as Arc<dyn EventBusEmit>,
+        concurrency: common::test_concurrency(),
     }
 }
 
@@ -436,6 +443,67 @@ async fn write_rejects_non_u8_in_data_list() {
         .unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("non-u8 element"));
+}
+
+// V15 — mkdir then write; symlink intermediate refused; event fs.mkdir.
+#[tokio::test]
+async fn v15_mkdir_then_write_and_symlink_refused() {
+    let f = fixture();
+    let mkdir = mkdir_handler(&f);
+    let out = mkdir
+        .call(ctx(), vec![Val::String("notes".into())], 1)
+        .await
+        .unwrap();
+    unwrap_ok_none(out);
+    assert!(f.agent_workspace.join("notes").is_dir());
+    let evs = f.emitter.snapshot();
+    assert_eq!(evs[0].event_type, "fs.mkdir");
+    assert_eq!(evs[0].payload["Mkdir"]["path"], "notes");
+
+    let write = write_handler(&f);
+    let data: Vec<Val> = b"hello".iter().copied().map(Val::U8).collect();
+    let out = write
+        .call(
+            ctx(),
+            vec![Val::String("notes/x.md".into()), Val::List(data)],
+            1,
+        )
+        .await
+        .unwrap();
+    unwrap_ok_none(out);
+    let body = std::fs::read_to_string(f.agent_workspace.join("notes/x.md")).unwrap();
+    assert_eq!(body, "hello");
+
+    let nested = mkdir
+        .call(ctx(), vec![Val::String("notes/a/b".into())], 1)
+        .await
+        .unwrap();
+    unwrap_ok_none(nested);
+    assert!(f.agent_workspace.join("notes/a/b").is_dir());
+
+    let again = mkdir
+        .call(ctx(), vec![Val::String("notes".into())], 1)
+        .await
+        .unwrap();
+    unwrap_ok_none(again);
+
+    let outside = f._workspace_root.join("outside-target");
+    std::fs::create_dir_all(&outside).unwrap();
+    let linked = f.agent_workspace.join("linked");
+    std::os::unix::fs::symlink(&outside, &linked).unwrap();
+    let out = mkdir
+        .call(ctx(), vec![Val::String("linked/child".into())], 1)
+        .await
+        .unwrap();
+    let (case, msg) = unwrap_err_variant(out);
+    assert!(
+        case == "not-found" || case == "permission-denied",
+        "symlink component is a typed refusal, got {case}: {msg}"
+    );
+    assert!(
+        !outside.join("child").exists(),
+        "mkdir must not follow a symlink out of the territory"
+    );
 }
 
 #[allow(dead_code)]

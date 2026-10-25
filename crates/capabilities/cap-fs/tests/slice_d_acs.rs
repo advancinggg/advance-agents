@@ -782,9 +782,9 @@ async fn sd_t47_real_write_then_delete_records_deletion_commit() {
 
 // SD-T48: full 11-arg register_agent_fs binding-layer integration. Verifies
 // that ONLY write + delete handlers wire git_sync (slice D scope), so
-// dispatching all 18 fns through the registry advances HEAD by EXACTLY 2.
+// dispatching all 19 fns through the registry advances HEAD by EXACTLY 2.
 #[tokio::test]
-async fn sd_t48_eighteen_fn_dispatch_advances_head_by_two_for_write_plus_delete() {
+async fn sd_t48_nineteen_fn_dispatch_advances_head_by_two_for_write_plus_delete() {
     let agent_id = "agent-1";
     let tempdir = tempfile::TempDir::new().unwrap();
     let workspace_root = tempdir.path().to_path_buf();
@@ -832,14 +832,14 @@ async fn sd_t48_eighteen_fn_dispatch_advances_head_by_two_for_write_plus_delete(
     );
 
     let specs = registry.lookup("fs");
-    assert_eq!(specs.len(), 18);
+    assert_eq!(specs.len(), 19);
     let mut by_name: std::collections::HashMap<String, _> = std::collections::HashMap::new();
     for s in specs {
         by_name.insert(s.name.clone(), s);
     }
     let ctx = ctx_for(agent_id);
 
-    // Dispatch all 18 fns. write + delete bracket the others to ensure the
+    // Dispatch all 19 fns. write + delete bracket the others to ensure the
     // file exists for read/list/scan/etc. in between.
     let dispatches: &[(&str, Vec<Val>)] = &[
         // 1. write — creates notes.md, advances HEAD (commit C0)
@@ -856,6 +856,8 @@ async fn sd_t48_eighteen_fn_dispatch_advances_head_by_two_for_write_plus_delete(
         ("list", vec![Val::String(".".into())]),
         // 4. scan — touches handler, no commit
         ("scan", vec![Val::String(".".into())]),
+        // mkdir — creates a dir, no git commit (mkdir does not wire git_sync)
+        ("mkdir", vec![Val::String("mkdir-t48".into())]),
         // slug (3) — likely error variant (no peer slug), but dispatch must work
         (
             "read-slug",
@@ -930,10 +932,10 @@ async fn sd_t48_eighteen_fn_dispatch_advances_head_by_two_for_write_plus_delete(
                 Val::List(vec![]),
             ],
         ),
-        // 18. delete — removes notes.md, advances HEAD (commit C1)
+        // 19. delete — removes notes.md, advances HEAD (commit C1)
         ("delete", vec![Val::String("notes.md".into())]),
     ];
-    assert_eq!(dispatches.len(), 18);
+    assert_eq!(dispatches.len(), 19);
 
     for (name, params) in dispatches {
         let spec = by_name.get(*name).expect("spec");

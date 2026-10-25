@@ -1,7 +1,7 @@
 //! Catalog projector: host-fn ∪ WASM methods ∪ MCP tools, L0 filter,
 //! collision host-fn > wasm-tool > mcp-tool (ADR 2026-10-24 D3 / D9).
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use advance_context_engine::inventory::{HostFnEntry, HostFnInventoryReader};
@@ -11,11 +11,13 @@ use advance_runtime::callable_registry::{
 use advance_shared_types::capability::{McpToolEntry, ToolEntry};
 
 /// Result of a catalog projection. `shadowed` names were dropped because a
-/// higher-precedence source already claimed them.
+/// higher-precedence source already claimed them. `shadow_logs` is the
+/// once-per-projection log line (no tracing crate — MODULE-019 AC-13).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProjectedCatalog {
     pub entries: Vec<CallableDefinition>,
     pub shadowed: Vec<String>,
+    pub shadow_logs: Vec<String>,
 }
 
 /// Merge three sources in view order. Host-fn wins, then WASM, then MCP.
@@ -26,17 +28,33 @@ pub fn project_catalog(
     wasm: Vec<CallableDefinition>,
     mcp: Vec<CallableDefinition>,
 ) -> ProjectedCatalog {
-    let mut seen = BTreeSet::new();
+    let mut seen: BTreeMap<String, CallableSource> = BTreeMap::new();
     let mut entries = Vec::new();
     let mut shadowed = Vec::new();
+    let mut shadow_logs = Vec::new();
     for entry in host.into_iter().chain(wasm).chain(mcp) {
-        if seen.insert(entry.name.clone()) {
-            entries.push(entry);
-        } else {
+        if let Some(winner) = seen.get(&entry.name).copied() {
+            shadow_logs.push(catalog_shadow_log(&entry.name, winner, entry.source));
             shadowed.push(entry.name);
+        } else {
+            seen.insert(entry.name.clone(), entry.source);
+            entries.push(entry);
         }
     }
-    ProjectedCatalog { entries, shadowed }
+    ProjectedCatalog {
+        entries,
+        shadowed,
+        shadow_logs,
+    }
+}
+
+/// One log line per shadowed catalog name (ADR 2026-10-24 D3).
+pub fn catalog_shadow_log(name: &str, winning: CallableSource, losing: CallableSource) -> String {
+    format!(
+        "callable catalog shadowed name={name} winning_source={} losing_source={}",
+        winning.as_wit_name(),
+        losing.as_wit_name()
+    )
 }
 
 /// Project the three inventories for one agent. Host specs are filtered by
@@ -294,5 +312,38 @@ mod tests {
         }
         assert!(!full.contains("generate"), "{full}");
         assert!(!compact.contains("generate"), "{compact}");
+    }
+
+    /// V19 — a shadowed catalog name is logged once with winning/losing sources.
+    #[test]
+    fn v19_shadow_log_line() {
+        let projected = project_catalog(
+            vec![CallableDefinition {
+                name: "write".into(),
+                description: "fs".into(),
+                parameters: serde_json::json!({}),
+                source: CallableSource::HostFn,
+                idempotent: Some(false),
+            }],
+            vec![CallableDefinition {
+                name: "write".into(),
+                description: "wasm".into(),
+                parameters: serde_json::json!({}),
+                source: CallableSource::WasmTool,
+                idempotent: None,
+            }],
+            vec![],
+        );
+        assert_eq!(projected.shadowed, vec!["write"]);
+        assert_eq!(projected.shadow_logs.len(), 1);
+        let logs = projected.shadow_logs.join(" | ");
+        assert!(
+            logs.contains("name=write") && logs.contains("host-fn") && logs.contains("wasm-tool"),
+            "shadow log line: {logs}"
+        );
+        assert_eq!(
+            projected.shadow_logs[0],
+            catalog_shadow_log("write", CallableSource::HostFn, CallableSource::WasmTool)
+        );
     }
 }

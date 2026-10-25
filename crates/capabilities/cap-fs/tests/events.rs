@@ -10,8 +10,9 @@ use std::sync::Arc;
 use advance_runtime::host_registry::{HostCallContext, HostFunctionHandler};
 use advance_shared_types::traits::{AgentTreeSnapshot, EventBusEmit};
 use cap_fs::{
-    DefaultAtomicWriter, DefaultVirtualPathResolver, FsDeleteHandler, FsListHandler, FsReadHandler,
-    FsWriteHandler, MetaMaintainer, MetaSchemaLoader, DEFAULT_MAX_LIST_ENTRIES,
+    DefaultAtomicWriter, DefaultVirtualPathResolver, FsDeleteHandler, FsListHandler,
+    FsMkdirHandler, FsReadHandler, FsWriteHandler, MetaMaintainer, MetaSchemaLoader,
+    DEFAULT_MAX_LIST_ENTRIES,
 };
 
 fn test_maintainer() -> Arc<MetaMaintainer> {
@@ -120,6 +121,25 @@ async fn read_event_payload_shape() {
     assert_eq!(p["Read"]["path"], "r.md");
     assert_eq!(p["Read"]["source"], "Private");
     assert_eq!(p["Read"]["size"], 3);
+}
+
+#[tokio::test]
+async fn mkdir_event_payload_shape() {
+    let s = setup();
+    let handler = FsMkdirHandler {
+        resolver: s.resolver.clone(),
+        emitter: s.emitter.clone() as Arc<dyn EventBusEmit>,
+        concurrency: common::test_concurrency(),
+    };
+    handler
+        .call(ctx(), vec![Val::String("notes".into())], 1)
+        .await
+        .unwrap();
+    let evs = s.emitter.snapshot();
+    assert_eq!(evs[0].event_type, "fs.mkdir");
+    assert_eq!(evs[0].payload["Mkdir"]["agent_id"], AGENT_ID);
+    assert_eq!(evs[0].payload["Mkdir"]["path"], "notes");
+    assert_eq!(evs[0].trace_id, TRACE_ID);
 }
 
 // SA-T29c: fs.delete and fs.list payload shapes.

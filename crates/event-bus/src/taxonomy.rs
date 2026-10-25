@@ -5,8 +5,9 @@
 //! "NOT in PRD §15.3" doc comments. Coverage tests T71/T72 lock the alignment.
 //!
 //! Canonical entries: 130 across 22 PRD-aligned sub-modules (31 distinct top-level
-//! prefixes). Enumerated extensions: 8 — 4 in `extensions::` plus the 3 MODULE-018
-//! `pack::` lifecycle events (Pack lane P1) plus `files::CHANGED` (ADR 2026-10-15).
+//! prefixes). Enumerated extensions: 11 — 5 in `extensions::` plus the 3 MODULE-018
+//! `pack::` lifecycle events (Pack lane P1) plus `files::CHANGED` (ADR 2026-10-15)
+//! plus the 2 `callable::*` Layer 3 events (ADR 2026-10-24 A7).
 //! `runtime.degraded.{reason}`
 //! is documented as a dynamic prefix via `extensions::RUNTIME_DEGRADED_PREFIX` but is
 //! NOT a fixed-string entry in `ALL_EVENT_TYPES` — concrete strings are runtime-formed.
@@ -422,6 +423,19 @@ pub mod extensions {
     /// this event is emitted ONCE per (agent, file mtime). Payload: `agent_id`,
     /// `reason` (the parser's message; never config content).
     pub const AGENT_LLM_POLICY_INVALID: &str = "agent.llm_policy_invalid";
+
+    /// `fs.mkdir` — ADR 2026-10-24 A3 host fn. NOT in PRD §15.3 (canonical
+    /// `fs.*` stays the 6 events in `taxonomy::fs`).
+    pub const FS_MKDIR: &str = "fs.mkdir";
+}
+
+/// Layer 3 callable dispatcher (ADR 2026-10-24). **NOT in PRD §15.3** —
+/// documented operational extensions, enumerated in `ALL_EVENT_TYPES`.
+pub mod callable {
+    /// One `invoke-callable` dispatch (success or typed refusal).
+    pub const INVOKED: &str = "callable.invoked";
+    /// A catalog name the model asked for that the projector dropped.
+    pub const UNKNOWN_DROPPED: &str = "callable.unknown-dropped";
 }
 
 /// MODULE-018 pack-system lifecycle events (Pack lane P1). **NOT in
@@ -664,6 +678,11 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     data::ENTITY_CHANGED,
     // Vault files family (ADR 2026-10-15). Documented EXTENSION; never a trigger.
     files::CHANGED,
+    // Layer 3 callables (ADR 2026-10-24 A7). Documented EXTENSION; never a trigger.
+    callable::INVOKED,
+    callable::UNKNOWN_DROPPED,
+    // `fs.mkdir` host fn (ADR 2026-10-24 A3). Documented EXTENSION; canonical fs.* stays 6.
+    extensions::FS_MKDIR,
     // NOTE: extensions::RUNTIME_DEGRADED_PREFIX is intentionally NOT enumerated —
     // concrete strings are dynamic (`runtime.degraded.{reason}`); T72 prefix-exempts.
 ];

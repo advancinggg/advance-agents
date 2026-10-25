@@ -10,6 +10,7 @@ interface agent-fs {
     %list: func(path: string) -> result<list<entry>, fs-error>;
     delete: func(path: string) -> result<_, fs-error>;
     scan: func(path: string) -> result<scan-result, fs-error>;
+    mkdir: func(path: string) -> result<_, fs-error>;
 
     read-slug: func(agent-id: string, slug: string, file: string) -> result<list<u8>, fs-error>;
     list-slug: func(agent-id: string, slug: string) -> result<list<entry>, fs-error>;

@@ -238,6 +238,11 @@ const KNOWN_EXTENSIONS: &[&str] = &[
     "data.entity_changed",
     // Vault files family (ADR 2026-10-15; `taxonomy::files::CHANGED`). Never a trigger.
     "files.changed",
+    // Layer 3 callables (ADR 2026-10-24 A7).
+    "callable.invoked",
+    "callable.unknown-dropped",
+    // `fs.mkdir` host fn (ADR 2026-10-24 A3). Canonical fs.* stays 6.
+    "fs.mkdir",
 ];
 
 /// Events whose concrete strings are formed at the call site (not enumerated in

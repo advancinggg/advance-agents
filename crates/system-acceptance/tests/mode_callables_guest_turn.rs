@@ -129,19 +129,24 @@ const REMEMBER_ARGS: &str = r##"{"content":"remember-this","tags":["insight"]}"#
 const WRITE_ARGS: &str = r##"{"path":"roadmap.md","content":"# Roadmap\n"}"##;
 const IDENTITY: &str = "IDENTITY-PREFIX-CALLABLES";
 
-#[tokio::test(flavor = "multi_thread")]
-async fn v11_callables_guest_remember_then_write_then_text() {
+struct CallablesGuestOutcome {
+    payload: Vec<u8>,
+    bodies: Vec<String>,
+    invoked: Vec<Event>,
+    roadmap: Option<String>,
+}
+
+async fn run_callables_guest(
+    scripts: Vec<ScriptedResponse>,
+    prompt: &str,
+) -> CallablesGuestOutcome {
     let tmp = tempfile::TempDir::new().unwrap();
     let workspace_root = tmp.path().to_path_buf();
     let agent_workspace = workspace_root.join("callables");
     std::fs::create_dir_all(&agent_workspace).unwrap();
 
     let loopback = LoopbackLlm::start(
-        vec![
-            ScriptedResponse::ok_tool_calls("call_1", "remember", REMEMBER_ARGS, 11, 6),
-            ScriptedResponse::ok_tool_calls("call_2", "write", WRITE_ARGS, 14, 6),
-            ScriptedResponse::ok_chat(FINAL_REPLY, 18, 4),
-        ],
+        scripts,
         None,
         None,
         Arc::new(CaptureBus {
@@ -262,7 +267,7 @@ async fn v11_callables_guest_remember_then_write_then_text() {
         .expect("init returns Ok");
 
     let msg = wit_types::Message {
-        payload: b"remember then write a roadmap".to_vec(),
+        payload: prompt.as_bytes().to_vec(),
     };
     let action_result = bindings
         .advance_runtime_message_driven()
@@ -270,27 +275,6 @@ async fn v11_callables_guest_remember_then_write_then_text() {
         .await
         .expect("call_handle_message does not trap")
         .expect("handle_message returns Ok");
-
-    assert_eq!(action_result.actions.len(), 1);
-    assert_eq!(
-        action_result.actions[0].payload,
-        FINAL_REPLY.as_bytes(),
-        "final generate text is the action payload"
-    );
-    assert_eq!(
-        loopback.chat_request_count(),
-        3,
-        "guest generate loop: remember, write, then text"
-    );
-    let bodies = loopback.all_chat_request_bodies();
-    assert_eq!(bodies.len(), 3);
-    for (i, body) in bodies.iter().enumerate() {
-        assert!(
-            body.contains(IDENTITY),
-            "generate {} must keep the identity seed (F3 peek): {body}",
-            i + 1
-        );
-    }
 
     let invoked: Vec<Event> = captured
         .events
@@ -300,22 +284,130 @@ async fn v11_callables_guest_remember_then_write_then_text() {
         .filter(|e| e.event_type == "callable.invoked")
         .cloned()
         .collect();
+    let roadmap = std::fs::read_to_string(agent_workspace.join("roadmap.md")).ok();
+    CallablesGuestOutcome {
+        payload: action_result
+            .actions
+            .first()
+            .map(|a| a.payload.clone())
+            .unwrap_or_default(),
+        bodies: loopback.all_chat_request_bodies(),
+        invoked,
+        roadmap,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v11_callables_guest_remember_then_write_then_text() {
+    let out = run_callables_guest(
+        vec![
+            ScriptedResponse::ok_tool_calls("call_1", "remember", REMEMBER_ARGS, 11, 6),
+            ScriptedResponse::ok_tool_calls("call_2", "write", WRITE_ARGS, 14, 6),
+            ScriptedResponse::ok_chat(FINAL_REPLY, 18, 4),
+        ],
+        "remember then write a roadmap",
+    )
+    .await;
+
     assert_eq!(
-        invoked.len(),
+        out.payload,
+        FINAL_REPLY.as_bytes(),
+        "final generate text is the action payload"
+    );
+    assert_eq!(
+        out.bodies.len(),
+        3,
+        "guest generate loop: remember, write, then text"
+    );
+    for (i, body) in out.bodies.iter().enumerate() {
+        assert!(
+            body.contains(IDENTITY),
+            "generate {} must keep the identity seed (F3 peek): {body}",
+            i + 1
+        );
+    }
+    assert_eq!(
+        out.invoked.len(),
         2,
         "callable.invoked ×2, got {:?}",
-        invoked.iter().map(|e| &e.payload).collect::<Vec<_>>()
+        out.invoked.iter().map(|e| &e.payload).collect::<Vec<_>>()
     );
-    assert_eq!(invoked[0].payload["name"], "remember");
-    assert_eq!(invoked[0].payload["source"], "host-fn");
-    assert_eq!(invoked[1].payload["name"], "write");
-    assert_eq!(invoked[1].payload["source"], "host-fn");
-
-    let wrote = agent_workspace.join("roadmap.md");
-    let body = std::fs::read_to_string(&wrote)
-        .unwrap_or_else(|_| panic!("guest callable loop must write {}", wrote.display()));
+    assert_eq!(out.invoked[0].payload["name"], "remember");
+    assert_eq!(out.invoked[0].payload["source"], "host-fn");
+    assert_eq!(out.invoked[1].payload["name"], "write");
+    assert_eq!(out.invoked[1].payload["source"], "host-fn");
+    let body = out
+        .roadmap
+        .expect("guest callable loop must write roadmap.md");
     assert!(
         body.contains("Roadmap"),
         "written file carries tool content: {body:?}"
+    );
+}
+
+/// V13 — a schema-invalid call is recorded as a tool-role message; the turn
+/// still closes with the scripted final text.
+#[tokio::test(flavor = "multi_thread")]
+async fn v13_invalid_arguments_recorded_then_text() {
+    let out = run_callables_guest(
+        vec![
+            ScriptedResponse::ok_tool_calls("bad_1", "remember", "{}", 11, 6),
+            ScriptedResponse::ok_chat(FINAL_REPLY, 18, 4),
+        ],
+        "please remember",
+    )
+    .await;
+
+    assert_eq!(out.payload, FINAL_REPLY.as_bytes());
+    assert_eq!(out.bodies.len(), 2, "invalid call then closing text");
+    let body: serde_json::Value = serde_json::from_str(&out.bodies[1]).expect("request 2 is JSON");
+    let msgs = body["messages"].as_array().expect("request 2 has messages");
+    assert!(
+        msgs.iter().any(|m| {
+            m["role"] == "tool"
+                && m["tool_call_id"] == "bad_1"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("invalid-arguments"))
+        }),
+        "request 2 carries the refusal as a tool-role message: {msgs:?}"
+    );
+    assert!(
+        out.invoked.iter().any(|e| {
+            e.payload["name"] == "remember"
+                && e.payload["is_error"] == true
+                && !e.trace_id.is_empty()
+        }),
+        "callable.invoked is_error with a trace_id: {:?}",
+        out.invoked
+    );
+}
+
+/// V14 — eight tool_calls rounds, then one closing generate without a tools
+/// array; that text is the action payload.
+#[tokio::test(flavor = "multi_thread")]
+async fn v14_round_cap_closing_generate_omits_tools() {
+    let mut scripts: Vec<ScriptedResponse> = (0..8)
+        .map(|i| {
+            ScriptedResponse::ok_tool_calls(&format!("call_{i}"), "remember", REMEMBER_ARGS, 11, 6)
+        })
+        .collect();
+    scripts.push(ScriptedResponse::ok_chat(FINAL_REPLY, 18, 4));
+    let out = run_callables_guest(scripts, "keep calling tools").await;
+
+    assert_eq!(out.payload, FINAL_REPLY.as_bytes());
+    assert_eq!(out.bodies.len(), 9, "8 tool rounds + 1 closing generate");
+    for (i, body) in out.bodies.iter().enumerate().take(8) {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(
+            v.get("tools").is_some(),
+            "round {i} still advertises tools: {body}"
+        );
+    }
+    let closing: serde_json::Value =
+        serde_json::from_str(&out.bodies[8]).expect("closing body is JSON");
+    assert!(
+        closing.get("tools").is_none(),
+        "closing generate has no tools array: {closing}"
     );
 }

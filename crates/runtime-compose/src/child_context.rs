@@ -194,6 +194,9 @@ pub fn attach_child_context(
             runtime_info: Some(runtime_info),
             report_sink: Some(deps.context_store.clone()),
             light_llm: Some(Arc::new(GatewayLightLlm::new(deps.gateway.clone()))),
+            native_tools: Some(Arc::new(crate::context_wiring::GatewayNativeTools::new(
+                deps.gateway.clone(),
+            ))),
         },
     );
 

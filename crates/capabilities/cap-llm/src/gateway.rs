@@ -2553,7 +2553,8 @@ impl LlmGateway {
         slot.messages.push(msg);
     }
 
-    /// Drop the transcript for `(agent_id, turn_id)` if it is the active slot.
+    /// Drop the transcript for `(agent_id, turn_id)` if it is the active slot,
+    /// and clear the assembled seed for that agent (adversarial-r9 W1).
     pub fn end_turn(&self, agent_id: &str, turn_id: &str) {
         let mut guard = self
             .transcripts
@@ -2565,6 +2566,34 @@ impl LlmGateway {
         {
             guard.remove(agent_id);
         }
+        self.assembled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(agent_id);
+    }
+
+    /// Whether this agent's resolved placement serializes a native `tools`
+    /// array (ADR 2026-10-24 D6). Same `descriptor_for(..).tool_calling ==
+    /// Native` predicate `generate` applies at dispatch, over the agent's
+    /// `llm:` provider pin or the head provider. No budget, no telemetry, no
+    /// per-request model override.
+    pub fn would_be_native_placement(&self, agent_id: &str) -> bool {
+        let cfg = self.config_provider.current();
+        if cfg.llm_providers.is_empty() {
+            return false;
+        }
+        let policy = self
+            .agent_policy
+            .as_ref()
+            .and_then(|source| source.policy_for(agent_id));
+        let candidate = match policy.as_ref().and_then(|p| p.provider.as_deref()) {
+            Some(pin) => cfg.llm_providers.iter().find(|p| p.id == pin),
+            None => cfg.llm_providers.first(),
+        };
+        candidate
+            .and_then(|p| crate::capability::descriptor_for(p, &self.catalog).ok())
+            .map(|d| d.tool_calling == crate::capability::ToolCallingLevel::Native)
+            .unwrap_or(false)
     }
 
     fn seed_messages(&self, agent_id: &str) -> Vec<ChatMessage> {

@@ -291,10 +291,51 @@ fn build_guest_messages_continue_fresh_empty_prompt_and_end_turn() {
     assert_eq!(fresh[1].content, "side");
 
     gw.end_turn(AGENT, TURN);
+    assert!(
+        gw.assembled_for(AGENT).is_none(),
+        "end_turn also clears the assembled seed"
+    );
     let after = gw.build_guest_messages(AGENT, Some(TURN), "next", TranscriptMode::Continue);
-    assert_eq!(after.len(), 2, "end_turn drops the transcript slot");
-    assert_eq!(after[0].content, IDENTITY);
-    assert_eq!(after[1].content, "next");
+    assert_eq!(
+        after.len(),
+        1,
+        "end_turn drops the transcript slot and the seed"
+    );
+    assert_eq!(after[0].content, "next");
+}
+
+#[test]
+fn v13_error_format_records_as_tool_role() {
+    let bus = Arc::new(MockEventBusEmit::default());
+    let chain = Arc::new(MockHttpSecurityChain::default());
+    let gw = test_gateway_with(bus, chain);
+    gw.record_generate(
+        AGENT,
+        TURN,
+        "please remember",
+        &ChatResponse {
+            text: String::new(),
+            model: "m".into(),
+            input_tokens: 1,
+            output_tokens: 1,
+            finish_reason: "tool_calls".into(),
+            parsed_output: None,
+            tool_calls: vec![ToolCall {
+                id: "bad_1".into(),
+                name: "remember".into(),
+                arguments: "{}".into(),
+            }],
+        },
+    );
+    let content = "[invoke-callable error: invalid-arguments] missing required property 'content'";
+    gw.record_tool_result(AGENT, TURN, "bad_1", "remember", content);
+    let msgs = gw.build_guest_messages(AGENT, Some(TURN), "", TranscriptMode::Continue);
+    assert!(
+        msgs.iter().any(|m| m.role == ChatRole::Tool
+            && m.tool_call_id.as_deref() == Some("bad_1")
+            && m.content.contains("invalid-arguments")),
+        "refusal is a tool-role message answering the pending call: {msgs:?}"
+    );
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! `FsEvent` — full 8-variant event enum + emit helper.
+//! `FsEvent` — full 9-variant event enum + emit helper.
 //!
 //! Slice A declared the original 7 FsEvent variants per MODULE-002 §2.3 to lock the
 //! contract surface that downstream M004 indexer + M011 post-processor subscribe to
@@ -55,7 +55,9 @@ pub struct RebuildReportSummary {
     pub errors_count: u64,
 }
 
-/// Full 8-variant FsEvent enum mirroring MODULE-002 §2.3. Slice A emits 4;
+/// Full 9-variant FsEvent enum mirroring MODULE-002 §2.3 plus `Mkdir`
+/// (ADR 2026-10-24 A3; event_type `fs.mkdir`, a documented taxonomy
+/// extension — not one of the canonical 6 `fs.*` PRD events). Slice A emits 4;
 /// slice B emits Scan/History/MetaUpdated; slice C emits ReconcileCompleted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FsEvent {
@@ -72,6 +74,12 @@ pub enum FsEvent {
         is_new_file: bool,
     },
     Delete {
+        agent_id: String,
+        path: String,
+    },
+    /// ADR 2026-10-24 A3: one successful `mkdir` (including the
+    /// already-exists-as-directory case). `event_type` string: `"fs.mkdir"`.
+    Mkdir {
         agent_id: String,
         path: String,
     },
@@ -132,6 +140,7 @@ pub fn event_type_for(ev: &FsEvent) -> &'static str {
         FsEvent::Read { .. } => "fs.read",
         FsEvent::Write { .. } => "fs.write",
         FsEvent::Delete { .. } => "fs.delete",
+        FsEvent::Mkdir { .. } => "fs.mkdir",
         FsEvent::List { .. } => "fs.list",
         FsEvent::Scan { .. } => "fs.scan",
         FsEvent::History { .. } => "fs.history",
@@ -316,7 +325,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exhaustive_event_type_mapping_all_eight_variants() {
+    fn exhaustive_event_type_mapping_all_nine_variants() {
         assert_eq!(
             event_type_for(&FsEvent::Read {
                 agent_id: "a".into(),
@@ -341,6 +350,13 @@ mod tests {
                 path: "p".into()
             }),
             "fs.delete"
+        );
+        assert_eq!(
+            event_type_for(&FsEvent::Mkdir {
+                agent_id: "a".into(),
+                path: "p".into()
+            }),
+            "fs.mkdir"
         );
         assert_eq!(
             event_type_for(&FsEvent::List {

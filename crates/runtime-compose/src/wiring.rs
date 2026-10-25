@@ -3609,7 +3609,7 @@ pub(crate) async fn wire_capabilities_inner(
                 event_bus_dyn.clone(),
                 guard.clone(),
                 web_grant,
-                dispatcher,
+                dispatcher.clone(),
             );
         } else {
             register_agent_tools_with_guard(
@@ -3626,6 +3626,9 @@ pub(crate) async fn wire_capabilities_inner(
             }
             if let Some(g) = repetition_guard_handle.as_ref() {
                 disp.bind_repetition(g.clone());
+            }
+            if let (Some(web_d), Some(web_g)) = (dispatcher.as_ref(), web_grant_handle.as_ref()) {
+                disp.bind_web(Arc::clone(web_d), Arc::clone(web_g));
             }
         }
     }

@@ -12,7 +12,10 @@ exports `message-driven` + `runnable`). On `handle-message` it:
    (no text parsing, no DSML).
 4. For each entry, calls `invoke-callable(id, name, arguments)`.
 5. Later rounds: `generate("", callables: all, transcript: continue)`.
-6. Stops when the envelope is empty, or after 8 rounds.
+6. Stops when the envelope is empty, or after 8 rounds. If the 8th round still
+   returned tool calls, those calls are invoked, then ONE closing
+   `generate("", callables: none, transcript: continue)` runs (no `tools`
+   array) and that text is the payload.
 
 Payload is the last assistant text, or the last invoke result when that text is
 empty. `run` is a trivial `Completed`.
@@ -50,17 +53,20 @@ copy `agent-fs`. `llm-response` is **not** extended; tool calls travel in `parse
    ```
    Validate: `wasm-tools component wit wit/advance.wit`.
 3. First-time bootstrap (no Cargo.lock): `cargo generate-lockfile`.
-4. Build (LINKEDIT workaround on this Darwin toolchain):
+4. Build (rustc 1.91.0; wasm32 debug-split flags are unstable on this rustc):
+   Toolchain: `rustc 1.91.0 (f8297e351 2025-10-28)` (see `rust-toolchain.toml`).
    ```
-   RUSTFLAGS="-C debuginfo=0 -C split-debuginfo=unpacked" CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true \
+   RUSTFLAGS="-C debuginfo=0" CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true \
      cargo build --target wasm32-unknown-unknown --release --locked
    ```
 5. Copy artifact:
    `cp target/wasm32-unknown-unknown/release/guest_rust_callables.wasm ../guest-rust-callables.core.wasm`
-   and `cp ../guest-rust-callables.core.wasm ../../../advance-home/src/fixtures/behavior.core.wasm`.
+   and `cp ../guest-rust-callables.core.wasm ../../../../advance-home/src/fixtures/behavior.core.wasm`.
 6. Verify size < 500 KiB: `wc -c ../guest-rust-callables.core.wasm`.
 7. Confirm imports: `wasm-tools print ../guest-rust-callables.core.wasm | grep import`
    — exactly `agent-llm.generate`, `agent-callables.list-callables`,
    `agent-callables.invoke-callable`.
 8. `cargo clean`. Do NOT commit `target/`.
 9. Commit atomically: the `.wasm` artifact, `Cargo.lock`, WIT, and the CREATE_DRIVER copy.
+
+Committed artifact sha256: 81ea832ec7215dd47b68facdfc3a41651aa25aa6c87a739752d6853d9882c697

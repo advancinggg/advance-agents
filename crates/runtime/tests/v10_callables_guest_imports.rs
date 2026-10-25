@@ -59,4 +59,39 @@ fn v10_callables_guest_imports_size_and_regen() {
         README.contains("wasm-tools print"),
         "fixture README shows the wasm-tools import check"
     );
+    assert!(
+        README.contains("RUSTFLAGS=\"-C debuginfo=0\""),
+        "fixture README regen command is the rustc 1.91-stable form"
+    );
+    assert!(
+        !README.contains("split-debuginfo=unpacked"),
+        "unpacked split-debuginfo is unstable for wasm32 on rustc 1.91"
+    );
+
+    let hash = README
+        .lines()
+        .find_map(|l| l.strip_prefix("Committed artifact sha256: "))
+        .unwrap_or_else(|| panic!("README records Committed artifact sha256"));
+    assert_eq!(hash.len(), 64, "README hash is 64 hex chars, got {hash:?}");
+    assert!(
+        hash.chars().all(|c| c.is_ascii_hexdigit()),
+        "README hash is hex: {hash}"
+    );
+    let actual = sha256_hex(CORE);
+    assert_eq!(
+        hash, actual,
+        "README-documented hash equals the committed CORE artifact"
+    );
+    assert_eq!(
+        sha256_hex(DRIVER),
+        actual,
+        "CREATE_DRIVER hash equals the committed CORE artifact"
+    );
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
 }

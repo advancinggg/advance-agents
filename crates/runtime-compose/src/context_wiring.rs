@@ -70,7 +70,7 @@ pub use advance_context_engine::ports::PortError as CePortError;
 use advance_context_engine::{
     build_agent_search_corpus, AgentSearchCorpus, ContextAssemblerImpl, CorpusDoc, CorpusDocKind,
     CosineTaskIndex, HostFnEntry, HostFnInventoryReader, IndexedTask, KnowledgeRecord,
-    ProjectingKnowledgeMap, RankingUnifiedSearch,
+    NativeToolsPort, ProjectingKnowledgeMap, RankingUnifiedSearch,
 };
 // Wave-20 Lane `search`: the MODULE-004 dense+sparse read path + its cross-crate
 // adapter. Only the non-hit types are imported (TaskHit/ContentHit/etc. collide
@@ -1886,6 +1886,7 @@ pub fn build_context_assembler_for_agent_with_pack_skills(
         runtime_info: None,
         report_sink: None,
         light_llm: None,
+        native_tools: None,
     })
 }
 
@@ -1925,6 +1926,9 @@ pub struct ProductionAssemblerParts<'a> {
     pub report_sink: Option<Arc<dyn AssemblyReportSink>>,
     /// Residual task-routing tie-break. `None` → first-candidate stub.
     pub light_llm: Option<Arc<dyn LightLlmFallbackPort>>,
+    /// Compact `# Available Tools` when the agent's placement is native
+    /// (ADR 2026-10-24 D6). `None` → full form (`NeverNativeTools`).
+    pub native_tools: Option<Arc<dyn NativeToolsPort>>,
 }
 
 /// The production agent-level builder the daemon calls (every frozen
@@ -1950,6 +1954,7 @@ pub fn build_context_assembler_for_agent_production(
         runtime_info,
         report_sink,
         light_llm,
+        native_tools,
     } = parts;
     // The skill-summary reader is INDEPENDENT of the memory capability. `Some` →
     // the real DiskSkillSummaryReader over the agent's on-disk activated skills;
@@ -2092,7 +2097,30 @@ pub fn build_context_assembler_for_agent_production(
         Some(port) => assembler.with_light_llm(port),
         None => assembler,
     };
+    let assembler = match native_tools {
+        Some(port) => assembler.with_native_tools_port(port),
+        None => assembler,
+    };
     Arc::new(assembler)
+}
+
+/// Production `NativeToolsPort`: the gateway's would-be native placement for
+/// the agent (ADR 2026-10-24 D6 / A5). A per-request model override does not
+/// re-render.
+pub struct GatewayNativeTools {
+    gateway: Arc<LlmGateway>,
+}
+
+impl GatewayNativeTools {
+    pub fn new(gateway: Arc<LlmGateway>) -> Self {
+        Self { gateway }
+    }
+}
+
+impl NativeToolsPort for GatewayNativeTools {
+    fn supports_native_tools(&self, agent_id: &str) -> bool {
+        self.gateway.would_be_native_placement(agent_id)
+    }
 }
 
 /// skills-J26 reader satellite (2026-06-20) — the agent-level entry whose 9-arg

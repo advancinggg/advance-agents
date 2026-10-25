@@ -4,7 +4,7 @@
 //! read-child-at, slug-file-history) call into a `FileHistoryProvider` trait
 //! that future MODULE-003 work will implement with real git2-backed history.
 //! Slice B ships `StubFileHistoryProvider` as a placeholder that returns:
-//!   - `Ok(empty list)` for `file_history` (so `AC-01: 18 fns implemented and
+//!   - `Ok(empty list)` for `file_history` (so `AC-01: 19 fns implemented and
 //!     callable` passes — the host fn is callable and returns a valid empty result)
 //!   - `Err(NotFound)` for `read_at` (no version exists yet — caller must handle).
 //!

@@ -1403,6 +1403,9 @@ async fn try_spawn_agent_loop(
                 light_llm: Some(Arc::new(crate::context_wiring::GatewayLightLlm::new(
                     gateway.clone(),
                 ))),
+                native_tools: Some(Arc::new(crate::context_wiring::GatewayNativeTools::new(
+                    gateway.clone(),
+                ))),
             },
         );
         // Wave-12 (SYS-AC-122): LATE-BIND THIS per-agent assembler into the

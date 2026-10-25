@@ -68,11 +68,11 @@ pub use history_provider::{FileHistoryProvider, StubFileHistoryProvider};
 pub use host_fn::{
     list_over_limit_msg, register_agent_fs, register_agent_fs_default,
     register_agent_fs_with_maintainer, FsChildFileHistoryHandler, FsDeleteHandler,
-    FsFileHistoryHandler, FsListChildHandler, FsListHandler, FsListSlugHandler, FsReadAtHandler,
-    FsReadChildAtHandler, FsReadChildHandler, FsReadHandler, FsReadSlugHandler, FsScanChildHandler,
-    FsScanHandler, FsScanSlugHandler, FsSlugFileHistoryHandler, FsUpdateEntryMetaHandler,
-    FsUpdateScopeHandler, FsWriteHandler, DEFAULT_FS_CONCURRENCY, DEFAULT_MAX_LIST_ENTRIES,
-    MAX_PATH_BYTES, MAX_READ_BYTES,
+    FsFileHistoryHandler, FsListChildHandler, FsListHandler, FsListSlugHandler, FsMkdirHandler,
+    FsReadAtHandler, FsReadChildAtHandler, FsReadChildHandler, FsReadHandler, FsReadSlugHandler,
+    FsScanChildHandler, FsScanHandler, FsScanSlugHandler, FsSlugFileHistoryHandler,
+    FsUpdateEntryMetaHandler, FsUpdateScopeHandler, FsWriteHandler, DEFAULT_FS_CONCURRENCY,
+    DEFAULT_MAX_LIST_ENTRIES, MAX_PATH_BYTES, MAX_READ_BYTES,
 };
 pub use meta_maintainer::{
     DirMetaWrite, EntryMetaValues, MetaFile, MetaMaintainer, RecordChange, RecordObserver,

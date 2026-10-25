@@ -15,10 +15,14 @@ use advance_shared_types::repetition::{RepetitionDecision, ToolCallSignature};
 use advance_shared_types::traits::{
     CallableInventoryReader, EventBusEmit, GrantCheck, RepetitionGuardCheck,
 };
+use advance_shared_types::web_search::is_web_tool_id;
 use cap_llm::ToolDefinition;
 use cap_mcp::McpGate;
+use cap_tools::web::{check_web_grant, WebFamilyDispatcher};
 use cap_tools::{normalize_callable_name, ToolRegistry};
+use chrono::Utc;
 use serde_json::Value;
+use uuid::Uuid;
 
 use super::catalog::{project_for_caps, ProjectedCatalog};
 
@@ -103,6 +107,7 @@ pub struct CallableDispatcher {
     wasm: RwLock<Option<Arc<dyn ToolRegistry>>>,
     mcp: RwLock<Option<McpDispatch>>,
     gateway: RwLock<Option<Arc<cap_llm::LlmGateway>>>,
+    web: RwLock<Option<(Arc<WebFamilyDispatcher>, Arc<dyn GrantCheck>)>>,
 }
 
 impl CallableDispatcher {
@@ -125,6 +130,7 @@ impl CallableDispatcher {
             wasm: RwLock::new(None),
             mcp: RwLock::new(None),
             gateway: RwLock::new(None),
+            web: RwLock::new(None),
         }
     }
 
@@ -146,6 +152,14 @@ impl CallableDispatcher {
 
     pub fn bind_gateway(&self, gateway: Arc<cap_llm::LlmGateway>) {
         *self.gateway.write().unwrap_or_else(|e| e.into_inner()) = Some(gateway);
+    }
+
+    pub fn bind_web(&self, dispatcher: Arc<WebFamilyDispatcher>, web_grant: Arc<dyn GrantCheck>) {
+        *self.web.write().unwrap_or_else(|e| e.into_inner()) = Some((dispatcher, web_grant));
+    }
+
+    fn web_bound(&self) -> bool {
+        self.web.read().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
     pub fn project(&self, agent_id: &str) -> ProjectedCatalog {
@@ -173,65 +187,95 @@ impl CallableDispatcher {
             .entries
             .iter()
             .find(|e| e.name == catalog_name || e.name == name)
-            .cloned()
-            .ok_or_else(|| CallableError::NotFound(name.clone()))?;
+            .cloned();
+        let event_name = entry
+            .as_ref()
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| catalog_name.clone());
+        let source = entry
+            .as_ref()
+            .map(|e| e.source.as_wit_name())
+            .unwrap_or("unknown");
 
-        let args = parse_arguments(&arguments)?;
-        validate_schema(&entry.parameters, &args)?;
-
-        let result = match entry.source {
-            CallableSource::HostFn => {
-                let spec = self
-                    .host
-                    .lookup(&entry.name)
-                    .ok_or_else(|| CallableError::NotFound(entry.name.clone()))?;
-                self.invoke_host_fn(&ctx, spec, call_id.clone(), args).await
-            }
-            CallableSource::WasmTool => {
-                self.invoke_wasm(&ctx, &entry.name, call_id.clone(), &arguments)
-                    .await
-            }
-            CallableSource::McpTool => {
-                self.invoke_mcp(&ctx, &entry.name, call_id.clone(), arguments.as_bytes())
-                    .await
-            }
-        };
+        let result = self
+            .invoke_body(&ctx, call_id.clone(), &name, &arguments, entry.as_ref())
+            .await;
 
         let duration_ms = started.elapsed().as_millis() as u64;
         let is_error = match &result {
             Ok(o) => o.is_error,
             Err(_) => true,
         };
-        self.events.emit(Event::observability(
-            "callable.invoked",
-            ctx.agent_id.clone(),
-            serde_json::json!({
+        self.events.emit(Event {
+            id: Uuid::new_v4().to_string(),
+            timestamp: Utc::now(),
+            agent_id: ctx.agent_id.clone(),
+            task_id: None,
+            run_id: ctx.run_id.clone(),
+            execution_id: None,
+            trace_id: ctx.trace_id.clone(),
+            span_id: Uuid::new_v4().to_string(),
+            parent_span_id: None,
+            event_type: "callable.invoked".into(),
+            payload: serde_json::json!({
                 "call_id": call_id,
-                "name": entry.name,
-                "source": entry.source.as_wit_name(),
+                "name": event_name,
+                "source": source,
                 "is_error": is_error,
             }),
-            Some(duration_ms),
-        ));
+            duration_ms: Some(duration_ms),
+        });
 
-        if let Ok(outcome) = &result {
-            if let (Some(gw), Some(turn_id)) = (
-                self.gateway
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-                ctx.turn_id.as_deref(),
-            ) {
-                gw.record_tool_result(
-                    &ctx.agent_id,
-                    turn_id,
-                    &outcome.call_id,
-                    &entry.name,
-                    &outcome.content,
-                );
-            }
+        let (record_id, content) = match &result {
+            Ok(outcome) => (outcome.call_id.as_str(), outcome.content.clone()),
+            Err(err) => (
+                call_id.as_str(),
+                format!(
+                    "[invoke-callable error: {}] {}",
+                    err.wit_case(),
+                    err.payload()
+                ),
+            ),
+        };
+        if let (Some(gw), Some(turn_id)) = (
+            self.gateway
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            ctx.turn_id.as_deref(),
+        ) {
+            gw.record_tool_result(&ctx.agent_id, turn_id, record_id, &event_name, &content);
         }
         result
+    }
+
+    async fn invoke_body(
+        &self,
+        ctx: &HostCallContext,
+        call_id: String,
+        name: &str,
+        arguments: &str,
+        entry: Option<&CallableDefinition>,
+    ) -> Result<CallableOutcome, CallableError> {
+        let entry = entry.ok_or_else(|| CallableError::NotFound(name.to_string()))?;
+        let args = parse_arguments(arguments)?;
+        validate_schema(&entry.parameters, &args)?;
+        match entry.source {
+            CallableSource::HostFn => {
+                let spec = self
+                    .host
+                    .lookup(&entry.name)
+                    .ok_or_else(|| CallableError::NotFound(entry.name.clone()))?;
+                self.invoke_host_fn(ctx, spec, call_id, args).await
+            }
+            CallableSource::WasmTool => {
+                self.invoke_wasm(ctx, &entry.name, call_id, arguments).await
+            }
+            CallableSource::McpTool => {
+                self.invoke_mcp(ctx, &entry.name, call_id, arguments.as_bytes())
+                    .await
+            }
+        }
     }
 
     fn inventories(&self, agent_id: &str, caps: &[String]) -> (Vec<ToolEntry>, Vec<McpToolEntry>) {
@@ -241,9 +285,21 @@ impl CallableDispatcher {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let wasm = if caps.iter().any(|c| c == "tools") {
-            inv.as_ref()
+            let listed = inv
+                .as_ref()
                 .map(|i| i.list_wasm_tools(agent_id))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            if self.web_bound() {
+                listed
+            } else {
+                listed
+                    .into_iter()
+                    .filter(|t| {
+                        let (tool_id, _) = split_method_name(&t.name);
+                        !is_web_tool_id(&tool_id) && !is_web_tool_id(&t.name)
+                    })
+                    .collect()
+            }
         } else {
             Vec::new()
         };
@@ -320,6 +376,35 @@ impl CallableDispatcher {
             GrantDecision::Deny(reason) => return Err(CallableError::PermissionDenied(reason)),
         }
         let (tool_id, method) = split_method_name(name);
+        if is_web_tool_id(&tool_id) {
+            let web = self.web.read().unwrap_or_else(|e| e.into_inner()).clone();
+            let Some((dispatcher, web_grant)) = web else {
+                return Err(CallableError::PermissionDenied(
+                    "web family withheld".into(),
+                ));
+            };
+            match check_web_grant(web_grant.as_ref(), &ctx.agent_id) {
+                GrantDecision::Allow => {}
+                GrantDecision::Deny(reason) => {
+                    return Err(CallableError::PermissionDenied(reason));
+                }
+            }
+            return match dispatcher
+                .invoke(&ctx.agent_id, &tool_id, &method, arguments.as_bytes())
+                .await
+            {
+                Ok(bytes) => Ok(CallableOutcome {
+                    call_id,
+                    content: cap_result(String::from_utf8_lossy(&bytes).into_owned()),
+                    is_error: false,
+                }),
+                Err(err) => Ok(CallableOutcome {
+                    call_id,
+                    content: cap_result(err.to_string()),
+                    is_error: true,
+                }),
+            };
+        }
         let wasm = self
             .wasm
             .read()
@@ -358,11 +443,22 @@ impl CallableDispatcher {
                 .ok_or_else(|| CallableError::NotFound(name.to_string()))?;
             (Arc::clone(&mcp.client), mcp.gate.clone())
         };
-        // Same GrantCheck as invoke-mcp-tool (V5 / D9-a).
+        // Same GrantCheck as invoke-mcp-tool (V5 / D9-a), plus the web-family
+        // half of authorize_tool_call (stdio refuse + web grant).
         if let Err(denied) =
             gate.check_tool(&ctx.agent_id, INVOKE_MCP_TOOL_FUNCTION, &server, &tool)
         {
             return Err(CallableError::PermissionDenied(denied.to_string()));
+        }
+        if is_web_tool_id(&tool) {
+            if client.refuses_web_tools(&server) {
+                return Err(CallableError::PermissionDenied(format!(
+                    "web family tools are refused from stdio server {server:?}"
+                )));
+            }
+            if let Err(denied) = gate.check_web(&ctx.agent_id, "invoke-callable") {
+                return Err(CallableError::PermissionDenied(denied.to_string()));
+            }
         }
         match client
             .invoke_tool(Some(&ctx.agent_id), &server, &tool, arguments)
@@ -578,20 +674,364 @@ mod tests {
         }
     }
 
-    /// V5 — GrantCheck parts for invoke-callable MCP names match invoke-mcp-tool.
-    #[test]
-    fn v5_mcp_grantcheck_parts_match_invoke_mcp_tool() {
+    struct CaptureBus(Mutex<Vec<Event>>);
+    impl EventBusEmit for CaptureBus {
+        fn emit(&self, event: Event) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    struct FakeInv {
+        wasm: Vec<ToolEntry>,
+        mcp: Vec<McpToolEntry>,
+    }
+    impl CallableInventoryReader for FakeInv {
+        fn list_wasm_tools(&self, _: &str) -> Vec<ToolEntry> {
+            self.wasm.clone()
+        }
+        fn list_mcp_tools(&self, _: &str) -> Vec<McpToolEntry> {
+            self.mcp.clone()
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnrestrictedMcp;
+    impl advance_shared_types::traits::McpGrantReader for UnrestrictedMcp {
+        fn mcp_grant_scopes(&self, _: &str) -> Vec<advance_shared_types::mcp::McpGrantScope> {
+            vec![advance_shared_types::mcp::McpGrantScope::unrestricted()]
+        }
+    }
+
+    #[derive(Debug)]
+    struct WebHeld(bool);
+    impl advance_shared_types::traits::WebGrantReader for WebHeld {
+        fn web_grant_held(&self, _: &str) -> bool {
+            self.0
+        }
+    }
+
+    struct NoOpLeak;
+    impl advance_shared_types::security_validator::LeakDetector for NoOpLeak {
+        fn scan(
+            &self,
+            _: &str,
+            _: advance_shared_types::security_validator::ScanContext,
+        ) -> advance_shared_types::security_validator::ScanResult {
+            advance_shared_types::security_validator::ScanResult::Clean
+        }
+        fn scan_headers(
+            &self,
+            _: &[(String, String)],
+        ) -> advance_shared_types::security_validator::ScanResult {
+            advance_shared_types::security_validator::ScanResult::Clean
+        }
+    }
+
+    fn stdio_entry(id: &str) -> cap_mcp::McpServerEntry {
+        cap_mcp::McpServerEntry {
+            server_id: id.into(),
+            description: "stdio".into(),
+            transport: cap_mcp::McpTransportSpec::Stdio {
+                command: "/usr/bin/true".into(),
+                args: vec![],
+                env: std::collections::BTreeMap::new(),
+                cwd: None,
+            },
+            tool_patterns: None,
+            tool_schemas: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn http_entry(id: &str) -> cap_mcp::McpServerEntry {
+        cap_mcp::McpServerEntry {
+            server_id: id.into(),
+            description: "http".into(),
+            transport: cap_mcp::McpTransportSpec::Http {
+                endpoint_url: "https://example.com".into(),
+                capability: advance_shared_types::security_validator::HttpCapability {
+                    allowlist: advance_shared_types::security_validator::Allowlist {
+                        patterns: vec!["*.example.com".into()],
+                    },
+                    credentials: vec![],
+                    component_id: id.into(),
+                },
+            },
+            tool_patterns: None,
+            tool_schemas: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn mcp_client(entry: cap_mcp::McpServerEntry) -> Arc<cap_mcp::McpClient> {
+        let cfg = cap_mcp::McpServersConfig::builder()
+            .add_server(entry)
+            .unwrap()
+            .build();
+        Arc::new(cap_mcp::McpClient::new(
+            Arc::new(cfg),
+            Arc::new(NoOpLeak),
+            None,
+        ))
+    }
+
+    fn web_dispatcher() -> Arc<WebFamilyDispatcher> {
+        Arc::new(WebFamilyDispatcher::from_parts(
+            cap_tools::web::WebFamilyParts {
+                chain: None,
+                helpers: None,
+                web: cap_tools::web::WebFamilyConfig::default(),
+                tools: advance_runtime::config::ToolsConfig::default(),
+                evidence_ids: Arc::new(cap_tools::web::EvidenceIdStore::new()),
+                provider: Arc::new(cap_tools::web::FixtureProvider::default()),
+            },
+        ))
+    }
+
+    /// V13 — dispatcher refusals still return Err, and callable.invoked is_error.
+    #[tokio::test]
+    async fn v13_invalid_arguments_returns_err_and_emits_error_event() {
+        let bus = Arc::new(CaptureBus(Mutex::new(Vec::new())));
+        let reg = Arc::new(InMemoryCallableRegistry::new());
+        reg.register(CallableSpec {
+            capability: "memory".into(),
+            name: "remember".into(),
+            description: "remember".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "content": { "type": "string" } },
+                "required": ["content"],
+                "additionalProperties": false
+            }),
+            idempotent: false,
+            original_function: "advance:runtime/agent-memory@0.1.0::remember".into(),
+            handler: Arc::new(EchoHandler),
+        });
+        let disp = CallableDispatcher::new(
+            reg,
+            Arc::new(StaticCaps(vec!["memory".into()])),
+            Arc::new(Allow),
+            Arc::new(DefaultCircuitBreakerBus::new()),
+            Arc::new(PassRep),
+            bus.clone(),
+        );
+        let err = disp
+            .invoke(ctx(), "bad_1".into(), "remember".into(), "{}".into())
+            .await
+            .expect_err("schema-invalid call is Err");
+        assert_eq!(err.wit_case(), "invalid-arguments");
+        let events = bus.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "callable.invoked");
+        assert_eq!(events[0].payload["is_error"], true);
+        assert_eq!(events[0].payload["name"], "remember");
+        assert_eq!(events[0].trace_id, "t");
+        assert_eq!(
+            format!(
+                "[invoke-callable error: {}] {}",
+                err.wit_case(),
+                err.payload()
+            )
+            .contains("invalid-arguments"),
+            true
+        );
+    }
+
+    /// V16 — spy GrantCheck sees MCP invoke-mcp-tool parts for `<server>__<tool>`.
+    #[tokio::test]
+    async fn v16_mcp_invoke_spy_sees_grant_parts() {
         let (cap, func, params) = mcp_invoke_grant_parts("github", "search");
         assert_eq!(cap, "mcp");
         assert_eq!(func, INVOKE_MCP_TOOL_FUNCTION);
         assert_eq!(params.as_value()["servers"], "github");
         assert_eq!(params.as_value()["tool-patterns"], "search");
-        let spy = SpyGrant::new();
-        let _ = spy.check("agent-a", cap, func, &params);
+
+        let spy = Arc::new(SpyGrant::new());
+        let client = mcp_client(http_entry("github"));
+        let gate = cap_mcp::McpGate::new(
+            spy.clone(),
+            Arc::new(UnrestrictedMcp),
+            Some(cap_mcp::McpWebGrant::new(
+                spy.clone(),
+                Arc::new(WebHeld(true)),
+            )),
+        );
+        let reg = Arc::new(InMemoryCallableRegistry::new());
+        let disp = CallableDispatcher::new(
+            reg,
+            Arc::new(StaticCaps(vec!["mcp".into()])),
+            spy.clone(),
+            Arc::new(DefaultCircuitBreakerBus::new()),
+            Arc::new(PassRep),
+            Arc::new(NoopBus),
+        );
+        disp.bind_mcp(client, gate);
+        disp.bind_inventory(Arc::new(FakeInv {
+            wasm: vec![],
+            mcp: vec![McpToolEntry {
+                name: "search".into(),
+                description: "search".into(),
+                params_schema: serde_json::json!({"type": "object"}),
+                server_id: "github".into(),
+            }],
+        }));
+        let _ = disp
+            .invoke(ctx(), "c1".into(), "github__search".into(), "{}".into())
+            .await;
         let calls = spy.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].1, "mcp");
-        assert_eq!(calls[0].2, INVOKE_MCP_TOOL_FUNCTION);
+        assert!(
+            calls.iter().any(|c| c.1 == "mcp"
+                && c.2 == INVOKE_MCP_TOOL_FUNCTION
+                && c.3["servers"] == "github"
+                && c.3["tool-patterns"] == "search"),
+            "spy mcp grant parts: {calls:?}"
+        );
+    }
+
+    /// V16 — stdio web-family MCP tool is refused.
+    #[tokio::test]
+    async fn v16_stdio_web_tool_refused() {
+        let spy = Arc::new(SpyGrant::new());
+        let client = mcp_client(stdio_entry("stdio-srv"));
+        let gate = cap_mcp::McpGate::new(
+            spy.clone(),
+            Arc::new(UnrestrictedMcp),
+            Some(cap_mcp::McpWebGrant::new(
+                spy.clone(),
+                Arc::new(WebHeld(true)),
+            )),
+        );
+        let reg = Arc::new(InMemoryCallableRegistry::new());
+        let disp = CallableDispatcher::new(
+            reg,
+            Arc::new(StaticCaps(vec!["mcp".into()])),
+            spy.clone(),
+            Arc::new(DefaultCircuitBreakerBus::new()),
+            Arc::new(PassRep),
+            Arc::new(NoopBus),
+        );
+        disp.bind_mcp(client, gate);
+        disp.bind_inventory(Arc::new(FakeInv {
+            wasm: vec![],
+            mcp: vec![McpToolEntry {
+                name: "web.search".into(),
+                description: "search".into(),
+                params_schema: serde_json::json!({"type": "object"}),
+                server_id: "stdio-srv".into(),
+            }],
+        }));
+        let err = disp
+            .invoke(
+                ctx(),
+                "c1".into(),
+                "stdio-srv__web.search".into(),
+                r#"{"query":"q"}"#.into(),
+            )
+            .await
+            .expect_err("stdio web is refused");
+        assert_eq!(err.wit_case(), "permission-denied");
+        assert!(
+            err.payload().contains("refused"),
+            "stdio refuse payload: {}",
+            err.payload()
+        );
+    }
+
+    /// V16 — web.search__search reaches WebFamilyDispatcher under the web grant.
+    #[tokio::test]
+    async fn v16_web_search_reaches_dispatcher_or_denied() {
+        let spy = Arc::new(SpyGrant::new());
+        let reg = Arc::new(InMemoryCallableRegistry::new());
+        let disp = CallableDispatcher::new(
+            reg,
+            Arc::new(StaticCaps(vec!["tools".into()])),
+            spy.clone(),
+            Arc::new(DefaultCircuitBreakerBus::new()),
+            Arc::new(PassRep),
+            Arc::new(NoopBus),
+        );
+        disp.bind_inventory(Arc::new(FakeInv {
+            wasm: vec![ToolEntry {
+                name: "web.search__search".into(),
+                description: "search".into(),
+                params_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "query": { "type": "string" } },
+                    "required": ["query"]
+                }),
+            }],
+            mcp: vec![],
+        }));
+        let listed = disp.list("root").unwrap();
+        assert!(
+            listed.iter().all(|e| e.name != "web.search__search"),
+            "unbound web is not listed: {listed:?}"
+        );
+
+        disp.bind_web(web_dispatcher(), spy.clone());
+        let listed = disp.list("root").unwrap();
+        assert!(
+            listed.iter().any(|e| e.name == "web.search__search"),
+            "bound web is listed: {listed:?}"
+        );
+        let out = disp
+            .invoke(
+                ctx(),
+                "c1".into(),
+                "web.search__search".into(),
+                r#"{"query":"hello"}"#.into(),
+            )
+            .await
+            .expect("granted web search dispatches");
+        assert!(!out.is_error, "fixture search content: {}", out.content);
+        let calls = spy.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.1 == "web"),
+            "web grant was checked: {calls:?}"
+        );
+    }
+
+    /// V16 — HTTP MCP web-family tool also checks the web grant.
+    #[tokio::test]
+    async fn v16_http_mcp_web_tool_checks_web_grant() {
+        let spy = Arc::new(SpyGrant::new());
+        let client = mcp_client(http_entry("http-srv"));
+        let gate = cap_mcp::McpGate::new(
+            spy.clone(),
+            Arc::new(UnrestrictedMcp),
+            Some(cap_mcp::McpWebGrant::new(
+                spy.clone(),
+                Arc::new(WebHeld(true)),
+            )),
+        );
+        let reg = Arc::new(InMemoryCallableRegistry::new());
+        let disp = CallableDispatcher::new(
+            reg,
+            Arc::new(StaticCaps(vec!["mcp".into()])),
+            spy.clone(),
+            Arc::new(DefaultCircuitBreakerBus::new()),
+            Arc::new(PassRep),
+            Arc::new(NoopBus),
+        );
+        disp.bind_mcp(client, gate);
+        disp.bind_inventory(Arc::new(FakeInv {
+            wasm: vec![],
+            mcp: vec![McpToolEntry {
+                name: "web.search".into(),
+                description: "search".into(),
+                params_schema: serde_json::json!({"type": "object"}),
+                server_id: "http-srv".into(),
+            }],
+        }));
+        let _ = disp
+            .invoke(
+                ctx(),
+                "c1".into(),
+                "http-srv__web.search".into(),
+                r#"{"query":"q"}"#.into(),
+            )
+            .await;
+        let calls = spy.calls.lock().unwrap();
+        assert!(calls.iter().any(|c| c.1 == "mcp"), "mcp grant: {calls:?}");
+        assert!(calls.iter().any(|c| c.1 == "web"), "web grant: {calls:?}");
     }
 
     /// V8 — dotted alias normalizes to `__` catalog name.

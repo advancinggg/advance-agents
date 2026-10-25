@@ -6,7 +6,10 @@
 //!   2. calls `generate` with `callables: all` and `transcript: continue`;
 //!   3. if `parsed-output` is the host envelope `{"tool_calls":[...]}`,
 //!      dispatches each call through `invoke-callable`;
-//!   4. repeats with an empty prompt until the envelope is empty, or 8 rounds.
+//!   4. repeats with an empty prompt until the envelope is empty, or 8 rounds;
+//!   5. if the 8th round still returned tool calls, invokes them, then performs
+//!      ONE closing `generate("", callables: none, transcript: continue)` so
+//!      the model must answer in text (ADR 2026-10-24 D7 / A2).
 //!
 //! No text parsing, no DSML. WIT `llm-response` stays 6 fields; tool calls
 //! travel in `parsed-output`. Host bindgen world ≠ guest world — only the
@@ -56,6 +59,7 @@ impl MessageDrivenGuest for CallablesGuest {
 
         let mut last_text = String::new();
         let mut last_result = String::new();
+        let mut last_had_calls = false;
 
         for round in 0..MAX_ROUNDS {
             let prompt = if round == 0 {
@@ -79,8 +83,10 @@ impl MessageDrivenGuest for CallablesGuest {
                 .map(parse_tool_calls)
                 .unwrap_or_default();
             if calls.is_empty() {
+                last_had_calls = false;
                 break;
             }
+            last_had_calls = true;
 
             for (i, call) in calls.iter().enumerate() {
                 let id = if call.id.is_empty() {
@@ -98,6 +104,26 @@ impl MessageDrivenGuest for CallablesGuest {
                     Err(e) => last_result = format!("invoke failed: {e:?}"),
                 }
             }
+        }
+
+        if last_had_calls {
+            let request = LlmRequest {
+                task_id: None,
+                prompt: String::new(),
+                params: Some(LlmParams {
+                    model: None,
+                    temperature: None,
+                    max_tokens: None,
+                    stop_sequences: None,
+                    tools: None,
+                    callables: None,
+                    transcript: Some(TranscriptMode::Continue),
+                }),
+                output_schema: None,
+            };
+            let response =
+                agent_llm::generate(&request).map_err(|e| format!("llm_generate_failed: {e:?}"))?;
+            last_text = response.text.clone();
         }
 
         let payload = if last_text.trim().is_empty() {

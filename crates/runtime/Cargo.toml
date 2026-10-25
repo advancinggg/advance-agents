@@ -61,6 +61,7 @@ wit-component = { workspace = true }
 # Slice X — wit-parser direct dep for `Resolve` + `ManglingAndAbi`
 # (only DecodedWasm + decode + decode_reader are re-exported by wit-component).
 wit-parser = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

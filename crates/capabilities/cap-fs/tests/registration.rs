@@ -1,5 +1,5 @@
-//! `register_agent_fs` registers exactly 18 specs under capability "fs"
-//! (slice A: 4 + slice B: 14).
+//! `register_agent_fs` registers exactly 19 specs under capability "fs"
+//! (slice A: 4 + slice B: 14 + mkdir).
 
 mod common;
 
@@ -12,9 +12,9 @@ use cap_fs::{register_agent_fs_default, DefaultVirtualPathResolver, MetaSchemaLo
 
 use common::{single_agent_tree, TestEmitter};
 
-// SB-T01 / SB-T02: register_agent_fs_default registers exactly 18 specs.
+// SB-T01 / SB-T02: register_agent_fs_default registers exactly 19 specs.
 #[test]
-fn registers_eighteen_specs_with_idempotent_flags() {
+fn registers_nineteen_specs_with_idempotent_flags() {
     let tempdir = tempfile::TempDir::new().unwrap();
     let workspace_root = tempdir.path().to_path_buf();
     let agent_workspace = workspace_root.join("a");
@@ -33,8 +33,8 @@ fn registers_eighteen_specs_with_idempotent_flags() {
     let specs = registry.lookup("fs");
     assert_eq!(
         specs.len(),
-        18,
-        "expected 18 specs (slice A: 4 + slice B: 14)"
+        19,
+        "expected 19 specs (slice A: 4 + slice B: 14 + mkdir)"
     );
 
     let mut by_name: std::collections::HashMap<
@@ -50,6 +50,7 @@ fn registers_eighteen_specs_with_idempotent_flags() {
         "write",
         "list",
         "delete",
+        "mkdir",
         "scan",
         "read-slug",
         "list-slug",
@@ -99,7 +100,13 @@ fn registers_eighteen_specs_with_idempotent_flags() {
             "{name} should be idempotent (read-only)"
         );
     }
-    let mutating_names = ["write", "delete", "update-scope", "update-entry-meta"];
+    let mutating_names = [
+        "write",
+        "delete",
+        "mkdir",
+        "update-scope",
+        "update-entry-meta",
+    ];
     for name in mutating_names {
         assert!(
             !by_name[name].idempotent,
@@ -108,15 +115,15 @@ fn registers_eighteen_specs_with_idempotent_flags() {
     }
 }
 
-// AC-01 (REQ-170): all 18 host fns are dispatch-ready through the registry —
-// for each of the 18 specs, look up the handler via `registry.lookup("fs")`,
+// AC-01 (REQ-170): all 19 host fns are dispatch-ready through the registry —
+// for each of the 19 specs, look up the handler via `registry.lookup("fs")`,
 // invoke it through the same WIT-shaped `HostFunctionHandler::call` interface
 // that wasmtime invokes when WASM imports `advance:runtime/agent-fs@0.1.0`, and
 // confirm the dispatch returns a structured result (Ok with a Result-typed
 // Val arm OR a HostCallError) rather than panicking. This proves each spec's
 // handler is bound and callable through the same code path WASM would hit.
 #[tokio::test]
-async fn all_eighteen_specs_callable_via_registry_dispatch() {
+async fn all_nineteen_specs_callable_via_registry_dispatch() {
     use advance_runtime::host_registry::HostCallContext;
     use wasmtime::component::Val;
 
@@ -136,7 +143,7 @@ async fn all_eighteen_specs_callable_via_registry_dispatch() {
     register_agent_fs_default(&*registry, resolver, emitter, schema, None);
 
     let specs = registry.lookup("fs");
-    assert_eq!(specs.len(), 18);
+    assert_eq!(specs.len(), 19);
     let mut by_name: std::collections::HashMap<
         String,
         advance_runtime::host_registry::HostFunctionSpec,
@@ -168,6 +175,7 @@ async fn all_eighteen_specs_callable_via_registry_dispatch() {
         ),
         ("list", vec![Val::String(".".into())]),
         ("delete", vec![Val::String("missing.md".into())]),
+        ("mkdir", vec![Val::String("mkdir-probe".into())]),
         ("scan", vec![Val::String(".".into())]),
         (
             "read-slug",
@@ -241,7 +249,7 @@ async fn all_eighteen_specs_callable_via_registry_dispatch() {
         ),
     ];
 
-    assert_eq!(dispatches.len(), 18);
+    assert_eq!(dispatches.len(), 19);
     for (name, params) in dispatches {
         let spec = by_name
             .get(*name)

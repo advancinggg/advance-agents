@@ -26,7 +26,7 @@
 //! actually mutate the filesystem.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -49,7 +49,7 @@ use crate::git_sync::{GitSync, GitSyncError, GitSyncOp, PendingFsCommit};
 use crate::history_provider::FileHistoryProvider;
 use crate::meta_maintainer::{MetaFile, MetaMaintainer};
 use crate::meta_schema::MetaSchemaLoader;
-use crate::resolver::{is_workspace_hidden_name, VirtualPathResolver};
+use crate::resolver::{is_workspace_hidden_name, VirtualPathResolver, MAX_PATH_DEPTH};
 use crate::sqlite_sync::{
     agent_id_for_m004, is_text_for_sql_index, normalize_ws_path, FsSyncError, SqliteSync,
     MAX_SQL_PREVIEW_CHARS,
@@ -3047,11 +3047,166 @@ impl HostFunctionHandler for FsUpdateEntryMetaHandler {
     }
 }
 
+// ---- FsMkdirHandler ------------------------------------------------------------
+
+/// Create a directory one virtual-path component at a time.
+///
+/// Never `create_dir_all`: each component is `resolve_write`d, then
+/// `symlink_metadata`'d, then `create_dir`'d if missing. A symlink
+/// component is `permission-denied` (TOCTOU: following it would let a
+/// guest escape the territory). Existing directories are left in place.
+pub struct FsMkdirHandler {
+    pub resolver: Arc<dyn VirtualPathResolver>,
+    pub emitter: Arc<dyn EventBusEmit>,
+    pub concurrency: Arc<Semaphore>,
+}
+
+fn mkdir_prefixes(vpath: &str) -> Result<Vec<String>, FsError> {
+    let mut names = Vec::new();
+    for c in Path::new(vpath).components() {
+        match c {
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                let s = name.to_string_lossy();
+                if s.is_empty() {
+                    continue;
+                }
+                names.push(s.into_owned());
+            }
+            _ => {
+                return Err(FsError::InvalidPath(format!(
+                    "mkdir path has non-normal component: {vpath}"
+                )));
+            }
+        }
+    }
+    if names.is_empty() {
+        return Err(FsError::InvalidPath(format!(
+            "mkdir path has no directory component: {vpath}"
+        )));
+    }
+    if names.len() > MAX_PATH_DEPTH {
+        return Err(FsError::InvalidPath(format!(
+            "path depth {} exceeds MAX_PATH_DEPTH ({MAX_PATH_DEPTH}): {vpath}",
+            names.len()
+        )));
+    }
+    let mut prefixes = Vec::with_capacity(names.len());
+    let mut acc = String::new();
+    for name in names {
+        if !acc.is_empty() {
+            acc.push('/');
+        }
+        acc.push_str(&name);
+        prefixes.push(acc.clone());
+    }
+    Ok(prefixes)
+}
+
+fn mkdir_classify_existing(meta: std::fs::Metadata) -> Result<(), FsError> {
+    if meta.file_type().is_symlink() {
+        Err(FsError::PermissionDenied(
+            "mkdir refuses symlink component".into(),
+        ))
+    } else if meta.is_dir() {
+        Ok(())
+    } else {
+        Err(FsError::InvalidPath(
+            "mkdir target exists and is not a directory".into(),
+        ))
+    }
+}
+
+async fn mkdir_ensure_dir(physical: &Path) -> Result<(), FsError> {
+    match tokio::fs::symlink_metadata(physical).await {
+        Ok(meta) => mkdir_classify_existing(meta),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match tokio::fs::create_dir(physical).await {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    match tokio::fs::symlink_metadata(physical).await {
+                        Ok(meta) => mkdir_classify_existing(meta),
+                        Err(e) => Err(map_io_error(&e)),
+                    }
+                }
+                Err(e) => Err(map_io_error(&e)),
+            }
+        }
+        Err(e) => Err(map_io_error(&e)),
+    }
+}
+
+impl HostFunctionHandler for FsMkdirHandler {
+    fn call(
+        &self,
+        ctx: HostCallContext,
+        params: Vec<Val>,
+        results_len: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>> {
+        let resolver = Arc::clone(&self.resolver);
+        let emitter = Arc::clone(&self.emitter);
+        let concurrency = Arc::clone(&self.concurrency);
+        Box::pin(async move {
+            if results_len != 1 {
+                return Err(HostCallError::HandlerError(format!(
+                    "expected results_len == 1 for fs.mkdir, got {results_len}"
+                )));
+            }
+            let path = match params.as_slice() {
+                [Val::String(s)] => s.clone(),
+                _ => {
+                    return Err(HostCallError::HandlerError(
+                        "expected single Val::String parameter".into(),
+                    ));
+                }
+            };
+            check_param!(validate_path_param(&path));
+            let prefixes = match mkdir_prefixes(&path) {
+                Ok(p) => p,
+                Err(e) => return Ok(ok_err_variant(&e)),
+            };
+
+            let _permit = concurrency.acquire().await.map_err(|_| {
+                HostCallError::HandlerError("fs.mkdir concurrency semaphore closed".into())
+            })?;
+
+            for prefix in &prefixes {
+                let physical = match resolve_via_blocking(
+                    Arc::clone(&resolver),
+                    ctx.agent_id.clone(),
+                    prefix.clone(),
+                    true,
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e) => return Ok(ok_err_variant(&e)),
+                };
+                if let Err(e) = mkdir_ensure_dir(&physical).await {
+                    return Ok(ok_err_variant(&e));
+                }
+            }
+
+            emit_fs_event(
+                &*emitter,
+                &ctx.agent_id,
+                &ctx.trace_id,
+                FsEvent::Mkdir {
+                    agent_id: ctx.agent_id.clone(),
+                    path: path.clone(),
+                },
+            );
+            Ok(vec![Val::Result(Ok(None))])
+        })
+    }
+}
+
 // ---- registration --------------------------------------------------------------
 
 /// Register the slice A subset of `agent-fs` (read/write/list/delete) into the
 /// supplied `HostRegistry` under capability `"fs"` and namespace
-/// `"advance:runtime/agent-fs@0.1.0"`. The full 18-fn surface ships across slices A→B+;
+/// `"advance:runtime/agent-fs@0.1.0"`. The full 19-fn surface ships across slices A→B+
+/// plus the ADR 2026-10-24 `mkdir` host fn;
 /// later slices add more `register_*` calls that target the same namespace.
 ///
 /// # Trust boundary — `HostCallContext.agent_id` (slice A waiver)
@@ -3078,7 +3233,7 @@ impl HostFunctionHandler for FsUpdateEntryMetaHandler {
 /// delete any agent's territory by spoofing the id. The id MUST flow from the
 /// runtime's per-instance binding to `HostCallContext`, never from the
 /// guest's own argument list.
-/// Register the 18 cap-fs `agent-fs` host functions.
+/// Register the 19 cap-fs `agent-fs` host functions.
 ///
 /// Slice C parameters (`db_sync`, `workspace_root`, `agent_tree`) wire CONTRACT-030
 /// triple-sync into FsWriteHandler / FsDeleteHandler. They MUST be all-Some
@@ -3218,6 +3373,17 @@ pub fn register_agent_fs_with_maintainer(
             workspace_root: workspace_root.clone(),
             agent_tree: agent_tree.clone(),
             git_sync: git_sync.clone(),
+        }),
+        idempotent: false,
+    });
+    registry.register(HostFunctionSpec {
+        capability: cap.clone(),
+        namespace: ns.clone(),
+        name: "mkdir".to_string(),
+        handler: Arc::new(FsMkdirHandler {
+            resolver: Arc::clone(&resolver),
+            emitter: Arc::clone(&emitter),
+            concurrency: Arc::clone(&concurrency),
         }),
         idempotent: false,
     });
@@ -3402,7 +3568,7 @@ pub fn register_agent_fs_with_maintainer(
     });
 }
 
-/// Convenience wrapper that registers all 18 handlers using `DefaultAtomicWriter`
+/// Convenience wrapper that registers all 19 handlers using `DefaultAtomicWriter`
 /// and `StubFileHistoryProvider` defaults. Production wiring slices may use this
 /// when they don't need to inject custom providers; tests use the full
 /// `register_agent_fs` to inject `FailingAtomicWriter` etc.

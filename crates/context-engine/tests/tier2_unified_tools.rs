@@ -12,7 +12,7 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use advance_context_engine::{SkillSummaryEntry, SkillSummaryReader};
+use advance_context_engine::{AlwaysNativeTools, SkillSummaryEntry, SkillSummaryReader};
 use advance_shared_types::capability::{McpToolEntry, McpToolsShown, ToolEntry};
 use advance_shared_types::context::ContextAssembler;
 use advance_shared_types::traits::CallableInventoryReader;
@@ -572,4 +572,66 @@ async fn content_over_budget_without_its_mcp_entries_still_drops_tier2() {
         .messages
         .iter()
         .any(|m| m.content.starts_with("# Available Tools")));
+}
+
+/// V17 — compact form under AlwaysNativeTools, full form under the default
+/// NeverNativeTools; names identical in both.
+#[tokio::test]
+async fn v17_compact_under_native_full_under_non_native() {
+    let host_fns = vec![
+        host(
+            "fs.read",
+            "Read a file",
+            json!({"properties": {"path": {"type": "string"}}}),
+        ),
+        host(
+            "fs.write",
+            "Write a file",
+            json!({"properties": {"path": {"type": "string"}, "data": {"type": "string"}}}),
+        ),
+    ];
+    let wasm_tools = vec![tool(
+        "editor.format",
+        "Format source code",
+        json!({"properties": {"lang": {"type": "string"}}}),
+    )];
+    let mcp_tools = vec![mcp(
+        "search",
+        "Search",
+        json!({"properties": {"query": {"type": "string"}}}),
+        "github",
+    )];
+    let names = ["fs.read", "fs.write", "editor.format", "github__search"];
+
+    let full_asm = build_assembler_with(host_fns.clone(), wasm_tools.clone(), mcp_tools.clone());
+    let compact_asm = build_assembler_with(host_fns, wasm_tools, mcp_tools)
+        .with_native_tools_port(Arc::new(AlwaysNativeTools));
+
+    let full = find_tier2_section(&full_asm.assemble(stub_ctx()).await.unwrap().messages);
+    let compact = find_tier2_section(&compact_asm.assemble(stub_ctx()).await.unwrap().messages);
+
+    let full_entries: Vec<&str> = full.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(full_entries.len(), 4, "full form: {full}");
+    assert!(
+        full_entries.iter().all(|e| e.contains(") — ")),
+        "full form is prose lines: {full}"
+    );
+
+    assert!(compact.starts_with("# Available Tools\n"));
+    assert!(
+        !compact.contains(") — "),
+        "compact form has no per-tool prose: {compact}"
+    );
+    let compact_names: Vec<&str> = compact
+        .lines()
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap_or("")
+        .split(", ")
+        .collect();
+    assert_eq!(compact_names, names, "compact names: {compact}");
+
+    for name in names {
+        assert!(full.contains(name), "full missing {name}: {full}");
+        assert!(compact.contains(name), "compact missing {name}: {compact}");
+    }
 }

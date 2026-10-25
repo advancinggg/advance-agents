@@ -86,10 +86,10 @@ fn assembler_has_no_session_id_shaped_fields() {
     // invariant.
     let asm = common::build_assembler_with_empty_inventories();
 
-    // 19 fat `Arc<dyn _>` trait-object pointers + 1 thin `Arc<WarningQueue>`
-    // + 1 `Vec<String>` agent-id alias config = 21 fields. All `Arc<dyn _>` are
+    // 21 fat `Arc<dyn _>` trait-object pointers + 1 thin `Arc<WarningQueue>`
+    // + 1 `Vec<String>` agent-id alias config. All `Arc<dyn _>` are
     // the same width regardless of the trait, so one representative `size_of`
-    // covers the 19 (Slice D added `event_bus`; Slice V1-c added `skill_summary:
+    // covers them (Slice D added `event_bus`; Slice V1-c added `skill_summary:
     // Arc<dyn SkillSummaryReader>`; Stage-C SAT-A added the 6 L1-L6 reader ports
     // `l1_vector`/`l2_digest`/`l3_epoch`/`l4_summary`/`l5_synthesis`/
     // `l6_consolidation`; Stage-C SAT-E added `prompt_injection: Arc<dyn
@@ -102,14 +102,16 @@ fn assembler_has_no_session_id_shaped_fields() {
     // per-call/session/provider state — the AC-01 stateless invariant (no
     // mutation across `assemble()` calls) is preserved).
     // Runtime-info slice: `runtime_info: Arc<dyn RuntimeInfoReader>` (the 20th
-    // read-only port), `report_sink: Option<Arc<dyn AssemblyReportSink>>` (an
-    // inverted-dependency SINK the composition root installs — it receives the
-    // per-turn report; the assembler never reads it back, so no state crosses
-    // `assemble()` calls through it) and `model_window_override: Option<usize>`
+    // read-only port). ADR 2026-10-24 D6: `native_tools: Arc<dyn NativeToolsPort>`
+    // (the 21st; compact vs full `# Available Tools`). `report_sink:
+    // Option<Arc<dyn AssemblyReportSink>>` (an inverted-dependency SINK the
+    // composition root installs — it receives the per-turn report; the
+    // assembler never reads it back, so no state crosses `assemble()` calls
+    // through it) and `model_window_override: Option<usize>`
     // (immutable construction config, like the alias set).
     let fat = size_of::<Arc<dyn CallableInventoryReader>>();
     let thin = size_of::<Arc<WarningQueue>>();
-    let expected_size = 20 * fat
+    let expected_size = 21 * fat
         + size_of::<Option<Arc<dyn CallableInventoryReader>>>()
         + size_of::<Option<usize>>()
         + thin
@@ -119,14 +121,15 @@ fn assembler_has_no_session_id_shaped_fields() {
         size_of_val(&asm),
         expected_size,
         "ContextAssemblerImpl field-set changed — possible provider-state \
-         addition. AC-01 requires the struct hold ONLY 20 Arc<dyn _> \
+         addition. AC-01 requires the struct hold ONLY 21 Arc<dyn _> \
          inverted-dependency ports (incl. the canonical EventBusEmit, the \
          Slice-V1-c SkillSummaryReader, the Stage-C SAT-A 6 L1-L6 reader \
          ports, the Stage-C SAT-E PromptInjectionHelpers, the Wave-12 \
-         Lane C DecompositionReader and the RuntimeInfoReader) + 1 optional \
-         AssemblyReportSink + 1 Option<usize> model-window override + 1 \
-         Arc<WarningQueue> + 1 Vec<String> agent-id alias config (immutable \
-         construction config — not session/provider state); no session map, \
+         Lane C DecompositionReader, the RuntimeInfoReader and NativeToolsPort) \
+         + 1 optional AssemblyReportSink + 1 Option<usize> model-window \
+         override + 1 Arc<WarningQueue> + 1 Vec<String> agent-id alias config \
+         (immutable construction config — not session/provider state); no \
+         session map, \
          connection pool, or provider handle."
     );
 }

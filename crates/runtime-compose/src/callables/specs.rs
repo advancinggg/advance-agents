@@ -19,7 +19,7 @@ const FS_NS: &str = "advance:runtime/agent-fs@0.1.0";
 const MEMORY_NS: &str = "advance:runtime/agent-memory@0.1.0";
 const GENUI_NS: &str = "advance:runtime/agent-genui@0.1.0";
 
-/// Register model-facing fs callables: write / read / list / delete / scan.
+/// Register model-facing fs callables: write / read / list / delete / scan / mkdir.
 pub fn register_fs_callables(callables: &dyn CallableRegistry, hosts: &dyn HostRegistry) {
     register_one(
         callables,
@@ -27,7 +27,7 @@ pub fn register_fs_callables(callables: &dyn CallableRegistry, hosts: &dyn HostR
         "fs",
         "write",
         FS_NS,
-        "Write a file at the given path with the given text content.",
+        "Write a file at the given path with the given text content. Parent directories must already exist (call mkdir first).",
         json!({
             "type": "object",
             "properties": {
@@ -53,6 +53,11 @@ pub fn register_fs_callables(callables: &dyn CallableRegistry, hosts: &dyn HostR
             false,
         ),
         ("scan", "Scan the directory tree at the given path.", true),
+        (
+            "mkdir",
+            "Create a directory at the given path, one component at a time. Existing directories are left in place. Parent components that are symlinks are refused.",
+            false,
+        ),
     ] {
         register_one(
             callables,

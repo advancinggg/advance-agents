@@ -86,6 +86,9 @@ mod policy_tests;
 mod test_support;
 
 #[cfg(test)]
+mod native_placement_tests;
+
+#[cfg(test)]
 mod transcript_tests;
 
 #[cfg(all(test, unix))]
