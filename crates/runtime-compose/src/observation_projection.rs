@@ -1,8 +1,7 @@
 //! CONTRACT-219 composition for EventBus observation output.
 
-use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use advance_event_bus::{Event, ObservationProjection, ObservationProjector};
 use advance_scheduler::sensitive_params::RegistrySensitiveParamProvider;
@@ -11,7 +10,7 @@ use advance_shared_types::contract218_previsible::{
 };
 use advance_shared_types::observation_identity::{
     AgentObservationIdentityRegistrar, HostEmitterId, HostObservationIdentityRegistrar,
-    IssuedObservationSourceHandle, ObservationIdentityAuthority,
+    IssuedObservationSourceHandle, ObservationIdentityAuthority, ObservationIdentityClass,
     ObservationIdentityPersistenceSealer, PersistedObservationBinding,
     PersistedObservationIdentity, SensitiveParamCatalog, SourceBindingDigest,
 };
@@ -57,11 +56,6 @@ const PENDING_SINGLE_PARAM_KEYS: &[&str] = &[
 
 const PENDING_FS_PARAM_KEYS: &[&str] = &["read-paths", "write-paths"];
 const UNKNOWN_C219_SOURCE: &str = "unknown C219 observation source";
-
-/// The root agents that compositions in this process registered, each with its home
-/// (see [`Contract219EventProjector::register_root_agent`]).
-static ROOT_AGENTS_REGISTERED_HERE: Mutex<BTreeSet<(PathBuf, String)>> =
-    Mutex::new(BTreeSet::new());
 
 /// Production C219 boundary. The non-clone issuer and sealed redactor stay in
 /// this object; callers can only refresh authenticated sources or request an
@@ -234,33 +228,25 @@ impl Contract219EventProjector {
         Ok(*digest.as_bytes())
     }
 
-    /// Register the root agent of a composition of `home` before its first event.
+    /// Register the root agent of a composition before its first event.
     ///
-    /// When a composition of the same home earlier in this process registered it, the
-    /// registration is durable and hydration in [`Self::build`] re-issued its source, so
-    /// the root agent is live already: that registration is reused, since a second
-    /// registration of a live identity conflicts with it. Every other case, a
-    /// registration another process left included, goes through
-    /// [`Self::register_agent`].
-    pub(crate) async fn register_root_agent(
-        &self,
-        home: &Path,
-        exact_agent_id: &str,
-    ) -> Result<(), String> {
-        let key = (home.to_path_buf(), exact_agent_id.to_owned());
-        let registered_here = ROOT_AGENTS_REGISTERED_HERE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&key);
-        if registered_here && self.require_live_source(exact_agent_id).is_ok() {
+    /// The registration is durable: once a composition of the home has registered and
+    /// published the root agent, hydration in [`Self::build`] re-issues its source for every
+    /// later composition of that home, whether another composition in this process or a
+    /// restart of `advance start` in a new process. The root agent is then a live agent
+    /// already and that registration is reused, since a second registration of a live identity
+    /// conflicts with it. Any other id goes through [`Self::register_agent`], so an id that a
+    /// live source of another class holds fails closed there.
+    pub(crate) async fn register_root_agent(&self, exact_agent_id: &str) -> Result<(), String> {
+        let live_agent = self
+            .mint_live_identity_for(exact_agent_id)
+            .is_ok_and(|identity| {
+                identity.claims_for_persistence().expected_class == ObservationIdentityClass::Agent
+            });
+        if live_agent {
             return Ok(());
         }
-        self.register_agent(exact_agent_id).await?;
-        ROOT_AGENTS_REGISTERED_HERE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(key);
-        Ok(())
+        self.register_agent(exact_agent_id).await
     }
 
     /// Register and publish a live agent identity before its first event. The
@@ -725,4 +711,83 @@ fn member_keys<const N: usize>(members: &[(String, ObservationNode)]) -> [&str; 
             .map(|entry| entry.0.as_str())
             .unwrap_or("")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use advance_scheduler::registry::ComponentRegistry;
+    use advance_scheduler::types::ComponentSubmitConfig;
+    use advance_scheduler::{ComponentSubmitApi, InMemoryComponentSubmitApi};
+    use advance_shared_types::component::ComponentType;
+
+    use crate::contract218_bootstrap::bootstrap_contract218;
+
+    /// The root agent's registration is reused only when its id is a live agent: an id that a
+    /// live component holds is not taken for the root agent, and registering it fails closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn root_agent_reuses_only_a_live_agent() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let registry = Arc::new(
+            ComponentRegistry::open_in(workspace.path(), "components.db")
+                .await
+                .expect("registry"),
+        );
+        let runtime = bootstrap_contract218(workspace.path(), registry)
+            .await
+            .expect("bootstrap");
+        let projector = Contract219EventProjector::build(
+            Arc::clone(&runtime.provider),
+            Arc::clone(&runtime.ready_issuer),
+            runtime.boot_id,
+            Arc::new(ObservationCarrierStore::open(workspace.path()).expect("carrier store")),
+        )
+        .await
+        .expect("projector");
+        InMemoryComponentSubmitApi::new()
+            .with_observation_provider(
+                Arc::clone(&runtime.provider),
+                Arc::clone(&runtime.ready_issuer),
+            )
+            .submit_component(
+                "root",
+                ComponentSubmitConfig {
+                    id: "held-by-a-component".to_owned(),
+                    component_type: ComponentType::Task,
+                    binary: Vec::new(),
+                    capabilities: Vec::new(),
+                    output_dir: None,
+                    trigger: None,
+                    restart_policy: None,
+                    delay: None,
+                    initial_grants: None,
+                    preset: None,
+                    retry: None,
+                    sensitive_params: Vec::new(),
+                },
+            )
+            .await
+            .expect("anchored component admission");
+        projector.refresh_sources().await.expect("source refresh");
+        projector
+            .require_live_source("held-by-a-component")
+            .expect("the component is a live source");
+
+        assert!(
+            projector
+                .register_root_agent("held-by-a-component")
+                .await
+                .is_err(),
+            "a live component's id is not taken for the root agent"
+        );
+        projector
+            .register_root_agent("root-agent")
+            .await
+            .expect("a new root agent registers");
+        projector
+            .register_root_agent("root-agent")
+            .await
+            .expect("the live root agent's registration is reused");
+    }
 }

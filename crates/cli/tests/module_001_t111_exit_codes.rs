@@ -151,49 +151,91 @@ impl Drop for Daemon {
     }
 }
 
-/// What a restart of `advance start` does on a home declaring `lifecycle` (here with `fs`
-/// and `llm`) is what it did before `compose`: the first run registers the root agent with
-/// the CONTRACT-219 projector and exits 0 after SIGTERM; the second run, a new process,
-/// registers the root agent again, which conflicts with the live registration the first run
-/// left, and exits 1 with that wiring failure. Reusing the registration is limited to a
-/// composition earlier in the same process
-/// (`crates/runtime-compose/tests/module_001_compose_lifecycle_again.rs`).
+/// A restart of `advance start` on a home declaring `lifecycle` (here with `fs` and `llm`)
+/// comes up again. The first run registers the root agent with the CONTRACT-219 projector;
+/// every later run, a new process, finds that durable registration live (hydration
+/// re-issued its source) and reuses it instead of registering the root agent a second time,
+/// which would conflict with it. Each run reaches readiness, exits 0 after SIGTERM, releases
+/// the runtime lock and records new root agent events, each with its CONTRACT-218 carrier (an
+/// event the projector blocks is never recorded); the home's registry keeps the one
+/// registration the first run made.
 #[test]
-fn module_001_ac30_lifecycle_home_restart_keeps_its_wiring_failure() {
+fn module_001_ac30_lifecycle_home_restart_reuses_its_registration() {
     let home = AllCapsHome::declaring(&["fs", "llm", "lifecycle"], true);
-    let mut first = Daemon::start(&home);
-    first.wait_ready();
-    let (status, _) = first.stop();
-    assert_eq!(
-        status.code(),
-        Some(0),
-        "the first run exits 0 after SIGTERM; stderr:\n{}",
-        first.stderr.finish()
-    );
+    let mut recorded = 0;
+    for run in ["first", "second", "third"] {
+        let mut daemon = Daemon::start(&home);
+        daemon.wait_ready();
+        let (status, _) = daemon.stop();
+        let stdout = daemon.stdout.finish();
+        let stderr = daemon.stderr.finish();
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the {run} run exits 0 after SIGTERM; stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.lines().last(),
+            Some("advance: shutting down"),
+            "the {run} run shuts down in order; stdout:\n{stdout}"
+        );
+        assert!(
+            !home.ws.join(".runtime/runtime.lock").exists(),
+            "the {run} run released the runtime lock"
+        );
+        let (events, carried) = root_agent_events(&home);
+        assert!(
+            events > recorded,
+            "the {run} run records root agent events ({events} after {recorded})"
+        );
+        assert_eq!(
+            carried, events,
+            "every root agent event through the {run} run has its CONTRACT-218 carrier"
+        );
+        recorded = events;
+    }
 
-    let mut second = Daemon::start(&home);
-    let status = second
-        .wait_exit(FAILURE_EXIT_BUDGET)
-        .expect("the second run exits on its own");
-    let stderr = second.stderr.finish();
-    let stdout = second.stdout.finish();
-    assert_eq!(status.code(), Some(1), "stderr:\n{stderr}");
+    let registry = rusqlite::Connection::open(home.ws.join(".triggers/components.db"))
+        .expect("the home's component registry");
+    let registrations: i64 = registry
+        .query_row(
+            "SELECT COUNT(*) FROM observation_identity_operations WHERE kind = 'register-agent'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count agent registrations");
     assert_eq!(
-        stderr.lines().last(),
-        Some(
-            "advance start: wiring failed: agent-tree config materialization failure: \
-             begin C219 agent registration: InvalidIdentity"
-        ),
-        "stderr:\n{stderr}"
+        registrations, 1,
+        "the restarts reuse the root agent registration the first run made"
     );
-    assert!(
-        !stdout.contains("advance: runtime ready"),
-        "the second run fails before readiness; stdout:\n{stdout}"
-    );
-    assert!(
-        !home.ws.join(".runtime/runtime.lock").exists(),
-        "the failed run released the runtime lock"
-    );
+}
+
+/// The root agent's events in the home's event store, and how many of them have a CONTRACT-218
+/// carrier in the home's carrier store.
+fn root_agent_events(home: &AllCapsHome) -> (i64, i64) {
+    let store = rusqlite::Connection::open(home.ws.join(".runtime/events.db"))
+        .expect("the home's event store");
+    for (name, path) in [
+        ("carriers", ".runtime/observation-carriers.db"),
+        ("registry", ".triggers/components.db"),
+    ] {
+        store
+            .execute(
+                &format!("ATTACH DATABASE ?1 AS {name}"),
+                [home.ws.join(path).to_string_lossy().into_owned()],
+            )
+            .expect("attach a home database");
+    }
+    store
+        .query_row(
+            "SELECT COUNT(*), COUNT(c.event_id) FROM events e \
+             LEFT JOIN carriers.observation_carriers c ON c.event_id = e.id \
+             WHERE e.agent_id IN \
+             (SELECT id FROM registry.observation_identities WHERE class = 'agent')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("count the root agent's events")
 }
 
 /// A second `advance start` on a home whose daemon is up exits 1 with the lock failure,

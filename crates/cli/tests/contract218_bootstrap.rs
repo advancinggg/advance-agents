@@ -314,3 +314,112 @@ async fn restarted_known_empty_agent_and_all_hosts_reach_every_eventbus_sink() {
 
     bus.shutdown().await;
 }
+
+/// An agent registered in one boot is live again after a restart: the restarted projector's
+/// hydration re-issues its source, so registering it a second time conflicts (why a restart
+/// of `advance start` reuses its root agent's registration) and its events still reach the
+/// sinks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_registered_before_a_restart_is_live_and_projects_after_it() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let trigger_root = workspace.path().join(".triggers");
+    std::fs::create_dir_all(&trigger_root).unwrap();
+
+    let first_registry = Arc::new(
+        ComponentRegistry::open_in(&trigger_root, "components.db")
+            .await
+            .expect("first registry"),
+    );
+    let first = bootstrap_contract218(workspace.path(), Arc::clone(&first_registry))
+        .await
+        .expect("first boot");
+    let first_boot = first.boot_id;
+    let first_carriers = Arc::new(
+        ObservationCarrierStore::open(workspace.path()).expect("first observation carrier store"),
+    );
+    let first_projector = Contract219EventProjector::build(
+        Arc::clone(&first.provider),
+        Arc::clone(&first.ready_issuer),
+        first.boot_id,
+        first_carriers,
+    )
+    .await
+    .expect("first projector");
+    first_projector
+        .register_agent("root-agent")
+        .await
+        .expect("the first boot registers the agent");
+    drop(first_projector);
+    drop(first);
+    drop(first_registry);
+
+    let restarted_registry = Arc::new(
+        ComponentRegistry::open_in(&trigger_root, "components.db")
+            .await
+            .expect("restarted registry"),
+    );
+    let restarted = bootstrap_contract218(workspace.path(), restarted_registry)
+        .await
+        .expect("restarted boot");
+    assert_ne!(restarted.boot_id, first_boot);
+    let carriers = Arc::new(
+        ObservationCarrierStore::open(workspace.path()).expect("observation carrier store"),
+    );
+    let projector = Contract219EventProjector::build(
+        Arc::clone(&restarted.provider),
+        Arc::clone(&restarted.ready_issuer),
+        restarted.boot_id,
+        Arc::clone(&carriers),
+    )
+    .await
+    .expect("restarted projector");
+    projector
+        .require_live_source("root-agent")
+        .expect("hydration re-issued the agent registered before the restart");
+    assert!(
+        projector.register_agent("root-agent").await.is_err(),
+        "a second registration of the live agent conflicts with it"
+    );
+
+    let database_path = workspace.path().join("events.db");
+    let mut config =
+        EventBusConfig::new(workspace.path().join("events-jsonl"), database_path.clone());
+    config.websocket_addr = "127.0.0.1:0".parse().unwrap();
+    config.observation_projector = Some(Arc::clone(&projector) as Arc<dyn ObservationProjector>);
+    let bus = EventBus::new(config).await.expect("EventBus");
+    let mut event = Event::observability(
+        "runtime.identity_probe",
+        "root-agent".to_owned(),
+        serde_json::json!({"source": "root-agent", "known_empty": true}),
+        None,
+    );
+    event.id = "registered-before-restart".to_owned();
+    bus.emit(event);
+
+    let mut persisted = false;
+    for _ in 0..100 {
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE id = 'registered-before-restart'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if count == 1 {
+            persisted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        persisted,
+        "the agent's event must reach SQLite after the restart"
+    );
+    assert!(
+        carriers.get("registered-before-restart").unwrap().is_some(),
+        "C218 carrier omitted the agent's event"
+    );
+
+    bus.shutdown().await;
+}
