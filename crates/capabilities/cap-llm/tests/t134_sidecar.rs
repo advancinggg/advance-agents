@@ -56,6 +56,7 @@ fn t134_spawn_handoff_chat_kill() {
         stop_sequences: None,
         tools: None,
         output_schema: None,
+        reasoning_effort: None,
         deadline: Instant::now() + Duration::from_secs(5),
         cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };

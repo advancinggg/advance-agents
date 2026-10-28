@@ -249,48 +249,85 @@ pub fn upsert_provider_entry(
     entry: serde_yml::Value,
     mode: UpsertMode,
 ) -> Result<(), ProviderWriteError> {
+    let (id, mapping) = entry_id_and_mapping(entry)?;
+    rewrite_llm_providers(home, move |seq| {
+        apply_upsert(seq, &id, mapping, mode).map(|_| ())
+    })
+}
+
+/// The entry [`upsert_provider_entry`] would leave in the document for `entry` under `mode`,
+/// computed the same way and without writing anything. Refused as the write would be when the
+/// id is taken (create) or absent (update), or the document cannot be read; the result is not
+/// validated.
+pub(crate) fn provider_entry_after_upsert(
+    home: &Path,
+    entry: serde_yml::Value,
+    mode: UpsertMode,
+) -> Result<serde_yml::Mapping, ProviderWriteError> {
+    let (id, mapping) = entry_id_and_mapping(entry)?;
+    let mut value = read_runtime_config_document(home)?;
+    let seq = llm_providers_mut(&mut value)?;
+    let idx = apply_upsert(seq, &id, mapping, mode)?;
+    seq[idx]
+        .as_mapping()
+        .cloned()
+        .ok_or_else(|| ProviderWriteError::Invalid("entry is not a mapping".into()))
+}
+
+/// The `id` an upsert's `entry` names, and the entry as a mapping.
+fn entry_id_and_mapping(
+    entry: serde_yml::Value,
+) -> Result<(String, serde_yml::Mapping), ProviderWriteError> {
     let id = entry
         .get("id")
         .and_then(|i| i.as_str())
         .ok_or_else(|| ProviderWriteError::Invalid("entry has no id".into()))?
         .to_string();
-    let mapping = match entry {
-        serde_yml::Value::Mapping(m) => m,
-        _ => return Err(ProviderWriteError::Invalid("entry is not a mapping".into())),
-    };
-    rewrite_llm_providers(home, move |seq| {
-        let existing = seq
-            .iter()
-            .position(|e| e.get("id").and_then(|i| i.as_str()) == Some(id.as_str()));
-        match (mode, existing) {
-            (UpsertMode::Create, Some(_)) => Err(ProviderWriteError::AlreadyExists),
-            (UpsertMode::Create, None) => {
-                let mapping: serde_yml::Mapping = mapping
-                    .into_iter()
-                    .filter(|(_, value)| !value.is_null())
-                    .collect();
-                seq.push(serde_yml::Value::Mapping(mapping));
-                Ok(())
-            }
-            (UpsertMode::Update, None) => Err(ProviderWriteError::NotFound),
-            (UpsertMode::Update, Some(idx)) => {
-                let target = seq[idx]
-                    .as_mapping_mut()
-                    .ok_or_else(|| ProviderWriteError::Invalid("entry is not a mapping".into()))?;
-                for (key, value) in mapping {
-                    if key.as_str() == Some("id") {
-                        continue;
-                    }
-                    if value.is_null() {
-                        target.remove(&key);
-                    } else {
-                        target.insert(key, value);
-                    }
-                }
-                Ok(())
-            }
+    match entry {
+        serde_yml::Value::Mapping(m) => Ok((id, m)),
+        _ => Err(ProviderWriteError::Invalid("entry is not a mapping".into())),
+    }
+}
+
+/// Apply one upsert of the entry `id` names to the `llm-providers` sequence; the index of the
+/// entry it leaves.
+fn apply_upsert(
+    seq: &mut Vec<serde_yml::Value>,
+    id: &str,
+    mapping: serde_yml::Mapping,
+    mode: UpsertMode,
+) -> Result<usize, ProviderWriteError> {
+    let existing = seq
+        .iter()
+        .position(|e| e.get("id").and_then(|i| i.as_str()) == Some(id));
+    match (mode, existing) {
+        (UpsertMode::Create, Some(_)) => Err(ProviderWriteError::AlreadyExists),
+        (UpsertMode::Create, None) => {
+            let mapping: serde_yml::Mapping = mapping
+                .into_iter()
+                .filter(|(_, value)| !value.is_null())
+                .collect();
+            seq.push(serde_yml::Value::Mapping(mapping));
+            Ok(seq.len() - 1)
         }
-    })
+        (UpsertMode::Update, None) => Err(ProviderWriteError::NotFound),
+        (UpsertMode::Update, Some(idx)) => {
+            let target = seq[idx]
+                .as_mapping_mut()
+                .ok_or_else(|| ProviderWriteError::Invalid("entry is not a mapping".into()))?;
+            for (key, value) in mapping {
+                if key.as_str() == Some("id") {
+                    continue;
+                }
+                if value.is_null() {
+                    target.remove(&key);
+                } else {
+                    target.insert(key, value);
+                }
+            }
+            Ok(idx)
+        }
+    }
 }
 
 /// Remove one entry by id (the stored key, if any, is left in the secret store).
@@ -328,22 +365,8 @@ where
     F: FnOnce(&mut Vec<serde_yml::Value>) -> Result<(), ProviderWriteError>,
 {
     let cfg_path = runtime_config_path(home);
-    let raw = crate::scaffold::read_small_regular(&cfg_path, MAX_RUNTIME_CONFIG_BYTES)
-        .ok_or_else(|| ProviderWriteError::Io("runtime-config.yaml unreadable".into()))?;
-    let mut value: serde_yml::Value =
-        serde_yml::from_str(&raw).map_err(|e| ProviderWriteError::Invalid(e.to_string()))?;
-    let doc = value
-        .as_mapping_mut()
-        .ok_or_else(|| ProviderWriteError::Invalid("document is not a mapping".into()))?;
-    let key = serde_yml::Value::String("llm-providers".into());
-    if !matches!(doc.get(&key), Some(serde_yml::Value::Sequence(_))) {
-        doc.insert(key.clone(), serde_yml::Value::Sequence(Vec::new()));
-    }
-    let seq = match doc.get_mut(&key) {
-        Some(serde_yml::Value::Sequence(seq)) => seq,
-        _ => unreachable!("llm-providers sequence was just ensured"),
-    };
-    f(seq)?;
+    let mut value = read_runtime_config_document(home)?;
+    f(llm_providers_mut(&mut value)?)?;
     let rendered =
         serde_yml::to_string(&value).map_err(|e| ProviderWriteError::Invalid(e.to_string()))?;
     let tmp = home.join(".advance").join("runtime-config.yaml.tmp");
@@ -355,6 +378,32 @@ where
     }
     std::fs::rename(&tmp, &cfg_path).map_err(|e| ProviderWriteError::Io(e.to_string()))?;
     Ok(())
+}
+
+/// The parsed `runtime-config.yaml` document, as the writer reads it.
+fn read_runtime_config_document(home: &Path) -> Result<serde_yml::Value, ProviderWriteError> {
+    let raw =
+        crate::scaffold::read_small_regular(&runtime_config_path(home), MAX_RUNTIME_CONFIG_BYTES)
+            .ok_or_else(|| ProviderWriteError::Io("runtime-config.yaml unreadable".into()))?;
+    serde_yml::from_str(&raw).map_err(|e| ProviderWriteError::Invalid(e.to_string()))
+}
+
+/// The document's `llm-providers` sequence, made an empty one when the key is missing (so a
+/// create on a hand-trimmed config works).
+fn llm_providers_mut(
+    value: &mut serde_yml::Value,
+) -> Result<&mut Vec<serde_yml::Value>, ProviderWriteError> {
+    let doc = value
+        .as_mapping_mut()
+        .ok_or_else(|| ProviderWriteError::Invalid("document is not a mapping".into()))?;
+    let key = serde_yml::Value::String("llm-providers".into());
+    if !matches!(doc.get(&key), Some(serde_yml::Value::Sequence(_))) {
+        doc.insert(key.clone(), serde_yml::Value::Sequence(Vec::new()));
+    }
+    match doc.get_mut(&key) {
+        Some(serde_yml::Value::Sequence(seq)) => Ok(seq),
+        _ => unreachable!("llm-providers sequence was just ensured"),
+    }
 }
 
 fn starter_provider_value(provider_id: &str) -> Option<serde_yml::Value> {

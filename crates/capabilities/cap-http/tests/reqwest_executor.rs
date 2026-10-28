@@ -1319,3 +1319,153 @@ async fn a_redirect_from_an_exempt_endpoint_to_another_loopback_port_is_refused(
     assert!(matches!(err, ExecutorError::Transport), "got {err:?}");
     assert!(other_rec.0.lock().unwrap().is_empty());
 }
+
+// ─── A caller's per-request total timeout (`with_request_timeout`) ──────────────────────────
+// A provider entry with a longer generate budget runs its requests inside this scope, so the
+// executor's configured 30 s is not a second, shorter clock on them.
+
+/// Serve ONE connection: drain the request head, wait `delay_ms`, answer `200 ok`.
+async fn spawn_delayed_server(delay_ms: u64) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let mut req = Vec::new();
+        loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            req.extend_from_slice(&buf[..n]);
+            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+            .await;
+        let _ = sock.flush().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+    addr
+}
+
+fn delayed_req(addr: SocketAddr) -> HttpRequest {
+    HttpRequest {
+        method: HttpMethod::Post,
+        url: format!("http://api.slow.test:{}/v1/chat/completions", addr.port()),
+        headers: vec![],
+        body: b"{}".to_vec(),
+    }
+}
+
+fn delayed_executor(addr: SocketAddr, timeout: Duration) -> ReqwestHttpExecutor {
+    ReqwestHttpExecutor::from_config(ReqwestExecutorConfig {
+        timeout,
+        dns_overrides: vec![("api.slow.test".to_string(), addr)],
+        max_redirects: 0,
+        max_response_bytes: 1024,
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn request_timeout_scope_lets_a_buffered_request_outlive_the_configured_timeout() {
+    // Outside a scope the configured timeout cuts the slow answer, as before.
+    let addr = spawn_delayed_server(700).await;
+    let err = delayed_executor(addr, Duration::from_millis(250))
+        .execute(&delayed_req(addr), Arc::new(AllowAllRedirect))
+        .await
+        .unwrap_err();
+    assert_eq!(err, ExecutorError::Timeout);
+
+    // Inside one, the caller's longer timeout replaces it (outer bound and reqwest's own).
+    let addr = spawn_delayed_server(700).await;
+    let exec = delayed_executor(addr, Duration::from_millis(250));
+    let resp = cap_http::with_request_timeout(
+        Duration::from_secs(5),
+        exec.execute(&delayed_req(addr), Arc::new(AllowAllRedirect)),
+    )
+    .await
+    .expect("the scoped timeout outlives the configured one");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"ok");
+}
+
+#[tokio::test]
+async fn request_timeout_scope_bounds_a_buffered_request_below_the_configured_timeout() {
+    let addr = spawn_delayed_server(2_000).await;
+    let exec = delayed_executor(addr, Duration::from_secs(10));
+    let started = std::time::Instant::now();
+    let err = cap_http::with_request_timeout(
+        Duration::from_millis(300),
+        exec.execute(&delayed_req(addr), Arc::new(AllowAllRedirect)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, ExecutorError::Timeout);
+    assert!(
+        started.elapsed() < Duration::from_millis(1_500),
+        "the scoped bound replaces the configured one: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn request_timeout_scope_is_the_head_and_idle_bound_of_a_streamed_request() {
+    // Outside a scope a 600 ms gap between chunks trips the 250 ms idle bound.
+    let addr = spawn_chunked_server(vec![(0, b"one".to_vec()), (600, b"two".to_vec())]).await;
+    let exec = stream_executor_for(addr, Duration::from_millis(250), 1024 * 1024);
+    let (_head, mut wire) = exec
+        .execute_stream(&stream_req(addr), Arc::new(AllowAllRedirect))
+        .await
+        .unwrap();
+    assert_eq!(wire.next().await.unwrap().unwrap(), b"one");
+    assert!(matches!(
+        wire.next().await,
+        Some(Err(ExecutorError::Timeout))
+    ));
+
+    // Inside a scope the caller's bound applies to every later read too (it is captured when
+    // the stream is opened, so the reads need not run inside the scope).
+    let addr = spawn_chunked_server(vec![(0, b"one".to_vec()), (600, b"two".to_vec())]).await;
+    let exec = stream_executor_for(addr, Duration::from_millis(250), 1024 * 1024);
+    let (_head, mut wire) = cap_http::with_request_timeout(
+        Duration::from_secs(5),
+        exec.execute_stream(&stream_req(addr), Arc::new(AllowAllRedirect)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(wire.next().await.unwrap().unwrap(), b"one");
+    assert_eq!(wire.next().await.unwrap().unwrap(), b"two");
+    assert!(wire.next().await.is_none());
+}
+
+#[tokio::test]
+async fn request_timeout_scope_is_clamped_scoped_and_not_inherited_by_spawned_tasks() {
+    assert_eq!(cap_http::current_request_timeout(), None);
+    assert_eq!(cap_http::MAX_REQUEST_TIMEOUT, Duration::from_secs(900));
+    cap_http::with_request_timeout(Duration::from_secs(120), async {
+        assert_eq!(
+            cap_http::current_request_timeout(),
+            Some(Duration::from_secs(120))
+        );
+        let spawned = tokio::spawn(async { cap_http::current_request_timeout() })
+            .await
+            .unwrap();
+        assert_eq!(spawned, None, "a spawned task does not inherit the scope");
+    })
+    .await;
+    cap_http::with_request_timeout(Duration::from_secs(3_600), async {
+        assert_eq!(
+            cap_http::current_request_timeout(),
+            Some(cap_http::MAX_REQUEST_TIMEOUT)
+        );
+    })
+    .await;
+    assert_eq!(cap_http::current_request_timeout(), None);
+}

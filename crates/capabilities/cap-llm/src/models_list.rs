@@ -400,6 +400,8 @@ mod tests {
             device_id: None,
             agent_cli: None,
             auth_source: ProviderAuthSource::ApiKey,
+            generate_timeout_secs: None,
+            reasoning_effort: None,
         }
     }
 

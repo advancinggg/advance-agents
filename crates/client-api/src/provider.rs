@@ -79,6 +79,35 @@ pub const AUTH_SOURCE_MISMATCH_DETAIL: &str = "auth_source_mismatch";
 /// same token; adapters construct [`ProviderError::InvalidState`] with it.
 pub const TOO_MANY_ENTRIES_DETAIL: &str = "too_many_entries";
 
+/// The `ClientError.details` token of an `invalid_request` whose cause is a provider entry's
+/// `generate_timeout_secs` outside its range: 5–900 seconds, at most 300 on a `chatgpt-oauth`
+/// entry.
+pub const INVALID_GENERATE_TIMEOUT_DETAIL: &str = "invalid_generate_timeout";
+
+/// The `ClientError.details` token of an `invalid_request` whose cause is a
+/// `generate_timeout_secs` on an entry that cannot apply it (only `cloud-http` and `local`
+/// entries can).
+pub const GENERATE_TIMEOUT_UNSUPPORTED_DETAIL: &str = "generate_timeout_unsupported";
+
+/// The `ClientError.details` token of an `invalid_request` whose cause is a `reasoning_effort`
+/// that is not one of `none | minimal | low | medium | high | xhigh`.
+pub const INVALID_REASONING_EFFORT_DETAIL: &str = "invalid_reasoning_effort";
+
+/// The `ClientError.details` token of an `invalid_request` whose cause is a `reasoning_effort`
+/// on an entry that cannot send it (another backend class, the `anthropic-messages` dialect, or
+/// a `chatgpt-oauth` entry).
+pub const REASONING_EFFORT_UNSUPPORTED_DETAIL: &str = "reasoning_effort_unsupported";
+
+/// The provider-entry setting tokens an adapter may carry as the inner string of
+/// [`ProviderError::InvalidRequest`]: each is projected as an `invalid_request` with that token
+/// as its only detail.
+pub const PROVIDER_SETTING_DETAILS: &[&str] = &[
+    INVALID_GENERATE_TIMEOUT_DETAIL,
+    GENERATE_TIMEOUT_UNSUPPORTED_DETAIL,
+    INVALID_REASONING_EFFORT_DETAIL,
+    REASONING_EFFORT_UNSUPPORTED_DETAIL,
+];
+
 /// The `ClientError.details` token of a `module_unavailable` whose cause is a child process the
 /// host's `ProcessPolicy::Forbid` refused (ADR 2026-10-03 D3).
 pub const PROCESS_FORBIDDEN_DETAIL: &str = advance_shared_types::process_policy::PROCESS_FORBIDDEN;
@@ -106,7 +135,8 @@ pub enum ProviderError {
     AlreadyExists(String),
     /// The request is well-formed at the envelope level but semantically invalid for the
     /// provider (unknown template, unparseable config document, a root agent named by a delete,
-    /// a Sub named as a parent, …). → `invalid_request`
+    /// a Sub named as a parent, …). → `invalid_request`. An inner string that is one of
+    /// [`PROVIDER_SETTING_DETAILS`] is that response's only detail; any other stays log-only.
     InvalidRequest(String),
     /// Lane agent-llm-policy: an agent's `llm.provider` names an `llm-providers[].id` that is
     /// not in the live runtime config. → `invalid_request` with details `["unknown_provider"]`
@@ -167,6 +197,12 @@ impl ProviderError {
             }
             ProviderError::AlreadyExists(_) => {
                 (ClientErrorCode::AlreadyExists, "resource already exists")
+            }
+            ProviderError::InvalidRequest(detail)
+                if PROVIDER_SETTING_DETAILS.contains(&detail.as_str()) =>
+            {
+                return ClientError::new(ClientErrorCode::InvalidRequest, "invalid request")
+                    .with_details(vec![detail]);
             }
             ProviderError::InvalidRequest(_) | ProviderError::PlatformUnsupported(_) => {
                 (ClientErrorCode::InvalidRequest, "invalid request")
@@ -655,6 +691,32 @@ mod module_001_ac32_tests {
         assert_eq!(err.message, "provider unavailable");
         assert_eq!(err.details, [PROCESS_FORBIDDEN_DETAIL]);
         assert!(!err.message.contains(inner));
+    }
+
+    #[test]
+    fn provider_setting_refusals_are_invalid_request_with_their_detail() {
+        for detail in PROVIDER_SETTING_DETAILS {
+            let err = ProviderError::InvalidRequest((*detail).into()).into_client_error();
+            assert_eq!(err.code, ClientErrorCode::InvalidRequest);
+            assert_eq!(err.message, "invalid request");
+            assert_eq!(err.details, [*detail]);
+        }
+        // Any other inner string stays undisclosed.
+        let err = ProviderError::InvalidRequest(
+            "generate-timeout-secs must be from 5 to 900 seconds (got 4)".into(),
+        )
+        .into_client_error();
+        assert_eq!(err.code, ClientErrorCode::InvalidRequest);
+        assert!(err.details.is_empty());
+        assert_eq!(
+            PROVIDER_SETTING_DETAILS,
+            [
+                "invalid_generate_timeout",
+                "generate_timeout_unsupported",
+                "invalid_reasoning_effort",
+                "reasoning_effort_unsupported"
+            ]
+        );
     }
 
     #[test]

@@ -135,7 +135,9 @@ pub use provider::{
     provider_or_unavailable, AgentAdminProvider, CostProvider, EntityProvider, FilesProvider,
     GitHistoryProvider, MessagingProvider, PackAdminProvider, ProviderAdminProvider, ProviderError,
     RunControlProvider, SecretsAdminProvider, ToolsProvider, AUTH_SOURCE_MISMATCH_DETAIL,
-    PROCESS_FORBIDDEN_DETAIL, TOO_MANY_ENTRIES_DETAIL, UNKNOWN_PROVIDER_DETAIL,
+    GENERATE_TIMEOUT_UNSUPPORTED_DETAIL, INVALID_GENERATE_TIMEOUT_DETAIL,
+    INVALID_REASONING_EFFORT_DETAIL, PROCESS_FORBIDDEN_DETAIL, PROVIDER_SETTING_DETAILS,
+    REASONING_EFFORT_UNSUPPORTED_DETAIL, TOO_MANY_ENTRIES_DETAIL, UNKNOWN_PROVIDER_DETAIL,
 };
 pub use provider_admin::{
     ClientCreateProviderRequest, ClientProviderCost, ClientProviderDeleteResult, ClientProviderKey,

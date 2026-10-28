@@ -34,6 +34,13 @@ pub(crate) struct MockHttpSecurityChain {
     /// 1-based call index at which `execute_delay` starts applying. `None`
     /// means every call (existing behavior).
     pub execute_delay_from_call: Mutex<Option<usize>>,
+    /// Per-URL delays of `execute`: a call whose URL contains the key awaits that duration
+    /// after logging the call, in place of `execute_delay`, so two entries of one test can
+    /// answer at different speeds.
+    pub url_delays: Mutex<Vec<(String, Duration)>>,
+    /// When set, `execute_streaming` awaits this duration after logging the call, before it
+    /// answers with the head (a streamed upstream that is slow to answer).
+    pub stream_delay: Mutex<Option<Duration>>,
     /// Scripted answers of `execute_streaming` with an explicit head status, keyed by
     /// path suffix and consumed in push order. They take precedence over `stream_results`
     /// and over the buffered-response-derived synthesis, so a test can script a refused
@@ -43,6 +50,11 @@ pub(crate) struct MockHttpSecurityChain {
     /// The URL of every `execute_streaming` call, in order. `call_log` records the requests
     /// of both entry points; this tells which of them were streamed.
     pub streamed_urls: Mutex<Vec<String>>,
+    /// The HTTP layer's request timeout in scope for every call of either entry point, in
+    /// call order (`cap_http::current_request_timeout`): `Some` when the caller ran the
+    /// exchange under an entry's own generate budget, `None` when the executor's configured
+    /// timeout applies.
+    pub request_timeouts: Mutex<Vec<Option<Duration>>>,
 }
 
 /// One scripted answer of `execute_streaming` (see `MockHttpSecurityChain::stream_scripts`).
@@ -212,10 +224,23 @@ impl HttpSecurityChain for MockHttpSecurityChain {
             t("return");
         }
         self.call_log.lock().unwrap().push(req.clone());
+        self.request_timeouts
+            .lock()
+            .unwrap()
+            .push(cap_http::current_request_timeout());
         let n = self.call_log.lock().unwrap().len();
+        let url_delay = self
+            .url_delays
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| req.url.contains(key.as_str()))
+            .map(|(_, delay)| *delay);
         let delay = *self.execute_delay.lock().unwrap();
         let from = *self.execute_delay_from_call.lock().unwrap();
-        if let Some(d) = delay {
+        if let Some(d) = url_delay {
+            tokio::time::sleep(d).await;
+        } else if let Some(d) = delay {
             if from.map(|f| n >= f).unwrap_or(true) {
                 tokio::time::sleep(d).await;
             }
@@ -516,6 +541,14 @@ impl HttpStreamingChain for MockHttpSecurityChain {
     ) -> Result<(HttpResponseHead, Box<dyn HttpBodyStream>), HttpError> {
         self.call_log.lock().unwrap().push(req.clone());
         self.streamed_urls.lock().unwrap().push(req.url.clone());
+        self.request_timeouts
+            .lock()
+            .unwrap()
+            .push(cap_http::current_request_timeout());
+        let delay = *self.stream_delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         // A status-carrying script answers first: it is the only way to script a
         // refused head with the body that follows it.
         if let Some(script) = self.take_stream_script_for(&req.url) {

@@ -83,6 +83,9 @@ mod plan_usage_tests;
 mod policy_tests;
 
 #[cfg(test)]
+mod provider_knob_tests;
+
+#[cfg(test)]
 mod test_support;
 
 #[cfg(test)]

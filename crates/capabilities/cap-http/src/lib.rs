@@ -39,8 +39,9 @@ pub use prompt_injection::DefaultPromptInjectionHelpers;
 // Slice C public surface
 pub use credential_injection::{inject_credentials, substitute_placeholders};
 pub use executor::{
-    DefaultRedirectCheck, ExecutorError, HttpExecutor, MockHttpExecutor, ReqwestExecutorConfig,
-    ReqwestHttpExecutor, DEFAULT_MAX_REDIRECTS, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_TIMEOUT,
+    current_request_timeout, with_request_timeout, DefaultRedirectCheck, ExecutorError,
+    HttpExecutor, MockHttpExecutor, ReqwestExecutorConfig, ReqwestHttpExecutor,
+    DEFAULT_MAX_REDIRECTS, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_TIMEOUT, MAX_REQUEST_TIMEOUT,
 };
 // NOTE (audit round 1): `HttpStreamExecutor` / `WireChunkStream` /
 // `MAX_STREAM_DURATION` are deliberately NOT re-exported at the crate root.

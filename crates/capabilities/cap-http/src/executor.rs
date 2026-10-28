@@ -755,6 +755,39 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// puller's check before every read.
 pub const MAX_STREAM_DURATION: Duration = Duration::from_secs(300);
 
+/// Longest total timeout a caller may give the requests of one scope through
+/// [`with_request_timeout`] (15 minutes); a longer one is clamped to it. Also the longest a
+/// local inference request may run (`DefaultLocalInferenceTransport`).
+pub const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
+
+tokio::task_local! {
+    /// The caller's total timeout for the requests [`ReqwestHttpExecutor`] sends inside a
+    /// [`with_request_timeout`] scope. Unset everywhere else, where the executor's own
+    /// configured timeout applies as before.
+    static REQUEST_TIMEOUT: Duration;
+}
+
+/// Run `future` with `timeout` (clamped to [`MAX_REQUEST_TIMEOUT`]) in place of the
+/// configured total timeout of every request [`ReqwestHttpExecutor`] sends while polling it:
+/// the cumulative bound and reqwest's per-request timeout of a buffered request, and the head
+/// and per-read idle bound of a streamed one (whose lifetime stays capped at the stream
+/// deadline). For a caller whose upstream is slower than the default, such as a provider
+/// entry with a longer generate budget. The value reaches only what is polled inside the
+/// scope, never a spawned task.
+pub async fn with_request_timeout<T>(
+    timeout: Duration,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    REQUEST_TIMEOUT
+        .scope(timeout.min(MAX_REQUEST_TIMEOUT), future)
+        .await
+}
+
+/// The total timeout an enclosing [`with_request_timeout`] scope set, if any.
+pub fn current_request_timeout() -> Option<Duration> {
+    REQUEST_TIMEOUT.try_with(|timeout| *timeout).ok()
+}
+
 /// reqwest DNS resolver that CIDR-checks resolved IPs at CONNECT time and rejects any
 /// resolution landing in the SSRF forbidden ranges — installed via
 /// `ClientBuilder::dns_resolver`. The IPs reqwest actually connects to are validated by the
@@ -1022,9 +1055,11 @@ impl ReqwestHttpExecutor {
 
     /// Issue a single request (no auto-redirect). Header-build failures and any
     /// send/connect/DNS/TLS error map to `ExecutorError::Transport`; a reqwest
-    /// timeout maps to `ExecutorError::Timeout`. `timeout_override` (streaming
-    /// walk only) replaces the client-level total timeout for this request so a
-    /// live body may outlive it — the caller still bounds the HEAD phase.
+    /// timeout maps to `ExecutorError::Timeout`. `timeout_override`, when set,
+    /// replaces the client-level total timeout for this request: the buffered
+    /// walk passes the timeout of an enclosing `with_request_timeout` scope, and
+    /// the streaming walk passes `MAX_STREAM_DURATION` so a live body may outlive
+    /// it — the caller still bounds the HEAD phase.
     async fn send_once(
         &self,
         method: reqwest::Method,
@@ -1064,8 +1099,11 @@ impl HttpExecutor for ReqwestHttpExecutor {
     ) -> Result<HttpResponse, ExecutorError> {
         // Cumulative deadline across ALL redirect hops: each hop is bounded by reqwest's
         // per-request `.timeout()`, but this outer bound stops N hops from multiplying the
-        // budget to N×timeout (round-9 adversarial W4).
-        match tokio::time::timeout(self.timeout, self.execute_inner(req, redirect_check)).await {
+        // budget to N×timeout (round-9 adversarial W4). A `with_request_timeout` scope
+        // replaces both bounds with the caller's.
+        let scoped = current_request_timeout();
+        let total = scoped.unwrap_or(self.timeout);
+        match tokio::time::timeout(total, self.execute_inner(req, redirect_check, scoped)).await {
             Ok(result) => result,
             Err(_) => Err(ExecutorError::Timeout),
         }
@@ -1074,20 +1112,26 @@ impl HttpExecutor for ReqwestHttpExecutor {
 
 impl ReqwestHttpExecutor {
     /// The redirect-following request loop (wrapped by `execute` in a cumulative deadline).
+    /// `per_request_timeout` is `None` outside a `with_request_timeout` scope (the
+    /// client-level timeout applies to each hop, as before).
     async fn execute_inner(
         &self,
         req: &HttpRequest,
         redirect_check: Arc<dyn RedirectCheck>,
+        per_request_timeout: Option<Duration>,
     ) -> Result<HttpResponse, ExecutorError> {
-        let resp = self.walk_to_final(req, redirect_check, None).await?;
+        let resp = self
+            .walk_to_final(req, redirect_check, per_request_timeout)
+            .await?;
         map_response(resp, self.max_response_bytes).await
     }
 
     /// Walk redirects to the final (non-redirect) response and return it RAW.
     /// Shared by the buffered path (`execute_inner` → `map_response`) and the
     /// streaming path (`execute_stream` → head + chunk pull). Behavior is the
-    /// buffered path's loop verbatim; `per_request_timeout` is `None` on the
-    /// buffered path (client-level timeout applies) and `MAX_STREAM_DURATION`
+    /// buffered path's loop verbatim; `per_request_timeout` on the buffered path
+    /// is the timeout of an enclosing `with_request_timeout` scope, or `None`
+    /// outside one (client-level timeout applies), and `MAX_STREAM_DURATION`
     /// on the streaming path (so the final hop's live body may outlive the
     /// client-level total timeout — the HEAD phase is still bounded by the
     /// caller's cumulative deadline).
@@ -1268,7 +1312,10 @@ impl HttpStreamExecutor for ReqwestHttpExecutor {
         // EARLIER of the executor's per-call timeout and the stream deadline.
         let started = tokio::time::Instant::now();
         let deadline = started + MAX_STREAM_DURATION;
-        let head_deadline = deadline.min(started + self.timeout);
+        // A `with_request_timeout` scope replaces the configured timeout as the head and
+        // idle bound; the stream deadline above still caps the whole exchange.
+        let budget = current_request_timeout().unwrap_or(self.timeout);
+        let head_deadline = deadline.min(started + budget);
 
         // HEAD phase (redirect walk + response head) — connect errors and
         // rejected redirects fail HERE, before any stream object exists
@@ -1310,7 +1357,7 @@ impl HttpStreamExecutor for ReqwestHttpExecutor {
             HttpResponseHead { status, headers },
             Box::new(ReqwestChunkStream {
                 resp: Some(resp),
-                idle: self.timeout,
+                idle: budget,
                 // The SAME entry-anchored instant — every attempted body read
                 // inherits whatever the head phase left of the 300 s budget.
                 deadline,

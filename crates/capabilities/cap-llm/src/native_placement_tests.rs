@@ -61,6 +61,8 @@ fn agent_cli_cfg() -> LlmProviderConfig {
             args: vec![],
         }),
         auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+        generate_timeout_secs: None,
+        reasoning_effort: None,
     }
 }
 

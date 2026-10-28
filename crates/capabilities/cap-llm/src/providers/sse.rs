@@ -80,6 +80,11 @@ pub struct SseEvent {
     /// Incremental native tool-call fragments for this frame (OpenAI
     /// `delta.tool_calls`). `None` on frames that carry no tool-call delta.
     pub tool_call_deltas: Option<Vec<SseToolCallDelta>>,
+    /// True when the frame carries only reasoning output (an OpenAI-compatible
+    /// `delta.reasoning_content` / `delta.reasoning`, a Responses reasoning event). Never
+    /// text: consumers keep it out of the answer, but count it as stream progress, since a
+    /// reasoning model may stream many such frames before its first text delta (or none).
+    pub reasoning: bool,
 }
 
 /// One streamed `delta.tool_calls[i]` fragment. `id` / `name` arrive on the
@@ -100,6 +105,13 @@ impl SseEvent {
         finish_reason: None,
         terminal: false,
         tool_call_deltas: None,
+        reasoning: false,
+    };
+
+    /// A reasoning-only frame: no text, usage, finish or tool call, but progress.
+    pub const REASONING: SseEvent = SseEvent {
+        reasoning: true,
+        ..Self::IGNORE
     };
 
     pub fn is_ignore(&self) -> bool {
@@ -504,5 +516,22 @@ mod tests {
             ..SseEvent::IGNORE
         }
         .is_ignore());
+    }
+
+    /// A reasoning-only frame is progress, not an ignorable frame, and carries nothing a
+    /// consumer would bill or show.
+    #[test]
+    fn reasoning_frame_is_progress_without_text_usage_or_finish() {
+        let ev = SseEvent::REASONING;
+        assert!(ev.reasoning);
+        assert!(!ev.is_ignore());
+        assert_eq!(
+            (ev.delta, ev.usage, ev.finish_reason, ev.terminal),
+            (None, None, None, false)
+        );
+        assert!(ev.tool_call_deltas.is_none());
+        let mut fold = SseUsageFold::default();
+        fold.apply(&SseEvent::REASONING);
+        assert!(!fold.any_usage_seen());
     }
 }

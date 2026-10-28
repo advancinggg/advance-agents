@@ -237,6 +237,8 @@ mod tests {
             device_id: None,
             agent_cli: None,
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+            generate_timeout_secs: None,
+            reasoning_effort: None,
         };
         resolve_provider_and_model(&[cfg], Some("a")).unwrap()
     }

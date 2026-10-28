@@ -51,6 +51,8 @@ fn mesh_cfg() -> LlmProviderConfig {
         device_id: Some("peer-b".into()),
         agent_cli: None,
         auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+        generate_timeout_secs: None,
+        reasoning_effort: None,
     }
 }
 
@@ -324,6 +326,8 @@ async fn t135_gateway_resolve_returns_local_prefix() {
         device_id: None,
         agent_cli: None,
         auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+        generate_timeout_secs: None,
+        reasoning_effort: None,
     };
     let mut cfg = fixture_runtime_config();
     cfg.llm_providers = vec![local];
@@ -684,6 +688,7 @@ fn adapter_probe_req() -> InferenceChatRequest {
         stop_sequences: None,
         tools: None,
         output_schema: None,
+        reasoning_effort: None,
         deadline: Instant::now() + Duration::from_secs(5),
         cancel: Arc::new(AtomicBool::new(false)),
     }

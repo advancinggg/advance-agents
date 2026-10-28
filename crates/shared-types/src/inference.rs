@@ -41,6 +41,10 @@ pub struct InferenceChatRequest {
     pub stop_sequences: Option<Vec<String>>,
     pub tools: Option<Vec<InferenceTool>>,
     pub output_schema: Option<String>,
+    /// The entry's OpenAI-compatible reasoning setting (`none`, `minimal`, `low`, `medium`,
+    /// `high` or `xhigh`), for a backend that sends it with the request. `None` = nothing is
+    /// sent.
+    pub reasoning_effort: Option<String>,
     pub deadline: Instant,
     pub cancel: Arc<AtomicBool>,
 }

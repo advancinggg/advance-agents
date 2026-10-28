@@ -15,8 +15,20 @@
 //!   file itself.
 //! - **Preflight before store.** A `cloud-http` key is verified through the SAME overlay
 //!   preflight the Landing first-open flow uses (`crate::GeneratePathPreflight`: an
-//!   in-memory `SecretStore` overlay + `chat_preflight`), bounded by [`PREFLIGHT_TIMEOUT`]. A
-//!   failed / timed-out preflight leaves the previous key untouched and is reported as data.
+//!   in-memory `SecretStore` overlay + `chat_preflight`), bounded by [`PREFLIGHT_TIMEOUT`], or
+//!   by the entry's own `generate-timeout-secs` when it sets one (the bound its generate hop
+//!   has, so a slow model the entry allows is not reported as a timeout). The check runs
+//!   outside the write lock, so other mutations are not held up by it; the key is stored only
+//!   when the entry is unchanged afterwards (otherwise the answer is `stored: false` with the
+//!   reason `cancelled`). A failed / timed-out preflight leaves the previous key untouched and
+//!   is reported as data.
+//! - **Generate budget and reasoning setting.** `generate_timeout_secs` / `reasoning_effort`
+//!   are written as the entry's `generate-timeout-secs` / `reasoning-effort`; an update's
+//!   explicit `null` removes the key. Before any write, the entry as it would be after the
+//!   mutation is checked with the runtime loader's own rules, and a setting it cannot take is
+//!   refused as `InvalidRequest` carrying the setting's detail token
+//!   (`generate_timeout_unsupported`, `reasoning_effort_unsupported`, or
+//!   `invalid_generate_timeout` / `invalid_reasoning_effort` for a value out of range).
 //! - **Every YAML write waits for the applied reload** (≤ [`RELOAD_WAIT`]) on a subscription
 //!   taken BEFORE the write; a miss is the `reload_pending` advisory, never an error.
 //! - `ClientApi::handle()` is SYNC and may run on a tokio worker; the reload wait therefore
@@ -75,10 +87,16 @@ use advance_client_api::provider_admin::{
     ProviderAdminWarning, AGENT_CLI_BACKEND_CLASS, CHATGPT_OAUTH_AUTH_SOURCE,
     CHATGPT_OAUTH_BACKEND, DEFAULT_BACKEND_CLASS,
 };
-use advance_client_api::{ClientApi, ProviderAdminProvider, ProviderError};
+use advance_client_api::{
+    ClientApi, ProviderAdminProvider, ProviderError, GENERATE_TIMEOUT_UNSUPPORTED_DETAIL,
+    INVALID_GENERATE_TIMEOUT_DETAIL, INVALID_REASONING_EFFORT_DETAIL,
+    REASONING_EFFORT_UNSUPPORTED_DETAIL,
+};
 use advance_runtime::config::{
-    AgentCliSpec, AuthScheme, InferenceBackendClass, LlmProviderConfig, ProviderAuthSource,
-    ProviderBackend, RuntimeConfig, RuntimeConfigProvider, CHATGPT_OAUTH_RECORD_SUFFIX,
+    effective_backend, generate_timeout_refusal, max_generate_timeout_secs,
+    reasoning_effort_refusal, AgentCliSpec, AuthScheme, InferenceBackendClass, LlmProviderConfig,
+    ProviderAuthSource, ProviderBackend, ReasoningEffort, RuntimeConfig, RuntimeConfigProvider,
+    CHATGPT_OAUTH_RECORD_SUFFIX, MAX_GENERATE_TIMEOUT_SECS, MIN_GENERATE_TIMEOUT_SECS,
 };
 use advance_shared_types::process_policy::{ProcessPolicy, SpawnSite};
 use advance_shared_types::security_validator::{HttpError, HttpSecurityChain};
@@ -98,7 +116,8 @@ use serde_yml::{Mapping, Value};
 /// How long a YAML write waits for the config watcher to report the applied reload.
 pub const RELOAD_WAIT: Duration = Duration::from_secs(2);
 /// Bound on one preflight, the check of a sign-in entry included (the cancel token fires at the
-/// deadline; reason `timeout`).
+/// deadline; reason `timeout`). The chat preflight of an entry that sets its own
+/// `generate-timeout-secs` is bounded by that budget instead.
 pub const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on one catalog probe and on a whole `list_providers` walk.
 pub const MODELS_LIST_TIMEOUT: Duration = Duration::from_secs(8);
@@ -532,7 +551,8 @@ pub struct WiredProviderAdmin {
     agent_cli_usage_probe: Arc<dyn AgentCliUsageProbe>,
     /// The sign-in behind `auth-source: chatgpt-oauth` entries; `None` = not served here.
     chatgpt_sign_in: Option<Arc<dyn ChatGptSignInPort>>,
-    /// Serializes every mutation: YAML rewrites + key writes must not interleave.
+    /// Serializes every mutation: YAML rewrites + key writes must not interleave. The network
+    /// check of a key runs outside it (`set_key`).
     write_lock: Mutex<()>,
     /// The last preflight verdict per provider id (in-memory; cleared at restart).
     last_preflight: Mutex<HashMap<String, ClientProviderPreflightResult>>,
@@ -829,6 +849,8 @@ impl WiredProviderAdmin {
             auth_scheme: entry.auth_scheme.map(|a| auth_scheme_str(a).to_string()),
             auth_source: (entry.auth_source != ProviderAuthSource::ApiKey)
                 .then(|| entry.auth_source.as_str().to_string()),
+            generate_timeout_secs: entry.generate_timeout_secs,
+            reasoning_effort: entry.reasoning_effort.map(|e| e.as_str().to_string()),
             cost: ClientProviderCost {
                 input_per_mtoken: entry.cost_per_mtoken_in,
                 output_per_mtoken: entry.cost_per_mtoken_out,
@@ -1172,6 +1194,21 @@ impl WiredProviderAdmin {
         Ok(())
     }
 
+    /// Refuse, before the document changes, a generate budget or reasoning setting the entry
+    /// cannot take once `written` is applied under `mode` (see [`check_entry_settings`]): the
+    /// check reads the entry exactly as the writer would leave it. A write the writer itself
+    /// refuses (a taken or missing id) is left to it.
+    fn refuse_unappliable_settings(
+        &self,
+        written: &Value,
+        mode: UpsertMode,
+    ) -> Result<(), ProviderError> {
+        match crate::provider::provider_entry_after_upsert(&self.home, written.clone(), mode) {
+            Ok(entry) => check_entry_settings(&entry),
+            Err(_) => Ok(()),
+        }
+    }
+
     /// A sign-in entry's check: the port renews the access token when needed and lists the
     /// models with it. Never the chat preflight. Bounded by `preflight_timeout` like every
     /// preflight (reason `timeout`): the check runs on its own thread, and a renewal it started
@@ -1291,11 +1328,19 @@ impl WiredProviderAdmin {
 
     // ── preflight ────────────────────────────────────────────────────────────────────────────
 
-    /// Run the overlay preflight for `entry` with `key`, bounded by `preflight_timeout`.
+    /// The bound of one chat preflight of `entry` (overlay or claimed): its own
+    /// `generate-timeout-secs` when it sets one (the bound of its generate hop), else the
+    /// preflight deadline. The check of a sign-in entry keeps the preflight deadline.
+    fn preflight_budget(&self, entry: &LlmProviderConfig) -> Duration {
+        entry.generate_timeout().unwrap_or(self.preflight_timeout)
+    }
+
+    /// Run the overlay preflight for `entry` with `key`, bounded by
+    /// [`Self::preflight_budget`].
     fn run_preflight(&self, entry: &LlmProviderConfig, key: &str) -> ClientProviderPreflightResult {
         let cancel = CancelToken::new();
         let deadline_cancel = cancel.clone();
-        let deadline = self.preflight_timeout;
+        let deadline = self.preflight_budget(entry);
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let timer = std::thread::spawn(move || {
             // A `recv_timeout` miss means the preflight is still running at the deadline.
@@ -1345,7 +1390,7 @@ impl WiredProviderAdmin {
     ) -> ClientProviderPreflightResult {
         let cancel = CancelToken::new();
         let deadline_cancel = cancel.clone();
-        let deadline = self.preflight_timeout;
+        let deadline = self.preflight_budget(entry);
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let timer = std::thread::spawn(move || {
             if done_rx.recv_timeout(deadline).is_err() {
@@ -1355,7 +1400,7 @@ impl WiredProviderAdmin {
                 false
             }
         });
-        let outcome = port.preflight(&entry.id, &cancel, self.preflight_timeout);
+        let outcome = port.preflight(&entry.id, &cancel, deadline);
         let _ = done_tx.send(());
         let timed_out = timer.join().unwrap_or(false);
         let reason = match outcome {
@@ -1528,13 +1573,11 @@ impl ProviderAdminProvider for WiredProviderAdmin {
             }
         }
         let secret = self.create_secret_name(request)?;
+        let written = create_mapping(request, &secret);
+        self.refuse_unappliable_settings(&written, UpsertMode::Create)?;
         let rx = self.subscribe_if_watching();
-        crate::upsert_provider_entry(
-            &self.home,
-            create_mapping(request, &secret),
-            UpsertMode::Create,
-        )
-        .map_err(write_error)?;
+        crate::upsert_provider_entry(&self.home, written, UpsertMode::Create)
+            .map_err(write_error)?;
         let (idx, entry) = self.find(&request.provider_id)?;
         if matches!(
             entry.backend_class,
@@ -1600,13 +1643,11 @@ impl ProviderAdminProvider for WiredProviderAdmin {
                 "sign-in secret name is fixed".into(),
             ));
         }
+        let written = update_mapping(provider_id, request);
+        self.refuse_unappliable_settings(&written, UpsertMode::Update)?;
         let rx = self.subscribe_if_watching();
-        crate::upsert_provider_entry(
-            &self.home,
-            update_mapping(provider_id, request),
-            UpsertMode::Update,
-        )
-        .map_err(write_error)?;
+        crate::upsert_provider_entry(&self.home, written, UpsertMode::Update)
+            .map_err(write_error)?;
         let (idx, entry) = self.find(provider_id)?;
         if request.agent_cli.is_some()
             || request.endpoint.is_some()
@@ -1712,39 +1753,59 @@ impl ProviderAdminProvider for WiredProviderAdmin {
         provider_id: &str,
         key: &str,
     ) -> Result<ProviderAdminOutcome<ClientProviderKeyResult>, ProviderError> {
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let (_, entry) = self.find(provider_id)?;
         if entry.uses_chatgpt_sign_in() {
             // The value under the name is the session's access token, written by the sign-in.
             return Err(ProviderError::AuthSourceMismatch(provider_id.to_string()));
         }
         let store = self.key_store()?;
-        let mut outcome = ProviderAdminOutcome::new(ClientProviderKeyResult::default());
-        let preflight = if entry.backend_class == InferenceBackendClass::CloudHttp {
-            let verdict = self.run_preflight(&entry, key);
-            self.record_preflight(provider_id, &verdict);
-            if !verdict.ok {
-                // The previous key (if any) stays; the verdict is the answer.
-                outcome.value = ClientProviderKeyResult {
-                    stored: false,
-                    preflight: Some(verdict),
-                };
-                return Ok(outcome);
-            }
-            Some(verdict)
-        } else {
-            outcome = outcome.with_warning(ProviderAdminWarning::PreflightSkipped);
-            None
-        };
+        if entry.backend_class != InferenceBackendClass::CloudHttp {
+            store
+                .store(&entry.api_key_secret, key)
+                .map_err(|_| ProviderError::Unavailable("secret store write".into()))?;
+            self.invalidate_models(provider_id);
+            return Ok(ProviderAdminOutcome::new(ClientProviderKeyResult {
+                stored: true,
+                preflight: None,
+            })
+            .with_warning(ProviderAdminWarning::PreflightSkipped));
+        }
+        // The check may run as long as the entry's own generate budget, so it runs without the
+        // write lock: every other mutation goes on meanwhile, and the key is stored only if the
+        // entry is still the one that was checked.
+        drop(guard);
+        let verdict = self.run_preflight(&entry, key);
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, current) = self.find(provider_id)?;
+        if current != entry {
+            // The entry changed while its key was being checked: the verdict is about settings
+            // that are gone, so nothing is stored or recorded.
+            return Ok(ProviderAdminOutcome::new(ClientProviderKeyResult {
+                stored: false,
+                preflight: Some(ClientProviderPreflightResult {
+                    ok: false,
+                    checked_at_ms: now_ms(),
+                    reason: Some(REASON_CANCELLED.to_string()),
+                }),
+            }));
+        }
+        self.record_preflight(provider_id, &verdict);
+        if !verdict.ok {
+            // The previous key (if any) stays; the verdict is the answer.
+            return Ok(ProviderAdminOutcome::new(ClientProviderKeyResult {
+                stored: false,
+                preflight: Some(verdict),
+            }));
+        }
         store
             .store(&entry.api_key_secret, key)
             .map_err(|_| ProviderError::Unavailable("secret store write".into()))?;
         self.invalidate_models(provider_id);
-        outcome.value = ClientProviderKeyResult {
+        Ok(ProviderAdminOutcome::new(ClientProviderKeyResult {
             stored: true,
-            preflight,
-        };
-        Ok(outcome)
+            preflight: Some(verdict),
+        }))
     }
 
     fn clear_key(&self, provider_id: &str) -> Result<ClientProviderSummary, ProviderError> {
@@ -2032,6 +2093,66 @@ fn aliases_value(aliases: &std::collections::BTreeMap<String, String>) -> Value 
     Value::Mapping(m)
 }
 
+/// Refuse a generate budget or reasoning setting `entry` (an entry's YAML mapping) cannot take
+/// — by the runtime loader's own rules, read off the entry itself — as `InvalidRequest`
+/// carrying the setting's detail token. The loader refuses such a document without saying
+/// which setting is at fault. An entry whose other keys the loader refuses is left to the
+/// write's own validation.
+fn check_entry_settings(entry: &Mapping) -> Result<(), ProviderError> {
+    let refuse = |detail: &str| Err(ProviderError::InvalidRequest(detail.into()));
+    let secs = match entry.get(GENERATE_TIMEOUT_KEY) {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_u64().and_then(|secs| u32::try_from(secs).ok()) {
+            Some(secs)
+                if (MIN_GENERATE_TIMEOUT_SECS..=MAX_GENERATE_TIMEOUT_SECS).contains(&secs) =>
+            {
+                Some(secs)
+            }
+            _ => return refuse(INVALID_GENERATE_TIMEOUT_DETAIL),
+        },
+    };
+    let effort = match entry.get(REASONING_EFFORT_KEY) {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_str().and_then(ReasoningEffort::parse) {
+            Some(effort) => Some(effort),
+            None => return refuse(INVALID_REASONING_EFFORT_DETAIL),
+        },
+    };
+    if secs.is_none() && effort.is_none() {
+        return Ok(());
+    }
+    // What decides whether the entry can take them, as the loader reads it from the entry
+    // without them (the backend class, the dialect, the credential source).
+    let mut rest = entry.clone();
+    rest.remove(GENERATE_TIMEOUT_KEY);
+    rest.remove(REASONING_EFFORT_KEY);
+    let Ok(base) = serde_yml::from_value::<LlmProviderConfig>(Value::Mapping(rest)) else {
+        return Ok(());
+    };
+    if let Some(secs) = secs {
+        if secs > max_generate_timeout_secs(base.auth_source) {
+            return refuse(INVALID_GENERATE_TIMEOUT_DETAIL);
+        }
+        if generate_timeout_refusal(base.backend_class).is_some() {
+            return refuse(GENERATE_TIMEOUT_UNSUPPORTED_DETAIL);
+        }
+    }
+    if effort.is_some()
+        && reasoning_effort_refusal(
+            base.backend_class,
+            effective_backend(&base.id, base.backend),
+            base.auth_source,
+        )
+        .is_some()
+    {
+        return refuse(REASONING_EFFORT_UNSUPPORTED_DETAIL);
+    }
+    Ok(())
+}
+
+const GENERATE_TIMEOUT_KEY: &str = "generate-timeout-secs";
+const REASONING_EFFORT_KEY: &str = "reasoning-effort";
+
 /// The YAML mapping of a create request (the runtime's `LlmProviderConfigRaw` spelling) whose
 /// `api-key-secret` is `secret`. A sign-in request also writes its source and the one dialect
 /// such an entry speaks.
@@ -2066,6 +2187,12 @@ fn create_mapping(req: &ClientCreateProviderRequest, secret: &str) -> Value {
     }
     if let Some(scheme) = &req.auth_scheme {
         m.insert(key("auth-scheme"), key(scheme));
+    }
+    if let Some(secs) = req.generate_timeout_secs {
+        m.insert(key("generate-timeout-secs"), Value::from(secs));
+    }
+    if let Some(effort) = &req.reasoning_effort {
+        m.insert(key("reasoning-effort"), key(effort));
     }
     cost_into(&mut m, &req.cost);
     m.insert(key("rate-limit"), rate_limit_value(&req.rate_limit));
@@ -2132,6 +2259,19 @@ fn update_mapping(provider_id: &str, req: &ClientUpdateProviderRequest) -> Value
     }
     if let Some(device) = &req.device_id {
         m.insert(key("device-id"), key(device));
+    }
+    // An explicit null clears the setting: the writer removes a key whose value is null.
+    if let Some(secs) = req.generate_timeout_secs {
+        m.insert(
+            key("generate-timeout-secs"),
+            secs.map_or(Value::Null, Value::from),
+        );
+    }
+    if let Some(effort) = &req.reasoning_effort {
+        m.insert(
+            key("reasoning-effort"),
+            effort.as_deref().map_or(Value::Null, key),
+        );
     }
     Value::Mapping(m)
 }
@@ -2225,6 +2365,224 @@ mod tests {
     }
 
     #[test]
+    fn create_mapping_writes_the_generate_budget_and_reasoning_setting_only_when_set() {
+        let base = ClientCreateProviderRequest {
+            provider_id: "reasoner".into(),
+            endpoint: Some("https://api.example.com".into()),
+            model_aliases: [("think".to_string(), "reasoner-large".to_string())]
+                .into_iter()
+                .collect(),
+            cost: ClientProviderCost {
+                input_per_mtoken: 1.0,
+                output_per_mtoken: 2.0,
+                ..Default::default()
+            },
+            rate_limit: ClientProviderRateLimit {
+                requests_per_minute: 100,
+                tokens_per_minute: 1000,
+            },
+            ..Default::default()
+        };
+        let plain = create_mapping(&base, "reasoner-api-key");
+        assert!(plain.get("generate-timeout-secs").is_none(), "{plain:?}");
+        assert!(plain.get("reasoning-effort").is_none(), "{plain:?}");
+
+        let req = ClientCreateProviderRequest {
+            generate_timeout_secs: Some(120),
+            reasoning_effort: Some("low".into()),
+            ..base
+        };
+        let v = create_mapping(&req, "reasoner-api-key");
+        assert_eq!(v["generate-timeout-secs"], 120);
+        assert!(
+            v["generate-timeout-secs"].is_u64(),
+            "a number, not a string"
+        );
+        assert_eq!(v["reasoning-effort"], "low");
+        let parsed: LlmProviderConfig = serde_yml::from_value(v).expect("runtime parses");
+        assert_eq!(parsed.generate_timeout_secs, Some(120));
+        assert_eq!(parsed.reasoning_effort, Some(ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn update_mapping_sets_and_clears_the_generate_budget_and_reasoning_setting() {
+        let set = update_mapping(
+            "reasoner",
+            &ClientUpdateProviderRequest {
+                generate_timeout_secs: Some(Some(300)),
+                reasoning_effort: Some(Some("high".into())),
+                ..Default::default()
+            },
+        );
+        assert_eq!(set["generate-timeout-secs"], 300);
+        assert_eq!(set["reasoning-effort"], "high");
+        // An explicit null travels as `null`, which the writer turns into removing the key.
+        let cleared = update_mapping(
+            "reasoner",
+            &ClientUpdateProviderRequest {
+                generate_timeout_secs: Some(None),
+                reasoning_effort: Some(None),
+                ..Default::default()
+            },
+        );
+        let m = cleared.as_mapping().unwrap();
+        assert_eq!(m.len(), 3, "id + the two cleared keys: {m:?}");
+        assert!(cleared["generate-timeout-secs"].is_null());
+        assert!(cleared["reasoning-effort"].is_null());
+        // An absent field names nothing.
+        let untouched = update_mapping(
+            "reasoner",
+            &ClientUpdateProviderRequest {
+                endpoint: Some("https://proxy.example".into()),
+                ..Default::default()
+            },
+        );
+        assert!(untouched.get("generate-timeout-secs").is_none());
+        assert!(untouched.get("reasoning-effort").is_none());
+    }
+
+    /// The pre-write check refuses exactly the entries the runtime loader refuses, with the token
+    /// of the setting at fault: it reads the class, dialect and credential source off the entry
+    /// the way the loader does.
+    #[test]
+    fn unappliable_settings_are_refused_with_their_detail_by_the_loaders_rules() {
+        let entry = |id: &str, extra: &str| -> Mapping {
+            serde_yml::from_str(&format!(
+                "id: {id}\nendpoint: https://api.example.com\napi-key-secret: {id}-api-key\n\
+                 model-aliases:\n  m: model\ncost-per-mtoken-in: 1.0\ncost-per-mtoken-out: 1.0\n\
+                 rate-limit:\n  requests-per-minute: 10\n  tokens-per-minute: 1000\n{extra}"
+            ))
+            .expect("entry yaml")
+        };
+        let agent_cli =
+            "backend-class: agent-cli\nagent-cli:\n  vendor: claude\n  command: /nonexistent/claude\n";
+        let mesh = "backend-class: mesh-remote\ndevice-id: peer\n";
+        let sign_in = "auth-source: chatgpt-oauth\n";
+        let refused = |detail: &str| Err(ProviderError::InvalidRequest(detail.into()));
+        for (id, extra, expected, why) in [
+            ("gw", String::new(), Ok(()), "nothing set"),
+            (
+                "gw",
+                "backend: openai-chat\ngenerate-timeout-secs: 5\nreasoning-effort: none\n".into(),
+                Ok(()),
+                "chat",
+            ),
+            (
+                "gw",
+                "backend-class: local\ngenerate-timeout-secs: 900\nreasoning-effort: xhigh\n"
+                    .into(),
+                Ok(()),
+                "local",
+            ),
+            (
+                "gw",
+                "backend: openai-responses\ngenerate-timeout-secs: 60\nreasoning-effort: low\n"
+                    .into(),
+                Ok(()),
+                "responses",
+            ),
+            (
+                "signed-in",
+                format!("{sign_in}generate-timeout-secs: 300\n"),
+                Ok(()),
+                "sign-in budget at its ceiling",
+            ),
+            (
+                "signed-in",
+                format!("{sign_in}generate-timeout-secs: 301\n"),
+                refused(INVALID_GENERATE_TIMEOUT_DETAIL),
+                "sign-in budget above its ceiling",
+            ),
+            (
+                "gw",
+                "generate-timeout-secs: 4\n".into(),
+                refused(INVALID_GENERATE_TIMEOUT_DETAIL),
+                "below",
+            ),
+            (
+                "gw",
+                "generate-timeout-secs: 901\n".into(),
+                refused(INVALID_GENERATE_TIMEOUT_DETAIL),
+                "above",
+            ),
+            (
+                "gw",
+                format!("{agent_cli}generate-timeout-secs: 60\n"),
+                refused(GENERATE_TIMEOUT_UNSUPPORTED_DETAIL),
+                "agent-cli budget",
+            ),
+            (
+                "gw",
+                format!("{mesh}generate-timeout-secs: 60\n"),
+                refused(GENERATE_TIMEOUT_UNSUPPORTED_DETAIL),
+                "mesh budget",
+            ),
+            (
+                "gw",
+                "reasoning-effort: max\n".into(),
+                refused(INVALID_REASONING_EFFORT_DETAIL),
+                "spelling",
+            ),
+            (
+                "gw",
+                "backend: anthropic-messages\nreasoning-effort: low\n".into(),
+                refused(REASONING_EFFORT_UNSUPPORTED_DETAIL),
+                "messages dialect",
+            ),
+            (
+                "anthropic",
+                "reasoning-effort: low\n".into(),
+                refused(REASONING_EFFORT_UNSUPPORTED_DETAIL),
+                "anthropic id",
+            ),
+            (
+                "anthropic",
+                "backend: openai-chat\nreasoning-effort: low\n".into(),
+                Ok(()),
+                "anthropic id on chat",
+            ),
+            (
+                "anthropic",
+                "backend-class: local\nreasoning-effort: low\n".into(),
+                Ok(()),
+                "anthropic id on a local entry, which speaks openai-chat",
+            ),
+            (
+                "anthropic",
+                "backend: local\nreasoning-effort: low\n".into(),
+                Ok(()),
+                "anthropic id on the local backend",
+            ),
+            (
+                "gw",
+                format!("{agent_cli}reasoning-effort: low\n"),
+                refused(REASONING_EFFORT_UNSUPPORTED_DETAIL),
+                "agent-cli effort",
+            ),
+            (
+                "gw",
+                format!("{mesh}reasoning-effort: low\n"),
+                refused(REASONING_EFFORT_UNSUPPORTED_DETAIL),
+                "mesh effort",
+            ),
+            (
+                "signed-in",
+                format!("{sign_in}reasoning-effort: low\n"),
+                refused(REASONING_EFFORT_UNSUPPORTED_DETAIL),
+                "sign-in effort",
+            ),
+        ] {
+            let entry = entry(id, &extra);
+            assert_eq!(check_entry_settings(&entry), expected, "{why}");
+            assert_eq!(
+                serde_yml::from_value::<LlmProviderConfig>(Value::Mapping(entry)).is_ok(),
+                expected.is_ok(),
+                "{why}: the loader agrees"
+            );
+        }
+    }
+
+    #[test]
     fn update_mapping_carries_only_named_fields() {
         let req = ClientUpdateProviderRequest {
             endpoint: Some("https://proxy.example".into()),
@@ -2302,6 +2660,102 @@ mod tests {
     }
 
     #[test]
+    fn client_api_provider_setting_vocabulary_is_the_runtime_loaders() {
+        use advance_client_api::provider_admin::{
+            effective_backend as client_effective_backend, entry_backend, BACKENDS,
+            BACKEND_CLASSES, MAX_GENERATE_TIMEOUT_SECS as CLIENT_MAX,
+            MAX_SIGN_IN_GENERATE_TIMEOUT_SECS as CLIENT_SIGN_IN_MAX,
+            MIN_GENERATE_TIMEOUT_SECS as CLIENT_MIN, PROVIDER_KNOB_BACKEND_CLASSES,
+            REASONING_EFFORTS, REASONING_EFFORT_BACKENDS,
+        };
+        use advance_runtime::config::MAX_SIGN_IN_GENERATE_TIMEOUT_SECS;
+        use InferenceBackendClass::{AgentCli, CloudHttp, Local, MeshRemote};
+        let runtime: Vec<&str> = ReasoningEffort::ALL.iter().map(|e| e.as_str()).collect();
+        assert_eq!(REASONING_EFFORTS, runtime.as_slice());
+        for spelling in REASONING_EFFORTS {
+            assert_eq!(
+                ReasoningEffort::parse(spelling).map(ReasoningEffort::as_str),
+                Some(*spelling)
+            );
+        }
+        assert_eq!(
+            (CLIENT_MIN, CLIENT_MAX, CLIENT_SIGN_IN_MAX),
+            (
+                MIN_GENERATE_TIMEOUT_SECS,
+                MAX_GENERATE_TIMEOUT_SECS,
+                MAX_SIGN_IN_GENERATE_TIMEOUT_SECS
+            )
+        );
+        assert_eq!(
+            CLIENT_SIGN_IN_MAX,
+            max_generate_timeout_secs(ProviderAuthSource::ChatGptOAuth)
+        );
+        let classes = [CloudHttp, Local, MeshRemote, AgentCli];
+        assert_eq!(BACKEND_CLASSES.len(), classes.len());
+        for class in classes {
+            let spelling = backend_class_str(class);
+            assert!(BACKEND_CLASSES.contains(&spelling), "{spelling}");
+            assert_eq!(
+                PROVIDER_KNOB_BACKEND_CLASSES.contains(&spelling),
+                generate_timeout_refusal(class).is_none(),
+                "{spelling}"
+            );
+        }
+        let backends = [
+            ProviderBackend::OpenAiChat,
+            ProviderBackend::OpenAiResponses,
+            ProviderBackend::AnthropicMessages,
+        ];
+        assert_eq!(BACKENDS.len(), backends.len());
+        for backend in backends {
+            let spelling = backend_str(backend);
+            assert!(BACKENDS.contains(&spelling), "{spelling}");
+            assert_eq!(
+                REASONING_EFFORT_BACKENDS.contains(&spelling),
+                reasoning_effort_refusal(CloudHttp, backend, ProviderAuthSource::ApiKey).is_none(),
+                "{spelling}"
+            );
+        }
+        for id in ["anthropic", "openai", "gw"] {
+            assert_eq!(
+                client_effective_backend(id, None),
+                backend_str(effective_backend(id, None)),
+                "{id}"
+            );
+        }
+        // The dialect the client-side check reads for an entry that names none is the one the
+        // loader gives it.
+        let entry = |id: &str, extra: &str| -> LlmProviderConfig {
+            serde_yml::from_str(&format!(
+                "id: {id}\nendpoint: https://api.example.com\napi-key-secret: {id}-api-key\n\
+                 model-aliases:\n  m: model\ncost-per-mtoken-in: 1.0\ncost-per-mtoken-out: 1.0\n\
+                 rate-limit:\n  requests-per-minute: 10\n  tokens-per-minute: 1000\n{extra}"
+            ))
+            .expect("entry yaml")
+        };
+        for (class, extra) in [
+            (CloudHttp, ""),
+            (Local, "backend-class: local\n"),
+            (MeshRemote, "backend-class: mesh-remote\ndevice-id: peer\n"),
+            (
+                AgentCli,
+                "backend-class: agent-cli\nagent-cli:\n  vendor: claude\n  command: /nonexistent/claude\n",
+            ),
+        ] {
+            for id in ["anthropic", "gw"] {
+                let loaded = entry(id, extra);
+                assert_eq!(loaded.backend_class, class);
+                assert_eq!(
+                    entry_backend(id, backend_class_str(class), None),
+                    backend_str(effective_backend(&loaded.id, loaded.backend)),
+                    "{id} on {}",
+                    backend_class_str(class)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn write_error_projection() {
         assert!(matches!(
             write_error(ProviderWriteError::NotFound),
@@ -2331,6 +2785,7 @@ mod sign_in_entry_tests {
         SignInModel, SignInStarted, SignOutOutcome, VerifyOutcome, STATE_PENDING, STATE_SIGNED_IN,
         STATE_SIGNED_OUT,
     };
+    use advance_runtime::config::MAX_SIGN_IN_GENERATE_TIMEOUT_SECS;
     use cap_secrets::InMemorySecretStorage;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroize::Zeroizing;
@@ -3094,6 +3549,8 @@ database:
             auth_scheme: None,
             api_key_secret: None,
             auth_source: None,
+            generate_timeout_secs: None,
+            reasoning_effort: None,
             cost: ClientProviderCost {
                 input_per_mtoken: 0.001,
                 output_per_mtoken: 0.001,
@@ -3124,6 +3581,7 @@ database:
         outcome: Mutex<Result<(), PreflightFail>>,
         stall: Mutex<Duration>,
         calls: Mutex<Vec<String>>,
+        budgets: Mutex<Vec<Duration>>,
     }
 
     impl FakeClaimed {
@@ -3133,6 +3591,7 @@ database:
                 outcome: Mutex::new(outcome),
                 stall: Mutex::new(Duration::ZERO),
                 calls: Mutex::new(Vec::new()),
+                budgets: Mutex::new(Vec::new()),
             })
         }
     }
@@ -3145,9 +3604,10 @@ database:
             &self,
             provider_id: &str,
             cancel: &CancelToken,
-            _budget: Duration,
+            budget: Duration,
         ) -> Result<(), PreflightFail> {
             self.calls.lock().unwrap().push(provider_id.to_string());
+            self.budgets.lock().unwrap().push(budget);
             let stall = *self.stall.lock().unwrap();
             if !stall.is_zero() {
                 let start = std::time::Instant::now();
@@ -3425,6 +3885,630 @@ database:
         assert_eq!(
             admin.get_provider("local-a").unwrap().last_preflight,
             Some(verdict)
+        );
+    }
+
+    // ── an entry's own generate budget and reasoning setting ─────────────────────────────────
+
+    fn keyed_create(id: &str) -> ClientCreateProviderRequest {
+        ClientCreateProviderRequest {
+            provider_id: id.into(),
+            auth_source: None,
+            endpoint: Some("https://api.example.com".into()),
+            ..sign_in_request()
+        }
+    }
+
+    fn document(f: &Fixture) -> String {
+        std::fs::read_to_string(f.home.join(".advance/runtime-config.yaml")).unwrap()
+    }
+
+    fn update(
+        admin: &WiredProviderAdmin,
+        id: &str,
+        request: ClientUpdateProviderRequest,
+    ) -> Result<ClientProviderSummary, ProviderError> {
+        admin
+            .update_provider(id, &request)
+            .map(|outcome| outcome.value)
+    }
+
+    /// Both settings are written under the runtime's spelling, read back by the strict loader,
+    /// echoed by the summary, replaced by a value, kept by an update that does not name them,
+    /// and removed by an explicit null.
+    #[test]
+    fn provider_settings_round_trip_through_create_update_and_the_summary() {
+        let f = Fixture::new();
+        let admin = f.admin();
+        let created = admin
+            .create_provider(&ClientCreateProviderRequest {
+                generate_timeout_secs: Some(120),
+                reasoning_effort: Some("low".into()),
+                ..keyed_create("reasoner")
+            })
+            .expect("created")
+            .value;
+        assert_eq!(created.generate_timeout_secs, Some(120));
+        assert_eq!(created.reasoning_effort.as_deref(), Some("low"));
+        let text = document(&f);
+        assert!(text.contains("generate-timeout-secs: 120"), "{text}");
+        assert!(text.contains("reasoning-effort: low"), "{text}");
+        let entry = f.entry("reasoner").expect("on disk");
+        assert_eq!(entry.generate_timeout(), Some(Duration::from_secs(120)));
+        assert_eq!(entry.reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(admin.get_provider("reasoner").unwrap(), created);
+
+        let replaced = update(
+            &admin,
+            "reasoner",
+            ClientUpdateProviderRequest {
+                generate_timeout_secs: Some(Some(600)),
+                reasoning_effort: Some(Some("xhigh".into())),
+                ..Default::default()
+            },
+        )
+        .expect("replaced");
+        assert_eq!(replaced.generate_timeout_secs, Some(600));
+        assert_eq!(replaced.reasoning_effort.as_deref(), Some("xhigh"));
+
+        let kept = update(
+            &admin,
+            "reasoner",
+            ClientUpdateProviderRequest {
+                endpoint: Some("https://proxy.example.com".into()),
+                ..Default::default()
+            },
+        )
+        .expect("kept");
+        assert_eq!(kept.generate_timeout_secs, Some(600));
+        assert_eq!(kept.reasoning_effort.as_deref(), Some("xhigh"));
+
+        let cleared = update(
+            &admin,
+            "reasoner",
+            ClientUpdateProviderRequest {
+                generate_timeout_secs: Some(None),
+                reasoning_effort: Some(None),
+                ..Default::default()
+            },
+        )
+        .expect("cleared");
+        assert_eq!(cleared.generate_timeout_secs, None);
+        assert_eq!(cleared.reasoning_effort, None);
+        let entry = f.entry("reasoner").unwrap();
+        assert_eq!(entry.generate_timeout_secs, None);
+        assert_eq!(entry.reasoning_effort, None);
+        let text = document(&f);
+        assert!(!text.contains("generate-timeout-secs"), "{text}");
+        assert!(!text.contains("reasoning-effort"), "{text}");
+        let wire = serde_json::to_value(&cleared).unwrap();
+        assert!(wire.get("generate_timeout_secs").is_none(), "{wire}");
+        assert!(wire.get("reasoning_effort").is_none(), "{wire}");
+
+        // A local entry takes both.
+        let local = admin
+            .create_provider(&ClientCreateProviderRequest {
+                generate_timeout_secs: Some(900),
+                reasoning_effort: Some("high".into()),
+                ..local_create("local-reasoner")
+            })
+            .expect("local")
+            .value;
+        assert_eq!(local.generate_timeout_secs, Some(900));
+        assert_eq!(local.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    /// A setting the entry would not be able to take is refused before the document changes,
+    /// with the setting's detail token — also when the update changes what decides it.
+    #[test]
+    fn a_setting_the_entry_cannot_take_is_refused_with_its_detail_before_any_write() {
+        let f = Fixture::new();
+        let admin = f.admin();
+        admin
+            .create_provider(&ClientCreateProviderRequest {
+                reasoning_effort: Some("low".into()),
+                ..keyed_create("reasoner")
+            })
+            .expect("created");
+        let before = document(&f);
+        let refused = |detail: &str| Err(ProviderError::InvalidRequest(detail.into()));
+
+        for (request, expected, why) in [
+            (
+                ClientCreateProviderRequest {
+                    generate_timeout_secs: Some(4),
+                    ..keyed_create("c1")
+                },
+                refused(INVALID_GENERATE_TIMEOUT_DETAIL),
+                "below the bound",
+            ),
+            (
+                ClientCreateProviderRequest {
+                    reasoning_effort: Some("turbo".into()),
+                    ..keyed_create("c2")
+                },
+                refused(INVALID_REASONING_EFFORT_DETAIL),
+                "unknown spelling",
+            ),
+            (
+                ClientCreateProviderRequest {
+                    backend: Some("anthropic-messages".into()),
+                    reasoning_effort: Some("low".into()),
+                    ..keyed_create("c3")
+                },
+                refused(REASONING_EFFORT_UNSUPPORTED_DETAIL),
+                "messages dialect",
+            ),
+            (
+                ClientCreateProviderRequest {
+                    reasoning_effort: Some("low".into()),
+                    ..keyed_create("anthropic")
+                },
+                refused(REASONING_EFFORT_UNSUPPORTED_DETAIL),
+                "the anthropic id",
+            ),
+            (
+                ClientCreateProviderRequest {
+                    backend_class: Some("mesh-remote".into()),
+                    device_id: Some("peer".into()),
+                    generate_timeout_secs: Some(60),
+                    ..keyed_create("c4")
+                },
+                refused(GENERATE_TIMEOUT_UNSUPPORTED_DETAIL),
+                "mesh-remote budget",
+            ),
+        ] {
+            assert_eq!(
+                admin.create_provider(&request).map(|o| o.value.provider_id),
+                expected.map(|()| String::new()),
+                "{why}"
+            );
+            assert_eq!(document(&f), before, "{why}: the document is unchanged");
+        }
+
+        // The stored setting meets the update's new dialect.
+        let to_messages = ClientUpdateProviderRequest {
+            backend: Some("anthropic-messages".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            update(&admin, "reasoner", to_messages.clone()).map(|_| ()),
+            refused(REASONING_EFFORT_UNSUPPORTED_DETAIL)
+        );
+        assert_eq!(
+            update(
+                &admin,
+                "reasoner",
+                ClientUpdateProviderRequest {
+                    generate_timeout_secs: Some(Some(901)),
+                    ..Default::default()
+                }
+            )
+            .map(|_| ()),
+            refused(INVALID_GENERATE_TIMEOUT_DETAIL)
+        );
+        assert_eq!(
+            update(
+                &admin,
+                "openai",
+                ClientUpdateProviderRequest {
+                    backend_class: Some("mesh-remote".into()),
+                    device_id: Some("peer".into()),
+                    generate_timeout_secs: Some(Some(60)),
+                    ..Default::default()
+                }
+            )
+            .map(|_| ()),
+            refused(GENERATE_TIMEOUT_UNSUPPORTED_DETAIL)
+        );
+        assert_eq!(document(&f), before, "refused updates leave the document");
+
+        // Clearing the setting in the same update makes the change legal.
+        let moved = update(
+            &admin,
+            "reasoner",
+            ClientUpdateProviderRequest {
+                reasoning_effort: Some(None),
+                ..to_messages
+            },
+        )
+        .expect("the setting goes with the dialect");
+        assert_eq!(moved.backend.as_deref(), Some("anthropic-messages"));
+        assert_eq!(moved.reasoning_effort, None);
+    }
+
+    /// The pre-write check reads the dialect the way the loader does: a `local` entry speaks
+    /// `openai-chat` whatever its id, and an update that moves such an entry to `cloud-http`
+    /// gives it the dialect its id implies there.
+    #[test]
+    fn the_pre_write_check_reads_the_dialect_the_way_the_loader_does() {
+        let f = Fixture::new();
+        let admin = f.admin();
+        let created = admin
+            .create_provider(&ClientCreateProviderRequest {
+                reasoning_effort: Some("low".into()),
+                ..local_create("anthropic")
+            })
+            .expect("a local entry takes a reasoning setting whatever its id")
+            .value;
+        assert_eq!(created.reasoning_effort.as_deref(), Some("low"));
+        let before = document(&f);
+        let to_cloud = ClientUpdateProviderRequest {
+            backend_class: Some("cloud-http".into()),
+            endpoint: Some("https://api.example.com".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            update(&admin, "anthropic", to_cloud.clone()).map(|_| ()),
+            Err(ProviderError::InvalidRequest(
+                REASONING_EFFORT_UNSUPPORTED_DETAIL.into()
+            ))
+        );
+        assert_eq!(document(&f), before, "the document is unchanged");
+        // Naming a dialect that carries the setting in the same update makes the move legal.
+        let moved = update(
+            &admin,
+            "anthropic",
+            ClientUpdateProviderRequest {
+                backend: Some("openai-chat".into()),
+                ..to_cloud
+            },
+        )
+        .expect("moved");
+        assert_eq!(moved.backend_class, "cloud-http");
+        assert_eq!(moved.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    /// A sign-in entry sends only what its route accepts: a reasoning setting is refused on
+    /// create and on update, while its own generate budget (at most the streamed-exchange
+    /// lifetime) is kept. Its `:preflight` (the sign-in's verify, not a generate hop) keeps the
+    /// preflight deadline.
+    #[test]
+    fn a_sign_in_entry_refuses_a_reasoning_setting_and_keeps_its_generate_budget() {
+        let f = Fixture::new();
+        let admin = f.admin().with_preflight_timeout(Duration::from_millis(100));
+        let refused = Err(ProviderError::InvalidRequest(
+            REASONING_EFFORT_UNSUPPORTED_DETAIL.into(),
+        ));
+        assert_eq!(
+            admin
+                .create_provider(&ClientCreateProviderRequest {
+                    reasoning_effort: Some("low".into()),
+                    ..sign_in_request()
+                })
+                .map(|o| o.value),
+            refused.clone()
+        );
+        assert!(f.entry("openai-plan").is_none());
+        // Its requests are streamed exchanges, which end after the streamed-exchange lifetime.
+        let too_long = Err(ProviderError::InvalidRequest(
+            INVALID_GENERATE_TIMEOUT_DETAIL.into(),
+        ));
+        assert_eq!(
+            admin
+                .create_provider(&ClientCreateProviderRequest {
+                    generate_timeout_secs: Some(MAX_SIGN_IN_GENERATE_TIMEOUT_SECS + 1),
+                    ..sign_in_request()
+                })
+                .map(|o| o.value),
+            too_long.clone()
+        );
+        assert!(f.entry("openai-plan").is_none());
+
+        let created = admin
+            .create_provider(&ClientCreateProviderRequest {
+                generate_timeout_secs: Some(120),
+                ..sign_in_request()
+            })
+            .expect("created")
+            .value;
+        assert_eq!(created.generate_timeout_secs, Some(120));
+        assert_eq!(
+            f.entry("openai-plan").unwrap().generate_timeout_secs,
+            Some(120)
+        );
+        let budget = |secs| ClientUpdateProviderRequest {
+            generate_timeout_secs: Some(Some(secs)),
+            ..Default::default()
+        };
+        assert_eq!(
+            update(
+                &admin,
+                "openai-plan",
+                budget(MAX_SIGN_IN_GENERATE_TIMEOUT_SECS + 1)
+            ),
+            too_long
+        );
+        let at_ceiling = update(
+            &admin,
+            "openai-plan",
+            budget(MAX_SIGN_IN_GENERATE_TIMEOUT_SECS),
+        )
+        .expect("the ceiling itself is accepted");
+        assert_eq!(
+            at_ceiling.generate_timeout_secs,
+            Some(MAX_SIGN_IN_GENERATE_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            update(
+                &admin,
+                "openai-plan",
+                ClientUpdateProviderRequest {
+                    reasoning_effort: Some(Some("low".into())),
+                    ..Default::default()
+                }
+            ),
+            refused
+        );
+
+        *f.port.verify_delay.lock().unwrap() = Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        let verdict = admin.preflight("openai-plan").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(verdict.reason.as_deref(), Some(REASON_TIMEOUT));
+    }
+
+    /// A chat preflight that answers after `delay` (or `Cancelled` when its deadline fires
+    /// first), recording the entry it was handed.
+    struct SlowPreflight {
+        delay: Duration,
+        seen: Mutex<Vec<(Option<u32>, Option<ReasoningEffort>)>>,
+    }
+
+    impl PreflightPort for SlowPreflight {
+        fn preflight(
+            &self,
+            _home: &Path,
+            provider: &LlmProviderConfig,
+            _key: &SecretBytes,
+            cancel: &CancelToken,
+        ) -> Result<(), PreflightFail> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((provider.generate_timeout_secs, provider.reasoning_effort));
+            let started = std::time::Instant::now();
+            while started.elapsed() < self.delay {
+                if cancel.is_cancelled() {
+                    return Err(PreflightFail::Cancelled);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        }
+    }
+
+    /// The chat preflight of an entry with its own generate budget (`:set-key` and
+    /// `:preflight`) is bounded by that budget instead of the preflight deadline, and is handed
+    /// the entry with its settings; without the key the deadline still applies.
+    #[test]
+    fn the_chat_preflight_of_an_entry_is_bounded_by_its_own_generate_budget() {
+        let f = Fixture::new();
+        let slow = Arc::new(SlowPreflight {
+            delay: Duration::from_millis(300),
+            seen: Mutex::new(Vec::new()),
+        });
+        let cfg =
+            advance_runtime::config::load_config(&f.home.join(".advance/runtime-config.yaml"))
+                .expect("fixture parses");
+        let admin = WiredProviderAdmin::new(
+            f.home.clone(),
+            Arc::new(cap_llm::StaticConfig(Arc::new(cfg))),
+            Some(Arc::clone(&f.store)),
+            slow.clone(),
+            Arc::new(NoReferences),
+        )
+        .with_reload_wait(Duration::from_millis(1))
+        .with_preflight_timeout(Duration::from_millis(100));
+        admin
+            .create_provider(&ClientCreateProviderRequest {
+                generate_timeout_secs: Some(5),
+                reasoning_effort: Some("minimal".into()),
+                ..keyed_create("slow")
+            })
+            .unwrap();
+        admin.create_provider(&keyed_create("plain")).unwrap();
+
+        let stored = admin.set_key("slow", "sk-test-slow").unwrap().value;
+        assert!(stored.stored, "{stored:?}");
+        assert!(stored.preflight.as_ref().unwrap().ok, "{stored:?}");
+        assert!(admin.preflight("slow").unwrap().ok);
+
+        let refused = admin.set_key("plain", "sk-test-plain").unwrap().value;
+        assert!(!refused.stored);
+        assert_eq!(
+            refused.preflight.unwrap().reason.as_deref(),
+            Some(REASON_TIMEOUT)
+        );
+        assert_eq!(
+            *slow.seen.lock().unwrap(),
+            vec![
+                (Some(5), Some(ReasoningEffort::Minimal)),
+                (Some(5), Some(ReasoningEffort::Minimal)),
+                (None, None),
+            ]
+        );
+    }
+
+    /// A claimed entry's preflight is handed (and bounded by) the entry's own generate budget.
+    #[test]
+    fn the_claimed_preflight_budget_is_the_entry_generate_budget() {
+        let f = Fixture::new();
+        let port = FakeClaimed::new(&["local-a", "local-b"], Ok(()));
+        *port.stall.lock().unwrap() = Duration::from_millis(300);
+        let admin = f
+            .admin()
+            .with_claimed_preflight(port.clone() as Arc<dyn ClaimedEntryPreflight>)
+            .with_preflight_timeout(Duration::from_millis(100));
+        admin
+            .create_provider(&ClientCreateProviderRequest {
+                generate_timeout_secs: Some(5),
+                ..local_create("local-a")
+            })
+            .unwrap();
+        admin.create_provider(&local_create("local-b")).unwrap();
+        assert!(admin.preflight("local-a").unwrap().ok);
+        assert_eq!(
+            admin.preflight("local-b").unwrap().reason.as_deref(),
+            Some(REASON_TIMEOUT)
+        );
+        assert_eq!(
+            *port.budgets.lock().unwrap(),
+            vec![Duration::from_secs(5), Duration::from_millis(100)]
+        );
+    }
+
+    /// A chat preflight that holds until the test opens its gate (or its deadline cancels it),
+    /// telling the test each time one starts. It gives up by itself after a while, so a check
+    /// that blocks the test fails it instead of hanging it.
+    struct GatedPreflight {
+        started: Mutex<std::sync::mpsc::Sender<()>>,
+        open: Mutex<bool>,
+        opened: Condvar,
+    }
+
+    impl GatedPreflight {
+        fn open_gate(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+
+        fn close_gate(&self) {
+            *self.open.lock().unwrap() = false;
+        }
+    }
+
+    impl PreflightPort for GatedPreflight {
+        fn preflight(
+            &self,
+            _home: &Path,
+            _provider: &LlmProviderConfig,
+            _key: &SecretBytes,
+            cancel: &CancelToken,
+        ) -> Result<(), PreflightFail> {
+            let _ = self.started.lock().unwrap().send(());
+            let give_up = std::time::Instant::now() + Duration::from_secs(10);
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                if cancel.is_cancelled() {
+                    return Err(PreflightFail::Cancelled);
+                }
+                if std::time::Instant::now() >= give_up {
+                    return Err(PreflightFail::ProviderRejected {
+                        reason: "gate-never-opened".into(),
+                    });
+                }
+                open = self
+                    .opened
+                    .wait_timeout(open, Duration::from_millis(20))
+                    .unwrap()
+                    .0;
+            }
+            Ok(())
+        }
+    }
+
+    /// A key's check, which may run as long as the entry's own generate budget, does not hold
+    /// other mutations up; a key checked against settings that changed (or an entry that went)
+    /// meanwhile is not stored.
+    #[test]
+    fn a_key_check_does_not_hold_up_other_mutations() {
+        let f = Fixture::new();
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let gate = Arc::new(GatedPreflight {
+            started: Mutex::new(started_tx),
+            open: Mutex::new(false),
+            opened: Condvar::new(),
+        });
+        let cfg =
+            advance_runtime::config::load_config(&f.home.join(".advance/runtime-config.yaml"))
+                .expect("fixture parses");
+        let admin = WiredProviderAdmin::new(
+            f.home.clone(),
+            Arc::new(cap_llm::StaticConfig(Arc::new(cfg))),
+            Some(Arc::clone(&f.store)),
+            gate.clone(),
+            Arc::new(NoReferences),
+        )
+        .with_reload_wait(Duration::from_millis(1));
+        admin
+            .create_provider(&ClientCreateProviderRequest {
+                generate_timeout_secs: Some(600),
+                ..keyed_create("slow")
+            })
+            .unwrap();
+        let secret = f.entry("slow").unwrap().api_key_secret;
+        let wait_started = || {
+            started
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the key check started")
+        };
+
+        // An update while the key is being checked goes through at once and voids the check.
+        let answer = std::thread::scope(|s| {
+            let pending = s.spawn(|| admin.set_key("slow", "sk-test-slow"));
+            wait_started();
+            let moved = update(
+                &admin,
+                "slow",
+                ClientUpdateProviderRequest {
+                    endpoint: Some("https://moved.example.com".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("the update does not wait for the check");
+            assert_eq!(moved.endpoint, "https://moved.example.com");
+            assert!(
+                !pending.is_finished(),
+                "the update finished while the key was still being checked"
+            );
+            gate.open_gate();
+            pending.join().unwrap()
+        })
+        .expect("answered")
+        .value;
+        assert!(!answer.stored, "{answer:?}");
+        assert_eq!(
+            answer.preflight.unwrap().reason.as_deref(),
+            Some(REASON_CANCELLED)
+        );
+        assert!(f.store.resolve(&secret).is_err(), "nothing was stored");
+
+        // A check nothing overlaps stores the key.
+        let stored = admin.set_key("slow", "sk-test-slow").unwrap().value;
+        wait_started();
+        assert!(stored.stored, "{stored:?}");
+        assert!(stored.preflight.unwrap().ok);
+        assert_eq!(
+            f.store.resolve(&secret).unwrap().expose_secret(),
+            "sk-test-slow"
+        );
+
+        // An entry deleted while its key is being checked answers as gone; the key it held
+        // before stays as the delete left it.
+        gate.close_gate();
+        let answer = std::thread::scope(|s| {
+            let pending = s.spawn(|| admin.set_key("slow", "sk-test-other"));
+            wait_started();
+            admin
+                .delete_provider("slow")
+                .expect("the delete does not wait");
+            gate.open_gate();
+            pending.join().unwrap()
+        });
+        assert_eq!(
+            answer.map(|o| o.value),
+            Err(ProviderError::NotFound("slow".into()))
+        );
+        assert!(f.entry("slow").is_none());
+        assert_ne!(
+            f.store
+                .resolve(&secret)
+                .ok()
+                .map(|key| key.expose_secret().to_string())
+                .as_deref(),
+            Some("sk-test-other"),
+            "the key checked for the deleted entry was not stored"
         );
     }
 }

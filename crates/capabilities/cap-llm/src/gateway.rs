@@ -334,6 +334,17 @@ struct DispatchError {
     tokens_released: bool,
 }
 
+/// Wall time one `generate` has spent inside hops that carry a bound of their own, credited
+/// back to the bounds other hops share (see [`LlmGateway::hop_deadline`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HopCredit {
+    /// Inside agent-cli hops: added back to the shared 30s default.
+    pub(crate) agent_cli: Duration,
+    /// Inside hops of entries with their own `generate-timeout-secs`: added back to the
+    /// shared 30s default and to the agent-cli bound.
+    pub(crate) entry_budget: Duration,
+}
+
 /// A failed upstream attempt of a buffered cloud call, with the usage the upstream reported
 /// before the failure: an answer that ended incomplete still consumed (and reported) tokens,
 /// which the site owes like any other attempt's usage.
@@ -454,8 +465,10 @@ pub struct LlmGateway {
     delta_sink: Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
     placement_telemetry: Arc<dyn crate::placement::PlacementTelemetry>,
     /// Test-only hop budget. `Some` bounds every hop of that `generate` from its
-    /// start. `None` uses `cap_http::DEFAULT_TIMEOUT` for cloud-http, local, and
-    /// mesh, and [`crate::backend_cli::MAX_CALL_DURATION`] for an agent-cli hop.
+    /// start. `None` gives a hop of an entry with its own `generate-timeout-secs` that
+    /// budget from the hop's own start, an agent-cli hop
+    /// [`crate::backend_cli::MAX_CALL_DURATION`], and every other cloud-http, local and
+    /// mesh hop the shared `cap_http::DEFAULT_TIMEOUT` (see [`Self::hop_deadline`]).
     generate_timeout: Option<Duration>,
     /// Optional Client API note for a guest-visible subscription-usage failure.
     /// `None` (every plain `new`) records nothing.
@@ -676,24 +689,51 @@ impl LlmGateway {
         }
     }
 
-    /// Deadline for one hop of `generate`, measured from `start` (the start of that
-    /// `generate`). An explicit `generate_timeout` applies to every hop. Otherwise an
-    /// agent-cli hop gets [`crate::backend_cli::MAX_CALL_DURATION`], and cloud-http /
-    /// local / mesh keep the 30s default plus time already spent inside agent-cli hops
-    /// (`cli_elapsed`), so a long CLI call does not expire the next hop the moment it returns.
+    /// Deadline for one hop of `generate` that starts at `hop_start`; `start` is the start of
+    /// that `generate`.
+    ///
+    /// - An explicit `generate_timeout` bounds every hop from `start`.
+    /// - A hop of an entry with its own budget (`entry_timeout`, its `generate-timeout-secs`)
+    ///   gets that budget from its own start, whatever earlier hops spent.
+    /// - An agent-cli hop gets [`crate::backend_cli::MAX_CALL_DURATION`] from `start`.
+    /// - Every other cloud-http / local / mesh hop shares the 30s default from `start`.
+    ///
+    /// The time already spent inside hops with a bound of their own (`credit`) is added back
+    /// to the shared bounds, so a long agent-cli call or a long hop of an entry with its own
+    /// budget does not expire the next hop the moment it returns.
     pub(crate) fn hop_deadline(
         &self,
         start: Instant,
+        hop_start: Instant,
         backend: InferenceBackendClass,
-        cli_elapsed: Duration,
+        entry_timeout: Option<Duration>,
+        credit: HopCredit,
     ) -> Instant {
         if let Some(limit) = self.generate_timeout {
             return start + limit;
         }
         if backend == InferenceBackendClass::AgentCli {
-            return start + crate::backend_cli::MAX_CALL_DURATION;
+            return start + crate::backend_cli::MAX_CALL_DURATION + credit.entry_budget;
         }
-        start + cap_http::DEFAULT_TIMEOUT + cli_elapsed
+        if let Some(budget) = entry_timeout {
+            return hop_start + budget;
+        }
+        start + cap_http::DEFAULT_TIMEOUT + credit.agent_cli + credit.entry_budget
+    }
+
+    /// Whether a failed hop of `resolved` ended because the entry's own generate budget ran
+    /// out before it released a token: a cloud-http entry with `generate-timeout-secs`, not
+    /// under an explicit `generate_timeout`. The walker then tries the next candidate, which
+    /// has a bound of its own (or what is left of the shared default), as it would after a
+    /// transport timeout. The shared default running out stays terminal, as before, and so
+    /// does a local hop's own budget: a local failure never hops onto another candidate this
+    /// way (C238).
+    fn ran_out_of_entry_budget(&self, resolved: &ResolvedProvider, de: &DispatchError) -> bool {
+        self.generate_timeout.is_none()
+            && resolved.backend_class == InferenceBackendClass::CloudHttp
+            && resolved.generate_timeout.is_some()
+            && !de.tokens_released
+            && matches!(&de.err, LlmError::ProviderError(msg) if msg == "deadline-exceeded")
     }
 
     pub fn with_inference_backends(mut self, registry: InferenceBackendRegistry) -> Self {
@@ -1805,6 +1845,9 @@ impl LlmGateway {
         // and report a rejected sign-in after the gateway borrow has ended.
         let plan_entry = resolved.uses_chatgpt_sign_in();
         let credential_watch = self.credential_watch(&resolved);
+        // The entry's own generate budget, when it sets one, is the HTTP layer's head and idle
+        // bound for this stream; the single anchor below still caps the whole stream.
+        let entry_timeout = resolved.generate_timeout;
 
         let owner_task = tokio::spawn(async move {
             // ONE deadline anchor for the entire stream: dispatch, every pull,
@@ -1897,7 +1940,10 @@ impl LlmGateway {
                 } => {
                     let dispatched = tokio::time::timeout_at(
                         dl,
-                        chain.execute_streaming(&agent_owner, req, &http_cap),
+                        under_entry_timeout(
+                            entry_timeout,
+                            chain.execute_streaming(&agent_owner, req, &http_cap),
+                        ),
                     )
                     .await;
                     let (head, mut body) = match dispatched {
@@ -2208,6 +2254,12 @@ impl LlmGateway {
                                 }
                             }
                             if ev.tool_call_deltas.is_some() {
+                                progressed = true;
+                            }
+                            if ev.reasoning {
+                                // Reasoning output is never released as text, but a reasoning
+                                // model may stream more than MAX_IGNORE_STREAK such frames
+                                // before its first text delta: it is progress, not a flood.
                                 progressed = true;
                             }
                             if let Some(fr) = &ev.finish_reason {
@@ -2801,9 +2853,10 @@ impl LlmGateway {
         pin: Option<&str>,
     ) -> Result<ChatResponse, LlmError> {
         let start = Instant::now();
-        // Wall time spent inside agent-cli hops when no explicit generate_timeout is set.
-        // Added back onto the 30s budget of later cloud-http / local / mesh hops.
-        let mut cli_elapsed = Duration::ZERO;
+        // Wall time spent inside hops with a bound of their own (agent-cli hops, hops of
+        // entries with their own generate budget) when no explicit generate_timeout is set.
+        // Added back onto the shared bounds of later hops (`hop_deadline`).
+        let mut credit = HopCredit::default();
         let cfg = self.config_provider.current();
         // Lane agent-llm-policy: the agent's pin / default model / constraint shape the
         // request BEFORE placement; a pinned provider absent from config fails closed here.
@@ -2877,7 +2930,14 @@ impl LlmGateway {
             };
             let resolved = crate::provider::make_resolved(&pcfg, rec.model_revision.clone());
             ctx.placement = Some(rec.clone());
-            let hop_deadline = self.hop_deadline(start, resolved.backend_class, cli_elapsed);
+            let hop_started = Instant::now();
+            let hop_deadline = self.hop_deadline(
+                start,
+                hop_started,
+                resolved.backend_class,
+                resolved.generate_timeout,
+                credit,
+            );
             if Instant::now() >= hop_deadline {
                 if let Some(outcome) = last_ok.take() {
                     return self.finish_winner(&ctx, outcome, start, &mut tee);
@@ -2910,9 +2970,6 @@ impl LlmGateway {
                     return Err(err);
                 }
             }
-            let count_cli = self.generate_timeout.is_none()
-                && resolved.backend_class == InferenceBackendClass::AgentCli;
-            let hop_started = Instant::now();
             let dispatched = self
                 .dispatch_one(
                     &mut ctx,
@@ -2923,8 +2980,13 @@ impl LlmGateway {
                     hop_deadline,
                 )
                 .await;
-            if count_cli {
-                cli_elapsed = cli_elapsed.saturating_add(hop_started.elapsed());
+            if self.generate_timeout.is_none() {
+                let spent = hop_started.elapsed();
+                if resolved.backend_class == InferenceBackendClass::AgentCli {
+                    credit.agent_cli = credit.agent_cli.saturating_add(spent);
+                } else if resolved.generate_timeout.is_some() {
+                    credit.entry_budget = credit.entry_budget.saturating_add(spent);
+                }
             }
             match dispatched {
                 Ok(outcome) if ctx.hard_task_class => {
@@ -2948,7 +3010,9 @@ impl LlmGateway {
                     continue;
                 }
                 Err(de)
-                    if crate::placement::is_pre_token_failover(&de.err) && !de.tokens_released =>
+                    if (crate::placement::is_pre_token_failover(&de.err)
+                        && !de.tokens_released)
+                        || self.ran_out_of_entry_budget(&resolved, &de) =>
                 {
                     if de.request_emitted {
                         self.emit_hop_error(&ctx, &resolved.model, &de.err);
@@ -2978,8 +3042,12 @@ impl LlmGateway {
     ///
     /// The plan route of a ChatGPT sign-in entry only accepts streamed requests, so such an
     /// entry is served by [`Self::streamed_attempt`] instead of the three unstreamed steps.
-    /// That attempt is never unbounded: a site without a deadline gets the buffered
-    /// executor's default total timeout.
+    /// That attempt is never unbounded: a site without a deadline gets the entry's generate
+    /// budget (the buffered executor's default total timeout unless the entry sets its own).
+    ///
+    /// An entry with its own `generate-timeout-secs` sends its request with that budget as
+    /// the HTTP layer's total timeout ([`under_entry_timeout`]), so the executor's default
+    /// does not cut a hop the entry allows to run longer.
     async fn cloud_attempt(
         &self,
         adapter: &dyn crate::providers::ProviderAdapter,
@@ -2992,7 +3060,7 @@ impl LlmGateway {
             || AttemptFailure::from(LlmError::ProviderError("deadline-exceeded".into()));
 
         if resolved.uses_chatgpt_sign_in() {
-            let deadline = deadline.unwrap_or_else(|| Instant::now() + cap_http::DEFAULT_TIMEOUT);
+            let deadline = deadline.unwrap_or_else(|| Instant::now() + resolved.generate_budget());
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(deadline_exceeded());
@@ -3001,7 +3069,10 @@ impl LlmGateway {
             // upstream read.
             return match tokio::time::timeout(
                 remaining,
-                self.streamed_attempt(adapter, resolved, ctx, http_cap),
+                under_entry_timeout(
+                    resolved.generate_timeout,
+                    self.streamed_attempt(adapter, resolved, ctx, http_cap),
+                ),
             )
             .await
             {
@@ -3019,7 +3090,10 @@ impl LlmGateway {
                 }
                 match tokio::time::timeout(
                     remaining,
-                    self.chain.execute(&ctx.agent_id, req, http_cap),
+                    under_entry_timeout(
+                        resolved.generate_timeout,
+                        self.chain.execute(&ctx.agent_id, req, http_cap),
+                    ),
                 )
                 .await
                 {
@@ -3027,7 +3101,13 @@ impl LlmGateway {
                     Err(_) => return Err(deadline_exceeded()),
                 }
             }
-            None => self.chain.execute(&ctx.agent_id, req, http_cap).await,
+            None => {
+                under_entry_timeout(
+                    resolved.generate_timeout,
+                    self.chain.execute(&ctx.agent_id, req, http_cap),
+                )
+                .await
+            }
         };
         let response = sent.map_err(map_http_err_to_llm)?;
         adapter
@@ -3045,7 +3125,8 @@ impl LlmGateway {
     /// - Every text fragment passes the decoded-layer scan of the live path before it is
     ///   kept: the streaming chain scans wire chunks only, and the whole-body inbound scan
     ///   of the buffered chain does not run here.
-    /// - Both usage counters and some text are required, as in the unstreamed parser.
+    /// - Both usage counters and some text (or tool calls, or reasoning output) are required,
+    ///   as in the unstreamed parser.
     /// - A stream that ends before the dialect's terminal event is a failure, and so is a
     ///   terminal event that reports the response incomplete: only a completed response
     ///   is an answer. The usage an incomplete response reported comes back with the
@@ -3094,6 +3175,7 @@ impl LlmGateway {
         let mut pipeline = crate::stream::DecodedPipeline::new();
         let mut text = String::new();
         let mut saw_text = false;
+        let mut saw_reasoning = false;
         let mut finish_reason: Option<String> = None;
         let mut wire_bytes: usize = 0;
         let mut ignore_streak: u32 = 0;
@@ -3131,7 +3213,9 @@ impl LlmGateway {
                 // In-band error frames (typed by their code where it is a plan-usage one),
                 // malformed terminals and unknown terminal families fail closed.
                 let ev = adapter.parse_sse_frame(&frame)?;
-                let mut progressed = ev.usage.is_some() || ev.terminal;
+                // Reasoning output is never text, but it is progress (see the live path).
+                let mut progressed = ev.usage.is_some() || ev.terminal || ev.reasoning;
+                saw_reasoning |= ev.reasoning;
                 fold.apply(&ev);
                 tool_fold.apply(&ev);
                 if ev.tool_call_deltas.is_some() {
@@ -3197,10 +3281,11 @@ impl LlmGateway {
         text.push_str(&released);
 
         // Usage must not coerce to 0, and an answer without any text part is a shape error
-        // unless the model returned native tool_calls (content may be empty).
+        // unless the model returned native tool_calls (content may be empty) or only reasoning
+        // (a reasoning model that spent its budget reasoning), as in the unstreamed parsers.
         let invalid_shape = || LlmError::ProviderError("invalid response shape".into());
         let tool_calls = tool_fold.finish();
-        if !saw_text && tool_calls.is_empty() {
+        if !saw_text && tool_calls.is_empty() && !saw_reasoning {
             return Err(invalid_shape().into());
         }
         let input_tokens = fold.input_tokens.ok_or_else(invalid_shape)?;
@@ -4169,7 +4254,7 @@ impl LlmGateway {
             let port = self.port_for(&resolved)?;
             emit_llm_request(self.event_bus.as_ref(), &ctx, &resolved.model);
             let req =
-                to_inference_chat_req(&resolved, &ctx, Instant::now() + cap_http::DEFAULT_TIMEOUT);
+                to_inference_chat_req(&resolved, &ctx, Instant::now() + resolved.generate_budget());
             let remaining = req.deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 let mapped = LlmError::ProviderError("deadline-exceeded".into());
@@ -4237,18 +4322,20 @@ impl LlmGateway {
         // round-AUDIT-2 W2 ordering as generate()).
         let http_cap = build_http_cap(&resolved, &provider_cfg)?;
         // Credential freshness before `llm.request`: a failure here emits nothing.
-        self.ensure_credential_fresh(&resolved, Some(start + cap_http::DEFAULT_TIMEOUT))
+        self.ensure_credential_fresh(&resolved, Some(start + resolved.generate_budget()))
             .await?;
         emit_llm_request(self.event_bus.as_ref(), &ctx, &resolved.model);
 
         let adapter = select_adapter(resolved.backend);
-        // The unstreamed request of every other entry is bounded by the chain's own total
-        // timeout, as before. The streamed request that serves a ChatGPT sign-in entry has
-        // no such bound in the chain, so the whole dispatch — the freshness check above and
-        // every attempt — shares the one budget a buffered `generate` hop has.
+        // The unstreamed request of every other entry is bounded by the HTTP layer's own
+        // total timeout, as before; for an entry with its own `generate-timeout-secs` that
+        // bound is the entry's budget (`cloud_attempt`). The streamed request that serves a
+        // ChatGPT sign-in entry has no such bound in the chain, so the whole dispatch — the
+        // freshness check above and every attempt — shares the one budget a buffered
+        // `generate` hop of the entry has.
         let attempt_deadline = resolved
             .uses_chatgpt_sign_in()
-            .then(|| start + cap_http::DEFAULT_TIMEOUT);
+            .then(|| start + resolved.generate_budget());
 
         // Transport-ONLY retry loop (cap=6). DELIBERATE focused copy of
         // `generate()`'s transport branch (see `generate()` above) — kept
@@ -4520,6 +4607,19 @@ pub(crate) fn wrap_stream_partial(err: LlmError, released_bytes: usize) -> LlmEr
     }
 }
 
+/// Run one HTTP exchange of an entry with `entry_timeout` (its `generate-timeout-secs`) as
+/// the HTTP layer's total timeout ([`cap_http::with_request_timeout`]); without one the
+/// exchange runs exactly as before, under the executor's configured timeout.
+pub(crate) async fn under_entry_timeout<T>(
+    entry_timeout: Option<Duration>,
+    exchange: impl std::future::Future<Output = T>,
+) -> T {
+    match entry_timeout {
+        Some(timeout) => cap_http::with_request_timeout(timeout, exchange).await,
+        None => exchange.await,
+    }
+}
+
 fn to_inference_chat_req(
     resolved: &ResolvedProvider,
     ctx: &LlmRequestContext,
@@ -4569,6 +4669,7 @@ fn to_inference_chat_req(
                 .collect()
         }),
         output_schema: ctx.output_schema.clone(),
+        reasoning_effort: resolved.reasoning_effort.map(|e| e.as_str().to_string()),
         deadline,
         cancel: Arc::new(AtomicBool::new(false)),
     }
@@ -6102,6 +6203,8 @@ mod tests {
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
             embedding_model: None,
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+            generate_timeout: None,
+            reasoning_effort: None,
         };
         let cfg1 = LlmProviderConfig {
             id: "openai".into(),
@@ -6124,6 +6227,8 @@ mod tests {
             device_id: None,
             agent_cli: None,
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+            generate_timeout_secs: None,
+            reasoning_effort: None,
         };
         let cap1 = build_http_cap(&p1, &cfg1).unwrap();
         assert_eq!(
@@ -6149,6 +6254,8 @@ mod tests {
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
             embedding_model: None,
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+            generate_timeout: None,
+            reasoning_effort: None,
         };
         let cfg2 = LlmProviderConfig {
             id: "local-llm".into(),
@@ -6171,6 +6278,8 @@ mod tests {
             device_id: None,
             agent_cli: None,
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+            generate_timeout_secs: None,
+            reasoning_effort: None,
         };
         let cap2 = build_http_cap(&p2, &cfg2).unwrap();
         assert_eq!(
@@ -6206,6 +6315,8 @@ mod tests {
                     backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
                     embedding_model: None,
                     auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+                    generate_timeout: None,
+                    reasoning_effort: None,
                 },
                 LlmProviderConfig {
                     id: "openai".into(),
@@ -6228,6 +6339,8 @@ mod tests {
                     device_id: None,
                     agent_cli: None,
                     auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+                    generate_timeout_secs: None,
+                    reasoning_effort: None,
                 },
             )
         };

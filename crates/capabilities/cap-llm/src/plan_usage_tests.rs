@@ -795,6 +795,47 @@ async fn streamed_answer_needs_usage_and_text_like_the_unstreamed_parser() {
     }
 }
 
+/// A completed streamed answer whose output is only reasoning (a reasoning model that spent its
+/// output reasoning) is an answer with empty text and its usage, as in the unstreamed parser,
+/// at both buffered sites; reasoning events never become text.
+#[tokio::test]
+async fn streamed_answer_with_only_reasoning_output_is_an_empty_answer() {
+    let frames = [
+        (
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1"}}"#,
+        ),
+        (
+            "response.reasoning_summary_text.delta",
+            r#"{"type":"response.reasoning_summary_text.delta","delta":"Thinking it over"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1"}}"#,
+        ),
+        COMPLETED_3_2,
+    ];
+    let rig = rig(true);
+    rig.chain
+        .push_stream("/v1/responses", 200, responses_stream(&frames));
+    let generated = rig
+        .gateway
+        .generate(ctx("plan"))
+        .await
+        .expect("a reasoning-only answer is an answer");
+    assert_eq!(generated.text, "");
+    assert_eq!((generated.input_tokens, generated.output_tokens), (3, 2));
+    assert_eq!(generated.finish_reason, "stop");
+
+    rig.chain
+        .push_stream("/v1/responses", 200, responses_stream(&frames));
+    let streamed = buffered_stream(&rig, "plan")
+        .await
+        .expect("a reasoning-only answer is an answer");
+    assert_eq!(streamed.text, "");
+    assert_eq!(rig.requests(), 2, "no retry");
+}
+
 /// `response.incomplete` with each reason the upstream may give.
 fn incomplete_streams() -> Vec<Vec<Result<Vec<u8>, HttpError>>> {
     ["max_output_tokens", "content_filter", "server_limit"]

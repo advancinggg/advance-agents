@@ -16,9 +16,11 @@
 //!   redacts at its source.
 
 use std::fmt;
+use std::time::Duration;
 
 use advance_runtime::config::{
     AuthScheme, InferenceBackendClass, LlmProviderConfig, ProviderAuthSource, ProviderBackend,
+    ReasoningEffort,
 };
 
 use crate::catalog::CacheCost;
@@ -54,12 +56,24 @@ pub struct ResolvedProvider {
     /// Where the entry's credential comes from. For anything but an API key the gateway asks
     /// the installed credential source to keep the secret fresh before each cloud dispatch.
     pub auth_source: ProviderAuthSource,
+    /// The entry's `generate-timeout-secs`: replaces `cap_http::DEFAULT_TIMEOUT` wherever one
+    /// of its generate hops is bounded. `None` = the default.
+    pub generate_timeout: Option<Duration>,
+    /// The entry's `reasoning-effort`, sent with every chat request (never an embedding one).
+    /// `None` = nothing is sent.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl ResolvedProvider {
     /// Whether the entry's credential is a Sign in with ChatGPT session rather than an API key.
     pub fn uses_chatgpt_sign_in(&self) -> bool {
         self.auth_source == ProviderAuthSource::ChatGptOAuth
+    }
+
+    /// The time one generate hop of this entry may take: its `generate-timeout-secs`, else the
+    /// buffered executor's default total timeout.
+    pub fn generate_budget(&self) -> Duration {
+        self.generate_timeout.unwrap_or(cap_http::DEFAULT_TIMEOUT)
     }
 }
 
@@ -78,6 +92,8 @@ impl fmt::Debug for ResolvedProvider {
             .field("backend_class", &self.backend_class)
             .field("embedding_model", &self.embedding_model)
             .field("auth_source", &self.auth_source)
+            .field("generate_timeout", &self.generate_timeout)
+            .field("reasoning_effort", &self.reasoning_effort)
             .finish()
     }
 }
@@ -194,6 +210,8 @@ pub(crate) fn make_resolved(p: &LlmProviderConfig, model: String) -> ResolvedPro
         backend_class: p.backend_class,
         embedding_model: p.embedding_model.clone(),
         auth_source: p.auth_source,
+        generate_timeout: p.generate_timeout(),
+        reasoning_effort: p.reasoning_effort,
     }
 }
 
@@ -228,6 +246,8 @@ mod tests {
             device_id: None,
             agent_cli: None,
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+            generate_timeout_secs: None,
+            reasoning_effort: None,
         }
     }
 

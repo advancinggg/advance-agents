@@ -38,7 +38,8 @@ use base64::Engine;
 
 use crate::error::LlmError;
 use crate::gateway::{
-    build_http_cap, map_http_err_to_llm, ChatMessage, ChatParams, ChatRole, LlmGatewayInternal,
+    build_http_cap, map_http_err_to_llm, under_entry_timeout, ChatMessage, ChatParams, ChatRole,
+    LlmGatewayInternal,
 };
 
 /// MODULE-009 §2.3 CONTRACT-082 — file-content variants the VlmExtractor
@@ -165,11 +166,14 @@ impl VlmExtractor for LlmGatewayVlm {
         }
 
         let req = build_vlm_request(&resolved, content)?;
-        let response = self
-            .chain
-            .execute(&self.default_agent_id, req, &http_cap)
-            .await
-            .map_err(map_http_err_to_llm)?;
+        // An entry with its own generate budget sends its request under that budget as the
+        // HTTP layer's total timeout, as on the chat path; without one, the executor's default.
+        let response = under_entry_timeout(
+            resolved.generate_timeout,
+            self.chain.execute(&self.default_agent_id, req, &http_cap),
+        )
+        .await
+        .map_err(map_http_err_to_llm)?;
         parse_vlm_response(response.status, &response.body)
     }
 }
@@ -241,7 +245,7 @@ fn build_vlm_request(
     // since AnthropicAdapter::supports_embedding() is false and the Slice D
     // resolver picks the first provider which is OpenAI in the canonical
     // fixture.
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": resolved.model,
         "messages": [{
             "role": "user",
@@ -251,6 +255,11 @@ fn build_vlm_request(
             ],
         }],
     });
+    // The entry's reasoning setting, top-level as on every chat-completions request of the
+    // entry. Absent = the body is the one sent before the setting existed.
+    if let Some(effort) = resolved.reasoning_effort {
+        body["reasoning_effort"] = serde_json::json!(effort.as_str());
+    }
     let body_bytes = serde_json::to_vec(&body)
         .map_err(|e| LlmError::ProviderError(format!("serialize vlm body: {e}")))?;
 
@@ -272,21 +281,27 @@ fn build_vlm_request(
 }
 
 /// Parse an OpenAI Vision response (same shape as chat-completions: extract
-/// `choices[0].message.content`).
+/// `choices[0].message.content`). A reasoning model that spent its whole output reasoning
+/// answers with a null or absent `content` beside its reasoning output: that is an empty
+/// description, as on the chat path (the indexer skips an empty one). A null `content` without
+/// reasoning output is still a malformed answer.
 fn parse_vlm_response(status: u16, body: &[u8]) -> Result<String, LlmError> {
     if status != 200 {
         return Err(LlmError::ProviderError(format!("vlm http {status}")));
     }
     let value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| LlmError::ProviderError(format!("invalid response shape: {e}")))?;
-    let text = value
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|t| t.as_str())
-        .ok_or_else(|| LlmError::ProviderError("invalid response shape".into()))?;
-    Ok(text.to_string())
+    let message = &value["choices"][0]["message"];
+    match message["content"].as_str() {
+        Some(text) => Ok(text.to_string()),
+        // `Index` yields `Null` for an absent key too.
+        None if message["content"].is_null()
+            && crate::providers::openai::has_reasoning(message) =>
+        {
+            Ok(String::new())
+        }
+        None => Err(LlmError::ProviderError("invalid response shape".into())),
+    }
 }
 
 /// §1.4.3b routing orchestrator. Routes by MIME class:
@@ -608,6 +623,8 @@ mod tests {
             device_id: None,
             agent_cli: None,
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+            generate_timeout_secs: None,
+            reasoning_effort: None,
         };
         let mut cfg = fixture_runtime_config();
         cfg.llm_providers.insert(0, local);
@@ -659,6 +676,8 @@ mod tests {
             device_id: None,
             agent_cli: None,
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+            generate_timeout_secs: None,
+            reasoning_effort: None,
         };
         let mut cfg = fixture_runtime_config();
         cfg.llm_providers = vec![local];
@@ -714,6 +733,8 @@ mod tests {
             device_id: None,
             agent_cli: None,
             auth_source: ProviderAuthSource::ChatGptOAuth,
+            generate_timeout_secs: None,
+            reasoning_effort: None,
         };
         let png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 

@@ -2493,3 +2493,283 @@ fn an_mcp_edit_is_reported_as_a_changed_section() {
     edit.pack.fetch_timeout_sec = 7;
     assert_eq!(config_sections_changed(&base, &edit), vec!["pack", "mcp"]);
 }
+
+// ── `generate-timeout-secs` / `reasoning-effort` on a provider entry ─────────────────────────
+
+/// One entry `id` of `class` (with what the class needs to load); `block` is spliced in before
+/// `model-aliases`.
+fn provider_knob_yaml(id: &str, class: &str, block: &str) -> String {
+    let class_block = match class {
+        "cloud-http" => "    endpoint: https://api.example.com\n".to_string(),
+        "local" => "    backend-class: local\n".to_string(),
+        "mesh-remote" => "    backend-class: mesh-remote\n    device-id: peer\n".to_string(),
+        "agent-cli" => "    backend-class: agent-cli\n    agent-cli:\n      vendor: claude\n      command: /opt/homebrew/bin/claude\n".to_string(),
+        other => panic!("unknown class {other}"),
+    };
+    format!(
+        "{}\n",
+        minimal_yaml().trim_end_matches('\n').replace(
+            "llm-providers: []",
+            &format!(
+                "llm-providers:\n  - id: {id}\n    api-key-secret: {id}-key\n{class_block}{block}    model-aliases:\n      m: m\n    cost-per-mtoken-in: 0.001\n    cost-per-mtoken-out: 0.001\n    rate-limit:\n      requests-per-minute: 6\n      tokens-per-minute: 60000"
+            )
+        )
+    )
+}
+
+fn load_knob_yaml(yaml: &str) -> Result<RuntimeConfig, String> {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("runtime-config.yaml");
+    write_config(&config_path, yaml);
+    load_config(&config_path).map_err(|err| {
+        let mut out = err.to_string();
+        let mut cur = std::error::Error::source(&err);
+        while let Some(e) = cur {
+            out.push_str(" / ");
+            out.push_str(&e.to_string());
+            cur = e.source();
+        }
+        out
+    })
+}
+
+#[test]
+fn generate_timeout_secs_parses_on_cloud_http_and_local_and_is_absent_by_default() {
+    for class in ["cloud-http", "local"] {
+        let cfg = load_knob_yaml(&provider_knob_yaml("gw", class, ""))
+            .unwrap_or_else(|e| panic!("{class} without the key: {e}"));
+        let p = &cfg.llm_providers[0];
+        assert_eq!(p.generate_timeout_secs, None, "{class}");
+        assert_eq!(p.generate_timeout(), None, "{class}");
+        for secs in [MIN_GENERATE_TIMEOUT_SECS, 120, MAX_GENERATE_TIMEOUT_SECS] {
+            let cfg = load_knob_yaml(&provider_knob_yaml(
+                "gw",
+                class,
+                &format!("    generate-timeout-secs: {secs}\n"),
+            ))
+            .unwrap_or_else(|e| panic!("{class} {secs}: {e}"));
+            let p = &cfg.llm_providers[0];
+            assert_eq!(p.generate_timeout_secs, Some(secs), "{class}");
+            assert_eq!(
+                p.generate_timeout(),
+                Some(Duration::from_secs(u64::from(secs))),
+                "{class}"
+            );
+            assert!(
+                format!("{p:?}").contains(&format!("generate_timeout_secs: Some({secs})")),
+                "Debug names the key"
+            );
+        }
+    }
+    assert_eq!(
+        (MIN_GENERATE_TIMEOUT_SECS, MAX_GENERATE_TIMEOUT_SECS),
+        (5, 900)
+    );
+}
+
+#[test]
+fn generate_timeout_secs_refuses_out_of_range_values_and_other_classes() {
+    let cases: Vec<(String, &str)> = vec![
+        (
+            provider_knob_yaml("gw", "cloud-http", "    generate-timeout-secs: 4\n"),
+            "generate-timeout-secs must be from 5 to 900 seconds (got 4)",
+        ),
+        (
+            provider_knob_yaml("gw", "cloud-http", "    generate-timeout-secs: 0\n"),
+            "generate-timeout-secs must be from 5 to 900 seconds (got 0)",
+        ),
+        (
+            provider_knob_yaml("gw", "local", "    generate-timeout-secs: 901\n"),
+            "generate-timeout-secs must be from 5 to 900 seconds (got 901)",
+        ),
+        (
+            provider_knob_yaml("gw", "cloud-http", "    generate-timeout-secs: -1\n"),
+            "generate-timeout-secs",
+        ),
+        (
+            provider_knob_yaml("gw", "cloud-http", "    generate-timeout-secs: 1.5\n"),
+            "generate-timeout-secs",
+        ),
+        (
+            provider_knob_yaml("gw", "cloud-http", "    generate-timeout-secs: \"60\"\n"),
+            "generate-timeout-secs",
+        ),
+        (
+            provider_knob_yaml("gw", "agent-cli", "    generate-timeout-secs: 60\n"),
+            "generate-timeout-secs is only valid on backend-class: cloud-http or local",
+        ),
+        (
+            provider_knob_yaml("gw", "mesh-remote", "    generate-timeout-secs: 60\n"),
+            "generate-timeout-secs is only valid on backend-class: cloud-http or local",
+        ),
+    ];
+    for (yaml, needle) in cases {
+        let err = load_knob_yaml(&yaml).expect_err(needle);
+        assert!(err.contains(needle), "needle {needle:?}: {err}");
+    }
+    assert_eq!(
+        generate_timeout_refusal(InferenceBackendClass::CloudHttp),
+        None
+    );
+    assert_eq!(generate_timeout_refusal(InferenceBackendClass::Local), None);
+    assert!(generate_timeout_refusal(InferenceBackendClass::AgentCli).is_some());
+    assert!(generate_timeout_refusal(InferenceBackendClass::MeshRemote).is_some());
+}
+
+#[test]
+fn reasoning_effort_parses_every_value_on_openai_compatible_entries() {
+    assert_eq!(
+        ReasoningEffort::ALL.map(ReasoningEffort::as_str),
+        ["none", "minimal", "low", "medium", "high", "xhigh"]
+    );
+    for effort in ReasoningEffort::ALL {
+        assert_eq!(ReasoningEffort::parse(effort.as_str()), Some(effort));
+    }
+    assert_eq!(ReasoningEffort::parse("Low"), None);
+    assert_eq!(ReasoningEffort::parse("max"), None);
+
+    // (id, class, extra block): openai-chat inferred and explicit, openai-responses, local.
+    let accepted = [
+        ("gw", "cloud-http", ""),
+        ("gw", "cloud-http", "    backend: openai-chat\n"),
+        ("gw", "cloud-http", "    backend: openai-responses\n"),
+        ("gw", "local", ""),
+        // An explicit OpenAI dialect wins over the `anthropic` id's inference.
+        ("anthropic", "cloud-http", "    backend: openai-chat\n"),
+        // A local entry speaks openai-chat whatever its id.
+        ("anthropic", "local", ""),
+    ];
+    for (id, class, block) in accepted {
+        let cfg = load_knob_yaml(&provider_knob_yaml(id, class, block))
+            .unwrap_or_else(|e| panic!("{id} {class} {block:?} without the key: {e}"));
+        assert_eq!(cfg.llm_providers[0].reasoning_effort, None);
+        for effort in ReasoningEffort::ALL {
+            let yaml = provider_knob_yaml(
+                id,
+                class,
+                &format!("{block}    reasoning-effort: {}\n", effort.as_str()),
+            );
+            let cfg = load_knob_yaml(&yaml)
+                .unwrap_or_else(|e| panic!("{id} {class} {block:?} {effort:?}: {e}"));
+            assert_eq!(cfg.llm_providers[0].reasoning_effort, Some(effort));
+        }
+    }
+}
+
+#[test]
+fn reasoning_effort_refuses_unknown_values_other_dialects_classes_and_sign_in() {
+    let cases: Vec<(String, &str)> = vec![
+        (
+            provider_knob_yaml("gw", "cloud-http", "    reasoning-effort: max\n"),
+            "unknown llm-providers[].reasoning-effort value \"max\" (expected none, minimal, low, medium, high or xhigh)",
+        ),
+        (
+            provider_knob_yaml("gw", "cloud-http", "    reasoning-effort: LOW\n"),
+            "unknown llm-providers[].reasoning-effort value \"LOW\"",
+        ),
+        (
+            provider_knob_yaml(
+                "gw",
+                "cloud-http",
+                "    backend: anthropic-messages\n    reasoning-effort: low\n",
+            ),
+            "reasoning-effort is only valid on backend: openai-chat or openai-responses",
+        ),
+        // The `anthropic` id infers the Anthropic dialect when no backend is named.
+        (
+            provider_knob_yaml("anthropic", "cloud-http", "    reasoning-effort: low\n"),
+            "reasoning-effort is only valid on backend: openai-chat or openai-responses",
+        ),
+        (
+            provider_knob_yaml("gw", "agent-cli", "    reasoning-effort: low\n"),
+            "reasoning-effort is only valid on backend-class: cloud-http or local",
+        ),
+        (
+            provider_knob_yaml("gw", "mesh-remote", "    reasoning-effort: low\n"),
+            "reasoning-effort is only valid on backend-class: cloud-http or local",
+        ),
+        (
+            chatgpt_oauth_yaml("    auth-source: chatgpt-oauth\n    reasoning-effort: low\n", ""),
+            "reasoning-effort is invalid with auth-source: chatgpt-oauth",
+        ),
+    ];
+    for (yaml, needle) in cases {
+        let err = load_knob_yaml(&yaml).expect_err(needle);
+        assert!(err.contains(needle), "needle {needle:?}: {err}");
+    }
+    assert_eq!(
+        reasoning_effort_refusal(
+            InferenceBackendClass::CloudHttp,
+            ProviderBackend::OpenAiResponses,
+            ProviderAuthSource::ApiKey
+        ),
+        None
+    );
+    assert_eq!(
+        effective_backend("anthropic", None),
+        ProviderBackend::AnthropicMessages
+    );
+    assert_eq!(effective_backend("gw", None), ProviderBackend::OpenAiChat);
+    assert_eq!(
+        effective_backend("anthropic", Some(ProviderBackend::OpenAiChat)),
+        ProviderBackend::OpenAiChat
+    );
+}
+
+#[test]
+fn provider_knobs_compose_with_each_other_and_a_sign_in_entry_keeps_its_timeout() {
+    let cfg = load_knob_yaml(&provider_knob_yaml(
+        "gw",
+        "cloud-http",
+        "    generate-timeout-secs: 120\n    reasoning-effort: low\n",
+    ))
+    .expect("both knobs load");
+    let p = &cfg.llm_providers[0];
+    assert_eq!(p.generate_timeout_secs, Some(120));
+    assert_eq!(p.reasoning_effort, Some(ReasoningEffort::Low));
+    assert!(format!("{p:?}").contains("reasoning_effort: Some(Low)"));
+
+    // A ChatGPT sign-in entry is a cloud-http entry: its hops may take longer too.
+    let cfg = load_knob_yaml(&chatgpt_oauth_yaml(
+        "    auth-source: chatgpt-oauth\n    generate-timeout-secs: 300\n",
+        "",
+    ))
+    .expect("a sign-in entry takes a generate timeout");
+    assert_eq!(cfg.llm_providers[0].generate_timeout_secs, Some(300));
+}
+
+#[test]
+fn a_sign_in_entry_budget_is_capped_at_the_streamed_exchange_lifetime() {
+    assert_eq!(MAX_SIGN_IN_GENERATE_TIMEOUT_SECS, 300);
+    assert_eq!(
+        max_generate_timeout_secs(ProviderAuthSource::ApiKey),
+        MAX_GENERATE_TIMEOUT_SECS
+    );
+    assert_eq!(
+        max_generate_timeout_secs(ProviderAuthSource::ChatGptOAuth),
+        MAX_SIGN_IN_GENERATE_TIMEOUT_SECS
+    );
+    for secs in [301, MAX_GENERATE_TIMEOUT_SECS] {
+        let err = load_knob_yaml(&chatgpt_oauth_yaml(
+            &format!("    auth-source: chatgpt-oauth\n    generate-timeout-secs: {secs}\n"),
+            "",
+        ))
+        .expect_err("over the ceiling of a streamed exchange");
+        assert!(
+            err.contains(&format!(
+                "generate-timeout-secs must be at most 300 seconds with auth-source: \
+                 chatgpt-oauth, whose requests are streamed exchanges that end after 300 s \
+                 (got {secs})"
+            )),
+            "{err}"
+        );
+    }
+    // An API-key entry of the same dialect may take the whole range.
+    let cfg = load_knob_yaml(&provider_knob_yaml(
+        "gw",
+        "cloud-http",
+        "    backend: openai-responses\n    generate-timeout-secs: 900\n",
+    ))
+    .expect("an API-key entry takes 900 s");
+    assert_eq!(cfg.llm_providers[0].generate_timeout_secs, Some(900));
+}

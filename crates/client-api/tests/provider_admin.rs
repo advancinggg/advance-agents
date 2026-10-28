@@ -17,19 +17,24 @@ use advance_client_api::compat::{EXCLUDED_COMPONENTS, RESPONSE_COMPONENTS};
 use advance_client_api::envelope::{
     WARNING_PREFLIGHT_SKIPPED, WARNING_RELOAD_PENDING, WARNING_RESTART_REQUIRED,
 };
+use advance_client_api::provider_admin::effective_backend;
 use advance_client_api::provider_admin::{
     ClientCreateProviderRequest, ClientProviderCost, ClientProviderDeleteResult, ClientProviderKey,
     ClientProviderKeyResult, ClientProviderList, ClientProviderPreflightResult,
     ClientProviderRateLimit, ClientProviderSignIn, ClientProviderSignInModel,
     ClientProviderSignInStart, ClientProviderSignOut, ClientProviderSummary, ClientProviderUsage,
     ClientProviderUsageWindow, ClientUpdateProviderRequest, ProviderAdminOutcome,
-    ProviderAdminWarning, AUTH_SOURCES, CHATGPT_OAUTH_AUTH_SOURCE, MAX_KEY_BYTES, SIGN_IN_STATES,
+    ProviderAdminWarning, AUTH_SOURCES, CHATGPT_OAUTH_AUTH_SOURCE, MAX_GENERATE_TIMEOUT_SECS,
+    MAX_KEY_BYTES, MAX_SIGN_IN_GENERATE_TIMEOUT_SECS, MIN_GENERATE_TIMEOUT_SECS,
+    PROVIDER_KNOB_BACKEND_CLASSES, REASONING_EFFORTS, REASONING_EFFORT_BACKENDS, SIGN_IN_STATES,
 };
 use advance_client_api::routes;
 use advance_client_api::schema::generate_schema_artifact;
 use advance_client_api::{
     ClientApi, ClientApiConfig, ClientEnvelope, ClientErrorCode, ClientRequest, ClientSession,
     Platform, Principal, ProviderAdminProvider, ProviderError, Scope, AUTH_SOURCE_MISMATCH_DETAIL,
+    GENERATE_TIMEOUT_UNSUPPORTED_DETAIL, INVALID_GENERATE_TIMEOUT_DETAIL,
+    INVALID_REASONING_EFFORT_DETAIL, REASONING_EFFORT_UNSUPPORTED_DETAIL,
 };
 
 const SECRET_KEY: &str = "sk-live-ULTRA-SECRET-0123456789";
@@ -113,6 +118,8 @@ fn summary(id: &str, selected: bool) -> ClientProviderSummary {
         embedding_model: None,
         auth_scheme: None,
         auth_source: None,
+        generate_timeout_secs: None,
+        reasoning_effort: None,
         cost: ClientProviderCost {
             input_per_mtoken: 1.0,
             output_per_mtoken: 2.0,
@@ -326,6 +333,9 @@ impl ProviderAdminProvider for MemoryProviders {
         s.endpoint = request.endpoint.clone().unwrap_or_default();
         s.model_aliases = request.model_aliases.clone();
         s.sidecar_present = request.sidecar.is_some();
+        s.backend = request.backend.clone();
+        s.generate_timeout_secs = request.generate_timeout_secs;
+        s.reasoning_effort = request.reasoning_effort.clone();
         if request.auth_source.as_deref() == Some(CHATGPT_OAUTH_AUTH_SOURCE) {
             s.auth_source = request.auth_source.clone();
             s.backend = Some("openai-responses".into());
@@ -356,6 +366,30 @@ impl ProviderAdminProvider for MemoryProviders {
             .ok_or_else(|| ProviderError::NotFound(provider_id.into()))?;
         if let Some(endpoint) = &request.endpoint {
             e.endpoint = endpoint.clone();
+        }
+        // Like the production provider, whether the updated entry can apply a setting is
+        // decided against the entry, and refused with the setting's detail token.
+        let backend = e
+            .backend
+            .clone()
+            .unwrap_or_else(|| effective_backend(&e.provider_id, None).to_string());
+        if matches!(request.generate_timeout_secs, Some(Some(_)))
+            && !["cloud-http", "local"].contains(&e.backend_class.as_str())
+        {
+            return Err(ProviderError::InvalidRequest(
+                GENERATE_TIMEOUT_UNSUPPORTED_DETAIL.into(),
+            ));
+        }
+        if matches!(request.reasoning_effort, Some(Some(_))) && backend == "anthropic-messages" {
+            return Err(ProviderError::InvalidRequest(
+                REASONING_EFFORT_UNSUPPORTED_DETAIL.into(),
+            ));
+        }
+        if let Some(secs) = request.generate_timeout_secs {
+            e.generate_timeout_secs = secs;
+        }
+        if let Some(effort) = &request.reasoning_effort {
+            e.reasoning_effort = effort.clone();
         }
         Ok(ProviderAdminOutcome::new(e.clone()))
     }
@@ -1283,6 +1317,45 @@ fn pa09_schema_components_inventoried() {
         components["ClientUpdateProviderRequest"]["properties"]["auth_source"].is_null(),
         "the credential source is fixed at creation"
     );
+
+    // The generate budget and the reasoning setting are optional fields of the summary, the
+    // create and the update; the setting stays a plain string checked against its table.
+    for component in [
+        "ClientProviderSummary",
+        "ClientCreateProviderRequest",
+        "ClientUpdateProviderRequest",
+    ] {
+        let properties = &components[component]["properties"];
+        for field in ["generate_timeout_secs", "reasoning_effort"] {
+            assert!(
+                properties[field].is_object(),
+                "{component}.{field} in schema"
+            );
+            let required = components[component]["required"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !required.contains(&json!(field)),
+                "{component}.{field} is optional"
+            );
+        }
+        let text = serde_json::to_string(&properties["reasoning_effort"]).unwrap();
+        assert!(
+            !text.contains("\"enum\"") && !text.contains("\"const\""),
+            "{component}.reasoning_effort must stay a free string: {text}"
+        );
+    }
+    // An update may clear either with an explicit null.
+    for field in ["generate_timeout_secs", "reasoning_effort"] {
+        let text =
+            serde_json::to_string(&components["ClientUpdateProviderRequest"]["properties"][field])
+                .unwrap();
+        assert!(
+            text.contains("null"),
+            "{field} accepts null on update: {text}"
+        );
+    }
 }
 
 // ── PA-11: GET …/usage — the vendor CLI's own allowance is a read; other classes answer a
@@ -2052,4 +2125,365 @@ fn am_t01_available_models_omitted_when_empty() {
     assert_eq!(v["available_models"][0]["id"], "gpt-4o");
     assert_eq!(v["available_models"][0]["display_name"], "GPT-4o");
     assert_eq!(v["model_aliases"]["fast"], "openai-fast");
+}
+
+// ── PA-19: create takes an entry's own generate budget and reasoning setting, the summary echoes
+//    both, and a value the entry cannot take is refused before the provider with its detail ──
+#[test]
+fn pa19_create_generate_timeout_and_reasoning_effort() {
+    let provider = MemoryProviders::new();
+    let (api, _sink) = api_with(provider.clone());
+    operator(&api);
+    assert_eq!(
+        (MIN_GENERATE_TIMEOUT_SECS, MAX_GENERATE_TIMEOUT_SECS),
+        (5, 900)
+    );
+    assert_eq!(
+        REASONING_EFFORTS,
+        ["none", "minimal", "low", "medium", "high", "xhigh"]
+    );
+    assert_eq!(PROVIDER_KNOB_BACKEND_CLASSES, ["cloud-http", "local"]);
+    assert_eq!(
+        REASONING_EFFORT_BACKENDS,
+        ["openai-chat", "openai-responses"]
+    );
+
+    let with = |id: &str, fields: Value| {
+        let mut body = create_body(id);
+        for (field, value) in fields.as_object().unwrap() {
+            body[field] = value.clone();
+        }
+        body
+    };
+
+    // Accepted: both bounds, every spelling, both dialects, a local entry.
+    let mut accepted = vec![
+        (
+            with(
+                "both",
+                json!({"generate_timeout_secs": 120, "reasoning_effort": "low"}),
+            ),
+            "both",
+        ),
+        (
+            with("min", json!({"generate_timeout_secs": 5})),
+            "lower bound",
+        ),
+        (
+            with("max", json!({"generate_timeout_secs": 900})),
+            "upper bound",
+        ),
+        (
+            with(
+                "responses",
+                json!({"backend": "openai-responses", "reasoning_effort": "xhigh"}),
+            ),
+            "responses dialect",
+        ),
+        (
+            with(
+                "local",
+                json!({"backend_class": "local", "generate_timeout_secs": 600, "reasoning_effort": "high"}),
+            ),
+            "local entry",
+        ),
+    ];
+    for effort in REASONING_EFFORTS {
+        accepted.push((
+            with(&format!("e-{effort}"), json!({"reasoning_effort": effort})),
+            effort,
+        ));
+    }
+    // An entry that signs in takes a budget up to the lifetime of a streamed exchange.
+    let mut sign_in_ceiling = sign_in_create_body("signed-in-300");
+    sign_in_ceiling["generate_timeout_secs"] = json!(MAX_SIGN_IN_GENERATE_TIMEOUT_SECS);
+    accepted.push((sign_in_ceiling, "sign-in ceiling"));
+    for (body, why) in accepted {
+        let env = api.handle(post(routes::PATH_PROVIDERS, body, &format!("ok-{why}")));
+        assert!(env.is_ok(), "{why}: {env:?}");
+    }
+    assert_eq!(
+        provider.calls.create.load(Ordering::SeqCst),
+        6 + REASONING_EFFORTS.len()
+    );
+
+    let both: ClientProviderSummary = data(&api.handle(get("/client/providers/both")));
+    assert_eq!(both.generate_timeout_secs, Some(120));
+    assert_eq!(both.reasoning_effort.as_deref(), Some("low"));
+    let env = api.handle(get("/client/providers/both"));
+    assert_eq!(env.data.as_ref().unwrap()["generate_timeout_secs"], 120);
+    assert_eq!(env.data.as_ref().unwrap()["reasoning_effort"], "low");
+    // An entry without them serializes neither field.
+    let env = api.handle(get("/client/providers/openai"));
+    let plain = env.data.as_ref().unwrap().as_object().unwrap();
+    assert!(!plain.contains_key("generate_timeout_secs"), "{plain:?}");
+    assert!(!plain.contains_key("reasoning_effort"), "{plain:?}");
+
+    // Refused before the provider, each with its detail token.
+    let creates = provider.calls.create.load(Ordering::SeqCst);
+    let agent_cli = |id: &str, field: &str, value: Value| {
+        let mut body = create_body(id);
+        body.as_object_mut().unwrap().remove("endpoint");
+        body["backend_class"] = json!("agent-cli");
+        body["agent_cli"] = json!({ "vendor": "codex", "command": "/opt/homebrew/bin/codex" });
+        body[field] = value;
+        body
+    };
+    let mut sign_in = sign_in_create_body("signed-in");
+    sign_in["reasoning_effort"] = json!("low");
+    let mut sign_in_long = sign_in_create_body("signed-in-301");
+    sign_in_long["generate_timeout_secs"] = json!(MAX_SIGN_IN_GENERATE_TIMEOUT_SECS + 1);
+    let mut anthropic = create_body("anthropic-2");
+    anthropic["provider_id"] = json!("anthropic");
+    anthropic["reasoning_effort"] = json!("low");
+    for (bad, why, detail) in [
+        (
+            with("t0", json!({"generate_timeout_secs": 0})),
+            "zero",
+            INVALID_GENERATE_TIMEOUT_DETAIL,
+        ),
+        (
+            with("t4", json!({"generate_timeout_secs": 4})),
+            "below the bound",
+            INVALID_GENERATE_TIMEOUT_DETAIL,
+        ),
+        (
+            with("t901", json!({"generate_timeout_secs": 901})),
+            "above the bound",
+            INVALID_GENERATE_TIMEOUT_DETAIL,
+        ),
+        (
+            sign_in_long,
+            "above the sign-in ceiling",
+            INVALID_GENERATE_TIMEOUT_DETAIL,
+        ),
+        (
+            with(
+                "tm",
+                json!({"backend_class": "mesh-remote", "device_id": "peer", "generate_timeout_secs": 60}),
+            ),
+            "mesh-remote entry",
+            GENERATE_TIMEOUT_UNSUPPORTED_DETAIL,
+        ),
+        (
+            agent_cli("ta", "generate_timeout_secs", json!(60)),
+            "agent-cli entry",
+            GENERATE_TIMEOUT_UNSUPPORTED_DETAIL,
+        ),
+        (
+            with("e0", json!({"reasoning_effort": "LOW"})),
+            "spelling is exact",
+            INVALID_REASONING_EFFORT_DETAIL,
+        ),
+        (
+            with("e1", json!({"reasoning_effort": "max"})),
+            "unknown spelling",
+            INVALID_REASONING_EFFORT_DETAIL,
+        ),
+        (
+            with("e2", json!({"reasoning_effort": ""})),
+            "empty",
+            INVALID_REASONING_EFFORT_DETAIL,
+        ),
+        (
+            with(
+                "e3",
+                json!({"backend": "anthropic-messages", "reasoning_effort": "low"}),
+            ),
+            "anthropic dialect",
+            REASONING_EFFORT_UNSUPPORTED_DETAIL,
+        ),
+        (
+            anthropic,
+            "the anthropic id speaks the anthropic dialect",
+            REASONING_EFFORT_UNSUPPORTED_DETAIL,
+        ),
+        (
+            agent_cli("e4", "reasoning_effort", json!("low")),
+            "agent-cli entry",
+            REASONING_EFFORT_UNSUPPORTED_DETAIL,
+        ),
+        (
+            with(
+                "e5",
+                json!({"backend_class": "mesh-remote", "device_id": "peer", "reasoning_effort": "low"}),
+            ),
+            "mesh-remote entry",
+            REASONING_EFFORT_UNSUPPORTED_DETAIL,
+        ),
+        (
+            sign_in,
+            "sign-in entry",
+            REASONING_EFFORT_UNSUPPORTED_DETAIL,
+        ),
+    ] {
+        let env = api.handle(post(routes::PATH_PROVIDERS, bad, &format!("no-{why}")));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{why}");
+        assert_eq!(details(&env), [detail], "{why}");
+    }
+    // A value that is not a whole number of seconds (or a spelling that is not a string) is a
+    // malformed body.
+    for (bad, why) in [
+        (with("m0", json!({"generate_timeout_secs": -1})), "negative"),
+        (
+            with("m1", json!({"generate_timeout_secs": 1.5})),
+            "fraction",
+        ),
+        (with("m2", json!({"generate_timeout_secs": "60"})), "string"),
+        (with("m3", json!({"reasoning_effort": 3})), "number"),
+    ] {
+        let env = api.handle(post(routes::PATH_PROVIDERS, bad, &format!("bad-{why}")));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{why}");
+        assert!(details(&env).is_empty(), "{why}");
+    }
+    assert_eq!(provider.calls.create.load(Ordering::SeqCst), creates);
+}
+
+// ── PA-20: update sets, replaces and (with an explicit null) clears both; an absent field
+//    leaves them; a bad value never reaches the provider; the provider's refusal against the
+//    entry keeps its detail token ───────────────────────────────────────────────────────────
+#[test]
+fn pa20_update_generate_timeout_and_reasoning_effort() {
+    let provider = MemoryProviders::new();
+    let (api, _sink) = api_with(provider.clone());
+    operator(&api);
+    let update = |id: &str, body: Value, key: &str| {
+        api.handle(post(&format!("/client/providers/{id}:update"), body, key))
+    };
+
+    let set: ClientProviderSummary = data(&update(
+        "openai",
+        json!({"generate_timeout_secs": 300, "reasoning_effort": "medium"}),
+        "u1",
+    ));
+    assert_eq!(set.generate_timeout_secs, Some(300));
+    assert_eq!(set.reasoning_effort.as_deref(), Some("medium"));
+
+    // An absent field leaves the entry's value.
+    let kept: ClientProviderSummary = data(&update(
+        "openai",
+        json!({"endpoint": "https://api.openai.example"}),
+        "u2",
+    ));
+    assert_eq!(kept.generate_timeout_secs, Some(300));
+    assert_eq!(kept.reasoning_effort.as_deref(), Some("medium"));
+
+    // A value replaces it.
+    let replaced: ClientProviderSummary =
+        data(&update("openai", json!({"reasoning_effort": "high"}), "u3"));
+    assert_eq!(replaced.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(replaced.generate_timeout_secs, Some(300));
+
+    // An explicit null clears it — and is an update on its own, not an empty one.
+    let env = update("openai", json!({"generate_timeout_secs": null}), "u4");
+    let cleared = env.data.as_ref().unwrap().as_object().unwrap();
+    assert!(
+        !cleared.contains_key("generate_timeout_secs"),
+        "{cleared:?}"
+    );
+    assert_eq!(cleared["reasoning_effort"], "high");
+    let env = update("openai", json!({"reasoning_effort": null}), "u5");
+    let cleared = env.data.as_ref().unwrap().as_object().unwrap();
+    assert!(!cleared.contains_key("reasoning_effort"), "{cleared:?}");
+    assert_eq!(provider.calls.update.load(Ordering::SeqCst), 5);
+    assert_eq!(
+        code(&update("openai", json!({}), "u6")),
+        Some(ClientErrorCode::InvalidRequest),
+        "an empty update stays refused"
+    );
+
+    // Refused before the provider, each with its detail token.
+    let updates = provider.calls.update.load(Ordering::SeqCst);
+    for (bad, why, detail) in [
+        (
+            json!({"generate_timeout_secs": 4}),
+            "below the bound",
+            INVALID_GENERATE_TIMEOUT_DETAIL,
+        ),
+        (
+            json!({"generate_timeout_secs": 901}),
+            "above the bound",
+            INVALID_GENERATE_TIMEOUT_DETAIL,
+        ),
+        (
+            json!({"reasoning_effort": "turbo"}),
+            "unknown spelling",
+            INVALID_REASONING_EFFORT_DETAIL,
+        ),
+    ] {
+        let env = update("openai", bad, &format!("bad-{why}"));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{why}");
+        assert_eq!(details(&env), [detail], "{why}");
+    }
+    assert_eq!(provider.calls.update.load(Ordering::SeqCst), updates);
+
+    // Whether the updated entry can take a value is the provider's decision; its refusal keeps
+    // the detail token through the projection.
+    let env = update("anthropic", json!({"reasoning_effort": "low"}), "u7");
+    assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest));
+    assert_eq!(details(&env), [REASONING_EFFORT_UNSUPPORTED_DETAIL]);
+    assert_eq!(env.error.as_ref().unwrap().message, "invalid request");
+    // Clearing a value the entry does not have is fine.
+    assert!(update("anthropic", json!({"reasoning_effort": null}), "u8").is_ok());
+}
+
+// ── PA-21: the wire shape of both fields: absent is omitted, an update's explicit null
+//    survives a round trip, and the summary only carries what the entry sets ────────────────
+#[test]
+fn pa21_generate_timeout_and_reasoning_effort_wire_shape() {
+    let parse = |body: Value| -> ClientUpdateProviderRequest {
+        serde_json::from_value(body).expect("update parses")
+    };
+    let absent = parse(json!({"endpoint": "https://p.example"}));
+    assert_eq!(absent.generate_timeout_secs, None);
+    assert_eq!(absent.reasoning_effort, None);
+    let nulls = parse(json!({"generate_timeout_secs": null, "reasoning_effort": null}));
+    assert_eq!(nulls.generate_timeout_secs, Some(None));
+    assert_eq!(nulls.reasoning_effort, Some(None));
+    assert!(!nulls.is_empty(), "a clear is a change");
+    let values = parse(json!({"generate_timeout_secs": 60, "reasoning_effort": "none"}));
+    assert_eq!(values.generate_timeout_secs, Some(Some(60)));
+    assert_eq!(values.reasoning_effort, Some(Some("none".into())));
+
+    // Serialization keeps the three states apart.
+    assert_eq!(
+        serde_json::to_value(&nulls).unwrap(),
+        json!({"generate_timeout_secs": null, "reasoning_effort": null})
+    );
+    assert_eq!(
+        serde_json::to_value(&values).unwrap(),
+        json!({"generate_timeout_secs": 60, "reasoning_effort": "none"})
+    );
+    let absent_wire = serde_json::to_value(&absent).unwrap();
+    assert_eq!(absent_wire, json!({"endpoint": "https://p.example"}));
+    for request in [absent, nulls, values] {
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(parse(wire), request, "round trip");
+    }
+
+    let create: ClientCreateProviderRequest = serde_json::from_value({
+        let mut body = create_body("p");
+        body["generate_timeout_secs"] = json!(45);
+        body["reasoning_effort"] = json!("minimal");
+        body
+    })
+    .unwrap();
+    assert_eq!(create.generate_timeout_secs, Some(45));
+    assert_eq!(create.reasoning_effort.as_deref(), Some("minimal"));
+    let plain: ClientCreateProviderRequest = serde_json::from_value(create_body("p")).unwrap();
+    let wire = serde_json::to_value(&plain).unwrap();
+    assert!(wire.get("generate_timeout_secs").is_none(), "{wire}");
+    assert!(wire.get("reasoning_effort").is_none(), "{wire}");
+
+    let mut entry = summary("openai", true);
+    let wire = serde_json::to_value(&entry).unwrap();
+    assert!(wire.get("generate_timeout_secs").is_none(), "{wire}");
+    assert!(wire.get("reasoning_effort").is_none(), "{wire}");
+    entry.generate_timeout_secs = Some(120);
+    entry.reasoning_effort = Some("low".into());
+    let wire = serde_json::to_value(&entry).unwrap();
+    assert_eq!(wire["generate_timeout_secs"], 120);
+    assert_eq!(wire["reasoning_effort"], "low");
+    let back: ClientProviderSummary = serde_json::from_value(wire).unwrap();
+    assert_eq!(back, entry);
 }

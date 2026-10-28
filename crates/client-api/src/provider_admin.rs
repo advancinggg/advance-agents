@@ -47,6 +47,26 @@
 //! and for every entry while this installation's host id cannot be read (either way the state
 //! reads `signed-out` with reason `unavailable`), and creating a `chatgpt-oauth`
 //! entry under a named secret that already holds a value answers `already_exists`.
+//!
+//! Generate budget and reasoning setting (both optional, both echoed by the summary):
+//! - `generate_timeout_secs` (5–900; at most 300 on a `chatgpt-oauth` entry, whose every request
+//!   is a streamed exchange that ends after 300 s) replaces the 30 s default bound of one
+//!   generate hop of a `cloud-http` or `local` entry, measured from that hop's own start, so a
+//!   slow model can finish its answer. It also bounds the entry's chat preflight (`:set-key`,
+//!   and `:preflight` of an API-key or local entry); the `:preflight` of a `chatgpt-oauth`
+//!   entry checks its sign-in instead and keeps the preflight deadline. Absent = the default.
+//! - `reasoning_effort` (`none | minimal | low | medium | high | xhigh`) is sent with every chat
+//!   request of a `cloud-http` or `local` entry that speaks `openai-chat` (top-level
+//!   `reasoning_effort`) or `openai-responses` (`reasoning.effort`); never with an embedding
+//!   request, and never by a `chatgpt-oauth` entry, whose requests carry only the fields its
+//!   route accepts. Absent = no setting is sent.
+//! - On `:update` an explicit JSON `null` removes either from the entry and an absent field
+//!   leaves it unchanged (the other update fields cannot be cleared).
+//! - Refusals are `invalid_request` with details `invalid_generate_timeout` /
+//!   `invalid_reasoning_effort` (a value out of range / an unknown spelling, decided here) or
+//!   `generate_timeout_unsupported` / `reasoning_effort_unsupported` (the entry cannot apply
+//!   it: decided here for a create, and by the provider against the updated entry for an
+//!   update).
 
 use std::collections::BTreeMap;
 
@@ -59,7 +79,11 @@ use crate::envelope::{
     ClientError, ClientErrorCode, ClientWarning, WARNING_PREFLIGHT_SKIPPED, WARNING_RELOAD_PENDING,
     WARNING_RESTART_REQUIRED,
 };
-use crate::provider::{provider_or_unavailable, ProviderAdminSlot, ProviderError};
+use crate::provider::{
+    provider_or_unavailable, ProviderAdminSlot, ProviderError, GENERATE_TIMEOUT_UNSUPPORTED_DETAIL,
+    INVALID_GENERATE_TIMEOUT_DETAIL, INVALID_REASONING_EFFORT_DETAIL,
+    REASONING_EFFORT_UNSUPPORTED_DETAIL,
+};
 use crate::request::Method;
 use crate::routes;
 use crate::session::Scope;
@@ -114,6 +138,21 @@ pub const SIGN_IN_STATES: &[&str] = &["signed-out", "pending", "signed-in", "fai
 /// Suffix of the internal secret that holds a sign-in record (the runtime loader's
 /// `CHATGPT_OAUTH_RECORD_SUFFIX`): no entry may name a secret ending with it.
 pub const RESERVED_SECRET_SUFFIX: &str = ".chatgpt-oauth";
+/// Inclusive bounds of `generate_timeout_secs` (the runtime loader's
+/// `MIN_GENERATE_TIMEOUT_SECS` / `MAX_GENERATE_TIMEOUT_SECS`).
+pub const MIN_GENERATE_TIMEOUT_SECS: u32 = 5;
+pub const MAX_GENERATE_TIMEOUT_SECS: u32 = 900;
+/// The largest `generate_timeout_secs` of a `chatgpt-oauth` entry (the runtime loader's
+/// `MAX_SIGN_IN_GENERATE_TIMEOUT_SECS`): every request of such an entry is a streamed
+/// exchange, which ends after 300 s.
+pub const MAX_SIGN_IN_GENERATE_TIMEOUT_SECS: u32 = 300;
+/// The backend classes whose generate hop an entry's own budget bounds (`generate_timeout_secs`)
+/// and whose requests carry a reasoning setting (`reasoning_effort`).
+pub const PROVIDER_KNOB_BACKEND_CLASSES: &[&str] = &["cloud-http", "local"];
+/// Closed spellings of `reasoning_effort` (the runtime's `ReasoningEffort`).
+pub const REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
+/// The wire dialects that carry a reasoning setting.
+pub const REASONING_EFFORT_BACKENDS: &[&str] = &["openai-chat", "openai-responses"];
 
 const RELOAD_PENDING_MESSAGE: &str =
     "runtime-config.yaml was written but the daemon has not observed the reload yet; it applies at the next watcher tick";
@@ -342,6 +381,14 @@ pub struct ClientProviderSummary {
     /// API key (`key` says whether one is stored).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_source: Option<String>,
+    /// The entry's own bound on one generate hop, in seconds (5–900; at most 300 on a
+    /// `chatgpt-oauth` entry). Absent = the 30 s default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate_timeout_secs: Option<u32>,
+    /// The reasoning setting sent with every chat request of the entry
+    /// (`none | minimal | low | medium | high | xhigh`). Absent = none is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub cost: ClientProviderCost,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<ClientProviderRateLimit>,
@@ -407,6 +454,20 @@ pub struct ClientCreateProviderRequest {
     /// `bearer`; such an entry takes no key (`:set-key` is refused) and signs in instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_source: Option<String>,
+    /// The entry's own bound on one generate hop (and on its chat preflight), in seconds: 5–900,
+    /// at most 300 with `auth_source` `chatgpt-oauth` (details `invalid_generate_timeout`
+    /// otherwise). `cloud-http` and `local` only (details `generate_timeout_unsupported`).
+    /// Absent = the 30 s default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate_timeout_secs: Option<u32>,
+    /// `none | minimal | low | medium | high | xhigh` (details `invalid_reasoning_effort`
+    /// otherwise), sent with every chat request of the entry. Only a `cloud-http` or `local`
+    /// entry that speaks `openai-chat` or `openai-responses` (an absent `backend` means
+    /// `openai-chat`, except on a `cloud-http` entry with the id `anthropic`, which speaks
+    /// `anthropic-messages`) and does not sign in with `chatgpt-oauth` takes it (details
+    /// `reasoning_effort_unsupported`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub cost: ClientProviderCost,
     /// Required (the runtime refuses an entry without a rate limit).
     pub rate_limit: ClientProviderRateLimit,
@@ -455,6 +516,33 @@ pub struct ClientUpdateProviderRequest {
     pub device_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_cli: Option<ClientProviderAgentCli>,
+    /// A value (5–900; at most 300 on a `chatgpt-oauth` entry) replaces the entry's own generate
+    /// budget; an explicit `null` removes it (back to the 30 s default); absent leaves it
+    /// unchanged.
+    #[serde(
+        default,
+        deserialize_with = "explicit_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub generate_timeout_secs: Option<Option<u32>>,
+    /// A value replaces the entry's reasoning setting; an explicit `null` removes it (no setting
+    /// is sent); absent leaves it unchanged.
+    #[serde(
+        default,
+        deserialize_with = "explicit_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reasoning_effort: Option<Option<String>>,
+}
+
+/// An update field that an explicit `null` clears: absent stays `None` (`#[serde(default)]`),
+/// `null` is `Some(None)`, and a value is `Some(Some(value))`.
+fn explicit_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 impl ClientUpdateProviderRequest {
@@ -473,6 +561,8 @@ impl ClientUpdateProviderRequest {
             && self.profile_id.is_none()
             && self.device_id.is_none()
             && self.agent_cli.is_none()
+            && self.generate_timeout_secs.is_none()
+            && self.reasoning_effort.is_none()
     }
 }
 
@@ -493,7 +583,8 @@ impl std::fmt::Debug for ClientSetProviderKeyRequest {
 }
 
 /// The result of `:set-key`: whether the key was stored (only after a passing preflight for
-/// `cloud-http`) and the preflight verdict (absent when preflight was skipped).
+/// `cloud-http`) and the preflight verdict (absent when preflight was skipped). A `cloud-http`
+/// key whose entry changed while it was being checked is not stored (reason `cancelled`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientProviderKeyResult {
     pub stored: bool,
@@ -735,6 +826,92 @@ pub fn validate_agent_cli(spec: &ClientProviderAgentCli) -> Result<(), ClientErr
     Ok(())
 }
 
+fn knob_refusal(message: &'static str, detail: &str) -> ClientError {
+    invalid(message).with_details(vec![detail.to_string()])
+}
+
+/// `generate_timeout_secs` within the runtime loader's bounds (details
+/// `invalid_generate_timeout`).
+pub fn validate_generate_timeout_secs(secs: u32) -> Result<(), ClientError> {
+    if (MIN_GENERATE_TIMEOUT_SECS..=MAX_GENERATE_TIMEOUT_SECS).contains(&secs) {
+        Ok(())
+    } else {
+        Err(knob_refusal(
+            "generate_timeout_secs must be from 5 to 900",
+            INVALID_GENERATE_TIMEOUT_DETAIL,
+        ))
+    }
+}
+
+/// `reasoning_effort` is a closed spelling (details `invalid_reasoning_effort`).
+pub fn validate_reasoning_effort(effort: &str) -> Result<(), ClientError> {
+    if REASONING_EFFORTS.contains(&effort) {
+        Ok(())
+    } else {
+        Err(knob_refusal(
+            "invalid reasoning_effort",
+            INVALID_REASONING_EFFORT_DETAIL,
+        ))
+    }
+}
+
+/// The wire dialect an entry speaks: `backend`, else the resolver's id-based default
+/// (`anthropic-messages` for the id `anthropic`, `openai-chat` for every other id).
+pub fn effective_backend<'a>(provider_id: &str, backend: Option<&'a str>) -> &'a str {
+    backend.unwrap_or(if provider_id == "anthropic" {
+        "anthropic-messages"
+    } else {
+        "openai-chat"
+    })
+}
+
+/// The wire dialect an API-key entry of `backend_class` speaks, as the runtime loader resolves
+/// it: `backend` when named; else `openai-chat` on every class but `cloud-http` (a `local`,
+/// `mesh-remote` or `agent-cli` entry), whatever the id; else [`effective_backend`].
+pub fn entry_backend<'a>(
+    provider_id: &str,
+    backend_class: &str,
+    backend: Option<&'a str>,
+) -> &'a str {
+    match backend {
+        Some(backend) => backend,
+        None if backend_class != DEFAULT_BACKEND_CLASS => "openai-chat",
+        None => effective_backend(provider_id, None),
+    }
+}
+
+/// Whether an entry of `class` can apply its own generate budget (details
+/// `generate_timeout_unsupported` otherwise).
+pub fn check_generate_timeout_support(class: &str) -> Result<(), ClientError> {
+    if PROVIDER_KNOB_BACKEND_CLASSES.contains(&class) {
+        Ok(())
+    } else {
+        Err(knob_refusal(
+            "generate_timeout_secs is only valid for cloud-http and local providers",
+            GENERATE_TIMEOUT_UNSUPPORTED_DETAIL,
+        ))
+    }
+}
+
+/// Whether an entry of `class` speaking `backend` with credentials from `auth_source` can send
+/// a reasoning setting (details `reasoning_effort_unsupported` otherwise).
+pub fn check_reasoning_effort_support(
+    class: &str,
+    backend: &str,
+    auth_source: &str,
+) -> Result<(), ClientError> {
+    let message = if !PROVIDER_KNOB_BACKEND_CLASSES.contains(&class) {
+        "reasoning_effort is only valid for cloud-http and local providers"
+    } else if !REASONING_EFFORT_BACKENDS.contains(&backend) {
+        "reasoning_effort is only valid with backend openai-chat or openai-responses"
+    } else if auth_source == CHATGPT_OAUTH_AUTH_SOURCE {
+        "reasoning_effort is not valid with auth_source chatgpt-oauth"
+    } else {
+        return Ok(());
+    };
+    Err(knob_refusal(message, REASONING_EFFORT_UNSUPPORTED_DETAIL))
+}
+
 /// Validate a create request (everything the handler can decide without the runtime).
 pub fn validate_create_request(req: &ClientCreateProviderRequest) -> Result<(), ClientError> {
     validate_provider_id(&req.provider_id)?;
@@ -782,6 +959,25 @@ pub fn validate_create_request(req: &ClientCreateProviderRequest) -> Result<(), 
                 "auth_source chatgpt-oauth sends a bearer token (omit auth_scheme)",
             ));
         }
+    }
+    if let Some(secs) = req.generate_timeout_secs {
+        validate_generate_timeout_secs(secs)?;
+        if source == CHATGPT_OAUTH_AUTH_SOURCE && secs > MAX_SIGN_IN_GENERATE_TIMEOUT_SECS {
+            return Err(knob_refusal(
+                "generate_timeout_secs must be at most 300 for a chatgpt-oauth provider",
+                INVALID_GENERATE_TIMEOUT_DETAIL,
+            ));
+        }
+        check_generate_timeout_support(class)?;
+    }
+    if let Some(effort) = &req.reasoning_effort {
+        validate_reasoning_effort(effort)?;
+        let backend = match source {
+            // A sign-in entry speaks the Responses dialect whatever its id.
+            CHATGPT_OAUTH_AUTH_SOURCE => CHATGPT_OAUTH_BACKEND,
+            _ => entry_backend(&req.provider_id, class, req.backend.as_deref()),
+        };
+        check_reasoning_effort_support(class, backend, source)?;
     }
     validate_cost(&req.cost)?;
     validate_rate_limit(&req.rate_limit)?;
@@ -875,6 +1071,13 @@ pub fn validate_update_request(req: &ClientUpdateProviderRequest) -> Result<(), 
     }
     if let Some(device) = &req.device_id {
         validate_optional_string(device, "invalid device_id")?;
+    }
+    // Whether the updated entry can apply a knob is the provider's check (it knows the entry).
+    if let Some(Some(secs)) = req.generate_timeout_secs {
+        validate_generate_timeout_secs(secs)?;
+    }
+    if let Some(Some(effort)) = &req.reasoning_effort {
+        validate_reasoning_effort(effort)?;
     }
     Ok(())
 }
@@ -1201,6 +1404,63 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    /// A reasoning setting goes with the dialect the runtime loader resolves (an absent backend
+    /// is `openai-chat` on every class but `cloud-http`, whatever the id; on `cloud-http` the id
+    /// `anthropic` speaks `anthropic-messages`), and the generate budget of an entry that signs
+    /// in stops at the lifetime of a streamed exchange.
+    #[test]
+    fn provider_settings_follow_the_loaders_dialect_and_sign_in_ceiling() {
+        for (class, backend, expected) in [
+            ("local", None, "openai-chat"),
+            ("mesh-remote", None, "openai-chat"),
+            ("agent-cli", None, "openai-chat"),
+            ("cloud-http", None, "anthropic-messages"),
+            ("cloud-http", Some("openai-chat"), "openai-chat"),
+            ("local", Some("openai-chat"), "openai-chat"),
+        ] {
+            assert_eq!(
+                entry_backend("anthropic", class, backend),
+                expected,
+                "{class} {backend:?}"
+            );
+        }
+        assert_eq!(entry_backend("gw", "cloud-http", None), "openai-chat");
+
+        // `create_req` is the id `anthropic`.
+        let with_effort = |class: Option<&str>| {
+            let mut req = create_req();
+            req.backend_class = class.map(str::to_string);
+            req.reasoning_effort = Some("low".into());
+            validate_create_request(&req)
+        };
+        assert!(
+            with_effort(Some("local")).is_ok(),
+            "a local entry speaks openai-chat whatever its id"
+        );
+        assert_eq!(
+            with_effort(None).unwrap_err().details,
+            [REASONING_EFFORT_UNSUPPORTED_DETAIL]
+        );
+
+        let budget = |source: Option<&str>, secs: u32| {
+            let mut req = create_req();
+            req.provider_id = "gw".into();
+            req.auth_source = source.map(str::to_string);
+            req.generate_timeout_secs = Some(secs);
+            validate_create_request(&req)
+        };
+        let sign_in = Some(CHATGPT_OAUTH_AUTH_SOURCE);
+        assert!(budget(sign_in, MAX_SIGN_IN_GENERATE_TIMEOUT_SECS).is_ok());
+        assert_eq!(
+            budget(sign_in, MAX_SIGN_IN_GENERATE_TIMEOUT_SECS + 1)
+                .unwrap_err()
+                .details,
+            [INVALID_GENERATE_TIMEOUT_DETAIL]
+        );
+        assert!(budget(None, MAX_GENERATE_TIMEOUT_SECS).is_ok());
+        assert_eq!(MAX_SIGN_IN_GENERATE_TIMEOUT_SECS, 300);
     }
 
     #[test]

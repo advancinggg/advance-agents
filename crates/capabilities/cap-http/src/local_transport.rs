@@ -13,7 +13,7 @@ use advance_shared_types::inference::{
 use async_trait::async_trait;
 use reqwest::redirect::Policy;
 
-use crate::executor::{DEFAULT_MAX_RESPONSE_BYTES, MAX_STREAM_DURATION};
+use crate::executor::{DEFAULT_MAX_RESPONSE_BYTES, MAX_REQUEST_TIMEOUT};
 
 #[derive(Clone, Debug, Default)]
 pub struct DefaultLocalInferenceTransport;
@@ -68,9 +68,10 @@ fn url_for(handoff: &SidecarHandoff, path: &str) -> Result<String, LocalTranspor
 }
 
 fn timeout_for(deadline: Instant) -> Duration {
-    // Cap at MAX_STREAM_DURATION (300s, same as S4) — never the 30s buffered
-    // DEFAULT_TIMEOUT, which would be a second clock on live streams.
-    remaining_until(deadline).min(MAX_STREAM_DURATION)
+    // The caller's deadline decides, capped at MAX_REQUEST_TIMEOUT (900 s, the longest generate
+    // budget a provider entry may set) — never the 30s buffered DEFAULT_TIMEOUT, which would
+    // be a second clock on live streams. A live stream's deadline is its 300 s handle TTL.
+    remaining_until(deadline).min(MAX_REQUEST_TIMEOUT)
 }
 
 fn build_client(timeout: Duration) -> Result<reqwest::Client, LocalTransportError> {
@@ -262,6 +263,22 @@ mod tests {
         let policy = DefaultLocalInferenceTransport;
         let h = handoff(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80);
         assert!(policy.execute(&h, req()).await.is_err());
+    }
+
+    /// A local request's transport timeout is its deadline, up to the longest generate budget
+    /// an entry may set (900 s): a long-budget local hop is not cut at the 300 s stream bound.
+    #[test]
+    fn local_request_timeout_follows_the_deadline_up_to_the_longest_generate_budget() {
+        let now = Instant::now();
+        let soon = timeout_for(now + Duration::from_secs(30));
+        assert!(soon <= Duration::from_secs(30) && soon > Duration::from_secs(29));
+        let long = timeout_for(now + Duration::from_secs(600));
+        assert!(long > Duration::from_secs(599), "{long:?}");
+        assert_eq!(
+            timeout_for(now + Duration::from_secs(5_000)),
+            MAX_REQUEST_TIMEOUT
+        );
+        assert_eq!(MAX_REQUEST_TIMEOUT, Duration::from_secs(900));
     }
 
     #[test]

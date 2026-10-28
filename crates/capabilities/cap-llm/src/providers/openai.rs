@@ -52,8 +52,21 @@ impl OpenAiAdapter {
                 }))
                 .collect::<Vec<_>>());
         }
+        // The entry's reasoning setting, top-level as OpenAI-compatible reasoning models take
+        // it. Absent = the body is byte-identical to an entry without one.
+        if let Some(effort) = provider.reasoning_effort {
+            body["reasoning_effort"] = json!(effort.as_str());
+        }
         body
     }
+}
+
+/// Whether `object` (a chat `message` or a stream `delta`) carries non-empty reasoning output:
+/// `reasoning_content` or `reasoning`, the two spellings OpenAI-compatible servers use.
+pub(crate) fn has_reasoning(object: &Value) -> bool {
+    ["reasoning_content", "reasoning"]
+        .iter()
+        .any(|key| object[*key].as_str().is_some_and(|s| !s.is_empty()))
 }
 
 fn parse_message_tool_calls(message: &Value) -> Vec<ToolCall> {
@@ -251,11 +264,17 @@ impl ProviderAdapter for OpenAiAdapter {
                 cache_write_1h_tokens: None,
             });
         let tool_call_deltas = parse_sse_tool_call_deltas(&value);
+        // Reasoning output is never text, but it is progress: a reasoning model may stream
+        // many such chunks before its first content delta.
+        let reasoning = has_reasoning(&value["choices"][0]["delta"]);
         if delta.is_none()
             && finish_reason.is_none()
             && usage.is_none()
             && tool_call_deltas.is_none()
         {
+            if reasoning {
+                return Ok(SseEvent::REASONING);
+            }
             // Role-only first chunk / keep-alive → Ignore, never Some("").
             return Ok(SseEvent::IGNORE);
         }
@@ -265,6 +284,7 @@ impl ProviderAdapter for OpenAiAdapter {
             finish_reason,
             terminal: false,
             tool_call_deltas,
+            reasoning,
         })
     }
 
@@ -274,14 +294,16 @@ impl ProviderAdapter for OpenAiAdapter {
                 .map_err(|_| LlmError::ProviderError("invalid response shape".into()))?;
             let message = &value["choices"][0]["message"];
             let tool_calls = parse_message_tool_calls(message);
-            // `content` is JSON null when the model returns only tool_calls.
-            let text = if tool_calls.is_empty() {
-                message["content"]
-                    .as_str()
-                    .ok_or_else(|| LlmError::ProviderError("invalid response shape".into()))?
-                    .to_string()
-            } else {
-                message["content"].as_str().unwrap_or("").to_string()
+            // `content` is JSON null when the model returns only tool_calls, and when a
+            // reasoning model spends its whole budget reasoning (`reasoning_content` /
+            // `reasoning` set, typically with finish_reason "length"): both are answers with
+            // empty text. A null `content` with neither is still a malformed answer.
+            let text = match message["content"].as_str() {
+                Some(content) => content.to_string(),
+                None if !tool_calls.is_empty() => String::new(),
+                // `Index` yields `Null` for an absent key too.
+                None if message["content"].is_null() && has_reasoning(message) => String::new(),
+                None => return Err(LlmError::ProviderError("invalid response shape".into())),
             };
             let model = value["model"].as_str().unwrap_or("").to_string();
             // Round-AUDIT-5 C1 fix: missing usage fields MUST NOT silently
@@ -726,6 +748,8 @@ mod tests {
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
             embedding_model: None,
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+            generate_timeout: None,
+            reasoning_effort: None,
         }
     }
 
@@ -827,6 +851,172 @@ mod tests {
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].name, "write");
         assert_eq!(calls[0].arguments, "{\"path\":\"a.md\"}");
+    }
+
+    /// The 16-token preflight answer of an OpenAI-compatible reasoning model: the whole budget
+    /// went to reasoning, so `content` is null and the reasoning field is set.
+    const REASONING_ONLY_CONTENT: &[u8] = br#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"reasoning_content":"The user says ping. I should answer"},"finish_reason":"length"}],"usage":{"prompt_tokens":9,"completion_tokens":16,"completion_tokens_details":{"reasoning_tokens":16}},"model":"reasoner-1"}"#;
+
+    #[test]
+    fn t_openai_parse_chat_response_reasoning_content_only_is_an_empty_answer() {
+        let outcome = OpenAiAdapter
+            .parse_chat_response(200, REASONING_ONLY_CONTENT)
+            .expect("a reasoning-only answer is valid");
+        assert_eq!(outcome.text, "");
+        assert_eq!(outcome.finish_reason, "length");
+        assert_eq!((outcome.input_tokens, outcome.output_tokens), (9, 16));
+        assert!(outcome.tool_calls.is_empty());
+        assert_eq!(outcome.model, "reasoner-1");
+    }
+
+    #[test]
+    fn t_openai_parse_chat_response_reasoning_only_is_an_empty_answer_for_both_spellings() {
+        // `reasoning` instead of `reasoning_content`, and `content` absent instead of null.
+        for body in [
+            br#"{"choices":[{"message":{"content":null,"reasoning":"thinking"},"finish_reason":"length"}],"usage":{"prompt_tokens":4,"completion_tokens":16}}"#.as_slice(),
+            br#"{"choices":[{"message":{"reasoning":"thinking"},"finish_reason":"length"}],"usage":{"prompt_tokens":4,"completion_tokens":16}}"#.as_slice(),
+            br#"{"choices":[{"message":{"reasoning_content":"thinking"},"finish_reason":"length"}],"usage":{"prompt_tokens":4,"completion_tokens":16}}"#.as_slice(),
+        ] {
+            let outcome = OpenAiAdapter
+                .parse_chat_response(200, body)
+                .unwrap_or_else(|e| panic!("{e:?}: {}", String::from_utf8_lossy(body)));
+            assert_eq!(outcome.text, "");
+            assert_eq!(outcome.output_tokens, 16);
+        }
+    }
+
+    #[test]
+    fn t_openai_parse_chat_response_null_content_without_reasoning_or_tools_stays_invalid() {
+        for body in [
+            // Round-AUDIT-5 intent: a null answer is not silently an empty one.
+            br#"{"choices":[{"message":{"content":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":1}}"#.as_slice(),
+            br#"{"choices":[{"message":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":1}}"#.as_slice(),
+            // Empty or non-string reasoning is no reasoning.
+            br#"{"choices":[{"message":{"content":null,"reasoning_content":""},"finish_reason":"length"}],"usage":{"prompt_tokens":4,"completion_tokens":1}}"#.as_slice(),
+            br#"{"choices":[{"message":{"content":null,"reasoning":{"text":"x"}},"finish_reason":"length"}],"usage":{"prompt_tokens":4,"completion_tokens":1}}"#.as_slice(),
+            // A non-null, non-string content is malformed even beside reasoning.
+            br#"{"choices":[{"message":{"content":7,"reasoning_content":"x"},"finish_reason":"length"}],"usage":{"prompt_tokens":4,"completion_tokens":1}}"#.as_slice(),
+        ] {
+            match OpenAiAdapter.parse_chat_response(200, body) {
+                Err(LlmError::ProviderError(msg)) => assert_eq!(msg, "invalid response shape"),
+                other => panic!("{}: {other:?}", String::from_utf8_lossy(body)),
+            }
+        }
+    }
+
+    #[test]
+    fn t_openai_parse_chat_response_reasoning_answer_still_requires_usage() {
+        let body = br#"{"choices":[{"message":{"content":null,"reasoning_content":"thinking"},"finish_reason":"length"}]}"#;
+        match OpenAiAdapter.parse_chat_response(200, body) {
+            Err(LlmError::ProviderError(msg)) => assert_eq!(msg, "invalid response shape"),
+            other => panic!("missing usage must stay an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t_openai_parse_chat_response_string_content_is_unchanged_beside_reasoning() {
+        let body = br#"{"choices":[{"message":{"content":"pong","reasoning_content":"The user says ping."},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":40}}"#;
+        let outcome = OpenAiAdapter.parse_chat_response(200, body).unwrap();
+        assert_eq!(outcome.text, "pong", "reasoning never joins the text");
+        assert_eq!(outcome.finish_reason, "stop");
+    }
+
+    #[test]
+    fn t_openai_reasoning_stream_frames_are_progress_never_text() {
+        let adapter = OpenAiAdapter;
+        for data in [
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"The user"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":null,"reasoning":" says"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"","reasoning_content":" ping"}}]}"#,
+        ] {
+            let ev = adapter.parse_sse_frame(&data_frame(data)).unwrap();
+            assert_eq!(ev, SseEvent::REASONING, "{data}");
+        }
+        // Reasoning beside a usage or finish frame keeps those, flagged as reasoning.
+        let ev = adapter
+            .parse_sse_frame(&data_frame(
+                r#"{"choices":[{"index":0,"delta":{"reasoning_content":"x"},"finish_reason":"length"}]}"#,
+            ))
+            .unwrap();
+        assert!(ev.reasoning);
+        assert_eq!(ev.finish_reason.as_deref(), Some("length"));
+        assert_eq!(ev.delta, None);
+        // Empty reasoning is not reasoning: the frame stays ignorable.
+        let ev = adapter
+            .parse_sse_frame(&data_frame(
+                r#"{"choices":[{"index":0,"delta":{"reasoning_content":""}}]}"#,
+            ))
+            .unwrap();
+        assert!(ev.is_ignore());
+        // A content frame is unchanged.
+        let ev = adapter
+            .parse_sse_frame(&data_frame(
+                r#"{"choices":[{"index":0,"delta":{"content":"pong"}}]}"#,
+            ))
+            .unwrap();
+        assert_eq!(ev.delta.as_deref(), Some("pong"));
+        assert!(!ev.reasoning);
+    }
+
+    #[test]
+    fn t_openai_reasoning_effort_is_sent_top_level_on_chat_and_stream_requests() {
+        use advance_runtime::config::ReasoningEffort;
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "ping".into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }];
+        let params = ChatParams {
+            max_tokens: Some(16),
+            ..ChatParams::default()
+        };
+        let plain = provider("https://gw.example");
+        let buffered = OpenAiAdapter
+            .build_chat_request(&plain, &messages, &params)
+            .unwrap();
+        // Absent: byte-identical to the request of an entry without the key.
+        assert_eq!(
+            String::from_utf8(buffered.body.clone()).unwrap(),
+            r#"{"max_tokens":16,"messages":[{"content":"ping","role":"user"}],"model":"gpt-4o"}"#
+        );
+        let streamed = OpenAiAdapter
+            .build_stream_request(&plain, &messages, &params)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(streamed.body).unwrap(),
+            r#"{"max_tokens":16,"messages":[{"content":"ping","role":"user"}],"model":"gpt-4o","stream":true,"stream_options":{"include_usage":true}}"#
+        );
+
+        for effort in ReasoningEffort::ALL {
+            let p = ResolvedProvider {
+                reasoning_effort: Some(effort),
+                ..provider("https://gw.example")
+            };
+            let buffered = OpenAiAdapter
+                .build_chat_request(&p, &messages, &params)
+                .unwrap();
+            assert_eq!(
+                String::from_utf8(buffered.body).unwrap(),
+                format!(
+                    r#"{{"max_tokens":16,"messages":[{{"content":"ping","role":"user"}}],"model":"gpt-4o","reasoning_effort":"{}"}}"#,
+                    effort.as_str()
+                )
+            );
+            let streamed = OpenAiAdapter
+                .build_stream_request(&p, &messages, &params)
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&streamed.body).unwrap();
+            assert_eq!(body["reasoning_effort"], effort.as_str());
+            assert_eq!(body["stream"], true);
+        }
+        // Never on an embedding request.
+        let p = ResolvedProvider {
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..provider("https://gw.example")
+        };
+        let embed = OpenAiAdapter.build_embed_request(&p, "hello").unwrap();
+        assert!(!String::from_utf8(embed.body).unwrap().contains("reasoning"));
     }
 
     /// MODULE-009-T70 — OpenAi parse_chat_response status mapping.

@@ -2378,6 +2378,7 @@ mod tests {
             stop_sequences: None,
             tools: None,
             output_schema: None,
+            reasoning_effort: None,
             deadline: Instant::now() + Duration::from_secs(30),
             cancel: Arc::new(AtomicBool::new(false)),
         }
@@ -3122,6 +3123,7 @@ mod module_001_ac32_tests {
             stop_sequences: None,
             tools: None,
             output_schema: None,
+            reasoning_effort: None,
             deadline: Instant::now() + Duration::from_secs(5),
             cancel: Arc::new(AtomicBool::new(false)),
         }

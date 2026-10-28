@@ -548,6 +548,10 @@ fn oai_chat_body(req: &InferenceChatRequest) -> Value {
             }))
             .collect::<Vec<_>>());
     }
+    // The entry's reasoning setting, top-level as OpenAI-compatible servers take it.
+    if let Some(effort) = &req.reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
+    }
     body
 }
 
@@ -860,12 +864,44 @@ mod spawn_tests {
                 parameters: serde_json::json!({"type": "object"}),
             }]),
             output_schema: None,
+            reasoning_effort: None,
             deadline: Instant::now() + Duration::from_secs(1),
             cancel: Arc::new(AtomicBool::new(false)),
         };
         let body = oai_chat_body(&req);
         assert!(body["tools"].is_array(), "{body}");
         assert_eq!(body["tools"][0]["function"]["name"], "search");
+    }
+
+    /// A local entry's reasoning setting reaches its OpenAI-compatible sidecar top-level, and
+    /// an entry without one sends the body it always sent.
+    #[test]
+    fn local_sidecar_body_carries_the_reasoning_effort_only_when_set() {
+        let mut req = InferenceChatRequest {
+            provider_id: "local".into(),
+            model: "llama".into(),
+            messages: vec![InferenceMessage {
+                role: "user".into(),
+                content: "ping".into(),
+            }],
+            temperature: None,
+            max_tokens: Some(16),
+            stop_sequences: None,
+            tools: None,
+            output_schema: None,
+            reasoning_effort: None,
+            deadline: Instant::now() + Duration::from_secs(1),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        assert_eq!(
+            serde_json::to_string(&oai_chat_body(&req)).unwrap(),
+            r#"{"max_tokens":16,"messages":[{"content":"ping","role":"user"}],"model":"llama"}"#
+        );
+        req.reasoning_effort = Some("low".into());
+        assert_eq!(
+            serde_json::to_string(&oai_chat_body(&req)).unwrap(),
+            r#"{"max_tokens":16,"messages":[{"content":"ping","role":"user"}],"model":"llama","reasoning_effort":"low"}"#
+        );
     }
 
     #[cfg(unix)]

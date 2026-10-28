@@ -1412,3 +1412,114 @@ async fn am_t12_scripted_cloud_and_pv02_stays_offline() {
     assert_eq!(got.available_models[0].id, "gpt-4o");
     assert!(!serde_json::to_string(&got).unwrap().contains(SECRET_KEY));
 }
+
+// ── PV-07: an entry's own generate budget and reasoning setting over the daemon-composed API:
+//    written to the real document under the runtime's spelling, echoed, cleared by an explicit
+//    null, and refused with the setting's detail token before any write ─────────────────────
+#[tokio::test(flavor = "multi_thread")]
+async fn pv07_generate_budget_and_reasoning_setting_over_production_wiring() {
+    let (_g, ws, cfg) = fresh_workspace();
+    let (_host, handles) = boot(&ws, &cfg).await;
+    let api = handles
+        .client_api_server
+        .as_ref()
+        .expect("EventBus up ⇒ Client API bound")
+        .api();
+    mint(&api, "tok", Scope::operator_default());
+    let details = |env: &ClientEnvelope<Value>| -> Vec<String> {
+        env.error
+            .as_ref()
+            .map(|e| e.details.clone())
+            .unwrap_or_default()
+    };
+    let document = || std::fs::read_to_string(ws.join(".advance/runtime-config.yaml")).unwrap();
+
+    let env = post(
+        &api,
+        "/client/providers",
+        json!({
+            "provider_id": "reasoner",
+            "endpoint": "https://api.reasoner.example",
+            "model_aliases": { "think": "reasoner-large" },
+            "cost": { "input_per_mtoken": 1.0, "output_per_mtoken": 2.0 },
+            "rate_limit": { "requests_per_minute": 60, "tokens_per_minute": 100000 },
+            "generate_timeout_secs": 120,
+            "reasoning_effort": "low"
+        }),
+        "k-create",
+    );
+    let created: ClientProviderSummary = data(&env);
+    assert_eq!(created.generate_timeout_secs, Some(120));
+    assert_eq!(created.reasoning_effort.as_deref(), Some("low"));
+    let text = document();
+    assert!(text.contains("generate-timeout-secs: 120"), "{text}");
+    assert!(text.contains("reasoning-effort: low"), "{text}");
+    let entry = entries(&ws)
+        .into_iter()
+        .find(|p| p.id == "reasoner")
+        .unwrap();
+    assert_eq!(entry.generate_timeout(), Some(Duration::from_secs(120)));
+    assert_eq!(
+        entry.reasoning_effort,
+        Some(advance_runtime::config::ReasoningEffort::Low)
+    );
+    let got: ClientProviderSummary = data(&get(&api, "/client/providers/reasoner"));
+    assert_eq!(got.generate_timeout_secs, Some(120));
+
+    // An explicit null clears the budget; the setting stays.
+    let env = post(
+        &api,
+        "/client/providers/reasoner:update",
+        json!({ "generate_timeout_secs": null }),
+        "k-clear",
+    );
+    let cleared = env.data.clone().expect("cleared");
+    assert!(cleared.get("generate_timeout_secs").is_none(), "{cleared}");
+    assert_eq!(cleared["reasoning_effort"], "low");
+    let text = document();
+    assert!(!text.contains("generate-timeout-secs"), "{text}");
+    assert!(text.contains("reasoning-effort: low"), "{text}");
+
+    // Refusals carry the setting's detail token and leave the document as it was.
+    let before = document();
+    let env = post(
+        &api,
+        "/client/providers",
+        json!({
+            "provider_id": "messages",
+            "backend": "anthropic-messages",
+            "endpoint": "https://api.messages.example",
+            "model_aliases": { "m": "m" },
+            "cost": { "input_per_mtoken": 1.0, "output_per_mtoken": 2.0 },
+            "rate_limit": { "requests_per_minute": 60, "tokens_per_minute": 100000 },
+            "reasoning_effort": "low"
+        }),
+        "k-bad-create",
+    );
+    assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
+    assert_eq!(details(&env), ["reasoning_effort_unsupported"]);
+    // The stored setting meets the update's new dialect: decided by the provider.
+    let env = post(
+        &api,
+        "/client/providers/reasoner:update",
+        json!({ "backend": "anthropic-messages" }),
+        "k-bad-dialect",
+    );
+    assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
+    assert_eq!(details(&env), ["reasoning_effort_unsupported"]);
+    let env = post(
+        &api,
+        "/client/providers/reasoner:update",
+        json!({ "generate_timeout_secs": 901 }),
+        "k-bad-budget",
+    );
+    assert_eq!(details(&env), ["invalid_generate_timeout"]);
+    assert_eq!(document(), before);
+    assert_eq!(ids(&ws), vec!["openai", "reasoner"]);
+
+    // The workspace's commit worker runs until its queue is closed: join it so the runtime's
+    // teardown does not wait on it.
+    if let Some(queue) = handles.git_queue_owner.as_ref() {
+        queue.close_and_join().await;
+    }
+}

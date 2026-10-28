@@ -20,7 +20,7 @@ use advance_shared_types::security_validator::{
 };
 use async_trait::async_trait;
 
-use crate::gateway::{ChatMessage, ChatParams, ChatRole, LlmGateway};
+use crate::gateway::{ChatMessage, ChatParams, ChatRole, HopCredit, LlmGateway};
 use crate::test_support::{
     fixture_runtime_config, no_op_repetition_guard, MockEventBusEmit, MockHttpSecurityChain,
     MockRunBudget, MockRuntimeConfigProvider,
@@ -54,6 +54,8 @@ fn agent_cli_cfg() -> LlmProviderConfig {
             args: vec![],
         }),
         auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+        generate_timeout_secs: None,
+        reasoning_effort: None,
     }
 }
 
@@ -328,50 +330,106 @@ fn agent_cli_elapsed_does_not_expire_the_next_cloud_hop() {
         })),
     );
     let start = Instant::now();
-    let cli = gw.hop_deadline(start, InferenceBackendClass::AgentCli, Duration::ZERO);
+    let none = HopCredit::default();
+    let deadline = |gw: &LlmGateway, class, credit| {
+        gw.hop_deadline(start, start, class, None, credit)
+            .duration_since(start)
+    };
     assert_eq!(
-        cli.duration_since(start),
+        deadline(&gw, InferenceBackendClass::AgentCli, none),
         crate::backend_cli::MAX_CALL_DURATION
     );
-    let cloud = gw.hop_deadline(start, InferenceBackendClass::CloudHttp, Duration::ZERO);
-    assert_eq!(cloud.duration_since(start), cap_http::DEFAULT_TIMEOUT);
-    assert_eq!(
-        gw.hop_deadline(start, InferenceBackendClass::Local, Duration::ZERO)
-            .duration_since(start),
-        cap_http::DEFAULT_TIMEOUT
-    );
-    assert_eq!(
-        gw.hop_deadline(start, InferenceBackendClass::MeshRemote, Duration::ZERO)
-            .duration_since(start),
-        cap_http::DEFAULT_TIMEOUT
-    );
-    let after_cli = gw.hop_deadline(
-        start,
+    for class in [
         InferenceBackendClass::CloudHttp,
-        Duration::from_secs(61),
-    );
+        InferenceBackendClass::Local,
+        InferenceBackendClass::MeshRemote,
+    ] {
+        assert_eq!(deadline(&gw, class, none), cap_http::DEFAULT_TIMEOUT);
+    }
+    let after_cli = HopCredit {
+        agent_cli: Duration::from_secs(61),
+        ..HopCredit::default()
+    };
     assert_eq!(
-        after_cli.duration_since(start),
+        deadline(&gw, InferenceBackendClass::CloudHttp, after_cli),
         cap_http::DEFAULT_TIMEOUT + Duration::from_secs(61)
     );
-    assert!(after_cli > start + Duration::from_secs(61));
+    // Time inside agent-cli hops is not added back to the agent-cli bound itself.
+    assert_eq!(
+        deadline(&gw, InferenceBackendClass::AgentCli, after_cli),
+        crate::backend_cli::MAX_CALL_DURATION
+    );
 
     let limited = gw.with_generate_timeout(Duration::from_millis(80));
     assert_eq!(
-        limited
-            .hop_deadline(
-                start,
-                InferenceBackendClass::AgentCli,
-                Duration::from_secs(61)
-            )
-            .duration_since(start),
+        deadline(&limited, InferenceBackendClass::AgentCli, after_cli),
         Duration::from_millis(80)
     );
     assert_eq!(
-        limited
-            .hop_deadline(start, InferenceBackendClass::CloudHttp, Duration::ZERO)
-            .duration_since(start),
+        deadline(&limited, InferenceBackendClass::CloudHttp, none),
         Duration::from_millis(80)
+    );
+}
+
+/// A hop of an entry with its own generate budget gets that budget from its own start,
+/// whatever earlier hops spent, and the time it spends is added back to the bounds the other
+/// hops share; an explicit test hop budget still bounds every hop from the start.
+#[test]
+fn an_entry_budget_bounds_its_own_hop_and_is_credited_to_the_shared_bounds() {
+    let gw = gateway(
+        Arc::new(recording("fine")),
+        Some(Arc::new(MarkerDetector {
+            marker: "unused",
+            scans: Mutex::new(Vec::new()),
+        })),
+    );
+    let start = Instant::now();
+    let later = start + Duration::from_secs(70);
+    let budget = Some(Duration::from_secs(120));
+    for class in [
+        InferenceBackendClass::CloudHttp,
+        InferenceBackendClass::Local,
+    ] {
+        assert_eq!(
+            gw.hop_deadline(start, later, class, budget, HopCredit::default()),
+            later + Duration::from_secs(120),
+            "{class:?}"
+        );
+    }
+    let after_long_hop = HopCredit {
+        agent_cli: Duration::from_secs(5),
+        entry_budget: Duration::from_secs(70),
+    };
+    assert_eq!(
+        gw.hop_deadline(
+            start,
+            later,
+            InferenceBackendClass::CloudHttp,
+            None,
+            after_long_hop
+        ),
+        start + cap_http::DEFAULT_TIMEOUT + Duration::from_secs(75)
+    );
+    assert_eq!(
+        gw.hop_deadline(
+            start,
+            later,
+            InferenceBackendClass::AgentCli,
+            None,
+            after_long_hop
+        ),
+        start + crate::backend_cli::MAX_CALL_DURATION + Duration::from_secs(70)
+    );
+    let limited = gw.with_generate_timeout(Duration::from_millis(80));
+    assert_eq!(
+        limited.hop_deadline(
+            start,
+            later,
+            InferenceBackendClass::CloudHttp,
+            budget,
+            after_long_hop
+        ),
+        start + Duration::from_millis(80)
     );
 }
 

@@ -699,6 +699,119 @@ impl ProviderAuthSource {
     }
 }
 
+/// Smallest `generate-timeout-secs` an entry may set (inclusive).
+pub const MIN_GENERATE_TIMEOUT_SECS: u32 = 5;
+/// Largest `generate-timeout-secs` an entry may set (inclusive).
+pub const MAX_GENERATE_TIMEOUT_SECS: u32 = 900;
+/// Largest `generate-timeout-secs` an `auth-source: chatgpt-oauth` entry may set (inclusive).
+/// Every request of such an entry is a streamed exchange, and the HTTP layer ends a streamed
+/// exchange after 300 s, so a longer budget could never apply.
+pub const MAX_SIGN_IN_GENERATE_TIMEOUT_SECS: u32 = 300;
+
+/// Largest `generate-timeout-secs` an entry whose credential comes from `auth_source` may set
+/// (inclusive).
+pub fn max_generate_timeout_secs(auth_source: ProviderAuthSource) -> u32 {
+    match auth_source {
+        ProviderAuthSource::ApiKey => MAX_GENERATE_TIMEOUT_SECS,
+        ProviderAuthSource::ChatGptOAuth => MAX_SIGN_IN_GENERATE_TIMEOUT_SECS,
+    }
+}
+
+/// How much an OpenAI-compatible reasoning model reasons before it answers (an entry's
+/// `reasoning-effort`). Sent as-is: `reasoning_effort` on `openai-chat`, `reasoning.effort` on
+/// `openai-responses`. Which values a model honours is the upstream's business.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "minimal")]
+    Minimal,
+    #[serde(rename = "low")]
+    Low,
+    #[serde(rename = "medium")]
+    Medium,
+    #[serde(rename = "high")]
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+}
+
+impl ReasoningEffort {
+    /// Every value, in increasing effort.
+    pub const ALL: [ReasoningEffort; 6] = [
+        Self::None,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+    ];
+
+    /// The config and wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+        }
+    }
+
+    /// The value spelled `s`, if any.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|effort| effort.as_str() == s)
+    }
+}
+
+/// Why `generate-timeout-secs` cannot be set on an entry of `class`; `None` when it can.
+/// An `agent-cli` call is bounded by the CLI call limit, and a `mesh-remote` call by the
+/// serving device.
+pub fn generate_timeout_refusal(class: InferenceBackendClass) -> Option<&'static str> {
+    match class {
+        InferenceBackendClass::CloudHttp | InferenceBackendClass::Local => None,
+        InferenceBackendClass::MeshRemote | InferenceBackendClass::AgentCli => {
+            Some("generate-timeout-secs is only valid on backend-class: cloud-http or local")
+        }
+    }
+}
+
+/// Why `reasoning-effort` cannot be set on an entry of `class` whose requests speak `backend`
+/// with a credential from `auth_source`; `None` when it can. Only the OpenAI-compatible
+/// dialects carry the setting. The request of a `chatgpt-oauth` entry is pinned to the fields
+/// its route was verified to accept, and a reasoning setting is not one of them.
+pub fn reasoning_effort_refusal(
+    class: InferenceBackendClass,
+    backend: ProviderBackend,
+    auth_source: ProviderAuthSource,
+) -> Option<&'static str> {
+    if !matches!(
+        class,
+        InferenceBackendClass::CloudHttp | InferenceBackendClass::Local
+    ) {
+        return Some("reasoning-effort is only valid on backend-class: cloud-http or local");
+    }
+    if backend == ProviderBackend::AnthropicMessages {
+        return Some("reasoning-effort is only valid on backend: openai-chat or openai-responses");
+    }
+    if auth_source == ProviderAuthSource::ChatGptOAuth {
+        return Some("reasoning-effort is invalid with auth-source: chatgpt-oauth");
+    }
+    None
+}
+
+/// The wire dialect of an entry with `id` and `backend`: the configured one, else
+/// `anthropic-messages` for the id `anthropic` and `openai-chat` for every other id (the
+/// resolver's historical id-based routing).
+pub fn effective_backend(id: &str, backend: Option<ProviderBackend>) -> ProviderBackend {
+    backend.unwrap_or(if id == "anthropic" {
+        ProviderBackend::AnthropicMessages
+    } else {
+        ProviderBackend::OpenAiChat
+    })
+}
+
 #[derive(Deserialize, Clone, PartialEq)]
 #[serde(try_from = "LlmProviderConfigRaw")]
 pub struct LlmProviderConfig {
@@ -741,6 +854,19 @@ pub struct LlmProviderConfig {
     pub agent_cli: Option<AgentCliSpec>,
     /// Where the entry's credential comes from. Absent → an operator-entered API key.
     pub auth_source: ProviderAuthSource,
+    /// `generate-timeout-secs` (`cloud-http` and `local` only, 5..=900; at most 300 with
+    /// `auth-source: chatgpt-oauth`): how long one generate hop of this entry may take, for
+    /// upstreams slower than the default budget (a reasoning model decoding a long answer). It
+    /// replaces the default 30 s wherever the entry's hop is bounded, the HTTP layer's own total
+    /// timeout of its requests included, and is measured from the start of that hop: time
+    /// earlier hops of the same request spent does not shorten it, and time it spends does not
+    /// shorten the hops after it. A cloud-http hop that runs it out before releasing any text
+    /// hands the request to the next candidate, like a transport timeout. `None` = the default.
+    pub generate_timeout_secs: Option<u32>,
+    /// `reasoning-effort` (OpenAI-compatible `cloud-http` / `local` entries only): sent with
+    /// every chat request of this entry, the preflight included; never with an embedding
+    /// request. `None` = nothing is sent (the upstream's default).
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl LlmProviderConfig {
@@ -748,6 +874,12 @@ impl LlmProviderConfig {
     /// (`auth-source: chatgpt-oauth`) rather than an API key.
     pub fn uses_chatgpt_sign_in(&self) -> bool {
         self.auth_source == ProviderAuthSource::ChatGptOAuth
+    }
+
+    /// The entry's `generate-timeout-secs` as a duration; `None` = the default budget.
+    pub fn generate_timeout(&self) -> Option<Duration> {
+        self.generate_timeout_secs
+            .map(|secs| Duration::from_secs(u64::from(secs)))
     }
 }
 
@@ -793,6 +925,10 @@ struct LlmProviderConfigRaw {
     agent_cli: Option<AgentCliSpec>,
     #[serde(rename = "auth-source", default)]
     auth_source: Option<ProviderAuthSource>,
+    #[serde(rename = "generate-timeout-secs", default)]
+    generate_timeout_secs: Option<u32>,
+    #[serde(rename = "reasoning-effort", default)]
+    reasoning_effort: Option<String>,
 }
 
 impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
@@ -917,6 +1053,42 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
                 return Err("embedding-model is invalid with auth-source: chatgpt-oauth".into());
             }
         }
+        if let Some(secs) = raw.generate_timeout_secs {
+            if !(MIN_GENERATE_TIMEOUT_SECS..=MAX_GENERATE_TIMEOUT_SECS).contains(&secs) {
+                return Err(format!(
+                    "generate-timeout-secs must be from {MIN_GENERATE_TIMEOUT_SECS} to \
+                     {MAX_GENERATE_TIMEOUT_SECS} seconds (got {secs})"
+                ));
+            }
+            if secs > max_generate_timeout_secs(auth_source) {
+                return Err(format!(
+                    "generate-timeout-secs must be at most {MAX_SIGN_IN_GENERATE_TIMEOUT_SECS} \
+                     seconds with auth-source: chatgpt-oauth, whose requests are streamed \
+                     exchanges that end after {MAX_SIGN_IN_GENERATE_TIMEOUT_SECS} s (got {secs})"
+                ));
+            }
+            if let Some(why) = generate_timeout_refusal(backend_class) {
+                return Err(why.into());
+            }
+        }
+        let reasoning_effort = match raw.reasoning_effort.as_deref() {
+            None => None,
+            Some(s) => Some(ReasoningEffort::parse(s).ok_or_else(|| {
+                format!(
+                    "unknown llm-providers[].reasoning-effort value {s:?} (expected none, \
+                     minimal, low, medium, high or xhigh)"
+                )
+            })?),
+        };
+        if reasoning_effort.is_some() {
+            if let Some(why) = reasoning_effort_refusal(
+                backend_class,
+                effective_backend(&raw.id, backend),
+                auth_source,
+            ) {
+                return Err(why.into());
+            }
+        }
         Ok(Self {
             id: raw.id,
             endpoint: raw.endpoint,
@@ -938,6 +1110,8 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
             device_id: raw.device_id,
             agent_cli: raw.agent_cli,
             auth_source,
+            generate_timeout_secs: raw.generate_timeout_secs,
+            reasoning_effort,
         })
     }
 }
@@ -974,6 +1148,8 @@ impl fmt::Debug for LlmProviderConfig {
             .field("device_id", &self.device_id)
             .field("agent_cli", &self.agent_cli)
             .field("auth_source", &self.auth_source)
+            .field("generate_timeout_secs", &self.generate_timeout_secs)
+            .field("reasoning_effort", &self.reasoning_effort)
             .finish()
     }
 }

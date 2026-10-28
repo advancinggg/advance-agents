@@ -129,6 +129,18 @@ fn map_incomplete_reason(reason: Option<&str>) -> &'static str {
     }
 }
 
+/// Whether the multi-segment item event `response.<rest>` (payload `value`) is reasoning
+/// output: a `reasoning*` delta (`response.reasoning_text.delta`,
+/// `response.reasoning_summary_text.delta`, …) or a reasoning output item being added or
+/// done. Never text; consumers count it as progress.
+fn is_reasoning_event(rest: &str, value: &Value) -> bool {
+    if rest.starts_with("reasoning") && rest.ends_with(".delta") {
+        return true;
+    }
+    matches!(rest, "output_item.added" | "output_item.done")
+        && value["item"]["type"].as_str() == Some("reasoning")
+}
+
 /// In-band error probe (MODULE-009-AC-21): both OpenAI error shapes —
 /// the object form `{"error":{...}}` and the flat `{code, error}` form —
 /// fold to an enum-coded STATIC reason before any typed decode. Called only
@@ -216,13 +228,18 @@ impl OpenAiResponsesAdapter {
         // The plan route of a ChatGPT sign-in entry rejects a request that carries
         // `temperature` or `max_output_tokens`, so a caller-supplied value is dropped there
         // (the live path and the preflight always set `max_tokens`; failing closed would
-        // make the entry unusable). Every other entry sends them as before.
+        // make the entry unusable). Every other entry sends them as before, and its
+        // reasoning setting when it has one (the loader refuses one on a sign-in entry, whose
+        // request stays pinned to the fields its route was verified to accept).
         if !provider.uses_chatgpt_sign_in() {
             if let Some(t) = params.temperature {
                 body["temperature"] = json!(t);
             }
             if let Some(m) = params.max_tokens {
                 body["max_output_tokens"] = json!(m);
+            }
+            if let Some(effort) = provider.reasoning_effort {
+                body["reasoning"] = json!({ "effort": effort.as_str() });
             }
         }
         Ok(body)
@@ -290,7 +307,11 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                 .as_array()
                 .ok_or_else(|| LlmError::ProviderError("invalid response shape".into()))?;
             let mut parts: Vec<&str> = Vec::new();
+            let mut reasoned = false;
             for item in output {
+                if item["type"].as_str() == Some("reasoning") {
+                    reasoned = true;
+                }
                 if item["type"].as_str() != Some("message") {
                     continue;
                 }
@@ -304,7 +325,9 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                     }
                 }
             }
-            if parts.is_empty() {
+            // A reasoning model that spent its whole budget reasoning returns only reasoning
+            // items: an answer with empty text. No text and no reasoning is malformed.
+            if parts.is_empty() && !reasoned {
                 return Err(LlmError::ProviderError("invalid response shape".into()));
             }
             let text = parts.concat();
@@ -463,6 +486,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                     finish_reason: Some(finish),
                     terminal: true,
                     tool_call_deltas: None,
+                    reasoning: false,
                 })
             }
             "response.failed" => {
@@ -483,6 +507,9 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                         return Err(LlmError::ProviderError(
                             "unrecognized terminal-family event".into(),
                         ));
+                    }
+                    if is_reasoning_event(rest, &value) {
+                        return Ok(SseEvent::REASONING);
                     }
                 }
                 Ok(SseEvent::IGNORE)
@@ -707,6 +734,8 @@ mod tests {
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
             embedding_model: None,
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
+            generate_timeout: None,
+            reasoning_effort: None,
         }
     }
 
@@ -969,6 +998,120 @@ mod tests {
         assert_eq!(outcome.input_tokens, 11);
         assert_eq!(outcome.output_tokens, 4);
         assert_eq!(outcome.finish_reason, "stop");
+    }
+
+    /// A reasoning model that spends its whole output budget reasoning answers with reasoning
+    /// items only: an answer with empty text, its usage kept.
+    #[test]
+    fn t_responses_parse_chat_response_reasoning_only_output_is_an_empty_answer() {
+        let body = br#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"model":"reasoner-1","output":[{"type":"reasoning","id":"rs_1","summary":[]}],"usage":{"input_tokens":9,"output_tokens":16,"output_tokens_details":{"reasoning_tokens":16}}}"#;
+        let outcome = OpenAiResponsesAdapter
+            .parse_chat_response(200, body)
+            .expect("a reasoning-only answer is valid");
+        assert_eq!(outcome.text, "");
+        assert_eq!(outcome.finish_reason, "length");
+        assert_eq!((outcome.input_tokens, outcome.output_tokens), (9, 16));
+
+        let completed = br#"{"status":"completed","model":"reasoner-1","output":[{"type":"reasoning","encrypted_content":"zzz"}],"usage":{"input_tokens":9,"output_tokens":16}}"#;
+        let outcome = OpenAiResponsesAdapter
+            .parse_chat_response(200, completed)
+            .unwrap();
+        assert_eq!(outcome.text, "");
+        assert_eq!(outcome.finish_reason, "stop");
+    }
+
+    #[test]
+    fn t_responses_parse_chat_response_without_text_or_reasoning_stays_invalid() {
+        for body in [
+            br#"{"status":"completed","model":"m","output":[],"usage":{"input_tokens":9,"output_tokens":1}}"#.as_slice(),
+            // Usage is still required beside a reasoning item.
+            br#"{"status":"completed","model":"m","output":[{"type":"reasoning"}]}"#.as_slice(),
+        ] {
+            match OpenAiResponsesAdapter.parse_chat_response(200, body) {
+                Err(LlmError::ProviderError(msg)) => assert_eq!(msg, "invalid response shape"),
+                other => panic!("{}: {other:?}", String::from_utf8_lossy(body)),
+            }
+        }
+    }
+
+    #[test]
+    fn t_responses_reasoning_stream_events_are_progress_never_text() {
+        let adapter = OpenAiResponsesAdapter;
+        for (name, data) in [
+            (
+                "response.reasoning_text.delta",
+                r#"{"type":"response.reasoning_text.delta","delta":"The user"}"#,
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","delta":"Thinking"}"#,
+            ),
+            (
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1"}}"#,
+            ),
+            (
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1"}}"#,
+            ),
+        ] {
+            let ev = adapter.parse_sse_frame(&frame(Some(name), data)).unwrap();
+            assert_eq!(ev, SseEvent::REASONING, "{name}");
+        }
+        // Other item events stay ignorable.
+        for (name, data) in [
+            (
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"type":"message"}}"#,
+            ),
+            (
+                "response.reasoning_summary_part.added",
+                r#"{"type":"response.reasoning_summary_part.added"}"#,
+            ),
+        ] {
+            let ev = adapter.parse_sse_frame(&frame(Some(name), data)).unwrap();
+            assert!(ev.is_ignore(), "{name}");
+        }
+    }
+
+    #[test]
+    fn t_responses_reasoning_effort_is_sent_as_reasoning_effort_object() {
+        use advance_runtime::config::ReasoningEffort;
+        let adapter = OpenAiResponsesAdapter;
+        for effort in ReasoningEffort::ALL {
+            let p = ResolvedProvider {
+                reasoning_effort: Some(effort),
+                ..provider()
+            };
+            let chat = adapter
+                .build_chat_request(&p, &shaping_messages(), &shaping_params())
+                .unwrap();
+            assert_eq!(
+                String::from_utf8(chat.body).unwrap(),
+                format!(
+                    r#"{{"include":["reasoning.encrypted_content"],"input":[{{"content":"hi","role":"user"}}],"instructions":"be brief","max_output_tokens":64,"model":"gpt-5.2","reasoning":{{"effort":"{}"}},"store":false,"temperature":0.5}}"#,
+                    effort.as_str()
+                )
+            );
+            let stream = adapter
+                .build_stream_request(&p, &shaping_messages(), &shaping_params())
+                .unwrap();
+            let body: Value = serde_json::from_slice(&stream.body).unwrap();
+            assert_eq!(body["reasoning"], json!({ "effort": effort.as_str() }));
+            assert_eq!(body["stream"], json!(true));
+            // Never on an embedding request.
+            let embed = adapter.build_embed_request(&p, "text").unwrap();
+            assert!(!String::from_utf8(embed.body).unwrap().contains("effort"));
+        }
+        // A sign-in entry's pinned request never carries one (the loader refuses the key there).
+        let p = ResolvedProvider {
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..sign_in_provider()
+        };
+        let req = adapter
+            .build_stream_request(&p, &shaping_messages(), &shaping_params())
+            .unwrap();
+        assert!(!String::from_utf8(req.body).unwrap().contains("effort"));
     }
 
     /// MODULE-009-T117 — buffered incomplete maps to the closed
