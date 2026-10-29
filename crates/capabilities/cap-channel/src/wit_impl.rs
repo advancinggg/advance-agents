@@ -531,6 +531,7 @@ mod tests {
             agent_id: agent_id.to_string(),
             trace_id: "trace-test".to_string(),
             turn_id: None,
+            transcript_scope: None,
             capability: CHANNEL_HOST_CAPABILITY.to_string(),
             function: "subscribe".to_string(),
             run_id: None,

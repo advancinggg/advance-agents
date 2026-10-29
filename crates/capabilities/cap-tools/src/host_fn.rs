@@ -939,6 +939,7 @@ mod tests {
             agent_id: "test-agent".into(),
             trace_id: "test-trace".into(),
             turn_id: None,
+            transcript_scope: None,
             capability: CAPABILITY.into(),
             function: format!("{NAMESPACE}::tool-invoke"),
             run_id: None,

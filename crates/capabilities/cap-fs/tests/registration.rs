@@ -156,6 +156,7 @@ async fn all_nineteen_specs_callable_via_registry_dispatch() {
         agent_id: "a".into(),
         trace_id: "tr-reg".into(),
         turn_id: None,
+        transcript_scope: None,
         capability: "fs".into(),
         function: "advance:runtime/agent-fs::dispatch-probe".into(),
         run_id: None,

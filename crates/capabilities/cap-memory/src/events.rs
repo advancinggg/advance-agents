@@ -332,6 +332,7 @@ mod tests {
             agent_id: agent.to_string(),
             trace_id: "trace-1".to_string(),
             turn_id: None,
+            transcript_scope: None,
             capability: "memory".to_string(),
             function: "advance:runtime/agent-memory::test".to_string(),
             run_id: None,

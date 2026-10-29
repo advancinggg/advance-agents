@@ -30,6 +30,7 @@ use advance_runtime::ComponentRuntime;
 use advance_scheduler::agent_loop::AgentLoopDriverImpl;
 use advance_scheduler::hook::{
     BootstrapError, HookError, MessageHandler, ProtectedTurnExecutionBoundary, RunBootstrap,
+    TurnEnd, TurnObserver, TurnOutcome,
 };
 use advance_scheduler::types::{ComponentConfig, ComponentId, WasmInstance};
 use advance_shared_types::capability::{CapParams, CapRequest, CapabilityId, GrantDecision};
@@ -216,6 +217,87 @@ impl ProtectedTurnExecutionBoundary for RecordingBoundary {
             incarnation: store_incarnation,
         });
         Ok(())
+    }
+}
+
+/// Records what the serving loop reports at each turn boundary, in order.
+#[derive(Default)]
+struct TurnEnds(Mutex<Vec<String>>);
+
+impl TurnEnds {
+    fn recorded(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl TurnObserver for TurnEnds {
+    fn on_turn_end(&self, agent_id: &str, end: &TurnEnd) {
+        self.0.lock().unwrap().push(format!(
+            "end {agent_id} {} {:?}",
+            end.message_id, end.outcome
+        ));
+    }
+
+    fn on_turn_complete(&self, _agent_id: &str) {
+        self.0.lock().unwrap().push("complete".into());
+    }
+}
+
+/// A handler whose guest Store stayed poisoned (a fresh instance could not be
+/// started): it has no incarnation, so a protected turn can never start on it.
+struct PoisonedStoreHandler {
+    handle_calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl MessageHandler for PoisonedStoreHandler {
+    async fn init(&self, _: ComponentConfig) -> Result<Vec<u8>, HookError> {
+        Ok(Vec::new())
+    }
+
+    async fn handle_message(
+        &self,
+        _: &Message,
+        _: Vec<u8>,
+    ) -> Result<advance_shared_types::mailbox::ActionResult, HookError> {
+        self.handle_calls.fetch_add(1, Ordering::AcqRel);
+        Err(HookError::Failure("guest Store is poisoned".into()))
+    }
+
+    fn trusted_store_incarnation(&self) -> Option<[u8; 16]> {
+        None
+    }
+}
+
+/// A boundary whose start fails: the dequeued turn is abandoned before it starts, as a
+/// provider failure leaves it.
+struct RefusingBoundary;
+
+impl ProtectedTurnExecutionBoundary for RefusingBoundary {
+    fn begin(
+        &self,
+        _: &MailboxTurnIdentity,
+        guard: DequeuedTurnGuard,
+    ) -> Result<TurnStartOutcome, HookError> {
+        drop(guard);
+        Err(HookError::Failure("protected-turn-start-failed".into()))
+    }
+
+    fn finish_drained(
+        &self,
+        _: &MailboxTurnIdentity,
+        _: [u8; 16],
+        _: u64,
+    ) -> Result<(), HookError> {
+        Err(HookError::Failure("never started".into()))
+    }
+
+    fn finish_store_destroyed(
+        &self,
+        _: &MailboxTurnIdentity,
+        _: [u8; 16],
+    ) -> Result<(), HookError> {
+        Err(HookError::Failure("never started".into()))
     }
 }
 
@@ -662,4 +744,82 @@ async fn c216_real_store_outer_cancellation_drops_owned_store_before_finalizer_a
     );
     assert_eq!(concrete.trusted_store_incarnation(), None);
     harness.assert_untracked("outer-cancel");
+}
+
+/// A protected message the loop dequeues while the guest Store stays poisoned is consumed
+/// without running: the turn ends `Failed` for the observer (so a Client API message gets
+/// its `agent-error` instead of waiting forever, as an unprotected home's would), and the
+/// abandoned turn leaves no tracked row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c216_dequeued_protected_message_without_a_store_incarnation_ends_failed() {
+    let harness = C216Harness::new();
+    let handler = Arc::new(PoisonedStoreHandler {
+        handle_calls: AtomicUsize::new(0),
+    });
+    let ends = Arc::new(TurnEnds::default());
+    let driver = driver(&harness, handler.clone(), false).with_turn_observer(ends.clone());
+    harness.publish("never-started");
+
+    driver
+        .serve_n_turns(AGENT, component_config(None), instance(), 1)
+        .await;
+
+    assert_eq!(
+        handler.handle_calls.load(Ordering::Acquire),
+        0,
+        "the guest never ran"
+    );
+    assert_eq!(
+        ends.recorded(),
+        [
+            format!("end {AGENT} never-started {:?}", TurnOutcome::Failed),
+            "complete".to_string(),
+        ]
+    );
+    assert!(harness.boundary.drained().is_empty());
+    assert!(harness.boundary.destroyed().is_empty());
+    harness.assert_untracked("never-started");
+}
+
+/// A protected message whose start the boundary refuses ends `Failed` the same way; the
+/// idle Store is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c216_dequeued_protected_message_whose_start_is_refused_ends_failed() {
+    let harness = C216Harness::new();
+    let registry: Arc<dyn HostRegistry> = Arc::new(InMemoryHostRegistry::new());
+    let concrete = wasm_handler(COUNTER_CORE, registry, Vec::new());
+    let incarnation = concrete.trusted_store_incarnation().unwrap();
+    let handler: Arc<dyn MessageHandler> = concrete.clone();
+    let ends = Arc::new(TurnEnds::default());
+    let reader: Arc<dyn MailboxReader> =
+        Arc::new(StoreMailboxReader::new(Arc::clone(&harness.store)));
+    let driver = AgentLoopDriverImpl::new(
+        reader,
+        Arc::new(ScriptedAssembler { fail: false }),
+        Arc::new(NoopPostProcessor),
+        Arc::new(NoopDispatcher),
+        Arc::new(NoopRunBootstrap),
+        handler,
+    )
+    .with_protected_turn_boundary(Arc::new(RefusingBoundary))
+    .with_turn_observer(ends.clone());
+    harness.publish("refused");
+
+    driver
+        .serve_n_turns(AGENT, component_config(None), instance(), 1)
+        .await;
+
+    assert_eq!(
+        ends.recorded(),
+        [
+            format!("end {AGENT} refused {:?}", TurnOutcome::Failed),
+            "complete".to_string(),
+        ]
+    );
+    assert_eq!(
+        concrete.trusted_store_incarnation(),
+        Some(incarnation),
+        "a start that never happened leaves the idle Store as it was"
+    );
+    harness.assert_untracked("refused");
 }

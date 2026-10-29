@@ -48,7 +48,8 @@
 //! reads `signed-out` with reason `unavailable`), and creating a `chatgpt-oauth`
 //! entry under a named secret that already holds a value answers `already_exists`.
 //!
-//! Generate budget and reasoning setting (both optional, both echoed by the summary):
+//! Generate budget, reasoning setting and system-message mode (all optional, all echoed by the
+//! summary):
 //! - `generate_timeout_secs` (5–900; at most 300 on a `chatgpt-oauth` entry, whose every request
 //!   is a streamed exchange that ends after 300 s) replaces the 30 s default bound of one
 //!   generate hop of a `cloud-http` or `local` entry, measured from that hop's own start, so a
@@ -60,11 +61,20 @@
 //!   `reasoning_effort`) or `openai-responses` (`reasoning.effort`); never with an embedding
 //!   request, and never by a `chatgpt-oauth` entry, whose requests carry only the fields its
 //!   route accepts. Absent = no setting is sent.
-//! - On `:update` an explicit JSON `null` removes either from the entry and an absent field
-//!   leaves it unchanged (the other update fields cannot be cleared).
+//! - `system_messages` (`separate | merge`) says how every chat, stream, image and preflight
+//!   request of a `cloud-http` or `local` entry that speaks `openai-chat` sends its system
+//!   messages: `merge` sends the text of every system message, in order and joined by a blank
+//!   line, as one system message first (the other messages keep their order), for upstreams
+//!   that take a single system message or one only at the start; `separate` (or absent) sends
+//!   them as they stand. Not on `openai-responses` (whose `instructions` already joins every
+//!   system message the same way), `anthropic-messages`, `agent-cli`, `mesh-remote`, or a
+//!   `chatgpt-oauth` entry.
+//! - On `:update` an explicit JSON `null` removes any of the three from the entry and an absent
+//!   field leaves it unchanged (the other update fields cannot be cleared).
 //! - Refusals are `invalid_request` with details `invalid_generate_timeout` /
-//!   `invalid_reasoning_effort` (a value out of range / an unknown spelling, decided here) or
-//!   `generate_timeout_unsupported` / `reasoning_effort_unsupported` (the entry cannot apply
+//!   `invalid_reasoning_effort` / `invalid_system_messages` (a value out of range / an unknown
+//!   spelling, decided here) or `generate_timeout_unsupported` /
+//!   `reasoning_effort_unsupported` / `system_messages_unsupported` (the entry cannot apply
 //!   it: decided here for a create, and by the provider against the updated entry for an
 //!   update).
 
@@ -82,7 +92,8 @@ use crate::envelope::{
 use crate::provider::{
     provider_or_unavailable, ProviderAdminSlot, ProviderError, GENERATE_TIMEOUT_UNSUPPORTED_DETAIL,
     INVALID_GENERATE_TIMEOUT_DETAIL, INVALID_REASONING_EFFORT_DETAIL,
-    REASONING_EFFORT_UNSUPPORTED_DETAIL,
+    INVALID_SYSTEM_MESSAGES_DETAIL, REASONING_EFFORT_UNSUPPORTED_DETAIL,
+    SYSTEM_MESSAGES_UNSUPPORTED_DETAIL,
 };
 use crate::request::Method;
 use crate::routes;
@@ -153,6 +164,10 @@ pub const PROVIDER_KNOB_BACKEND_CLASSES: &[&str] = &["cloud-http", "local"];
 pub const REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
 /// The wire dialects that carry a reasoning setting.
 pub const REASONING_EFFORT_BACKENDS: &[&str] = &["openai-chat", "openai-responses"];
+/// Closed spellings of `system_messages` (the runtime's `SystemMessages`).
+pub const SYSTEM_MESSAGES_MODES: &[&str] = &["separate", "merge"];
+/// The wire dialects whose requests send system messages as messages (`system_messages`).
+pub const SYSTEM_MESSAGES_BACKENDS: &[&str] = &["openai-chat"];
 
 const RELOAD_PENDING_MESSAGE: &str =
     "runtime-config.yaml was written but the daemon has not observed the reload yet; it applies at the next watcher tick";
@@ -389,6 +404,10 @@ pub struct ClientProviderSummary {
     /// (`none | minimal | low | medium | high | xhigh`). Absent = none is sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// How the entry's requests send their system messages (`separate | merge`), as configured.
+    /// Absent = as they stand (`separate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_messages: Option<String>,
     pub cost: ClientProviderCost,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<ClientProviderRateLimit>,
@@ -468,6 +487,14 @@ pub struct ClientCreateProviderRequest {
     /// `reasoning_effort_unsupported`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// `separate | merge` (details `invalid_system_messages` otherwise): how every chat, stream,
+    /// image and preflight request of the entry sends its system messages. `merge` sends the
+    /// text of every system message, in order and joined by a blank line, as one system message
+    /// first. Only a `cloud-http` or `local` entry that speaks `openai-chat` (see
+    /// `reasoning_effort` for an absent `backend`) and does not sign in with `chatgpt-oauth`
+    /// takes it (details `system_messages_unsupported`). Absent = as they stand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_messages: Option<String>,
     pub cost: ClientProviderCost,
     /// Required (the runtime refuses an entry without a rate limit).
     pub rate_limit: ClientProviderRateLimit,
@@ -533,6 +560,14 @@ pub struct ClientUpdateProviderRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub reasoning_effort: Option<Option<String>>,
+    /// A value (`separate | merge`) replaces the entry's system-message mode; an explicit `null`
+    /// removes it (system messages are sent as they stand); absent leaves it unchanged.
+    #[serde(
+        default,
+        deserialize_with = "explicit_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub system_messages: Option<Option<String>>,
 }
 
 /// An update field that an explicit `null` clears: absent stays `None` (`#[serde(default)]`),
@@ -563,6 +598,7 @@ impl ClientUpdateProviderRequest {
             && self.agent_cli.is_none()
             && self.generate_timeout_secs.is_none()
             && self.reasoning_effort.is_none()
+            && self.system_messages.is_none()
     }
 }
 
@@ -855,6 +891,18 @@ pub fn validate_reasoning_effort(effort: &str) -> Result<(), ClientError> {
     }
 }
 
+/// `system_messages` is a closed spelling (details `invalid_system_messages`).
+pub fn validate_system_messages(mode: &str) -> Result<(), ClientError> {
+    if SYSTEM_MESSAGES_MODES.contains(&mode) {
+        Ok(())
+    } else {
+        Err(knob_refusal(
+            "invalid system_messages",
+            INVALID_SYSTEM_MESSAGES_DETAIL,
+        ))
+    }
+}
+
 /// The wire dialect an entry speaks: `backend`, else the resolver's id-based default
 /// (`anthropic-messages` for the id `anthropic`, `openai-chat` for every other id).
 pub fn effective_backend<'a>(provider_id: &str, backend: Option<&'a str>) -> &'a str {
@@ -910,6 +958,26 @@ pub fn check_reasoning_effort_support(
         return Ok(());
     };
     Err(knob_refusal(message, REASONING_EFFORT_UNSUPPORTED_DETAIL))
+}
+
+/// Whether an entry of `class` speaking `backend` with credentials from `auth_source` can apply
+/// a system-message mode (details `system_messages_unsupported` otherwise): the runtime
+/// loader's `system_messages_refusal`.
+pub fn check_system_messages_support(
+    class: &str,
+    backend: &str,
+    auth_source: &str,
+) -> Result<(), ClientError> {
+    let message = if !PROVIDER_KNOB_BACKEND_CLASSES.contains(&class) {
+        "system_messages is only valid for cloud-http and local providers"
+    } else if auth_source == CHATGPT_OAUTH_AUTH_SOURCE {
+        "system_messages is not valid with auth_source chatgpt-oauth"
+    } else if !SYSTEM_MESSAGES_BACKENDS.contains(&backend) {
+        "system_messages is only valid with backend openai-chat"
+    } else {
+        return Ok(());
+    };
+    Err(knob_refusal(message, SYSTEM_MESSAGES_UNSUPPORTED_DETAIL))
 }
 
 /// Validate a create request (everything the handler can decide without the runtime).
@@ -978,6 +1046,14 @@ pub fn validate_create_request(req: &ClientCreateProviderRequest) -> Result<(), 
             _ => entry_backend(&req.provider_id, class, req.backend.as_deref()),
         };
         check_reasoning_effort_support(class, backend, source)?;
+    }
+    if let Some(mode) = &req.system_messages {
+        validate_system_messages(mode)?;
+        let backend = match source {
+            CHATGPT_OAUTH_AUTH_SOURCE => CHATGPT_OAUTH_BACKEND,
+            _ => entry_backend(&req.provider_id, class, req.backend.as_deref()),
+        };
+        check_system_messages_support(class, backend, source)?;
     }
     validate_cost(&req.cost)?;
     validate_rate_limit(&req.rate_limit)?;
@@ -1078,6 +1154,9 @@ pub fn validate_update_request(req: &ClientUpdateProviderRequest) -> Result<(), 
     }
     if let Some(Some(effort)) = &req.reasoning_effort {
         validate_reasoning_effort(effort)?;
+    }
+    if let Some(Some(mode)) = &req.system_messages {
+        validate_system_messages(mode)?;
     }
     Ok(())
 }

@@ -255,6 +255,8 @@ fn build_vlm_request(
             ],
         }],
     });
+    // The image request carries one user message and no system message, so the entry's
+    // `system-messages` leaves it as it is.
     // The entry's reasoning setting, top-level as on every chat-completions request of the
     // entry. Absent = the body is the one sent before the setting existed.
     if let Some(effort) = resolved.reasoning_effort {
@@ -625,6 +627,7 @@ mod tests {
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
             generate_timeout_secs: None,
             reasoning_effort: None,
+            system_messages: None,
         };
         let mut cfg = fixture_runtime_config();
         cfg.llm_providers.insert(0, local);
@@ -678,6 +681,7 @@ mod tests {
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
             generate_timeout_secs: None,
             reasoning_effort: None,
+            system_messages: None,
         };
         let mut cfg = fixture_runtime_config();
         cfg.llm_providers = vec![local];
@@ -735,6 +739,7 @@ mod tests {
             auth_source: ProviderAuthSource::ChatGptOAuth,
             generate_timeout_secs: None,
             reasoning_effort: None,
+            system_messages: None,
         };
         let png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 

@@ -71,6 +71,7 @@ fn ctx_for(agent_id: &str, function: &str) -> HostCallContext {
         agent_id: agent_id.to_string(),
         trace_id: "t-lc".to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: CAP.to_string(),
         function: format!("{NS}::{function}"),
         run_id: None,

@@ -209,6 +209,7 @@ async fn production_guest_is_raw_only_at_execution_and_redacted_on_every_surface
                 agent_id: "root".to_owned(),
                 trace_id: "legacy3-submit".to_owned(),
                 turn_id: None,
+                transcript_scope: None,
                 capability: "lifecycle".to_owned(),
                 function: "advance:runtime/agent-lifecycle@0.2.0::submit-component".to_owned(),
                 run_id: None,

@@ -642,6 +642,7 @@ mod tests {
             agent_id: agent_id.into(),
             trace_id: "t".into(),
             turn_id: None,
+            transcript_scope: None,
             capability: NOTIFY_CAPABILITY.into(),
             function: "advance:runtime/notify::notify-channel".into(),
             run_id: None,

@@ -558,6 +558,7 @@ mod tests {
             agent_id: "root".into(),
             trace_id: String::new(),
             turn_id: None,
+            transcript_scope: None,
             capability: "fixture.probe".into(),
             function: "fixture:probe/host::call".into(),
             run_id: None,

@@ -142,9 +142,22 @@ impl ChatMessage {
     }
 }
 
+/// One agent's host-owned turn transcript, keyed by the transcript scope of
+/// the guest invocation that wrote it (`HostCallContext::transcript_scope`:
+/// the trusted turn id, or a host-minted per-invocation key).
 struct AgentTranscript {
-    turn_id: String,
+    scope: String,
     messages: Vec<ChatMessage>,
+}
+
+/// A guest `generate` / `stream` request body plus whether the assembled seed
+/// already carried the guest prompt (ADR 2026-10-24 D4, prompt sent once).
+pub(crate) struct GuestMessages {
+    pub messages: Vec<ChatMessage>,
+    /// True when the seed's last message is a user message byte-equal to the
+    /// guest prompt, so the prompt was not appended again and the recorder
+    /// must not copy it into the transcript either.
+    pub prompt_in_seed: bool,
 }
 
 fn assembled_to_chat(m: &LlmMessage) -> ChatMessage {
@@ -292,12 +305,17 @@ pub(crate) struct LlmRequestContext {
     pub messages: Vec<ChatMessage>,
     pub params: ChatParams,
     pub output_schema: Option<String>,
-    /// Trusted-turn id from `HostCallContext`. `None` = no transcript recording
-    /// (one-shot `chat()` / hello-llm / preflight).
-    pub turn_id: Option<String>,
+    /// Transcript scope from `HostCallContext::transcript_scope` (the trusted
+    /// turn id, or a host-minted per-invocation key). `None` = no transcript
+    /// recording (one-shot `chat()` / hello-llm / preflight). Read ONLY by the
+    /// transcript recorder; attribution reads the frozen trusted turn instead.
+    pub transcript_scope: Option<String>,
     /// The guest's raw `llm-request.prompt` (may be empty). Used to record the
     /// user turn; omitted from `messages` when empty.
     pub guest_prompt: String,
+    /// The seed already ended with `guest_prompt` as its last user message, so
+    /// `messages` carries it once and the recorder does not record it.
+    pub prompt_in_seed: bool,
     /// WIT `llm-params.transcript`; default continue.
     pub transcript: TranscriptMode,
     /// True when the guest set `llm-params.callables` (ADR 2026-10-24 D10).
@@ -437,8 +455,10 @@ pub struct LlmGateway {
     /// across an await. Default-empty so this is back-compat for all `new` callers.
     assembled: Arc<Mutex<HashMap<String, Arc<[LlmMessage]>>>>,
     /// Per-agent host-owned turn transcript (ADR 2026-10-24 D4). Keyed by
-    /// `agent_id`; `turn_id` inside the slot detects a new turn and resets.
-    /// Dropped by [`LlmGateway::end_turn`] at `clear_trusted_turn`.
+    /// `agent_id`; the transcript scope inside the slot (the trusted turn id, or
+    /// the key the host minted for one unprotected invocation) detects a new
+    /// scope and resets. Dropped by [`LlmGateway::end_turn`] when the trusted
+    /// turn is cleared or destroyed, or when the unprotected invocation returns.
     transcripts: Arc<Mutex<HashMap<String, AgentTranscript>>>,
     /// Small-witness 2026-06-11 — the §1.4.3c AGENT-TIER retry overrides,
     /// installed via [`Self::with_retry_overrides`] (non-trait inherent;
@@ -662,15 +682,16 @@ impl LlmGateway {
         Ok(selection.is_some())
     }
 
-    /// Install the Client API note for subscription-usage failures. The note stores
-    /// only the redacted class token. Call once at composition, before requests.
+    /// Install the Client API note for model-call failures. The note stores only
+    /// redacted class tokens. Call once at composition, before requests.
     pub fn set_failure_class_note(&self, note: Arc<dyn crate::error::FailureClassNote>) {
         *self.failure_note.lock().unwrap_or_else(|e| e.into_inner()) = Some(note);
     }
 
     /// Tell the Client API note about the result that is about to cross into the guest.
-    /// A subscription-usage failure records the redacted class. A success clears it for
-    /// the in-flight message. Any other error leaves a previously recorded class in place.
+    /// A subscription-usage failure records the redacted class. Any other error is
+    /// noted as a pending model failure (it only becomes a class if the turn then ends
+    /// without a reply). A success clears both for the in-flight message.
     pub(crate) fn observe_guest_visible_error(&self, agent_id: &str, err: Option<&LlmError>) {
         let note = self
             .failure_note
@@ -685,7 +706,7 @@ impl LlmGateway {
                 note.note_subscription_usage_limit(agent_id);
             }
             None => note.clear_subscription_usage_limit(agent_id),
-            Some(_) => {}
+            Some(_) => note.note_model_failure(agent_id),
         }
     }
 
@@ -2510,40 +2531,71 @@ impl LlmGateway {
     /// ADR 2026-10-24 D4 — request messages for a guest `generate` / `stream`.
     ///
     /// `continue` (default): seed ++ transcript ++ `[user: prompt]` (prompt omitted
-    /// when empty). `fresh`: seed ++ `[user: prompt]`; nothing is recorded.
-    /// A missing `turn_id` yields seed ++ prompt (hello-llm / one-shot).
+    /// when empty, or when the seed already ends with it — see
+    /// [`Self::guest_messages`]). `fresh`: seed ++ `[user: prompt]`; nothing is
+    /// recorded. A missing transcript scope yields seed ++ prompt (hello-llm /
+    /// one-shot).
     pub fn build_guest_messages(
         &self,
         agent_id: &str,
-        turn_id: Option<&str>,
+        transcript_scope: Option<&str>,
         prompt: &str,
         mode: TranscriptMode,
     ) -> Vec<ChatMessage> {
+        self.guest_messages(agent_id, transcript_scope, prompt, mode)
+            .messages
+    }
+
+    /// [`Self::build_guest_messages`] plus whether the seed carried the prompt.
+    ///
+    /// The assembled seed ends with the inbound message as its current prompt
+    /// (context-engine Tier 3 pushes it last, unwrapped). When the guest sends
+    /// that same text as its prompt in `continue` mode, the seed's last message
+    /// is a user message byte-equal to it: the prompt is then not appended a
+    /// second time, and `prompt_in_seed` tells the recorder not to copy it into
+    /// the transcript (the seed carries it in every round). Any other prompt —
+    /// different text, an empty seed, a seed ending otherwise, or `fresh` mode —
+    /// is appended exactly as before.
+    pub(crate) fn guest_messages(
+        &self,
+        agent_id: &str,
+        transcript_scope: Option<&str>,
+        prompt: &str,
+        mode: TranscriptMode,
+    ) -> GuestMessages {
         let mut messages = self.seed_messages(agent_id);
+        let prompt_in_seed = mode == TranscriptMode::Continue
+            && !prompt.is_empty()
+            && messages
+                .last()
+                .is_some_and(|last| last.role == ChatRole::User && last.content == prompt);
         match mode {
             TranscriptMode::Fresh => {}
             TranscriptMode::Continue => {
-                if let Some(tid) = turn_id {
-                    messages.extend(self.transcript_messages(agent_id, tid));
+                if let Some(scope) = transcript_scope {
+                    messages.extend(self.transcript_messages(agent_id, scope));
                 }
             }
         }
-        if !prompt.is_empty() {
+        if !prompt.is_empty() && !prompt_in_seed {
             messages.push(ChatMessage::new(ChatRole::User, prompt));
         }
-        messages
+        GuestMessages {
+            messages,
+            prompt_in_seed,
+        }
     }
 
     /// Append the guest prompt (if any) and the assistant reply to the turn
-    /// transcript. No-op for `fresh`, missing `turn_id`, or empty (agent, turn).
+    /// transcript of `scope`. No-op for an empty scope.
     pub fn record_generate(
         &self,
         agent_id: &str,
-        turn_id: &str,
+        scope: &str,
         prompt: &str,
         response: &ChatResponse,
     ) {
-        if turn_id.is_empty() {
+        if scope.is_empty() {
             return;
         }
         let mut guard = self
@@ -2553,11 +2605,11 @@ impl LlmGateway {
         let slot = guard
             .entry(agent_id.to_string())
             .or_insert_with(|| AgentTranscript {
-                turn_id: turn_id.to_string(),
+                scope: scope.to_string(),
                 messages: Vec::new(),
             });
-        if slot.turn_id != turn_id {
-            slot.turn_id = turn_id.to_string();
+        if slot.scope != scope {
+            slot.scope = scope.to_string();
             slot.messages.clear();
         }
         if !prompt.is_empty() {
@@ -2575,12 +2627,12 @@ impl LlmGateway {
     pub fn record_tool_result(
         &self,
         agent_id: &str,
-        turn_id: &str,
+        scope: &str,
         call_id: &str,
         name: &str,
         content: &str,
     ) {
-        if turn_id.is_empty() {
+        if scope.is_empty() {
             return;
         }
         let mut guard = self
@@ -2590,11 +2642,11 @@ impl LlmGateway {
         let slot = guard
             .entry(agent_id.to_string())
             .or_insert_with(|| AgentTranscript {
-                turn_id: turn_id.to_string(),
+                scope: scope.to_string(),
                 messages: Vec::new(),
             });
-        if slot.turn_id != turn_id {
-            slot.turn_id = turn_id.to_string();
+        if slot.scope != scope {
+            slot.scope = scope.to_string();
             slot.messages.clear();
         }
         let msg = if pending_tool_call(&slot.messages, call_id) {
@@ -2605,17 +2657,14 @@ impl LlmGateway {
         slot.messages.push(msg);
     }
 
-    /// Drop the transcript for `(agent_id, turn_id)` if it is the active slot,
+    /// Drop the transcript for `(agent_id, scope)` if it is the active slot,
     /// and clear the assembled seed for that agent (adversarial-r9 W1).
-    pub fn end_turn(&self, agent_id: &str, turn_id: &str) {
+    pub fn end_turn(&self, agent_id: &str, scope: &str) {
         let mut guard = self
             .transcripts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard
-            .get(agent_id)
-            .is_some_and(|slot| slot.turn_id == turn_id)
-        {
+        if guard.get(agent_id).is_some_and(|slot| slot.scope == scope) {
             guard.remove(agent_id);
         }
         self.assembled
@@ -2655,26 +2704,32 @@ impl LlmGateway {
         }
     }
 
-    fn transcript_messages(&self, agent_id: &str, turn_id: &str) -> Vec<ChatMessage> {
+    fn transcript_messages(&self, agent_id: &str, scope: &str) -> Vec<ChatMessage> {
         let guard = self
             .transcripts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match guard.get(agent_id) {
-            Some(slot) if slot.turn_id == turn_id => slot.messages.clone(),
+            Some(slot) if slot.scope == scope => slot.messages.clone(),
             _ => Vec::new(),
         }
     }
 
     /// Record a successful guest generate/stream onto the turn transcript.
+    /// A prompt the seed already carried is not recorded (prompt sent once).
     pub(crate) fn maybe_record_generate(&self, ctx: &LlmRequestContext, response: &ChatResponse) {
         if ctx.transcript != TranscriptMode::Continue {
             return;
         }
-        let Some(turn_id) = ctx.turn_id.as_deref() else {
+        let Some(scope) = ctx.transcript_scope.as_deref() else {
             return;
         };
-        self.record_generate(&ctx.agent_id, turn_id, &ctx.guest_prompt, response);
+        let prompt = if ctx.prompt_in_seed {
+            ""
+        } else {
+            ctx.guest_prompt.as_str()
+        };
+        self.record_generate(&ctx.agent_id, scope, prompt, response);
     }
 
     /// Round-4 C1 — public verification surface for AC-15 (RunBudget integration).
@@ -4628,8 +4683,9 @@ fn to_inference_chat_req(
     InferenceChatRequest {
         provider_id: resolved.id.clone(),
         model: resolved.model.clone(),
-        messages: ctx
-            .messages
+        // `system-messages: merge` applies before the IR is built, so a sidecar receives the
+        // merged system message like a cloud entry's upstream does.
+        messages: crate::providers::outgoing_messages(resolved, &ctx.messages)
             .iter()
             .map(|m| match m.role {
                 ChatRole::Tool => InferenceMessage {
@@ -6205,6 +6261,7 @@ mod tests {
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
             generate_timeout: None,
             reasoning_effort: None,
+            system_messages: None,
         };
         let cfg1 = LlmProviderConfig {
             id: "openai".into(),
@@ -6229,6 +6286,7 @@ mod tests {
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
             generate_timeout_secs: None,
             reasoning_effort: None,
+            system_messages: None,
         };
         let cap1 = build_http_cap(&p1, &cfg1).unwrap();
         assert_eq!(
@@ -6256,6 +6314,7 @@ mod tests {
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
             generate_timeout: None,
             reasoning_effort: None,
+            system_messages: None,
         };
         let cfg2 = LlmProviderConfig {
             id: "local-llm".into(),
@@ -6280,6 +6339,7 @@ mod tests {
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
             generate_timeout_secs: None,
             reasoning_effort: None,
+            system_messages: None,
         };
         let cap2 = build_http_cap(&p2, &cfg2).unwrap();
         assert_eq!(
@@ -6317,6 +6377,7 @@ mod tests {
                     auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
                     generate_timeout: None,
                     reasoning_effort: None,
+                    system_messages: None,
                 },
                 LlmProviderConfig {
                     id: "openai".into(),
@@ -6341,6 +6402,7 @@ mod tests {
                     auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
                     generate_timeout_secs: None,
                     reasoning_effort: None,
+                    system_messages: None,
                 },
             )
         };

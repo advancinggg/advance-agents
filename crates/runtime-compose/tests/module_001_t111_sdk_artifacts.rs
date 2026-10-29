@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 const LANE_BASE: &str = include_str!("fixtures/sdk_artifacts_lane_base.sha256");
-const SCHEMA_HASH: &str = "591caa9db2f8a222c27af3188be15b7a8a113272dcdd59bd1733cf474f690220";
+const SCHEMA_HASH: &str = "9a10e1702510baf50d2be1a1e9ebc90820dcd1b320d45389824917b46f4883aa";
 const API_VERSION: &str = "2026-09-17";
 
 fn artifacts_dir() -> PathBuf {

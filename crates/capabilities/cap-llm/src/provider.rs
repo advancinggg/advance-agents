@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use advance_runtime::config::{
     AuthScheme, InferenceBackendClass, LlmProviderConfig, ProviderAuthSource, ProviderBackend,
-    ReasoningEffort,
+    ReasoningEffort, SystemMessages,
 };
 
 use crate::catalog::CacheCost;
@@ -62,6 +62,10 @@ pub struct ResolvedProvider {
     /// The entry's `reasoning-effort`, sent with every chat request (never an embedding one).
     /// `None` = nothing is sent.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// The entry's `system-messages`: with [`SystemMessages::Merge`] every chat, stream, image
+    /// and preflight request sends its system messages as one
+    /// ([`crate::providers::outgoing_messages`]). `None` = as they stand.
+    pub system_messages: Option<SystemMessages>,
 }
 
 impl ResolvedProvider {
@@ -74,6 +78,11 @@ impl ResolvedProvider {
     /// buffered executor's default total timeout.
     pub fn generate_budget(&self) -> Duration {
         self.generate_timeout.unwrap_or(cap_http::DEFAULT_TIMEOUT)
+    }
+
+    /// Whether the entry sends its system messages as one (`system-messages: merge`).
+    pub fn merges_system_messages(&self) -> bool {
+        self.system_messages == Some(SystemMessages::Merge)
     }
 }
 
@@ -94,6 +103,7 @@ impl fmt::Debug for ResolvedProvider {
             .field("auth_source", &self.auth_source)
             .field("generate_timeout", &self.generate_timeout)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("system_messages", &self.system_messages)
             .finish()
     }
 }
@@ -212,6 +222,7 @@ pub(crate) fn make_resolved(p: &LlmProviderConfig, model: String) -> ResolvedPro
         auth_source: p.auth_source,
         generate_timeout: p.generate_timeout(),
         reasoning_effort: p.reasoning_effort,
+        system_messages: p.system_messages,
     }
 }
 
@@ -248,6 +259,7 @@ mod tests {
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
             generate_timeout_secs: None,
             reasoning_effort: None,
+            system_messages: None,
         }
     }
 

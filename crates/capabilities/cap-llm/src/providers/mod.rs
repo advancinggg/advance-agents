@@ -8,14 +8,55 @@
 //! `provider::backend_of`, which derives the enum when config omits
 //! `backend:`.
 
+use std::borrow::Cow;
+
 use advance_runtime::config::{AuthScheme, ProviderBackend};
 use advance_shared_types::security_validator::{CredentialPosition, HttpRequest};
 
 use crate::error::LlmError;
 use crate::executor::ExecutionOutcome;
-use crate::gateway::{ChatMessage, ChatParams};
+use crate::gateway::{ChatMessage, ChatParams, ChatRole};
 use crate::provider::ResolvedProvider;
 use crate::providers::sse::{SseEvent, SseFrame};
+
+/// The messages a request of `provider` sends: `messages` as they stand, unless the entry
+/// merges its system messages (`system-messages: merge`). Then the text of every system
+/// message, in order and joined by a blank line, is one system message at index 0 and the
+/// other messages keep their relative order; a request without system messages is unchanged.
+/// Every chat-completions body of a `cloud-http` entry (chat, stream, image, preflight) and the
+/// request of a `local` entry, built before its sidecar IR, go through here.
+pub(crate) fn outgoing_messages<'a>(
+    provider: &ResolvedProvider,
+    messages: &'a [ChatMessage],
+) -> Cow<'a, [ChatMessage]> {
+    if !provider.merges_system_messages() {
+        return Cow::Borrowed(messages);
+    }
+    merge_system_messages(messages)
+}
+
+/// [`outgoing_messages`] of an entry that merges its system messages.
+pub(crate) fn merge_system_messages(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]> {
+    let systems: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.role == ChatRole::System)
+        .map(|m| m.content.as_str())
+        .collect();
+    let already_one =
+        systems.len() == 1 && messages.first().map(|m| m.role) == Some(ChatRole::System);
+    if systems.is_empty() || already_one {
+        return Cow::Borrowed(messages);
+    }
+    let mut merged = Vec::with_capacity(messages.len() - systems.len() + 1);
+    merged.push(ChatMessage::new(ChatRole::System, systems.join("\n\n")));
+    merged.extend(
+        messages
+            .iter()
+            .filter(|m| m.role != ChatRole::System)
+            .cloned(),
+    );
+    Cow::Owned(merged)
+}
 
 pub mod anthropic;
 pub mod local;
@@ -167,6 +208,7 @@ mod cred_tests {
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
             generate_timeout: None,
             reasoning_effort: None,
+            system_messages: None,
         }
     }
 

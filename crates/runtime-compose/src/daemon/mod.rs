@@ -1864,6 +1864,14 @@ impl TurnObserver for WatchTurnObserver {
         self.reply_registry.cancel(agent_id);
         self.in_flight.store(false, Ordering::Release);
     }
+
+    fn on_turn_end(&self, agent_id: &str, end: &advance_scheduler::TurnEnd) {
+        // The turn has settled (dispatch finished or the turn failed), so the Client
+        // API message it executed can take its redacted failure class here and only
+        // here: a client that stops waiting on that class never misses a reply.
+        self.reply_registry
+            .note_turn_end(agent_id, &end.message_id, end.outcome);
+    }
 }
 
 struct SkillTurnBoundary {

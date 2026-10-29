@@ -23,6 +23,7 @@ fn ctx() -> HostCallContext {
         agent_id: "agent-1".into(),
         trace_id: "trace-1".into(),
         turn_id: None,
+        transcript_scope: None,
         capability: "tools".into(),
         function: "advance:runtime/agent-tools::tool-invoke".into(),
         run_id: Some("run-9".into()),

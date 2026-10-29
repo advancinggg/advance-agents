@@ -49,8 +49,8 @@ pub use daemon::{
 };
 pub use hook::{
     BootstrapError, CrashCascadeSink, FileWatchSource, HookError, MessageHandler, RunBootstrap,
-    RunnableHook, RunnableHookFactory, RuntimeReadiness, TurnObserver, WebhookSource,
-    WorkspaceRollbackSink,
+    RunnableHook, RunnableHookFactory, RuntimeReadiness, TurnEnd, TurnObserver, TurnOutcome,
+    WebhookSource, WorkspaceRollbackSink,
 };
 pub use materializer::ComponentMaterializer;
 pub use output::write_result_to_dir;

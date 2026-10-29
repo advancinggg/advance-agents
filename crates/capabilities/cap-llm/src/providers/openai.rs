@@ -26,9 +26,11 @@ impl OpenAiAdapter {
         messages: &[ChatMessage],
         params: &ChatParams,
     ) -> Value {
+        // The entry's `system-messages: merge` sends the system messages as one; otherwise
+        // (absent or `separate`) the messages are sent as they stand, byte for byte.
         let mut body = json!({
             "model": provider.model,
-            "messages": json_messages(messages),
+            "messages": json_messages(&super::outgoing_messages(provider, messages)),
         });
         if let Some(t) = params.temperature {
             body["temperature"] = json!(t);
@@ -750,6 +752,7 @@ mod tests {
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
             generate_timeout: None,
             reasoning_effort: None,
+            system_messages: None,
         }
     }
 

@@ -297,6 +297,7 @@ async fn sys_ac_136_distinct_iterations_distinct_aggregates() {
             agent_id: AGENT.into(),
             trace_id: "trace-j42".into(),
             turn_id: None,
+            transcript_scope: None,
             capability: "llm".into(),
             function: "agent-llm::generate".into(),
             run_id: Some(run.clone()),

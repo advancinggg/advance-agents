@@ -393,6 +393,7 @@ async fn t_172_05_update_subtask_status_emits_and_mutates() {
         agent_id: CAP_AGENT.to_string(),
         trace_id: "tr-172".to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: "lifecycle".to_string(),
         function: "advance:runtime/agent-lifecycle::update-subtask-status".to_string(),
         run_id: None,

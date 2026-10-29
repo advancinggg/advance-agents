@@ -29,6 +29,7 @@ fn ctx_for(agent: &str) -> HostCallContext {
         agent_id: agent.to_string(),
         trace_id: "trace-ac29".to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: CAPABILITY.to_string(),
         function: format!("{NAMESPACE}::test"),
         run_id: None,

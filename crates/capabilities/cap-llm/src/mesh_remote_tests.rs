@@ -53,6 +53,7 @@ fn mesh_cfg() -> LlmProviderConfig {
         auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
         generate_timeout_secs: None,
         reasoning_effort: None,
+        system_messages: None,
     }
 }
 
@@ -328,6 +329,7 @@ async fn t135_gateway_resolve_returns_local_prefix() {
         auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
         generate_timeout_secs: None,
         reasoning_effort: None,
+        system_messages: None,
     };
     let mut cfg = fixture_runtime_config();
     cfg.llm_providers = vec![local];

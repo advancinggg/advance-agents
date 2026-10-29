@@ -352,6 +352,7 @@ fn ctx(caller: &str, op: &str) -> HostCallContext {
         agent_id: caller.into(),
         trace_id: "trace-j44".into(),
         turn_id: None,
+        transcript_scope: None,
         capability: "lifecycle".into(),
         function: format!("advance:runtime/agent-lifecycle::{op}"),
         run_id: None,

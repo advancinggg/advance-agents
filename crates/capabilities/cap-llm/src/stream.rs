@@ -1256,7 +1256,8 @@ pub(crate) struct LiveStream {
     pub poll_gate: Arc<TokioMutex<()>>, // held across await to serialize polls (Δ4)
     pub settlement: Arc<Settlement>,
     pub task: JoinHandle<()>,
-    /// Original guest request envelope (turn_id / guest_prompt / transcript).
+    /// Original guest request envelope (transcript scope / guest_prompt /
+    /// prompt_in_seed / transcript).
     /// `claim_done` copies this onto `ReadyStream.ctx` so live poll-Done can
     /// record onto the host-owned turn transcript (ADR 2026-10-24 D4).
     pub record_ctx: LlmRequestContext,

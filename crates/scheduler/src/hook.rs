@@ -224,6 +224,41 @@ pub trait ProtectedTurnExecutionBoundary: Send + Sync {
 /// concern only.
 pub trait TurnObserver: Send + Sync {
     fn on_turn_complete(&self, agent_id: &str);
+
+    /// How the turn that just ran ended, reported right BEFORE
+    /// [`Self::on_turn_complete`] for every message the mailbox handed to the
+    /// loop (a recv failure, a malformed envelope, or a protected turn retired
+    /// as a detached batch entry never reach it). It fires after the turn's
+    /// dispatch has settled, so an observer that marks a [`TurnOutcome::Failed`]
+    /// turn as "will not answer" can never precede that turn's reply. Default:
+    /// nothing.
+    fn on_turn_end(&self, _agent_id: &str, _end: &TurnEnd) {}
+}
+
+/// The message a served turn executed and how the turn ended
+/// ([`TurnObserver::on_turn_end`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnEnd {
+    /// `Message::id` of the inbound message the turn executed.
+    pub message_id: String,
+    pub outcome: TurnOutcome,
+}
+
+/// How an admitted turn ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnOutcome {
+    /// `handle-message` returned and its actions were dispatched (a reply or an
+    /// empty batch). A failure after dispatch (post-processing, a protected
+    /// finalizer) still counts here: whatever the turn produced was delivered.
+    Completed,
+    /// The turn ended in an error or a trap: a protected message that could not
+    /// start (no boundary, no Store incarnation, a refused start — consumed
+    /// without running), context assembly, the persistence boundary, the
+    /// trusted-turn stamp, `handle-message` itself, or a dispatch that returned
+    /// an error. Only that last case can have delivered anything (the part of
+    /// the batch sent before the error); an observer that must know whether a
+    /// reply went out tracks deliveries itself.
+    Failed,
 }
 
 /// Optional persistence boundary for live agent turns.

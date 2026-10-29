@@ -17,12 +17,13 @@
 //! at each turn boundary); the real channel-adapter
 //! outbound (notify-channel `send-raw`, SYS-AC-001) is Step-3.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::oneshot;
 
 use advance_messaging::{AgentAction, OutboundActionSink};
+use advance_scheduler::TurnOutcome;
 use advance_shared_types::mailbox::{DispatchError, Message};
 use advance_shared_types::outbound::DeliveryReport;
 
@@ -40,6 +41,96 @@ const STDOUT_PREVIEW_BYTES: usize = 4096;
 /// Reply value carried by a [`ReplyRegistry`] oneshot: `Some(bytes)` when the
 /// turn produced at least one action, `None` when it produced none.
 type ReplySlot = oneshot::Sender<Option<Vec<u8>>>;
+
+/// The kind of an agent's last failed model call while one of its Client API
+/// messages is in flight; it becomes a failure class only if the turn then
+/// ends without a reply ([`ReplyRegistry::note_turn_end`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelFailure {
+    /// The call returned the subscription-usage class.
+    UsageLimit,
+    /// The call returned any other model error.
+    Provider,
+}
+
+/// One tracked Client API message: its redacted failure class, and whether the turn
+/// that executed it has ended (after which the class is final).
+#[derive(Default)]
+struct TrackedMessage {
+    class: Option<&'static str>,
+    ended: bool,
+}
+
+/// The Client API messages the registry tracks, bounded like the messaging provider's
+/// send ledger ([`crate::client_api_adapters::MAX_TRACKED_CLIENT_MESSAGES`]): the
+/// oldest message is forgotten first.
+#[derive(Default)]
+struct MessageFailureClasses {
+    by_message: HashMap<String, TrackedMessage>,
+    order: VecDeque<String>,
+}
+
+impl MessageFailureClasses {
+    fn track(&mut self, message_id: &str) {
+        if self.by_message.contains_key(message_id) {
+            return;
+        }
+        while self.order.len() >= crate::client_api_adapters::MAX_TRACKED_CLIENT_MESSAGES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_message.remove(&oldest);
+            }
+        }
+        self.order.push_back(message_id.to_string());
+        self.by_message
+            .insert(message_id.to_string(), TrackedMessage::default());
+    }
+
+    fn class(&self, message_id: &str) -> Option<String> {
+        self.by_message
+            .get(message_id)
+            .and_then(|m| m.class)
+            .map(str::to_string)
+    }
+
+    fn ended(&self, message_id: &str) -> bool {
+        self.by_message.get(message_id).is_some_and(|m| m.ended)
+    }
+
+    /// The usage class, set while the message's turn is still running.
+    fn note_usage_limit(&mut self, message_id: &str) {
+        if let Some(m) = self.by_message.get_mut(message_id) {
+            if !m.ended {
+                m.class = Some(cap_llm::SUBSCRIPTION_USAGE_LIMIT_CLASS);
+            }
+        }
+    }
+
+    /// Withdraw the usage class while the message's turn is still running.
+    fn withdraw_usage_limit(&mut self, message_id: &str) {
+        if let Some(m) = self.by_message.get_mut(message_id) {
+            if !m.ended && m.class == Some(cap_llm::SUBSCRIPTION_USAGE_LIMIT_CLASS) {
+                m.class = None;
+            }
+        }
+    }
+
+    /// Forget a message that was never published.
+    fn untrack(&mut self, message_id: &str) {
+        if self.by_message.remove(message_id).is_some() {
+            self.order.retain(|id| id != message_id);
+        }
+    }
+
+    /// The message's turn ended; `class` lands only when it carries none yet.
+    fn end(&mut self, message_id: &str, class: Option<&'static str>) {
+        if let Some(m) = self.by_message.get_mut(message_id) {
+            m.ended = true;
+            if m.class.is_none() {
+                m.class = class;
+            }
+        }
+    }
+}
 
 /// Correlates a `POST /msg` turn with the reply its dispatch produces.
 ///
@@ -63,11 +154,22 @@ pub struct ReplyRegistry {
     pending_message: Mutex<HashMap<String, VecDeque<String>>>,
     /// stream_key stored on a Client API message_id (pointer only, never body).
     keys_by_message: Mutex<HashMap<String, String>>,
-    /// Client API message id currently in flight for each agent alias.
-    inflight_message: Mutex<HashMap<String, String>>,
-    /// Redacted failure class keyed by Client API message id. The only value stored
-    /// is `subscription-usage-limit`.
-    failure_by_message: Mutex<HashMap<String, String>>,
+    /// Client API messages in flight for each agent alias, oldest first; the last one
+    /// is the message a model failure is attributed to. Entered before the message is
+    /// published ([`Self::note_pending_message`]) and dropped once its turn has ended
+    /// ([`Self::note_turn_end`]) or its publish failed
+    /// ([`Self::forget_unpublished_message`]).
+    inflight_message: Mutex<HashMap<String, Vec<String>>>,
+    /// Redacted failure class of each tracked Client API message: a fixed token only
+    /// (`subscription-usage-limit`, `provider-error`, `agent-error`), final once the
+    /// message's turn has ended. Bounded.
+    failure_by_message: Mutex<MessageFailureClasses>,
+    /// Last failed model call per agent slot (`pending_slot`) while one of its Client
+    /// API messages is in flight. Taken at the turn's end; a successful call clears it.
+    pending_model_failure: Mutex<HashMap<String, ModelFailure>>,
+    /// Agent slots (`pending_slot`) whose running turn has delivered a reply
+    /// ([`Self::fulfill`] with a payload). Taken at the turn's end: one entry per agent.
+    replied_in_turn: Mutex<HashSet<String>>,
 }
 
 impl ReplyRegistry {
@@ -80,7 +182,9 @@ impl ReplyRegistry {
             pending_message: Mutex::new(HashMap::new()),
             keys_by_message: Mutex::new(HashMap::new()),
             inflight_message: Mutex::new(HashMap::new()),
-            failure_by_message: Mutex::new(HashMap::new()),
+            failure_by_message: Mutex::new(MessageFailureClasses::default()),
+            pending_model_failure: Mutex::new(HashMap::new()),
+            replied_in_turn: Mutex::new(HashSet::new()),
         }
     }
 
@@ -120,7 +224,31 @@ impl ReplyRegistry {
             .unwrap_or_else(|| id.to_string())
     }
 
+    /// Start tracking a Client API message for its failure class, so a turn that ends
+    /// at once still finds it. [`Self::note_pending_message`] does this too.
+    pub fn track_client_message(&self, message_id: &str) {
+        self.failure_by_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .track(message_id);
+    }
+
+    /// A Client API message of `agent_id` is about to be published: track it, queue it
+    /// for its stream-key binding and put it in flight, so a turn that runs it before
+    /// the sender has returned from publishing is still attributed to it. A message
+    /// whose turn already ended is neither pending nor in flight.
     pub fn note_pending_message(&self, agent_id: &str, message_id: &str) {
+        {
+            let mut ledger = self
+                .failure_by_message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            ledger.track(message_id);
+            if ledger.ended(message_id) {
+                // Its turn already ran: the message is not pending and not in flight.
+                return;
+            }
+        }
         let slot = self.pending_slot(agent_id);
         self.pending_message
             .lock()
@@ -133,7 +261,47 @@ impl ReplyRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for key in self.alias_keys(agent_id) {
-            inflight.insert(key, message_id.to_string());
+            let queue = inflight.entry(key).or_default();
+            if !queue.iter().any(|id| id == message_id) {
+                queue.push(message_id.to_string());
+            }
+        }
+    }
+
+    /// The message was not published after all (the mailbox refused it): it is not in
+    /// flight, not queued for a stream key and not tracked, and whatever message of the
+    /// agent was in flight before it stays so.
+    pub fn forget_unpublished_message(&self, agent_id: &str, message_id: &str) {
+        let slot = self.pending_slot(agent_id);
+        if let Some(queue) = self
+            .pending_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&slot)
+        {
+            queue.retain(|id| id != message_id);
+        }
+        {
+            let mut inflight = self
+                .inflight_message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for key in self.alias_keys(agent_id) {
+                Self::drop_inflight(&mut inflight, &key, message_id);
+            }
+        }
+        self.failure_by_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .untrack(message_id);
+    }
+
+    fn drop_inflight(inflight: &mut HashMap<String, Vec<String>>, key: &str, message_id: &str) {
+        if let Some(queue) = inflight.get_mut(key) {
+            queue.retain(|id| id != message_id);
+            if queue.is_empty() {
+                inflight.remove(key);
+            }
         }
     }
 
@@ -143,7 +311,7 @@ impl ReplyRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for key in self.alias_keys(agent_id) {
-            if let Some(id) = inflight.get(&key) {
+            if let Some(id) = inflight.get(&key).and_then(|queue| queue.last()) {
                 return Some(id.clone());
             }
         }
@@ -159,31 +327,101 @@ impl ReplyRegistry {
         self.failure_by_message
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                message_id,
-                cap_llm::SUBSCRIPTION_USAGE_LIMIT_CLASS.to_string(),
-            );
+            .note_usage_limit(&message_id);
+        self.note_pending_model_failure(agent_id, ModelFailure::UsageLimit);
     }
 
-    /// Drop the redacted class for the in-flight message after a successful model call.
+    /// Withdraw the subscription-usage class from the in-flight message after a
+    /// successful model call, and forget the agent's pending model failure. A class
+    /// recorded at a turn's end is final and stays.
     pub fn clear_recorded_failure_class(&self, agent_id: &str) {
+        self.pending_model_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.pending_slot(agent_id));
         let Some(message_id) = self.inflight_message_id(agent_id) else {
             return;
         };
         self.failure_by_message
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&message_id);
+            .withdraw_usage_limit(&message_id);
     }
 
-    /// `Some("subscription-usage-limit")` when this message's model call stopped on
-    /// an exhausted subscription window. Never vendor text.
+    /// A model call of `agent_id` returned an error other than the subscription-usage
+    /// class to its guest. Only pending: it names the class if the turn then ends
+    /// without a reply. Ignored when no Client API message of the agent is in flight.
+    pub fn record_model_failure(&self, agent_id: &str) {
+        self.note_pending_model_failure(agent_id, ModelFailure::Provider);
+    }
+
+    fn note_pending_model_failure(&self, agent_id: &str, failure: ModelFailure) {
+        if self.inflight_message_id(agent_id).is_none() {
+            return;
+        }
+        self.pending_model_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(self.pending_slot(agent_id), failure);
+    }
+
+    /// The turn that executed `message_id` for `agent_id` (any alias) has ended.
+    ///
+    /// The message is no longer in flight and its class is final, so later turns
+    /// cannot attach one to it; the agent's pending model failure and reply mark are
+    /// consumed. A turn that ended [`TurnOutcome::Failed`] without delivering a reply
+    /// marks a tracked Client API message that carries no class yet:
+    /// `provider-error` when its last model call failed, `agent-error` when no model
+    /// failure was observed, and `subscription-usage-limit` when that call stopped on
+    /// the usage window but the class landed on a later in-flight message. A class
+    /// already recorded (the usage class, set when the call returned) is never
+    /// replaced. A turn that delivered a reply, and a completed turn (a reply or an
+    /// empty batch), record nothing.
+    pub fn note_turn_end(&self, agent_id: &str, message_id: &str, outcome: TurnOutcome) {
+        let slot = self.pending_slot(agent_id);
+        let pending = self
+            .pending_model_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&slot);
+        let replied = self
+            .replied_in_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&slot);
+        {
+            let mut inflight = self
+                .inflight_message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for key in self.alias_keys(agent_id) {
+                Self::drop_inflight(&mut inflight, &key, message_id);
+            }
+        }
+        let class = match (outcome, pending) {
+            _ if replied => None,
+            (TurnOutcome::Completed, _) => None,
+            (TurnOutcome::Failed, Some(ModelFailure::UsageLimit)) => {
+                Some(cap_llm::SUBSCRIPTION_USAGE_LIMIT_CLASS)
+            }
+            (TurnOutcome::Failed, Some(ModelFailure::Provider)) => {
+                Some(advance_client_api::FAILURE_CLASS_PROVIDER_ERROR)
+            }
+            (TurnOutcome::Failed, None) => Some(advance_client_api::FAILURE_CLASS_AGENT_ERROR),
+        };
+        self.failure_by_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .end(message_id, class);
+    }
+
+    /// The redacted failure class of this Client API message, when it has one:
+    /// `subscription-usage-limit`, `provider-error` or `agent-error`. Never vendor text.
     pub fn failure_class_for_message(&self, message_id: &str) -> Option<String> {
         self.failure_by_message
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(message_id)
-            .cloned()
+            .class(message_id)
     }
 
     pub fn record_stream_key(&self, agent_id: &str, key: &str) {
@@ -255,6 +493,14 @@ impl ReplyRegistry {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             last.insert(agent_id.to_string(), reply.is_some());
+        }
+        if reply.is_some() {
+            // Dispatch runs inside the agent's turn, so this reply is the running
+            // turn's: that turn's end records no failure class.
+            self.replied_in_turn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(self.pending_slot(agent_id));
         }
         if let Some(tx) = self.lock().remove(agent_id) {
             let _ = tx.send(reply);
@@ -335,6 +581,10 @@ impl cap_llm::FailureClassNote for ReplyRegistry {
 
     fn clear_subscription_usage_limit(&self, agent_id: &str) {
         self.clear_recorded_failure_class(agent_id);
+    }
+
+    fn note_model_failure(&self, agent_id: &str) {
+        self.record_model_failure(agent_id);
     }
 }
 
@@ -792,5 +1042,267 @@ mod tests {
             "a later message does not erase the earlier class"
         );
         assert!(reg.failure_class_for_message("cmsg-2").is_none());
+    }
+
+    /// The registry as cap-llm's gateway sees it.
+    fn note(reg: &ReplyRegistry) -> &dyn cap_llm::FailureClassNote {
+        reg
+    }
+
+    #[test]
+    fn turn_end_after_a_failed_model_call_is_provider_error() {
+        let reg = ReplyRegistry::new();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        note(&reg).note_model_failure("root");
+        assert!(
+            reg.failure_class_for_message("cmsg-1").is_none(),
+            "a failed model call is only pending while the turn runs"
+        );
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Failed);
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-1").as_deref(),
+            Some(advance_client_api::FAILURE_CLASS_PROVIDER_ERROR)
+        );
+    }
+
+    #[test]
+    fn turn_end_without_a_model_failure_is_agent_error() {
+        let reg = ReplyRegistry::new();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        assert!(reg.failure_class_for_message("cmsg-1").is_none());
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Failed);
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-1").as_deref(),
+            Some(advance_client_api::FAILURE_CLASS_AGENT_ERROR)
+        );
+    }
+
+    #[test]
+    fn a_later_successful_model_call_withdraws_the_pending_failure() {
+        let reg = ReplyRegistry::new();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        note(&reg).note_model_failure("root");
+        note(&reg).clear_subscription_usage_limit("root");
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Failed);
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-1").as_deref(),
+            Some(advance_client_api::FAILURE_CLASS_AGENT_ERROR),
+            "the last model call succeeded, so the failure is the agent's"
+        );
+    }
+
+    #[test]
+    fn completed_and_replied_turns_take_no_generic_class() {
+        let reg = ReplyRegistry::new();
+        // Completed with an empty batch after a failed model call.
+        reg.note_pending_message("agent:root", "cmsg-1");
+        note(&reg).note_model_failure("root");
+        reg.fulfill("agent:root", None);
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Completed);
+        assert!(reg.failure_class_for_message("cmsg-1").is_none());
+        // Replied, then the turn still failed (a later dispatch step): no class.
+        reg.note_pending_message("agent:root", "cmsg-2");
+        note(&reg).note_model_failure("root");
+        reg.fulfill("root", Some(b"answer".to_vec()));
+        reg.note_turn_end("agent:root", "cmsg-2", TurnOutcome::Failed);
+        assert!(reg.failure_class_for_message("cmsg-2").is_none());
+        // The reply mark belongs to that turn only.
+        reg.note_pending_message("agent:root", "cmsg-3");
+        reg.note_turn_end("agent:root", "cmsg-3", TurnOutcome::Failed);
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-3").as_deref(),
+            Some(advance_client_api::FAILURE_CLASS_AGENT_ERROR)
+        );
+    }
+
+    #[test]
+    fn subscription_usage_limit_takes_precedence_at_turn_end() {
+        let reg = ReplyRegistry::new();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        note(&reg).note_subscription_usage_limit("root");
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-1").as_deref(),
+            Some(cap_llm::SUBSCRIPTION_USAGE_LIMIT_CLASS),
+            "recorded when the call returns, as before"
+        );
+        note(&reg).note_model_failure("root");
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Failed);
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-1").as_deref(),
+            Some(cap_llm::SUBSCRIPTION_USAGE_LIMIT_CLASS),
+            "never overwritten by a generic class"
+        );
+
+        // Overlapping sends: the usage class lands on the last-sent message (as
+        // before), and the turn that hit it still ends with the usage class.
+        reg.note_pending_message("agent:root", "cmsg-2");
+        reg.note_pending_message("agent:root", "cmsg-3");
+        note(&reg).note_subscription_usage_limit("root");
+        reg.note_turn_end("agent:root", "cmsg-2", TurnOutcome::Failed);
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-2").as_deref(),
+            Some(cap_llm::SUBSCRIPTION_USAGE_LIMIT_CLASS)
+        );
+    }
+
+    #[test]
+    fn a_class_is_final_once_the_turn_has_ended() {
+        let reg = ReplyRegistry::new();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Failed);
+        // A later turn of the agent (no Client API message in flight) changes nothing.
+        note(&reg).note_subscription_usage_limit("root");
+        note(&reg).clear_subscription_usage_limit("root");
+        note(&reg).note_model_failure("root");
+        reg.note_turn_end("agent:root", "msg-from-elsewhere", TurnOutcome::Failed);
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-1").as_deref(),
+            Some(advance_client_api::FAILURE_CLASS_AGENT_ERROR)
+        );
+        assert!(
+            reg.failure_class_for_message("msg-from-elsewhere")
+                .is_none(),
+            "only tracked Client API messages take a class"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_ends_before_its_send_returns_keeps_its_class() {
+        let reg = ReplyRegistry::new();
+        reg.track_client_message("cmsg-1");
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Failed);
+        reg.note_pending_message("agent:root", "cmsg-1");
+        assert!(
+            reg.inflight_message_id("agent:root").is_none(),
+            "an ended message is not in flight"
+        );
+        note(&reg).note_subscription_usage_limit("root");
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-1").as_deref(),
+            Some(advance_client_api::FAILURE_CLASS_AGENT_ERROR)
+        );
+    }
+
+    #[test]
+    fn a_message_the_mailbox_refused_is_forgotten_and_the_earlier_one_stays_in_flight() {
+        let reg = ReplyRegistry::new();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.note_pending_message("agent:root", "cmsg-2");
+        reg.forget_unpublished_message("agent:root", "cmsg-2");
+        assert_eq!(
+            reg.inflight_message_id("root").as_deref(),
+            Some("cmsg-1"),
+            "the message sent before it is still the one in flight"
+        );
+        note(&reg).note_model_failure("root");
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Failed);
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-1").as_deref(),
+            Some(advance_client_api::FAILURE_CLASS_PROVIDER_ERROR)
+        );
+        // The forgotten message is not tracked: nothing attaches to it, not even its
+        // own turn's end.
+        assert!(reg.failure_class_for_message("cmsg-2").is_none());
+        reg.note_turn_end("agent:root", "cmsg-2", TurnOutcome::Failed);
+        assert!(reg.failure_class_for_message("cmsg-2").is_none());
+
+        // Alone in flight: forgetting it leaves nothing in flight (a failure noted now
+        // is nobody's), and the next message takes the stream-key binding.
+        let reg = ReplyRegistry::new();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.forget_unpublished_message("agent:root", "cmsg-1");
+        assert!(reg.inflight_message_id("agent:root").is_none());
+        note(&reg).note_model_failure("root");
+        reg.note_pending_message("agent:root", "cmsg-2");
+        reg.record_stream_key("root", "st_2");
+        assert!(reg.stream_key_for_message("cmsg-1").is_none());
+        assert_eq!(
+            reg.stream_key_for_message("cmsg-2").as_deref(),
+            Some("st_2")
+        );
+        reg.note_turn_end("agent:root", "cmsg-2", TurnOutcome::Failed);
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-2").as_deref(),
+            Some(advance_client_api::FAILURE_CLASS_AGENT_ERROR)
+        );
+    }
+
+    #[test]
+    fn turn_end_resolves_the_root_through_any_alias() {
+        struct OneRoot;
+        impl advance_shared_types::agent_tree::AgentTreeReader for OneRoot {
+            fn parent_of(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn children_of(&self, _: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn siblings_of(&self, _: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn agent_exists(&self, id: &str) -> bool {
+                id == ROOT_ID
+            }
+            fn agent_kind(&self, _: &str) -> Option<advance_shared_types::agent_tree::AgentKind> {
+                None
+            }
+            fn capabilities(&self, _: &str) -> Vec<advance_shared_types::agent_tree::Capability> {
+                Vec::new()
+            }
+            fn handle_of(&self, id: &str) -> Option<String> {
+                self.agent_exists(id).then(|| "root".to_string())
+            }
+            fn id_by_handle(&self, handle: &str) -> Option<String> {
+                (handle == "root").then(|| ROOT_ID.to_string())
+            }
+        }
+        const ROOT_ID: &str = "11111111-1111-4111-8111-111111111111";
+        let reg = ReplyRegistry::new().with_tree(Arc::new(OneRoot));
+        // Sent to the served key, failed under the tree id, ended under the served key.
+        reg.note_pending_message("agent:root", "cmsg-1");
+        note(&reg).note_model_failure(ROOT_ID);
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Failed);
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-1").as_deref(),
+            Some(advance_client_api::FAILURE_CLASS_PROVIDER_ERROR)
+        );
+        // Ended under the tree id; replied under the served key.
+        reg.note_pending_message("agent:root", "cmsg-2");
+        note(&reg).note_model_failure("agent:root");
+        reg.note_turn_end(ROOT_ID, "cmsg-2", TurnOutcome::Failed);
+        assert_eq!(
+            reg.failure_class_for_message("cmsg-2").as_deref(),
+            Some(advance_client_api::FAILURE_CLASS_PROVIDER_ERROR)
+        );
+        assert!(reg.inflight_message_id(ROOT_ID).is_none());
+        reg.note_pending_message("agent:root", "cmsg-3");
+        reg.fulfill("agent:root", Some(b"ok".to_vec()));
+        reg.note_turn_end(ROOT_ID, "cmsg-3", TurnOutcome::Failed);
+        assert!(reg.failure_class_for_message("cmsg-3").is_none());
+    }
+
+    #[test]
+    fn failure_classes_are_bounded_like_the_send_ledger() {
+        let max = crate::client_api_adapters::MAX_TRACKED_CLIENT_MESSAGES;
+        let reg = ReplyRegistry::new();
+        reg.note_pending_message("agent:root", "cmsg-0");
+        reg.note_turn_end("agent:root", "cmsg-0", TurnOutcome::Failed);
+        for i in 1..=max {
+            reg.track_client_message(&format!("cmsg-{i}"));
+        }
+        let ledger = reg.failure_by_message.lock().unwrap();
+        assert_eq!(ledger.by_message.len(), max);
+        assert_eq!(ledger.order.len(), max);
+        drop(ledger);
+        assert!(
+            reg.failure_class_for_message("cmsg-0").is_none(),
+            "the oldest message is forgotten first"
+        );
+        reg.note_turn_end("agent:root", &format!("cmsg-{max}"), TurnOutcome::Failed);
+        assert_eq!(
+            reg.failure_class_for_message(&format!("cmsg-{max}"))
+                .as_deref(),
+            Some(advance_client_api::FAILURE_CLASS_AGENT_ERROR)
+        );
     }
 }

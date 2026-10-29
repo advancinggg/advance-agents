@@ -59,6 +59,7 @@ fn tool_invoke_ctx(caller: &str) -> HostCallContext {
         agent_id: caller.to_string(),
         trace_id: "tr-web".to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: "tools".to_string(),
         function: format!("{TOOLS_NS}::tool-invoke"),
         run_id: None,

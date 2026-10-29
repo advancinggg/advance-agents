@@ -98,6 +98,15 @@ pub const INVALID_REASONING_EFFORT_DETAIL: &str = "invalid_reasoning_effort";
 /// a `chatgpt-oauth` entry).
 pub const REASONING_EFFORT_UNSUPPORTED_DETAIL: &str = "reasoning_effort_unsupported";
 
+/// The `ClientError.details` token of an `invalid_request` whose cause is a `system_messages`
+/// that is not one of `separate | merge`.
+pub const INVALID_SYSTEM_MESSAGES_DETAIL: &str = "invalid_system_messages";
+
+/// The `ClientError.details` token of an `invalid_request` whose cause is a `system_messages`
+/// on an entry that cannot apply it (another backend class, a dialect other than
+/// `openai-chat`, or a `chatgpt-oauth` entry).
+pub const SYSTEM_MESSAGES_UNSUPPORTED_DETAIL: &str = "system_messages_unsupported";
+
 /// The provider-entry setting tokens an adapter may carry as the inner string of
 /// [`ProviderError::InvalidRequest`]: each is projected as an `invalid_request` with that token
 /// as its only detail.
@@ -106,6 +115,8 @@ pub const PROVIDER_SETTING_DETAILS: &[&str] = &[
     GENERATE_TIMEOUT_UNSUPPORTED_DETAIL,
     INVALID_REASONING_EFFORT_DETAIL,
     REASONING_EFFORT_UNSUPPORTED_DETAIL,
+    INVALID_SYSTEM_MESSAGES_DETAIL,
+    SYSTEM_MESSAGES_UNSUPPORTED_DETAIL,
 ];
 
 /// The `ClientError.details` token of a `module_unavailable` whose cause is a child process the
@@ -714,7 +725,9 @@ mod module_001_ac32_tests {
                 "invalid_generate_timeout",
                 "generate_timeout_unsupported",
                 "invalid_reasoning_effort",
-                "reasoning_effort_unsupported"
+                "reasoning_effort_unsupported",
+                "invalid_system_messages",
+                "system_messages_unsupported"
             ]
         );
     }

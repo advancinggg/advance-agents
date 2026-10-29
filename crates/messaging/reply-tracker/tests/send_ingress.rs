@@ -99,6 +99,7 @@ fn test_ctx(agent_id: &str) -> HostCallContext {
         agent_id: agent_id.to_string(),
         trace_id: "tr-b3-test".to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: "messaging".to_string(),
         function: "agent-messaging::send".to_string(),
         run_id: None,

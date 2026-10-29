@@ -444,6 +444,7 @@ post-processor:
             agent_id: agent.into(),
             trace_id: "t120-trace".into(),
             turn_id: None,
+            transcript_scope: None,
             capability: "llm".into(),
             function: "agent-llm::stream".into(),
             // A wired run_id (with the rig's budget) makes the reap's settlement

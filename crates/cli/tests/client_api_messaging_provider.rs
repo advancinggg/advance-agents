@@ -518,6 +518,7 @@ post-processor:
         agent_id: "root".into(),
         trace_id: "t-c235".into(),
         turn_id: None,
+        transcript_scope: None,
         capability: "llm".into(),
         function: "agent-llm::generate".into(),
         run_id: None,

@@ -2716,6 +2716,173 @@ fn reasoning_effort_refuses_unknown_values_other_dialects_classes_and_sign_in() 
     );
 }
 
+// ── `system-messages` on a provider entry ────────────────────────────────────────────────────
+
+#[test]
+fn system_messages_parses_both_values_on_openai_chat_entries_and_is_absent_by_default() {
+    assert_eq!(
+        SystemMessages::ALL.map(SystemMessages::as_str),
+        ["separate", "merge"]
+    );
+    for mode in SystemMessages::ALL {
+        assert_eq!(SystemMessages::parse(mode.as_str()), Some(mode));
+    }
+    assert_eq!(SystemMessages::parse("Merge"), None);
+    assert_eq!(SystemMessages::parse("join"), None);
+
+    // (id, class, extra block): openai-chat inferred and explicit, local (inferred and the
+    // `local` backend spelling), and the `anthropic` id on an explicit chat dialect or a local
+    // entry (which speaks openai-chat whatever its id).
+    let accepted = [
+        ("gw", "cloud-http", ""),
+        ("gw", "cloud-http", "    backend: openai-chat\n"),
+        ("gw", "local", ""),
+        ("gw", "cloud-http-local-backend", ""),
+        ("anthropic", "cloud-http", "    backend: openai-chat\n"),
+        ("anthropic", "local", ""),
+    ];
+    for (id, class, block) in accepted {
+        let (class, block) = match class {
+            "cloud-http-local-backend" => ("local", "    backend: local\n"),
+            other => (other, block),
+        };
+        let cfg = load_knob_yaml(&provider_knob_yaml(id, class, block))
+            .unwrap_or_else(|e| panic!("{id} {class} {block:?} without the key: {e}"));
+        let p = &cfg.llm_providers[0];
+        assert_eq!(p.system_messages, None);
+        assert!(!p.merges_system_messages());
+        for mode in SystemMessages::ALL {
+            let yaml = provider_knob_yaml(
+                id,
+                class,
+                &format!("{block}    system-messages: {}\n", mode.as_str()),
+            );
+            let cfg = load_knob_yaml(&yaml)
+                .unwrap_or_else(|e| panic!("{id} {class} {block:?} {mode:?}: {e}"));
+            let p = &cfg.llm_providers[0];
+            assert_eq!(p.system_messages, Some(mode));
+            assert_eq!(p.merges_system_messages(), mode == SystemMessages::Merge);
+            assert!(
+                format!("{p:?}").contains(&format!("system_messages: Some({mode:?})")),
+                "Debug names the key"
+            );
+        }
+    }
+}
+
+#[test]
+fn system_messages_refuses_unknown_values_other_dialects_classes_and_sign_in() {
+    let cases: Vec<(String, &str)> =
+        vec![
+        (
+            provider_knob_yaml("gw", "cloud-http", "    system-messages: join\n"),
+            "unknown llm-providers[].system-messages value \"join\" (expected separate or merge)",
+        ),
+        (
+            provider_knob_yaml("gw", "cloud-http", "    system-messages: MERGE\n"),
+            "unknown llm-providers[].system-messages value \"MERGE\"",
+        ),
+        // The Responses dialect already sends every system message as one `instructions`
+        // string: neither value could change its request.
+        (
+            provider_knob_yaml(
+                "gw",
+                "cloud-http",
+                "    backend: openai-responses\n    system-messages: merge\n",
+            ),
+            "system-messages is only valid on backend: openai-chat",
+        ),
+        (
+            provider_knob_yaml(
+                "gw",
+                "cloud-http",
+                "    backend: openai-responses\n    system-messages: separate\n",
+            ),
+            "system-messages is only valid on backend: openai-chat",
+        ),
+        (
+            provider_knob_yaml(
+                "gw",
+                "cloud-http",
+                "    backend: anthropic-messages\n    system-messages: merge\n",
+            ),
+            "system-messages is only valid on backend: openai-chat",
+        ),
+        // The `anthropic` id infers the Anthropic dialect when no backend is named.
+        (
+            provider_knob_yaml("anthropic", "cloud-http", "    system-messages: merge\n"),
+            "system-messages is only valid on backend: openai-chat",
+        ),
+        (
+            provider_knob_yaml("gw", "agent-cli", "    system-messages: merge\n"),
+            "system-messages is only valid on backend-class: cloud-http or local",
+        ),
+        (
+            provider_knob_yaml("gw", "mesh-remote", "    system-messages: merge\n"),
+            "system-messages is only valid on backend-class: cloud-http or local",
+        ),
+        (
+            chatgpt_oauth_yaml("    auth-source: chatgpt-oauth\n    system-messages: merge\n", ""),
+            "system-messages is invalid with auth-source: chatgpt-oauth",
+        ),
+    ];
+    for (yaml, needle) in cases {
+        let err = load_knob_yaml(&yaml).expect_err(needle);
+        assert!(err.contains(needle), "needle {needle:?}: {err}");
+    }
+    use InferenceBackendClass::{AgentCli, CloudHttp, Local, MeshRemote};
+    for (class, backend, source, allowed) in [
+        (
+            CloudHttp,
+            ProviderBackend::OpenAiChat,
+            ProviderAuthSource::ApiKey,
+            true,
+        ),
+        (
+            Local,
+            ProviderBackend::OpenAiChat,
+            ProviderAuthSource::ApiKey,
+            true,
+        ),
+        (
+            CloudHttp,
+            ProviderBackend::OpenAiResponses,
+            ProviderAuthSource::ApiKey,
+            false,
+        ),
+        (
+            CloudHttp,
+            ProviderBackend::AnthropicMessages,
+            ProviderAuthSource::ApiKey,
+            false,
+        ),
+        (
+            CloudHttp,
+            ProviderBackend::OpenAiResponses,
+            ProviderAuthSource::ChatGptOAuth,
+            false,
+        ),
+        (
+            AgentCli,
+            ProviderBackend::OpenAiChat,
+            ProviderAuthSource::ApiKey,
+            false,
+        ),
+        (
+            MeshRemote,
+            ProviderBackend::OpenAiChat,
+            ProviderAuthSource::ApiKey,
+            false,
+        ),
+    ] {
+        assert_eq!(
+            system_messages_refusal(class, backend, source).is_none(),
+            allowed,
+            "{class:?} {backend:?} {source:?}"
+        );
+    }
+}
+
 #[test]
 fn provider_knobs_compose_with_each_other_and_a_sign_in_entry_keeps_its_timeout() {
     let cfg = load_knob_yaml(&provider_knob_yaml(

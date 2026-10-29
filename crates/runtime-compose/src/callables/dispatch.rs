@@ -237,14 +237,17 @@ impl CallableDispatcher {
                 ),
             ),
         };
-        if let (Some(gw), Some(turn_id)) = (
+        // ADR 2026-10-24 D4: the result lands on the host-owned transcript of
+        // this invocation's scope (the trusted turn, or the host-minted scope
+        // of an invocation without one), so the next continue-generate sees it.
+        if let (Some(gw), Some(scope)) = (
             self.gateway
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
-            ctx.turn_id.as_deref(),
+            ctx.transcript_scope.as_deref(),
         ) {
-            gw.record_tool_result(&ctx.agent_id, turn_id, record_id, &event_name, &content);
+            gw.record_tool_result(&ctx.agent_id, scope, record_id, &event_name, &content);
         }
         result
     }
@@ -351,6 +354,7 @@ impl CallableDispatcher {
             agent_id: ctx.agent_id.clone(),
             trace_id: ctx.trace_id.clone(),
             turn_id: ctx.turn_id.clone(),
+            transcript_scope: ctx.transcript_scope.clone(),
             capability: spec.capability.clone(),
             function: spec.original_function.clone(),
             run_id: ctx.run_id.clone(),
@@ -667,6 +671,7 @@ mod tests {
             agent_id: "root".into(),
             trace_id: "t".into(),
             turn_id: Some("turn-1".into()),
+            transcript_scope: Some("turn-1".into()),
             capability: "llm".into(),
             function: "advance:runtime/agent-callables@0.1.0::invoke-callable".into(),
             run_id: None,

@@ -32,12 +32,19 @@ pub fn is_subscription_usage_limit(err: &LlmError) -> bool {
     }
 }
 
-/// Records the redacted subscription-usage class for the Client API. Implementations
-/// store [`SUBSCRIPTION_USAGE_LIMIT_CLASS`] only — never vendor stderr, account
-/// identifiers, reset times, or tokens.
+/// Records the redacted outcome of the model calls an agent's guest makes, for the
+/// Client API. Implementations store fixed tokens only ([`SUBSCRIPTION_USAGE_LIMIT_CLASS`]
+/// and the generic failure classes derived from [`Self::note_model_failure`]) — never
+/// vendor stderr, account identifiers, reset times, or tokens.
 pub trait FailureClassNote: Send + Sync {
+    /// A model call returned the subscription-usage class to the guest.
     fn note_subscription_usage_limit(&self, agent_id: &str);
+    /// A model call succeeded: withdraw the usage class and any pending model failure.
     fn clear_subscription_usage_limit(&self, agent_id: &str);
+    /// A model call returned any other error to the guest. Only a pending note: it
+    /// becomes a failure class when the turn then ends without a reply, and a later
+    /// successful call withdraws it. Default: nothing.
+    fn note_model_failure(&self, _agent_id: &str) {}
 }
 
 /// LLM-gateway error variants. Variant names are kebab-case strings matching

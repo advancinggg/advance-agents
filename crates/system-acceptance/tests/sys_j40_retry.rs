@@ -54,6 +54,7 @@ fn host_ctx() -> HostCallContext {
         agent_id: AGENT.into(),
         trace_id: "trace-h40".into(),
         turn_id: None,
+        transcript_scope: None,
         capability: "llm".into(),
         function: "agent-llm::generate".into(),
         run_id: None,

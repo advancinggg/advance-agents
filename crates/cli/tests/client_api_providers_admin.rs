@@ -1523,3 +1523,120 @@ async fn pv07_generate_budget_and_reasoning_setting_over_production_wiring() {
         queue.close_and_join().await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pv08_system_message_mode_over_production_wiring() {
+    let (_g, ws, cfg) = fresh_workspace();
+    let (_host, handles) = boot(&ws, &cfg).await;
+    let api = handles
+        .client_api_server
+        .as_ref()
+        .expect("EventBus up ⇒ Client API bound")
+        .api();
+    mint(&api, "tok", Scope::operator_default());
+    let document = || std::fs::read_to_string(ws.join(".advance/runtime-config.yaml")).unwrap();
+
+    let env = post(
+        &api,
+        "/client/providers",
+        json!({
+            "provider_id": "merger",
+            "endpoint": "https://api.merger.example",
+            "model_aliases": { "m": "merger-large" },
+            "cost": { "input_per_mtoken": 1.0, "output_per_mtoken": 2.0 },
+            "rate_limit": { "requests_per_minute": 60, "tokens_per_minute": 100000 },
+            "system_messages": "merge"
+        }),
+        "k-create",
+    );
+    let created: ClientProviderSummary = data(&env);
+    assert_eq!(created.system_messages.as_deref(), Some("merge"));
+    let text = document();
+    assert!(text.contains("system-messages: merge"), "{text}");
+    let entry = entries(&ws).into_iter().find(|p| p.id == "merger").unwrap();
+    assert_eq!(
+        entry.system_messages,
+        Some(advance_runtime::config::SystemMessages::Merge)
+    );
+    assert!(entry.merges_system_messages());
+    let got: ClientProviderSummary = data(&get(&api, "/client/providers/merger"));
+    assert_eq!(got.system_messages.as_deref(), Some("merge"));
+
+    let env = post(
+        &api,
+        "/client/providers/merger:update",
+        json!({ "system_messages": "separate" }),
+        "k-separate",
+    );
+    let updated: ClientProviderSummary = data(&env);
+    assert_eq!(updated.system_messages.as_deref(), Some("separate"));
+    assert!(document().contains("system-messages: separate"));
+
+    // An explicit null clears the key: the entry sends as it did before it was named.
+    let env = post(
+        &api,
+        "/client/providers/merger:update",
+        json!({ "system_messages": null }),
+        "k-clear",
+    );
+    let cleared = env.data.clone().expect("cleared");
+    assert!(cleared.get("system_messages").is_none(), "{cleared}");
+    assert!(!document().contains("system-messages"), "{}", document());
+
+    // Refusals carry the setting's detail token and leave the document as it was.
+    let details = |env: &ClientEnvelope<Value>| -> Vec<String> {
+        env.error
+            .as_ref()
+            .map(|e| e.details.clone())
+            .unwrap_or_default()
+    };
+    let env = post(
+        &api,
+        "/client/providers/merger:update",
+        json!({ "system_messages": "merge" }),
+        "k-merge-again",
+    );
+    assert!(env.error.is_none(), "{:?}", env.error);
+    let before = document();
+    let env = post(
+        &api,
+        "/client/providers",
+        json!({
+            "provider_id": "messages",
+            "backend": "anthropic-messages",
+            "endpoint": "https://api.messages.example",
+            "model_aliases": { "m": "m" },
+            "cost": { "input_per_mtoken": 1.0, "output_per_mtoken": 2.0 },
+            "rate_limit": { "requests_per_minute": 60, "tokens_per_minute": 100000 },
+            "system_messages": "merge"
+        }),
+        "k-bad-create",
+    );
+    assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
+    assert_eq!(details(&env), ["system_messages_unsupported"]);
+    // The stored mode meets the update's new dialect: decided by the provider.
+    let env = post(
+        &api,
+        "/client/providers/merger:update",
+        json!({ "backend": "openai-responses" }),
+        "k-bad-dialect",
+    );
+    assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
+    assert_eq!(details(&env), ["system_messages_unsupported"]);
+    let env = post(
+        &api,
+        "/client/providers/merger:update",
+        json!({ "system_messages": "joined" }),
+        "k-bad-mode",
+    );
+    assert_eq!(env.error_code(), Some(ClientErrorCode::InvalidRequest));
+    assert_eq!(details(&env), ["invalid_system_messages"]);
+    assert_eq!(document(), before);
+    assert_eq!(ids(&ws), vec!["openai", "merger"]);
+
+    // The workspace's commit worker runs until its queue is closed: join it so the runtime's
+    // teardown does not wait on it.
+    if let Some(queue) = handles.git_queue_owner.as_ref() {
+        queue.close_and_join().await;
+    }
+}

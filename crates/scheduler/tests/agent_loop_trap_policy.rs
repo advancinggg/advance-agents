@@ -17,7 +17,8 @@ use async_trait::async_trait;
 
 use advance_scheduler::agent_loop::AgentLoopDriverImpl;
 use advance_scheduler::hook::{
-    BootstrapError, CrashCascadeSink, HookError, MessageHandler, RunBootstrap, TurnObserver,
+    BootstrapError, CrashCascadeSink, HookError, MessageHandler, RunBootstrap, TurnEnd,
+    TurnObserver,
 };
 use advance_scheduler::types::{
     ComponentConfig, ComponentId, RestartPolicy, TrapError, WasmInstance,
@@ -583,4 +584,121 @@ async fn module_001_ac31_serving_loops_prepare_the_handler_between_turns() {
         .run_agent("agent:trap", cfg(), inst())
         .await;
     assert_eq!(recorded(&sequence), ["init", "handle 0", "component.error"]);
+}
+
+/// Records each turn end the loop reports and each turn completion, in order.
+struct EndObserver(Sequence);
+impl TurnObserver for EndObserver {
+    fn on_turn_end(&self, agent_id: &str, end: &TurnEnd) {
+        self.0.lock().unwrap().push(format!(
+            "end {agent_id} {} {:?}",
+            end.message_id, end.outcome
+        ));
+    }
+    fn on_turn_complete(&self, _agent_id: &str) {
+        self.0.lock().unwrap().push("observed".into());
+    }
+}
+
+/// Refuses every batch.
+struct FailingDispatcher;
+#[async_trait]
+impl AgentActionDispatcher for FailingDispatcher {
+    async fn dispatch(
+        &self,
+        _agent_id: &str,
+        _source: &Message,
+        _actions: &[AgentAction],
+    ) -> Result<DeliveryReport, DispatchError> {
+        Err(DispatchError::TargetNotFound("nowhere".into()))
+    }
+}
+
+fn end_driver(
+    mailbox: Arc<dyn MailboxReader>,
+    dispatcher: Arc<dyn AgentActionDispatcher>,
+    sequence: &Sequence,
+) -> AgentLoopDriverImpl {
+    AgentLoopDriverImpl::new(
+        mailbox,
+        Arc::new(OkAssembler),
+        Arc::new(OkPostProcessor),
+        dispatcher,
+        Arc::new(OkBootstrap),
+        Arc::new(SequenceHandler {
+            sequence: Arc::clone(sequence),
+            turns: Mutex::new(0),
+        }),
+    )
+    .with_turn_observer(Arc::new(EndObserver(Arc::clone(sequence))))
+}
+
+/// The serving loops report how each executed turn ended, against the message it
+/// executed: `Failed` for a guest error or trap and for a refused dispatch,
+/// `Completed` for a dispatched batch. The report comes after the turn settled and
+/// before `on_turn_complete`, in `serve` and `serve_n_turns` alike.
+#[tokio::test]
+async fn serving_loops_report_each_turn_end_before_turn_complete() {
+    let ok = [
+        "init",
+        "handle 0",
+        "end agent:trap m Failed",
+        "observed",
+        "next",
+        "handle 1",
+        "end agent:trap m Completed",
+        "observed",
+    ];
+    let sequence: Sequence = Arc::default();
+    end_driver(Arc::new(YieldMailbox), Arc::new(OkDispatcher), &sequence)
+        .serve_n_turns("agent:trap", cfg(), inst(), 2)
+        .await;
+    assert_eq!(recorded(&sequence), ok);
+
+    let refused = [
+        "init",
+        "handle 0",
+        "end agent:trap m Failed",
+        "observed",
+        "next",
+        "handle 1",
+        "end agent:trap m Failed",
+        "observed",
+    ];
+    let sequence: Sequence = Arc::default();
+    end_driver(
+        Arc::new(YieldMailbox),
+        Arc::new(FailingDispatcher),
+        &sequence,
+    )
+    .serve_n_turns("agent:trap", cfg(), inst(), 2)
+    .await;
+    assert_eq!(recorded(&sequence), refused);
+
+    // `serve` (the daemon's loop): two turns, then the mailbox is idle.
+    let sequence: Sequence = Arc::default();
+    let driver = Arc::new(end_driver(
+        Arc::new(ParkingMailbox {
+            left: Mutex::new(2),
+        }),
+        Arc::new(OkDispatcher),
+        &sequence,
+    ));
+    let serving = tokio::spawn({
+        let driver = Arc::clone(&driver);
+        async move { driver.serve("agent:trap", cfg(), inst()).await }
+    });
+    // `serve` prepares the handler after every turn, the last included.
+    let served: Vec<&str> = ok.iter().copied().chain(["next"]).collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while recorded(&sequence).len() < served.len() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "serve stalled at {:?}",
+            recorded(&sequence)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    serving.abort();
+    assert_eq!(recorded(&sequence), served);
 }

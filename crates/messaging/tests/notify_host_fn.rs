@@ -32,6 +32,7 @@ fn test_ctx(agent_id: &str) -> HostCallContext {
         agent_id: agent_id.to_string(),
         trace_id: "tr-notify-test".to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: NOTIFY_CAPABILITY.to_string(),
         function: format!("{NOTIFY_NAMESPACE}::notify-agent"),
         run_id: None,

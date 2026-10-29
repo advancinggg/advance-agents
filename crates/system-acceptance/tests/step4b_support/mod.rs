@@ -153,6 +153,7 @@ impl Wired {
             agent_id: self.agent.clone(),
             trace_id: "tr-step4b".to_string(),
             turn_id: None,
+            transcript_scope: None,
             capability: "messaging".to_string(),
             function: "agent-messaging::await-replies".to_string(),
             run_id: Some(self.run_id.to_string()),

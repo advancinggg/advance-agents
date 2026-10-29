@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use advance_scheduler::TurnObserver;
+use advance_scheduler::{TurnEnd, TurnObserver};
 
 use crate::api::log_keys;
 use crate::compose_log::LogHandle;
@@ -45,6 +45,14 @@ impl TurnObserver for CompositeTurnObserver {
     fn on_turn_complete(&self, agent_id: &str) {
         for observer in &self.observers {
             observer.on_turn_complete(agent_id);
+        }
+    }
+
+    /// Forwarded in the same declaration order, so a wrapped observer that marks
+    /// a failed turn (the root's `WatchTurnObserver`) sees every turn end.
+    fn on_turn_end(&self, agent_id: &str, end: &TurnEnd) {
+        for observer in &self.observers {
+            observer.on_turn_end(agent_id, end);
         }
     }
 }
@@ -283,5 +291,39 @@ mod tests {
         composite.on_turn_complete("agent:root");
         assert_eq!(a.load(Ordering::SeqCst), 1);
         assert_eq!(b.load(Ordering::SeqCst), 1);
+    }
+
+    type SeenEnds = Arc<Mutex<Vec<(String, TurnEnd)>>>;
+
+    struct Ends(SeenEnds);
+    impl TurnObserver for Ends {
+        fn on_turn_complete(&self, _agent_id: &str) {}
+
+        fn on_turn_end(&self, agent_id: &str, end: &TurnEnd) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((agent_id.to_string(), end.clone()));
+        }
+    }
+
+    /// The turn end reaches every wrapped observer, the root's watch observer
+    /// included (it is what marks a failed Client API message).
+    #[test]
+    fn composite_forwards_turn_end_to_every_observer() {
+        let a: SeenEnds = Arc::default();
+        let b: SeenEnds = Arc::default();
+        let composite = CompositeTurnObserver::new(vec![
+            Arc::new(Ends(a.clone())) as Arc<dyn TurnObserver>,
+            Arc::new(Ends(b.clone())),
+        ]);
+        let end = TurnEnd {
+            message_id: "cmsg-0".into(),
+            outcome: advance_scheduler::TurnOutcome::Failed,
+        };
+        composite.on_turn_end("agent:root", &end);
+        let expected = vec![("agent:root".to_string(), end)];
+        assert_eq!(*a.lock().unwrap(), expected);
+        assert_eq!(*b.lock().unwrap(), expected);
     }
 }

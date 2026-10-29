@@ -161,6 +161,8 @@ pub async fn compose(
             probe: failpoints.probe.clone(),
             #[cfg(feature = "test-support")]
             fail_after_git_queue: failpoints.wiring_after_git_queue,
+            #[cfg(feature = "test-support")]
+            llm_security_override: failpoints.llm_security.clone(),
             ..WiringOptions::compat()
         },
         hot_reload,

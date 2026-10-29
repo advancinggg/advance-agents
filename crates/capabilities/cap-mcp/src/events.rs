@@ -209,6 +209,7 @@ mod tests {
             agent_id: "agent-1".into(),
             trace_id: "trace-1".into(),
             turn_id: None,
+            transcript_scope: None,
             capability: "mcp".into(),
             function: "advance:runtime/mcp-client@0.1.0::invoke-mcp-tool".into(),
             run_id: Some("run-1".into()),

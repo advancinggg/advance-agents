@@ -631,7 +631,9 @@ pub use crate::grant_adapter::Contract219GrantAdapter;
 /// (`WiringHandles::root_mailbox_id`).
 const SERVE_LOOP_AGENT: &str = "agent:root";
 
-const MAX_TRACKED_CLIENT_MESSAGES: usize = 4096;
+/// The most Client API messages tracked at once (the send ledger here and the
+/// reply registry's failure classes); the oldest is forgotten first.
+pub(crate) const MAX_TRACKED_CLIENT_MESSAGES: usize = 4096;
 
 /// Bounded send ledger so `GET /client/messages/{id}` cannot grow without
 /// bound for the daemon lifetime. Oldest ids evict first.
@@ -732,6 +734,9 @@ impl MessagingProvider for ServeLoopMessagingProvider {
             timestamp: SystemTime::now(),
             origin: None,
         };
+        // Tracked and in flight before it is published: the serve loop may run the
+        // turn — and observe its model failure or its end — before this call returns.
+        self.replies.note_pending_message(to, &message_id);
         let delivery = match self.ingress.as_deref() {
             Some(ingress) => ingress.publish(msg),
             None => self
@@ -739,13 +744,15 @@ impl MessagingProvider for ServeLoopMessagingProvider {
                 .get_or_create(to)
                 .and_then(|mailbox| mailbox.deliver(msg)),
         };
-        delivery.map_err(|e| match e {
-            MsgError::MailboxFull => ProviderError::Unavailable("mailbox_full".to_owned()),
-            MsgError::InvalidPayload(_) => ProviderError::TooLarge("payload".to_owned()),
-            _ => ProviderError::Unavailable("deliver".to_owned()),
-        })?;
+        if let Err(e) = delivery {
+            self.replies.forget_unpublished_message(to, &message_id);
+            return Err(match e {
+                MsgError::MailboxFull => ProviderError::Unavailable("mailbox_full".to_owned()),
+                MsgError::InvalidPayload(_) => ProviderError::TooLarge("payload".to_owned()),
+                _ => ProviderError::Unavailable("deliver".to_owned()),
+            });
+        }
         self.replies.clear_last_outbound(to);
-        self.replies.note_pending_message(to, &message_id);
         self.sent
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1419,6 +1426,7 @@ fn agent_status_name(status: &AgentStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use advance_scheduler::TurnOutcome;
     use chrono::{TimeZone, Utc};
     use serde_json::json;
 
@@ -1789,5 +1797,84 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["failure_class"], "subscription-usage-limit");
         assert_eq!(json["reply_state"], "none");
+    }
+
+    #[test]
+    fn message_status_failure_class_appears_once_the_failed_turn_has_ended() {
+        let store = Arc::new(MailboxStore::new(
+            std::num::NonZeroUsize::new(8).expect("capacity"),
+        ));
+        let replies = Arc::new(ReplyRegistry::new());
+        let provider =
+            ServeLoopMessagingProvider::new(store, None, Arc::clone(&replies), "agent:root");
+        let note: &dyn cap_llm::FailureClassNote = &*replies;
+
+        let ack = provider.send("agent:root", b"hello").expect("send");
+        note.note_model_failure("root");
+        let in_flight = provider.message_status(&ack.message_id).expect("status");
+        assert!(in_flight.failure_class.is_none(), "absent while in flight");
+        let json = serde_json::to_value(&in_flight).unwrap();
+        assert!(json.get("failure_class").is_none(), "omitted from the JSON");
+        replies.note_turn_end("agent:root", &ack.message_id, TurnOutcome::Failed);
+        let ended = provider.message_status(&ack.message_id).expect("status");
+        assert_eq!(ended.reply_state, "none");
+        assert_eq!(
+            ended.failure_class.as_deref(),
+            Some(advance_client_api::FAILURE_CLASS_PROVIDER_ERROR)
+        );
+        let json = serde_json::to_value(&ended).unwrap();
+        assert_eq!(json["failure_class"], "provider-error");
+
+        let ack = provider.send("agent:root", b"again").expect("send");
+        replies.note_turn_end("agent:root", &ack.message_id, TurnOutcome::Failed);
+        let status = provider.message_status(&ack.message_id).expect("status");
+        assert_eq!(status.failure_class.as_deref(), Some("agent-error"));
+
+        let ack = provider.send("agent:root", b"answered").expect("send");
+        replies.fulfill("agent:root", Some(b"hi".to_vec()));
+        replies.note_turn_end("agent:root", &ack.message_id, TurnOutcome::Completed);
+        let status = provider.message_status(&ack.message_id).expect("status");
+        assert_eq!(status.reply_state, "replied");
+        assert!(status.failure_class.is_none());
+    }
+
+    /// A message is in flight from before it is published, so a turn that runs it
+    /// before `send` returns is attributed to it; a message the mailbox refuses is
+    /// forgotten again, and the message in flight before it stays in flight.
+    #[test]
+    fn a_send_the_mailbox_refuses_leaves_the_registry_as_it_was() {
+        let store = Arc::new(MailboxStore::new(
+            std::num::NonZeroUsize::new(1).expect("capacity"),
+        ));
+        let replies = Arc::new(ReplyRegistry::new());
+        let provider =
+            ServeLoopMessagingProvider::new(store, None, Arc::clone(&replies), "agent:root");
+        let note: &dyn cap_llm::FailureClassNote = &*replies;
+
+        let first = provider.send("agent:root", b"first").expect("send");
+        let refused = provider
+            .send("agent:root", b"second")
+            .expect_err("the mailbox holds one message");
+        assert!(
+            matches!(refused, ProviderError::Unavailable(ref what) if what == "mailbox_full"),
+            "{refused:?}"
+        );
+        assert!(
+            matches!(
+                provider.message_status("cmsg-1"),
+                Err(ProviderError::NotFound(_))
+            ),
+            "a refused message was never sent"
+        );
+
+        // The first message is still the one in flight: its turn's model failure is its own.
+        note.note_model_failure("root");
+        replies.note_turn_end("agent:root", &first.message_id, TurnOutcome::Failed);
+        let status = provider.message_status(&first.message_id).expect("status");
+        assert_eq!(
+            status.failure_class.as_deref(),
+            Some(advance_client_api::FAILURE_CLASS_PROVIDER_ERROR)
+        );
+        assert!(replies.failure_class_for_message("cmsg-1").is_none());
     }
 }

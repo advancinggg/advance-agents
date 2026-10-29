@@ -317,6 +317,7 @@ impl LifecycleFixture {
             agent_id: caller.into(),
             trace_id: "trace-harness".into(),
             turn_id: None,
+            transcript_scope: None,
             capability: "lifecycle".into(),
             function: format!("advance:runtime/agent-lifecycle::{op}"),
             run_id: None,

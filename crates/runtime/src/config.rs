@@ -765,6 +765,70 @@ impl ReasoningEffort {
     }
 }
 
+/// How an entry sends the system messages of a chat request (an entry's `system-messages`).
+///
+/// Some OpenAI-compatible servers take a single system message, or a system message only at
+/// the start of the conversation, while a request can carry several (the context engine's
+/// tiers and cache-breakpoint markers among them). `merge` serves such servers.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemMessages {
+    /// Each system message is sent where it stands: what an entry without the key sends.
+    #[serde(rename = "separate")]
+    Separate,
+    /// The text of every system message, in order and joined by a blank line (`"\n\n"`), is
+    /// sent as one system message first; the other messages keep their relative order. All of
+    /// the text is kept, markers included.
+    #[serde(rename = "merge")]
+    Merge,
+}
+
+impl SystemMessages {
+    /// Every value.
+    pub const ALL: [SystemMessages; 2] = [Self::Separate, Self::Merge];
+
+    /// The config spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Separate => "separate",
+            Self::Merge => "merge",
+        }
+    }
+
+    /// The value spelled `s`, if any.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == s)
+    }
+}
+
+/// Why `system-messages` cannot be set on an entry of `class` whose requests speak `backend`
+/// with a credential from `auth_source`; `None` when it can.
+///
+/// Only the `openai-chat` dialect sends system messages as messages. `openai-responses`
+/// already sends the text of every system message, in order and joined by a blank line, as
+/// its one `instructions` string, and `anthropic-messages` lifts them into its own `system`
+/// field the same way, so the setting could change neither; an `agent-cli` or `mesh-remote`
+/// entry builds no request body here. The request of a `chatgpt-oauth` entry is pinned to the
+/// fields its route was verified to accept.
+pub fn system_messages_refusal(
+    class: InferenceBackendClass,
+    backend: ProviderBackend,
+    auth_source: ProviderAuthSource,
+) -> Option<&'static str> {
+    if !matches!(
+        class,
+        InferenceBackendClass::CloudHttp | InferenceBackendClass::Local
+    ) {
+        return Some("system-messages is only valid on backend-class: cloud-http or local");
+    }
+    if auth_source == ProviderAuthSource::ChatGptOAuth {
+        return Some("system-messages is invalid with auth-source: chatgpt-oauth");
+    }
+    if backend != ProviderBackend::OpenAiChat {
+        return Some("system-messages is only valid on backend: openai-chat");
+    }
+    None
+}
+
 /// Why `generate-timeout-secs` cannot be set on an entry of `class`; `None` when it can.
 /// An `agent-cli` call is bounded by the CLI call limit, and a `mesh-remote` call by the
 /// serving device.
@@ -867,6 +931,10 @@ pub struct LlmProviderConfig {
     /// every chat request of this entry, the preflight included; never with an embedding
     /// request. `None` = nothing is sent (the upstream's default).
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// `system-messages` (`openai-chat` `cloud-http` / `local` entries only): how every chat,
+    /// stream, image and preflight request of this entry sends its system messages. `None` and
+    /// [`SystemMessages::Separate`] send them as they stand.
+    pub system_messages: Option<SystemMessages>,
 }
 
 impl LlmProviderConfig {
@@ -880,6 +948,11 @@ impl LlmProviderConfig {
     pub fn generate_timeout(&self) -> Option<Duration> {
         self.generate_timeout_secs
             .map(|secs| Duration::from_secs(u64::from(secs)))
+    }
+
+    /// Whether the entry sends its system messages as one (`system-messages: merge`).
+    pub fn merges_system_messages(&self) -> bool {
+        self.system_messages == Some(SystemMessages::Merge)
     }
 }
 
@@ -929,6 +1002,8 @@ struct LlmProviderConfigRaw {
     generate_timeout_secs: Option<u32>,
     #[serde(rename = "reasoning-effort", default)]
     reasoning_effort: Option<String>,
+    #[serde(rename = "system-messages", default)]
+    system_messages: Option<String>,
 }
 
 impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
@@ -1089,6 +1164,24 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
                 return Err(why.into());
             }
         }
+        let system_messages = match raw.system_messages.as_deref() {
+            None => None,
+            Some(s) => Some(SystemMessages::parse(s).ok_or_else(|| {
+                format!(
+                    "unknown llm-providers[].system-messages value {s:?} (expected separate or \
+                     merge)"
+                )
+            })?),
+        };
+        if system_messages.is_some() {
+            if let Some(why) = system_messages_refusal(
+                backend_class,
+                effective_backend(&raw.id, backend),
+                auth_source,
+            ) {
+                return Err(why.into());
+            }
+        }
         Ok(Self {
             id: raw.id,
             endpoint: raw.endpoint,
@@ -1112,6 +1205,7 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
             auth_source,
             generate_timeout_secs: raw.generate_timeout_secs,
             reasoning_effort,
+            system_messages,
         })
     }
 }
@@ -1150,6 +1244,7 @@ impl fmt::Debug for LlmProviderConfig {
             .field("auth_source", &self.auth_source)
             .field("generate_timeout_secs", &self.generate_timeout_secs)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("system_messages", &self.system_messages)
             .finish()
     }
 }

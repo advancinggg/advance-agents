@@ -84,6 +84,7 @@ fn secret_exists_ctx(agent_id: &str) -> HostCallContext {
         agent_id: agent_id.to_string(),
         trace_id: "tr-t15".to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: "secrets".to_string(),
         function: "advance:runtime/agent-secrets::secret-exists".to_string(),
         run_id: None,

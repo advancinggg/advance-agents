@@ -33,6 +33,17 @@ pub struct HostCallContext {
     /// runtime-owned `ComponentCtx` when a mailbox turn is activated and is
     /// never decoded from guest parameters or message context.
     pub turn_id: Option<String>,
+    /// Host-owned turn-transcript scope (ADR 2026-10-24 D4) of the guest
+    /// invocation this host call belongs to: the trusted `turn_id` on a
+    /// CONTRACT-216 turn, otherwise a key the host mints for exactly one guest
+    /// `handle-message` invocation and drops when that invocation returns.
+    /// Read ONLY by the turn-transcript paths (guest message build, generate
+    /// recording, callable tool-result recording, end of turn); cost
+    /// attribution, reply routing and the progress lifecycle keep reading
+    /// `turn_id`, so a minted scope never reaches them.  Like `turn_id` it is
+    /// stamped from the runtime-owned `ComponentCtx` and never decoded from
+    /// guest parameters or message context.
+    pub transcript_scope: Option<String>,
     pub capability: String,
     /// `"{namespace}::{name}"` — for logging / error messages only.
     pub function: String,

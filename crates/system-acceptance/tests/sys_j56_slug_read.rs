@@ -99,6 +99,7 @@ fn ctx_for(agent_id: &str) -> HostCallContext {
         agent_id: agent_id.to_string(),
         trace_id: "trace-j56".to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: "fs".to_string(),
         function: "advance:runtime/agent-fs@0.1.0::read-slug".to_string(),
         run_id: None,

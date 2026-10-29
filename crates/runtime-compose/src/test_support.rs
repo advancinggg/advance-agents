@@ -99,6 +99,18 @@ pub struct ComposeFailpoints {
     pub turn_gate: Option<TurnGate>,
     /// Records what the composition built and the steps its teardown ran.
     pub probe: Option<Arc<ComposeProbe>>,
+    /// Deterministic DNS and the external HTTP peer inside the LLM egress chain.
+    pub llm_security: Option<LlmSecurityOverride>,
+}
+
+/// The SSRF guard and the buffered executor of the LLM egress chain, in place of the
+/// live DNS resolver and the network (every other link of the chain is the production
+/// one: credential injection, leak scan, rate limit, events). A streamed request keeps
+/// the live executor.
+#[derive(Clone)]
+pub struct LlmSecurityOverride {
+    pub ssrf: Arc<dyn advance_shared_types::security_validator::SsrfGuard>,
+    pub executor: Arc<dyn cap_http::HttpExecutor>,
 }
 
 /// Holds a message turn in flight: the turn signals [`entered`](Self::entered) and then

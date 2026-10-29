@@ -143,6 +143,40 @@ impl<'a> OwnedWasmInstance<'a> {
     }
 }
 
+/// ADR 2026-10-24 D4 — the host-minted transcript scope of ONE guest
+/// `handle-message` invocation that runs without a CONTRACT-216 trusted turn
+/// (an agent whose mailbox turns are unprotected). The id is minted here,
+/// never read from the Message or the guest, and is stamped only on
+/// `ComponentCtx::transcript_scope` — never on `turn_id`, so cost attribution,
+/// reply routing and the progress lifecycle never see it. Dropping the guard
+/// drops the scope's transcript; `handle_message` drops it as soon as the
+/// guest call returns (normal return, guest error, trap, contained panic), and
+/// a cancelled call drops it with the future, so nothing carries into the
+/// next turn.
+struct InvocationTranscriptScope<'a> {
+    id: String,
+    agent_id: &'a str,
+    gateway: Option<&'a Arc<LlmGateway>>,
+}
+
+impl<'a> InvocationTranscriptScope<'a> {
+    fn mint(agent_id: &'a str, gateway: Option<&'a Arc<LlmGateway>>) -> Self {
+        Self {
+            id: format!("invocation-{}", uuid::Uuid::new_v4()),
+            agent_id,
+            gateway,
+        }
+    }
+}
+
+impl Drop for InvocationTranscriptScope<'_> {
+    fn drop(&mut self) {
+        if let Some(gw) = self.gateway {
+            gw.end_turn(self.agent_id, &self.id);
+        }
+    }
+}
+
 impl Drop for OwnedWasmInstance<'_> {
     fn drop(&mut self) {
         // Explicit ordering is load-bearing: Store is gone before observers can
@@ -190,8 +224,10 @@ pub struct WasmMessageHandler {
     /// ([`Self::with_log`]; none by default).
     log: LogHandle,
     /// Host-owned turn transcript (ADR 2026-10-24 D4). `end_turn` drops the
-    /// slot at `clear_trusted_turn` / `destroy_trusted_turn`. `None` on the
-    /// harness path that never wires llm.
+    /// slot at `clear_trusted_turn` / `destroy_trusted_turn` for a trusted
+    /// turn, and when the guest call returns for an invocation that ran under
+    /// a minted scope ([`InvocationTranscriptScope`]). `None` on the harness
+    /// path that never wires llm.
     llm_gateway: Option<Arc<LlmGateway>>,
 }
 
@@ -241,7 +277,8 @@ impl WasmMessageHandler {
         self
     }
 
-    /// Drop the host-owned turn transcript when the trusted turn ends.
+    /// Drop the host-owned turn transcript when the trusted turn ends, or when
+    /// an invocation without one returns.
     pub fn with_llm_gateway(mut self, gateway: Arc<LlmGateway>) -> Self {
         self.llm_gateway = Some(gateway);
         self
@@ -381,6 +418,12 @@ impl MessageHandler for WasmMessageHandler {
             .lock()
             .map_err(|_| HookError::Failure("trusted turn state poisoned".into()))?
             .clone();
+        // ADR 2026-10-24 D4: every invocation gets a host-owned transcript
+        // scope. A trusted turn is its own scope (`stamp_trusted_turn` below);
+        // an invocation without one gets a scope minted for this call only.
+        let mut invocation_scope = trusted_turn_id
+            .is_none()
+            .then(|| InvocationTranscriptScope::mint(&self.agent_id, self.llm_gateway.as_ref()));
         {
             let pair = owned.pair_mut();
             if let Some(tid) = msg.context.as_ref().and_then(|c| c.trace_id.clone()) {
@@ -394,6 +437,8 @@ impl MessageHandler for WasmMessageHandler {
                     return Err(HookError::Failure("trusted turn Store not clear".into()));
                 }
                 pair.1.data_mut().stamp_trusted_turn(turn_id.clone());
+            } else if let Some(scope) = invocation_scope.as_ref() {
+                pair.1.data_mut().stamp_transcript_scope(scope.id.clone());
             }
         }
         let wit_msg = wit_types::Message {
@@ -410,6 +455,14 @@ impl MessageHandler for WasmMessageHandler {
             )
             .await
         };
+        // The minted scope ends with the call it was minted for, whatever the
+        // call returned: clear it from the (possibly reused) Store and drop its
+        // transcript here. A cancelled call never reaches this point; dropping
+        // the future drops the guard (transcript) and `owned` (the Store).
+        if let Some(scope) = invocation_scope.take() {
+            owned.pair_mut().1.data_mut().clear_transcript_scope();
+            drop(scope);
+        }
 
         let wit_result = match call_result {
             Ok(Ok(result)) => result,
@@ -934,4 +987,504 @@ fn build_agent_loop_from_dispatcher(
         run_bootstrap,
         message_handler,
     )
+}
+
+#[cfg(test)]
+mod invocation_transcript_scope_tests {
+    //! ADR 2026-10-24 D4 — the host-owned transcript scope of every guest invocation, over the
+    //! real hello-llm guest, the real `CapabilityInjector` and the real cap-llm `generate`
+    //! handler and gateway (only the upstream is scripted). An invocation without a trusted
+    //! turn runs under a scope the host mints for that call only: it reaches the transcript
+    //! paths and never `turn_id`, and every exit of the guest call drops it.
+
+    use std::collections::HashSet;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+    use std::time::{Duration, SystemTime};
+
+    use advance_runtime::circuit_breaker::DefaultCircuitBreakerBus;
+    use advance_runtime::config::{RuntimeConfig, WasmConfig};
+    use advance_runtime::host_registry::{
+        HostCallContext, HostCallError, HostFunctionHandler, HostFunctionSpec, HostRegistry,
+        InMemoryHostRegistry,
+    };
+    use advance_shared_types::capability::{CapParams, CapabilityId, GrantDecision};
+    use advance_shared_types::mailbox::MessageKind;
+    use advance_shared_types::security_validator::{
+        HttpCapability, HttpError, HttpRequest, HttpResponse, HttpSecurityChain,
+    };
+    use advance_shared_types::traits::GrantCheck;
+    use advance_shared_types::turn_attribution::{
+        CostAttributionLookup, TurnCostAttributionReadPort,
+    };
+    use cap_llm::TranscriptMode;
+    use wasmtime::component::types::ComponentFunc;
+    use wasmtime::component::Val;
+    use wit_component::ComponentEncoder;
+
+    use super::*;
+
+    const AGENT: &str = "agent:scoped";
+    const PROMPT: &str = "what is in the notes";
+    const REPLY: &str = "the notes list three things";
+
+    struct AllowAll;
+
+    impl GrantCheck for AllowAll {
+        fn check(&self, _: &str, _: &str, _: &str, _: &CapParams) -> GrantDecision {
+            GrantDecision::Allow
+        }
+    }
+
+    /// The scripted upstream: a chat completion answering [`REPLY`], or a 401 while `fail`.
+    #[derive(Default)]
+    struct Upstream {
+        fail: AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl HttpSecurityChain for Upstream {
+        async fn execute(
+            &self,
+            _: &str,
+            _: HttpRequest,
+            _: &HttpCapability,
+        ) -> Result<HttpResponse, HttpError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Ok(HttpResponse {
+                    status: 401,
+                    headers: Vec::new(),
+                    body: b"{}".to_vec(),
+                });
+            }
+            Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&serde_json::json!({
+                    "choices": [{"message": {"content": REPLY}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+                    "model": "scoped-model",
+                }))
+                .expect("answer serializes"),
+            })
+        }
+    }
+
+    /// Every turn id cost attribution is asked about.
+    #[derive(Default)]
+    struct RecordingTurnCost(Mutex<Vec<String>>);
+
+    impl TurnCostAttributionReadPort for RecordingTurnCost {
+        fn cost_attribution(&self, turn_id: &str, _: &str) -> CostAttributionLookup {
+            self.0.lock().unwrap().push(turn_id.to_string());
+            CostAttributionLookup::Untracked
+        }
+    }
+
+    /// How the scripted `generate` leaves the guest call.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Exit {
+        /// The real handler answers; the guest returns its action.
+        Return,
+        /// The real handler answers a model error; the guest returns an error.
+        GuestError,
+        /// The host function fails: the guest call traps.
+        Trap,
+        /// The host function fails as a contained extension panic does.
+        ContainedPanic,
+        /// The host function never answers; the caller gives up on the call.
+        Cancelled,
+    }
+
+    /// What one `generate` call saw.
+    #[derive(Clone, Debug)]
+    struct Seen {
+        turn_id: Option<String>,
+        scope: Option<String>,
+        /// Transcript messages under the scope when the call left.
+        recorded: usize,
+    }
+
+    /// Transcript messages recorded for `scope` (seed and prompt excluded).
+    fn transcript_len(gateway: &LlmGateway, scope: &str) -> usize {
+        let with = gateway.build_guest_messages(AGENT, Some(scope), "", TranscriptMode::Continue);
+        let without = gateway.build_guest_messages(AGENT, None, "", TranscriptMode::Continue);
+        with.len() - without.len()
+    }
+
+    /// Wraps the real `generate` handler. Each call records what it saw; every exit but
+    /// [`Exit::Return`] first records one transcript entry under the scope, so the exit has
+    /// something to drop.
+    struct ScriptedGenerate {
+        inner: Arc<dyn HostFunctionHandler>,
+        gateway: Arc<LlmGateway>,
+        exit: Mutex<Exit>,
+        seen: Arc<Mutex<Vec<Seen>>>,
+    }
+
+    impl ScriptedGenerate {
+        fn run(
+            &self,
+            ctx: HostCallContext,
+            inner: Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>>
+        {
+            let exit = *self.exit.lock().unwrap();
+            let gateway = Arc::clone(&self.gateway);
+            let seen = Arc::clone(&self.seen);
+            Box::pin(async move {
+                let scope = ctx.transcript_scope.clone();
+                let note = |recorded| Seen {
+                    turn_id: ctx.turn_id.clone(),
+                    scope: scope.clone(),
+                    recorded,
+                };
+                if exit != Exit::Return {
+                    if let Some(scope) = scope.as_deref() {
+                        gateway.record_tool_result(AGENT, scope, "call-1", "notes", "three things");
+                    }
+                }
+                let recorded = scope.as_deref().map_or(0, |s| transcript_len(&gateway, s));
+                match exit {
+                    Exit::Return | Exit::GuestError => {
+                        let out = inner.await;
+                        let recorded = scope.as_deref().map_or(0, |s| transcript_len(&gateway, s));
+                        seen.lock().unwrap().push(note(recorded));
+                        out
+                    }
+                    Exit::Trap => {
+                        seen.lock().unwrap().push(note(recorded));
+                        Err(HostCallError::HandlerError("scripted trap".into()))
+                    }
+                    Exit::ContainedPanic => {
+                        seen.lock().unwrap().push(note(recorded));
+                        crate::extension::guest_call::mark_trapped_by_contained_panic();
+                        Err(HostCallError::HandlerError(
+                            "scripted contained panic".into(),
+                        ))
+                    }
+                    Exit::Cancelled => {
+                        seen.lock().unwrap().push(note(recorded));
+                        std::future::pending().await
+                    }
+                }
+            })
+        }
+    }
+
+    impl HostFunctionHandler for ScriptedGenerate {
+        fn call(
+            &self,
+            ctx: HostCallContext,
+            params: Vec<Val>,
+            results_len: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>>
+        {
+            let inner = self.inner.call(ctx.clone(), params, results_len);
+            self.run(ctx, inner)
+        }
+
+        fn call_typed(
+            &self,
+            func: &ComponentFunc,
+            ctx: HostCallContext,
+            params: Vec<Val>,
+            results_len: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Val>, HostCallError>> + Send + 'static>>
+        {
+            let inner = self
+                .inner
+                .call_typed(func, ctx.clone(), params, results_len);
+            self.run(ctx, inner)
+        }
+    }
+
+    struct Rig {
+        handler: WasmMessageHandler,
+        gateway: Arc<LlmGateway>,
+        upstream: Arc<Upstream>,
+        generate: Arc<ScriptedGenerate>,
+        seen: Arc<Mutex<Vec<Seen>>>,
+        turn_cost: Arc<RecordingTurnCost>,
+    }
+
+    impl Rig {
+        async fn new() -> Self {
+            let config: RuntimeConfig = serde_yml::from_str(
+                "wasm:\n  max_memory_pages: 1024\n  epoch_interruption_ms: 100\n  fuel_enabled: false\n\
+                 llm-providers:\n  - id: scoped\n    endpoint: https://api.example.test\n    \
+                 api-key-secret: scoped-api-key\n    model-aliases:\n      default: scoped-model\n    \
+                 cost-per-mtoken-in: 1.0\n    cost-per-mtoken-out: 2.0\n    rate-limit:\n      \
+                 requests-per-minute: 1000\n      tokens-per-minute: 400000\n\
+                 cron:\n  max_jitter_ratio: 0.1\ngit:\n  gc_interval_hours: 24\n  max_tracked_file_mb: 10\n\
+                 secrets:\n  master-key-source: env-var\n  env-var-name: SCOPED_TEST_MASTER_KEY\n\
+                 post-processor:\n  llm-model: scoped-model\n  llm-failure-cooldown-seconds: 600\n",
+            )
+            .expect("runtime config parses");
+            let upstream = Arc::new(Upstream::default());
+            let gateway = Arc::new(LlmGateway::new(
+                Arc::new(cap_llm::StaticConfig(Arc::new(config))),
+                Arc::clone(&upstream) as Arc<dyn HttpSecurityChain>,
+                Arc::new(cap_llm::PreflightAllowBudget),
+                Arc::new(cap_llm::DiscardEventBus),
+                Arc::new(cap_llm::NoopRepetition),
+                AGENT.to_string(),
+            ));
+            let turn_cost = Arc::new(RecordingTurnCost::default());
+            // The production registration of `agent-llm`, with `generate` wrapped.
+            let real = InMemoryHostRegistry::new();
+            let _reaper = cap_llm::register_agent_llm_with_turn_cost(
+                &real,
+                Arc::clone(&gateway),
+                Some(Arc::clone(&turn_cost) as Arc<dyn TurnCostAttributionReadPort>),
+            );
+            let registry: Arc<dyn HostRegistry> = Arc::new(InMemoryHostRegistry::new());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut generate = None;
+            for spec in real.lookup("llm") {
+                if spec.name == "generate" {
+                    let wrapped = Arc::new(ScriptedGenerate {
+                        inner: Arc::clone(&spec.handler),
+                        gateway: Arc::clone(&gateway),
+                        exit: Mutex::new(Exit::Return),
+                        seen: Arc::clone(&seen),
+                    });
+                    generate = Some(Arc::clone(&wrapped));
+                    registry.register(HostFunctionSpec {
+                        handler: wrapped,
+                        ..spec
+                    });
+                } else {
+                    registry.register(spec);
+                }
+            }
+            let generate = generate.expect("agent-llm registers generate");
+            let injector = Arc::new(CapabilityInjector::new(
+                registry,
+                Arc::new(AllowAll),
+                Arc::new(DefaultCircuitBreakerBus::new()),
+            ));
+            let component = ComponentEncoder::default()
+                .validate(true)
+                .module(crate::test_support::fixture::hello_llm_core())
+                .expect("encoder accepts the hello-llm core")
+                .encode()
+                .expect("encode to a component");
+            let runtime = Arc::new(
+                ComponentRuntime::new(&WasmConfig {
+                    max_memory_pages: 256,
+                    epoch_interruption_ms: 100,
+                    fuel_enabled: false,
+                })
+                .expect("runtime"),
+            );
+            let loaded = runtime.load_component(&component).expect("component loads");
+            let handler = WasmMessageHandler::new(
+                runtime,
+                loaded,
+                injector,
+                vec![CapRequest {
+                    capability: CapabilityId::from("llm"),
+                }],
+                AGENT.to_string(),
+                "trace-scoped".to_string(),
+            )
+            .with_llm_gateway(Arc::clone(&gateway));
+            handler.init(component_config()).await.expect("init");
+            Self {
+                handler,
+                gateway,
+                upstream,
+                generate,
+                seen,
+                turn_cost,
+            }
+        }
+
+        fn exit_by(&self, exit: Exit) {
+            *self.generate.exit.lock().unwrap() = exit;
+            self.upstream
+                .fail
+                .store(exit == Exit::GuestError, Ordering::SeqCst);
+        }
+
+        fn last_seen(&self) -> Seen {
+            self.seen
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("generate was called")
+        }
+
+        /// The scope stamped on the idle Store, if any.
+        fn idle_store_scope(&self) -> (Option<String>, Option<String>) {
+            let idle = self.handler.instance.lock().unwrap();
+            let ctx = idle.as_ref().expect("idle Store").1.data();
+            (
+                ctx.turn_id.clone(),
+                ctx.transcript_scope().map(str::to_string),
+            )
+        }
+
+        /// A seed for the turn, as the context assembler publishes one.
+        fn publish_seed(&self) {
+            self.gateway.publish_assembled(
+                AGENT,
+                Arc::from(vec![LlmMessage {
+                    role: "system".into(),
+                    content: "persona".into(),
+                }]),
+            );
+        }
+    }
+
+    fn component_config() -> ComponentConfig {
+        ComponentConfig {
+            id: AGENT.to_string(),
+            config_data: None,
+            trigger_context: None,
+        }
+    }
+
+    fn message(id: &str) -> Message {
+        Message {
+            id: id.to_string(),
+            kind: MessageKind::User,
+            from: "user:test".to_string(),
+            to: AGENT.to_string(),
+            payload: PROMPT.as_bytes().to_vec(),
+            context: None,
+            timestamp: SystemTime::now(),
+            origin: None,
+        }
+    }
+
+    /// Every exit of an unprotected invocation — a normal return, a guest error, a trap, a
+    /// contained panic and a cancelled call — ran under a scope minted for that call alone,
+    /// never on `turn_id`, and left neither its transcript nor the seed behind; the Store that
+    /// is reused carries no scope; cost attribution was never asked about a minted id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_exit_of_an_unprotected_invocation_drops_its_minted_scope() {
+        let rig = Rig::new().await;
+        let mut scopes = HashSet::new();
+        let exits = [
+            Exit::Return,
+            Exit::Return,
+            Exit::GuestError,
+            Exit::Trap,
+            Exit::ContainedPanic,
+            Exit::Cancelled,
+        ];
+        for (n, exit) in exits.into_iter().enumerate() {
+            rig.exit_by(exit);
+            rig.publish_seed();
+            let msg = message(&format!("m{n}"));
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(2),
+                rig.handler.handle_message(&msg, Vec::new()),
+            )
+            .await;
+            match exit {
+                Exit::Return => {
+                    let result = outcome.expect("answers").expect("the turn returns");
+                    assert_eq!(result.actions.len(), 1, "{exit:?}");
+                    assert_eq!(result.actions[0].payload, REPLY.as_bytes(), "{exit:?}");
+                    assert_eq!(rig.idle_store_scope(), (None, None), "{exit:?}");
+                }
+                Exit::GuestError | Exit::Trap | Exit::ContainedPanic => {
+                    let error = outcome.expect("answers").expect_err("the turn fails");
+                    assert!(
+                        matches!(error, HookError::Failure(_)),
+                        "{exit:?}: {error:?}"
+                    );
+                }
+                Exit::Cancelled => assert!(outcome.is_err(), "the call never answers"),
+            }
+            let seen = rig.last_seen();
+            assert_eq!(
+                seen.turn_id, None,
+                "{exit:?}: the minted id never reaches turn_id"
+            );
+            let scope = seen.scope.expect("every invocation has a scope");
+            assert!(scope.starts_with("invocation-"), "{exit:?}: {scope}");
+            assert!(
+                scopes.insert(scope.clone()),
+                "{exit:?}: a fresh scope per invocation"
+            );
+            let expected = if exit == Exit::Return {
+                2 // the prompt and the reply
+            } else {
+                1 // the scripted entry
+            };
+            assert_eq!(
+                seen.recorded, expected,
+                "{exit:?}: recorded under the scope"
+            );
+            assert_eq!(
+                transcript_len(&rig.gateway, &scope),
+                0,
+                "{exit:?}: the minted transcript is dropped when the call leaves"
+            );
+            assert!(
+                rig.gateway.assembled_for(AGENT).is_none(),
+                "{exit:?}: the seed goes with it"
+            );
+            match exit {
+                // A failed call destroyed the Store: start the fresh instance the next turn
+                // gets.
+                Exit::GuestError | Exit::Trap | Exit::ContainedPanic => {
+                    rig.handler.before_next_turn().await;
+                }
+                // A cancelled call dropped its Store with the future.
+                Exit::Cancelled => assert!(rig.handler.instance.lock().unwrap().is_none()),
+                Exit::Return => {}
+            }
+        }
+        assert_eq!(scopes.len(), exits.len());
+        assert!(
+            rig.turn_cost.0.lock().unwrap().is_empty(),
+            "cost attribution reads turn_id only, and no unprotected call has one"
+        );
+        assert_eq!(rig.upstream.calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A trusted turn is its own transcript scope, exactly as before: the call sees the turn
+    /// id on both fields, no scope is minted, the transcript outlives the invocation until the
+    /// trusted turn is cleared, and cost attribution is asked about the turn id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_protected_turn_keeps_its_trusted_turn_as_the_transcript_scope() {
+        let rig = Rig::new().await;
+        rig.exit_by(Exit::Return);
+        rig.handler
+            .stamp_trusted_turn("turn-7")
+            .await
+            .expect("stamp");
+        let result = rig
+            .handler
+            .handle_message(&message("m1"), Vec::new())
+            .await
+            .expect("the turn returns");
+        assert_eq!(result.actions[0].payload, REPLY.as_bytes());
+        let seen = rig.last_seen();
+        assert_eq!(seen.turn_id.as_deref(), Some("turn-7"));
+        assert_eq!(seen.scope.as_deref(), Some("turn-7"));
+        assert_eq!(seen.recorded, 2);
+        assert_eq!(
+            transcript_len(&rig.gateway, "turn-7"),
+            2,
+            "the trusted turn's transcript lives until the turn is cleared"
+        );
+        assert_eq!(rig.idle_store_scope(), (None, None));
+        rig.handler
+            .clear_trusted_turn("turn-7")
+            .await
+            .expect("clear");
+        assert_eq!(transcript_len(&rig.gateway, "turn-7"), 0);
+        assert_eq!(rig.turn_cost.0.lock().unwrap().as_slice(), ["turn-7"]);
+    }
 }

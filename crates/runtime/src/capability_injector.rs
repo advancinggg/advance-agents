@@ -81,6 +81,14 @@ pub struct ComponentCtx {
     /// CONTRACT-216 trusted current turn.  Only the host execution loop
     /// stamps/clears this field; WIT parameters have no path to it.
     pub turn_id: Option<String>,
+    /// Host-owned turn-transcript scope of the current guest invocation
+    /// (ADR 2026-10-24 D4), propagated to `HostCallContext.transcript_scope`.
+    /// A trusted turn stamps it to its turn id ([`Self::stamp_trusted_turn`]);
+    /// an invocation without one gets a host-minted scope
+    /// ([`Self::stamp_transcript_scope`]) that never touches `turn_id`.
+    /// Private: only the host execution loop writes it, through the stamp /
+    /// clear methods; WIT parameters have no path to it.
+    transcript_scope: Option<String>,
     pub capabilities: Vec<String>,
     /// WASI 0.2 (preview2) host context. `pub(crate)` so external crates cannot
     /// replace the empty default sandbox — see struct rustdoc + §1.7.
@@ -129,6 +137,7 @@ impl ComponentCtx {
             agent_id,
             trace_id,
             turn_id: None,
+            transcript_scope: None,
             capabilities,
             wasi: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
@@ -145,14 +154,36 @@ impl ComponentCtx {
         self
     }
 
-    /// Stamp the exact host-dequeued turn before Store/guest execution.
+    /// Stamp the exact host-dequeued turn before Store/guest execution.  The
+    /// trusted turn is also the invocation's transcript scope.
     pub fn stamp_trusted_turn(&mut self, turn_id: String) {
+        self.transcript_scope = Some(turn_id.clone());
         self.turn_id = Some(turn_id);
     }
 
     /// Clear attribution before the Store is reused for a non-message path.
+    /// Clears the transcript scope with it.
     pub fn clear_trusted_turn(&mut self) {
         self.turn_id = None;
+        self.transcript_scope = None;
+    }
+
+    /// Stamp a host-minted transcript scope for one guest invocation that
+    /// runs WITHOUT a trusted turn.  `turn_id` is left untouched (it stays
+    /// `None`), so trusted-identity readers never see the minted key.
+    pub fn stamp_transcript_scope(&mut self, scope: String) {
+        self.transcript_scope = Some(scope);
+    }
+
+    /// Clear the transcript scope once the invocation it was minted for has
+    /// returned.  Leaves `turn_id` alone.
+    pub fn clear_transcript_scope(&mut self) {
+        self.transcript_scope = None;
+    }
+
+    /// The transcript scope the next host call would carry.
+    pub fn transcript_scope(&self) -> Option<&str> {
+        self.transcript_scope.as_deref()
     }
 
     /// Slice C (2026-05-09): build a `HostCallContext` from this `ComponentCtx`
@@ -173,6 +204,7 @@ impl ComponentCtx {
             agent_id: self.agent_id.clone(),
             trace_id: self.trace_id.clone(),
             turn_id: self.turn_id.clone(),
+            transcript_scope: self.transcript_scope.clone(),
             capability,
             function,
             run_id: self.run_id.clone(),
@@ -1102,6 +1134,48 @@ mod tests {
 
         assert_eq!(frozen.turn_id.as_deref(), Some("message-1"));
         assert_eq!(next.turn_id.as_deref(), Some("message-2"));
+    }
+
+    /// ADR 2026-10-24 D4: a host-minted transcript scope reaches every host call's
+    /// `transcript_scope` (notify included) and never `turn_id`, the trusted identity C216
+    /// readers (cost attribution, reply routing, progress) consume. Clearing it leaves no
+    /// scope behind.
+    #[test]
+    fn t_minted_transcript_scope_never_reaches_turn_id() {
+        let mut ctx = ComponentCtx::new("agent-1".into(), "trace-1".into(), vec!["llm".into()])
+            .with_notify_sender_override("agent-sender".into());
+        ctx.stamp_transcript_scope("invocation-1".into());
+        assert_eq!(ctx.transcript_scope(), Some("invocation-1"));
+        assert_eq!(ctx.turn_id, None);
+        for call in [
+            ctx.to_host_call_context("llm".into(), "agent-llm::generate".into()),
+            ctx.to_notify_host_call_context("messaging".into(), "notify::send".into()),
+        ] {
+            assert_eq!(call.transcript_scope.as_deref(), Some("invocation-1"));
+            assert_eq!(call.turn_id, None, "the minted key is not a trusted turn");
+        }
+        ctx.clear_transcript_scope();
+        let call = ctx.to_host_call_context("llm".into(), "agent-llm::generate".into());
+        assert_eq!(call.transcript_scope, None);
+        assert_eq!(call.turn_id, None);
+    }
+
+    /// A trusted turn is its own transcript scope, and clearing the turn clears both; clearing
+    /// a transcript scope alone never touches the trusted turn.
+    #[test]
+    fn t_trusted_turn_is_its_own_transcript_scope() {
+        let mut ctx = ComponentCtx::new("agent-1".into(), "trace-1".into(), vec!["llm".into()]);
+        ctx.stamp_trusted_turn("message-1".into());
+        let call = ctx.to_host_call_context("llm".into(), "agent-llm::generate".into());
+        assert_eq!(call.turn_id.as_deref(), Some("message-1"));
+        assert_eq!(call.transcript_scope.as_deref(), Some("message-1"));
+        ctx.clear_transcript_scope();
+        assert_eq!(ctx.turn_id.as_deref(), Some("message-1"));
+        ctx.stamp_trusted_turn("message-2".into());
+        ctx.clear_trusted_turn();
+        let call = ctx.to_host_call_context("llm".into(), "agent-llm::generate".into());
+        assert_eq!(call.turn_id, None);
+        assert_eq!(call.transcript_scope, None);
     }
 
     /// MODULE-001-T94: non-message paths explicitly clear the trusted carrier.

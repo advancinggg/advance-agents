@@ -877,6 +877,7 @@ done
             agent_id: agent.to_string(),
             trace_id: "trace-mcp".to_string(),
             turn_id: None,
+            transcript_scope: None,
             capability: "mcp".to_string(),
             function: format!("{NAMESPACE}::{name}"),
             run_id: None,

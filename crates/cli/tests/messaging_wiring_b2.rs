@@ -210,6 +210,7 @@ async fn t_b2_02_handler_drives_suspend_on_park_then_cancel_closes() {
         agent_id: "root".to_string(), // BARE — the handler prepends `agent:`
         trace_id: "tr-b2".to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: "messaging".to_string(),
         function: "agent-messaging::await-replies".to_string(),
         run_id: Some(run_id.to_string()),

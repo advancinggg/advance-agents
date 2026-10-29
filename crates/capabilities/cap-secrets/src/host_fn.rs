@@ -230,6 +230,7 @@ mod tests {
             agent_id: "test-agent".into(),
             trace_id: "test-trace".into(),
             turn_id: None,
+            transcript_scope: None,
             capability: "secrets".into(),
             function: "advance:runtime/agent-secrets::secret-exists".into(),
             run_id: None,

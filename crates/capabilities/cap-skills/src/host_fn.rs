@@ -726,6 +726,7 @@ mod tests {
             agent_id: agent_id.to_string(),
             trace_id: "t-0".to_string(),
             turn_id: None,
+            transcript_scope: None,
             capability: CAPABILITY.to_string(),
             function: format!("{NAMESPACE}::{function}"),
             run_id: None,

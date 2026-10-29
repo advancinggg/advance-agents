@@ -161,6 +161,7 @@ fn ctx_with_run(agent_id: &str, run_id: Option<&str>) -> HostCallContext {
         agent_id: agent_id.to_string(),
         trace_id: "tr-fresh".to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: "messaging".to_string(),
         function: "agent-messaging::await-replies".to_string(),
         run_id: run_id.map(|r| r.to_string()),

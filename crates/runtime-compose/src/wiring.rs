@@ -1376,6 +1376,10 @@ pub(crate) struct WiringOptions {
     /// The wiring fails right after the git commit queue started (test-only).
     #[cfg(feature = "test-support")]
     pub fail_after_git_queue: bool,
+    /// Deterministic DNS and the external HTTP peer inside the LLM egress chain
+    /// (test seam).
+    #[cfg(feature = "test-support")]
+    pub llm_security_override: Option<crate::test_support::LlmSecurityOverride>,
     /// Prepared extensions for this composition (`empty()` when none).
     pub extensions: Arc<ExtensionSet>,
     /// Whether OSS code of this composition may start child processes.
@@ -1402,6 +1406,8 @@ impl WiringOptions {
             probe: None,
             #[cfg(feature = "test-support")]
             fail_after_git_queue: false,
+            #[cfg(feature = "test-support")]
+            llm_security_override: None,
             extensions: ExtensionSet::empty(),
             processes: ProcessPolicy::Allow,
             hot_reload: true,
@@ -1566,6 +1572,8 @@ pub(crate) async fn wire_capabilities_inner(
         probe,
         #[cfg(feature = "test-support")]
         fail_after_git_queue,
+        #[cfg(feature = "test-support")]
+        llm_security_override,
         extensions,
         processes,
         hot_reload,
@@ -3203,6 +3211,15 @@ pub(crate) async fn wire_capabilities_inner(
         let llm_executor = crate::channels_boot::live_executor(Some(
             builder.config_watcher() as Arc<dyn RuntimeConfigProvider>
         ));
+        let llm_ssrf: Arc<dyn advance_shared_types::security_validator::SsrfGuard> = llm_ssrf;
+        let llm_buffered_executor: Arc<dyn HttpExecutor> = llm_executor.clone();
+        // Test seam: deterministic DNS and the external peer of the buffered path; the rest
+        // of the chain is unchanged.
+        #[cfg(feature = "test-support")]
+        let (llm_ssrf, llm_buffered_executor) = match llm_security_override {
+            Some(seam) => (seam.ssrf, seam.executor),
+            None => (llm_ssrf, llm_buffered_executor),
+        };
         let chain = Arc::new(
             DefaultHttpSecurityChain::new(
                 store,
@@ -3215,7 +3232,7 @@ pub(crate) async fn wire_capabilities_inner(
                 // guard. Replaces the fail-closed NotWiredHttpExecutor.
                 // AC-17: connect-time DNS timeout sourced live (matches the chain's
                 // SSRF guard), so `security.ssrf.dns_timeout_ms` hot-reload applies here too.
-                llm_executor.clone(),
+                llm_buffered_executor,
             )
             // Phase-3 kickoff: emit http.*/security.*/secret.injected on the live
             // LLM egress (host-only redacted payloads — MODULE-019-AC-22).

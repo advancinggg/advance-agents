@@ -41,8 +41,12 @@ pub struct ClientMessageStatus {
     pub from: String,
     /// `delivered | pending`.
     pub delivery_state: String,
-    /// `none | replied`. This vocabulary is unchanged. Subscription usage exhaustion
-    /// is not a third `reply_state`; it is [`Self::failure_class`].
+    /// `none | replied`. This vocabulary is unchanged. A turn that will not answer
+    /// (subscription usage exhaustion, a failed turn) is not a third `reply_state`;
+    /// it is [`Self::failure_class`]. The value is the agent's, not the message's:
+    /// it reflects the last turn the agent ran, so an older message of the agent
+    /// reads `replied` once a later message was answered, while
+    /// [`Self::failure_class`] stays that older message's own.
     pub reply_state: String,
     /// Opaque C235 subscribe pointer (`st_<hex>`). Never assistant body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,14 +57,42 @@ pub struct ClientMessageStatus {
     /// (`none` | `replied`) keep working: this field is optional and is left out
     /// of the JSON when absent.
     ///
-    /// `subscription-usage-limit` means the agent's model call stopped because the
-    /// subscription usage window is exhausted. The value is that fixed token. It
-    /// does not include vendor stderr, account identifiers, reset times, or tokens.
-    /// The WIT `provider-error` payload the guest reads is the same token (the WIT
-    /// case stays `provider-error`). Other provider failures stay `"provider error"`.
+    /// Every value is one fixed token. None carries vendor stderr, account
+    /// identifiers, reset times, or tokens:
+    ///
+    /// - `subscription-usage-limit`: the agent's model call stopped because the
+    ///   subscription usage window is exhausted. Recorded when that call returns
+    ///   to the guest, while the turn is still running: a later model call of the
+    ///   same turn that succeeds withdraws it, and the turn may still reply (the
+    ///   token then stays beside `reply_state: replied`). The WIT `provider-error`
+    ///   payload the guest reads is the same token (the WIT case stays
+    ///   `provider-error`). It takes precedence: the two tokens below never
+    ///   replace it, so a usage-limited turn that ends without a reply keeps it.
+    /// - `provider-error` ([`FAILURE_CLASS_PROVIDER_ERROR`]): the turn ended in an
+    ///   error or trap without a reply after its last model call returned any
+    ///   other model error (the guest itself still reads `"provider error"`).
+    /// - `agent-error` ([`FAILURE_CLASS_AGENT_ERROR`]): the turn ended in an error
+    ///   or trap without a reply and no model failure was observed; a message
+    ///   whose turn could not be started at all ends this way too.
+    ///
+    /// Client rule: `provider-error` and `agent-error` are final — this message
+    /// will get no reply; stop waiting. They are recorded once the turn has ended,
+    /// never while it is in flight, so a client that stops on them cannot miss a
+    /// later reply. `subscription-usage-limit` is recorded in flight and is not by
+    /// itself proof that no reply will come: a client that stops on it trades
+    /// that certainty for an immediate usage signal. A turn that produced a reply,
+    /// or that ended normally without one, carries neither generic token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<String>,
 }
+
+/// [`ClientMessageStatus::failure_class`] of a message whose turn ended in an error
+/// or trap without a reply after its last model call failed.
+pub const FAILURE_CLASS_PROVIDER_ERROR: &str = "provider-error";
+
+/// [`ClientMessageStatus::failure_class`] of a message whose turn ended in an error
+/// or trap without a reply and no model failure was observed.
+pub const FAILURE_CLASS_AGENT_ERROR: &str = "agent-error";
 
 /// Register the messaging routes, capturing the shared provider slot in each closure.
 pub(crate) fn register(api: &mut ClientApi, slot: MessagingProviderSlot) {

@@ -36,6 +36,7 @@ fn ctx_for(agent_id: &str) -> HostCallContext {
         agent_id: agent_id.into(),
         trace_id: TRACE_ID.into(),
         turn_id: None,
+        transcript_scope: None,
         capability: "fs".into(),
         function: "advance:runtime/agent-fs::test".into(),
         run_id: None,

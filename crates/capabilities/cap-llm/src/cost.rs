@@ -172,6 +172,7 @@ mod tests {
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
             generate_timeout: None,
             reasoning_effort: None,
+            system_messages: None,
         }
     }
 

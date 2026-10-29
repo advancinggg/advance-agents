@@ -99,6 +99,7 @@ async fn drive_send_raw(
         agent_id: AGENT.to_string(),
         trace_id: "trace-e30".into(),
         turn_id: None,
+        transcript_scope: None,
         capability: "channel".into(),
         function: format!("{CHANNEL_HOST_NAMESPACE}::send-raw"),
         run_id: None,

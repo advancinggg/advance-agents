@@ -20,6 +20,7 @@ fn ctx_for(agent: &str) -> HostCallContext {
         agent_id: agent.to_string(),
         trace_id: "trace-1".to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: CAPABILITY.to_string(),
         function: format!("{}::test", NAMESPACE),
         run_id: None,

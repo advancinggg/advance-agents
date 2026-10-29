@@ -173,6 +173,7 @@ pub fn ctx(agent: &str, name: &str) -> HostCallContext {
         agent_id: agent.into(),
         trace_id: format!("trace-{name}"),
         turn_id: None,
+        transcript_scope: None,
         capability: "mcp".into(),
         function: format!("advance:runtime/mcp-client@0.1.0::{name}"),
         run_id: Some("run-1".into()),

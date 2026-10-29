@@ -83,6 +83,7 @@ fn ctx_for(agent_id: &str) -> HostCallContext {
         agent_id: agent_id.into(),
         trace_id: "trace-w11c".into(),
         turn_id: None,
+        transcript_scope: None,
         capability: CAP.into(),
         function: "advance:runtime/agent-tools@0.1.0::tool-invoke".into(),
         run_id: None,

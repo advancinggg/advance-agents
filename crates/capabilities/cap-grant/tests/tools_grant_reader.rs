@@ -543,6 +543,7 @@ async fn call_mcp(
         agent_id: agent.to_string(),
         trace_id: "t".into(),
         turn_id: None,
+        transcript_scope: None,
         capability: "mcp".into(),
         function: format!("advance:runtime/mcp-client@0.1.0::{name}"),
         run_id: None,

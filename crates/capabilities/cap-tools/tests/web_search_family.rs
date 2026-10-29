@@ -663,6 +663,7 @@ fn dummy_ctx(agent: &str) -> HostCallContext {
         agent_id: agent.into(),
         trace_id: "t".into(),
         turn_id: None,
+        transcript_scope: None,
         capability: "tools".into(),
         function: "advance:runtime/agent-tools@0.1.0::tool-invoke".into(),
         run_id: None,

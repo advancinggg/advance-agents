@@ -22,13 +22,15 @@
 //!   when the entry is unchanged afterwards (otherwise the answer is `stored: false` with the
 //!   reason `cancelled`). A failed / timed-out preflight leaves the previous key untouched and
 //!   is reported as data.
-//! - **Generate budget and reasoning setting.** `generate_timeout_secs` / `reasoning_effort`
-//!   are written as the entry's `generate-timeout-secs` / `reasoning-effort`; an update's
-//!   explicit `null` removes the key. Before any write, the entry as it would be after the
-//!   mutation is checked with the runtime loader's own rules, and a setting it cannot take is
-//!   refused as `InvalidRequest` carrying the setting's detail token
-//!   (`generate_timeout_unsupported`, `reasoning_effort_unsupported`, or
-//!   `invalid_generate_timeout` / `invalid_reasoning_effort` for a value out of range).
+//! - **Generate budget, reasoning setting, system-message mode.** `generate_timeout_secs` /
+//!   `reasoning_effort` / `system_messages` are written as the entry's `generate-timeout-secs`
+//!   / `reasoning-effort` / `system-messages`; an update's explicit `null` removes the key.
+//!   Before any write, the entry as it would be after the mutation is checked with the runtime
+//!   loader's own rules, and a setting it cannot take is refused as `InvalidRequest` carrying
+//!   the setting's detail token (`generate_timeout_unsupported`,
+//!   `reasoning_effort_unsupported`, `system_messages_unsupported`, or
+//!   `invalid_generate_timeout` / `invalid_reasoning_effort` / `invalid_system_messages` for a
+//!   value out of range).
 //! - **Every YAML write waits for the applied reload** (≤ [`RELOAD_WAIT`]) on a subscription
 //!   taken BEFORE the write; a miss is the `reload_pending` advisory, never an error.
 //! - `ClientApi::handle()` is SYNC and may run on a tokio worker; the reload wait therefore
@@ -90,13 +92,15 @@ use advance_client_api::provider_admin::{
 use advance_client_api::{
     ClientApi, ProviderAdminProvider, ProviderError, GENERATE_TIMEOUT_UNSUPPORTED_DETAIL,
     INVALID_GENERATE_TIMEOUT_DETAIL, INVALID_REASONING_EFFORT_DETAIL,
-    REASONING_EFFORT_UNSUPPORTED_DETAIL,
+    INVALID_SYSTEM_MESSAGES_DETAIL, REASONING_EFFORT_UNSUPPORTED_DETAIL,
+    SYSTEM_MESSAGES_UNSUPPORTED_DETAIL,
 };
 use advance_runtime::config::{
     effective_backend, generate_timeout_refusal, max_generate_timeout_secs,
-    reasoning_effort_refusal, AgentCliSpec, AuthScheme, InferenceBackendClass, LlmProviderConfig,
-    ProviderAuthSource, ProviderBackend, ReasoningEffort, RuntimeConfig, RuntimeConfigProvider,
-    CHATGPT_OAUTH_RECORD_SUFFIX, MAX_GENERATE_TIMEOUT_SECS, MIN_GENERATE_TIMEOUT_SECS,
+    reasoning_effort_refusal, system_messages_refusal, AgentCliSpec, AuthScheme,
+    InferenceBackendClass, LlmProviderConfig, ProviderAuthSource, ProviderBackend, ReasoningEffort,
+    RuntimeConfig, RuntimeConfigProvider, SystemMessages, CHATGPT_OAUTH_RECORD_SUFFIX,
+    MAX_GENERATE_TIMEOUT_SECS, MIN_GENERATE_TIMEOUT_SECS,
 };
 use advance_shared_types::process_policy::{ProcessPolicy, SpawnSite};
 use advance_shared_types::security_validator::{HttpError, HttpSecurityChain};
@@ -851,6 +855,7 @@ impl WiredProviderAdmin {
                 .then(|| entry.auth_source.as_str().to_string()),
             generate_timeout_secs: entry.generate_timeout_secs,
             reasoning_effort: entry.reasoning_effort.map(|e| e.as_str().to_string()),
+            system_messages: entry.system_messages.map(|m| m.as_str().to_string()),
             cost: ClientProviderCost {
                 input_per_mtoken: entry.cost_per_mtoken_in,
                 output_per_mtoken: entry.cost_per_mtoken_out,
@@ -1194,8 +1199,9 @@ impl WiredProviderAdmin {
         Ok(())
     }
 
-    /// Refuse, before the document changes, a generate budget or reasoning setting the entry
-    /// cannot take once `written` is applied under `mode` (see [`check_entry_settings`]): the
+    /// Refuse, before the document changes, a generate budget, reasoning setting or
+    /// system-message mode the entry cannot take once `written` is applied under `mode` (see
+    /// [`check_entry_settings`]): the
     /// check reads the entry exactly as the writer would leave it. A write the writer itself
     /// refuses (a taken or missing id) is left to it.
     fn refuse_unappliable_settings(
@@ -2093,11 +2099,11 @@ fn aliases_value(aliases: &std::collections::BTreeMap<String, String>) -> Value 
     Value::Mapping(m)
 }
 
-/// Refuse a generate budget or reasoning setting `entry` (an entry's YAML mapping) cannot take
-/// — by the runtime loader's own rules, read off the entry itself — as `InvalidRequest`
-/// carrying the setting's detail token. The loader refuses such a document without saying
-/// which setting is at fault. An entry whose other keys the loader refuses is left to the
-/// write's own validation.
+/// Refuse a generate budget, reasoning setting or system-message mode `entry` (an entry's YAML
+/// mapping) cannot take — by the runtime loader's own rules, read off the entry itself — as
+/// `InvalidRequest` carrying the setting's detail token. The loader refuses such a document
+/// without saying which setting is at fault. An entry whose other keys the loader refuses is
+/// left to the write's own validation.
 fn check_entry_settings(entry: &Mapping) -> Result<(), ProviderError> {
     let refuse = |detail: &str| Err(ProviderError::InvalidRequest(detail.into()));
     let secs = match entry.get(GENERATE_TIMEOUT_KEY) {
@@ -2118,7 +2124,14 @@ fn check_entry_settings(entry: &Mapping) -> Result<(), ProviderError> {
             None => return refuse(INVALID_REASONING_EFFORT_DETAIL),
         },
     };
-    if secs.is_none() && effort.is_none() {
+    let system_messages = match entry.get(SYSTEM_MESSAGES_KEY) {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_str().and_then(SystemMessages::parse) {
+            Some(mode) => Some(mode),
+            None => return refuse(INVALID_SYSTEM_MESSAGES_DETAIL),
+        },
+    };
+    if secs.is_none() && effort.is_none() && system_messages.is_none() {
         return Ok(());
     }
     // What decides whether the entry can take them, as the loader reads it from the entry
@@ -2126,6 +2139,7 @@ fn check_entry_settings(entry: &Mapping) -> Result<(), ProviderError> {
     let mut rest = entry.clone();
     rest.remove(GENERATE_TIMEOUT_KEY);
     rest.remove(REASONING_EFFORT_KEY);
+    rest.remove(SYSTEM_MESSAGES_KEY);
     let Ok(base) = serde_yml::from_value::<LlmProviderConfig>(Value::Mapping(rest)) else {
         return Ok(());
     };
@@ -2147,11 +2161,22 @@ fn check_entry_settings(entry: &Mapping) -> Result<(), ProviderError> {
     {
         return refuse(REASONING_EFFORT_UNSUPPORTED_DETAIL);
     }
+    if system_messages.is_some()
+        && system_messages_refusal(
+            base.backend_class,
+            effective_backend(&base.id, base.backend),
+            base.auth_source,
+        )
+        .is_some()
+    {
+        return refuse(SYSTEM_MESSAGES_UNSUPPORTED_DETAIL);
+    }
     Ok(())
 }
 
 const GENERATE_TIMEOUT_KEY: &str = "generate-timeout-secs";
 const REASONING_EFFORT_KEY: &str = "reasoning-effort";
+const SYSTEM_MESSAGES_KEY: &str = "system-messages";
 
 /// The YAML mapping of a create request (the runtime's `LlmProviderConfigRaw` spelling) whose
 /// `api-key-secret` is `secret`. A sign-in request also writes its source and the one dialect
@@ -2193,6 +2218,9 @@ fn create_mapping(req: &ClientCreateProviderRequest, secret: &str) -> Value {
     }
     if let Some(effort) = &req.reasoning_effort {
         m.insert(key("reasoning-effort"), key(effort));
+    }
+    if let Some(mode) = &req.system_messages {
+        m.insert(key(SYSTEM_MESSAGES_KEY), key(mode));
     }
     cost_into(&mut m, &req.cost);
     m.insert(key("rate-limit"), rate_limit_value(&req.rate_limit));
@@ -2271,6 +2299,12 @@ fn update_mapping(provider_id: &str, req: &ClientUpdateProviderRequest) -> Value
         m.insert(
             key("reasoning-effort"),
             effort.as_deref().map_or(Value::Null, key),
+        );
+    }
+    if let Some(mode) = &req.system_messages {
+        m.insert(
+            key(SYSTEM_MESSAGES_KEY),
+            mode.as_deref().map_or(Value::Null, key),
         );
     }
     Value::Mapping(m)
@@ -2441,6 +2475,71 @@ mod tests {
         assert!(untouched.get("reasoning-effort").is_none());
     }
 
+    #[test]
+    fn create_and_update_mappings_write_the_system_message_mode_only_when_named() {
+        let base = ClientCreateProviderRequest {
+            provider_id: "joiner".into(),
+            endpoint: Some("https://api.example.com".into()),
+            model_aliases: [("m".to_string(), "model".to_string())]
+                .into_iter()
+                .collect(),
+            cost: ClientProviderCost {
+                input_per_mtoken: 1.0,
+                output_per_mtoken: 2.0,
+                ..Default::default()
+            },
+            rate_limit: ClientProviderRateLimit {
+                requests_per_minute: 100,
+                tokens_per_minute: 1000,
+            },
+            ..Default::default()
+        };
+        let plain = create_mapping(&base, "joiner-api-key");
+        assert!(plain.get("system-messages").is_none(), "{plain:?}");
+        let parsed: LlmProviderConfig = serde_yml::from_value(plain).expect("runtime parses");
+        assert_eq!(parsed.system_messages, None);
+        for mode in SystemMessages::ALL {
+            let v = create_mapping(
+                &ClientCreateProviderRequest {
+                    system_messages: Some(mode.as_str().into()),
+                    ..base.clone()
+                },
+                "joiner-api-key",
+            );
+            assert_eq!(v["system-messages"], mode.as_str());
+            let parsed: LlmProviderConfig = serde_yml::from_value(v).expect("runtime parses");
+            assert_eq!(parsed.system_messages, Some(mode));
+        }
+
+        let set = update_mapping(
+            "joiner",
+            &ClientUpdateProviderRequest {
+                system_messages: Some(Some("merge".into())),
+                ..Default::default()
+            },
+        );
+        assert_eq!(set["system-messages"], "merge");
+        // An explicit null travels as `null`, which the writer turns into removing the key.
+        let cleared = update_mapping(
+            "joiner",
+            &ClientUpdateProviderRequest {
+                system_messages: Some(None),
+                ..Default::default()
+            },
+        );
+        let m = cleared.as_mapping().unwrap();
+        assert_eq!(m.len(), 2, "id + the cleared key: {m:?}");
+        assert!(cleared["system-messages"].is_null());
+        let untouched = update_mapping(
+            "joiner",
+            &ClientUpdateProviderRequest {
+                endpoint: Some("https://proxy.example".into()),
+                ..Default::default()
+            },
+        );
+        assert!(untouched.get("system-messages").is_none());
+    }
+
     /// The pre-write check refuses exactly the entries the runtime loader refuses, with the token
     /// of the setting at fault: it reads the class, dialect and credential source off the entry
     /// the way the loader does.
@@ -2571,6 +2670,84 @@ mod tests {
                 refused(REASONING_EFFORT_UNSUPPORTED_DETAIL),
                 "sign-in effort",
             ),
+            (
+                "gw",
+                "system-messages: merge\n".into(),
+                Ok(()),
+                "merge on the id's chat dialect",
+            ),
+            (
+                "gw",
+                "backend: openai-chat\nsystem-messages: separate\n".into(),
+                Ok(()),
+                "separate on chat",
+            ),
+            (
+                "gw",
+                "backend-class: local\ngenerate-timeout-secs: 60\nsystem-messages: merge\n".into(),
+                Ok(()),
+                "merge on a local entry",
+            ),
+            (
+                "anthropic",
+                "backend-class: local\nsystem-messages: merge\n".into(),
+                Ok(()),
+                "anthropic id on a local entry, which speaks openai-chat",
+            ),
+            (
+                "gw",
+                "system-messages: joined\n".into(),
+                refused(INVALID_SYSTEM_MESSAGES_DETAIL),
+                "system-messages spelling",
+            ),
+            (
+                "gw",
+                "system-messages: 1\n".into(),
+                refused(INVALID_SYSTEM_MESSAGES_DETAIL),
+                "system-messages is a spelling",
+            ),
+            (
+                "gw",
+                "backend: openai-responses\nsystem-messages: merge\n".into(),
+                refused(SYSTEM_MESSAGES_UNSUPPORTED_DETAIL),
+                "responses dialect merge",
+            ),
+            (
+                "gw",
+                "backend: openai-responses\nsystem-messages: separate\n".into(),
+                refused(SYSTEM_MESSAGES_UNSUPPORTED_DETAIL),
+                "responses dialect separate",
+            ),
+            (
+                "gw",
+                "backend: anthropic-messages\nsystem-messages: merge\n".into(),
+                refused(SYSTEM_MESSAGES_UNSUPPORTED_DETAIL),
+                "messages dialect merge",
+            ),
+            (
+                "anthropic",
+                "system-messages: merge\n".into(),
+                refused(SYSTEM_MESSAGES_UNSUPPORTED_DETAIL),
+                "anthropic id merge",
+            ),
+            (
+                "gw",
+                format!("{agent_cli}system-messages: merge\n"),
+                refused(SYSTEM_MESSAGES_UNSUPPORTED_DETAIL),
+                "agent-cli merge",
+            ),
+            (
+                "gw",
+                format!("{mesh}system-messages: merge\n"),
+                refused(SYSTEM_MESSAGES_UNSUPPORTED_DETAIL),
+                "mesh merge",
+            ),
+            (
+                "signed-in",
+                format!("{sign_in}system-messages: merge\n"),
+                refused(SYSTEM_MESSAGES_UNSUPPORTED_DETAIL),
+                "sign-in merge",
+            ),
         ] {
             let entry = entry(id, &extra);
             assert_eq!(check_entry_settings(&entry), expected, "{why}");
@@ -2666,7 +2843,8 @@ mod tests {
             BACKEND_CLASSES, MAX_GENERATE_TIMEOUT_SECS as CLIENT_MAX,
             MAX_SIGN_IN_GENERATE_TIMEOUT_SECS as CLIENT_SIGN_IN_MAX,
             MIN_GENERATE_TIMEOUT_SECS as CLIENT_MIN, PROVIDER_KNOB_BACKEND_CLASSES,
-            REASONING_EFFORTS, REASONING_EFFORT_BACKENDS,
+            REASONING_EFFORTS, REASONING_EFFORT_BACKENDS, SYSTEM_MESSAGES_BACKENDS,
+            SYSTEM_MESSAGES_MODES,
         };
         use advance_runtime::config::MAX_SIGN_IN_GENERATE_TIMEOUT_SECS;
         use InferenceBackendClass::{AgentCli, CloudHttp, Local, MeshRemote};
@@ -2675,6 +2853,14 @@ mod tests {
         for spelling in REASONING_EFFORTS {
             assert_eq!(
                 ReasoningEffort::parse(spelling).map(ReasoningEffort::as_str),
+                Some(*spelling)
+            );
+        }
+        let runtime: Vec<&str> = SystemMessages::ALL.iter().map(|m| m.as_str()).collect();
+        assert_eq!(SYSTEM_MESSAGES_MODES, runtime.as_slice());
+        for spelling in SYSTEM_MESSAGES_MODES {
+            assert_eq!(
+                SystemMessages::parse(spelling).map(SystemMessages::as_str),
                 Some(*spelling)
             );
         }
@@ -2700,6 +2886,16 @@ mod tests {
                 generate_timeout_refusal(class).is_none(),
                 "{spelling}"
             );
+            assert_eq!(
+                PROVIDER_KNOB_BACKEND_CLASSES.contains(&spelling),
+                system_messages_refusal(
+                    class,
+                    ProviderBackend::OpenAiChat,
+                    ProviderAuthSource::ApiKey
+                )
+                .is_none(),
+                "{spelling}"
+            );
         }
         let backends = [
             ProviderBackend::OpenAiChat,
@@ -2713,6 +2909,18 @@ mod tests {
             assert_eq!(
                 REASONING_EFFORT_BACKENDS.contains(&spelling),
                 reasoning_effort_refusal(CloudHttp, backend, ProviderAuthSource::ApiKey).is_none(),
+                "{spelling}"
+            );
+            for class in [CloudHttp, Local] {
+                assert_eq!(
+                    SYSTEM_MESSAGES_BACKENDS.contains(&spelling),
+                    system_messages_refusal(class, backend, ProviderAuthSource::ApiKey).is_none(),
+                    "{spelling}"
+                );
+            }
+            assert!(
+                system_messages_refusal(CloudHttp, backend, ProviderAuthSource::ChatGptOAuth)
+                    .is_some(),
                 "{spelling}"
             );
         }
@@ -3551,6 +3759,7 @@ database:
             auth_source: None,
             generate_timeout_secs: None,
             reasoning_effort: None,
+            system_messages: None,
             cost: ClientProviderCost {
                 input_per_mtoken: 0.001,
                 output_per_mtoken: 0.001,
@@ -4157,6 +4366,183 @@ database:
         .expect("moved");
         assert_eq!(moved.backend_class, "cloud-http");
         assert_eq!(moved.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    /// The system-message mode is written under the runtime's spelling, read back by the strict
+    /// loader, echoed by the summary, replaced, kept by an update that does not name it, and
+    /// removed by an explicit null; a mode the entry could not apply is refused before any
+    /// write, with its detail token — also when an update changes what decides it.
+    #[test]
+    fn the_system_message_mode_round_trips_and_is_refused_where_it_cannot_apply() {
+        let f = Fixture::new();
+        let admin = f.admin();
+        let created = admin
+            .create_provider(&ClientCreateProviderRequest {
+                system_messages: Some("merge".into()),
+                ..keyed_create("joiner")
+            })
+            .expect("created")
+            .value;
+        assert_eq!(created.system_messages.as_deref(), Some("merge"));
+        assert!(document(&f).contains("system-messages: merge"));
+        let entry = f.entry("joiner").expect("on disk");
+        assert_eq!(entry.system_messages, Some(SystemMessages::Merge));
+        assert!(entry.merges_system_messages());
+        assert_eq!(admin.get_provider("joiner").unwrap(), created);
+
+        let replaced = update(
+            &admin,
+            "joiner",
+            ClientUpdateProviderRequest {
+                system_messages: Some(Some("separate".into())),
+                ..Default::default()
+            },
+        )
+        .expect("replaced");
+        assert_eq!(replaced.system_messages.as_deref(), Some("separate"));
+        assert!(!f.entry("joiner").unwrap().merges_system_messages());
+        let kept = update(
+            &admin,
+            "joiner",
+            ClientUpdateProviderRequest {
+                endpoint: Some("https://proxy.example.com".into()),
+                ..Default::default()
+            },
+        )
+        .expect("kept");
+        assert_eq!(kept.system_messages.as_deref(), Some("separate"));
+        let cleared = update(
+            &admin,
+            "joiner",
+            ClientUpdateProviderRequest {
+                system_messages: Some(None),
+                ..Default::default()
+            },
+        )
+        .expect("cleared");
+        assert_eq!(cleared.system_messages, None);
+        assert_eq!(f.entry("joiner").unwrap().system_messages, None);
+        let text = document(&f);
+        assert!(!text.contains("system-messages"), "{text}");
+        let wire = serde_json::to_value(&cleared).unwrap();
+        assert!(wire.get("system_messages").is_none(), "{wire}");
+
+        // A local entry takes it whatever its id.
+        let local = admin
+            .create_provider(&ClientCreateProviderRequest {
+                system_messages: Some("merge".into()),
+                ..local_create("anthropic")
+            })
+            .expect("local")
+            .value;
+        assert_eq!(local.system_messages.as_deref(), Some("merge"));
+
+        let merged = admin
+            .create_provider(&ClientCreateProviderRequest {
+                system_messages: Some("merge".into()),
+                ..keyed_create("merged")
+            })
+            .expect("merged")
+            .value;
+        assert_eq!(merged.system_messages.as_deref(), Some("merge"));
+        let refused = |detail: &str| Err(ProviderError::InvalidRequest(detail.into()));
+        for (request, expected, why) in [
+            (
+                ClientCreateProviderRequest {
+                    system_messages: Some("joined".into()),
+                    ..keyed_create("c1")
+                },
+                refused(INVALID_SYSTEM_MESSAGES_DETAIL),
+                "unknown spelling",
+            ),
+            (
+                ClientCreateProviderRequest {
+                    backend: Some("openai-responses".into()),
+                    system_messages: Some("merge".into()),
+                    ..keyed_create("c2")
+                },
+                refused(SYSTEM_MESSAGES_UNSUPPORTED_DETAIL),
+                "responses dialect",
+            ),
+            (
+                ClientCreateProviderRequest {
+                    system_messages: Some("merge".into()),
+                    ..keyed_create("anthropic-cloud")
+                },
+                Ok(()),
+                "another id speaks openai-chat",
+            ),
+            (
+                ClientCreateProviderRequest {
+                    backend: Some("anthropic-messages".into()),
+                    system_messages: Some("merge".into()),
+                    ..keyed_create("c3")
+                },
+                refused(SYSTEM_MESSAGES_UNSUPPORTED_DETAIL),
+                "messages dialect",
+            ),
+            (
+                ClientCreateProviderRequest {
+                    backend_class: Some("mesh-remote".into()),
+                    device_id: Some("peer".into()),
+                    system_messages: Some("merge".into()),
+                    ..keyed_create("c4")
+                },
+                refused(SYSTEM_MESSAGES_UNSUPPORTED_DETAIL),
+                "mesh-remote entry",
+            ),
+            (
+                ClientCreateProviderRequest {
+                    system_messages: Some("merge".into()),
+                    ..sign_in_request()
+                },
+                refused(SYSTEM_MESSAGES_UNSUPPORTED_DETAIL),
+                "sign-in entry",
+            ),
+        ] {
+            let before = document(&f);
+            let outcome = admin.create_provider(&request).map(|_| ());
+            assert_eq!(outcome, expected, "{why}");
+            if expected.is_err() {
+                assert_eq!(document(&f), before, "{why}: the document is unchanged");
+            }
+        }
+        let before = document(&f);
+
+        // The stored mode meets the update's new dialect.
+        let to_responses = ClientUpdateProviderRequest {
+            backend: Some("openai-responses".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            update(&admin, "merged", to_responses.clone()).map(|_| ()),
+            refused(SYSTEM_MESSAGES_UNSUPPORTED_DETAIL)
+        );
+        assert_eq!(
+            update(
+                &admin,
+                "merged",
+                ClientUpdateProviderRequest {
+                    system_messages: Some(Some("all".into())),
+                    ..Default::default()
+                }
+            )
+            .map(|_| ()),
+            refused(INVALID_SYSTEM_MESSAGES_DETAIL)
+        );
+        assert_eq!(document(&f), before, "refused updates leave the document");
+        // Clearing the mode in the same update makes the move legal.
+        let moved = update(
+            &admin,
+            "merged",
+            ClientUpdateProviderRequest {
+                system_messages: Some(None),
+                ..to_responses
+            },
+        )
+        .expect("the mode goes with the dialect");
+        assert_eq!(moved.backend.as_deref(), Some("openai-responses"));
+        assert_eq!(moved.system_messages, None);
     }
 
     /// A sign-in entry sends only what its route accepts: a reasoning setting is refused on

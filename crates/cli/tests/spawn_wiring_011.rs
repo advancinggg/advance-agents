@@ -118,6 +118,7 @@ fn spawn_ctx(caller: &str, op: &str) -> HostCallContext {
         agent_id: caller.to_string(),
         trace_id: "tr-011".to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: "lifecycle".to_string(),
         function: format!("advance:runtime/agent-lifecycle::{op}"),
         run_id: None,

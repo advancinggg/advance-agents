@@ -603,19 +603,21 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
             // Store construction) is still deferred — until then, public-surface
             // WIT calls carry None for both, matching prior behavior.
             // ADR 2026-10-24 D4 — seed (peek assembled) ++ transcript ++ prompt.
-            // Empty prompt omits the user message. `fresh` skips the transcript
-            // and records nothing. The first continue-generate of a turn is
-            // byte-identical to the pre-D4 seed+prompt body.
-            let messages = gateway.build_guest_messages(
+            // Empty prompt omits the user message; so does a prompt the seed
+            // already ends with (sent once). `fresh` skips the transcript and
+            // records nothing. The transcript is keyed by the host-owned
+            // transcript scope, never by the trusted turn (which only feeds
+            // attribution above).
+            let guest = gateway.guest_messages(
                 &ctx.agent_id,
-                ctx.turn_id.as_deref(),
+                ctx.transcript_scope.as_deref(),
                 &req.prompt,
                 req.transcript,
             );
-            if messages.is_empty() {
-                return Ok(vec![encode_llm_result(Err(LlmError::ProviderError(
-                    "empty-messages".into(),
-                )))]);
+            if guest.messages.is_empty() {
+                let err = LlmError::ProviderError("empty-messages".into());
+                gateway.observe_guest_visible_error(&ctx.agent_id, Some(&err));
+                return Ok(vec![encode_llm_result(Err(err))]);
             }
             let mut params = req.params.unwrap_or_default();
             let callables_selected = match gateway.expand_callables(
@@ -624,7 +626,10 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
                 &mut params,
             ) {
                 Ok(sel) => sel,
-                Err(e) => return Ok(vec![encode_llm_result(Err(e))]),
+                Err(e) => {
+                    gateway.observe_guest_visible_error(&ctx.agent_id, Some(&e));
+                    return Ok(vec![encode_llm_result(Err(e))]);
+                }
             };
             let llm_ctx = LlmRequestContext {
                 agent_id: ctx.agent_id.clone(),
@@ -632,7 +637,7 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
                 run_id: attribution.run_id,
                 iteration: ctx.iteration,
                 trace_id: Some(ctx.trace_id.clone()),
-                messages,
+                messages: guest.messages,
                 params,
                 output_schema: req.output_schema,
                 tee_live: true,
@@ -640,8 +645,9 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
                 hard_task_class: false,
                 placement: None,
                 policy_source: Default::default(),
-                turn_id: ctx.turn_id.clone(),
+                transcript_scope: ctx.transcript_scope.clone(),
                 guest_prompt: req.prompt,
+                prompt_in_seed: guest.prompt_in_seed,
                 transcript: req.transcript,
                 callables_selected,
             };
@@ -666,17 +672,18 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
             // Decode error is a host-ABI fault (HandlerError), not an llm-error.
             let req = decode_llm_request(&params).map_err(HostCallError::HandlerError)?;
             let attribution = freeze_request_attribution(&ctx, req.task_id, turn_cost.as_deref())?;
-            // Same seed ++ transcript ++ prompt as generate (ADR 2026-10-24 D4).
-            let messages = gateway.build_guest_messages(
+            // Same seed ++ transcript ++ prompt as generate (ADR 2026-10-24 D4),
+            // including the prompt-sent-once rule and the transcript scope.
+            let guest = gateway.guest_messages(
                 &ctx.agent_id,
-                ctx.turn_id.as_deref(),
+                ctx.transcript_scope.as_deref(),
                 &req.prompt,
                 req.transcript,
             );
-            if messages.is_empty() {
-                return Ok(vec![encode_stream_result(Err(LlmError::ProviderError(
-                    "empty-messages".into(),
-                )))]);
+            if guest.messages.is_empty() {
+                let err = LlmError::ProviderError("empty-messages".into());
+                gateway.observe_guest_visible_error(&ctx.agent_id, Some(&err));
+                return Ok(vec![encode_stream_result(Err(err))]);
             }
             let mut params = req.params.unwrap_or_default();
             let callables_selected = match gateway.expand_callables(
@@ -685,7 +692,10 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
                 &mut params,
             ) {
                 Ok(sel) => sel,
-                Err(e) => return Ok(vec![encode_stream_result(Err(e))]),
+                Err(e) => {
+                    gateway.observe_guest_visible_error(&ctx.agent_id, Some(&e));
+                    return Ok(vec![encode_stream_result(Err(e))]);
+                }
             };
             let llm_ctx = LlmRequestContext {
                 agent_id: ctx.agent_id.clone(),
@@ -693,7 +703,7 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
                 run_id: attribution.run_id,
                 iteration: ctx.iteration,
                 trace_id: Some(ctx.trace_id.clone()),
-                messages,
+                messages: guest.messages,
                 params,
                 output_schema: req.output_schema,
                 tee_live: false,
@@ -701,8 +711,9 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
                 hard_task_class: false,
                 placement: None,
                 policy_source: Default::default(),
-                turn_id: ctx.turn_id.clone(),
+                transcript_scope: ctx.transcript_scope.clone(),
                 guest_prompt: req.prompt,
+                prompt_in_seed: guest.prompt_in_seed,
                 transcript: req.transcript,
                 callables_selected,
             };
@@ -795,8 +806,11 @@ impl HostFunctionHandler for AgentLlmPollStreamHandler {
                         return Ok(vec![Val::Result(Err(Some(Box::new(encode_llm_error(&e)))))]);
                     }
                     PollOutcome::Unknown => {
+                        let err =
+                            LlmError::ProviderError("stream handle expired or unknown".into());
+                        gateway.observe_guest_visible_error(&ctx.agent_id, Some(&err));
                         return Ok(vec![Val::Result(Err(Some(Box::new(encode_llm_error(
-                            &LlmError::ProviderError("stream handle expired or unknown".into()),
+                            &err,
                         )))))]);
                     }
                 },
@@ -1402,6 +1416,7 @@ mod tests {
             agent_id: "test-agent".into(),
             trace_id: "test-trace".into(),
             turn_id: None,
+            transcript_scope: None,
             capability: CAPABILITY.into(),
             function: format!("{NAMESPACE}::generate"),
             run_id: None,
@@ -1632,6 +1647,7 @@ mod tests {
             agent_id: agent_id.into(),
             trace_id: "test-trace".into(),
             turn_id: None,
+            transcript_scope: None,
             capability: CAPABILITY.into(),
             function: format!("{NAMESPACE}::stream"),
             run_id: None,
@@ -2371,6 +2387,7 @@ mod tests {
             agent_id: "test-agent".into(),
             trace_id: "test-trace".into(),
             turn_id: None,
+            transcript_scope: None,
             capability: CAPABILITY.into(),
             function: format!("{NAMESPACE}::generate"),
             run_id: run_id.map(|s| s.to_string()),

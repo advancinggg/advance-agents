@@ -574,6 +574,7 @@ async fn the_host_functions_call_for_the_calling_agent() {
             agent_id: "agent-x".into(),
             trace_id: "trace".into(),
             turn_id: None,
+            transcript_scope: None,
             capability: spec.capability.clone(),
             function: format!("{}::{name}", spec.namespace),
             run_id: None,

@@ -92,6 +92,7 @@ fn ctx() -> HostCallContext {
         agent_id: "agent:test".to_string(),
         trace_id: "trace-intake".to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: "grant".to_string(),
         function: "advance:runtime/agent-grant@0.1.0::request-capability".to_string(),
         // MUST be None: production wires BudgetCheck with the live budget, which

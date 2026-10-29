@@ -1,5 +1,6 @@
 //! Gateway-level witnesses for OpenAI-compatible reasoning models: answers that carry only
-//! reasoning output, an entry's own `generate-timeout-secs`, and its `reasoning-effort`.
+//! reasoning output, an entry's own `generate-timeout-secs`, its `reasoning-effort`, and its
+//! `system-messages`.
 //!
 //! Every test drives the REAL `LlmGateway` request paths (`generate`, `stream_begin`,
 //! `stream_begin_live`, `embed`), the first-open `chat_preflight` or the real image / PDF
@@ -374,11 +375,13 @@ fn deadline_exceeded() -> LlmError {
     LlmError::ProviderError("deadline-exceeded".into())
 }
 
-/// A local entry's backend: records the budget it is given (`deadline` minus now) and the
-/// reasoning setting of every request, then answers `local` after `delay`.
+/// A local entry's backend: records the budget it is given (`deadline` minus now), the
+/// reasoning setting and the messages (role, content) of every request, then answers `local`
+/// after `delay`.
 struct RecordingPort {
     delay: Duration,
     seen: Mutex<Vec<(Duration, Option<String>)>>,
+    messages: Mutex<Vec<Vec<(String, String)>>>,
 }
 
 impl RecordingPort {
@@ -386,6 +389,7 @@ impl RecordingPort {
         Arc::new(Self {
             delay,
             seen: Mutex::new(Vec::new()),
+            messages: Mutex::new(Vec::new()),
         })
     }
 
@@ -394,10 +398,20 @@ impl RecordingPort {
             req.deadline.saturating_duration_since(Instant::now()),
             req.reasoning_effort.clone(),
         ));
+        self.messages.lock().unwrap().push(
+            req.messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect(),
+        );
     }
 
     fn seen(&self) -> Vec<(Duration, Option<String>)> {
         self.seen.lock().unwrap().clone()
+    }
+
+    fn messages(&self) -> Vec<Vec<(String, String)>> {
+        self.messages.lock().unwrap().clone()
     }
 }
 
@@ -1211,4 +1225,245 @@ async fn the_image_extractor_takes_a_reasoning_only_answer_as_an_empty_descripti
             Err(LlmError::ProviderError("invalid response shape".into()))
         );
     }
+}
+
+// ── `system-messages` ────────────────────────────────────────────────────────────────────────
+
+/// The context engine's cache-breakpoint marker between Tier 1b and Tier 2.
+const BREAKPOINT: &str = "<!-- ctx-cache-breakpoint:1b->2 -->";
+
+/// A request with three system messages spread through it, as an assembled turn carries them:
+/// the identity, a cache-breakpoint marker after an earlier exchange, and a late note.
+fn ctx_with_system_messages(alias: &str) -> LlmRequestContext {
+    let message = |role, content: &str| ChatMessage::new(role, content);
+    LlmRequestContext {
+        messages: vec![
+            message(ChatRole::System, "You are the agent."),
+            message(ChatRole::User, "earlier question"),
+            message(ChatRole::System, BREAKPOINT),
+            message(ChatRole::Assistant, "earlier answer"),
+            message(ChatRole::System, "Answer briefly."),
+            message(ChatRole::User, "hi"),
+        ],
+        ..ctx(alias)
+    }
+}
+
+/// The messages of [`ctx_with_system_messages`] as `merge` sends them.
+fn merged_messages() -> Value {
+    json!([
+        {"role": "system", "content": format!("You are the agent.\n\n{BREAKPOINT}\n\nAnswer briefly.")},
+        {"role": "user", "content": "earlier question"},
+        {"role": "assistant", "content": "earlier answer"},
+        {"role": "user", "content": "hi"},
+    ])
+}
+
+/// The messages of [`ctx_with_system_messages`] as they stand.
+fn separate_messages() -> Value {
+    json!([
+        {"role": "system", "content": "You are the agent."},
+        {"role": "user", "content": "earlier question"},
+        {"role": "system", "content": BREAKPOINT},
+        {"role": "assistant", "content": "earlier answer"},
+        {"role": "system", "content": "Answer briefly."},
+        {"role": "user", "content": "hi"},
+    ])
+}
+
+/// Every chat request of `rig`'s chat-completions entry for `request`: `generate`, the buffered
+/// stream and the live stream. Returns the three bodies.
+async fn three_chat_bodies(rig: &Rig, request: impl Fn() -> LlmRequestContext) -> Vec<String> {
+    rig.chain.push_response(CHAT_PATH, Ok(text_answer("ok")));
+    rig.gateway.generate(request()).await.expect("generate");
+    let ready = rig
+        .gateway
+        .stream_begin(request())
+        .await
+        .expect("stream_begin");
+    rig.gateway.stream_finish(ready);
+    rig.chain.push_stream(
+        CHAT_PATH,
+        200,
+        vec![content_frame("ok")]
+            .into_iter()
+            .chain(finish_frames("stop"))
+            .collect(),
+    );
+    let handle = rig
+        .gateway
+        .stream_begin_live(request(), &rig.registry)
+        .await
+        .expect("the head is a 200");
+    assert!(matches!(drain(rig, handle).await.1, PollOutcome::Done(_)));
+    rig.bodies()
+}
+
+/// `system-messages: merge` sends one system message first on `generate`, the buffered stream
+/// and the live stream: every system text in order, joined by a blank line, the marker
+/// included, with the other messages in their order.
+#[tokio::test]
+async fn system_messages_merge_sends_one_system_message_first_on_every_chat_request() {
+    let rig = rig(&reasoner("  system-messages: merge\n"));
+    let bodies = three_chat_bodies(&rig, || ctx_with_system_messages("think")).await;
+    assert_eq!(bodies.len(), 3);
+    for (body, path) in bodies
+        .iter()
+        .zip(["generate", "buffered stream", "live stream"])
+    {
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["messages"], merged_messages(), "{path}");
+        let systems = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "system")
+            .count();
+        assert_eq!(systems, 1, "{path}");
+    }
+}
+
+/// Without the key, or with `separate`, every body is byte-identical to the one the entry sent
+/// before the key existed (the pinned bodies), and the system messages stand where they are.
+#[tokio::test]
+async fn without_system_messages_or_with_separate_every_body_is_byte_identical() {
+    for extra in ["", "  system-messages: separate\n"] {
+        let entries = reasoner(extra);
+        let rig = rig(&entries);
+        let bodies = three_chat_bodies(&rig, || ctx("think")).await;
+        assert_eq!(bodies[0], CHAT_BODY, "generate {extra:?}");
+        assert_eq!(bodies[1], CHAT_BODY, "buffered stream {extra:?}");
+        assert_eq!(bodies[2], STREAM_BODY, "live stream {extra:?}");
+        preflight(&rig, &entries).await.expect("preflight");
+        assert_eq!(rig.bodies()[3], PREFLIGHT_BODY, "preflight {extra:?}");
+
+        let rig = self::rig(&entries);
+        let bodies = three_chat_bodies(&rig, || ctx_with_system_messages("think")).await;
+        for body in bodies {
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["messages"], separate_messages(), "{extra:?}");
+        }
+    }
+}
+
+/// The preflight and the image request carry no system message, so `merge` leaves them
+/// byte-identical to the entry without the key: no empty system message is invented.
+#[tokio::test]
+async fn system_messages_merge_leaves_the_preflight_and_image_requests_as_they_are() {
+    let mut sent: Vec<(String, String)> = Vec::new();
+    for extra in ["  system-messages: merge\n", ""] {
+        let entries = reasoner(extra);
+        let rig = rig(&entries);
+        rig.chain.push_response(CHAT_PATH, Ok(text_answer("ok")));
+        preflight(&rig, &entries).await.expect("preflight");
+        rig.chain.push_response(CHAT_PATH, Ok(text_answer("a cat")));
+        extractor(&rig, &entries)
+            .extract_description(&image())
+            .await
+            .expect("described");
+        let bodies = rig.bodies();
+        assert_eq!(bodies.len(), 2);
+        sent.push((bodies[0].clone(), bodies[1].clone()));
+    }
+    assert_eq!(sent[0].0, PREFLIGHT_BODY, "merged preflight");
+    assert_eq!(sent[0], sent[1], "merge changes neither request");
+    let image: Value = serde_json::from_str(&sent[0].1).unwrap();
+    assert_eq!(image["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(image["messages"][0]["role"], "user");
+}
+
+/// A local entry merges before its sidecar request is built: its backend receives the merged
+/// system message on every chat request (generate, buffered stream, live stream); without the
+/// key it receives the messages as they stand.
+#[tokio::test]
+async fn a_local_entry_merges_its_system_messages_before_the_backend_request_is_built() {
+    let pairs = |value: Value| -> Vec<(String, String)> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["role"].as_str().unwrap().to_string(),
+                    m["content"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    for (extra, expected) in [
+        ("  system-messages: merge\n", pairs(merged_messages())),
+        ("", pairs(separate_messages())),
+    ] {
+        let port = RecordingPort::new(Duration::ZERO);
+        let rig = local_rig(extra, &port);
+        rig.gateway
+            .generate(ctx_with_system_messages("llama"))
+            .await
+            .expect("generate");
+        let ready = rig
+            .gateway
+            .stream_begin(ctx_with_system_messages("llama"))
+            .await
+            .expect("stream_begin");
+        rig.gateway.stream_finish(ready);
+        let _ = rig
+            .gateway
+            .stream_begin_live(ctx_with_system_messages("llama"), &rig.registry)
+            .await;
+        let seen = port.messages();
+        assert_eq!(seen.len(), 3, "{extra:?}");
+        for messages in seen {
+            assert_eq!(messages, expected, "{extra:?}");
+        }
+    }
+}
+
+/// The merge itself: nothing to merge leaves the request alone, one system message moves to
+/// the front, several are joined in order, and every other message keeps its place and fields.
+#[test]
+fn merging_keeps_every_system_text_and_the_order_of_the_rest() {
+    use crate::providers::merge_system_messages;
+    use std::borrow::Cow;
+    let system = |content: &str| ChatMessage::new(ChatRole::System, content);
+    let user = |content: &str| ChatMessage::new(ChatRole::User, content);
+    let call = crate::gateway::ToolCall {
+        id: "call_1".into(),
+        name: "write".into(),
+        arguments: "{}".into(),
+    };
+
+    let none = vec![
+        user("a"),
+        ChatMessage::assistant_with_calls("", vec![call.clone()]),
+    ];
+    assert!(matches!(merge_system_messages(&none), Cow::Borrowed(_)));
+
+    let first = vec![system("s"), user("a")];
+    assert!(matches!(merge_system_messages(&first), Cow::Borrowed(_)));
+
+    let late = vec![user("a"), system("s")];
+    assert_eq!(
+        merge_system_messages(&late).into_owned(),
+        vec![system("s"), user("a")]
+    );
+
+    let spread = vec![
+        system("one"),
+        user("a"),
+        ChatMessage::assistant_with_calls("", vec![call.clone()]),
+        system(BREAKPOINT),
+        ChatMessage::tool("call_1", "ok"),
+        system(""),
+        user("b"),
+    ];
+    assert_eq!(
+        merge_system_messages(&spread).into_owned(),
+        vec![
+            system(&format!("one\n\n{BREAKPOINT}\n\n")),
+            user("a"),
+            ChatMessage::assistant_with_calls("", vec![call]),
+            ChatMessage::tool("call_1", "ok"),
+            user("b"),
+        ]
+    );
 }

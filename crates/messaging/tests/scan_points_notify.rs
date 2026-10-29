@@ -130,6 +130,7 @@ fn ctx(agent_id: &str) -> HostCallContext {
         agent_id: agent_id.into(),
         trace_id: "t".into(),
         turn_id: None,
+        transcript_scope: None,
         capability: "messaging".into(),
         function: "advance:runtime/notify::notify".into(),
         run_id: None,

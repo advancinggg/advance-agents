@@ -22,6 +22,7 @@ fn ctx() -> HostCallContext {
         agent_id: AGENT.into(),
         trace_id: "trace-rc".into(),
         turn_id: None,
+        transcript_scope: None,
         capability: "fs".into(),
         function: "advance:runtime/agent-fs::write".into(),
         run_id: None,

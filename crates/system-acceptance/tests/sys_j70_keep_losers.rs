@@ -185,6 +185,7 @@ fn host_context(agent: &str, turn_id: &str, trace_id: &str, run_id: &str) -> Hos
         agent_id: agent.to_string(),
         trace_id: trace_id.to_string(),
         turn_id: Some(turn_id.to_string()),
+        transcript_scope: Some(turn_id.to_string()),
         capability: "llm".to_string(),
         function: "agent-llm::generate".to_string(),
         // Deliberately populated even for post-detach calls: C216 must replace
@@ -199,6 +200,7 @@ fn send_context(agent: &str, turn_id: &str, run_id: &str) -> HostCallContext {
         agent_id: agent.to_string(),
         trace_id: "trace-send".to_string(),
         turn_id: Some(turn_id.to_string()),
+        transcript_scope: Some(turn_id.to_string()),
         capability: "messaging".to_string(),
         function: "agent-messaging::send".to_string(),
         run_id: Some(run_id.to_string()),

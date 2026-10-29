@@ -46,7 +46,7 @@ use crate::contracts::AgentLoopDriver;
 use crate::daemon::{restart_decision, RestartDecision};
 use crate::hook::{
     CrashCascadeSink, HookError, MessageHandler, ProtectedTurnExecutionBoundary, RunBootstrap,
-    TurnObserver, TurnPersistenceBoundary, WorkspaceRollbackSink,
+    TurnEnd, TurnObserver, TurnOutcome, TurnPersistenceBoundary, WorkspaceRollbackSink,
 };
 use crate::types::{ComponentConfig, RestartPolicy, TrapError, WasmInstance};
 
@@ -395,13 +395,22 @@ impl AgentLoopDriverImpl {
     /// turn (cross-turn continuity). On any per-turn error it logs and returns
     /// the PRIOR `state` (WIT semantics: no new-state on error → keep prior),
     /// so a single bad turn never loses the last-good state nor kills the loop.
+    /// Beside the state it returns how the turn ended ([`TurnEnd`]) for every
+    /// message the mailbox handed over, which the serving loops give to
+    /// [`TurnObserver::on_turn_end`]. `None` only for a recv failure, a malformed
+    /// envelope, or a protected turn the boundary answered `DoNotExecute` (a
+    /// detached batch entry retired without running; its batch was decided
+    /// elsewhere). A protected message that was dequeued but could not start —
+    /// no boundary, no Store incarnation (the Store stayed poisoned), a refused
+    /// start — is consumed without execution and ends [`TurnOutcome::Failed`]
+    /// like any other error path: its sender gets no reply.
     ///
     /// Behaviour is byte-for-byte identical to the pre-Phase-2 single-turn
     /// `run_agent` pipeline on every path — INCLUDING the dispatch-error path,
     /// which returns WITHOUT running `post_process` (the old `run_agent`
     /// `return`ed there). `run_agent` calls this once (discarding the returned
     /// state); `serve` calls it in a loop.
-    async fn run_turn_once(&self, agent_id: &str, state: Vec<u8>) -> Vec<u8> {
+    async fn run_turn_once(&self, agent_id: &str, state: Vec<u8>) -> (Vec<u8>, Option<TurnEnd>) {
         // Step 3: receive the exact mailbox execution envelope. A protected
         // message keeps its move-only dequeue guard beside its identity until
         // immediately before guest execution; every pre-start early return lets
@@ -412,7 +421,7 @@ impl AgentLoopDriverImpl {
                 eprintln!(
                     "AgentLoopDriverImpl::run_turn_once: protected recv failed for agent_id={agent_id:?}: {error:?}"
                 );
-                return state;
+                return (state, None);
             }
         };
         let (mut msg, turn_identity, mut dequeued_turn) = envelope.into_parts();
@@ -420,8 +429,17 @@ impl AgentLoopDriverImpl {
             eprintln!(
                 "AgentLoopDriverImpl::run_turn_once: incomplete protected envelope for agent_id={agent_id:?}"
             );
-            return state;
+            return (state, None);
         }
+        // The turn's end is reported against the message it executes. Paths that
+        // return before the message is admitted for execution report nothing.
+        let message_id = msg.id.clone();
+        let ended = |outcome| {
+            Some(TurnEnd {
+                message_id: message_id.clone(),
+                outcome,
+            })
+        };
         // CONTRACT-216 admission is the first execution-side operation after
         // envelope shape validation. In particular, protected start precedes
         // trace mutation, context assembly, persistence hooks, rollback marks,
@@ -433,7 +451,7 @@ impl AgentLoopDriverImpl {
                 eprintln!(
                     "AgentLoopDriverImpl::run_turn_once: protected turn boundary unavailable for agent_id={agent_id:?}"
                 );
-                return state;
+                return (state, ended(TurnOutcome::Failed));
             };
             let Some(store_incarnation) = self
                 .message_handler
@@ -443,18 +461,20 @@ impl AgentLoopDriverImpl {
                 eprintln!(
                     "AgentLoopDriverImpl::run_turn_once: protected Store incarnation unavailable for agent_id={agent_id:?}"
                 );
-                return state;
+                return (state, ended(TurnOutcome::Failed));
             };
             let guard = dequeued_turn
                 .take()
                 .expect("protected envelope shape checked before execution");
             match boundary.begin(identity, guard) {
-                Ok(TurnStartOutcome::DoNotExecute) => return state,
+                // A detached batch entry: retired without running, decided by its
+                // batch. Nothing ended here, so nothing is reported.
+                Ok(TurnStartOutcome::DoNotExecute) => return (state, None),
                 Err(error) => {
                     eprintln!(
                         "AgentLoopDriverImpl::run_turn_once: protected turn start failed for agent_id={agent_id:?}: {error}"
                     );
-                    return state;
+                    return (state, ended(TurnOutcome::Failed));
                 }
                 Ok(TurnStartOutcome::Execute) => {
                     let mut active = ActiveProtectedTurn::new(
@@ -475,7 +495,7 @@ impl AgentLoopDriverImpl {
                         eprintln!(
                             "AgentLoopDriverImpl::run_turn_once: trusted turn stamp failed for agent_id={agent_id:?}: {error}"
                         );
-                        return state;
+                        return (state, ended(TurnOutcome::Failed));
                     }
                     Some(active)
                 }
@@ -529,7 +549,7 @@ impl AgentLoopDriverImpl {
                 "AgentLoopDriverImpl::run_turn_once: assemble failed for agent_id={:?}: {:?}",
                 agent_id, e
             );
-            return state;
+            return (state, ended(TurnOutcome::Failed));
         }
         // Wave-19 (SYS-AC-028): record the agent territory's pre-turn HEAD BEFORE the guest
         // can write any file, so a mid-turn trap can roll the committed subtree back to it.
@@ -551,7 +571,7 @@ impl AgentLoopDriverImpl {
                     eprintln!(
                         "AgentLoopDriverImpl::run_turn_once: {reason} for agent_id={agent_id:?}"
                     );
-                    return state;
+                    return (state, ended(TurnOutcome::Failed));
                 }
             },
             None => None,
@@ -582,7 +602,7 @@ impl AgentLoopDriverImpl {
                         eprintln!(
                             "AgentLoopDriverImpl::run_turn_once: {reason} for agent_id={agent_id:?}"
                         );
-                        return state;
+                        return (state, ended(TurnOutcome::Failed));
                     }
                 }
                 // Step 6: dispatch. M006's dispatcher internally invokes the
@@ -605,14 +625,14 @@ impl AgentLoopDriverImpl {
                             eprintln!(
                                 "AgentLoopDriverImpl::run_turn_once: protected turn finalizer failed for agent_id={agent_id:?}: {finish_error}"
                             );
-                            return state;
+                            return (state, ended(TurnOutcome::Failed));
                         }
                     }
                     eprintln!(
                         "AgentLoopDriverImpl::run_turn_once: dispatch failed for agent_id={:?}: {:?}",
                         agent_id, e
                     );
-                    return action_result.new_state;
+                    return (action_result.new_state, ended(TurnOutcome::Failed));
                 }
                 // Step 7: post-process (happy path). Error swallowed via `let _`.
                 let _ = self
@@ -624,10 +644,10 @@ impl AgentLoopDriverImpl {
                         eprintln!(
                             "AgentLoopDriverImpl::run_turn_once: protected turn finalizer failed for agent_id={agent_id:?}: {error}"
                         );
-                        return state;
+                        return (state, ended(TurnOutcome::Completed));
                     }
                 }
-                action_result.new_state
+                (action_result.new_state, ended(TurnOutcome::Completed))
             }
             Err(HookError::Failure(reason)) => {
                 if let (Some(boundary), Some(lease_id)) =
@@ -644,7 +664,7 @@ impl AgentLoopDriverImpl {
                 }
                 // Trap-equivalent failure → handle_trap; keep prior state.
                 self.handle_trap(agent_id, TrapError::Crash(reason)).await;
-                state
+                (state, ended(TurnOutcome::Failed))
             }
             Err(e) => {
                 if let (Some(boundary), Some(lease_id)) =
@@ -665,7 +685,7 @@ impl AgentLoopDriverImpl {
                     "AgentLoopDriverImpl::run_turn_once: handle_message error for agent_id={:?}: {}",
                     agent_id, e
                 );
-                state
+                (state, ended(TurnOutcome::Failed))
             }
         }
     }
@@ -702,8 +722,12 @@ impl AgentLoopDriverImpl {
             None => return,
         };
         loop {
-            state = self.run_turn_once(agent_id, state).await;
+            let (next, end) = self.run_turn_once(agent_id, state).await;
+            state = next;
             if let Some(observer) = &self.turn_observer {
+                if let Some(end) = end.as_ref() {
+                    observer.on_turn_end(agent_id, end);
+                }
                 observer.on_turn_complete(agent_id);
             }
             // MODULE-014-AC-25 (029): a guest trap under `RestartPolicy::Never`
@@ -755,8 +779,12 @@ impl AgentLoopDriverImpl {
             None => return,
         };
         for turn in 1..=n {
-            state = self.run_turn_once(agent_id, state).await;
+            let (next, end) = self.run_turn_once(agent_id, state).await;
+            state = next;
             if let Some(observer) = &self.turn_observer {
+                if let Some(end) = end.as_ref() {
+                    observer.on_turn_end(agent_id, end);
+                }
                 observer.on_turn_complete(agent_id);
             }
             // MODULE-014-AC-25 (029): honor the same trap stop cell as `serve` so

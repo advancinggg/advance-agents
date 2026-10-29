@@ -125,6 +125,7 @@ fn host_ctx() -> HostCallContext {
         agent_id: "t110".into(),
         trace_id: "t110".into(),
         turn_id: None,
+        transcript_scope: None,
         capability: "genui".into(),
         function: format!("{NS}::emit-document"),
         run_id: None,

@@ -406,6 +406,7 @@ fn ctx_for(agent: &str) -> HostCallContext {
         agent_id: agent.to_string(),
         trace_id: "trace-persist".to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: "memory".to_string(),
         function: "advance:runtime/agent-memory@0.1.0::remember".to_string(),
         run_id: None,

@@ -56,6 +56,7 @@ fn test_ctx(agent_id: &str, trace_id: &str, run_id: Option<&str>) -> HostCallCon
         agent_id: agent_id.to_string(),
         trace_id: trace_id.to_string(),
         turn_id: None,
+        transcript_scope: None,
         capability: "messaging".to_string(),
         function: "agent-messaging::heartbeat".to_string(),
         run_id: run_id.map(|s| s.to_string()),

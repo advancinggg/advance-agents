@@ -27,6 +27,7 @@ use advance_client_api::provider_admin::{
     ProviderAdminWarning, AUTH_SOURCES, CHATGPT_OAUTH_AUTH_SOURCE, MAX_GENERATE_TIMEOUT_SECS,
     MAX_KEY_BYTES, MAX_SIGN_IN_GENERATE_TIMEOUT_SECS, MIN_GENERATE_TIMEOUT_SECS,
     PROVIDER_KNOB_BACKEND_CLASSES, REASONING_EFFORTS, REASONING_EFFORT_BACKENDS, SIGN_IN_STATES,
+    SYSTEM_MESSAGES_BACKENDS, SYSTEM_MESSAGES_MODES,
 };
 use advance_client_api::routes;
 use advance_client_api::schema::generate_schema_artifact;
@@ -34,7 +35,8 @@ use advance_client_api::{
     ClientApi, ClientApiConfig, ClientEnvelope, ClientErrorCode, ClientRequest, ClientSession,
     Platform, Principal, ProviderAdminProvider, ProviderError, Scope, AUTH_SOURCE_MISMATCH_DETAIL,
     GENERATE_TIMEOUT_UNSUPPORTED_DETAIL, INVALID_GENERATE_TIMEOUT_DETAIL,
-    INVALID_REASONING_EFFORT_DETAIL, REASONING_EFFORT_UNSUPPORTED_DETAIL,
+    INVALID_REASONING_EFFORT_DETAIL, INVALID_SYSTEM_MESSAGES_DETAIL,
+    REASONING_EFFORT_UNSUPPORTED_DETAIL, SYSTEM_MESSAGES_UNSUPPORTED_DETAIL,
 };
 
 const SECRET_KEY: &str = "sk-live-ULTRA-SECRET-0123456789";
@@ -120,6 +122,7 @@ fn summary(id: &str, selected: bool) -> ClientProviderSummary {
         auth_source: None,
         generate_timeout_secs: None,
         reasoning_effort: None,
+        system_messages: None,
         cost: ClientProviderCost {
             input_per_mtoken: 1.0,
             output_per_mtoken: 2.0,
@@ -336,6 +339,7 @@ impl ProviderAdminProvider for MemoryProviders {
         s.backend = request.backend.clone();
         s.generate_timeout_secs = request.generate_timeout_secs;
         s.reasoning_effort = request.reasoning_effort.clone();
+        s.system_messages = request.system_messages.clone();
         if request.auth_source.as_deref() == Some(CHATGPT_OAUTH_AUTH_SOURCE) {
             s.auth_source = request.auth_source.clone();
             s.backend = Some("openai-responses".into());
@@ -385,11 +389,22 @@ impl ProviderAdminProvider for MemoryProviders {
                 REASONING_EFFORT_UNSUPPORTED_DETAIL.into(),
             ));
         }
+        if matches!(request.system_messages, Some(Some(_)))
+            && (backend != "openai-chat"
+                || !["cloud-http", "local"].contains(&e.backend_class.as_str()))
+        {
+            return Err(ProviderError::InvalidRequest(
+                SYSTEM_MESSAGES_UNSUPPORTED_DETAIL.into(),
+            ));
+        }
         if let Some(secs) = request.generate_timeout_secs {
             e.generate_timeout_secs = secs;
         }
         if let Some(effort) = &request.reasoning_effort {
             e.reasoning_effort = effort.clone();
+        }
+        if let Some(mode) = &request.system_messages {
+            e.system_messages = mode.clone();
         }
         Ok(ProviderAdminOutcome::new(e.clone()))
     }
@@ -1318,15 +1333,20 @@ fn pa09_schema_components_inventoried() {
         "the credential source is fixed at creation"
     );
 
-    // The generate budget and the reasoning setting are optional fields of the summary, the
-    // create and the update; the setting stays a plain string checked against its table.
+    // The generate budget, the reasoning setting and the system-message mode are optional
+    // fields of the summary, the create and the update; the two spellings stay plain strings
+    // checked against their tables.
     for component in [
         "ClientProviderSummary",
         "ClientCreateProviderRequest",
         "ClientUpdateProviderRequest",
     ] {
         let properties = &components[component]["properties"];
-        for field in ["generate_timeout_secs", "reasoning_effort"] {
+        for field in [
+            "generate_timeout_secs",
+            "reasoning_effort",
+            "system_messages",
+        ] {
             assert!(
                 properties[field].is_object(),
                 "{component}.{field} in schema"
@@ -1340,14 +1360,20 @@ fn pa09_schema_components_inventoried() {
                 "{component}.{field} is optional"
             );
         }
-        let text = serde_json::to_string(&properties["reasoning_effort"]).unwrap();
-        assert!(
-            !text.contains("\"enum\"") && !text.contains("\"const\""),
-            "{component}.reasoning_effort must stay a free string: {text}"
-        );
+        for field in ["reasoning_effort", "system_messages"] {
+            let text = serde_json::to_string(&properties[field]).unwrap();
+            assert!(
+                !text.contains("\"enum\"") && !text.contains("\"const\""),
+                "{component}.{field} must stay a free string: {text}"
+            );
+        }
     }
-    // An update may clear either with an explicit null.
-    for field in ["generate_timeout_secs", "reasoning_effort"] {
+    // An update may clear any of them with an explicit null.
+    for field in [
+        "generate_timeout_secs",
+        "reasoning_effort",
+        "system_messages",
+    ] {
         let text =
             serde_json::to_string(&components["ClientUpdateProviderRequest"]["properties"][field])
                 .unwrap();
@@ -2484,6 +2510,244 @@ fn pa21_generate_timeout_and_reasoning_effort_wire_shape() {
     let wire = serde_json::to_value(&entry).unwrap();
     assert_eq!(wire["generate_timeout_secs"], 120);
     assert_eq!(wire["reasoning_effort"], "low");
+    let back: ClientProviderSummary = serde_json::from_value(wire).unwrap();
+    assert_eq!(back, entry);
+}
+
+// ── PA-22: create takes an entry's system-message mode, the summary echoes it, and a mode the
+//    entry cannot apply (or an unknown spelling) is refused before the provider ─────────────
+#[test]
+fn pa22_create_system_messages() {
+    let provider = MemoryProviders::new();
+    let (api, _sink) = api_with(provider.clone());
+    operator(&api);
+    assert_eq!(SYSTEM_MESSAGES_MODES, ["separate", "merge"]);
+    assert_eq!(SYSTEM_MESSAGES_BACKENDS, ["openai-chat"]);
+
+    let with = |id: &str, fields: Value| {
+        let mut body = create_body(id);
+        for (field, value) in fields.as_object().unwrap() {
+            body[field] = value.clone();
+        }
+        body
+    };
+
+    // Accepted: both spellings on a cloud-http entry of the id-default dialect, the explicit
+    // dialect, and a local entry.
+    for (body, why) in [
+        (with("merged", json!({"system_messages": "merge"})), "merge"),
+        (
+            with("separate", json!({"system_messages": "separate"})),
+            "separate",
+        ),
+        (
+            with(
+                "chat",
+                json!({"backend": "openai-chat", "system_messages": "merge"}),
+            ),
+            "explicit dialect",
+        ),
+        (
+            with(
+                "local",
+                json!({"backend_class": "local", "system_messages": "merge"}),
+            ),
+            "local entry",
+        ),
+    ] {
+        let env = api.handle(post(routes::PATH_PROVIDERS, body, &format!("ok-{why}")));
+        assert!(env.is_ok(), "{why}: {env:?}");
+    }
+    assert_eq!(provider.calls.create.load(Ordering::SeqCst), 4);
+
+    let merged: ClientProviderSummary = data(&api.handle(get("/client/providers/merged")));
+    assert_eq!(merged.system_messages.as_deref(), Some("merge"));
+    let env = api.handle(get("/client/providers/merged"));
+    assert_eq!(env.data.as_ref().unwrap()["system_messages"], "merge");
+    let env = api.handle(get("/client/providers/openai"));
+    let plain = env.data.as_ref().unwrap().as_object().unwrap();
+    assert!(!plain.contains_key("system_messages"), "{plain:?}");
+
+    // Refused before the provider, each with its detail token.
+    let creates = provider.calls.create.load(Ordering::SeqCst);
+    let mut agent_cli = create_body("s-cli");
+    agent_cli.as_object_mut().unwrap().remove("endpoint");
+    agent_cli["backend_class"] = json!("agent-cli");
+    agent_cli["agent_cli"] = json!({ "vendor": "codex", "command": "/opt/homebrew/bin/codex" });
+    agent_cli["system_messages"] = json!("merge");
+    let mut sign_in = sign_in_create_body("s-signed-in");
+    sign_in["system_messages"] = json!("merge");
+    let mut anthropic = create_body("anthropic-3");
+    anthropic["provider_id"] = json!("anthropic");
+    anthropic["system_messages"] = json!("merge");
+    for (bad, why, detail) in [
+        (
+            with("s0", json!({"system_messages": "MERGE"})),
+            "spelling is exact",
+            INVALID_SYSTEM_MESSAGES_DETAIL,
+        ),
+        (
+            with("s1", json!({"system_messages": "join"})),
+            "unknown spelling",
+            INVALID_SYSTEM_MESSAGES_DETAIL,
+        ),
+        (
+            with("s2", json!({"system_messages": ""})),
+            "empty",
+            INVALID_SYSTEM_MESSAGES_DETAIL,
+        ),
+        (
+            with(
+                "s3",
+                json!({"backend": "openai-responses", "system_messages": "merge"}),
+            ),
+            "responses dialect",
+            SYSTEM_MESSAGES_UNSUPPORTED_DETAIL,
+        ),
+        (
+            with(
+                "s4",
+                json!({"backend": "anthropic-messages", "system_messages": "merge"}),
+            ),
+            "anthropic dialect",
+            SYSTEM_MESSAGES_UNSUPPORTED_DETAIL,
+        ),
+        (
+            anthropic,
+            "the anthropic id speaks the anthropic dialect",
+            SYSTEM_MESSAGES_UNSUPPORTED_DETAIL,
+        ),
+        (
+            agent_cli,
+            "agent-cli entry",
+            SYSTEM_MESSAGES_UNSUPPORTED_DETAIL,
+        ),
+        (
+            with(
+                "s5",
+                json!({"backend_class": "mesh-remote", "device_id": "peer", "system_messages": "merge"}),
+            ),
+            "mesh-remote entry",
+            SYSTEM_MESSAGES_UNSUPPORTED_DETAIL,
+        ),
+        (sign_in, "sign-in entry", SYSTEM_MESSAGES_UNSUPPORTED_DETAIL),
+        (
+            with(
+                "s6",
+                json!({"backend": "openai-responses", "system_messages": "separate"}),
+            ),
+            "separate is refused where merge is",
+            SYSTEM_MESSAGES_UNSUPPORTED_DETAIL,
+        ),
+    ] {
+        let env = api.handle(post(routes::PATH_PROVIDERS, bad, &format!("no-{why}")));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{why}");
+        assert_eq!(details(&env), [detail], "{why}");
+    }
+    // A mode that is not a string is a malformed body.
+    let env = api.handle(post(
+        routes::PATH_PROVIDERS,
+        with("s7", json!({"system_messages": true})),
+        "bad-bool",
+    ));
+    assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest));
+    assert!(details(&env).is_empty());
+    assert_eq!(provider.calls.create.load(Ordering::SeqCst), creates);
+}
+
+// ── PA-23: update sets, replaces and (with an explicit null) clears the mode; an absent field
+//    leaves it; a bad spelling never reaches the provider; the provider's refusal against the
+//    entry keeps its detail token ──────────────────────────────────────────────────────────
+#[test]
+fn pa23_update_system_messages() {
+    let provider = MemoryProviders::new();
+    let (api, _sink) = api_with(provider.clone());
+    operator(&api);
+    let update = |id: &str, body: Value, key: &str| {
+        api.handle(post(&format!("/client/providers/{id}:update"), body, key))
+    };
+
+    let set: ClientProviderSummary =
+        data(&update("openai", json!({"system_messages": "merge"}), "u1"));
+    assert_eq!(set.system_messages.as_deref(), Some("merge"));
+    let kept: ClientProviderSummary =
+        data(&update("openai", json!({"reasoning_effort": "low"}), "u2"));
+    assert_eq!(kept.system_messages.as_deref(), Some("merge"));
+    let replaced: ClientProviderSummary = data(&update(
+        "openai",
+        json!({"system_messages": "separate"}),
+        "u3",
+    ));
+    assert_eq!(replaced.system_messages.as_deref(), Some("separate"));
+    let env = update("openai", json!({"system_messages": null}), "u4");
+    let cleared = env.data.as_ref().unwrap().as_object().unwrap();
+    assert!(!cleared.contains_key("system_messages"), "{cleared:?}");
+    assert_eq!(cleared["reasoning_effort"], "low");
+    assert_eq!(provider.calls.update.load(Ordering::SeqCst), 4);
+
+    let updates = provider.calls.update.load(Ordering::SeqCst);
+    for (bad, why) in [
+        (json!({"system_messages": "joined"}), "unknown spelling"),
+        (json!({"system_messages": "Separate"}), "spelling is exact"),
+    ] {
+        let env = update("openai", bad, &format!("bad-{why}"));
+        assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest), "{why}");
+        assert_eq!(details(&env), [INVALID_SYSTEM_MESSAGES_DETAIL], "{why}");
+    }
+    assert_eq!(provider.calls.update.load(Ordering::SeqCst), updates);
+
+    // The anthropic id speaks the anthropic dialect: the provider refuses against the entry.
+    let env = update("anthropic", json!({"system_messages": "merge"}), "u5");
+    assert_eq!(code(&env), Some(ClientErrorCode::InvalidRequest));
+    assert_eq!(details(&env), [SYSTEM_MESSAGES_UNSUPPORTED_DETAIL]);
+    assert_eq!(env.error.as_ref().unwrap().message, "invalid request");
+    assert!(update("anthropic", json!({"system_messages": null}), "u6").is_ok());
+}
+
+// ── PA-24: the wire shape of the mode: absent is omitted, an update's explicit null survives a
+//    round trip, and the summary only carries what the entry sets ──────────────────────────
+#[test]
+fn pa24_system_messages_wire_shape() {
+    let parse = |body: Value| -> ClientUpdateProviderRequest {
+        serde_json::from_value(body).expect("update parses")
+    };
+    let absent = parse(json!({"endpoint": "https://p.example"}));
+    assert_eq!(absent.system_messages, None);
+    let null = parse(json!({"system_messages": null}));
+    assert_eq!(null.system_messages, Some(None));
+    assert!(!null.is_empty(), "a clear is a change");
+    let value = parse(json!({"system_messages": "merge"}));
+    assert_eq!(value.system_messages, Some(Some("merge".into())));
+    assert_eq!(
+        serde_json::to_value(&null).unwrap(),
+        json!({"system_messages": null})
+    );
+    assert_eq!(
+        serde_json::to_value(&value).unwrap(),
+        json!({"system_messages": "merge"})
+    );
+    for request in [absent, null, value] {
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(parse(wire), request, "round trip");
+    }
+
+    let create: ClientCreateProviderRequest = serde_json::from_value({
+        let mut body = create_body("p");
+        body["system_messages"] = json!("separate");
+        body
+    })
+    .unwrap();
+    assert_eq!(create.system_messages.as_deref(), Some("separate"));
+    let plain: ClientCreateProviderRequest = serde_json::from_value(create_body("p")).unwrap();
+    let wire = serde_json::to_value(&plain).unwrap();
+    assert!(wire.get("system_messages").is_none(), "{wire}");
+
+    let mut entry = summary("openai", true);
+    let wire = serde_json::to_value(&entry).unwrap();
+    assert!(wire.get("system_messages").is_none(), "{wire}");
+    entry.system_messages = Some("merge".into());
+    let wire = serde_json::to_value(&entry).unwrap();
+    assert_eq!(wire["system_messages"], "merge");
     let back: ClientProviderSummary = serde_json::from_value(wire).unwrap();
     assert_eq!(back, entry);
 }
