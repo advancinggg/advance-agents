@@ -11,6 +11,7 @@ mod inference;
 mod options;
 mod runtime;
 mod tools;
+mod ui;
 
 pub use crate::compose::compose;
 pub use advance_client_api::families::method_label;
@@ -118,3 +119,7 @@ pub use tools::ToolDescription;
 pub use tools::ToolError;
 pub use tools::ToolRefusal;
 pub use tools::ToolRegistrar;
+pub use ui::BrowserDriverPort;
+pub use ui::ScreenDriverPort;
+pub use ui::UiDriverRefusal;
+pub use ui::UiDriverRegistrar;

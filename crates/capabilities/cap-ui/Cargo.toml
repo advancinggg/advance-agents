@@ -1,0 +1,35 @@
+[package]
+name = "cap-ui"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UI-automation capabilities (`browser`, `screen`): the model-facing `browser__*` / `screen__*` Layer 3 callables over product-injected driver ports, their CONTRACT-122 grant policy, the observation scan and `ui.*` events; Fake drivers and the driver conformance suite."
+
+publish = false
+
+[lib]
+name = "cap_ui"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
+chrono = { workspace = true, features = ["clock"] }
+uuid = { workspace = true }
+url = { workspace = true }
+advance-runtime = { path = "../../runtime" }
+advance-shared-types = { path = "../../shared-types" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+# V4 — the real inbound content scan (`DefaultLeakDetector`) over an observation.
+cap-http = { path = "../cap-http" }
+# V3 — the real L1 gate with a `browser` grant whose `origins` list is empty.
+cap-grant = { path = "../cap-grant" }
+advance-database = { path = "../../database" }
+
+[lints]
+workspace = true

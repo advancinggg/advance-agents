@@ -41,6 +41,10 @@ use std::sync::Arc;
 use advance_shared_types::capability::{CapParams, GrantDecision};
 use advance_shared_types::mcp::McpGrantScope;
 use advance_shared_types::traits::{GrantCheck, McpGrantReader, ToolsGrantReader, WebGrantReader};
+use advance_shared_types::ui::{
+    AllowRule, BrowserGrantPolicy, ConfirmPolicy, ScreenGrantPolicy, ScreenMode, UiPolicyReader,
+    BROWSER_CAPABILITY, SCREEN_CAPABILITY,
+};
 use advance_shared_types::web_search::WEB_GRANT_CAPABILITY;
 
 use crate::data::{Grant, GrantId, GrantStatus};
@@ -592,5 +596,148 @@ impl WebGrantReader for WebGrantReaderImpl {
                 && g.capability == WEB_GRANT_CAPABILITY
                 && g.expires_at.map_or(true, |t| t > now)
         })
+    }
+}
+
+/// [`UiPolicyReader`] provider (ADR 2026-10-28 D2): the agent's effective `browser` /
+/// `screen` grant, merged across its active, unexpired grants of that capability the
+/// way [`ToolsGrantReaderImpl`] merges `tools.ids` — a union of permissions. A
+/// whole-capability grant (no params) makes the allowlist dimension `Any`; a listed
+/// `origins` / `targets` param is an allowlist (empty = nothing). Each knob defaults
+/// to its most restrictive value and takes the most permissive value any grant names.
+///
+/// Read-only LIST / policy projection, NOT an authorization gate: it decides nothing
+/// and emits no `authz.checked` event. Allowlist decisions stay with
+/// [`GrantCheckImpl`], which `cap_ui` calls with the request's `origins` / `targets`.
+pub struct UiPolicyReaderImpl {
+    store: Arc<GrantStore>,
+}
+
+impl UiPolicyReaderImpl {
+    pub fn new(store: Arc<GrantStore>) -> Self {
+        Self { store }
+    }
+
+    fn active_grants(&self, agent_id: &str, capability: &str) -> Vec<Grant> {
+        let now = chrono::Utc::now();
+        reader_grants(&self.store, agent_id)
+            .into_iter()
+            .filter(|g| {
+                g.status == GrantStatus::Active
+                    && g.capability == capability
+                    && g.expires_at.map_or(true, |t| t > now)
+            })
+            .collect()
+    }
+}
+
+// Manual `Debug` for the same reason as `ToolsGrantReaderImpl`: `GrantStore` is not `Debug`.
+impl std::fmt::Debug for UiPolicyReaderImpl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UiPolicyReaderImpl").finish_non_exhaustive()
+    }
+}
+
+fn param_of<'a>(grant: &'a Grant, key: &str) -> Option<&'a str> {
+    grant
+        .params
+        .iter()
+        .find(|p| p.key == key)
+        .map(|p| p.value.as_str())
+}
+
+fn csv_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Merge one grant's allowlist param into the running rule (union; `Any` absorbs).
+fn merge_allow(rule: &mut Option<AllowRule>, grant: &Grant, key: &str) {
+    let next = match param_of(grant, key) {
+        None => AllowRule::Any,
+        Some(v) => AllowRule::List(csv_list(v)),
+    };
+    *rule = Some(match (rule.take(), next) {
+        (Some(AllowRule::Any), _) | (_, AllowRule::Any) => AllowRule::Any,
+        (Some(AllowRule::List(mut a)), AllowRule::List(b)) => {
+            for item in b {
+                if !a.iter().any(|x| x.eq_ignore_ascii_case(&item)) {
+                    a.push(item);
+                }
+            }
+            // Deterministic regardless of the store's grant order.
+            a.sort();
+            AllowRule::List(a)
+        }
+        (None, list) => list,
+    });
+}
+
+impl UiPolicyReader for UiPolicyReaderImpl {
+    fn browser_policy(&self, agent_id: &str) -> Option<BrowserGrantPolicy> {
+        let grants = self.active_grants(agent_id, BROWSER_CAPABILITY);
+        if grants.is_empty() {
+            return None;
+        }
+        let mut policy = BrowserGrantPolicy::whole_capability();
+        let mut origins = None;
+        let mut surfaces: Vec<String> = Vec::new();
+        for g in &grants {
+            merge_allow(&mut origins, g, "origins");
+            match param_of(g, "surfaces") {
+                Some(v) => {
+                    for s in csv_list(v) {
+                        if !surfaces.iter().any(|x| x == &s) {
+                            surfaces.push(s);
+                        }
+                    }
+                }
+                None => {
+                    if !surfaces.iter().any(|x| x == "in-app") {
+                        surfaces.push("in-app".to_string());
+                    }
+                }
+            }
+            if let Some(c) = param_of(g, "confirm").and_then(ConfirmPolicy::parse) {
+                if c.rank() < policy.confirm.rank() {
+                    policy.confirm = c;
+                }
+            }
+            if param_of(g, "downloads").map(str::trim) == Some("true") {
+                policy.downloads = true;
+            }
+        }
+        policy.origins = origins.unwrap_or(AllowRule::Any);
+        policy.surfaces = surfaces;
+        Some(policy)
+    }
+
+    fn screen_policy(&self, agent_id: &str) -> Option<ScreenGrantPolicy> {
+        let grants = self.active_grants(agent_id, SCREEN_CAPABILITY);
+        if grants.is_empty() {
+            return None;
+        }
+        let mut policy = ScreenGrantPolicy::whole_capability();
+        let mut targets = None;
+        for g in &grants {
+            merge_allow(&mut targets, g, "targets");
+            if param_of(g, "mode").and_then(ScreenMode::parse) == Some(ScreenMode::Pixel) {
+                policy.mode = ScreenMode::Pixel;
+            }
+            if let Some(c) = param_of(g, "confirm").and_then(ConfirmPolicy::parse) {
+                if c.rank() < policy.confirm.rank() {
+                    policy.confirm = c;
+                }
+            }
+            if param_of(g, "secure-input").map(str::trim) == Some("true") {
+                policy.secure_input = true;
+            }
+        }
+        policy.targets = targets.unwrap_or(AllowRule::Any);
+        Some(policy)
     }
 }

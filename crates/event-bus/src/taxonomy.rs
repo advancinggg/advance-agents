@@ -438,6 +438,21 @@ pub mod callable {
     pub const UNKNOWN_DROPPED: &str = "callable.unknown-dropped";
 }
 
+/// UI automation families (ADR 2026-10-28 D2: `browser.*` / `screen.*`
+/// callables). **NOT in PRD §15.3** — documented operational extensions,
+/// enumerated in `ALL_EVENT_TYPES`; never a trigger.
+pub mod ui {
+    /// One action verb executed by a driver (payload: `surface`, `verb`,
+    /// `target`, `sensitive`, `duration_ms`, `is_error`).
+    pub const ACTION: &str = "ui.action";
+    /// One observation returned to the model (payload: `surface`, `kind`,
+    /// `bytes`, `elements`, `scan`).
+    pub const OBSERVATION: &str = "ui.observation";
+    /// A call the family refused before reaching the driver (payload:
+    /// `surface`, `verb`, `reason`).
+    pub const REFUSED: &str = "ui.refused";
+}
+
 /// MODULE-018 pack-system lifecycle events (Pack lane P1). **NOT in
 /// PRD §15.3** — documented operational extensions, enumerated in
 /// `ALL_EVENT_TYPES` and deliberately ABSENT from `TRIGGER_BUS_WHITELIST`
@@ -681,6 +696,10 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     // Layer 3 callables (ADR 2026-10-24 A7). Documented EXTENSION; never a trigger.
     callable::INVOKED,
     callable::UNKNOWN_DROPPED,
+    // UI automation families (ADR 2026-10-28). Documented EXTENSION; never a trigger.
+    ui::ACTION,
+    ui::OBSERVATION,
+    ui::REFUSED,
     // `fs.mkdir` host fn (ADR 2026-10-24 A3). Documented EXTENSION; canonical fs.* stays 6.
     extensions::FS_MKDIR,
     // NOTE: extensions::RUNTIME_DEGRADED_PREFIX is intentionally NOT enumerated —

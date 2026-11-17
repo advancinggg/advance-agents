@@ -33,6 +33,7 @@ cap-grant = { path = "../capabilities/cap-grant" }
 cap-skills = { path = "../capabilities/cap-skills" }
 cap-tools = { path = "../capabilities/cap-tools" }
 cap-llm = { path = "../capabilities/cap-llm" }
+cap-ui = { path = "../capabilities/cap-ui" }
 cap-secrets = { path = "../capabilities/cap-secrets" }
 # HF fast-follow deps (2026-06-03): channel capture, in-process MCP, multi-agent
 # spawn (cap-lifecycle), await-replies (reply-tracker), and direct host-fn Vals.

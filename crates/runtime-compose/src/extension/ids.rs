@@ -1,12 +1,12 @@
 //! Extension id grammar and reserved names.
 
-use crate::agent_config::KNOWN_CAPABILITIES;
+use crate::agent_config::{KNOWN_CAPABILITIES, LAYER3_CAPABILITIES};
 
 /// Maximum byte length of an extension id (`[a-z][a-z0-9-]{0,31}`).
 pub const EXTENSION_ID_MAX_LEN: usize = 32;
 
 /// Names that are not valid extension ids, in addition to every
-/// [`KNOWN_CAPABILITIES`] entry.
+/// [`KNOWN_CAPABILITIES`] and [`LAYER3_CAPABILITIES`] entry.
 pub const RESERVED_EXTENSION_IDS: &[&str] = &["web", "data", "mcp"];
 
 /// Reasons: `"empty"`, `"longer than 32 bytes"`, `"must start with a-z"`,
@@ -29,7 +29,10 @@ pub fn check_extension_id(id: &str) -> Result<(), &'static str> {
     {
         return Err("only a-z, 0-9 and '-' allowed");
     }
-    if RESERVED_EXTENSION_IDS.contains(&id) || KNOWN_CAPABILITIES.contains(&id) {
+    if RESERVED_EXTENSION_IDS.contains(&id)
+        || KNOWN_CAPABILITIES.contains(&id)
+        || LAYER3_CAPABILITIES.contains(&id)
+    {
         return Err("reserved");
     }
     Ok(())

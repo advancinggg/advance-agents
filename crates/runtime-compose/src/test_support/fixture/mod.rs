@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::api::{
     BoxFuture, ClientFamilyRegistrar, ComposeCx, ComposeExtension, ExtensionError, ExtensionPhase,
     GatewayHandle, HostFunctionDef, HostFunctionRegistrar, InferenceContribution, StartedCx,
-    ToolRegistrar,
+    ToolRegistrar, UiDriverRegistrar,
 };
 
 mod capabilities;
@@ -50,6 +50,8 @@ pub struct FixtureExtension {
     spec: Option<FixtureSpec>,
     inference: Option<FixtureInference>,
     families: Option<FixtureFamilies>,
+    /// Register cap-ui's Fake browser driver in `ui_drivers`.
+    fake_browser: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -71,7 +73,14 @@ impl FixtureExtension {
             spec: None,
             inference: None,
             families: None,
+            fake_browser: false,
         }
+    }
+
+    /// Register cap-ui's Fake browser driver (the standard fixture pages) in `ui_drivers`.
+    pub fn with_fake_browser(mut self) -> Self {
+        self.fake_browser = true;
+        self
     }
 
     pub fn with_spec(mut self, spec: FixtureSpec) -> Self {
@@ -159,6 +168,7 @@ pub(crate) fn phase_name(phase: ExtensionPhase) -> &'static str {
         ExtensionPhase::Inference => "inference",
         ExtensionPhase::HostFunctions => "host_functions",
         ExtensionPhase::Tools => "tools",
+        ExtensionPhase::UiDrivers => "ui_drivers",
         ExtensionPhase::ClientFamilies => "client_families",
     }
 }
@@ -232,6 +242,18 @@ impl ComposeExtension for FixtureExtension {
             }
             Ok(())
         })
+    }
+
+    fn ui_drivers(
+        &self,
+        cx: &ComposeCx,
+        reg: &mut UiDriverRegistrar,
+    ) -> Result<(), ExtensionError> {
+        self.enter_phase(ExtensionPhase::UiDrivers, Some(cx))?;
+        if self.fake_browser {
+            reg.register_browser(Arc::new(cap_ui::conformance::fake_browser()))?;
+        }
+        Ok(())
     }
 
     fn client_families(

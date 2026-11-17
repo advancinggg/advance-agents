@@ -5,7 +5,7 @@
 
 use advance_pack_manager::StaticCapabilityCatalog;
 
-use crate::agent_config::KNOWN_CAPABILITIES;
+use crate::agent_config::{KNOWN_CAPABILITIES, LAYER3_CAPABILITIES};
 
 /// The catalog a pack's `required-capabilities` are checked against at install (CLI and
 /// Client API alike): exactly the runtime's capability names. A pack never adds one.
@@ -20,6 +20,7 @@ pub fn build_capability_catalog_with(extension_capabilities: &[String]) -> Stati
     StaticCapabilityCatalog::new(
         KNOWN_CAPABILITIES
             .iter()
+            .chain(LAYER3_CAPABILITIES.iter())
             .copied()
             .map(str::to_string)
             .chain(extension_capabilities.iter().cloned()),

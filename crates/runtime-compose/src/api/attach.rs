@@ -532,6 +532,7 @@ fn reason(e: &ComposeError) -> &'static str {
         | ComposeError::CapabilityCollision { .. }
         | ComposeError::HostFunction { .. }
         | ComposeError::Tool { .. }
+        | ComposeError::UiDriver { .. }
         | ComposeError::Extension { .. } => launch_reasons::COMPOSE_EXTENSION,
         ComposeError::Unsupported(_) => launch_reasons::COMPOSE_UNSUPPORTED,
     }

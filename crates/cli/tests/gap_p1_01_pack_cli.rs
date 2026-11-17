@@ -232,10 +232,15 @@ fn pc_07_retired_resource_capabilities_key() {
 }
 
 // The catalog `required-capabilities` are checked against is exactly the runtime's capability
-// names (no installed pack widens it), and the install note never names the retired kind.
+// names, KNOWN plus the Layer-3-only `browser` / `screen` (ADR 2026-10-28 D1); no installed pack
+// widens it, and the install note never names the retired kind.
 #[test]
 fn pc_08_capability_catalog_is_exactly_the_known_capabilities() {
-    let mut known = advance_cli::agent_config::KNOWN_CAPABILITIES.to_vec();
+    let mut known: Vec<&str> = advance_cli::agent_config::KNOWN_CAPABILITIES
+        .iter()
+        .chain(advance_cli::agent_config::LAYER3_CAPABILITIES)
+        .copied()
+        .collect();
     known.sort_unstable();
     known.dedup();
     let catalog = advance_cli::commands::pack::capability_catalog();

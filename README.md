@@ -63,7 +63,7 @@ The workspace is 31 crates. Everything is dependency-inverted through `shared-ty
 ### Capabilities (host-function surfaces)
 
 `cap-fs` · `cap-secrets` · `cap-http` · `cap-llm` · `cap-grant` · `cap-memory` ·
-`cap-tools` · `cap-skills` · `cap-mcp` · `cap-channel` · `cap-lifecycle`
+`cap-tools` · `cap-skills` · `cap-mcp` · `cap-channel` · `cap-lifecycle` · `cap-ui`
 
 ### Services
 

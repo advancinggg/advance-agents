@@ -54,6 +54,7 @@ pub use cap_memory;
 pub use cap_secrets;
 pub use cap_skills;
 pub use cap_tools;
+pub use cap_ui;
 
 // ── subsystem crates ──────────────────────────────────────────────────────────────
 pub use advance_client_api as client_api;

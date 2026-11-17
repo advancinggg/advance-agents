@@ -86,8 +86,8 @@ use cap_grant::{
     ToolsGrantReaderImpl,
 };
 use cap_http::{
-    DefaultHttpSecurityChain, DefaultLeakDetector, DefaultPromptInjectionHelpers, ExecutorError,
-    HttpExecutor,
+    DefaultHttpSecurityChain, DefaultLeakDetector, DefaultPromptInjectionHelpers, DefaultSsrfGuard,
+    ExecutorError, HttpExecutor,
 };
 use cap_lifecycle::spawn::{SpawnChildConfig, SpawnerSubsetGate};
 use cap_lifecycle::{
@@ -3370,12 +3370,25 @@ pub(crate) async fn wire_capabilities_inner(
             if builder.config().genui.enabled && !fallback.iter().any(|c| c == "genui") {
                 fallback.push("genui".into());
             }
+            // ADR 2026-10-28 D1: `browser` / `screen` are Layer-3-only (no CapRequest,
+            // so never in the tree's capability list); when the home declares them the
+            // catalog lists their callables for every agent and the grant decides.
+            let layer3: Vec<String> = crate::agent_config::LAYER3_CAPABILITIES
+                .iter()
+                .filter(|cap| declares(cap))
+                .map(|cap| (*cap).to_string())
+                .collect();
+            let tree_caps: Arc<dyn crate::callables::AgentCapsLookup> = Arc::new(
+                crate::callables::TreeCapsLookup::new(agent_tree_snapshot.clone(), fallback),
+            );
+            let caps_lookup: Arc<dyn crate::callables::AgentCapsLookup> = if layer3.is_empty() {
+                tree_caps
+            } else {
+                Arc::new(crate::callables::HomeLayer3Caps::new(tree_caps, layer3))
+            };
             let dispatcher = Arc::new(crate::callables::CallableDispatcher::new(
                 builder.callable_registry(),
-                Arc::new(crate::callables::TreeCapsLookup::new(
-                    agent_tree_snapshot.clone(),
-                    fallback,
-                )),
+                caps_lookup,
                 cap_grant.grant_check.clone(),
                 builder.circuit_breaker_bus(),
                 Arc::new(NotWiredRepetitionGuard),
@@ -3684,6 +3697,65 @@ pub(crate) async fn wire_capabilities_inner(
     // touches none): swept now that the runtime that would serve them is attached, before
     // its warm-up.
     let _ = pack_runtime.sweep_mcp_origins().await;
+
+    // ADR 2026-10-28 D2: the UI families. The extensions' drivers (one per
+    // surface) come after `tools`; the `browser__*` / `screen__*` callables are
+    // registered for the declared surfaces whether or not a driver exists, so a
+    // model learns a surface is off from a fixed refusal, not from silence.
+    let declares_browser = declares(advance_shared_types::ui::BROWSER_CAPABILITY);
+    let declares_screen = declares(advance_shared_types::ui::SCREEN_CAPABILITY);
+    if declares_browser || declares_screen {
+        let drivers = if extensions.is_empty() {
+            cap_ui::UiDrivers::none()
+        } else {
+            match crate::extension::ui::run_ui_drivers(&extensions, &log) {
+                Ok(drivers) => drivers,
+                Err(error) => {
+                    return Err(WiringFailure {
+                        error: WiringError::Compose(error),
+                        partial: started,
+                    });
+                }
+            }
+        };
+        let deps = cap_ui::UiDeps {
+            grant: Arc::clone(&cap_grant.grant_check) as Arc<dyn GrantCheck>,
+            policy: Arc::new(cap_grant::UiPolicyReaderImpl::new(Arc::clone(
+                &cap_grant.store,
+            ))),
+            leak: Arc::clone(&public_leak_detector),
+            events: event_bus_dyn.clone(),
+            ssrf: Some(Arc::new(DefaultSsrfGuard::new())),
+            injection: Some(Arc::new(DefaultPromptInjectionHelpers::new())),
+        };
+        let family = cap_ui::register_ui_callables(
+            &*host.callable_registry(),
+            deps,
+            drivers.clone(),
+            cap_ui::UiSurfaces {
+                browser: declares_browser,
+                screen: declares_screen,
+            },
+        );
+        log.out(
+            log_keys::UI_CALLABLES,
+            format!(
+                "advance: ui callables registered: {} (browser driver: {}, screen driver: {})",
+                family.specs().len(),
+                if drivers.browser.is_some() {
+                    "yes"
+                } else {
+                    "none"
+                },
+                if drivers.screen.is_some() {
+                    "yes"
+                } else {
+                    "none"
+                },
+            ),
+        );
+        probe_record!(probe, |record| record.ui_callables = Some(family.names()));
+    }
 
     // MODULE-001 §1.4.7 (a): extension client families — after tools, before
     // bind_runtime and the Client API bind factory.

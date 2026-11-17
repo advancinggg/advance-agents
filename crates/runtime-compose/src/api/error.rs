@@ -57,6 +57,11 @@ pub enum ComposeError {
         extension: &'static str,
         refusal: super::tools::ToolRefusal,
     },
+    /// An extension's UI driver was refused (ADR 2026-10-28 D2).
+    UiDriver {
+        extension: &'static str,
+        refusal: super::ui::UiDriverRefusal,
+    },
     /// An extension callback failed or panicked.
     Extension {
         extension: &'static str,
@@ -112,7 +117,8 @@ pub enum OssBinding {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapabilityRefusal {
-    /// The name is in `KNOWN_CAPABILITIES` or `RESERVED_CAPABILITY_NAMES`.
+    /// The name is in `KNOWN_CAPABILITIES`, `LAYER3_CAPABILITIES` or
+    /// `RESERVED_CAPABILITY_NAMES`.
     Known,
     /// An earlier extension already declared it.
     OtherExtension { owner: &'static str },
@@ -134,6 +140,7 @@ pub enum ExtensionPhase {
     Inference,
     HostFunctions,
     Tools,
+    UiDrivers,
     ClientFamilies,
 }
 
@@ -273,6 +280,9 @@ impl fmt::Display for ComposeError {
             ComposeError::Tool { extension, refusal } => {
                 write!(f, "extension {extension}: tool refused: {refusal}")
             }
+            ComposeError::UiDriver { extension, refusal } => {
+                write!(f, "extension {extension}: ui driver refused: {refusal}")
+            }
             ComposeError::Extension {
                 extension,
                 phase,
@@ -366,6 +376,7 @@ impl fmt::Display for ExtensionPhase {
             ExtensionPhase::Inference => "inference",
             ExtensionPhase::HostFunctions => "host_functions",
             ExtensionPhase::Tools => "tools",
+            ExtensionPhase::UiDrivers => "ui_drivers",
             ExtensionPhase::ClientFamilies => "client_families",
         })
     }

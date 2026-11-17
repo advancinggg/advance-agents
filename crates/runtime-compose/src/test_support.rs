@@ -235,6 +235,9 @@ pub struct ProbeRecord {
     pub effective_capabilities: Option<EffectiveCapabilities>,
     /// The root loop's declared capability names (the guest request set).
     pub root_request_set: Option<Vec<String>>,
+    /// The `browser__*` / `screen__*` callable names registered for the home's
+    /// declared surfaces (`None` when the home declares neither).
+    pub ui_callables: Option<Vec<String>>,
     /// The injector the host built (dies with the host).
     pub capability_injector: Option<Weak<CapabilityInjector>>,
     /// The concrete host-tool registry (created when the home declares `tools`).

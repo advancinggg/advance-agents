@@ -59,6 +59,20 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "mcp",
 ];
 
+/// Capabilities the model reaches only through Layer 3 callables (ADR 2026-10-28
+/// D1/D2: `browser` → `browser__*`, `screen` → `screen__*`). They are declared in
+/// `.agent/config.yaml` like any capability and decided by the caller's grants
+/// (CONTRACT-122 `browser` / `screen` param families), but they register NO host
+/// functions, so they are deliberately not [`KNOWN_CAPABILITIES`]: a `CapRequest`
+/// for them would make the injector answer `UnknownCapability` (there is no WIT
+/// interface to link). `wire_capabilities` registers their callables when the
+/// home declares them, and the Layer 3 catalog lists them for every agent of the
+/// home (`callables::HomeLayer3Caps`).
+pub const LAYER3_CAPABILITIES: &[&str] = &[
+    advance_shared_types::ui::BROWSER_CAPABILITY,
+    advance_shared_types::ui::SCREEN_CAPABILITY,
+];
+
 /// Defence-in-depth bound on `.agent/config.yaml` size (mirrors the read in
 /// `wiring.rs` — a pathologically large config cannot force an unbounded
 /// allocation before the size check).

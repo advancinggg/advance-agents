@@ -18,24 +18,25 @@ use std::sync::Arc;
 
 use advance_core::runtime_compose::{
     async_trait, compose, launch_reasons, log_keys, method_label, provider_or_unavailable,
-    scan_client_text, Admission, BoxFuture, CapParams, CapabilityRefusal, ClientApiCheck,
-    ClientApiEndpoint, ClientApiOptions, ClientApiRebindError, ClientError, ClientErrorCode,
-    ClientFamilyRegistrar, ClientWarning, ComponentFunc, ComposeCx, ComposeError, ComposeExtension,
-    ComposeLog, ComposeLogLine, ComposeOptions, ComposeProfile, ComposedRuntime, ConfigView,
-    DuplicateOf, EmitError, EmitReceipt, ExtensionCursorCodec, ExtensionEmitter, ExtensionError,
-    ExtensionFailure, ExtensionGrantCheck, ExtensionHealth, ExtensionPhase, ExtensionSecrets,
-    ExtensionServices, ExtensionState, FamilyBudget, GatewayHandle, GrantDecision, HandlerCtx,
-    HandlerResponse, HandlerSpec, HostCallContext, HostCallError, HostFunctionDef,
-    HostFunctionFailure, HostFunctionHandler, HostFunctionRefusal, HostFunctionRegistrar,
-    HostPlatform, HostTool, InProcessLauncher, InProcessLauncherError, InProcessStopError,
-    InferenceContribution, InferenceRefusal, InferenceSubject, InstanceGuard, InstanceGuardKind,
-    LaunchPlan, ListenerOptions, LockFailure, LogStream, MasterKeyInput, Method, MethodInfo,
-    NullComposeLog, OssBinding, PanicAnswer, PathDefect, PlatformRule, PollEmit, PollStreamSpec,
-    ProcessLocalAttachSource, ProcessPolicy, ProviderSlot, ResponseScan, RouteOptions,
-    RouteRefusal, RouteRefusalReason, RunInfo, RunView, RuntimeHealthView, RuntimePhase, Scope,
-    SecretViewError, ShutdownHandle, StartedCx, TaskRunStatus, TaskSpawner, ToolDescription,
-    ToolError, ToolRefusal, ToolRegistrar, UnknownPlatform, Unsupported, Val, ViewError,
-    WasmEngine, Zeroizing,
+    scan_client_text, Admission, BoxFuture, BrowserDriverPort, CapParams, CapabilityRefusal,
+    ClientApiCheck, ClientApiEndpoint, ClientApiOptions, ClientApiRebindError, ClientError,
+    ClientErrorCode, ClientFamilyRegistrar, ClientWarning, ComponentFunc, ComposeCx, ComposeError,
+    ComposeExtension, ComposeLog, ComposeLogLine, ComposeOptions, ComposeProfile, ComposedRuntime,
+    ConfigView, DuplicateOf, EmitError, EmitReceipt, ExtensionCursorCodec, ExtensionEmitter,
+    ExtensionError, ExtensionFailure, ExtensionGrantCheck, ExtensionHealth, ExtensionPhase,
+    ExtensionSecrets, ExtensionServices, ExtensionState, FamilyBudget, GatewayHandle,
+    GrantDecision, HandlerCtx, HandlerResponse, HandlerSpec, HostCallContext, HostCallError,
+    HostFunctionDef, HostFunctionFailure, HostFunctionHandler, HostFunctionRefusal,
+    HostFunctionRegistrar, HostPlatform, HostTool, InProcessLauncher, InProcessLauncherError,
+    InProcessStopError, InferenceContribution, InferenceRefusal, InferenceSubject, InstanceGuard,
+    InstanceGuardKind, LaunchPlan, ListenerOptions, LockFailure, LogStream, MasterKeyInput, Method,
+    MethodInfo, NullComposeLog, OssBinding, PanicAnswer, PathDefect, PlatformRule, PollEmit,
+    PollStreamSpec, ProcessLocalAttachSource, ProcessPolicy, ProviderSlot, ResponseScan,
+    RouteOptions, RouteRefusal, RouteRefusalReason, RunInfo, RunView, RuntimeHealthView,
+    RuntimePhase, Scope, ScreenDriverPort, SecretViewError, ShutdownHandle, StartedCx,
+    TaskRunStatus, TaskSpawner, ToolDescription, ToolError, ToolRefusal, ToolRegistrar,
+    UiDriverRefusal, UiDriverRegistrar, UnknownPlatform, Unsupported, Val, ViewError, WasmEngine,
+    Zeroizing,
 };
 
 /// The CONTRACT-244 API: every name `api/mod.rs` may re-export, and must.
@@ -146,6 +147,10 @@ const ALLOWED: &[&str] = &[
     "InProcessStopError",
     "LaunchPlan",
     "ProcessLocalAttachSource",
+    "BrowserDriverPort",
+    "ScreenDriverPort",
+    "UiDriverRefusal",
+    "UiDriverRegistrar",
 ];
 
 /// The one façade line.
@@ -274,6 +279,10 @@ fn uses_the_api_through_the_facade(home: std::path::PathBuf) {
     let _: Option<InProcessStopError> = None;
     let _: Option<LaunchPlan> = None;
     let _: ProcessLocalAttachSource = ProcessLocalAttachSource::new();
+    let _: Option<Arc<dyn BrowserDriverPort>> = None;
+    let _: Option<Arc<dyn ScreenDriverPort>> = None;
+    let _: Option<UiDriverRefusal> = None;
+    let _: Option<UiDriverRegistrar> = None;
 }
 
 #[test]

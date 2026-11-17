@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod dispatch;
 pub mod host_fn;
+pub mod layer3;
 pub mod specs;
 
 pub use catalog::{project_catalog, CatalogHostFnInventory, ProjectedCatalog};
@@ -11,4 +12,5 @@ pub use dispatch::{
     INVOKE_MCP_TOOL_FUNCTION, TOOL_INVOKE_FUNCTION,
 };
 pub use host_fn::register_agent_callables;
+pub use layer3::HomeLayer3Caps;
 pub use specs::{register_fs_callables, register_genui_callables, register_memory_callables};

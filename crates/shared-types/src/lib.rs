@@ -183,6 +183,7 @@ pub mod test_support;
 pub mod token_estimate;
 pub mod traits;
 pub mod turn_attribution;
+pub mod ui;
 pub mod web_search;
 pub mod workspace_path;
 pub mod yaml_guard;

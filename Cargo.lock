@@ -185,6 +185,7 @@ dependencies = [
  "cap-secrets",
  "cap-skills",
  "cap-tools",
+ "cap-ui",
 ]
 
 [[package]]
@@ -490,6 +491,7 @@ dependencies = [
  "cap-secrets",
  "cap-skills",
  "cap-tools",
+ "cap-ui",
  "chacha20poly1305",
  "chrono",
  "fd-lock",
@@ -1480,6 +1482,24 @@ dependencies = [
  "wit-component",
  "wit-parser",
  "zeroize",
+]
+
+[[package]]
+name = "cap-ui"
+version = "0.1.54"
+dependencies = [
+ "advance-database",
+ "advance-runtime",
+ "advance-shared-types",
+ "async-trait",
+ "cap-grant",
+ "cap-http",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -4734,6 +4754,7 @@ dependencies = [
  "cap-secrets",
  "cap-skills",
  "cap-tools",
+ "cap-ui",
  "chrono",
  "futures",
  "git2",

@@ -58,7 +58,7 @@ advance-core = { git = "https://github.com/advancinggg/advance-agents", tag = "v
 ### 能力（宿主函数面）
 
 `cap-fs` · `cap-secrets` · `cap-http` · `cap-llm` · `cap-grant` · `cap-memory` ·
-`cap-tools` · `cap-skills` · `cap-mcp` · `cap-channel` · `cap-lifecycle`
+`cap-tools` · `cap-skills` · `cap-mcp` · `cap-channel` · `cap-lifecycle` · `cap-ui`
 
 ### 服务
 

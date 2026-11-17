@@ -241,6 +241,10 @@ const KNOWN_EXTENSIONS: &[&str] = &[
     // Layer 3 callables (ADR 2026-10-24 A7).
     "callable.invoked",
     "callable.unknown-dropped",
+    // UI automation families (ADR 2026-10-28; `taxonomy::ui::*`). Never a trigger.
+    "ui.action",
+    "ui.observation",
+    "ui.refused",
     // `fs.mkdir` host fn (ADR 2026-10-24 A3). Canonical fs.* stays 6.
     "fs.mkdir",
 ];

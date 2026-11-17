@@ -63,7 +63,7 @@ El workspace tiene 31 crates. Todo está invertido en dependencias a través de 
 ### Capacidades (superficies host-function)
 
 `cap-fs` · `cap-secrets` · `cap-http` · `cap-llm` · `cap-grant` · `cap-memory` ·
-`cap-tools` · `cap-skills` · `cap-mcp` · `cap-channel` · `cap-lifecycle`
+`cap-tools` · `cap-skills` · `cap-mcp` · `cap-channel` · `cap-lifecycle` · `cap-ui`
 
 ### Servicios
 

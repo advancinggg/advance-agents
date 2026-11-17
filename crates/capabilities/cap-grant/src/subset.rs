@@ -140,6 +140,8 @@ impl SubsetValidator for SubsetValidatorImpl {
             // `data` grant. The arm stays so persisted grants still narrow and revoke cleanly.
             "data" => check_list_subset(&parent.params, &child.params, &["mode"]),
             "mcp" => check_mcp(&parent.params, &child.params),
+            "browser" => check_browser(&parent.params, &child.params),
+            "screen" => check_screen(&parent.params, &child.params),
             "skills" => check_skills(&parent.params, &child.params),
             "web" => Err(CapGrantError::SubsetViolation(
                 "web is a whole-capability-only grant dimension; param-level subset rules \
@@ -796,4 +798,113 @@ fn check_numeric_le(
         )));
     }
     Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// UI automation families (ADR 2026-10-28 D2) — `browser` / `screen`.
+//
+// `origins` (browser) and `targets` (screen) are allowlists. A parent that
+// carries the key covers a child token only when one of its entries covers it
+// (`origin_covered` for origins, exact match for targets); a parent WITHOUT the
+// key leaves that dimension unrestricted (the operator restricted other knobs
+// only), and an EMPTY parent list covers nothing — the fail-closed reading the
+// ADR asks for ("an empty list denies everything, it does not mean all").
+//
+// The knobs (`confirm`, `downloads`, `surfaces`, `mode`, `secure-input`) are
+// restriction dimensions: a child may only be as permissive as its parent.
+// ----------------------------------------------------------------------------
+
+pub use advance_shared_types::ui::origin_covered;
+
+/// `browser` family rule (see the module comment above).
+fn check_browser(parent: &[CapParam], child: &[CapParam]) -> Result<(), CapGrantError> {
+    if let Some(c) = get_param(child, "origins") {
+        if let Some(p) = get_param(parent, "origins") {
+            let parent_entries = parse_csv(p);
+            for origin in parse_csv(c) {
+                if !parent_entries.iter().any(|e| origin_covered(e, origin)) {
+                    return Err(CapGrantError::SubsetViolation(format!(
+                        "browser.origins: {origin:?} is not covered by the granted origins"
+                    )));
+                }
+            }
+        }
+    }
+    check_list_subset(parent, child, &["surfaces"])?;
+    check_confirm_not_wider(parent, child)?;
+    check_bool_not_wider(parent, child, "downloads")
+}
+
+/// `screen` family rule (see the module comment above).
+fn check_screen(parent: &[CapParam], child: &[CapParam]) -> Result<(), CapGrantError> {
+    if let Some(c) = get_param(child, "targets") {
+        if let Some(p) = get_param(parent, "targets") {
+            let parent_entries = parse_csv(p);
+            for target in parse_csv(c) {
+                if !parent_entries
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case(target))
+                {
+                    return Err(CapGrantError::SubsetViolation(format!(
+                        "screen.targets: {target:?} is not among the granted targets"
+                    )));
+                }
+            }
+        }
+    }
+    if let (Some(p), Some(c)) = (get_param(parent, "mode"), get_param(child, "mode")) {
+        // `ax` ⊂ `pixel` (pixel mode implies the text verbs).
+        if p.trim() != "pixel" && c.trim() != p.trim() {
+            return Err(CapGrantError::SubsetViolation(format!(
+                "screen.mode: child {c:?} is wider than parent {p:?}"
+            )));
+        }
+    }
+    check_confirm_not_wider(parent, child)?;
+    check_bool_not_wider(parent, child, "secure-input")
+}
+
+fn confirm_rank(v: &str) -> Option<u8> {
+    match v.trim() {
+        "never" => Some(0),
+        "sensitive" => Some(1),
+        "always" => Some(2),
+        _ => None,
+    }
+}
+
+/// `confirm`: a child may not confirm less often than its parent.
+fn check_confirm_not_wider(parent: &[CapParam], child: &[CapParam]) -> Result<(), CapGrantError> {
+    let (Some(p), Some(c)) = (get_param(parent, "confirm"), get_param(child, "confirm")) else {
+        return Ok(());
+    };
+    match (confirm_rank(p), confirm_rank(c)) {
+        (Some(pr), Some(cr)) if cr >= pr => Ok(()),
+        (Some(_), Some(_)) => Err(CapGrantError::SubsetViolation(format!(
+            "confirm: child {c:?} confirms less than parent {p:?}"
+        ))),
+        _ => Err(CapGrantError::SubsetViolation(format!(
+            "confirm: unknown value (parent {p:?}, child {c:?}); expected never | sensitive | always"
+        ))),
+    }
+}
+
+/// A boolean knob a child may only turn off, never on.
+fn check_bool_not_wider(
+    parent: &[CapParam],
+    child: &[CapParam],
+    key: &str,
+) -> Result<(), CapGrantError> {
+    let (Some(p), Some(c)) = (get_param(parent, key), get_param(child, key)) else {
+        return Ok(());
+    };
+    match (p.trim(), c.trim()) {
+        ("true", _) | (_, "false") => Ok(()),
+        ("false", "true") => Err(CapGrantError::SubsetViolation(format!(
+            "{key}: child enables what parent disables"
+        ))),
+        _ => Err(CapGrantError::SubsetViolation(format!(
+            "{key}: expected true | false (parent {p:?}, child {c:?})"
+        ))),
+    }
 }

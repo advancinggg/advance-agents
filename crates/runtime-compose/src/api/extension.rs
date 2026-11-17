@@ -11,13 +11,15 @@ use super::extension_cx::{ComposeCx, EmitError, SecretViewError, StartedCx, View
 use super::host_functions::HostFunctionRegistrar;
 use super::inference::InferenceContribution;
 use super::tools::ToolRegistrar;
+use super::ui::UiDriverRegistrar;
 
 /// A product (or test) addition to the composition. Trusted in-process code: the
 /// registrars stop collisions and broken invariants; they are not a sandbox (ADR D2
 /// trust model).
 ///
 /// Order: `capabilities` → `inference` (only with `llm`) → `host_functions` → `tools`
-/// (only with `tools`) → `client_families` → (Client API bind) → `on_started`
+/// (only with `tools`) → `ui_drivers` (only with `browser` / `screen`) → `client_families`
+/// → (Client API bind) → `on_started`
 /// (spawned). `id`, `capabilities` and `needs_secret_store` are declarations, read
 /// once before any side effect. `shutdown` runs in shutdown step 3, reverse
 /// registration order, for every extension of a composition whose wiring started —
@@ -77,8 +79,24 @@ pub trait ComposeExtension: Send + Sync + 'static {
         Box::pin(async { Ok(()) })
     }
 
+    /// UI drivers (ADR 2026-10-28 D2): the product's `BrowserDriverPort` /
+    /// `ScreenDriverPort`, after `tools` and before `client_families`. Called only
+    /// when the home declares `browser` or `screen`; one driver per surface per
+    /// composition (a second is refused: [`UiDriverRefusal::Duplicate`](super::UiDriverRefusal)).
+    /// The composition registers the `browser__*` / `screen__*` callables for the
+    /// declared surfaces whether or not a driver was registered; without one they
+    /// answer `not-found` with the fixed reason "no ui driver attached".
+    fn ui_drivers(
+        &self,
+        cx: &ComposeCx,
+        reg: &mut UiDriverRegistrar,
+    ) -> Result<(), ExtensionError> {
+        let _ = (cx, reg);
+        Ok(())
+    }
+
     /// (a) Called once per extension, phase-major in registration order, after
-    /// `tools` and before the Client API is bound. Routes are recorded,
+    /// `ui_drivers` and before the Client API is bound. Routes are recorded,
     /// validated, and replayed inside the bind factory.
     fn client_families(
         &self,

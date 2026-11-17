@@ -72,6 +72,10 @@ pub mod log_keys {
     pub const SHUTTING_DOWN: &str = "start.shutting_down";
     /// stdout: the deployed agent component is loaded and its loop serves messages.
     pub const AGENT_LOOP_WIRED: &str = "start.agent_loop_wired";
+    /// stdout: an extension registered a UI driver (browser or screen).
+    pub const UI_DRIVER_REGISTERED: &str = "start.ui_driver";
+    /// stdout: the `browser__*` / `screen__*` callables are registered for the declared surfaces.
+    pub const UI_CALLABLES: &str = "start.ui_callables";
     /// stdout: a lineage CREATE_DRIVER was replaced with the current default driver.
     pub const DRIVER_UPGRADED: &str = "start.driver_upgraded";
     /// stderr: replacing a lineage CREATE_DRIVER failed; the existing file was kept.
@@ -287,6 +291,8 @@ pub mod log_keys {
         READINESS_WALK_TIMEOUT,
         SHUTTING_DOWN,
         AGENT_LOOP_WIRED,
+        UI_DRIVER_REGISTERED,
+        UI_CALLABLES,
         DRIVER_UPGRADED,
         DRIVER_UPGRADE_FAILED,
         MSG_LISTENER,

@@ -45,7 +45,8 @@ pub use approval_intake::{
 pub use capability_subset::{project_capability_params, validate_capability_subset};
 pub use cascade::CascadeResult;
 pub use check::{
-    AuthzLevel, GrantCheckImpl, McpGrantReaderImpl, ToolsGrantReaderImpl, WebGrantReaderImpl,
+    AuthzLevel, GrantCheckImpl, McpGrantReaderImpl, ToolsGrantReaderImpl, UiPolicyReaderImpl,
+    WebGrantReaderImpl,
 };
 pub use compile::{StaticConfigCompiler, MAX_YAML_BYTES};
 pub use data::{
@@ -69,7 +70,7 @@ pub use resolver::{
 };
 pub use sqlite::GrantSqliteIndex;
 pub use store::GrantStore;
-pub use subset::{url_pattern_subset, SubsetValidator, SubsetValidatorImpl};
+pub use subset::{origin_covered, url_pattern_subset, SubsetValidator, SubsetValidatorImpl};
 pub use sweeper::TtlSweeper;
 pub use wit_impl::{
     register_agent_grant, AgentGrantBundle, AGENT_GRANT_CAPABILITY, AGENT_GRANT_NAMESPACE,

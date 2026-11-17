@@ -263,6 +263,10 @@ pub enum ScanContext {
     NotifyOutbound,
     ChannelBidi,
     LogOutput,
+    /// A tool / callable result on its way into the turn transcript (ADR
+    /// 2026-10-28 D2: UI observations — page text, accessibility trees — are
+    /// untrusted data and are scanned before `record_tool_result`).
+    ToolOutput,
 }
 
 /// Single pattern hit. `pattern_name` is bounded ≤ 256 bytes (implementer

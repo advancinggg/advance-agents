@@ -1,6 +1,6 @@
 //! Extension capability names: grammar, collisions, and the per-compose bound.
 
-use crate::agent_config::KNOWN_CAPABILITIES;
+use crate::agent_config::{KNOWN_CAPABILITIES, LAYER3_CAPABILITIES};
 use crate::api::{CapabilityRefusal, ComposeError};
 use crate::effective_capabilities::{
     EXTENSION_CAPABILITY_MAX_LEN, MAX_EXTENSION_CAPABILITIES, RESERVED_CAPABILITY_NAMES,
@@ -29,7 +29,10 @@ pub fn check_names(
         ));
     }
     for (index, name) in caps.iter().copied().enumerate() {
-        if KNOWN_CAPABILITIES.contains(&name) || RESERVED_CAPABILITY_NAMES.contains(&name) {
+        if KNOWN_CAPABILITIES.contains(&name)
+            || LAYER3_CAPABILITIES.contains(&name)
+            || RESERVED_CAPABILITY_NAMES.contains(&name)
+        {
             return Err(refused(id, name, CapabilityRefusal::Known));
         }
         if let Some(owner) = owner_in_earlier(earlier, name) {
@@ -377,6 +380,26 @@ mod tests {
             }
             .to_string(),
             format!("more than {MAX_EXTENSION_CAPABILITIES} extension capabilities")
+        );
+    }
+
+    /// ADR 2026-10-28: `browser` / `screen` are OSS capability names even though
+    /// they own no host functions (Layer 3 only), so an extension cannot claim them.
+    #[test]
+    fn layer3_capability_names_are_known() {
+        const BROWSER: &[&str] = &["browser"];
+        assert_collision(
+            check_names(&[], "fixture", BROWSER),
+            "fixture",
+            "browser",
+            CapabilityRefusal::Known,
+        );
+        const SCREEN: &[&str] = &["screen"];
+        assert_collision(
+            check_names(&[], "fixture", SCREEN),
+            "fixture",
+            "screen",
+            CapabilityRefusal::Known,
         );
     }
 

@@ -83,6 +83,11 @@ fn allowed_param_keys(capability: &str) -> Option<&'static [&'static str]> {
         "tools" => Some(&["ids"]),
         "notify" => Some(&["targets"]),
         "mcp" => Some(&["servers", "tool-patterns"]),
+        // UI automation families (ADR 2026-10-28 D2). `origins` / `targets` are
+        // allowlists (an empty list denies); the other keys are policy knobs the
+        // `cap_ui` family reads through `UiPolicyReader`.
+        "browser" => Some(&["origins", "surfaces", "confirm", "downloads"]),
+        "screen" => Some(&["targets", "mode", "confirm", "secure-input"]),
         "skills" => Some(&["allowed-actions", "max-active-skills"]),
         "web" => Some(&[]),
         // Retired family (the `data` host tool is authorized by `fs`); kept parseable for
