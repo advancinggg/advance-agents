@@ -46,6 +46,21 @@ pub enum EmbedderError {
     /// Upstream embedding service failed (transport / rate-limit / 5xx / etc.)
     #[error("upstream embedding failure: {0}")]
     Upstream(String),
+    /// The embedding service answered, and refused THIS text (it is too long for the
+    /// model, for one): asking again with the same text gets the same answer, while
+    /// another text may well be embedded. An embedder reports this only when the
+    /// refusal is certainly about the text — anything else is [`Self::Upstream`]. The
+    /// payload is under the same sanitization contract.
+    #[error("the embedding service refused the text: {0}")]
+    Refused(String),
+}
+
+impl EmbedderError {
+    /// Whether the failure is about the text itself ([`Self::Refused`]) rather than the
+    /// service.
+    pub fn is_about_the_text(&self) -> bool {
+        matches!(self, EmbedderError::Refused(_))
+    }
 }
 
 /// Cap-memory-internal embedder seam (AC-19). Compute an L1 vector embedding
@@ -58,6 +73,38 @@ pub enum EmbedderError {
 #[async_trait]
 pub trait Embedder: Send + Sync {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError>;
+
+    /// Embed `text` and name the model that produced the vector, so the index
+    /// can bind the two (a reader never compares vectors of different models).
+    ///
+    /// - `(vector, Some(model))` — a semantic embedding of that model.
+    /// - `(vector, None)` — the embedder cannot name a model (the default, and
+    ///   the stub sketch).
+    /// - `(empty, None)` — there is nothing to embed with right now (e.g. the
+    ///   agent's chat provider serves no embeddings). NOT an error: the row is
+    ///   still written, without a vector, and never matches a similarity query.
+    async fn embed_recorded(
+        &self,
+        text: &str,
+    ) -> Result<(Vec<f32>, Option<String>), EmbedderError> {
+        Ok((self.embed(text).await?, None))
+    }
+
+    /// The model the next [`Self::embed_recorded`] would use, when the embedder
+    /// knows it without making a request. `None` (the default) — unknown, or
+    /// nothing to embed with.
+    ///
+    /// It is what the vector catch-up goes by
+    /// ([`crate::post_processor::Components::heal_vectors`]): rows whose vector is not
+    /// of this model are embedded again, a few per turn end. The writers never ask —
+    /// they embed a new text and keep the vector of an unchanged one. An embedder that
+    /// answers `Some` here MUST name the model of every vector `embed_recorded`
+    /// returns: a vector without a model can never be stored as "of this model", so
+    /// the catch-up treats it as a failed request rather than ask for it again at
+    /// every turn end.
+    fn current_model(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Deterministic 8-dim per-byte-folded sketch (L2-normalized).

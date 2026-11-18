@@ -1,15 +1,16 @@
 //! B1 backbone — `GatewayEmbedding` adapter test over the real cap-llm gateway.
 //!
-//! `GatewayEmbedding` (cli `context_wiring`) wraps `LlmGateway::embed`
-//! (`/v1/embeddings`, CONTRACT-081) as the context-engine `EmbeddingPort`. It is
-//! built this slice but deliberately NOT injected into the live assembler
-//! (hermeticity — see MODULE-010 §3.6 B1 row), so it has no e2e turn path. This
-//! test exercises it directly against the harness loopback gateway (the real
-//! `LlmGateway` over a loopback `/v1/embeddings` endpoint — only the external HTTP
-//! peer is doubled), proving the wrapper forwards `embed` + maps the result.
+//! `GatewayEmbedding` (cli `context_wiring`) wraps the gateway's per-agent
+//! embedding (`LlmGateway::embed_for_agent` → `/v1/embeddings`) as the
+//! context-engine `EmbeddingPort`: an agent's text is embedded only by the
+//! provider that agent chats with. This test exercises it directly against the
+//! harness loopback gateway (the real `LlmGateway` over a loopback
+//! `/v1/embeddings` endpoint — only the external HTTP peer is doubled), proving
+//! the wrapper forwards `embed` + maps the result, for the agent it is built for.
 
-use advance_cli::context_wiring::{EmbeddingPort, GatewayEmbedding};
+use advance_cli::context_wiring::{live_embedding_model, EmbeddingPort, GatewayEmbedding};
 use system_acceptance::llm_loopback::ScriptedResponse;
+use system_acceptance::llm_loopback::LOOPBACK_EMBEDDING_MODEL;
 use system_acceptance::{Cap, LlmMode, SystemUnderTest};
 
 const HELLO_LLM_CORE: &[u8] =
@@ -30,12 +31,18 @@ async fn gateway_embedding_forwards_to_loopback_embeddings() {
     let gateway = sut
         .llm_gateway()
         .expect("loopback registered an LlmGateway");
-    let port = GatewayEmbedding::new(gateway);
+    // The agent chats with the loopback entry, which names an embedding model:
+    // that entry is the agent's embedding route.
+    assert_eq!(
+        live_embedding_model(&gateway, sut.agent_id()).as_deref(),
+        Some(LOOPBACK_EMBEDDING_MODEL)
+    );
+    let port = GatewayEmbedding::new(gateway, sut.agent_id());
 
     let v = port
         .embed("a short embedding input")
         .await
-        .expect("GatewayEmbedding forwards to LlmGateway::embed against the loopback");
+        .expect("GatewayEmbedding forwards to the agent's embedding route on the loopback");
 
     // The loopback `/v1/embeddings` handler returns a FIXED deterministic vector
     // (`[0.1, 0.2]`); the adapter must surface it VERBATIM (no transform/truncate,

@@ -13,8 +13,10 @@
 //! - Public production impl: `LlmGateway` with `chat_for_run` non-trait
 //!   inherent method (round-4 C1 verification surface for AC-15).
 //! - Internal: `LlmRequestContext` envelope (NOT on the trait surface),
-//!   `generate(LlmRequestContext)` entry, `select_embedding_provider`,
+//!   `generate(LlmRequestContext)` entry, `embedding_model_for`,
 //!   `build_http_cap`, `map_http_err_to_llm`.
+//! - Embedding follows chat: `embed_for_agent` / `embedding_route_for` send an agent's
+//!   text only to the entry its chat requests are placed on (no hop to another entry).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,7 +52,7 @@ use crate::host_fn::{
     truncate_text_at_char_boundary, DEFAULT_STREAM_OUTPUT_TOKENS, MAX_ENCODED_TEXT_BYTES,
     MAX_TOKENS_PER_ATTEMPT, STREAM_HANDLE_TTL,
 };
-use crate::provider::{make_resolved, ResolvedProvider};
+use crate::provider::ResolvedProvider;
 use crate::providers::select_adapter;
 use crate::retry::{backoff_ms, classify_retryable, resolve_retry_config, PartialRetry};
 use crate::structured_output::try_parse_and_validate;
@@ -329,6 +331,104 @@ pub(crate) struct LlmRequestContext {
     /// Lane agent-llm-policy: whether the caller agent's `llm:` policy shaped this request
     /// (`Agent`) or nothing applied (`Default`). Emitted as `llm.request.policy_source`.
     pub policy_source: crate::policy::LlmPolicySource,
+    /// Who makes the request (see [`Caller`]).
+    pub caller: Caller,
+}
+
+/// Who makes a chat request in an agent's name. Where an agent's own guest is served is
+/// where that agent chats, and what the host sends on an agent's behalf follows it there
+/// ([`LlmGateway::chat_entry`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Caller {
+    /// A host surface that names no agent of its own — the CONTRACT-081 methods of
+    /// [`LlmGateway`], `chat_for_run`, `chat_structured`, a provider preflight. Placed
+    /// like any request; says nothing about where an agent chats.
+    #[default]
+    Host,
+    /// The agent's own guest (`agent-llm` generate / stream). The entry that serves it is
+    /// recorded as the one the agent chats on.
+    AgentGuest,
+    /// The host, on an agent's behalf ([`AgentGateway`]). Confined to the entry that agent
+    /// chats on; sent nowhere while that entry is not known.
+    HostForAgent,
+}
+
+/// Agents whose serving entry is remembered at once ([`ChatsServed`]). A home has far
+/// fewer; an agent id is one more record for every child that ever chatted, so the
+/// number is bounded. Past the bound the agent served longest ago makes room — its
+/// record is written again by its next own request, exactly as after a restart.
+const MAX_AGENTS_SERVED: usize = 4096;
+
+/// Per agent (bare cap id): the entry that served its most recent own request
+/// ([`Caller::AgentGuest`]) to its end. Tells [`LlmGateway::chat_entry`] where an agent
+/// whose policy admits several entries chats. Process memory only: unknown again after
+/// a restart.
+///
+/// Only the entry is kept. The model that request named is not: a request the host
+/// makes on the agent's behalf is sent with the model the agent's policy and the entry
+/// name, never with one its guest chose.
+#[derive(Default)]
+struct ChatsServed {
+    state: Mutex<ChatsServedState>,
+}
+
+#[derive(Default)]
+struct ChatsServedState {
+    /// The serving entry (provider id) of each agent, with the count of records written
+    /// when it was written.
+    by_agent: HashMap<String, (String, u64)>,
+    written: u64,
+}
+
+impl ChatsServed {
+    /// The id of the entry that served `agent_id`'s most recent own request.
+    fn of(&self, agent_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .by_agent
+            .get(agent_id)
+            .map(|(provider_id, _)| provider_id.clone())
+    }
+
+    /// Record that a request of `agent_id` was served by `provider_id`. Only the agent's
+    /// own guest ([`Caller::AgentGuest`]) says where the agent chats.
+    fn note(&self, caller: Caller, agent_id: &str, provider_id: &str) {
+        if caller != Caller::AgentGuest {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.written += 1;
+        let written = state.written;
+        if !state.by_agent.contains_key(agent_id) && state.by_agent.len() >= MAX_AGENTS_SERVED {
+            let longest_ago = state
+                .by_agent
+                .iter()
+                .min_by_key(|(_, (_, written))| *written)
+                .map(|(agent, _)| agent.clone());
+            if let Some(agent) = longest_ago {
+                state.by_agent.remove(&agent);
+            }
+        }
+        state
+            .by_agent
+            .insert(agent_id.to_string(), (provider_id.to_string(), written));
+    }
+
+    /// Drop the record of `agent_id` (the agent is gone; see
+    /// [`LlmGateway::forget_agent`]).
+    fn forget(&self, agent_id: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .by_agent
+            .remove(agent_id);
+    }
+
+    #[cfg(test)]
+    fn agents(&self) -> usize {
+        self.state.lock().unwrap().by_agent.len()
+    }
 }
 
 /// Winner payload from one hop. Outer generate() is the only success
@@ -505,6 +605,10 @@ pub struct LlmGateway {
     /// credential. `None` = not wired; such an entry then fails closed with a fixed reason,
     /// and every API-key entry is unaffected.
     credential_source: Option<Arc<dyn crate::credential::ProviderCredentialSource>>,
+    /// Where each agent's most recent own request was served ([`ChatsServed`]). Shared
+    /// with the owner task of a live stream, which records the entry once the stream has
+    /// ended well.
+    chats_served: Arc<ChatsServed>,
 }
 
 /// What it takes to tell the credential source that the upstream rejected an entry's
@@ -616,6 +720,7 @@ impl LlmGateway {
             last_dropped_unknown: Mutex::new(Vec::new()),
             agent_policy: None,
             credential_source: None,
+            chats_served: Arc::default(),
         }
     }
 
@@ -1368,10 +1473,12 @@ impl LlmGateway {
 
     async fn embed_via_local(
         &self,
+        agent_id: &str,
         text: &str,
         resolved: ResolvedProvider,
         start: Instant,
         placement: Option<crate::placement::PlacementRecord>,
+        policy_source: crate::policy::LlmPolicySource,
     ) -> Result<Vec<f32>, LlmError> {
         let model = resolved
             .embedding_model
@@ -1379,7 +1486,7 @@ impl LlmGateway {
             .ok_or_else(|| LlmError::ModelNotAvailable("local embedding_model unset".into()))?;
         let port = self.port_for(&resolved)?;
         let placeholder_ctx = LlmRequestContext {
-            agent_id: self.default_agent_id.clone(),
+            agent_id: agent_id.to_string(),
             task_id: None,
             run_id: None,
             iteration: None,
@@ -1391,7 +1498,7 @@ impl LlmGateway {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement,
-            policy_source: Default::default(),
+            policy_source,
             ..Default::default()
         };
         emit_llm_request(self.event_bus.as_ref(), &placeholder_ctx, &model);
@@ -1448,6 +1555,21 @@ impl LlmGateway {
                 return Err(mapped);
             }
         };
+        // A local backend's answer is checked like a provider's: what cannot be an
+        // embedding is an error, never a stored vector.
+        if let Err(invalid) = crate::providers::validate_embedding(&resp.vector) {
+            emit_llm_error(
+                self.event_bus.as_ref(),
+                &placeholder_ctx,
+                &model,
+                invalid.variant_name(),
+                0,
+                None,
+                None,
+                None,
+            );
+            return Err(invalid);
+        }
         let latency_ms = start.elapsed().as_millis() as u64;
         let synth_resp = ChatResponse {
             text: String::new(),
@@ -1510,49 +1632,377 @@ impl advance_shared_types::inference::LocalInferenceResolve for LlmGateway {
     }
 }
 
+/// Where an agent's embedding requests go: the provider its chat requests are placed on,
+/// with the embedding model that provider serves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddingRoute {
+    /// The `llm-providers[].id` of the agent's chat provider.
+    pub provider_id: String,
+    /// The embedding model id sent to it. Index consumers bind every vector to this id.
+    pub model: String,
+}
+
+/// One embedding and where it came from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Embedded {
+    pub vector: Vec<f32>,
+    /// The embedding model that produced `vector`.
+    pub model: String,
+    /// The `llm-providers[].id` that served the request.
+    pub provider_id: String,
+}
+
+/// Why a provider entry does not serve embeddings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EmbeddingIncapable {
+    /// The entry's API has no embeddings endpoint: the Anthropic Messages API, or a vendor
+    /// agent CLI (text in, text out).
+    NoEmbeddingsApi,
+    /// The token of a ChatGPT sign-in entry is never sent to `/v1/embeddings`.
+    SignInEntry,
+    /// The entry names no `embedding-model`, and its endpoint is not one whose embedding
+    /// model is known without it (only OpenAI's own API is).
+    NoEmbeddingModel,
+}
+
+impl EmbeddingIncapable {
+    /// A short fixed description. Carries no configuration value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EmbeddingIncapable::NoEmbeddingsApi => "has no embeddings endpoint",
+            EmbeddingIncapable::SignInEntry => "is a sign-in entry, which never embeds",
+            EmbeddingIncapable::NoEmbeddingModel => "has no embedding-model configured",
+        }
+    }
+}
+
+/// Why an agent has no embedding route. In every case no request is made and no `llm.*`
+/// event is emitted: text is never embedded by a provider the agent does not chat with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EmbeddingUnavailable {
+    /// The agent's `llm:` policy admits no configured provider entry, so there is no
+    /// provider to follow. Holds the error a chat request of this agent gets.
+    NoChatProvider(LlmError),
+    /// The agent's policy admits several entries and none of them has served a request
+    /// of the agent's own since the start, so the one it chats with is not known. (An
+    /// entry that served it and is no longer open to it does not count.)
+    ChatProviderUnknown,
+    /// The provider the agent chats with cannot be used at this moment: it is not
+    /// authorized, or it is not on the device the agent is pinned to.
+    ChatProviderNotUsable { provider_id: String },
+    /// The provider the agent chats with does not serve embeddings.
+    ProviderCannotEmbed {
+        provider_id: String,
+        reason: EmbeddingIncapable,
+    },
+}
+
+impl std::fmt::Display for EmbeddingUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmbeddingUnavailable::NoChatProvider(e) => {
+                write!(f, "no chat provider to follow ({e})")
+            }
+            EmbeddingUnavailable::ChatProviderUnknown => {
+                write!(f, "{NOT_SERVED_YET}")
+            }
+            EmbeddingUnavailable::ChatProviderNotUsable { provider_id } => {
+                write!(f, "chat provider {provider_id} {NOT_USABLE_NOW}")
+            }
+            EmbeddingUnavailable::ProviderCannotEmbed {
+                provider_id,
+                reason,
+            } => write!(f, "chat provider {provider_id} {}", reason.as_str()),
+        }
+    }
+}
+
+impl From<EmbeddingUnavailable> for LlmError {
+    fn from(unavailable: EmbeddingUnavailable) -> Self {
+        match unavailable {
+            EmbeddingUnavailable::NoChatProvider(e) => e,
+            other => LlmError::ModelNotAvailable(format!("embedding unavailable: {other}")),
+        }
+    }
+}
+
+/// Why nothing is sent for an agent free to chat on several entries before one of them
+/// served it.
+const NOT_SERVED_YET: &str = "none of the providers open to this agent has served it yet";
+
+/// Why nothing is sent to a chat entry placement would refuse at this moment.
+const NOT_USABLE_NOW: &str =
+    "is not usable at the moment (not authorized, or not on the device this agent is pinned to)";
+
+/// A resolved embedding request target (see [`LlmGateway::embedding_plan`]).
+struct EmbeddingPlan {
+    placement: crate::placement::PlacementRecord,
+    provider_cfg: LlmProviderConfig,
+    /// `embedding_model` is always `Some(model)` here, so the adapter and the inference
+    /// port send exactly the model the route reports.
+    resolved: ResolvedProvider,
+    model: String,
+    policy_source: crate::policy::LlmPolicySource,
+}
+
+/// The entry an agent chats on ([`LlmGateway::chat_entry`]).
+struct ChatEntry {
+    provider: LlmProviderConfig,
+    /// How the entry is known: the agent's policy admits no other, or it served the
+    /// agent's most recent own request.
+    known_from: ChatEntrySource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatEntrySource {
+    Policy,
+    Served,
+}
+
+impl ChatEntrySource {
+    /// The `placement_reason` of a request the host sends to an agent's chat entry.
+    fn placement_reason(self) -> &'static str {
+        match self {
+            ChatEntrySource::Policy => "follows-chat:policy",
+            ChatEntrySource::Served => "follows-chat:served",
+        }
+    }
+}
+
+/// Why [`LlmGateway::chat_entry`] names no entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NoChatEntry {
+    /// The agent's policy admits no configured entry: the error its chat requests get.
+    NotAdmitted(LlmError),
+    /// Several entries are admitted and none of them has served the agent since the start.
+    NotServedYet,
+    /// The entry (by id) cannot be used at this moment ([`crate::placement::admits_now`]).
+    NotUsableNow(String),
+}
+
+impl From<NoChatEntry> for EmbeddingUnavailable {
+    fn from(none: NoChatEntry) -> Self {
+        match none {
+            NoChatEntry::NotAdmitted(e) => EmbeddingUnavailable::NoChatProvider(e),
+            NoChatEntry::NotServedYet => EmbeddingUnavailable::ChatProviderUnknown,
+            NoChatEntry::NotUsableNow(provider_id) => {
+                EmbeddingUnavailable::ChatProviderNotUsable { provider_id }
+            }
+        }
+    }
+}
+
+impl NoChatEntry {
+    /// The error of a chat request the host makes on behalf of `agent_id`.
+    fn into_chat_error(self, agent_id: &str) -> LlmError {
+        match self {
+            NoChatEntry::NotAdmitted(e) => e,
+            NoChatEntry::NotServedYet => {
+                LlmError::ModelNotAvailable(format!("agent {agent_id}: {NOT_SERVED_YET}"))
+            }
+            NoChatEntry::NotUsableNow(provider_id) => LlmError::ModelNotAvailable(format!(
+                "agent {agent_id}: chat provider {provider_id} {NOT_USABLE_NOW}"
+            )),
+        }
+    }
+}
+
 impl LlmGateway {
-    /// Whether the CURRENT provider config has at least one embedding-capable
-    /// entry (an OpenAI-compatible cloud endpoint, or a local / mesh entry with
-    /// an `embedding-model`; Anthropic, agent-cli and ChatGPT sign-in entries
-    /// never embed). The composition root gates the context assembler's live
-    /// embedding + the memory pipeline's real embedder on this, so a config
-    /// without an embedding provider never pays a failing `/v1/embeddings`
-    /// round-trip per turn.
-    pub fn has_embedding_provider(&self) -> bool {
-        let cfg = self.config_provider.current();
-        cfg.llm_providers.iter().any(is_embedding_capable)
+    /// The ONE entry `agent_id` chats on among `providers` — the list its `llm:` policy
+    /// leaves — under its hard `constraints`. Everything the host sends on the agent's
+    /// behalf (an embedding, a memory extraction, a classification) goes to this entry and
+    /// to no other.
+    ///
+    /// An agent whose policy admits a single entry chats on that entry. One whose policy
+    /// admits several chats wherever each of its requests is placed — by the model the
+    /// request names, by what it needs, by which entry answers — so its entry is the one
+    /// that served its most recent own request, and it has none until one was served.
+    fn chat_entry(
+        &self,
+        agent_id: &str,
+        providers: &[LlmProviderConfig],
+        constraints: &[crate::placement::UserHardConstraint],
+    ) -> Result<ChatEntry, NoChatEntry> {
+        if providers.is_empty() {
+            return Err(NoChatEntry::NotAdmitted(LlmError::ModelNotAvailable(
+                "no llm-providers configured".into(),
+            )));
+        }
+        let admitted: Vec<&LlmProviderConfig> = providers
+            .iter()
+            .filter(|p| crate::placement::admits(p, constraints))
+            .collect();
+        let entry = match admitted.as_slice() {
+            [] => {
+                return Err(NoChatEntry::NotAdmitted(LlmError::ModelNotAvailable(
+                    "no endpoints after constraints".into(),
+                )))
+            }
+            [only] => ChatEntry {
+                provider: (*only).clone(),
+                known_from: ChatEntrySource::Policy,
+            },
+            several => {
+                let served = self
+                    .chats_served
+                    .of(agent_id)
+                    .ok_or(NoChatEntry::NotServedYet)?;
+                let provider = several
+                    .iter()
+                    .find(|p| p.id == served)
+                    .ok_or(NoChatEntry::NotServedYet)?;
+                ChatEntry {
+                    provider: (*provider).clone(),
+                    known_from: ChatEntrySource::Served,
+                }
+            }
+        };
+        // The entry must also be one placement would use at this moment (authorized, on
+        // the pinned device): what the agent's own request cannot reach, nothing sent on
+        // its behalf reaches either.
+        if !crate::placement::admits_now(
+            &entry.provider,
+            constraints,
+            self.placement_telemetry.as_ref(),
+        ) {
+            return Err(NoChatEntry::NotUsableNow(entry.provider.id));
+        }
+        Ok(entry)
     }
 
-    /// The model id `embed()` would send, when an embedding-capable provider is
-    /// configured (the entry's `embedding-model`, else the adapter default).
-    pub fn embedding_model_id(&self) -> Option<String> {
-        let cfg = self.config_provider.current();
-        let resolved = select_embedding_provider(&cfg.llm_providers).ok()?;
-        resolved
-            .embedding_model
-            .clone()
-            .or_else(|| {
-                crate::providers::select_adapter(resolved.backend)
-                    .embedding_model()
-                    .map(str::to_string)
-            })
-            .or_else(|| (!resolved.model.is_empty()).then(|| resolved.model.clone()))
+    /// Test seam: `agent_id`'s own guest was last served by `provider_id` — what
+    /// [`Self::chat_entry`] reads when the agent's policy admits several entries.
+    #[cfg(test)]
+    pub(crate) fn test_agent_chats_on(&self, agent_id: &str, provider_id: &str) {
+        self.note_chat_served(Caller::AgentGuest, agent_id, provider_id);
     }
 
-    pub async fn embed_recorded(&self, text: &str) -> Result<(Vec<f32>, String), LlmError> {
+    /// Record that a request of `agent_id` was served by `provider_id`
+    /// ([`ChatsServed::note`]).
+    fn note_chat_served(&self, caller: Caller, agent_id: &str, provider_id: &str) {
+        self.chats_served.note(caller, agent_id, provider_id);
+    }
+
+    /// Forget where `agent_id` (the BARE cap agent id) chats: the agent is gone. An
+    /// agent created later under the same id starts like any agent after a restart — it
+    /// has no chat entry among several until one of them has served it — instead of
+    /// inheriting the entry of the agent that held the id before.
+    pub fn forget_agent(&self, agent_id: &str) {
+        self.chats_served.forget(agent_id);
+    }
+
+    /// The entries a chat request may be placed on: the caller agent's `llm:` policy
+    /// applied to `ctx` ([`Self::apply_agent_policy`]), and — for a request the host makes
+    /// on an agent's behalf ([`Caller::HostForAgent`]) — the one entry that agent chats on
+    /// ([`Self::chat_entry`]), so placement can pick no other and a failure hops nowhere.
+    ///
+    /// Such a request that names no model of its own is sent with the model the agent's
+    /// policy names, else the entry's default — what the owner configured. The model the
+    /// agent's guest named in a request of its own is not carried over: no run budget
+    /// covers these calls, so a guest must not be able to choose what they cost.
+    ///
+    /// The policy's model goes only to an entry a request of the agent's own naming it is
+    /// placed on ([`crate::placement::places_model_on`]): one that serves it, or — when no
+    /// entry the agent may chat on serves it — the first of them, which such a request
+    /// reaches with the name as it stands. The entry an agent free to chat on several
+    /// entries chats on is the one its own last request reached, and its guest may have
+    /// named a model of another entry for that request: where a request naming the
+    /// policy's model would go elsewhere, the entry's default is sent instead of a name the
+    /// entry does not know. (An entry that lists no models has no default: it gets the
+    /// policy's model as it stands, like any request placed on it.)
+    fn providers_for<'a>(
+        &self,
+        ctx: &mut LlmRequestContext,
+        providers: &'a [LlmProviderConfig],
+    ) -> Result<std::borrow::Cow<'a, [LlmProviderConfig]>, LlmError> {
+        let named_by_caller = ctx.params.model.is_some();
+        let admitted = self.apply_agent_policy(ctx, providers)?;
+        if ctx.caller != Caller::HostForAgent {
+            return Ok(admitted);
+        }
+        let entry = self
+            .chat_entry(&ctx.agent_id, &admitted, &ctx.user_constraints)
+            .map_err(|none| none.into_chat_error(&ctx.agent_id))?;
+        if entry.known_from == ChatEntrySource::Served && !named_by_caller {
+            let placed_elsewhere = ctx.params.model.as_deref().is_some_and(|model| {
+                !crate::placement::places_model_on(&admitted, model, &entry.provider.id)
+            });
+            if placed_elsewhere && crate::placement::bind_model(&entry.provider, None).is_some() {
+                ctx.params.model = None;
+            }
+        }
+        Ok(std::borrow::Cow::Owned(vec![entry.provider]))
+    }
+
+    /// Resolve where `agent_id`'s embedding requests go, from the CURRENT provider config
+    /// and the agent's CURRENT `llm:` policy.
+    ///
+    /// The route is the entry the agent chats on ([`Self::chat_entry`]) and it is the ONLY
+    /// entry an embedding may reach. There is no hop to another entry: an agent whose chat
+    /// provider cannot embed has no embeddings.
+    fn embedding_plan(&self, agent_id: &str) -> Result<EmbeddingPlan, EmbeddingUnavailable> {
         let cfg = self.config_provider.current();
-        let resolved = select_embedding_provider(&cfg.llm_providers)?;
-        let model = resolved
-            .embedding_model
-            .clone()
-            .or_else(|| {
-                crate::providers::select_adapter(resolved.backend)
-                    .embedding_model()
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| resolved.model.clone());
-        let vec = self.embed(text).await?;
-        Ok((vec, model))
+        let mut ctx = LlmRequestContext {
+            agent_id: agent_id.to_string(),
+            ..Default::default()
+        };
+        let providers = self
+            .apply_agent_policy(&mut ctx, &cfg.llm_providers)
+            .map_err(EmbeddingUnavailable::NoChatProvider)?;
+        let entry = self.chat_entry(agent_id, &providers, &ctx.user_constraints)?;
+        let provider_cfg = entry.provider;
+        let model = embedding_model_for(&provider_cfg).map_err(|reason| {
+            EmbeddingUnavailable::ProviderCannotEmbed {
+                provider_id: provider_cfg.id.clone(),
+                reason,
+            }
+        })?;
+        // The request names the embedding model only; no chat model is placed for it.
+        let mut resolved = crate::provider::make_resolved(&provider_cfg, model.clone());
+        resolved.embedding_model = Some(model.clone());
+        Ok(EmbeddingPlan {
+            placement: crate::placement::PlacementRecord {
+                endpoint_id: provider_cfg.id.clone(),
+                model_revision: model.clone(),
+                placement_reason: entry.known_from.placement_reason().into(),
+                strength: crate::placement::Strength::unbound(),
+            },
+            provider_cfg,
+            resolved,
+            model,
+            policy_source: ctx.policy_source,
+        })
+    }
+
+    /// The embedding route of `agent_id` (the BARE cap agent id), or why it has none.
+    /// Reads the live config and policy on every call, so a provider or policy change
+    /// applies to the next request without a restart. Makes no request.
+    pub fn embedding_route_for(
+        &self,
+        agent_id: &str,
+    ) -> Result<EmbeddingRoute, EmbeddingUnavailable> {
+        self.embedding_plan(agent_id).map(|plan| EmbeddingRoute {
+            provider_id: plan.provider_cfg.id,
+            model: plan.model,
+        })
+    }
+
+    /// Embed `text` for `agent_id` on the provider that agent chats with.
+    ///
+    /// `Ok(None)` — the agent has no embedding route ([`Self::embedding_route_for`] says
+    /// why): nothing was sent anywhere and no `llm.*` event was emitted. `Err` — the
+    /// request to the agent's own chat provider failed; no other provider is tried.
+    pub async fn embed_for_agent(
+        &self,
+        agent_id: &str,
+        text: &str,
+    ) -> Result<Option<Embedded>, LlmError> {
+        match self.embedding_plan(agent_id) {
+            Ok(plan) => self.embed_on(agent_id, plan, text).await.map(Some),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Small-witness 2026-06-11 — install §1.4.3c AGENT-TIER retry overrides.
@@ -1722,7 +2172,7 @@ impl LlmGateway {
         let cfg_now = self.config_provider.current();
         let mut ctx = ctx;
         // Lane agent-llm-policy: same pre-placement policy application as `generate`.
-        let providers = self.apply_agent_policy(&mut ctx, &cfg_now.llm_providers)?;
+        let providers = self.providers_for(&mut ctx, &cfg_now.llm_providers)?;
         let need = crate::capability::CapabilityNeed {
             tools: ctx.params.tools.as_ref().is_some_and(|t| !t.is_empty()),
             output_schema: ctx.output_schema.is_some(),
@@ -1746,6 +2196,7 @@ impl LlmGateway {
             .ok_or_else(|| LlmError::ModelNotAvailable(rec.endpoint_id.clone()))?;
         let resolved = crate::provider::make_resolved(&provider_cfg, rec.model_revision.clone());
         ctx.placement = Some(rec);
+        let (caller, served_by) = (ctx.caller, resolved.id.clone());
 
         // Stream path: absent max-tokens resolves to DEFAULT_STREAM_OUTPUT_TOKENS and
         // the RESOLVED value is serialized upstream — the reserved output ceiling is
@@ -1869,6 +2320,8 @@ impl LlmGateway {
         // The entry's own generate budget, when it sets one, is the HTTP layer's head and idle
         // bound for this stream; the single anchor below still caps the whole stream.
         let entry_timeout = resolved.generate_timeout;
+        // The owner records where the agent chats once the stream has ended well.
+        let served_owner = Arc::clone(&self.chats_served);
 
         let owner_task = tokio::spawn(async move {
             // ONE deadline anchor for the entire stream: dispatch, every pull,
@@ -2471,6 +2924,11 @@ impl LlmGateway {
                     // old value, so one record carried a cost_usd and an output_tokens
                     // that disagreed.
                     let (bill_in, bill_out) = settlement_owner.projected_bill();
+                    // The entry served this request to its end, as an entry that answers a
+                    // buffered request does: it is where the agent chats now. Recorded
+                    // before the terminal phase is published, so whatever the end of the
+                    // turn sends on the agent's behalf finds it.
+                    served_owner.note(caller, &agent_owner, &served_by);
                     crate::stream::LivePhase::Done {
                         model: model_owner.clone(),
                         input_tokens: bill_in,
@@ -2812,6 +3270,7 @@ impl LlmGateway {
         start: Instant,
         tee: &mut crate::stream::GenerateTee,
     ) -> Result<ChatResponse, LlmError> {
+        self.note_chat_served(ctx.caller, &ctx.agent_id, &outcome.provider_id);
         if let Some(rid) = &ctx.run_id {
             self.run_budget
                 .commit(rid, outcome.commit_tokens, outcome.commit_cost);
@@ -2917,7 +3376,7 @@ impl LlmGateway {
         // request BEFORE placement; a pinned provider absent from config fails closed here.
         // A `pin` (providers `:preflight`) skips the agent policy and uses that one entry.
         let providers = match pin {
-            None => self.apply_agent_policy(&mut ctx, &cfg.llm_providers)?,
+            None => self.providers_for(&mut ctx, &cfg.llm_providers)?,
             Some(id) => {
                 let only: Vec<LlmProviderConfig> = cfg
                     .llm_providers
@@ -3855,114 +4314,183 @@ impl LlmGateway {
 
 #[async_trait]
 impl LlmGatewayInternal for LlmGateway {
+    /// The frozen CONTRACT-081 entry names no caller: it chats as the gateway's default
+    /// agent, placed like any request of that agent ([`Caller::Host`]). Content that
+    /// belongs to one agent goes through [`LlmGateway::for_agent`] instead.
     async fn chat(
         &self,
         messages: Vec<ChatMessage>,
         params: ChatParams,
     ) -> Result<ChatResponse, LlmError> {
+        self.chat_as(Caller::Host, &self.default_agent_id, messages, params)
+            .await
+    }
+
+    /// The frozen CONTRACT-081 entry names no caller: it embeds for the gateway's default
+    /// agent, on that agent's chat provider (see [`LlmGateway::embed_for_agent`]). With no
+    /// embedding route it answers `ModelNotAvailable` and nothing is sent.
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, LlmError> {
+        self.embed_required(&self.default_agent_id, text).await
+    }
+
+    async fn stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        params: ChatParams,
+    ) -> Result<
+        Box<dyn futures_core::Stream<Item = Result<ChatDelta, LlmError>> + Send + Unpin>,
+        LlmError,
+    > {
+        // Slice D — single-chunk trait surface (AC-10 + §2.7 Stream Flow).
+        // Delegate to generate() with output_schema=None; wrap the resulting
+        // ChatResponse in a one-item futures::stream::iter.
+        self.stream_internal(Caller::Host, &self.default_agent_id, messages, params, None)
+            .await
+    }
+}
+
+/// The gateway as ONE agent's ([`LlmGateway::for_agent`]): a CONTRACT-081 surface whose
+/// every request is made on that agent's behalf — under its `llm:` policy, on the one
+/// entry its own turns chat on, and reported as its request — where the gateway's own
+/// trait surface makes a request as the default agent.
+///
+/// The host makes model calls of its own on an agent's behalf (the turn-end memory
+/// extraction, the consolidation classifier, the task tie-break, a text file's
+/// description). Each carries that agent's content, so it goes where the agent's chat
+/// goes and nowhere else: an agent whose policy admits no entry gets the error, and so
+/// does one whose policy admits several while none has served it yet — never another
+/// agent's provider, never an entry the agent does not chat on.
+pub struct AgentGateway {
+    gateway: Arc<LlmGateway>,
+    agent_id: String,
+}
+
+impl AgentGateway {
+    /// The agent every request is made as (the BARE cap agent id).
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+}
+
+#[async_trait]
+impl LlmGatewayInternal for AgentGateway {
+    async fn chat(
+        &self,
+        messages: Vec<ChatMessage>,
+        params: ChatParams,
+    ) -> Result<ChatResponse, LlmError> {
+        self.gateway
+            .chat_for_agent(&self.agent_id, messages, params)
+            .await
+    }
+
+    /// On the agent's own chat provider; `ModelNotAvailable`, with nothing sent, while
+    /// that provider serves no embeddings.
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, LlmError> {
+        self.gateway.embed_required(&self.agent_id, text).await
+    }
+
+    async fn stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        params: ChatParams,
+    ) -> Result<
+        Box<dyn futures_core::Stream<Item = Result<ChatDelta, LlmError>> + Send + Unpin>,
+        LlmError,
+    > {
+        self.gateway
+            .stream_internal(Caller::HostForAgent, &self.agent_id, messages, params, None)
+            .await
+    }
+}
+
+impl LlmGateway {
+    /// This gateway as `agent_id`'s (the BARE cap agent id): see [`AgentGateway`].
+    pub fn for_agent(self: &Arc<Self>, agent_id: &str) -> AgentGateway {
+        AgentGateway {
+            gateway: Arc::clone(self),
+            agent_id: agent_id.to_string(),
+        }
+    }
+
+    /// [`LlmGatewayInternal::chat`] on behalf of `agent_id` (the BARE cap agent id): the
+    /// request runs under that agent's `llm:` policy, on the one entry the agent chats on
+    /// ([`Caller::HostForAgent`]), and is reported as its request. No run, no transcript,
+    /// no live tee — a host-side call, not a turn of the agent's guest.
+    pub async fn chat_for_agent(
+        &self,
+        agent_id: &str,
+        messages: Vec<ChatMessage>,
+        params: ChatParams,
+    ) -> Result<ChatResponse, LlmError> {
+        self.chat_as(Caller::HostForAgent, agent_id, messages, params)
+            .await
+    }
+
+    async fn chat_as(
+        &self,
+        caller: Caller,
+        agent_id: &str,
+        messages: Vec<ChatMessage>,
+        params: ChatParams,
+    ) -> Result<ChatResponse, LlmError> {
         self.generate(LlmRequestContext {
-            agent_id: self.default_agent_id.clone(),
-            task_id: None,
-            run_id: None,
-            iteration: None,
-            trace_id: None,
+            agent_id: agent_id.to_string(),
             messages,
             params,
-            output_schema: None,
-            tee_live: false,
-            user_constraints: Vec::new(),
-            hard_task_class: false,
-            placement: None,
-            policy_source: Default::default(),
+            caller,
             ..Default::default()
         })
         .await
     }
 
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, LlmError> {
+    /// The CONTRACT-081 `embed` of `agent_id`: its vector, or `ModelNotAvailable` (nothing
+    /// sent) while the agent has no embedding route.
+    async fn embed_required(&self, agent_id: &str, text: &str) -> Result<Vec<f32>, LlmError> {
+        let plan = self.embedding_plan(agent_id)?;
+        Ok(self.embed_on(agent_id, plan, text).await?.vector)
+    }
+
+    /// Send one embedding request to the planned entry — the only entry it may reach.
+    async fn embed_on(
+        &self,
+        agent_id: &str,
+        plan: EmbeddingPlan,
+        text: &str,
+    ) -> Result<Embedded, LlmError> {
         // Round-AUDIT-2 W2 fix: capture wall-time across the full embed call
         // (including all retries) so emitted llm.response carries a real
         // latency_ms instead of the synthetic 0 used in slice B-2.
         let start = Instant::now();
-        let cfg = self.config_provider.current();
-        let embed_ps: Vec<_> = cfg
-            .llm_providers
-            .iter()
-            .filter(|p| is_embedding_capable(p))
-            .cloned()
-            .collect();
-        if embed_ps.is_empty() {
-            return Err(select_embedding_provider(&cfg.llm_providers).unwrap_err());
-        }
-        let need = crate::capability::CapabilityNeed {
-            tools: false,
-            output_schema: false,
-            image: false,
-            prompt_tokens_est: None,
-            max_tokens: None,
-        };
-        let (rec, provider_cfg, resolved) = match self.placed_endpoint(&embed_ps, None, &need, &[])
-        {
-            Ok(t) => t,
-            Err(e) if embed_ps.iter().any(|p| !p.model_aliases.is_empty()) => {
-                return Err(e);
-            }
-            Err(e) => {
-                // Empty-alias rows cannot bind in candidates_for (hint is
-                // None). Keep the pre-existing select_embedding_provider
-                // fallback, but only among endpoints place() would keep
-                // (authorized). Otherwise a denied CloudHttp that happens
-                // to be first still receives the embed text.
-                let authorized: Vec<_> = embed_ps
-                    .iter()
-                    .filter(|p| self.placement_telemetry.authorized(&p.id))
-                    .cloned()
-                    .collect();
-                if authorized.is_empty() {
-                    return Err(e);
-                }
-                let resolved = select_embedding_provider(&authorized)?;
-                let pcfg = cfg
-                    .llm_providers
-                    .iter()
-                    .find(|p| p.id == resolved.id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        LlmError::ModelNotAvailable("embedding provider missing".into())
-                    })?;
-                let rec = crate::placement::PlacementRecord {
-                    endpoint_id: resolved.id.clone(),
-                    model_revision: resolved.model.clone(),
-                    placement_reason: "embed:select".into(),
-                    strength: crate::placement::Strength::unbound(),
-                };
-                (rec, pcfg, resolved)
-            }
-        };
+        let EmbeddingPlan {
+            placement: rec,
+            provider_cfg,
+            resolved,
+            model: embed_model,
+            policy_source,
+        } = plan;
+        let provider_id = resolved.id.clone();
         if resolved.backend_class.uses_inference_port() {
-            return self.embed_via_local(text, resolved, start, Some(rec)).await;
+            let vector = self
+                .embed_via_local(agent_id, text, resolved, start, Some(rec), policy_source)
+                .await?;
+            return Ok(Embedded {
+                vector,
+                model: embed_model,
+                provider_id,
+            });
         }
         let retry_cfg = resolve_retry_config(&provider_cfg, self.retry_overrides.as_ref(), None);
         let http_cap = build_http_cap(&resolved, &provider_cfg)?;
         let adapter = select_adapter(resolved.backend);
-        // Round-AUDIT-2 W2 fix: emitted llm.* events for embed must reference
-        // the actual embedding model (e.g. `text-embedding-3-small`) rather
-        // than the chat-resolution model that `select_embedding_provider`
-        // returns as `resolved.model`. Adapters that don't expose embedding
-        // would have failed at `select_embedding_provider`; the fall-back
-        // here keeps the unwrap_or() chain total without panicking.
-        let embed_model: String = resolved
-            .embedding_model
-            .clone()
-            .or_else(|| adapter.embedding_model().map(str::to_string))
-            .unwrap_or_else(|| resolved.model.clone());
 
         // Round-4 W4 fix: embed flow emits the full four-event sequence per
         // AC-18. Placeholder context carries only agent_id + trace_id_or_default
         // (run_id is None — embed has no run scope; iteration/output_schema
-        // are not meaningful for embed).
+        // are not meaningful for embed). The events name the embedding model
+        // (never the chat model) and the agent the text belongs to.
         let placeholder_ctx = LlmRequestContext {
-            agent_id: self.default_agent_id.clone(),
+            agent_id: agent_id.to_string(),
             task_id: None,
             run_id: None,
             iteration: None,
@@ -3974,7 +4502,7 @@ impl LlmGatewayInternal for LlmGateway {
             user_constraints: Vec::new(),
             hard_task_class: false,
             placement: Some(rec),
-            policy_source: Default::default(),
+            policy_source,
             ..Default::default()
         };
         emit_llm_request(self.event_bus.as_ref(), &placeholder_ctx, &embed_model);
@@ -4028,13 +4556,9 @@ impl LlmGatewayInternal for LlmGateway {
                     return Err(e);
                 }
             };
-            match self
-                .chain
-                .execute(&self.default_agent_id, req, &http_cap)
-                .await
-            {
+            match self.chain.execute(agent_id, req, &http_cap).await {
                 Ok(resp) => match adapter.parse_embed_response(resp.status, &resp.body) {
-                    Ok(v) => {
+                    Ok(vector) => {
                         // Round-4 W4 + round-AUDIT-2 W2 fix: emit llm.response
                         // on success with synthetic ChatResponse (tokens=0,
                         // cost=0.0 because embedding is auxiliary per §2.7);
@@ -4060,7 +4584,11 @@ impl LlmGatewayInternal for LlmGateway {
                             None,
                             Some(&resolved.id),
                         );
-                        return Ok(v);
+                        return Ok(Embedded {
+                            vector,
+                            model: embed_model,
+                            provider_id,
+                        });
                     }
                     Err(e)
                         if classify_retryable(&e)
@@ -4128,20 +4656,6 @@ impl LlmGatewayInternal for LlmGateway {
         );
         Err(final_err)
     }
-
-    async fn stream(
-        &self,
-        messages: Vec<ChatMessage>,
-        params: ChatParams,
-    ) -> Result<
-        Box<dyn futures_core::Stream<Item = Result<ChatDelta, LlmError>> + Send + Unpin>,
-        LlmError,
-    > {
-        // Slice D — single-chunk trait surface (AC-10 + §2.7 Stream Flow).
-        // Delegate to generate() with output_schema=None; wrap the resulting
-        // ChatResponse in a one-item futures::stream::iter.
-        self.stream_internal(messages, params, None).await
-    }
 }
 
 impl LlmGateway {
@@ -4163,8 +4677,14 @@ impl LlmGateway {
         Box<dyn futures_core::Stream<Item = Result<ChatDelta, LlmError>> + Send + Unpin>,
         LlmError,
     > {
-        self.stream_internal(messages, params, Some(output_schema))
-            .await
+        self.stream_internal(
+            Caller::Host,
+            &self.default_agent_id,
+            messages,
+            params,
+            Some(output_schema),
+        )
+        .await
     }
 
     /// Shared implementation for `stream()` (trait) and `stream_for_schema()`
@@ -4183,6 +4703,8 @@ impl LlmGateway {
     ///   regardless of schema validation outcome (R6 audit-R1 C1 fix)
     async fn stream_internal(
         &self,
+        caller: Caller,
+        agent_id: &str,
         messages: Vec<ChatMessage>,
         params: ChatParams,
         output_schema: Option<String>,
@@ -4194,7 +4716,7 @@ impl LlmGateway {
         // structured-retry loop never runs (preserves AC-10 "validate at done
         // with no retry"). We do the schema validation here post-generate.
         let ctx = LlmRequestContext {
-            agent_id: self.default_agent_id.clone(),
+            agent_id: agent_id.to_string(),
             task_id: None,
             run_id: None,
             iteration: None,
@@ -4207,6 +4729,7 @@ impl LlmGateway {
             hard_task_class: false,
             placement: None,
             policy_source: Default::default(),
+            caller,
             ..Default::default()
         };
         match self.generate(ctx).await {
@@ -4280,7 +4803,7 @@ impl LlmGateway {
         let start = Instant::now();
         let cfg = self.config_provider.current();
         // Lane agent-llm-policy: same pre-placement policy application as `generate`.
-        let providers = self.apply_agent_policy(&mut ctx, &cfg.llm_providers)?;
+        let providers = self.providers_for(&mut ctx, &cfg.llm_providers)?;
         let need = crate::capability::CapabilityNeed {
             tools: ctx.params.tools.as_ref().is_some_and(|t| !t.is_empty()),
             output_schema: ctx.output_schema.is_some(),
@@ -4570,6 +5093,7 @@ impl LlmGateway {
             tool_calls: outcome.tool_calls,
         };
         self.maybe_record_generate(&ctx, &response);
+        self.note_chat_served(ctx.caller, &ctx.agent_id, &resolved.id);
         Ok(ReadyStream {
             ctx,
             response,
@@ -4755,67 +5279,53 @@ pub(crate) fn compute_output_hash(text: &str) -> OutputHash {
 // Helpers (pub(crate) — NOT part of the public surface)
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Round-3 W6 + round-4 W3 + C2 fix — pick the first embedding-capable provider
-/// per declaration order and resolve to a `ResolvedProvider` mirroring the
-/// canonical resolver at `provider.rs:98-115` (lex-smallest alias key, return
-/// the alias VALUE).
-pub(crate) fn is_embedding_capable(p: &LlmProviderConfig) -> bool {
-    if crate::provider::backend_of(p) == advance_runtime::config::ProviderBackend::AnthropicMessages
+/// The host of OpenAI's own API: the one endpoint whose embedding model is known without an
+/// `embedding-model` key.
+const OPENAI_API_HOST: &str = "api.openai.com";
+
+/// `true` only for `https://api.openai.com` itself (default port, no user-info): a
+/// look-alike host, another scheme or another port is some other server.
+fn is_openai_api_endpoint(endpoint: &str) -> bool {
+    url::Url::parse(endpoint).ok().is_some_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some(OPENAI_API_HOST)
+            && url.port().is_none()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
+/// The embedding model `p` serves, or why it serves none.
+///
+/// - Anthropic Messages entries, vendor agent-CLI entries and ChatGPT sign-in entries never
+///   embed — not even with an `embedding-model` key.
+/// - Any other entry embeds with its `embedding-model`.
+/// - Without that key only OpenAI's own API keeps the adapter default
+///   (`text-embedding-3-small`). Every other OpenAI-compatible endpoint, and every local /
+///   mesh entry, has no embedding model until one is configured: a model id is never
+///   guessed for an endpoint that may not serve it.
+pub(crate) fn embedding_model_for(p: &LlmProviderConfig) -> Result<String, EmbeddingIncapable> {
+    let backend = crate::provider::backend_of(p);
+    if backend == advance_runtime::config::ProviderBackend::AnthropicMessages
+        || p.backend_class == advance_runtime::config::InferenceBackendClass::AgentCli
     {
-        return false;
-    }
-    if p.backend_class.uses_inference_port() && p.embedding_model.is_none() {
-        return false;
+        return Err(EmbeddingIncapable::NoEmbeddingsApi);
     }
     // The token of a ChatGPT sign-in entry is never sent to `/v1/embeddings`.
     if p.uses_chatgpt_sign_in() {
-        return false;
+        return Err(EmbeddingIncapable::SignInEntry);
     }
-    true
-}
-
-pub(crate) fn select_embedding_provider(
-    providers: &[LlmProviderConfig],
-) -> Result<ResolvedProvider, LlmError> {
-    if providers.is_empty() {
-        return Err(LlmError::ModelNotAvailable(
-            "no llm-providers configured".into(),
-        ));
+    if let Some(model) = p.embedding_model.as_deref().map(str::trim) {
+        if !model.is_empty() {
+            return Ok(model.to_string());
+        }
     }
-    // Round-AUDIT-2 W3 + round-AUDIT-3 W1 fix: pick the FIRST embedding-
-    // capable provider regardless of `model_aliases` content. Slice B-2's
-    // embed flow uses `ProviderAdapter::embedding_model()` for the request
-    // body's model field (e.g. OpenAI hardcodes `text-embedding-3-small`),
-    // so `resolved.model` is only consumed as an event-payload fallback.
-    // When `model_aliases` is non-empty we still pick the lex-smallest
-    // alias VALUE (mirrors `provider::resolve_provider_and_model`); when
-    // empty we pass an empty string and rely entirely on
-    // `adapter.embedding_model()` for the event payload's model field.
-    for p in providers {
-        if crate::provider::backend_of(p)
-            == advance_runtime::config::ProviderBackend::AnthropicMessages
-        {
-            continue;
+    if !p.backend_class.uses_inference_port() && is_openai_api_endpoint(&p.endpoint) {
+        if let Some(model) = select_adapter(backend).embedding_model() {
+            return Ok(model.to_string());
         }
-        if p.backend_class.uses_inference_port() && p.embedding_model.is_none() {
-            continue;
-        }
-        // Same rule as `is_embedding_capable`: a ChatGPT sign-in entry never embeds.
-        if p.uses_chatgpt_sign_in() {
-            continue;
-        }
-        let target_model = if p.model_aliases.is_empty() {
-            String::new()
-        } else {
-            let mut keys: Vec<&String> = p.model_aliases.keys().collect();
-            keys.sort();
-            p.model_aliases[keys[0]].clone()
-        };
-        return Ok(make_resolved(p, target_model));
     }
-    Err(LlmError::ModelNotAvailable(
-        "no embedding-capable provider configured".into(),
-    ))
+    Err(EmbeddingIncapable::NoEmbeddingModel)
 }
 
 /// Round-3 W1 + round-4 C1 + round-AUDIT-2 W7 + round-AUDIT-ADV-1 W4 fix —
@@ -5973,10 +6483,80 @@ mod tests {
     // T74-T74f — AC-13 embed flow
     // ─────────────────────────────────────────────────────────────────────
 
+    /// The fixture config has two entries and no agent policy, so the default agent's
+    /// embedding route is the entry its own last request was served by (here: OpenAI).
+    fn embed_harness() -> Harness {
+        let h = harness();
+        h.gateway.test_agent_chats_on("test-agent", "openai");
+        h
+    }
+
+    /// What is remembered about where agents chat is bounded in the number of agents.
+    /// Past the bound ONE record makes room — the agent served longest ago — so an agent
+    /// that keeps chatting keeps its record whatever other agents do.
+    #[tokio::test]
+    async fn the_record_of_where_agents_chat_is_bounded() {
+        let h = harness();
+        let served = |agent: &str| h.gateway.chats_served.of(agent);
+        let note =
+            |agent: &str, entry: &str| h.gateway.note_chat_served(Caller::AgentGuest, agent, entry);
+
+        for n in 0..MAX_AGENTS_SERVED {
+            note(&format!("agent-{n}"), "openai");
+        }
+        assert_eq!(h.gateway.chats_served.agents(), MAX_AGENTS_SERVED);
+        // agent-0 chats again: it is no longer the one served longest ago.
+        note("agent-0", "anthropic");
+        assert_eq!(h.gateway.chats_served.agents(), MAX_AGENTS_SERVED);
+        assert_eq!(served("agent-0").as_deref(), Some("anthropic"));
+
+        // One more agent: exactly one record makes room, the one written longest ago.
+        note("one-more", "openai");
+        assert_eq!(h.gateway.chats_served.agents(), MAX_AGENTS_SERVED);
+        assert_eq!(served("agent-1"), None, "served longest ago: made room");
+        assert_eq!(served("agent-0").as_deref(), Some("anthropic"));
+        assert_eq!(served("agent-2").as_deref(), Some("openai"));
+        assert_eq!(served("one-more").as_deref(), Some("openai"));
+
+        // However many agents come and go, the number stays bounded and an agent that
+        // keeps chatting is never the one that makes room.
+        for n in 0..(MAX_AGENTS_SERVED + 10) {
+            note("agent-0", "anthropic");
+            note(&format!("later-{n}"), "openai");
+            assert!(h.gateway.chats_served.agents() <= MAX_AGENTS_SERVED);
+        }
+        assert_eq!(served("agent-0").as_deref(), Some("anthropic"));
+        assert_eq!(served("one-more"), None);
+
+        // Only an agent's own request says where it chats.
+        h.gateway
+            .note_chat_served(Caller::HostForAgent, "b", "openai");
+        h.gateway.note_chat_served(Caller::Host, "b", "openai");
+        assert_eq!(served("b"), None);
+    }
+
+    /// An agent that is gone leaves no record: an agent created later under its id has
+    /// no chat entry among several until one of them has served it.
+    #[tokio::test]
+    async fn a_forgotten_agent_has_no_chat_entry_among_several() {
+        let h = embed_harness();
+        assert!(h.gateway.embedding_route_for("test-agent").is_ok());
+
+        h.gateway.forget_agent("test-agent");
+
+        assert_eq!(
+            h.gateway.embedding_route_for("test-agent"),
+            Err(EmbeddingUnavailable::ChatProviderUnknown)
+        );
+        // Forgetting an agent nothing is known about changes nothing.
+        h.gateway.forget_agent("never-seen");
+        assert_eq!(h.gateway.chats_served.agents(), 0);
+    }
+
     /// MODULE-009-T74 — embed happy path through MockChain.
     #[tokio::test]
     async fn t74_embed_happy_path() {
-        let h = harness();
+        let h = embed_harness();
         h.chain
             .push_response("/v1/embeddings", Ok(ok_embed_response(&[0.1, 0.2, 0.3])));
         let v = h.gateway.embed("hello").await.unwrap();
@@ -5986,7 +6566,7 @@ mod tests {
     /// MODULE-009-T74b — embed rate-limited then ok: 2 calls + llm.retry event.
     #[tokio::test(start_paused = true)]
     async fn t74b_embed_rate_limited_then_ok() {
-        let h = harness();
+        let h = embed_harness();
         h.chain.push_response(
             "/v1/embeddings",
             Err(HttpError::RateLimited { retry_after_ms: 0 }),
@@ -6009,9 +6589,14 @@ mod tests {
         assert_eq!(retry_count, 1);
     }
 
-    /// MODULE-009-T74c — embed with [anthropic, openai] routes to openai.
+    /// MODULE-009-T74c — embedding follows the chat provider. With
+    /// [anthropic, openai] and no policy the agent may chat on either, so until one
+    /// has served it there is no entry to follow; once it chats with anthropic,
+    /// which has no embeddings endpoint, the agent has NO embedding. Either way its
+    /// text is never sent to the OpenAI entry it does not chat with: no request, no
+    /// event.
     #[tokio::test]
-    async fn t74c_embed_skips_anthropic_routes_to_openai() {
+    async fn t74c_embed_never_hops_to_a_provider_the_agent_does_not_chat_with() {
         let h = harness();
         // Reorder providers so anthropic is first.
         let mut cfg = fixture_runtime_config();
@@ -6019,11 +6604,54 @@ mod tests {
         h.cfg_provider.set_config(cfg);
         h.chain
             .push_response("/v1/embeddings", Ok(ok_embed_response(&[0.1])));
-        let v = h.gateway.embed("hello").await.unwrap();
-        assert_eq!(v.len(), 1);
-        // Verify the request URL hits openai's endpoint (NOT anthropic's).
-        let log = h.chain.call_log.lock().unwrap();
-        assert!(log[0].url.contains("api.openai.com"));
+        assert_eq!(
+            h.gateway.embedding_route_for("test-agent"),
+            Err(EmbeddingUnavailable::ChatProviderUnknown),
+            "two entries are admitted and none has served the agent"
+        );
+        assert_eq!(
+            h.gateway.embed("hello").await.unwrap_err(),
+            LlmError::ModelNotAvailable(
+                "embedding unavailable: none of the providers open to this agent has served it yet"
+                    .into()
+            )
+        );
+        assert_eq!(
+            h.gateway.embed_for_agent("test-agent", "hello").await,
+            Ok(None)
+        );
+        assert!(
+            h.chain.call_log.lock().unwrap().is_empty() && h.bus.snapshot().is_empty(),
+            "nothing is sent while the agent's chat entry is not known"
+        );
+
+        h.gateway.test_agent_chats_on("test-agent", "anthropic");
+        assert_eq!(
+            h.gateway.embed("hello").await.unwrap_err(),
+            LlmError::ModelNotAvailable(
+                "embedding unavailable: chat provider anthropic has no embeddings endpoint".into()
+            )
+        );
+        assert_eq!(
+            h.gateway.embed_for_agent("test-agent", "hello").await,
+            Ok(None),
+            "no route is not an error for the per-agent entry point"
+        );
+        assert_eq!(
+            h.gateway.embedding_route_for("test-agent"),
+            Err(EmbeddingUnavailable::ProviderCannotEmbed {
+                provider_id: "anthropic".into(),
+                reason: EmbeddingIncapable::NoEmbeddingsApi,
+            })
+        );
+        assert!(
+            h.chain.call_log.lock().unwrap().is_empty(),
+            "the text must not reach the OpenAI entry"
+        );
+        assert!(
+            h.bus.snapshot().is_empty(),
+            "no llm.* event without a request"
+        );
     }
 
     /// MODULE-009-T74d — embed with [anthropic] only → ModelNotAvailable.
@@ -6035,31 +6663,37 @@ mod tests {
         h.cfg_provider.set_config(cfg);
         match h.gateway.embed("hello").await {
             Err(LlmError::ModelNotAvailable(msg)) => {
-                assert!(msg.contains("no embedding-capable provider"));
+                assert_eq!(
+                    msg,
+                    "embedding unavailable: chat provider anthropic has no embeddings endpoint"
+                );
             }
             other => panic!("expected ModelNotAvailable, got {other:?}"),
         }
+        assert!(h.chain.call_log.lock().unwrap().is_empty());
     }
 
-    /// Round-AUDIT-4 W3 — embed with embedding-capable provider whose
-    /// `model_aliases` is empty must still succeed (round-AUDIT-3 W1 fix).
-    /// `select_embedding_provider` returns a `ResolvedProvider` with empty-
-    /// string `model`; the embed flow uses `adapter.embedding_model()`
-    /// (`text-embedding-3-small` for OpenAI) for the request body and event
-    /// payload, so the empty-string fallback never reaches the wire.
+    /// Round-AUDIT-4 W3 — an OpenAI entry whose `model_aliases` is empty (the
+    /// legacy shape: every chat request names a literal model, which placement
+    /// puts on the head entry) still embeds. The route is that head entry and
+    /// the request carries the first-party embedding model
+    /// (`text-embedding-3-small` on OpenAI's own API) — the empty chat model
+    /// never reaches the wire.
     #[tokio::test]
     async fn t74g_embed_with_empty_model_aliases_uses_adapter_embedding_model() {
         let h = harness();
         let mut cfg = fixture_runtime_config();
-        // Strip OpenAI's chat aliases — embed should still succeed because
-        // OpenAi adapter advertises supports_embedding=true and an explicit
-        // embedding_model("text-embedding-3-small").
-        for p in cfg.llm_providers.iter_mut() {
-            if p.id == "openai" {
-                p.model_aliases.clear();
-            }
-        }
+        // An alias-less config: only the OpenAI entry, with no chat aliases.
+        cfg.llm_providers.retain(|p| p.id == "openai");
+        cfg.llm_providers[0].model_aliases.clear();
         h.cfg_provider.set_config(cfg);
+        assert_eq!(
+            h.gateway.embedding_route_for("test-agent"),
+            Ok(EmbeddingRoute {
+                provider_id: "openai".into(),
+                model: "text-embedding-3-small".into(),
+            })
+        );
         h.chain
             .push_response("/v1/embeddings", Ok(ok_embed_response(&[0.5])));
         let v = h.gateway.embed("hello").await.expect("embed must succeed");
@@ -6087,7 +6721,7 @@ mod tests {
     /// MODULE-009-T74e — embed happy path emits [llm.request, llm.response] only.
     #[tokio::test]
     async fn t74e_embed_event_sequence_happy() {
-        let h = harness();
+        let h = embed_harness();
         h.chain
             .push_response("/v1/embeddings", Ok(ok_embed_response(&[0.1])));
         h.gateway.embed("hello").await.unwrap();
@@ -6117,7 +6751,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn t74f_embed_event_sequences() {
         // Sub-case A: rate-limited then ok → [request, retry, response]
-        let h = harness();
+        let h = embed_harness();
         h.chain.push_response(
             "/v1/embeddings",
             Err(HttpError::RateLimited { retry_after_ms: 0 }),
@@ -6139,7 +6773,7 @@ mod tests {
         assert_eq!(types, vec![LLM_REQUEST, LLM_RETRY, LLM_RESPONSE]);
 
         // Sub-case B: immediate non-retryable → [request, error]
-        let h = harness();
+        let h = embed_harness();
         h.chain.push_response(
             "/v1/embeddings",
             Ok(HttpResponse {
@@ -6162,7 +6796,7 @@ mod tests {
     /// MODULE-009-T75 — embed propagates non-retryable error verbatim.
     #[tokio::test]
     async fn t75_embed_propagates_non_retryable() {
-        let h = harness();
+        let h = embed_harness();
         h.chain.push_response(
             "/v1/embeddings",
             Ok(HttpResponse {

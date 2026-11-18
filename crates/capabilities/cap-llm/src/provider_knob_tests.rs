@@ -843,8 +843,10 @@ async fn the_test_hop_budget_still_wins_over_the_entry_timeout() {
 /// its embedding request; without the key every body is the one sent before the key existed.
 #[tokio::test]
 async fn the_reasoning_effort_reaches_every_chat_request_and_never_an_embedding() {
+    // The entry is not OpenAI's own API, so it embeds only with an explicit model.
+    const EMBEDS: &str = "  embedding-model: embed-small\n";
     for (extra, effort) in [("  reasoning-effort: low\n", Some("low")), ("", None)] {
-        let entries = reasoner(extra);
+        let entries = reasoner(&format!("{extra}{EMBEDS}"));
         let rig = rig(&entries);
         rig.chain.push_response(CHAT_PATH, Ok(text_answer("ok")));
         rig.gateway.generate(ctx("think")).await.expect("generate");
@@ -904,6 +906,11 @@ async fn the_reasoning_effort_reaches_every_chat_request_and_never_an_embedding(
         assert_eq!(bodies[2], with(STREAM_BODY), "live stream");
         assert_eq!(bodies[3], preflight_body, "preflight");
         assert!(!bodies[4].contains("reasoning"), "embedding: {}", bodies[4]);
+        assert!(
+            bodies[4].contains("embed-small"),
+            "embedding: {}",
+            bodies[4]
+        );
     }
 }
 

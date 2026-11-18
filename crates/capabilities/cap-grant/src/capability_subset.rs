@@ -29,6 +29,8 @@
 //! Per-family whitelist mirrors `SubsetValidatorImpl::validate`'s dispatch
 //! exactly. `channel` is intentionally absent — cap-grant's own validator
 //! has no `channel` arm either; both fail-closed via the wildcard branch.
+//! `web` and `memory` are whole-capability families: known ids with an empty
+//! key list, so the bare capability passes down and any param is refused.
 
 use serde_json::Value;
 
@@ -90,6 +92,10 @@ fn allowed_param_keys(capability: &str) -> Option<&'static [&'static str]> {
         "screen" => Some(&["targets", "mode", "confirm", "secure-input"]),
         "skills" => Some(&["allowed-actions", "max-active-skills"]),
         "web" => Some(&[]),
+        // Whole-capability only. An agent's memory is its own — every `agent-memory` call is
+        // keyed by the calling agent — so there is nothing to narrow: a child may hold
+        // `memory` exactly when its parent does, and no param is accepted.
+        "memory" => Some(&[]),
         // Retired family (the `data` host tool is authorized by `fs`); kept parseable for
         // grants persisted by earlier releases.
         "data" => Some(&["mode"]),

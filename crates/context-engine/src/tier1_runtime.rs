@@ -101,7 +101,11 @@ pub fn format_runtime_architecture_section(info: &RuntimeInfoView) -> Option<Str
         if info.embedding_enabled {
             "semantic (embedding index over past turns and tasks)"
         } else {
-            "disabled (no embedding provider)"
+            // One wording for every reason there is no model: the provider this
+            // agent chats on serves no embeddings, names no embedding model, or —
+            // for an agent free to chat on several providers — is not known
+            // before its first reply since the runtime started.
+            "disabled (no embedding model is available to this agent)"
         }
     ));
     Some(s)

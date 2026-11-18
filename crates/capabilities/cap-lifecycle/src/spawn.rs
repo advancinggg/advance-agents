@@ -16,6 +16,9 @@ use crate::workspace::{init_child_workspace, resolve_under_parent, symlink_check
 
 const MAX_CAPABILITIES: usize = 64;
 
+/// The `agent-memory` capability id: a Child's, never a Sub's (see `spawn_sub`).
+const MEMORY_CAPABILITY: &str = "memory";
+
 /// Wave-23 seam (a): upper bound on a materialized child driver binary. Generous
 /// (a real component is typically < a few MiB) but bounded so a compromised
 /// caller cannot spray arbitrarily-large workspace writes.
@@ -461,6 +464,21 @@ impl Spawner for DefaultSpawner {
             return Err(SpawnError::InvalidConfig(format!(
                 "capabilities.len() {} > {MAX_CAPABILITIES}",
                 cfg.capabilities.len()
+            )));
+        }
+        // A Sub persists no memory (its `.agent/` has no `memory/`, a template's memory seed
+        // is not copied to it): `memory` is a Child's capability, whatever the parent holds.
+        // This refusal is the whole rule: an agent's host functions are linked from the
+        // capabilities it is served with (its node's, never a grant's —
+        // `CapabilityInjector::inject`), so a `memory` grant delegated to a Sub's id
+        // afterwards links nothing and authorizes nothing.
+        if cfg
+            .capabilities
+            .iter()
+            .any(|c| c.id.as_str() == MEMORY_CAPABILITY)
+        {
+            return Err(SpawnError::SubsetViolation(format!(
+                "a Sub agent cannot hold the `{MEMORY_CAPABILITY}` capability (it persists no memory)"
             )));
         }
         self.subset_gate

@@ -1,6 +1,6 @@
 //! Anthropic Messages API adapter. Chat-only; embed returns
-//! `LlmError::ModelNotAvailable` (round-3 W6: `supports_embedding()` is false,
-//! so the gateway's `select_embedding_provider` skips this adapter for embed).
+//! `LlmError::ModelNotAvailable`, and the gateway's `embedding_model_for` gives an
+//! Anthropic Messages entry no embedding route (it reads the entry's backend).
 
 use advance_shared_types::security_validator::{HttpMethod, HttpRequest};
 use serde_json::{json, Value};

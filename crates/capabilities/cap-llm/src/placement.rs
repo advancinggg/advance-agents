@@ -284,7 +284,29 @@ pub fn candidates_for(
     Ok(out)
 }
 
-fn bind_model(p: &LlmProviderConfig, hint: Option<&str>) -> Option<String> {
+/// Whether a request naming `model` is placed on the entry `entry_id` of `providers`
+/// ([`candidates_for`]): the entry serves the model ([`bind_model`]), or no entry does and
+/// it is the first of them — where such a request goes, sent the name as it stands (rule
+/// 2c). Whether the entry has the capabilities a request needs is not asked.
+pub(crate) fn places_model_on(
+    providers: &[LlmProviderConfig],
+    model: &str,
+    entry_id: &str,
+) -> bool {
+    let serves = |p: &LlmProviderConfig| bind_model(p, Some(model)).is_some();
+    match providers.iter().find(|p| p.id == entry_id) {
+        None => false,
+        Some(entry) if serves(entry) => true,
+        Some(_) => {
+            !providers.iter().any(serves) && providers.first().is_some_and(|p| p.id == entry_id)
+        }
+    }
+}
+
+/// The model `p` is sent for a request naming `hint`: the alias it names, a model `p`
+/// lists under it, or (no hint) the first alias by name; `None` when `p` serves none of
+/// it.
+pub(crate) fn bind_model(p: &LlmProviderConfig, hint: Option<&str>) -> Option<String> {
     match hint {
         None => {
             if p.model_aliases.is_empty() {
@@ -306,6 +328,52 @@ fn bind_model(p: &LlmProviderConfig, hint: Option<&str>) -> Option<String> {
     }
 }
 
+/// Whether `constraints` let a request run on an entry of `backend_class` on `device_id`.
+/// The one statement of what each hard constraint means, shared by [`place`] and the
+/// per-entry checks below.
+fn constraints_allow(
+    backend_class: InferenceBackendClass,
+    device_id: Option<&str>,
+    constraints: &[UserHardConstraint],
+) -> bool {
+    constraints.iter().all(|c| match c {
+        UserHardConstraint::AlwaysLocal => backend_class == InferenceBackendClass::Local,
+        // `agent-cli` egresses to the vendor inside the CLI: it is cloud too.
+        UserHardConstraint::NeverCloud => {
+            backend_class != InferenceBackendClass::CloudHttp && !backend_class.is_remote_egress()
+        }
+        UserHardConstraint::DevicePin(id) => device_id == Some(id.as_str()),
+    })
+}
+
+/// Whether a request under `constraints` can ever be placed on `p`, read from the entry's
+/// configuration alone. A superset of what [`place`] lets through at any moment: an entry
+/// that configures no device may be reported on the pinned one by telemetry, so it counts,
+/// and an entry telemetry reports unauthorized still counts. What it rules out, no request
+/// of that agent can reach.
+pub fn admits(p: &LlmProviderConfig, constraints: &[UserHardConstraint]) -> bool {
+    constraints.iter().all(|c| match c {
+        UserHardConstraint::DevicePin(_) if p.device_id.is_none() => true,
+        one => constraints_allow(
+            p.backend_class,
+            p.device_id.as_deref(),
+            std::slice::from_ref(one),
+        ),
+    })
+}
+
+/// Whether a request under `constraints` can be placed on `p` right now: the filter
+/// [`place`] applies, for one entry.
+pub fn admits_now(
+    p: &LlmProviderConfig,
+    constraints: &[UserHardConstraint],
+    telemetry: &dyn PlacementTelemetry,
+) -> bool {
+    let device_id = p.device_id.clone().or_else(|| telemetry.device_id(&p.id));
+    telemetry.authorized(&p.id)
+        && constraints_allow(p.backend_class, device_id.as_deref(), constraints)
+}
+
 pub fn place(
     cands: &[PlacementCandidate],
     constraints: &[UserHardConstraint],
@@ -316,24 +384,8 @@ pub fn place(
         .iter()
         .filter(|c| !excluded.iter().any(|e| e == &c.endpoint_id))
         .filter(|c| c.authorized)
+        .filter(|c| constraints_allow(c.backend_class, c.device_id.as_deref(), constraints))
         .collect();
-    for cstr in constraints {
-        match cstr {
-            UserHardConstraint::AlwaysLocal => {
-                filtered.retain(|c| c.backend_class == InferenceBackendClass::Local);
-            }
-            UserHardConstraint::NeverCloud => {
-                // `agent-cli` egresses to the vendor inside the CLI: it is cloud too.
-                filtered.retain(|c| {
-                    c.backend_class != InferenceBackendClass::CloudHttp
-                        && !c.backend_class.is_remote_egress()
-                });
-            }
-            UserHardConstraint::DevicePin(id) => {
-                filtered.retain(|c| c.device_id.as_deref() == Some(id.as_str()));
-            }
-        }
-    }
     if let Some(floor) = strength_floor {
         filtered.retain(|c| c.strength > floor);
         if filtered.is_empty() {
@@ -664,6 +716,81 @@ mod t133_helpers {
         assert!(!is_pre_token_failover(&LlmError::ProviderError(
             "stream-partial: chatgpt-plan: usage limit reached".into()
         )));
+    }
+
+    /// [`places_model_on`] answers where [`candidates_for`] places a request naming the
+    /// model: over every order of four entries — one listing no model, three listing some,
+    /// two of those sharing an alias — and every prefix of each order, for a name by alias,
+    /// by listed model and listed by none.
+    #[test]
+    fn a_model_is_placed_on_an_entry_exactly_where_candidates_for_places_it() {
+        let entry = |id: &str, aliases: &[(&str, &str)]| {
+            let mut p = _cfg();
+            p.id = id.into();
+            p.model_aliases = aliases
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            p
+        };
+        let entries = [
+            entry("plain", &[]),
+            entry("openai", &[("gpt4o", "gpt-4o-2024-08-06")]),
+            entry("chat-only", &[("fast", "fast-chat")]),
+            entry("eu", &[("fast", "fast-eu"), ("gpt4o", "gpt-4o-eu")]),
+        ];
+        let need = CapabilityNeed {
+            tools: false,
+            output_schema: false,
+            image: false,
+            prompt_tokens_est: None,
+            max_tokens: None,
+        };
+        let catalog = ModelProfileCatalog::new();
+        let mut checked = 0;
+        for order in orders_of(entries.len()) {
+            for len in 1..=order.len() {
+                let providers: Vec<LlmProviderConfig> =
+                    order[..len].iter().map(|&i| entries[i].clone()).collect();
+                for model in ["gpt4o", "gpt-4o-2024-08-06", "fast", "fast-eu", "unlisted"] {
+                    let placed: Vec<String> = candidates_for(
+                        &providers,
+                        Some(model),
+                        &catalog,
+                        &need,
+                        &NotWiredPlacementTelemetry,
+                    )
+                    .map(|cands| cands.into_iter().map(|c| c.endpoint_id).collect())
+                    .unwrap_or_default();
+                    for id in ["plain", "openai", "chat-only", "eu", "absent"] {
+                        assert_eq!(
+                            places_model_on(&providers, model, id),
+                            placed.iter().any(|p| p == id),
+                            "{model} on {id} of {:?}",
+                            providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>()
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 24 * 4 * 5 * 5);
+    }
+
+    /// Every order of `0..n`.
+    fn orders_of(n: usize) -> Vec<Vec<usize>> {
+        if n == 0 {
+            return vec![Vec::new()];
+        }
+        let mut out = Vec::new();
+        for shorter in orders_of(n - 1) {
+            for at in 0..=shorter.len() {
+                let mut order = shorter.clone();
+                order.insert(at, n - 1);
+                out.push(order);
+            }
+        }
+        out
     }
 
     #[allow(dead_code)]

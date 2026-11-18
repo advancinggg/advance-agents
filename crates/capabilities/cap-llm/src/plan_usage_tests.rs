@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use crate::cost::{compute_cost, CacheUsage};
 use crate::credential::{CredentialFailure, ProviderCredentialSource};
 use crate::gateway::{
-    is_embedding_capable, plan_usage_status_error, select_embedding_provider, ChatMessage,
-    ChatParams, ChatResponse, ChatRole, LlmGateway, LlmGatewayInternal, LlmRequestContext,
+    embedding_model_for, plan_usage_status_error, ChatMessage, ChatParams, ChatResponse, ChatRole,
+    EmbeddingIncapable, LlmGateway, LlmGatewayInternal, LlmRequestContext,
 };
 use crate::stream::{PollOutcome, StreamRegistry};
 use crate::test_support::{
@@ -1646,37 +1646,97 @@ fn refused_status_rewrite_is_scoped_to_sign_in_entries() {
 
 // ── routes the sign-in token never reaches ───────────────────────────────────────────────────
 
-/// A ChatGPT sign-in entry is never an embedding provider: both selection filters skip it,
-/// so its token is never sent to `/v1/embeddings` and the source is not consulted.
+/// A ChatGPT sign-in entry never embeds — its token is never sent to `/v1/embeddings` and the
+/// source is not consulted — and, because embedding follows the chat provider, an agent that
+/// chats with it has no embedding at all: its text is NOT sent to the API-key entry configured
+/// next to it. Only an agent that chats with the API-key entry embeds there.
 #[tokio::test]
-async fn sign_in_entry_is_never_selected_for_embeddings() {
+async fn sign_in_entry_never_embeds_and_its_agents_never_borrow_another_entry() {
+    const SIGN_IN_REFUSAL: &str =
+        "embedding unavailable: chat provider openai-plan is a sign-in entry, which never embeds";
     let cfg = plan_config();
     let plan = cfg.llm_providers[0].clone();
     let key = cfg.llm_providers[1].clone();
-    assert!(!is_embedding_capable(&plan));
-    assert!(is_embedding_capable(&key));
     assert_eq!(
-        select_embedding_provider(&cfg.llm_providers).unwrap().id,
-        "openai-key"
+        embedding_model_for(&plan),
+        Err(EmbeddingIncapable::SignInEntry)
     );
     assert_eq!(
-        select_embedding_provider(std::slice::from_ref(&plan)).unwrap_err(),
-        LlmError::ModelNotAvailable("no embedding-capable provider configured".into())
+        embedding_model_for(&key).as_deref(),
+        Ok("text-embedding-3-small")
+    );
+    // Naming an embedding model does not open the sign-in entry either.
+    let mut plan_with_model = plan.clone();
+    plan_with_model.embedding_model = Some("text-embedding-3-small".into());
+    assert_eq!(
+        embedding_model_for(&plan_with_model),
+        Err(EmbeddingIncapable::SignInEntry)
     );
 
-    // Every entry configured: the embed request goes to the API-key entry.
-    let rig = rig(true);
-    rig.chain.push_response(
-        "/v1/embeddings",
+    let embed_ok = || {
         Ok(HttpResponse {
             status: 200,
             headers: vec![],
             body: br#"{"data":[{"embedding":[0.5,0.25]}]}"#.to_vec(),
-        }),
+        })
+    };
+
+    // Every entry configured and no policy: until one of the two has served the agent there
+    // is no entry to follow, and nothing is sent.
+    let rig = rig(true);
+    rig.chain.push_response("/v1/embeddings", embed_ok());
+    assert_eq!(
+        rig.gateway.embed_for_agent("test-agent", "text").await,
+        Ok(None)
     );
-    assert_eq!(rig.gateway.embed("text").await.unwrap(), vec![0.5, 0.25]);
+    assert_nothing_dispatched(&rig);
+    // The agent chats with the sign-in entry: nothing is sent anywhere — not to the sign-in
+    // entry, not to the API-key entry configured next to it.
+    rig.gateway.test_agent_chats_on("test-agent", "openai-plan");
+    assert_eq!(
+        rig.gateway.embed("text").await.unwrap_err(),
+        LlmError::ModelNotAvailable(SIGN_IN_REFUSAL.into())
+    );
+    assert_eq!(
+        rig.gateway.embed_for_agent("test-agent", "text").await,
+        Ok(None)
+    );
+    assert_nothing_dispatched(&rig);
+    assert!(rig.source.fresh_calls().is_empty());
+
+    // An agent that chats with the API-key entry (pinned) embeds there, with that entry's
+    // key; the sign-in credential is still never consulted.
+    struct PinTo(&'static str);
+    impl crate::policy::AgentLlmPolicySource for PinTo {
+        fn policy_for(&self, _agent_id: &str) -> Option<crate::policy::AgentLlmPolicy> {
+            Some(crate::policy::AgentLlmPolicy {
+                provider: Some(self.0.into()),
+                ..Default::default()
+            })
+        }
+    }
+    let keyed = self::rig(true);
+    let gateway = LlmGateway::new(
+        Arc::new(MockRuntimeConfigProvider::new(plan_config())),
+        Arc::clone(&keyed.chain) as Arc<dyn HttpSecurityChain>,
+        Arc::clone(&keyed.budget) as Arc<dyn RunBudget>,
+        Arc::clone(&keyed.bus) as Arc<dyn EventBusEmit>,
+        crate::test_support::no_op_repetition_guard() as Arc<dyn RepetitionGuardCheck>,
+        "test-agent".into(),
+    )
+    .with_credential_source(Arc::clone(&keyed.source) as Arc<dyn ProviderCredentialSource>)
+    .with_agent_policy(Arc::new(PinTo("openai-key")));
+    keyed.chain.push_response("/v1/embeddings", embed_ok());
+    let embedded = gateway
+        .embed_for_agent("test-agent", "text")
+        .await
+        .expect("embed")
+        .expect("the API-key entry embeds");
+    assert_eq!(embedded.vector, vec![0.5, 0.25]);
+    assert_eq!(embedded.provider_id, "openai-key");
+    assert_eq!(embedded.model, "text-embedding-3-small");
     {
-        let log = rig.chain.call_log.lock().unwrap();
+        let log = keyed.chain.call_log.lock().unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].url, "https://api.openai.com/v1/embeddings");
         assert!(log[0]
@@ -1684,7 +1744,7 @@ async fn sign_in_entry_is_never_selected_for_embeddings() {
             .iter()
             .any(|(n, v)| n == "Authorization" && v == "Bearer {openai-api-key}"));
     }
-    assert!(rig.source.fresh_calls().is_empty());
+    assert!(keyed.source.fresh_calls().is_empty());
 
     // Only the sign-in entry configured: nothing is sent at all.
     let only_plan = self::rig(true);
@@ -1701,7 +1761,7 @@ async fn sign_in_entry_is_never_selected_for_embeddings() {
     .with_credential_source(Arc::clone(&only_plan.source) as Arc<dyn ProviderCredentialSource>);
     assert_eq!(
         gateway.embed("text").await.unwrap_err(),
-        LlmError::ModelNotAvailable("no embedding-capable provider configured".into())
+        LlmError::ModelNotAvailable(SIGN_IN_REFUSAL.into())
     );
     assert_nothing_dispatched(&only_plan);
     assert!(only_plan.source.fresh_calls().is_empty());

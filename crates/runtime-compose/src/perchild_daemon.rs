@@ -26,19 +26,20 @@
 //! whose spawn handler holds this manager as its observer, so while both stay
 //! bound the manager and the registry keep each other alive.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use advance_messaging::{AgentIdBridge, DynamicRouting, MailboxStore};
 use advance_runtime::{CapabilityInjector, ComponentRuntime};
 use advance_scheduler::hook::{
-    CrashCascadeSink, MessageHandler, ProtectedTurnExecutionBoundary, TurnObserver,
+    CrashCascadeSink, MessageHandler, ProtectedTurnExecutionBoundary, TurnEnd, TurnObserver,
+    TurnOutcome,
 };
 use advance_scheduler::types::{ComponentConfig, ComponentId, WasmInstance};
 use advance_shared_types::agent_tree::{
-    AgentId, AgentKind, AgentTreeReader, AgentTreeSnapshot, Capability,
+    AgentId, AgentKind, AgentStatus, AgentTreeReader, AgentTreeSnapshot, Capability,
 };
 use advance_shared_types::capability::CapRequest;
 use advance_shared_types::mailbox::AgentActionDispatcher;
@@ -47,6 +48,7 @@ use cap_grant::{
     project_capability_params, GrantDraft, GrantStatus, GrantStore, GrantTtl, SubsetValidatorImpl,
 };
 use cap_lifecycle::{AgentTreeStore, SpawnObserver};
+use tokio::sync::watch;
 
 use crate::agent_loop::{
     build_agent_loop, build_agent_loop_with_prebuilt_dispatcher, WasmMessageHandler,
@@ -60,9 +62,13 @@ use crate::compose_log::LogHandle;
 /// special mapping — supplies it.
 pub type KeyResolver = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
+/// The turn ends [`RecordingTurnObserver::turn_end_of`] remembers per child: its most
+/// recent ones, so the record stays bounded however long a child is served.
+const TURN_ENDS_KEPT: usize = 16;
+
 /// Records each served child loop's turn completions so a witness can assert the
 /// child ran its OWN `handle-message` (SYS-AC-279 liveness / child-loop-absent
-/// discriminator).
+/// discriminator), and how its most recent turns ended.
 #[derive(Default)]
 pub struct RecordingTurnObserver {
     // Per-agent completed-turn COUNTS — NOT an unbounded per-turn log. A resident
@@ -71,6 +77,9 @@ pub struct RecordingTurnObserver {
     // map is bounded by the number of DISTINCT served children, and `count()` is
     // O(1) instead of an O(n) scan.
     counts: Mutex<HashMap<String, usize>>,
+    /// Per agent, its last [`TURN_ENDS_KEPT`] turn ends: the message each turn
+    /// executed and how it ended. Bounded like `counts`.
+    ends: Mutex<HashMap<String, VecDeque<(String, TurnOutcome)>>>,
 }
 
 impl RecordingTurnObserver {
@@ -81,12 +90,36 @@ impl RecordingTurnObserver {
             .map(|c| c.get(agent_id).copied().unwrap_or(0))
             .unwrap_or(0)
     }
+
+    /// How the turn of `agent_id` (the colon serve key) that executed message
+    /// `message_id` ended, while it is among the agent's last [`TURN_ENDS_KEPT`]
+    /// turns. A turn end is reported once the turn ran to its END — its turn-end
+    /// pipeline included — and before the turn is counted ([`Self::count`]).
+    /// `None`: no such turn has ended.
+    pub fn turn_end_of(&self, agent_id: &str, message_id: &str) -> Option<TurnOutcome> {
+        self.ends.lock().ok().and_then(|ends| {
+            ends.get(agent_id)?
+                .iter()
+                .find(|(ended, _)| ended == message_id)
+                .map(|(_, outcome)| *outcome)
+        })
+    }
 }
 
 impl TurnObserver for RecordingTurnObserver {
     fn on_turn_complete(&self, agent_id: &str) {
         if let Ok(mut c) = self.counts.lock() {
             *c.entry(agent_id.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    fn on_turn_end(&self, agent_id: &str, end: &TurnEnd) {
+        if let Ok(mut ends) = self.ends.lock() {
+            let kept = ends.entry(agent_id.to_string()).or_default();
+            if kept.len() == TURN_ENDS_KEPT {
+                kept.pop_front();
+            }
+            kept.push_back((end.message_id.clone(), end.outcome));
         }
     }
 }
@@ -122,10 +155,11 @@ pub struct PerChildLoopManager {
     /// concrete `turn_observer` field TYPE is deliberately unchanged — existing
     /// MODULE-001-AC-22 witnesses read it through `turn_observer()`/`turn_count()`.
     llm_stream_reaper: std::sync::OnceLock<Arc<cap_llm::AgentStreamReaper>>,
-    /// Loop-registry keyed by child COLON id (seam d + seam-f per-child abort).
-    /// Keyed (not a flat `Vec`) so `abort_child` can abort + REMOVE exactly one
-    /// child's loop, making `active_loop_count` deterministic.
-    loops: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// The loop-registry and the serves under way ([`LoopRegistry`]), shared with each
+    /// loop's own teardown when it ends ([`RouteCleanup`]).
+    loops: Arc<Mutex<LoopRegistry>>,
+    /// Numbers the serves ([`Serving`]).
+    next_serve: AtomicU64,
     /// seam (f): the shared crash-cascade sink attached to each child serve loop.
     /// Built once in wiring from the tree + mailbox store + resolver; it resolves
     /// the crashing agent's parent DYNAMICALLY, so one instance serves all agents.
@@ -154,6 +188,311 @@ pub struct PerChildLoopManager {
     /// after the LLM gateway exists and before any child is served; released by
     /// [`Self::unbind`] (they hold the host registry).
     context_deps: Mutex<Option<Arc<crate::child_context::ChildContextDeps>>>,
+    /// Where a terminated child is forgotten from ([`Self::forget_child`]). Bound and
+    /// released with the context deps.
+    record_stores: Mutex<Option<RecordStores>>,
+    /// Terminated children whose aborted loop has not ended yet ([`Self::forget_child`]),
+    /// each under both of its ids. A child served later under either id waits for the
+    /// pass before its own loop starts, and so does [`Self::shutdown`].
+    sweeps: Mutex<Vec<PendingPass>>,
+    /// Children terminated after a shutdown took the loop registry
+    /// ([`Self::forget_child`]): the shutdown aborts and awaits their loops itself, and
+    /// then forgets what those loops left ([`Self::shutdown`]). Queued under the
+    /// `record_stores` lock, which [`Self::unbind`] empties it under.
+    forget_at_shutdown: Mutex<Vec<AgentRecords>>,
+    /// Terminates under way ([`Self::abort_child`], counted by [`Terminating`]). One that
+    /// took its child's loop out of the registry before a shutdown took the registry
+    /// leaves the pass that shutdown must wait for only as it ends, so the shutdown waits
+    /// for every terminate under way first.
+    terminating: Mutex<usize>,
+    /// Told when the last terminate under way has ended.
+    terminates_ended: tokio::sync::Notify,
+}
+
+/// The serve loops retained ([`PerChildLoopManager::spawn_serve_loop`]) and the serves
+/// under way ([`Serving`]), under one lock. A terminate cancels the serves of its child
+/// and takes its loops out in one step ([`PerChildLoopManager::abort_child`]), and a serve
+/// retains its loop only if it is not cancelled, in one step too: so either the terminate
+/// finds the loop, or the serve finds itself cancelled.
+///
+/// What a child holds under a colon id — its route and its id pair — is registered and
+/// torn down under this lock too, each change in one step: by a serve
+/// ([`PerChildLoopManager::register_route`]), by a terminate
+/// ([`PerChildLoopManager::tear_down_under`]), and by a loop as it ends ([`RouteCleanup`]).
+/// So none of them meets one half done.
+#[derive(Default)]
+struct LoopRegistry {
+    /// The loop retained under each colon id, with the child it serves (seam d + seam-f
+    /// per-child abort). Keyed (not a flat `Vec`) so a terminate aborts + REMOVES exactly
+    /// its child's loops, making `active_loop_count` deterministic. A loop that ended on
+    /// its own stays until another is retained under its colon id or its child is
+    /// terminated.
+    retained: HashMap<String, Retained>,
+    /// Loops stopped because another was retained in their place under their colon id:
+    /// aborted, and awaited by [`PerChildLoopManager::shutdown`].
+    stopping: Vec<tokio::task::JoinHandle<()>>,
+    /// The serves under way, by number: the bare id of the child served, and whether a
+    /// terminate of that child has cancelled the serve.
+    serving: HashMap<u64, (String, bool)>,
+}
+
+/// A serve loop retained in the [`LoopRegistry`].
+struct Retained {
+    /// The child it serves, by bare id: the registry, not the colon id, tells whose a loop
+    /// is — a child renamed keeps the colon id it was served under, and another child can
+    /// take its old handle, and with it that colon id.
+    bare_id: String,
+    /// The serve that retained it ([`Serving`]).
+    serve: u64,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// One serve of a child under way ([`LoopRegistry::serving`]): from the start of
+/// [`SpawnObserver::on_child_spawned`] until it ends, its loop retained or not.
+struct Serving<'a> {
+    manager: &'a PerChildLoopManager,
+    serve: u64,
+}
+
+impl<'a> Serving<'a> {
+    fn begin(manager: &'a PerChildLoopManager, bare_id: &str) -> Self {
+        let serve = manager.next_serve.fetch_add(1, Ordering::Relaxed);
+        lock(&manager.loops)
+            .serving
+            .insert(serve, (bare_id.to_string(), false));
+        Self { manager, serve }
+    }
+}
+
+impl Drop for Serving<'_> {
+    fn drop(&mut self) {
+        lock(&self.manager.loops).serving.remove(&self.serve);
+    }
+}
+
+/// Unregister the route and the id pair of the child `bare_id` under `colon` while they
+/// are its own — the id bridge still pairs the two ids — and leave them alone otherwise:
+/// another child holds the colon id now. Called with the registry's lock held, as every
+/// registration is made ([`LoopRegistry`]), so no one meets one of the two without the
+/// other. Returns whether they were its own.
+fn unroute(routing: &DynamicRouting, bridge: &AgentIdBridge, bare_id: &str, colon: &str) -> bool {
+    let own = bridge.unregister_pair(colon, bare_id);
+    if own {
+        routing.unregister_child(colon);
+    }
+    own
+}
+
+/// What a serve loop tears down when it ends on its own — `serve` returned: a component
+/// that loaded but trapped in `bootstrap_and_init`, or a guest stop (audit r8 W2): the
+/// route and the id pair its serve registered, so a parent send then dead-ends
+/// (`unknown_target`) rather than black-holing into a mailbox no loop serves.
+///
+/// Only while the registry still retains this loop under its colon id, looked at under
+/// the registry's lock. Once a terminate has taken the loop out, what is under the colon
+/// id is the terminate's to tear down, and may be a successor's: the same bare id under
+/// the same handle registers the very same pair. An abort cannot stop a loop past its
+/// last await, so a loop that ends as its child is terminated would otherwise unroute the
+/// child served in its place. Once a shutdown has taken it out, the route and the id pair
+/// are left as they are, in memory, and go with the composition: no serve registers
+/// anything after a shutdown has begun.
+struct RouteCleanup {
+    loops: Arc<Mutex<LoopRegistry>>,
+    routing: Arc<DynamicRouting>,
+    bridge: Arc<AgentIdBridge>,
+    bare_id: String,
+    colon_id: String,
+    serve: u64,
+}
+
+impl RouteCleanup {
+    fn run(self) {
+        let registry = lock(&self.loops);
+        let retained = registry
+            .retained
+            .get(&self.colon_id)
+            .is_some_and(|retained| retained.serve == self.serve);
+        if retained {
+            unroute(&self.routing, &self.bridge, &self.bare_id, &self.colon_id);
+        }
+    }
+}
+
+/// The crash cascade of one serve's loop: tells `inner` of a crash of the loop only while
+/// the registry still retains this loop, looked at under the registry's lock as the loop's
+/// teardown is ([`RouteCleanup`]), and under the BARE id the registry records the loop
+/// for — the colon id the loop serves under follows the child's handle as it was, so after
+/// a rename it would name whoever holds that handle now. An abort cannot stop a loop past
+/// its last await, so a loop that traps as its child is terminated would otherwise report
+/// a crash of the child spawned since under the same ids. The lock is held while `inner`
+/// runs, so a terminate cannot take the loop out — nor the child be respawned — between
+/// the look and the report.
+struct ServedCrashSink {
+    inner: Arc<dyn CrashCascadeSink>,
+    loops: Arc<Mutex<LoopRegistry>>,
+    colon_id: String,
+    serve: u64,
+}
+
+impl CrashCascadeSink for ServedCrashSink {
+    fn handle_crash(&self, _served_as: &str, reason: &str) {
+        let registry = lock(&self.loops);
+        let retained = registry
+            .retained
+            .get(&self.colon_id)
+            .filter(|retained| retained.serve == self.serve);
+        if let Some(retained) = retained {
+            self.inner.handle_crash(&retained.bare_id, reason);
+        }
+    }
+}
+
+/// One terminate under way ([`PerChildLoopManager::abort_child`]), counted until dropped.
+struct Terminating<'a>(&'a PerChildLoopManager);
+
+impl<'a> Terminating<'a> {
+    fn begin(manager: &'a PerChildLoopManager) -> Self {
+        *lock(&manager.terminating) += 1;
+        Self(manager)
+    }
+}
+
+impl Drop for Terminating<'_> {
+    fn drop(&mut self) {
+        let mut under_way = lock(&self.0.terminating);
+        *under_way -= 1;
+        if *under_way == 0 {
+            self.0.terminates_ended.notify_waiters();
+        }
+    }
+}
+
+/// The second pass of a terminated child ([`PerChildLoopManager::forget_child`]),
+/// still to run: it forgets the rows and the served record under the child's BARE id,
+/// and the reports under it and the colon ids it held.
+struct PendingPass {
+    bare_id: String,
+    colon_ids: Vec<String>,
+    /// Closes when the pass has run.
+    swept: watch::Receiver<()>,
+}
+
+/// A second pass reserved by a terminate before it tears anything down
+/// ([`PerChildLoopManager::reserve_pass`]), pending in `sweeps` from then on and run by
+/// [`PerChildLoopManager::forget_child`] once the child's loops have ended.
+struct ReservedPass {
+    /// The passes before it that share an id with it, to run first.
+    earlier: Vec<watch::Receiver<()>>,
+    /// Closes the pass when dropped.
+    done: watch::Sender<()>,
+}
+
+/// The passes still pending in `passes` that forget something an agent known by
+/// `bare_id` / `colon_ids` keeps — a pass that shares ANY of those ids with it. A bare id
+/// and a colon id never equal each other (`agent:` is not a bare id), and the two need
+/// not name each other: the colon id follows the agent's handle, so an agent created
+/// later under a bare id a terminated child held can have another colon id, and one
+/// created under its handle another bare id.
+fn passes_pending_for(
+    passes: &[PendingPass],
+    bare_id: &str,
+    colon_ids: &[&str],
+) -> Vec<watch::Receiver<()>> {
+    passes
+        .iter()
+        .filter(|pass| {
+            pass.bare_id == bare_id
+                || pass
+                    .colon_ids
+                    .iter()
+                    .any(|held| colon_ids.contains(&held.as_str()))
+        })
+        .map(|pass| pass.swept.clone())
+        .collect()
+}
+
+/// Remembers the provider entry each agent chats on — the LLM gateway
+/// ([`cap_llm::LlmGateway::forget_agent`]).
+trait ChatRecord: Send + Sync {
+    /// Forget where `agent_id` (the BARE cap agent id) chats.
+    fn forget_agent(&self, agent_id: &str);
+}
+
+impl ChatRecord for cap_llm::LlmGateway {
+    fn forget_agent(&self, agent_id: &str) {
+        cap_llm::LlmGateway::forget_agent(self, agent_id);
+    }
+}
+
+/// Where the context engine keeps what it knows of an agent outside the agent's own
+/// workspace, keyed by the agent's id: the shared cap-memory index (turn digests, task
+/// briefs, memory rows, and their vectors), the gateway's record of the provider entry
+/// the agent chats on, and the store of last assembly reports.
+///
+/// The home's knowledge entries are not among them: the memory store keeps them under
+/// the agent's id by design, as it keeps a terminated sub-agent's archive.
+#[derive(Clone)]
+struct RecordStores {
+    chats: Arc<dyn ChatRecord>,
+    memory_index: Option<Arc<dyn cap_memory::SqliteIndex + Send + Sync>>,
+    context_store: Arc<crate::context_inspect::ContextSnapshotStore>,
+}
+
+/// What [`RecordStores`] hold under one agent's ids, held so it can be forgotten when
+/// the agent is terminated ([`PerChildLoopManager::forget_child`]): its bare id, and the
+/// colon ids it held then.
+#[derive(Clone)]
+struct AgentRecords {
+    bare_id: String,
+    colon_ids: Vec<String>,
+    stores: RecordStores,
+    log: LogHandle,
+}
+
+impl AgentRecords {
+    fn colon_ids(&self) -> Vec<&str> {
+        self.colon_ids.iter().map(String::as_str).collect()
+    }
+
+    /// Forget all of it: the agent is gone, and its ids name no agent any more.
+    fn forget(&self) {
+        self.stores
+            .context_store
+            .forget(&self.bare_id, &self.colon_ids());
+        self.forget_written();
+    }
+
+    /// Forget what a loop still running may have written since [`Self::forget`]: a
+    /// row, the entry a request of its guest was served by, an assembly report. The
+    /// ids stay known — an agent spawned under them since has registered them.
+    fn forget_late(&self) {
+        let mut ids = vec![self.bare_id.as_str()];
+        ids.extend(self.colon_ids());
+        self.stores.context_store.forget_reports(&ids);
+        self.forget_written();
+    }
+
+    fn forget_written(&self) {
+        self.stores.chats.forget_agent(&self.bare_id);
+        let Some(index) = self.stores.memory_index.as_ref() else {
+            return;
+        };
+        if let Err(e) = index.forget_agent(&self.bare_id) {
+            self.log.err(
+                log_keys::PERCHILD_FORGET_FAILED,
+                format!(
+                    "perchild: the index rows of terminated child {} are not removed: {e}",
+                    self.bare_id
+                ),
+            );
+        }
+    }
+}
+
+/// Wait until `swept` closes: the pass it stands for has run (or will never run —
+/// its task is gone with the runtime).
+async fn closed(mut swept: watch::Receiver<()>) {
+    while swept.changed().await.is_ok() {}
 }
 
 impl PerChildLoopManager {
@@ -182,7 +521,8 @@ impl PerChildLoopManager {
             key_resolver,
             turn_observer: Arc::new(RecordingTurnObserver::default()),
             llm_stream_reaper: std::sync::OnceLock::new(),
-            loops: Mutex::new(HashMap::new()),
+            loops: Arc::new(Mutex::new(LoopRegistry::default())),
+            next_serve: AtomicU64::new(0),
             crash_sink: None,
             action_dispatcher: None,
             protected_turn_boundary: None,
@@ -192,6 +532,11 @@ impl PerChildLoopManager {
             child_config_data: None,
             log: LogHandle::null(),
             context_deps: Mutex::new(None),
+            record_stores: Mutex::new(None),
+            sweeps: Mutex::new(Vec::new()),
+            forget_at_shutdown: Mutex::new(Vec::new()),
+            terminating: Mutex::new(0),
+            terminates_ended: tokio::sync::Notify::new(),
         }
     }
 
@@ -213,8 +558,10 @@ impl PerChildLoopManager {
 
     /// seam (f): attach the shared crash-cascade sink to each spawned child serve
     /// loop, so a trapping child turn drives `handle_crash` (child tree status →
-    /// Failed + a parent `component.terminated` notice). Production builds the sink
-    /// once in wiring and passes it here.
+    /// Failed + a parent `component.terminated` notice; nothing for a child a terminate
+    /// has marked terminated) — told of the child by its bare id, and only while the
+    /// registry retains the loop ([`ServedCrashSink`]). Production builds the sink once in
+    /// wiring and passes it here.
     pub fn with_crash_sink(mut self, sink: Arc<dyn CrashCascadeSink>) -> Self {
         self.crash_sink = Some(sink);
         self
@@ -262,7 +609,16 @@ impl PerChildLoopManager {
     /// Call once, after the LLM gateway exists and before any child is served
     /// (including `serve_existing_children`). The first binding wins.
     pub fn bind_context(&self, deps: Arc<crate::child_context::ChildContextDeps>) {
-        lock(&self.context_deps).get_or_insert(deps);
+        let mut bound = lock(&self.context_deps);
+        if bound.is_some() {
+            return;
+        }
+        *lock(&self.record_stores) = Some(RecordStores {
+            chats: deps.gateway.clone(),
+            memory_index: deps.memory_index.clone(),
+            context_store: deps.context_store.clone(),
+        });
+        *bound = Some(deps);
     }
 
     /// Release the late-bound runtime, injector and context deps.
@@ -278,22 +634,71 @@ impl PerChildLoopManager {
         let runtime = lock(&self.runtime).take();
         let injector = lock(&self.injector).take();
         let context_deps = lock(&self.context_deps).take();
-        drop((runtime, injector, context_deps));
+        // The stores, and with them a terminate queued for a shutdown that had already run
+        // its queue: its own first pass came after every loop had ended, so nothing is
+        // left for this one to do. Both under the lock a terminate queues under
+        // ([`Self::forget_child`]), so none is queued once the stores are gone.
+        let (record_stores, queued) = {
+            let mut bound = lock(&self.record_stores);
+            let queued = std::mem::take(&mut *lock(&self.forget_at_shutdown));
+            (bound.take(), queued)
+        };
+        drop((runtime, injector, context_deps, record_stores, queued));
     }
 
     /// Stop serving children, for an ordered shutdown: no child is served from now
-    /// on, every child serve loop is aborted and awaited, then the runtime, injector
+    /// on, every child serve loop is aborted and awaited — with those stopped because
+    /// another took their place — the terminates under way are let end, what terminated
+    /// children left is forgotten ([`Self::forget_child`]), then the runtime, injector
     /// and context deps are released ([`Self::unbind`]). Idempotent.
     pub async fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        let loops = std::mem::take(&mut *lock(&self.loops));
-        for handle in loops.values() {
-            handle.abort();
+        let (retained, stopping) = {
+            let mut registry = lock(&self.loops);
+            (
+                std::mem::take(&mut registry.retained),
+                std::mem::take(&mut registry.stopping),
+            )
+        };
+        for retained in retained.values() {
+            retained.handle.abort();
         }
-        for (_, handle) in loops {
+        let handles = retained.into_values().map(|retained| retained.handle);
+        for handle in handles.chain(stopping) {
             let _ = handle.await;
         }
+        // A terminate that took its child's loop out of the registry before it was taken
+        // above leaves that loop's pass only as it ends.
+        self.no_terminate_under_way().await;
+        // Each waits for a loop `abort_child` aborted, so none waits long; and none is
+        // left holding the gateway or the index once this returns.
+        let sweeps = std::mem::take(&mut *lock(&self.sweeps));
+        for pass in sweeps {
+            closed(pass.swept).await;
+        }
+        // Children terminated after the registry was taken above: their loops were among
+        // those aborted and awaited, so all they wrote is there to forget now. (One
+        // terminated later still is forgotten by its terminate alone: every loop has
+        // ended by then.)
+        let late = std::mem::take(&mut *lock(&self.forget_at_shutdown));
+        for records in late {
+            records.forget_late();
+        }
         self.unbind();
+    }
+
+    /// Wait until no terminate is under way ([`Terminating`]). A terminate does not wait
+    /// for anything a shutdown holds: it ends.
+    async fn no_terminate_under_way(&self) {
+        loop {
+            let ended = self.terminates_ended.notified();
+            let mut ended = std::pin::pin!(ended);
+            ended.as_mut().enable();
+            if *lock(&self.terminating) == 0 {
+                return;
+            }
+            ended.await;
+        }
     }
 
     /// Install the tee-slice-T3 reap handle (observer path (ii)).
@@ -315,6 +720,12 @@ impl PerChildLoopManager {
         self.turn_observer.count(colon_id)
     }
 
+    /// How the child `colon_id`'s turn of message `message_id` ended, once it ran to
+    /// its end ([`RecordingTurnObserver::turn_end_of`]).
+    pub fn child_turn_end(&self, colon_id: &str, message_id: &str) -> Option<TurnOutcome> {
+        self.turn_observer.turn_end_of(colon_id, message_id)
+    }
+
     /// Number of spawned child serve loops retained in the drain registry — the
     /// seam-(d) LOOP-REGISTRY the daemon aborts at shutdown. A served spawn pushes
     /// exactly one `JoinHandle`; a child that never serves (driverless / load-fail /
@@ -331,67 +742,265 @@ impl PerChildLoopManager {
         // absent==0 semantics (a served child parks on `recv`, never finishing).
         self.loops
             .lock()
-            .map(|l| l.values().filter(|h| !h.is_finished()).count())
+            .map(|registry| {
+                registry
+                    .retained
+                    .values()
+                    .filter(|retained| !retained.handle.is_finished())
+                    .count()
+            })
             .unwrap_or(0)
     }
 
-    /// Abort all spawned child serve loops (daemon shutdown drain).
+    /// Abort all spawned child serve loops (daemon shutdown drain). Those stopped
+    /// because another took their place are aborted already.
     pub fn drain(&self) {
-        if let Ok(mut loops) = self.loops.lock() {
-            for h in loops.values() {
-                h.abort();
+        if let Ok(mut registry) = self.loops.lock() {
+            for retained in registry.retained.values() {
+                retained.handle.abort();
             }
-            loops.clear();
+            registry.retained.clear();
         }
     }
 
-    /// seam (f) terminate: abort ONE child's serve loop and tear down its
-    /// per-child state, colon-correctly. `terminate_child` hands cascades the
-    /// BARE id, but the loop-registry + routing + mailbox are COLON-keyed, so
-    /// resolve bare→colon FIRST. Steps: (1) abort + REMOVE the retained loop
-    /// handle (so `active_loop_count` decrements deterministically, not on the
-    /// async `abort()` landing); (2) UNFREEZE then best-effort drain the colon
-    /// mailbox (a prior breaker-open leaves it frozen, and `poll()` returns
-    /// `None` while frozen — terminate must drain regardless); (3) unregister the
-    /// colon routing + id-bridge pair so a post-terminate parent send dead-ends
-    /// `unknown_target` rather than black-holing into a now-unserved mailbox.
-    /// Idempotent; a bare id with no served loop still tears down routing + mailbox.
+    /// seam (f) terminate: stop the child's serve loops and tear down its per-child
+    /// state, colon-correctly. `terminate_child` hands cascades the BARE id, but the
+    /// routing + mailbox are COLON-keyed. In one step under the registry's lock: (1) cancel
+    /// the serves of the child under way ([`Self::spawn_serve_loop`]) and abort + REMOVE
+    /// every loop retained for it (so `active_loop_count` decrements deterministically, not
+    /// on the async `abort()` landing); (2) when it had loops, reserve the pass that forgets
+    /// what they write late, for the colon ids it was served under and the one it resolves
+    /// to now ([`Self::reserve_pass`]); (3) for each of those ids — each only while it is
+    /// the child's or no one's ([`Self::tear_down_under`]) — unregister its route + id-bridge
+    /// pair, so a post-terminate parent send dead-ends `unknown_target` rather than
+    /// black-holing into a now-unserved mailbox, then UNFREEZE and best-effort drain the
+    /// mailbox. Then (4) forget what the context engine keeps under the child's ids
+    /// ([`Self::forget_child`]). Idempotent.
+    ///
+    /// One step: no serve registers one of these ids between its teardown and its drain,
+    /// or before the pass is pending, and no loop ending tears down half of one.
+    ///
+    /// A renamed child keeps the colon id it was served under (the live mailbox keeps it
+    /// until the next start), so the registry, not the resolver, tells which one that is.
+    /// And another child can hold a colon id this one held — its old handle, taken after
+    /// a rename — so what is under a colon id is torn down only while the id bridge pairs
+    /// it with this child or with no one.
     pub fn abort_child(&self, bare_id: &str) {
-        let colon = (self.key_resolver)(bare_id);
+        let _under_way = Terminating::begin(self);
+        let resolved = (self.key_resolver)(bare_id);
         // Root-collision guard (mirrors `on_child_spawned`'s serve-path guard @below):
         // a child whose bare id mechanically maps onto the ROOT's colon (a guest
         // `spawn-child(id="default")` → `agent:root`, the root's serve/mailbox key)
         // must NOT have the ROOT's mailbox unfrozen/drained — that would be a
-        // confused-deputy message-loss on the most-privileged agent. `unregister_child`
-        // / `bridge.unregister` already refuse the seed root, so the mailbox drain is
-        // the sole exposure; bail out entirely when the colon IS the root (the root's
+        // confused-deputy message-loss on the most-privileged agent — nor anything
+        // forgotten under its id. Bail out entirely when the colon IS the root (the root's
         // loop is served by `start.rs`, never retained in this registry — nothing to
         // abort). `agent_kind` reads the seeded root's colon kind from `DynamicRouting`.
-        if self.routing.agent_kind(&colon) == Some(AgentKind::Root) {
+        if self.routing.agent_kind(&resolved) == Some(AgentKind::Root) {
             return;
         }
-        if let Ok(mut loops) = self.loops.lock() {
-            if let Some(h) = loops.remove(&colon) {
-                h.abort();
+        let (colons, aborted, pass) = {
+            let mut registry = lock(&self.loops);
+            for (served, cancelled) in registry.serving.values_mut() {
+                if served == bare_id {
+                    *cancelled = true;
+                }
             }
+            let mine: Vec<String> = registry
+                .retained
+                .iter()
+                .filter(|(_, retained)| retained.bare_id == bare_id)
+                .map(|(colon, _)| colon.clone())
+                .collect();
+            let mut colons = Vec::new();
+            let mut aborted = Vec::new();
+            for colon in mine {
+                if let Some(retained) = registry.retained.remove(&colon) {
+                    retained.handle.abort();
+                    aborted.push(retained.handle);
+                    colons.push(colon);
+                }
+            }
+            // The id it resolves to now, unless a loop of another child is retained there.
+            if !registry.retained.contains_key(&resolved) && !colons.contains(&resolved) {
+                colons.push(resolved);
+            }
+            // Pending from here on: a child that takes one of these ids once it is free waits
+            // for it ([`Self::spawn_serve_loop`]).
+            let pass = (!aborted.is_empty()).then(|| self.reserve_pass(bare_id, &colons));
+            colons.retain(|colon| self.tear_down_under(bare_id, colon));
+            (colons, aborted, pass)
+        };
+        self.forget_child(bare_id, &colons, aborted, pass);
+    }
+
+    /// Whether a terminate of the child `bare_id` may empty the mailbox under `colon`: it
+    /// is the child's own or no one's — not the root's, not paired by the id bridge with
+    /// another agent, no loop of another child retained under it — as the ids
+    /// [`Self::abort_child`] tears down are. For the terminate cascade's mailbox flush,
+    /// which comes after [`Self::abort_child`] and resolves the child's colon id anew from
+    /// its handle ([`crate::client_api_agents::ColonMailboxCascade`]): a child renamed and
+    /// still served under its old handle's colon id keeps its mailbox when another child
+    /// that took that handle is terminated.
+    pub fn may_flush(&self, bare_id: &str, colon: &str) -> bool {
+        let registry = lock(&self.loops);
+        self.routing.agent_kind(colon) != Some(AgentKind::Root)
+            && registry
+                .retained
+                .get(colon)
+                .is_none_or(|retained| retained.bare_id == bare_id)
+            && self
+                .bridge
+                .resolve_owned(colon)
+                .is_none_or(|(holder, _)| holder == bare_id)
+    }
+
+    /// Reserve the second pass of the terminated child `bare_id`, for the colon ids
+    /// `colons` it may have held ([`Self::forget_child`]): pending from now on, so a child
+    /// served later under any of these ids waits for it ([`Self::passes_before_serving`]),
+    /// and to run after every pass before it that shares an id with it
+    /// ([`passes_pending_for`]).
+    fn reserve_pass(&self, bare_id: &str, colons: &[String]) -> ReservedPass {
+        let mut sweeps = lock(&self.sweeps);
+        // A pass that has run closed its channel: nothing waits for it any more.
+        sweeps.retain(|pass| pass.swept.has_changed().is_ok());
+        let ids: Vec<&str> = colons.iter().map(String::as_str).collect();
+        let earlier = passes_pending_for(&sweeps, bare_id, &ids);
+        let (done, swept) = watch::channel(());
+        sweeps.push(PendingPass {
+            bare_id: bare_id.to_string(),
+            colon_ids: colons.to_vec(),
+            swept,
+        });
+        ReservedPass { earlier, done }
+    }
+
+    /// Tear down what the terminated child `bare_id` leaves under `colon`: its route and
+    /// its id pair ([`unroute`]), then — once nothing routes there — what waits in the
+    /// mailbox, unfrozen first (a prior breaker-open leaves it frozen, and `poll` returns
+    /// `None` while frozen — terminate must drain regardless). The pair goes before the
+    /// drain, so a concurrent send dead-ends at `validate_routing` (`unknown_target`)
+    /// rather than enqueueing into a now-unserved mailbox after it.
+    ///
+    /// Returns `false`, touching nothing, when another agent holds `colon` now: the id
+    /// bridge pairs it with another bare id (the root's included).
+    fn tear_down_under(&self, bare_id: &str, colon: &str) -> bool {
+        if self.routing.agent_kind(colon) == Some(AgentKind::Root) {
+            return false;
         }
-        // Unregister routing + id-bridge FIRST, so a concurrent send dead-ends at
-        // `validate_routing` (`unknown_target`) rather than passing the still-present
-        // colon route and enqueueing into a now-unserved mailbox AFTER the drain
-        // (the send-vs-terminate race — narrow the window by removing the route before
-        // draining).
-        self.routing.unregister_child(&colon);
-        self.bridge.unregister(&colon, bare_id);
-        // THEN unfreeze + best-effort drain any message that enqueued before the
-        // unregister (a prior breaker-open leaves the mailbox frozen, and `poll`
-        // returns `None` while frozen — terminate must drain regardless).
-        if let Some(mb) = self.store.get(&colon) {
+        if self
+            .bridge
+            .resolve_owned(colon)
+            .is_some_and(|(holder, _)| holder != bare_id)
+        {
+            return false;
+        }
+        let own = unroute(&self.routing, &self.bridge, bare_id, colon);
+        // Drained once nothing routes the id: a route left with no pair of this child's is
+        // someone else's. (This manager leaves none: each registration and each teardown
+        // here is one step under the registry's lock, held by the caller.)
+        if own || self.routing.agent_kind(colon).is_none() {
+            self.drain_mailbox(colon);
+        }
+        true
+    }
+
+    /// Unfreeze the mailbox `colon`, then drain it, best-effort.
+    fn drain_mailbox(&self, colon: &str) {
+        if let Some(mb) = self.store.get(colon) {
             mb.unfreeze();
             let mut budget = mb.depth().saturating_add(8);
             while budget > 0 && mb.poll().is_some() {
                 budget -= 1;
             }
         }
+    }
+
+    /// The terminated child `bare_id` is gone: forget what the context engine keeps
+    /// under its bare id and the colon ids `colons` it held ([`AgentRecords`]), so an
+    /// agent created later under the same ids starts with none of it — neither the turns
+    /// the earlier one could recall, nor the provider entry it chatted on.
+    ///
+    /// Forgotten here and — when the child had serve loops, `aborted` — once more when
+    /// those loops have ended, by the pass the terminate reserved for it before it tore
+    /// anything down (`pass`, [`Self::reserve_pass`]): an aborted loop stops at its next
+    /// await, and until then may finish the step it is in and write a row. A child served
+    /// later under any of these ids does not start before that second pass
+    /// ([`Self::spawn_serve_loop`]), so it neither reads what the earlier loop wrote late
+    /// nor loses a row of its own to the pass; and a second pass starts only after every
+    /// pass before it that shares an id with it ([`passes_pending_for`]).
+    ///
+    /// Nothing is forgotten at a spawn: the tree is served again at every start
+    /// ([`Self::serve_existing_children`]), and a spawn is not a new agent. Nothing
+    /// can be forgotten either when no stores are bound (no context deps) or once a
+    /// shutdown has let go of them — that is logged — but the pass still stays pending
+    /// until the child's aborted loops have ended: a shutdown and a child served later
+    /// under its ids wait for those loops all the same.
+    fn forget_child(
+        &self,
+        bare_id: &str,
+        colons: &[String],
+        aborted: Vec<tokio::task::JoinHandle<()>>,
+        pass: Option<ReservedPass>,
+    ) {
+        let records = {
+            let bound = lock(&self.record_stores);
+            match bound.clone() {
+                Some(stores) => {
+                    let records = AgentRecords {
+                        bare_id: bare_id.to_string(),
+                        colon_ids: colons.to_vec(),
+                        stores,
+                        log: self.log.clone(),
+                    };
+                    // No loop here to wait for, because a shutdown under way took the
+                    // registry: it awaits the child's loop and then runs the second pass.
+                    // Queued BEFORE the first pass, so a shutdown that has already taken the
+                    // queue has also seen every loop end — and the first pass, after it,
+                    // forgets all they wrote. And queued while the stores are held, so a
+                    // shutdown's release ([`Self::unbind`]) takes the queue with them or
+                    // after it.
+                    if aborted.is_empty() && self.closed.load(Ordering::SeqCst) {
+                        lock(&self.forget_at_shutdown).push(records.clone());
+                    }
+                    Some(records)
+                }
+                None => {
+                    if self.closed.load(Ordering::SeqCst) {
+                        self.log.err(
+                            log_keys::PERCHILD_FORGET_FAILED,
+                            format!(
+                                "perchild: terminated child {bare_id} is not forgotten: the \
+                                 composition has shut down and let go of the stores it is \
+                                 kept in"
+                            ),
+                        );
+                    }
+                    None
+                }
+            }
+        };
+        if let Some(records) = records.as_ref() {
+            records.forget();
+        }
+        let Some(ReservedPass { earlier, done }) = pass else {
+            return;
+        };
+        self.handle.spawn(async move {
+            for earlier in earlier {
+                closed(earlier).await;
+            }
+            for aborted in aborted {
+                let _ = aborted.await;
+            }
+            if let Some(records) = records {
+                records.forget_late();
+                // Let go of the stores before telling anyone the pass has run: a shutdown
+                // that waited for it releases them next.
+                drop(records);
+            }
+            drop(done);
+        });
     }
 
     /// Boot leg: serve every NON-ROOT child already present in the tree at daemon
@@ -576,15 +1185,37 @@ impl SpawnObserver for PerChildLoopManager {
         }
         let parent_bare = parent.0.as_str();
         let child_bare = child.0.as_str();
+        // Under way from here: a terminate of the child from now on cancels it.
+        let serving = Serving::begin(self, child_bare);
+        // The node this serve is for, read once the serve is under way: a terminate of the
+        // child too early to cancel it marked the child terminated before this read (the
+        // cap-lifecycle cascade marks it before it stops the child's loops, and a crash of
+        // those loops on the way out leaves the mark: `handle_crash`). It must still
+        // be the node the call was made for — in the tree, not terminated, below `parent` and
+        // at `workspace` ([`same_workspace`]), as the spawner and the boot walk
+        // ([`Self::serve_existing_children`]) call it, and as no node changes once inserted. A
+        // call that comes late (a spawn held up, a boot walk's snapshot gone stale) for a
+        // child terminated since, or for another child that has taken its bare id since,
+        // serves nothing.
+        let Some(node) = self.tree.get_node(child).filter(|node| {
+            node.status != AgentStatus::Terminated
+                && node.parent.as_ref() == Some(parent)
+                && same_workspace(&node.workspace_path, workspace)
+        }) else {
+            self.log.err(
+                log_keys::PERCHILD_STALE_SERVE,
+                format!(
+                    "perchild: child {child_bare} was terminated, or its id taken by another \
+                     child, before it was served; not served"
+                ),
+            );
+            return;
+        };
         let child_colon = (self.key_resolver)(child_bare);
         let parent_colon = (self.key_resolver)(parent_bare);
 
-        // The child's declared capabilities (from the freshly-inserted tree node).
-        let declared: Vec<Capability> = self
-            .tree
-            .get_node(child)
-            .map(|n| n.capabilities)
-            .unwrap_or_default();
+        // The child's declared capabilities (from its tree node).
+        let declared: Vec<Capability> = node.capabilities;
         let caps: Vec<CapRequest> = declared
             .iter()
             .map(|c| CapRequest {
@@ -596,11 +1227,11 @@ impl SpawnObserver for PerChildLoopManager {
         self.delegate_child_grants(parent_bare, child_bare, &declared);
 
         // Discriminator: child-loop-absent — register seam-(e) routing but serve NO
-        // loop (the intentional routable-but-unserved state the witness asserts).
+        // loop (the intentional routable-but-unserved state the witness asserts), as a
+        // serve registers ([`Self::register_unserved`]).
         if self.skip_loop {
             if !self.skip_routing {
-                self.routing.register_child(&child_colon, &parent_colon);
-                self.bridge.register(&child_colon, child_bare);
+                self.register_unserved(&serving, child_bare, &child_colon, &parent_colon);
             }
             return;
         }
@@ -699,13 +1330,20 @@ impl SpawnObserver for PerChildLoopManager {
         }
         .with_turn_observer(obs);
         // seam (f): attach the crash-cascade sink so a trapping child turn drives
-        // `handle_crash` (child tree status → Failed + parent `component.terminated`).
+        // `handle_crash` (child tree status → Failed + parent `component.terminated`;
+        // nothing once a terminate has marked the child terminated).
         // `skip_crash` (witness-only) suppresses it for the crash-cascade discriminator.
         if !self.skip_crash {
             if let Some(sink) = self.crash_sink.as_ref() {
-                driver = driver.with_crash_cascade(sink.clone());
+                driver = driver.with_crash_cascade(Arc::new(ServedCrashSink {
+                    inner: sink.clone(),
+                    loops: self.loops.clone(),
+                    colon_id: child_colon.clone(),
+                    serve: serving.serve,
+                }));
             }
         }
+        let mut reports = None;
         if let Some(deps) = lock(&self.context_deps).clone() {
             let cap_names: Vec<String> =
                 declared.iter().map(|c| c.id.as_str().to_string()).collect();
@@ -717,7 +1355,16 @@ impl SpawnObserver for PerChildLoopManager {
                 workspace,
                 &cap_names,
             );
+            reports = Some(deps.context_store.clone());
         }
+        // The child's alias group in the context store: registered once its loop is
+        // retained, so a child that is never served leaves none.
+        let aliases = [child_bare.to_string(), child_colon.clone()];
+        let retained = move || {
+            if let Some(reports) = reports {
+                reports.register_aliases(&aliases);
+            }
+        };
         let cfg = ComponentConfig {
             id: child_bare.to_string(),
             config_data: self.child_config_data.clone(),
@@ -735,71 +1382,198 @@ impl SpawnObserver for PerChildLoopManager {
         };
         let instance = WasmInstance::new(component_id);
         let serve_key = child_colon.clone();
-        // seam (e) — the driver LOADED, so register colon routing + the id-bridge
-        // pair BEFORE the serve loop starts (a load-failing spawn returned above
-        // without registering). Registered BEFORE the spawn so the teardown below can
-        // never race ahead of the registration.
-        //
-        // audit r10 — COLON-ID COLLISION GUARD: `register_child` / `register` are
-        // FIRST-WINS and return `false` when `child_colon` (or its bare form) already
-        // belongs to another agent. The reachable case is a child whose bare id
-        // MECHANICALLY maps onto the ROOT's SPECIAL colon — a guest
-        // `spawn-child(id="default")` resolves to `agent:root`, the root's OWN
-        // serve key (`validate_agent_id` is charset-only, no reserved-name guard).
-        // Serving a loop on a colliding key would poll the INCUMBENT's mailbox — a
-        // confused-deputy / message-theft hijack of the root. So on ANY rejected
-        // registration, roll back a partial registration and DO NOT serve: the child
-        // stays an unserved tree node (safe; the incumbent keeps its mailbox intact).
-        // (`skip_routing` — a witness discriminator — intentionally serves without
-        // registering and is production-unreachable.)
-        if !self.skip_routing {
-            let routed = self.routing.register_child(&child_colon, &parent_colon);
-            let bridged = self.bridge.register(&child_colon, child_bare);
-            if !routed || !bridged {
-                if routed {
-                    self.routing.unregister_child(&child_colon);
-                }
-                if bridged {
-                    self.bridge.unregister(&child_colon, child_bare);
-                }
-                self.log.err(
-                    log_keys::PERCHILD_COLON_COLLISION,
-                    format!(
-                        "perchild: child {child_bare} colon id {child_colon} collides with an \
-                         existing agent; not served (tree node recorded, unrouted)"
-                    ),
-                );
-                return;
-            }
-        }
+        // seam (e) — the driver LOADED, so the serve registers colon routing + the
+        // id-bridge pair (a load-failing spawn returned above without registering), in
+        // the one step that decides and spawns the loop ([`Self::spawn_serve_loop`],
+        // [`Self::register_route`]): before the spawn, so the teardown below can never
+        // race ahead of the registration. (`skip_routing` — a witness discriminator —
+        // intentionally serves without registering and is production-unreachable.)
         // audit r8 W2 — when `serve` RETURNS (a component that loaded but trapped in
-        // `bootstrap_and_init`, or a guest stop), the loop is no longer live: TEAR
+        // `bootstrap_and_init`, or a guest stop), the loop is no longer live: the loop TEARS
         // DOWN the seam-(e) registration so a parent send then dead-ends cleanly
-        // (`unknown_target`) rather than black-holing into a now-unserved mailbox.
-        let cleanup = (!self.skip_routing).then(|| {
-            (
-                self.routing.clone(),
-                self.bridge.clone(),
-                child_colon.clone(),
-                child_bare.to_string(),
-            )
-        });
-        let handle = self.handle.spawn(async move {
-            driver.serve(&serve_key, cfg, instance).await;
-            if let Some((routing, bridge, colon, bare)) = cleanup {
-                routing.unregister_child(&colon);
-                bridge.unregister(&colon, &bare);
+        // (`unknown_target`) rather than black-holing into a now-unserved mailbox — while
+        // the registry still retains it ([`Self::spawn_serve_loop`], [`RouteCleanup`]).
+        let parent_route = (!self.skip_routing).then_some(parent_colon.as_str());
+        self.spawn_serve_loop(
+            &serving,
+            child_bare,
+            child_colon,
+            parent_route,
+            retained,
+            async move {
+                driver.serve(&serve_key, cfg, instance).await;
+            },
+        );
+    }
+}
+
+impl PerChildLoopManager {
+    /// The passes a loop served now for the child `bare_id`, under `colon_id`, waits for
+    /// before it starts: those of a child that held either id before and was terminated
+    /// ([`Self::forget_child`], [`passes_pending_for`]) — so it starts once that one's
+    /// loop has ended and what it left is forgotten.
+    fn passes_before_serving(&self, bare_id: &str, colon_id: &str) -> Vec<watch::Receiver<()>> {
+        passes_pending_for(&lock(&self.sweeps), bare_id, &[colon_id])
+    }
+
+    /// Serve the child `bare_id` under `colon_id`, for `serving`, in one step under the
+    /// registry's lock: decide; register the child's route below `parent_colon` and its id
+    /// pair ([`Self::register_route`]) — none when `parent_colon` is `None`, the
+    /// `skip_routing` witness serving unrouted; take the passes its loop waits for
+    /// ([`Self::passes_before_serving`]); spawn `serve`, its serve loop, to start once those
+    /// have run and, when `serve` returns, to tear down what was registered here while the
+    /// registry still retains it ([`RouteCleanup`]); retain it; and run `retained`. Returns
+    /// whether the loop is retained.
+    ///
+    /// It is not when, as the registry is taken, a shutdown has begun (it drains the
+    /// registry, and no loop may outlive it); when a terminate of the child has cancelled
+    /// `serving`; when the tree shows the child terminated or gone; or when its colon id
+    /// collides with another agent's. Then nothing of it is left registered, and `serve`
+    /// is never spawned.
+    ///
+    /// A terminate ([`Self::abort_child`]) cancels the serves of its child under way and
+    /// takes the child's loops out under the same lock: so either it finds the loop — and
+    /// tears down the route and the id pair registered with it — or the serve finds itself
+    /// cancelled and registers nothing, so no later serve meets a route a cancelled serve
+    /// holds. A serve that began after a terminate of its child reads the tree after
+    /// that terminate marked the child terminated (the cap-lifecycle cascade marks it
+    /// before it stops the child's loop, and a crash of that loop leaves the mark), so the
+    /// tree shows it terminated or gone. So it does a child a failed terminate left marked
+    /// terminated.
+    ///
+    /// The passes are taken once the colon id is registered: a child can register a colon
+    /// id another child held only once that one's route and id pair under it are gone —
+    /// torn down by that one's terminate, which reserved its pass first
+    /// ([`Self::reserve_pass`]), or by that one's loop as it ended, which writes nothing
+    /// after.
+    ///
+    /// A loop retained under `colon_id` before is stopped, not let go of: a task let go of
+    /// runs on out of the registry's reach, and holds what it holds after a shutdown.
+    fn spawn_serve_loop(
+        &self,
+        serving: &Serving<'_>,
+        bare_id: &str,
+        colon_id: String,
+        parent_colon: Option<&str>,
+        retained: impl FnOnce(),
+        serve: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        {
+            let mut registry = lock(&self.loops);
+            if !self.may_serve(&registry, serving, bare_id) {
+                return false;
             }
-        });
-        let mut loops = lock(&self.loops);
-        // A shutdown that began meanwhile has already drained the registry: this loop
-        // must not outlive it.
-        if self.closed.load(Ordering::SeqCst) {
-            drop(loops);
-            handle.abort();
-            return;
+            if parent_colon.is_none_or(|parent| self.register_route(bare_id, &colon_id, parent)) {
+                let predecessors = self.passes_before_serving(bare_id, &colon_id);
+                // What the loop tears down when `serve` returns: what was registered here,
+                // while the registry still retains this loop ([`RouteCleanup`]).
+                let cleanup = parent_colon.map(|_| RouteCleanup {
+                    loops: self.loops.clone(),
+                    routing: self.routing.clone(),
+                    bridge: self.bridge.clone(),
+                    bare_id: bare_id.to_string(),
+                    colon_id: colon_id.clone(),
+                    serve: serving.serve,
+                });
+                let handle = self.handle.spawn(async move {
+                    for swept in predecessors {
+                        closed(swept).await;
+                    }
+                    serve.await;
+                    if let Some(cleanup) = cleanup {
+                        cleanup.run();
+                    }
+                });
+                let replaced = registry.retained.insert(
+                    colon_id,
+                    Retained {
+                        bare_id: bare_id.to_string(),
+                        serve: serving.serve,
+                        handle,
+                    },
+                );
+                if let Some(replaced) = replaced {
+                    replaced.handle.abort();
+                    // Those stopped before and ended since leave nothing to wait for.
+                    registry.stopping.retain(|stopped| !stopped.is_finished());
+                    registry.stopping.push(replaced.handle);
+                }
+                retained();
+                return true;
+            }
         }
-        loops.insert(child_colon, handle);
+        self.log.err(
+            log_keys::PERCHILD_COLON_COLLISION,
+            format!(
+                "perchild: child {bare_id} colon id {colon_id} collides with an existing agent; \
+                 not served (tree node recorded, unrouted)"
+            ),
+        );
+        false
+    }
+
+    /// Whether the serve `serving` of the child `bare_id` may go on, `registry` — the
+    /// registry's lock — held: no shutdown has begun (it drains the registry, and no loop
+    /// may outlive it), no terminate of the child has cancelled the serve, and the tree
+    /// shows the child neither terminated nor gone.
+    fn may_serve(&self, registry: &LoopRegistry, serving: &Serving<'_>, bare_id: &str) -> bool {
+        if self.closed.load(Ordering::SeqCst) {
+            return false;
+        }
+        let cancelled = registry
+            .serving
+            .get(&serving.serve)
+            .is_some_and(|(_, cancelled)| *cancelled);
+        let gone = self
+            .tree
+            .get_node(&AgentId(bare_id.to_string()))
+            .is_none_or(|node| node.status == AgentStatus::Terminated);
+        !cancelled && !gone
+    }
+
+    /// The serve of the `skip_loop` witness: register the route of the child `bare_id`
+    /// below `parent_colon` and its id pair, and serve no loop — in one step under the
+    /// registry's lock, as [`Self::spawn_serve_loop`] registers, and only while the serve
+    /// may go on ([`Self::may_serve`]). Returns whether it registered.
+    fn register_unserved(
+        &self,
+        serving: &Serving<'_>,
+        bare_id: &str,
+        colon_id: &str,
+        parent_colon: &str,
+    ) -> bool {
+        let registry = lock(&self.loops);
+        self.may_serve(&registry, serving, bare_id)
+            && self.register_route(bare_id, colon_id, parent_colon)
+    }
+
+    /// Register the route of the child `bare_id` under `colon_id`, below `parent_colon`,
+    /// and its id pair (seam e), the registry's lock held. Returns whether both are its own
+    /// now; when either is another agent's, the one it did register is undone, and nothing
+    /// of it is left.
+    ///
+    /// audit r10 — COLON-ID COLLISION GUARD: `register_child` / `register` are FIRST-WINS
+    /// and return `false` when `colon_id` (or the bare form) already belongs to another
+    /// agent. The reachable case is a child whose bare id MECHANICALLY maps onto the ROOT's
+    /// SPECIAL colon — a guest `spawn-child(id="default")` resolves to `agent:root`, the
+    /// root's OWN serve key (`validate_agent_id` is charset-only, no reserved-name guard).
+    /// Serving a loop on a colliding key would poll the INCUMBENT's mailbox — a
+    /// confused-deputy / message-theft hijack of the root. So on ANY rejected registration
+    /// the serve rolls back a partial one and DOES NOT serve: the child stays an unserved
+    /// tree node (safe; the incumbent keeps its mailbox intact).
+    fn register_route(&self, bare_id: &str, colon_id: &str, parent_colon: &str) -> bool {
+        let routed = self.routing.register_child(colon_id, parent_colon);
+        let bridged = self.bridge.register(colon_id, bare_id);
+        if routed && bridged {
+            return true;
+        }
+        if routed {
+            self.routing.unregister_child(colon_id);
+        }
+        if bridged {
+            self.bridge.unregister(colon_id, bare_id);
+        }
+        false
     }
 }
 
@@ -809,26 +1583,32 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether `workspace`, as a serve is called with it, is the workspace `canonical` of a tree
+/// node. The tree keeps the canonical form (`AgentTreeStore::insert_child` canonicalizes
+/// it), which the path a spawner hands on need not be: a temporary directory under `/var`
+/// is under `/private/var` on macOS. A workspace that is not there any more is not it.
+fn same_workspace(canonical: &Path, workspace: &Path) -> bool {
+    canonical == workspace
+        || workspace
+            .canonicalize()
+            .is_ok_and(|workspace| workspace == canonical)
+}
+
 /// seam (f) glue: a cap-lifecycle [`cap_lifecycle::LoopCascade`] backed by the
 /// [`PerChildLoopManager`]. A `DefaultTerminateController` wired with
 /// `.with_loop_cascade(..)` uses it to abort a terminating child's serve loop + tear
 /// down its colon routing / mailbox. `abort_loop` forwards the BARE tree id
-/// `terminate_child` provides; `PerChildLoopManager::abort_child` resolves it to the
-/// colon serve key.
+/// `terminate_child` provides; `PerChildLoopManager::abort_child` finds the loops and the
+/// colon ids the child was served under.
 ///
-/// **NOT wired into `advance start` this wave** (UNLIKE seam-f's crash sink, which IS
-/// wired to the root + child loops this wave): `wire_capabilities` registers only
-/// `register_agent_spawn` + `register_agent_decomposition`, NOT the full
-/// `register_agent_lifecycle` bundle, so no production `terminate-child` controller
-/// exists to attach this cascade to yet. The seam-f terminate leg is
-/// witnessed at the composed-production-builders level (SYS-J-68 `sys_ac_281_*` construct
-/// the production `DefaultTerminateController` + this adapter directly) — the mechanism is
-/// proven; its guest-WIT production wiring is a later wave. (MODULE-001-AC-22 FLIPS at the
-/// sanctioned composed-production-builders bar — its witness floor + seam-(f)'s NAMED
-/// production mechanisms, `build_crash_cascade_sink` + `BreakerSubscriber` + the AC-21
-/// cascade, ARE production callers; this terminate `abort_child` production caller is the
-/// one disclosed deferral, recorded in the lane's `waived_scope`. Adversarial R13 H4:
-/// user-accepted flip-with-caveat, 2026-07-09.)
+/// Wired into `advance start` for the terminate controller of the Client API agents
+/// family (`DELETE /client/agents/{id}`), which the pack workflow executor's spawn
+/// compensation shares (`wiring.rs`, `build_agent_terminate_controller`): a child
+/// terminated through either stops its loops here, while other spawns and terminates may
+/// run concurrently. A guest's own `terminate-child` is not registered: `wire_capabilities`
+/// registers `register_agent_spawn` + `register_agent_decomposition`, not the full
+/// `register_agent_lifecycle` bundle. SYS-J-68 `sys_ac_281_*` witness the leg on the
+/// production `DefaultTerminateController` + this adapter.
 pub struct PerChildLoopCascade {
     manager: Arc<PerChildLoopManager>,
 }
@@ -850,9 +1630,10 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use advance_database::{R2d2SqliteIndexHandle, SqliteIndexHandle};
-    use advance_shared_types::agent_tree::{AgentNode, AgentStatus};
+    use advance_shared_types::agent_tree::AgentNode;
     use advance_shared_types::capability::{CapParams, CapabilityId};
     use advance_shared_types::event::Event;
+    use advance_shared_types::mailbox::{Message, MessageKind};
     use cap_grant::{CapParam, Grant, GrantId, GrantIssuer, GrantProvenance, GrantSqliteIndex};
     use serde_json::json;
 
@@ -885,6 +1666,26 @@ mod tests {
         parent_grants: Vec<(&str, &str, Vec<CapParam>)>,
         child_caps: Vec<Capability>,
     ) -> Vec<Grant> {
+        let home = kid_home(parent_grants, child_caps);
+        home.manager
+            .on_child_spawned(&home.root, &home.kid, &home.kid_dir);
+        home.grants.list_by_grantee("kid")
+    }
+
+    /// The home [`spawn_kid`] spawns `kid` in, before the spawn.
+    struct KidHome {
+        _ws: tempfile::TempDir,
+        manager: PerChildLoopManager,
+        grants: Arc<GrantStore>,
+        root: AgentId,
+        kid: AgentId,
+        kid_dir: std::path::PathBuf,
+    }
+
+    fn kid_home(
+        parent_grants: Vec<(&str, &str, Vec<CapParam>)>,
+        child_caps: Vec<Capability>,
+    ) -> KidHome {
         let ws = tempfile::TempDir::new().expect("tempdir");
         let root_dir = ws.path().join("root");
         let kid_dir = root_dir.join("kid");
@@ -952,8 +1753,77 @@ mod tests {
             tokio::runtime::Handle::current(),
             Arc::new(|bare: &str| format!("agent:{bare}")),
         );
-        manager.on_child_spawned(&root, &kid, &kid_dir);
-        grants.list_by_grantee("kid")
+        KidHome {
+            _ws: ws,
+            manager,
+            grants,
+            root,
+            kid,
+            kid_dir,
+        }
+    }
+
+    /// A serve called late serves nothing — for a child terminated since or gone, or for a
+    /// node that is not the one the call was made for (below another parent, at another
+    /// workspace: another child took the bare id since). It delegates no grant, and says
+    /// why. Called for the node that is there, it goes on (to the unbound runtime, here).
+    #[tokio::test]
+    async fn a_serve_called_for_a_node_that_is_not_there_any_more_serves_nothing() {
+        let grants = || vec![("static:root:mcp", "mcp", Vec::new())];
+        let caps = || vec![declared("mcp", serde_json::Value::Null)];
+        for stale in ["terminated", "gone", "another parent", "another workspace"] {
+            let lines = Arc::new(Lines::default());
+            let mut home = kid_home(grants(), caps());
+            home.manager = home.manager.with_log(LogHandle::new(lines.clone()));
+            let mut parent = home.root.clone();
+            let mut workspace = home.kid_dir.clone();
+            match stale {
+                "terminated" => home
+                    .manager
+                    .tree
+                    .set_status(&home.kid, AgentStatus::Terminated)
+                    .expect("kid is in the tree"),
+                "gone" => {
+                    home.manager.tree.remove(&home.kid).expect("kid is a leaf");
+                }
+                "another parent" => parent = AgentId("other".to_string()),
+                _ => workspace = home.kid_dir.join("elsewhere"),
+            }
+            home.manager
+                .on_child_spawned(&parent, &home.kid, &workspace);
+            assert!(home.grants.list_by_grantee("kid").is_empty(), "{stale}");
+            assert_eq!(lines.keys(), [log_keys::PERCHILD_STALE_SERVE], "{stale}");
+        }
+
+        let lines = Arc::new(Lines::default());
+        let mut home = kid_home(grants(), caps());
+        home.manager = home.manager.with_log(LogHandle::new(lines.clone()));
+        home.manager
+            .on_child_spawned(&home.root, &home.kid, &home.kid_dir);
+        assert!(grant_of(&home.grants.list_by_grantee("kid"), "mcp").is_some());
+        assert_eq!(lines.keys(), [log_keys::PERCHILD_UNBOUND]);
+    }
+
+    /// A workspace is the node's when it is the node's canonical path or leads to it (a
+    /// path through a link, as a temporary directory on macOS is), and not when it is
+    /// another directory or not there at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_is_the_nodes_when_it_leads_to_the_same_directory() {
+        let ws = tempfile::TempDir::new().expect("tempdir");
+        let real = ws.path().join("real");
+        let other = ws.path().join("other");
+        std::fs::create_dir_all(&real).expect("real");
+        std::fs::create_dir_all(&other).expect("other");
+        let link = ws.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let canonical = real.canonicalize().expect("canonical");
+
+        assert!(same_workspace(&canonical, &canonical));
+        assert!(same_workspace(&canonical, &link), "through a link");
+        assert!(same_workspace(&canonical, &real));
+        assert!(!same_workspace(&canonical, &other), "another directory");
+        assert!(!same_workspace(&canonical, &ws.path().join("gone")), "gone");
     }
 
     fn grant_of<'a>(grants: &'a [Grant], capability: &str) -> Option<&'a Grant> {
@@ -1087,5 +1957,2037 @@ mod tests {
         assert_eq!(params_of(&kid, "mcp"), None, "{kid:?}");
         // A path-restricted parent `fs` grant never carries across territories.
         assert_eq!(params_of(&kid, "fs"), None, "{kid:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // A terminated child is forgotten
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+
+    use advance_context_engine::AssemblyReportSink;
+    use cap_memory::{InMemorySqliteIndex, SqliteIndex, TurnIndexRow};
+
+    use crate::context_inspect::ContextSnapshotStore;
+
+    /// Records the ids it is told to forget.
+    #[derive(Default)]
+    struct Chats(Mutex<Vec<String>>);
+
+    impl Chats {
+        fn forgotten(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl ChatRecord for Chats {
+        fn forget_agent(&self, agent_id: &str) {
+            self.0.lock().unwrap().push(agent_id.to_string());
+        }
+    }
+
+    /// A manager over a tree of `root` and its child `kid`, bound to the stores a
+    /// terminated child is forgotten from. No runtime is bound: no child is served.
+    struct Managed {
+        _ws: tempfile::TempDir,
+        manager: PerChildLoopManager,
+        chats: Arc<Chats>,
+        index: Arc<InMemorySqliteIndex>,
+        reports: Arc<ContextSnapshotStore>,
+    }
+
+    fn managed() -> Managed {
+        // The root's mailbox is the special pair; `default` maps onto it too.
+        managed_with(Arc::new(|bare: &str| match bare {
+            "root" | "default" => "agent:root".to_string(),
+            other => format!("agent:{other}"),
+        }))
+    }
+
+    /// [`managed`] whose colon ids follow the handles in `handles` (an agent without
+    /// one keeps its bare id), as the production resolver follows the tree's handles.
+    fn managed_with_handles(handles: Arc<Mutex<HashMap<String, String>>>) -> Managed {
+        managed_with(Arc::new(move |bare: &str| match bare {
+            "root" | "default" => "agent:root".to_string(),
+            other => {
+                let handle = handles.lock().unwrap().get(other).cloned();
+                format!("agent:{}", handle.as_deref().unwrap_or(other))
+            }
+        }))
+    }
+
+    fn managed_with(key_resolver: KeyResolver) -> Managed {
+        let ws = tempfile::TempDir::new().expect("tempdir");
+        let root_dir = ws.path().join("root");
+        let kid_dir = root_dir.join("kid");
+        std::fs::create_dir_all(&kid_dir).expect("territories");
+        let root = AgentId("root".to_string());
+        let tree = AgentTreeStore::new(ws.path().to_path_buf()).expect("tree");
+        tree.insert_root(AgentNode {
+            id: root.clone(),
+            kind: AgentKind::Root,
+            parent: None,
+            workspace_path: root_dir,
+            capabilities: Vec::new(),
+            template_ref: None,
+            status: AgentStatus::Active,
+        })
+        .expect("root node");
+        tree.insert_child(
+            &root,
+            AgentNode {
+                id: AgentId("kid".to_string()),
+                kind: AgentKind::Child,
+                parent: Some(root.clone()),
+                workspace_path: kid_dir,
+                capabilities: Vec::new(),
+                template_ref: None,
+                status: AgentStatus::Active,
+            },
+        )
+        .expect("child node");
+        let routing = Arc::new(DynamicRouting::new(
+            Arc::new(tree.clone()) as Arc<dyn AgentTreeReader>
+        ));
+        routing.seed_root("agent:root");
+        let manager = PerChildLoopManager::new(
+            Arc::new(MailboxStore::new(NonZeroUsize::new(8).expect("capacity"))),
+            Arc::new(NullBus),
+            routing,
+            Arc::new(AgentIdBridge::from_pairs([("agent:root", "root")])),
+            None,
+            tree,
+            tokio::runtime::Handle::current(),
+            key_resolver,
+        );
+        let chats = Arc::new(Chats::default());
+        let index = Arc::new(InMemorySqliteIndex::default());
+        let reports = Arc::new(ContextSnapshotStore::new());
+        *lock(&manager.record_stores) = Some(RecordStores {
+            chats: chats.clone(),
+            memory_index: Some(index.clone()),
+            context_store: reports.clone(),
+        });
+        Managed {
+            _ws: ws,
+            manager,
+            chats,
+            index,
+            reports,
+        }
+    }
+
+    fn turn_of(agent: &str, turn: u32) -> TurnIndexRow {
+        TurnIndexRow {
+            agent_id: agent.to_string(),
+            task_id: "task".to_string(),
+            turn,
+            digest: format!("what {agent} was told in turn {turn}"),
+            embedding: vec![1.0, 0.0],
+            embedding_model: Some("embed".to_string()),
+            reference_count: 0,
+            updated_at: "2026-11-17T00:00:00Z".to_string(),
+        }
+    }
+
+    fn turns_of(index: &InMemorySqliteIndex, agent: &str) -> usize {
+        index.list_turns_for_agent(agent).len()
+    }
+
+    fn aliases(bare: &str) -> [String; 2] {
+        [bare.to_string(), format!("agent:{bare}")]
+    }
+
+    /// A loop that is in the middle of a step when it is told to stop: it goes on to
+    /// write one more row of `agent` (turn 2) before it reaches an await, where the
+    /// abort ends it. Returns the loop, the sender that lets the step finish and the
+    /// flag the write sets.
+    fn loop_in_a_step(
+        index: &Arc<InMemorySqliteIndex>,
+        agent: &'static str,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        mpsc::Sender<()>,
+        Arc<AtomicBool>,
+    ) {
+        let (in_step, entered) = mpsc::channel::<()>();
+        let (finish, may_finish) = mpsc::channel::<()>();
+        let written = Arc::new(AtomicBool::new(false));
+        let (index, wrote) = (index.clone(), written.clone());
+        let looping = tokio::spawn(async move {
+            in_step.send(()).expect("the test waits for the step");
+            may_finish
+                .recv_timeout(WAIT)
+                .expect("the test lets the step finish");
+            index.upsert_turn(turn_of(agent, 2));
+            wrote.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+        entered.recv_timeout(WAIT).expect("the loop is in its step");
+        (looping, finish, written)
+    }
+
+    /// The most recent pass pending under `colon`.
+    fn pending_pass(manager: &PerChildLoopManager, colon: &str) -> watch::Receiver<()> {
+        lock(&manager.sweeps)
+            .iter()
+            .rev()
+            .find(|pass| pass.colon_ids.iter().any(|held| held == colon))
+            .map(|pass| pass.swept.clone())
+            .unwrap_or_else(|| panic!("no pass is pending for {colon}"))
+    }
+
+    /// The loop `looping`, already running, retained for the child `bare` under `colon`.
+    fn retain_running(
+        manager: &PerChildLoopManager,
+        bare: &str,
+        colon: &str,
+        looping: tokio::task::JoinHandle<()>,
+    ) {
+        lock(&manager.loops).retained.insert(
+            colon.to_string(),
+            Retained {
+                bare_id: bare.to_string(),
+                serve: manager.next_serve.fetch_add(1, Ordering::Relaxed),
+                handle: looping,
+            },
+        );
+    }
+
+    /// Serve the child `bare` under `colon` with `serve` as `on_child_spawned` does, a serve
+    /// begun now, registering no route (as the `skip_routing` witness serves; [`route`]
+    /// stands in for the registration where a test needs one). Returns whether its loop is
+    /// retained.
+    fn serve(
+        manager: &PerChildLoopManager,
+        bare: &str,
+        colon: &str,
+        serve: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        let serving = Serving::begin(manager, bare);
+        manager.spawn_serve_loop(&serving, bare, colon.to_string(), None, || {}, serve)
+    }
+
+    /// [`serve`], registering the child's route below the root and its id pair, as the
+    /// serve of a spawned child does.
+    fn serve_routed(
+        manager: &PerChildLoopManager,
+        bare: &str,
+        colon: &str,
+        serve: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        let serving = Serving::begin(manager, bare);
+        manager.spawn_serve_loop(
+            &serving,
+            bare,
+            colon.to_string(),
+            Some("agent:root"),
+            || {},
+            serve,
+        )
+    }
+
+    /// Nothing of the child `bare` is registered under `colon`: no route, no id pair.
+    fn assert_not_registered(manager: &PerChildLoopManager, bare: &str, colon: &str) {
+        assert_eq!(manager.routing.agent_kind(colon), None, "{colon} is routed");
+        assert_eq!(manager.bridge.resolve_owned(colon), None);
+        assert_eq!(manager.bridge.resolve_owned(bare), None);
+    }
+
+    /// The child each loop retained under `colon` serves.
+    fn served_under(manager: &PerChildLoopManager, colon: &str) -> Option<String> {
+        lock(&manager.loops)
+            .retained
+            .get(colon)
+            .map(|retained| retained.bare_id.clone())
+    }
+
+    /// How long a test waits for what must happen: a regression that never lets it happen
+    /// fails the test instead of stalling the run.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// `wait`, which must end within [`WAIT`].
+    async fn within<T>(wait: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(WAIT, wait)
+            .await
+            .expect("ends in time")
+    }
+
+    /// Join `thread`, which must end within [`WAIT`].
+    fn joined<T>(thread: std::thread::JoinHandle<T>) -> T {
+        let deadline = std::time::Instant::now() + WAIT;
+        while !thread.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the thread ends in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        thread.join().expect("the thread ends without a panic")
+    }
+
+    /// Route the child `bare` under `colon` — its route and its id pair, as its serve
+    /// registers them — with a message waiting in its mailbox.
+    fn route(manager: &PerChildLoopManager, bare: &str, colon: &str) {
+        assert!(manager.routing.register_child(colon, "agent:root"));
+        assert!(manager.bridge.register(colon, bare));
+        deliver(manager, bare, colon);
+    }
+
+    /// Leave a message for the child `bare` waiting in the mailbox `colon`.
+    fn deliver(manager: &PerChildLoopManager, bare: &str, colon: &str) {
+        manager
+            .store
+            .get_or_create(colon)
+            .expect("mailbox")
+            .deliver(Message {
+                id: format!("for-{bare}"),
+                kind: MessageKind::User,
+                from: "user:test".to_string(),
+                to: colon.to_string(),
+                payload: b"hello".to_vec(),
+                context: None,
+                timestamp: std::time::SystemTime::now(),
+                origin: None,
+            })
+            .expect("delivered");
+    }
+
+    /// Wait until no loop retained by `manager` runs any more.
+    async fn loops_ended(manager: &PerChildLoopManager) {
+        within(async {
+            while manager.active_loop_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+
+    /// Nothing of the child `bare` is left routed under `colon`, nor waiting in its
+    /// mailbox.
+    fn assert_unrouted(manager: &PerChildLoopManager, bare: &str, colon: &str) {
+        assert_eq!(manager.routing.agent_kind(colon), None, "{colon} is routed");
+        assert_eq!(manager.bridge.resolve_owned(colon), None);
+        assert_eq!(manager.bridge.resolve_owned(bare), None);
+        assert_eq!(
+            manager.store.get(colon).map(|mailbox| mailbox.depth()),
+            Some(0),
+            "the mailbox is drained"
+        );
+    }
+
+    /// Add the child `bare` of `root` to the tree of `home`.
+    fn add_child(home: &Managed, bare: &str) {
+        let root = AgentId("root".to_string());
+        let workspace = home._ws.path().join("root").join(bare);
+        std::fs::create_dir_all(&workspace).expect("territory");
+        home.manager
+            .tree
+            .insert_child(
+                &root,
+                AgentNode {
+                    id: AgentId(bare.to_string()),
+                    kind: AgentKind::Child,
+                    parent: Some(root.clone()),
+                    workspace_path: workspace,
+                    capabilities: Vec::new(),
+                    template_ref: None,
+                    status: AgentStatus::Active,
+                },
+            )
+            .expect("child node");
+    }
+
+    /// Records the lines it is given, by key.
+    #[derive(Default)]
+    struct Lines(Mutex<Vec<(&'static str, String)>>);
+
+    impl Lines {
+        fn keys(&self) -> Vec<&'static str> {
+            self.0.lock().unwrap().iter().map(|(key, _)| *key).collect()
+        }
+    }
+
+    impl crate::api::ComposeLog for Lines {
+        fn line(&self, line: &crate::api::ComposeLogLine) {
+            self.0.lock().unwrap().push((line.key, line.text.clone()));
+        }
+
+        fn ready(&self, line: &crate::api::ComposeLogLine) -> std::io::Result<()> {
+            self.line(line);
+            Ok(())
+        }
+    }
+
+    /// Holds the first line logged under its key — and with it the call that logs it —
+    /// until the test lets it go.
+    struct HeldLine {
+        key: &'static str,
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl HeldLine {
+        /// Returns the sink, the receiver told when the line is held, and the sender that
+        /// lets it go on.
+        fn on(key: &'static str) -> (Arc<Self>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (entered, held) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let sink = Arc::new(Self {
+                key,
+                entered: Mutex::new(Some(entered)),
+                release: Mutex::new(released),
+            });
+            (sink, held, release)
+        }
+    }
+
+    impl crate::api::ComposeLog for HeldLine {
+        fn line(&self, line: &crate::api::ComposeLogLine) {
+            if line.key != self.key {
+                return;
+            }
+            let entered = self.entered.lock().unwrap().take();
+            if let Some(entered) = entered {
+                entered.send(()).expect("the test waits for the line");
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(WAIT)
+                    .expect("the test lets the line go on");
+            }
+        }
+
+        fn ready(&self, line: &crate::api::ComposeLogLine) -> std::io::Result<()> {
+            self.line(line);
+            Ok(())
+        }
+    }
+
+    /// Records the ids it is told to forget, like [`Chats`], and can hold the next call
+    /// until the test lets it go.
+    #[derive(Default)]
+    struct HeldChats {
+        forgotten: Mutex<Vec<String>>,
+        hold: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    }
+
+    impl HeldChats {
+        /// Hold the next call. Returns the receiver told when it is held, and the sender
+        /// that lets it go on.
+        fn hold_next(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (entered, held) = mpsc::channel();
+            let (let_go, release) = mpsc::channel();
+            *self.hold.lock().unwrap() = Some((entered, release));
+            (held, let_go)
+        }
+
+        fn forgotten(&self) -> Vec<String> {
+            self.forgotten.lock().unwrap().clone()
+        }
+    }
+
+    impl ChatRecord for HeldChats {
+        fn forget_agent(&self, agent_id: &str) {
+            self.forgotten.lock().unwrap().push(agent_id.to_string());
+            let hold = self.hold.lock().unwrap().take();
+            if let Some((entered, release)) = hold {
+                entered.send(()).expect("the test waits for the call");
+                release
+                    .recv_timeout(WAIT)
+                    .expect("the test lets the call go on");
+            }
+        }
+    }
+
+    /// Terminating a child forgets its rows of the shared index, where it chats and
+    /// its assembly report — the one under its colon id, as its loop records it — and
+    /// nothing of any other agent.
+    #[tokio::test]
+    async fn a_terminated_child_is_forgotten_and_no_other_agent_is() {
+        let home = managed();
+        for agent in ["root", "kid", "other"] {
+            home.index.upsert_turn(turn_of(agent, 1));
+            home.reports.register_aliases(&aliases(agent));
+            home.reports.record(crate::context_inspect::test_report(
+                &format!("agent:{agent}"),
+                100,
+            ));
+        }
+
+        home.manager.abort_child("kid");
+
+        assert_eq!(turns_of(&home.index, "kid"), 0);
+        assert_eq!(turns_of(&home.index, "root"), 1);
+        assert_eq!(turns_of(&home.index, "other"), 1);
+        assert_eq!(home.chats.forgotten(), ["kid"]);
+        assert!(!home.reports.knows("kid") && !home.reports.knows("agent:kid"));
+        assert!(home.reports.snapshot("agent:kid").is_none(), "its report");
+        assert!(home.reports.knows("root") && home.reports.knows("other"));
+        assert!(home.reports.snapshot("agent:other").is_some());
+        // It had no serve loop: nothing is left to wait for.
+        assert!(lock(&home.manager.sweeps).is_empty());
+    }
+
+    /// The root is never forgotten: not by its own id, and not by a child id that
+    /// maps onto the root's mailbox — nor is anything else forgotten for such an id.
+    #[tokio::test]
+    async fn an_id_that_maps_onto_the_root_forgets_nothing() {
+        let home = managed();
+        for agent in ["root", "default"] {
+            home.index.upsert_turn(turn_of(agent, 1));
+        }
+        home.reports.register_aliases(&aliases("root"));
+
+        home.manager.abort_child("default");
+        home.manager.abort_child("root");
+
+        assert_eq!(turns_of(&home.index, "root"), 1);
+        assert_eq!(turns_of(&home.index, "default"), 1);
+        assert!(home.chats.forgotten().is_empty());
+        assert!(home.reports.knows("root"));
+    }
+
+    /// Once the stores are released (a shutdown), a terminate forgets nothing.
+    #[tokio::test]
+    async fn nothing_is_forgotten_once_the_stores_are_released() {
+        let home = managed();
+        home.index.upsert_turn(turn_of("kid", 1));
+        home.manager.unbind();
+        home.manager.abort_child("kid");
+        assert_eq!(turns_of(&home.index, "kid"), 1);
+        assert!(home.chats.forgotten().is_empty());
+    }
+
+    /// A terminate that comes after a shutdown let go of the stores says it forgot
+    /// nothing.
+    #[tokio::test]
+    async fn a_terminate_after_a_shutdown_is_reported() {
+        let lines = Arc::new(Lines::default());
+        let mut home = managed();
+        home.manager = home.manager.with_log(LogHandle::new(lines.clone()));
+        home.index.upsert_turn(turn_of("kid", 1));
+        within(home.manager.shutdown()).await;
+        assert!(lines.keys().is_empty());
+
+        home.manager.abort_child("kid");
+        assert_eq!(turns_of(&home.index, "kid"), 1);
+        assert!(home.chats.forgotten().is_empty());
+        assert_eq!(lines.keys(), [log_keys::PERCHILD_FORGET_FAILED]);
+        assert!(lines.0.lock().unwrap()[0]
+            .1
+            .contains("terminated child kid"));
+    }
+
+    /// An aborted loop that is in the middle of a step still writes what the step
+    /// writes. That row is forgotten too, once the loop has ended — and until then a
+    /// pass is pending under the child's id, which a loop served under the same id
+    /// waits for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn what_an_aborted_loop_writes_late_is_forgotten_when_it_has_ended() {
+        let home = managed();
+        home.index.upsert_turn(turn_of("kid", 1));
+        let (looping, finish, written) = loop_in_a_step(&home.index, "kid");
+        retain_running(&home.manager, "kid", "agent:kid", looping);
+
+        home.manager.abort_child("kid");
+        assert_eq!(turns_of(&home.index, "kid"), 0, "forgotten at once");
+        let pass = pending_pass(&home.manager, "agent:kid");
+        assert!(pass.has_changed().is_ok(), "the loop has not ended yet");
+        // The step assembled once more, too: a report under the colon id it serves.
+        home.reports
+            .record(crate::context_inspect::test_report("agent:kid", 200));
+
+        finish.send(()).expect("the loop is still in its step");
+        within(closed(pass)).await;
+        assert!(written.load(Ordering::SeqCst), "the step wrote its row");
+        assert_eq!(turns_of(&home.index, "kid"), 0, "and the row is forgotten");
+        assert!(
+            home.reports.snapshot("agent:kid").is_none(),
+            "and its report"
+        );
+        assert_eq!(home.chats.forgotten(), ["kid", "kid"]);
+    }
+
+    /// With no stores bound (no context deps) nothing is forgotten, but the pass of a
+    /// terminated child still stays pending until its aborted loop has ended: a shutdown and
+    /// a child served later under its ids wait for that loop all the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn without_stores_the_pass_still_waits_for_the_aborted_loop() {
+        let home = managed();
+        *lock(&home.manager.record_stores) = None;
+        let (looping, finish, _written) = loop_in_a_step(&home.index, "kid");
+        retain_running(&home.manager, "kid", "agent:kid", looping);
+
+        home.manager.abort_child("kid");
+        let pass = pending_pass(&home.manager, "agent:kid");
+        assert!(pass.has_changed().is_ok(), "the loop has not ended yet");
+
+        finish.send(()).expect("the loop is still in its step");
+        within(closed(pass)).await;
+        assert!(home.chats.forgotten().is_empty(), "nothing to forget it in");
+    }
+
+    /// Two children terminated one after the other under the same id: the second
+    /// pass runs only after the first, however early the second loop ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn passes_under_one_id_run_in_the_order_of_the_terminations() {
+        let home = managed();
+        let (first, finish, written) = loop_in_a_step(&home.index, "kid");
+        retain_running(&home.manager, "kid", "agent:kid", first);
+        home.manager.abort_child("kid");
+
+        // A loop served under the same id since, terminated while the first one is
+        // still in its step. It ends at once.
+        let second = tokio::spawn(std::future::pending::<()>());
+        retain_running(&home.manager, "kid", "agent:kid", second);
+        home.manager.abort_child("kid");
+        let pass = pending_pass(&home.manager, "agent:kid");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            pass.has_changed().is_ok(),
+            "the second pass waits for the first, which waits for the first loop"
+        );
+
+        finish
+            .send(())
+            .expect("the first loop is still in its step");
+        within(closed(pass)).await;
+        assert!(written.load(Ordering::SeqCst));
+        assert_eq!(turns_of(&home.index, "kid"), 0);
+        // At each terminate, and once more after each loop's end.
+        assert_eq!(home.chats.forgotten(), ["kid"; 4]);
+    }
+
+    /// A shutdown waits for the passes still pending, and leaves none behind holding
+    /// the stores.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_waits_for_the_pending_passes() {
+        let home = managed();
+        let (looping, finish, written) = loop_in_a_step(&home.index, "kid");
+        retain_running(&home.manager, "kid", "agent:kid", looping);
+        home.manager.abort_child("kid");
+
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            finish.send(()).expect("the loop is still in its step");
+        });
+        within(home.manager.shutdown()).await;
+        joined(letting_go);
+
+        assert!(written.load(Ordering::SeqCst));
+        assert_eq!(turns_of(&home.index, "kid"), 0, "the late row is forgotten");
+        assert!(lock(&home.manager.sweeps).is_empty());
+        assert!(lock(&home.manager.record_stores).is_none());
+        // Nothing but the test holds the stores any more.
+        assert_eq!(Arc::strong_count(&home.index), 1);
+        assert_eq!(Arc::strong_count(&home.chats), 1);
+    }
+
+    /// A child renamed while it is served is still served under the colon id it was
+    /// served as — its loop, its route, its mailbox, its alias group and its reports are
+    /// keyed by that one — and its terminate tears down what is under that id, not under
+    /// the new handle's alone.
+    #[tokio::test]
+    async fn a_renamed_child_is_terminated_under_the_id_it_was_served_as() {
+        let handles = Arc::new(Mutex::new(HashMap::new()));
+        let home = managed_with_handles(handles.clone());
+        home.index.upsert_turn(turn_of("kid", 1));
+        home.reports.register_aliases(&aliases("kid"));
+        home.reports
+            .record(crate::context_inspect::test_report("agent:kid", 100));
+        route(&home.manager, "kid", "agent:kid");
+        assert!(serve(
+            &home.manager,
+            "kid",
+            "agent:kid",
+            std::future::pending::<()>()
+        ));
+
+        handles
+            .lock()
+            .unwrap()
+            .insert("kid".to_string(), "helper".to_string());
+        home.manager.abort_child("kid");
+
+        assert_eq!(
+            served_under(&home.manager, "agent:kid"),
+            None,
+            "the loop it was served by is aborted"
+        );
+        assert_unrouted(&home.manager, "kid", "agent:kid");
+        assert!(!home.reports.knows("kid") && !home.reports.knows("agent:kid"));
+        assert!(home.reports.snapshot("agent:kid").is_none(), "its report");
+        assert_eq!(turns_of(&home.index, "kid"), 0);
+        // Its loop's pass is pending under the id it was served as.
+        within(closed(pending_pass(&home.manager, "agent:kid"))).await;
+    }
+
+    /// The child `kid` served under `agent:kid`, its loop ended on its own (its finished
+    /// handle stays in the registry), then renamed: its colon id is `agent:helper` now,
+    /// and its old one free for another child. Its rows and its alias group are recorded,
+    /// and so are a row of `newcomer`, the child that takes the old colon id.
+    async fn served_ended_and_renamed() -> (Managed, Arc<Mutex<HashMap<String, String>>>) {
+        let handles = Arc::new(Mutex::new(HashMap::new()));
+        let home = managed_with_handles(handles.clone());
+        add_child(&home, "newcomer");
+        for agent in ["kid", "newcomer"] {
+            home.index.upsert_turn(turn_of(agent, 1));
+        }
+        home.reports.register_aliases(&aliases("kid"));
+        assert!(serve(&home.manager, "kid", "agent:kid", async {}));
+        loops_ended(&home.manager).await;
+        assert_eq!(
+            served_under(&home.manager, "agent:kid").as_deref(),
+            Some("kid")
+        );
+        handles
+            .lock()
+            .unwrap()
+            .insert("kid".to_string(), "helper".to_string());
+        (home, handles)
+    }
+
+    /// The newcomer holds `agent:kid`: its route, its id pair, the message waiting in
+    /// its mailbox, its row, its alias group and its report.
+    fn assert_newcomer_holds_the_id(home: &Managed) {
+        let manager = &home.manager;
+        assert_eq!(
+            manager.routing.agent_kind("agent:kid"),
+            Some(AgentKind::Child)
+        );
+        let pair = Some(("newcomer".to_string(), "agent:kid".to_string()));
+        assert_eq!(manager.bridge.resolve_owned("agent:kid"), pair);
+        assert_eq!(manager.bridge.resolve_owned("newcomer"), pair);
+        assert_eq!(
+            manager
+                .store
+                .get("agent:kid")
+                .map(|mailbox| mailbox.depth()),
+            Some(1),
+            "its message is still waiting"
+        );
+        assert_eq!(turns_of(&home.index, "newcomer"), 1);
+        let report = home.reports.snapshot("newcomer").expect("its report");
+        assert_eq!(report.report.used_tokens, 700);
+    }
+
+    /// Another child took the old handle of a child whose loop had ended on its own — and
+    /// with it the colon id — and is served under it. The first child's terminate finds
+    /// no loop of its own there, and leaves alone all the newcomer holds under the id.
+    #[tokio::test]
+    async fn a_terminate_leaves_alone_a_loop_another_child_serves_under_its_old_colon_id() {
+        let (home, _handles) = served_ended_and_renamed().await;
+        route(&home.manager, "newcomer", "agent:kid");
+        assert!(serve(
+            &home.manager,
+            "newcomer",
+            "agent:kid",
+            std::future::pending::<()>()
+        ));
+        home.reports
+            .register_aliases(&["newcomer".to_string(), "agent:kid".to_string()]);
+        home.reports
+            .record(crate::context_inspect::test_report("agent:kid", 700));
+
+        home.manager.abort_child("kid");
+        assert_newcomer_holds_the_id(&home);
+        assert_eq!(
+            served_under(&home.manager, "agent:kid").as_deref(),
+            Some("newcomer")
+        );
+        assert_eq!(home.manager.active_loop_count(), 1);
+        assert_eq!(turns_of(&home.index, "kid"), 0);
+        assert!(!home.reports.knows("kid"), "its own alias group goes");
+    }
+
+    /// As [`a_terminate_leaves_alone_a_loop_another_child_serves_under_its_old_colon_id`],
+    /// but the first child's terminate still finds its own ended loop under the colon id:
+    /// the newcomer's serve registered the id after the terminate took that loop out of the
+    /// registry, and before its teardown (outside the registry's lock) reached the id. The
+    /// teardown finds the id paired with the newcomer and leaves alone all the newcomer
+    /// holds under it; the newcomer's loop is retained after it.
+    #[tokio::test]
+    async fn a_terminate_leaves_alone_what_another_child_registered_under_its_old_colon_id() {
+        let (home, _handles) = served_ended_and_renamed().await;
+        route(&home.manager, "newcomer", "agent:kid");
+        home.reports
+            .register_aliases(&["newcomer".to_string(), "agent:kid".to_string()]);
+        home.reports
+            .record(crate::context_inspect::test_report("agent:kid", 700));
+
+        home.manager.abort_child("kid");
+        assert_newcomer_holds_the_id(&home);
+        assert_eq!(served_under(&home.manager, "agent:kid"), None);
+        assert_eq!(turns_of(&home.index, "kid"), 0);
+        assert!(!home.reports.knows("kid"));
+        // The pass of its ended loop forgets nothing under the newcomer's colon id.
+        within(closed(pending_pass(&home.manager, "agent:helper"))).await;
+        assert_newcomer_holds_the_id(&home);
+
+        assert!(serve(
+            &home.manager,
+            "newcomer",
+            "agent:kid",
+            std::future::pending::<()>()
+        ));
+        assert_eq!(home.manager.active_loop_count(), 1);
+    }
+
+    /// A child renamed to the handle another child gave up after its loop ended on its
+    /// own resolves to that child's colon id, where that child's ended loop is still
+    /// retained: its terminate leaves alone what that child left under the id — its
+    /// report, its alias group, its loop.
+    #[tokio::test]
+    async fn a_terminate_leaves_alone_what_another_child_left_under_the_id_it_resolves_to() {
+        let handles = Arc::new(Mutex::new(HashMap::new()));
+        let home = managed_with_handles(handles.clone());
+        add_child(&home, "other");
+        assert!(serve(&home.manager, "other", "agent:helper", async {}));
+        loops_ended(&home.manager).await;
+        home.reports
+            .register_aliases(&["other".to_string(), "agent:helper".to_string()]);
+        home.reports
+            .record(crate::context_inspect::test_report("agent:helper", 700));
+        {
+            let mut handles = handles.lock().unwrap();
+            handles.insert("other".to_string(), "other-renamed".to_string());
+            handles.insert("kid".to_string(), "helper".to_string());
+        }
+
+        home.manager.abort_child("kid");
+        let report = home.reports.snapshot("other").expect("its report");
+        assert_eq!(report.report.used_tokens, 700);
+        assert_eq!(
+            served_under(&home.manager, "agent:helper").as_deref(),
+            Some("other")
+        );
+    }
+
+    /// What waits under a colon id a terminated child was served under is drained while
+    /// no one routes the id — the child's loop ended on its own, and its serve undid its
+    /// route — and left alone while someone else routes it with no id pair (a state built
+    /// by hand: this manager never leaves one, its registrations and teardowns each one
+    /// step under the registry's lock): that route stays, and so does the message under
+    /// it.
+    #[tokio::test]
+    async fn a_terminate_drains_a_colon_id_only_while_no_one_routes_it() {
+        for registering in [false, true] {
+            let home = managed();
+            assert!(serve(&home.manager, "kid", "agent:kid", async {}));
+            loops_ended(&home.manager).await;
+            if registering {
+                assert!(home
+                    .manager
+                    .routing
+                    .register_child("agent:kid", "agent:root"));
+            }
+            deliver(&home.manager, "newcomer", "agent:kid");
+
+            home.manager.abort_child("kid");
+            let depth = home
+                .manager
+                .store
+                .get("agent:kid")
+                .map(|mailbox| mailbox.depth());
+            if registering {
+                assert_eq!(
+                    home.manager.routing.agent_kind("agent:kid"),
+                    Some(AgentKind::Child),
+                    "the other serve's route stays"
+                );
+                assert_eq!(depth, Some(1), "the message for its child stays");
+            } else {
+                assert_unrouted(&home.manager, "kid", "agent:kid");
+            }
+            assert_eq!(served_under(&home.manager, "agent:kid"), None);
+        }
+    }
+
+    /// A child renamed while it was served, its loop in the middle of a step: its terminate
+    /// reserves its pass before it tears anything down. So a child that takes the colon id
+    /// the moment it is free — while the terminate is still in its first pass — is served
+    /// only after that pass, as one under the same bare id would be, and the loop's late
+    /// row is forgotten by then.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_child_that_takes_a_terminated_childs_colon_id_starts_after_its_pass() {
+        let handles = Arc::new(Mutex::new(HashMap::new()));
+        let home = managed_with_handles(handles.clone());
+        let chats = Arc::new(HeldChats::default());
+        *lock(&home.manager.record_stores) = Some(RecordStores {
+            chats: chats.clone(),
+            memory_index: Some(home.index.clone()),
+            context_store: home.reports.clone(),
+        });
+        add_child(&home, "newcomer");
+        let (looping, finish, written) = loop_in_a_step(&home.index, "kid");
+        route(&home.manager, "kid", "agent:kid");
+        retain_running(&home.manager, "kid", "agent:kid", looping);
+        handles
+            .lock()
+            .unwrap()
+            .insert("kid".to_string(), "helper".to_string());
+        let manager = Arc::new(home.manager);
+
+        // The terminate is held in its first pass, its teardown done.
+        let (held, let_go) = chats.hold_next();
+        let terminating = std::thread::spawn({
+            let manager = manager.clone();
+            move || manager.abort_child("kid")
+        });
+        held.recv_timeout(WAIT)
+            .expect("the terminate is in its first pass");
+        let (looping, started) = marked_serve();
+        assert!(serve_routed(&manager, "newcomer", "agent:kid", looping));
+        deliver(&manager, "newcomer", "agent:kid");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "the newcomer waits for the terminated child's pass"
+        );
+
+        let_go.send(()).expect("the terminate is held");
+        joined(terminating);
+        finish.send(()).expect("the loop is still in its step");
+        within(async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(written.load(Ordering::SeqCst), "the loop wrote late");
+        assert_eq!(turns_of(&home.index, "kid"), 0, "and it is forgotten");
+        assert_eq!(
+            served_under(&manager, "agent:kid").as_deref(),
+            Some("newcomer")
+        );
+        let pair = Some(("newcomer".to_string(), "agent:kid".to_string()));
+        assert_eq!(manager.bridge.resolve_owned("agent:kid"), pair);
+        assert_eq!(
+            manager
+                .store
+                .get("agent:kid")
+                .map(|mailbox| mailbox.depth()),
+            Some(1),
+            "the newcomer's message is still waiting"
+        );
+    }
+
+    /// A terminate stops every loop retained for its child, whatever colon id each was
+    /// retained under — and waits for each in its pass.
+    #[tokio::test]
+    async fn a_terminate_stops_every_loop_of_its_child() {
+        let home = managed();
+        let (alive, stopped) = tokio::sync::oneshot::channel::<()>();
+        retain_running(
+            &home.manager,
+            "kid",
+            "agent:helper",
+            tokio::spawn(async move {
+                let _alive = alive;
+                std::future::pending::<()>().await
+            }),
+        );
+        retain_running(
+            &home.manager,
+            "kid",
+            "agent:kid",
+            tokio::spawn(std::future::pending::<()>()),
+        );
+        retain_running(
+            &home.manager,
+            "other",
+            "agent:other",
+            tokio::spawn(std::future::pending::<()>()),
+        );
+
+        home.manager.abort_child("kid");
+        assert_eq!(served_under(&home.manager, "agent:helper"), None);
+        assert_eq!(served_under(&home.manager, "agent:kid"), None);
+        assert_eq!(
+            served_under(&home.manager, "agent:other").as_deref(),
+            Some("other")
+        );
+        within(stopped)
+            .await
+            .expect_err("stopped, and told nothing");
+        within(closed(pending_pass(&home.manager, "agent:helper"))).await;
+        assert_eq!(home.manager.active_loop_count(), 1);
+    }
+
+    /// The colon id follows the handle, so an agent created later under a bare id a
+    /// terminated child held can have another colon id — and one created under its
+    /// handle another bare id. Either way it waits for the pass of the child that held
+    /// the id, and a later pass runs only after that one: the pass forgets by bare id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_pass_is_waited_for_under_either_id() {
+        let handles = Arc::new(Mutex::new(HashMap::new()));
+        handles
+            .lock()
+            .unwrap()
+            .insert("kid".to_string(), "helper".to_string());
+        let home = managed_with_handles(handles.clone());
+        let (first, finish, written) = loop_in_a_step(&home.index, "kid");
+        retain_running(&home.manager, "kid", "agent:helper", first);
+        home.manager.abort_child("kid");
+
+        let waited_by =
+            |bare: &str, colon: &str| home.manager.passes_before_serving(bare, colon).len();
+        // The same bare id with no handle any more, and the same handle on a new bare id.
+        assert_eq!(waited_by("kid", "agent:kid"), 1);
+        assert_eq!(waited_by("newcomer", "agent:helper"), 1);
+        // An agent that shares neither id waits for nothing.
+        assert_eq!(waited_by("other", "agent:other"), 0);
+
+        // A child served since under the same bare id and no handle, terminated while
+        // the first loop is still in its step. Its loop ends at once; its pass does not
+        // run before the first.
+        handles.lock().unwrap().remove("kid");
+        retain_running(
+            &home.manager,
+            "kid",
+            "agent:kid",
+            tokio::spawn(std::future::pending::<()>()),
+        );
+        home.manager.abort_child("kid");
+        let second = pending_pass(&home.manager, "agent:kid");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            second.has_changed().is_ok(),
+            "the second pass waits for the first, which waits for the first loop"
+        );
+
+        finish
+            .send(())
+            .expect("the first loop is still in its step");
+        within(closed(second)).await;
+        assert!(written.load(Ordering::SeqCst));
+        assert_eq!(turns_of(&home.index, "kid"), 0);
+    }
+
+    /// A child terminated after a shutdown took the loop registry has no loop here to
+    /// wait for: the shutdown awaits that loop itself, then forgets what it wrote late.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_child_terminated_during_a_shutdown_is_forgotten_after_its_loop_ended() {
+        let home = managed();
+        home.index.upsert_turn(turn_of("kid", 1));
+        let (looping, finish, written) = loop_in_a_step(&home.index, "kid");
+        retain_running(&home.manager, "kid", "agent:kid", looping);
+
+        // The first steps of a shutdown: closed, and the registry taken.
+        home.manager.closed.store(true, Ordering::SeqCst);
+        let taken = std::mem::take(&mut lock(&home.manager.loops).retained);
+        home.manager.abort_child("kid");
+        assert_eq!(turns_of(&home.index, "kid"), 0, "forgotten at once");
+        assert!(lock(&home.manager.sweeps).is_empty(), "no loop to wait for");
+
+        // The loop finishes its step, then the shutdown aborts and awaits it.
+        finish.send(()).expect("the loop is still in its step");
+        for (_, retained) in taken {
+            within(async {
+                while !written.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            retained.handle.abort();
+            let _ = within(retained.handle).await;
+        }
+        assert_eq!(
+            turns_of(&home.index, "kid"),
+            1,
+            "the loop wrote one more row"
+        );
+
+        within(home.manager.shutdown()).await;
+        assert_eq!(turns_of(&home.index, "kid"), 0, "the late row is forgotten");
+        assert_eq!(home.chats.forgotten(), ["kid", "kid"]);
+        assert!(lock(&home.manager.forget_at_shutdown).is_empty());
+        assert_eq!(Arc::strong_count(&home.index), 1);
+    }
+
+    /// A terminate under way when a shutdown begins — it has taken its child's loop out
+    /// of the registry, and has not yet left the pass that forgets what that loop writes
+    /// late: the shutdown waits for it, and then for that pass, before it lets go of the
+    /// stores.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_waits_for_a_terminate_under_way() {
+        let home = managed();
+        let chats = Arc::new(HeldChats::default());
+        *lock(&home.manager.record_stores) = Some(RecordStores {
+            chats: chats.clone(),
+            memory_index: Some(home.index.clone()),
+            context_store: home.reports.clone(),
+        });
+        home.index.upsert_turn(turn_of("kid", 1));
+        let (looping, finish, written) = loop_in_a_step(&home.index, "kid");
+        let manager = Arc::new(home.manager);
+        retain_running(&manager, "kid", "agent:kid", looping);
+
+        // The terminate is held in its first pass, the loop out of the registry already.
+        let (held, let_go) = chats.hold_next();
+        let terminating = std::thread::spawn({
+            let manager = manager.clone();
+            move || manager.abort_child("kid")
+        });
+        held.recv_timeout(WAIT)
+            .expect("the terminate is in its first pass");
+        assert!(lock(&manager.loops).retained.is_empty());
+
+        let shutting_down = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !shutting_down.is_finished(),
+            "the shutdown waits for the terminate under way"
+        );
+
+        let_go.send(()).expect("the terminate is held");
+        joined(terminating);
+        // The loop finishes its step, writing one more row, and ends at its abort.
+        finish.send(()).expect("the loop is still in its step");
+        within(shutting_down).await.expect("the shutdown ends");
+
+        assert!(written.load(Ordering::SeqCst), "the step wrote its row");
+        assert_eq!(turns_of(&home.index, "kid"), 0, "the late row is forgotten");
+        assert_eq!(chats.forgotten(), ["kid", "kid"]);
+        assert!(lock(&manager.sweeps).is_empty());
+        assert!(lock(&manager.record_stores).is_none());
+        // Nothing but the test holds the stores any more.
+        assert_eq!(Arc::strong_count(&home.index), 1);
+        assert_eq!(Arc::strong_count(&chats), 1);
+    }
+
+    /// A terminate is under way from its start: one held before it has taken its child's
+    /// loop out of the registry — while it resolves the child's colon id — is waited for by
+    /// a shutdown that has taken the registry meanwhile and aborted that loop, which ends
+    /// once its step is done. The terminate, let go, finds no loop: it forgets the child —
+    /// the row the loop wrote in its step with the rest — and leaves the child to the
+    /// shutdown, which forgets it once more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_waits_for_a_terminate_from_its_start() {
+        let (entered, held) = mpsc::channel::<()>();
+        let (let_go, release) = mpsc::channel::<()>();
+        let hold = Mutex::new(Some((entered, release)));
+        let home = managed_with(Arc::new(move |bare: &str| {
+            if bare == "kid" {
+                if let Some((entered, release)) = hold.lock().unwrap().take() {
+                    entered.send(()).expect("the test waits for the terminate");
+                    release
+                        .recv_timeout(WAIT)
+                        .expect("the test lets the terminate go on");
+                }
+            }
+            format!("agent:{bare}")
+        }));
+        home.index.upsert_turn(turn_of("kid", 1));
+        let (looping, finish, written) = loop_in_a_step(&home.index, "kid");
+        retain_running(&home.manager, "kid", "agent:kid", looping);
+        let manager = Arc::new(home.manager);
+        let terminating = std::thread::spawn({
+            let manager = manager.clone();
+            move || manager.abort_child("kid")
+        });
+        held.recv_timeout(WAIT)
+            .expect("the terminate is resolving the colon id");
+
+        let shutting_down = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        // The shutdown takes the registry and aborts the loop, which ends once its step is
+        // done.
+        within(async {
+            while !lock(&manager.loops).retained.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        finish.send(()).expect("the loop is still in its step");
+        within(async {
+            while !written.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !shutting_down.is_finished(),
+            "the shutdown waits for the terminate under way"
+        );
+
+        let_go.send(()).expect("the terminate is held");
+        joined(terminating);
+        within(shutting_down).await.expect("the shutdown ends");
+
+        assert_eq!(
+            turns_of(&home.index, "kid"),
+            0,
+            "the step's row is forgotten"
+        );
+        // At the terminate, and once more by the shutdown after the loop had ended.
+        assert_eq!(home.chats.forgotten(), ["kid", "kid"]);
+        assert!(lock(&manager.forget_at_shutdown).is_empty());
+        assert!(lock(&manager.record_stores).is_none());
+        assert_eq!(Arc::strong_count(&home.index), 1);
+        assert_eq!(Arc::strong_count(&home.chats), 1);
+    }
+
+    /// A terminate that began after a shutdown stopped waiting for terminates, and is
+    /// still forgetting its child while the shutdown lets go of the stores, leaves nothing
+    /// holding them: it queued the child for the shutdown while the stores were held, and
+    /// the release took the queue with them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminate_across_the_release_leaves_nothing_holding_the_stores() {
+        let home = managed();
+        let chats = Arc::new(HeldChats::default());
+        *lock(&home.manager.record_stores) = Some(RecordStores {
+            chats: chats.clone(),
+            memory_index: Some(home.index.clone()),
+            context_store: home.reports.clone(),
+        });
+        home.index.upsert_turn(turn_of("kid", 1));
+        let manager = Arc::new(home.manager);
+        // A shutdown up to its release: closed, the registry taken (there is no loop of the
+        // child here), no terminate under way then, the queue run.
+        manager.closed.store(true, Ordering::SeqCst);
+
+        let (held, let_go) = chats.hold_next();
+        let terminating = std::thread::spawn({
+            let manager = manager.clone();
+            move || manager.abort_child("kid")
+        });
+        held.recv_timeout(WAIT)
+            .expect("the terminate is in its first pass");
+        manager.unbind();
+        let_go.send(()).expect("the terminate is held");
+        joined(terminating);
+
+        assert_eq!(
+            turns_of(&home.index, "kid"),
+            0,
+            "forgotten by the terminate"
+        );
+        assert!(lock(&manager.forget_at_shutdown).is_empty());
+        assert_eq!(Arc::strong_count(&home.index), 1);
+        assert_eq!(Arc::strong_count(&chats), 1);
+    }
+
+    /// A loop served for a child under an id a terminated child held starts only once that
+    /// child's loop has ended and its pass has run — under the same bare id with another
+    /// colon id, and under the same colon id with another bare id — so the pass neither
+    /// forgets what the new loop writes nor leaves it what the old loop wrote late. A loop
+    /// that shares neither id starts at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_child_served_under_an_id_a_terminated_child_held_starts_after_its_pass() {
+        let handles = Arc::new(Mutex::new(HashMap::new()));
+        handles
+            .lock()
+            .unwrap()
+            .insert("kid".to_string(), "helper".to_string());
+        let home = managed_with_handles(handles);
+        for bare in ["newcomer", "other"] {
+            add_child(&home, bare);
+        }
+        let (first, finish, written) = loop_in_a_step(&home.index, "kid");
+        retain_running(&home.manager, "kid", "agent:helper", first);
+        home.manager.abort_child("kid");
+        let pass = pending_pass(&home.manager, "agent:helper");
+
+        // Each loop writes a row of its own as it starts.
+        let serving = |agent: &'static str| {
+            let index = home.index.clone();
+            let (tell, told) = tokio::sync::oneshot::channel::<()>();
+            let serve = async move {
+                index.upsert_turn(turn_of(agent, 3));
+                let _ = tell.send(());
+                std::future::pending::<()>().await;
+            };
+            (serve, told)
+        };
+        let (looping, kid_started) = serving("kid");
+        assert!(serve(&home.manager, "kid", "agent:kid", looping));
+        let (looping, newcomer_started) = serving("newcomer");
+        assert!(serve(&home.manager, "newcomer", "agent:helper", looping));
+        let (looping, other_started) = serving("other");
+        assert!(serve(&home.manager, "other", "agent:other", looping));
+        assert_eq!(
+            home.manager.active_loop_count(),
+            3,
+            "all three are retained"
+        );
+
+        within(other_started)
+            .await
+            .expect("a loop that shares no id starts at once");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(pass.has_changed().is_ok(), "the first loop is in its step");
+        assert_eq!(
+            turns_of(&home.index, "kid"),
+            0,
+            "not started under the bare id"
+        );
+        assert_eq!(
+            turns_of(&home.index, "newcomer"),
+            0,
+            "not started under the colon id"
+        );
+
+        finish
+            .send(())
+            .expect("the first loop is still in its step");
+        within(kid_started).await.expect("started after the pass");
+        within(newcomer_started)
+            .await
+            .expect("started after the pass");
+        assert!(written.load(Ordering::SeqCst), "the first loop wrote late");
+        // The pass forgot the late row (turn 2) before the new loop wrote its own (turn 3).
+        let kept: Vec<u32> = home
+            .index
+            .list_turns_for_agent("kid")
+            .iter()
+            .map(|row| row.turn)
+            .collect();
+        assert_eq!(kept, [3]);
+        assert_eq!(turns_of(&home.index, "newcomer"), 1);
+    }
+
+    /// A serve loop that marks when it starts, and the mark.
+    fn marked_serve() -> (
+        impl std::future::Future<Output = ()> + Send + 'static,
+        Arc<AtomicBool>,
+    ) {
+        let started = Arc::new(AtomicBool::new(false));
+        let marks = started.clone();
+        let serve = async move {
+            marks.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await
+        };
+        (serve, started)
+    }
+
+    /// `retained` for [`PerChildLoopManager::spawn_serve_loop`] that marks when it runs,
+    /// and the mark.
+    fn marked_retain() -> (impl FnOnce(), Arc<AtomicBool>) {
+        let told = Arc::new(AtomicBool::new(false));
+        let marks = told.clone();
+        (move || marks.store(true, Ordering::SeqCst), told)
+    }
+
+    /// Let the runtime run what it has to run for a while.
+    async fn let_run() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The tree shows the child terminated — a terminate marked it so before the serve
+    /// began, or failed after marking it — or gone: the serve registers nothing, retains
+    /// no loop and never starts it. No loop ran, so no pass is left to forget what one
+    /// wrote, and nothing is forgotten.
+    #[tokio::test]
+    async fn a_child_the_tree_shows_terminated_or_gone_is_not_served() {
+        let home = managed();
+        let kid = AgentId("kid".to_string());
+        home.manager
+            .tree
+            .set_status(&kid, AgentStatus::Terminated)
+            .expect("kid is in the tree");
+        for gone in [false, true] {
+            if gone {
+                home.manager.tree.remove(&kid).expect("kid is a leaf");
+            }
+            let (looping, started) = marked_serve();
+            let (retained, told) = marked_retain();
+            let serving = Serving::begin(&home.manager, "kid");
+            assert!(!home.manager.spawn_serve_loop(
+                &serving,
+                "kid",
+                "agent:kid".to_string(),
+                Some("agent:root"),
+                retained,
+                looping
+            ));
+            assert_eq!(
+                served_under(&home.manager, "agent:kid"),
+                None,
+                "not retained"
+            );
+            assert!(!told.load(Ordering::SeqCst), "nothing recorded of it");
+            assert_not_registered(&home.manager, "kid", "agent:kid");
+            let_run().await;
+            assert!(!started.load(Ordering::SeqCst), "never started");
+        }
+        assert!(lock(&home.manager.sweeps).is_empty());
+        assert!(home.chats.forgotten().is_empty());
+    }
+
+    /// A terminate of a child while a serve of it is under way cancels the serve: it
+    /// registers nothing, and its loop is not retained and never started — though the
+    /// tree still shows the child active (as it shows a child created since under the
+    /// same bare id: the tree cannot tell the two apart). A terminate of another child
+    /// cancels nothing of it, and a serve begun after the terminate is not cancelled by
+    /// it: it registers the child's route and id pair, and its loop is retained and runs.
+    #[tokio::test]
+    async fn a_terminate_cancels_the_serves_of_its_child_under_way() {
+        let home = managed();
+        let serving = Serving::begin(&home.manager, "kid");
+        home.manager.abort_child("other");
+        home.manager.abort_child("kid");
+        let (looping, started) = marked_serve();
+        let (retained, told) = marked_retain();
+        assert!(!home.manager.spawn_serve_loop(
+            &serving,
+            "kid",
+            "agent:kid".to_string(),
+            Some("agent:root"),
+            retained,
+            looping
+        ));
+        drop(serving);
+        assert_eq!(
+            served_under(&home.manager, "agent:kid"),
+            None,
+            "not retained"
+        );
+        assert!(!told.load(Ordering::SeqCst), "nothing recorded of it");
+        assert_not_registered(&home.manager, "kid", "agent:kid");
+        let_run().await;
+        assert!(!started.load(Ordering::SeqCst), "never started");
+        assert!(
+            lock(&home.manager.loops).serving.is_empty(),
+            "no serve is under way any more"
+        );
+
+        let serving = Serving::begin(&home.manager, "kid");
+        home.manager.abort_child("other");
+        let (looping, started) = marked_serve();
+        let (retained, told) = marked_retain();
+        assert!(home.manager.spawn_serve_loop(
+            &serving,
+            "kid",
+            "agent:kid".to_string(),
+            Some("agent:root"),
+            retained,
+            looping
+        ));
+        assert!(told.load(Ordering::SeqCst));
+        assert_eq!(
+            home.manager.routing.agent_kind("agent:kid"),
+            Some(AgentKind::Child)
+        );
+        assert_eq!(
+            home.manager.bridge.resolve_owned("kid"),
+            Some(("kid".to_string(), "agent:kid".to_string()))
+        );
+        within(async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+
+    /// A serve of `kid` stalled under way for the whole of a terminate of `kid` and of the
+    /// serve of a child that has taken the colon id since: the serve, cancelled, touches
+    /// nothing under the colon id — that child's route, id pair, loop and message stay —
+    /// and, never trying to register, is no collision either.
+    #[tokio::test]
+    async fn a_cancelled_serve_leaves_alone_what_another_child_registered_since() {
+        let lines = Arc::new(Lines::default());
+        let mut home = managed();
+        home.manager = home.manager.with_log(LogHandle::new(lines.clone()));
+        add_child(&home, "newcomer");
+        let serving = Serving::begin(&home.manager, "kid");
+        home.manager.abort_child("kid");
+        assert!(serve_routed(
+            &home.manager,
+            "newcomer",
+            "agent:kid",
+            std::future::pending::<()>()
+        ));
+        deliver(&home.manager, "newcomer", "agent:kid");
+
+        let (looping, started) = marked_serve();
+        assert!(!home.manager.spawn_serve_loop(
+            &serving,
+            "kid",
+            "agent:kid".to_string(),
+            Some("agent:root"),
+            || {},
+            looping
+        ));
+        drop(serving);
+        assert_eq!(
+            home.manager.routing.agent_kind("agent:kid"),
+            Some(AgentKind::Child)
+        );
+        let pair = Some(("newcomer".to_string(), "agent:kid".to_string()));
+        assert_eq!(home.manager.bridge.resolve_owned("agent:kid"), pair);
+        assert_eq!(home.manager.bridge.resolve_owned("newcomer"), pair);
+        assert_eq!(
+            home.manager
+                .store
+                .get("agent:kid")
+                .map(|mailbox| mailbox.depth()),
+            Some(1)
+        );
+        assert_eq!(
+            served_under(&home.manager, "agent:kid").as_deref(),
+            Some("newcomer")
+        );
+        assert!(lines.keys().is_empty(), "{:?}", lines.keys());
+        let_run().await;
+        assert!(!started.load(Ordering::SeqCst), "never started");
+    }
+
+    /// A routed loop that ends on its own — its component trapped as it started, or its
+    /// guest stopped — tears down the route and the id pair its serve registered, so a send
+    /// to the child dead-ends rather than waiting in a mailbox no loop serves. Its finished
+    /// handle stays retained until another loop takes its place or its child is terminated.
+    #[tokio::test]
+    async fn a_routed_loop_that_ends_on_its_own_is_unrouted() {
+        let home = managed();
+        assert!(serve_routed(&home.manager, "kid", "agent:kid", async {}));
+        loops_ended(&home.manager).await;
+        assert_not_registered(&home.manager, "kid", "agent:kid");
+        assert_eq!(
+            served_under(&home.manager, "agent:kid").as_deref(),
+            Some("kid")
+        );
+    }
+
+    /// A loop that ends as its child is terminated — in a step, past its last await, where
+    /// the abort cannot stop it — tears down what its serve registered only while the
+    /// registry still retains it. By then the terminate has taken it out, and the child
+    /// served since under the same ids (the same bare id under the same handle registers
+    /// the very same pair) keeps its route and its id pair. That child's loop, retained when
+    /// it ends, tears its own down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_loop_that_ends_after_its_terminate_leaves_its_successor_routed() {
+        let home = managed();
+        let (entered, in_step) = mpsc::channel();
+        let (finish, finished) = mpsc::channel::<()>();
+        assert!(serve_routed(
+            &home.manager,
+            "kid",
+            "agent:kid",
+            async move {
+                entered.send(()).expect("the test waits for the step");
+                finished.recv_timeout(WAIT).expect("the test ends the step");
+            }
+        ));
+        in_step.recv_timeout(WAIT).expect("the loop is in its step");
+        home.manager.abort_child("kid");
+        assert_not_registered(&home.manager, "kid", "agent:kid");
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        assert!(serve_routed(
+            &home.manager,
+            "kid",
+            "agent:kid",
+            async move {
+                let _ = stopped.await;
+            }
+        ));
+        let pass = pending_pass(&home.manager, "agent:kid");
+
+        finish.send(()).expect("the first loop is in its step");
+        // The pass waits for the first loop to end: it has torn down what it would by then.
+        within(closed(pass)).await;
+        assert_eq!(
+            home.manager.routing.agent_kind("agent:kid"),
+            Some(AgentKind::Child),
+            "the successor's route"
+        );
+        assert_eq!(
+            home.manager.bridge.resolve_owned("agent:kid"),
+            Some(("kid".to_string(), "agent:kid".to_string())),
+            "the successor's id pair"
+        );
+
+        stop.send(()).expect("the successor is served");
+        loops_ended(&home.manager).await;
+        assert_not_registered(&home.manager, "kid", "agent:kid");
+    }
+
+    /// The terminate cascade's mailbox flush, which resolves the child's colon id anew
+    /// after [`PerChildLoopManager::abort_child`], may empty a mailbox only of the child's
+    /// own or of no one: not the root's, not one the id bridge pairs with another child,
+    /// not one another child's loop is retained under (a child renamed keeps serving the
+    /// colon id of its old handle, which another child can take).
+    #[tokio::test]
+    async fn a_terminate_flushes_only_a_mailbox_of_its_child_or_of_no_one() {
+        let home = managed();
+        assert!(
+            !home.manager.may_flush("default", "agent:root"),
+            "the root's"
+        );
+        assert!(
+            !home.manager.may_flush("root", "agent:root"),
+            "the root's own"
+        );
+        route(&home.manager, "other", "agent:helper");
+        assert!(
+            !home.manager.may_flush("kid", "agent:helper"),
+            "another child's pair"
+        );
+        let elsewhere = tokio::spawn(std::future::pending::<()>());
+        retain_running(&home.manager, "other", "agent:old", elsewhere);
+        assert!(
+            !home.manager.may_flush("kid", "agent:old"),
+            "another child's loop"
+        );
+
+        route(&home.manager, "kid", "agent:kid");
+        assert!(home.manager.may_flush("kid", "agent:kid"), "its own pair");
+        let mine = tokio::spawn(std::future::pending::<()>());
+        retain_running(&home.manager, "kid", "agent:mine", mine);
+        assert!(home.manager.may_flush("kid", "agent:mine"), "its own loop");
+        assert!(home.manager.may_flush("kid", "agent:nobody"), "no one's");
+        within(home.manager.shutdown()).await;
+    }
+
+    /// The `skip_loop` witness's serve registers its child's route and id pair as a serve
+    /// does: in one step, and not once a terminate of the child has cancelled it.
+    #[tokio::test]
+    async fn a_serve_without_a_loop_registers_only_while_it_may_serve() {
+        let home = managed();
+        let serving = Serving::begin(&home.manager, "kid");
+        home.manager.abort_child("kid");
+        assert!(!home
+            .manager
+            .register_unserved(&serving, "kid", "agent:kid", "agent:root"));
+        drop(serving);
+        assert_not_registered(&home.manager, "kid", "agent:kid");
+
+        let serving = Serving::begin(&home.manager, "kid");
+        assert!(home
+            .manager
+            .register_unserved(&serving, "kid", "agent:kid", "agent:root"));
+        assert_eq!(
+            home.manager.routing.agent_kind("agent:kid"),
+            Some(AgentKind::Child)
+        );
+        assert_eq!(
+            home.manager.bridge.resolve_owned("kid"),
+            Some(("kid".to_string(), "agent:kid".to_string()))
+        );
+        assert_eq!(served_under(&home.manager, "agent:kid"), None, "no loop");
+    }
+
+    /// The same through the spawn: a terminate of the child while its `skip_loop` serve is
+    /// under way — held as it delegates the child's grants, past the check of its node —
+    /// leaves nothing of it registered. Not held, the serve registers the child's route.
+    #[tokio::test]
+    async fn a_spawn_without_a_loop_cancelled_under_way_registers_nothing() {
+        for terminated in [true, false] {
+            let (held, entered, release) = HeldLine::on(log_keys::PERCHILD_NO_FS_GRANT);
+            let home = kid_home(
+                vec![("static:root:fs", "fs", vec![param("paths", "notes")])],
+                vec![declared("fs", serde_json::Value::Null)],
+            );
+            let manager = Arc::new(
+                home.manager
+                    .with_log(LogHandle::new(held))
+                    .with_toggles(true, false),
+            );
+            let spawning = {
+                let manager = manager.clone();
+                let (root, kid, dir) = (home.root.clone(), home.kid.clone(), home.kid_dir.clone());
+                std::thread::spawn(move || manager.on_child_spawned(&root, &kid, &dir))
+            };
+            entered
+                .recv_timeout(WAIT)
+                .expect("the serve delegates the grants");
+            if terminated {
+                manager.abort_child("kid");
+            }
+            release.send(()).expect("the serve is held");
+            joined(spawning);
+            if terminated {
+                assert_not_registered(&manager, "kid", "agent:kid");
+            } else {
+                assert_eq!(
+                    manager.routing.agent_kind("agent:kid"),
+                    Some(AgentKind::Child)
+                );
+                assert_eq!(
+                    manager.bridge.resolve_owned("kid"),
+                    Some(("kid".to_string(), "agent:kid".to_string()))
+                );
+            }
+        }
+    }
+
+    /// Records the crashes it is told of.
+    #[derive(Default)]
+    struct Crashes(Mutex<Vec<(String, String)>>);
+
+    impl CrashCascadeSink for Crashes {
+        fn handle_crash(&self, agent_id: &str, reason: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((agent_id.to_string(), reason.to_string()));
+        }
+    }
+
+    /// The crash sink `on_child_spawned` gives the loop retained under `colon`.
+    fn crash_sink_of(
+        manager: &PerChildLoopManager,
+        inner: Arc<dyn CrashCascadeSink>,
+        colon: &str,
+    ) -> ServedCrashSink {
+        let serve = lock(&manager.loops)
+            .retained
+            .get(colon)
+            .map(|retained| retained.serve)
+            .expect("a loop is retained");
+        ServedCrashSink {
+            inner,
+            loops: manager.loops.clone(),
+            colon_id: colon.to_string(),
+            serve,
+        }
+    }
+
+    /// The crash notices (`component.terminated`) taken from the mailbox `key`.
+    fn crash_notices(store: &MailboxStore, key: &str) -> Vec<serde_json::Value> {
+        let Some(mailbox) = store.get(key) else {
+            return Vec::new();
+        };
+        std::iter::from_fn(|| mailbox.poll())
+            .filter_map(|message| {
+                serde_json::from_slice::<serde_json::Value>(&message.payload).ok()
+            })
+            .filter(|payload| payload["event"] == "component.terminated")
+            .collect()
+    }
+
+    /// A crash of a child's loop as its terminate is under way — the cascade has marked the
+    /// child terminated and not yet reached its loop — leaves the mark and tells no one,
+    /// through the production crash cascade; so a serve called for the child once its loop
+    /// is taken out (a boot walk's, from a snapshot taken before) serves nothing. A crash
+    /// before the terminate is reported through the same sink: the child fails, its parent
+    /// is told.
+    #[tokio::test]
+    async fn a_crash_as_its_child_is_terminated_leaves_it_terminated() {
+        let lines = Arc::new(Lines::default());
+        let mut home = kid_home(Vec::new(), Vec::new());
+        home.manager = home.manager.with_log(LogHandle::new(lines.clone()));
+        let store = home.manager.store.clone();
+        let inner = crate::crash_cascade::build_crash_cascade_sink(
+            home.manager.tree.clone(),
+            store.clone(),
+            |bare: &str| format!("agent:{bare}"),
+        );
+        assert!(serve_routed(
+            &home.manager,
+            "kid",
+            "agent:kid",
+            std::future::pending::<()>()
+        ));
+        let sink = crash_sink_of(&home.manager, inner, "agent:kid");
+        let status = || {
+            home.manager
+                .tree
+                .get_node(&home.kid)
+                .map(|node| node.status)
+        };
+
+        sink.handle_crash("agent:kid", "a trap");
+        assert_eq!(status(), Some(AgentStatus::Failed));
+        let notices = crash_notices(&store, "agent:root");
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0]["child"], "kid");
+
+        home.manager
+            .tree
+            .set_status(&home.kid, AgentStatus::Terminated)
+            .expect("kid is in the tree");
+        sink.handle_crash("agent:kid", "a trap as it is terminated");
+        assert_eq!(status(), Some(AgentStatus::Terminated));
+        assert_eq!(
+            crash_notices(&store, "agent:root"),
+            Vec::<serde_json::Value>::new()
+        );
+
+        home.manager.abort_child("kid");
+        home.manager
+            .on_child_spawned(&home.root, &home.kid, &home.kid_dir);
+        assert_eq!(served_under(&home.manager, "agent:kid"), None);
+        assert_eq!(lines.keys(), [log_keys::PERCHILD_STALE_SERVE]);
+        within(home.manager.shutdown()).await;
+    }
+
+    /// A loop's crash is told of its child by the child's bare id — not by the colon id the
+    /// loop serves under, which follows the child's old handle once it is renamed — and only
+    /// while the loop is retained: not once its child is terminated, nor while the loop of
+    /// the child served since under the same ids is.
+    #[tokio::test]
+    async fn a_loops_crash_is_told_of_its_child_only_while_it_is_retained() {
+        let handles = Arc::new(Mutex::new(HashMap::new()));
+        let home = managed_with_handles(handles.clone());
+        let crashes = Arc::new(Crashes::default());
+        let told = || crashes.0.lock().unwrap().clone();
+        assert!(serve_routed(
+            &home.manager,
+            "kid",
+            "agent:kid",
+            std::future::pending::<()>()
+        ));
+        let first = crash_sink_of(&home.manager, crashes.clone(), "agent:kid");
+        handles
+            .lock()
+            .unwrap()
+            .insert("kid".to_string(), "helper".to_string());
+        first.handle_crash("agent:kid", "a trap");
+        assert_eq!(told(), [("kid".to_string(), "a trap".to_string())]);
+
+        home.manager.abort_child("kid");
+        first.handle_crash("agent:kid", "a trap as it is terminated");
+        handles.lock().unwrap().remove("kid");
+        assert!(serve_routed(
+            &home.manager,
+            "kid",
+            "agent:kid",
+            std::future::pending::<()>()
+        ));
+        first.handle_crash("agent:kid", "a trap once the child is served again");
+        assert_eq!(told().len(), 1, "{:?}", told());
+        within(home.manager.shutdown()).await;
+    }
+
+    /// Records, each time it is told of a crash, whether the registry's lock is held then.
+    struct LockProbe {
+        loops: Arc<Mutex<LoopRegistry>>,
+        held: Mutex<Vec<bool>>,
+    }
+
+    impl CrashCascadeSink for LockProbe {
+        fn handle_crash(&self, _agent_id: &str, _reason: &str) {
+            let held = matches!(
+                self.loops.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            self.held.lock().unwrap().push(held);
+        }
+    }
+
+    /// A loop's crash is told with the registry's lock held, so no terminate can take the
+    /// loop out — and no respawn put a successor under the same id — between the look at
+    /// the registry and the report.
+    #[tokio::test]
+    async fn a_loops_crash_is_told_under_the_registrys_lock() {
+        let home = managed();
+        assert!(serve_routed(
+            &home.manager,
+            "kid",
+            "agent:kid",
+            std::future::pending::<()>()
+        ));
+        let probe = Arc::new(LockProbe {
+            loops: home.manager.loops.clone(),
+            held: Mutex::default(),
+        });
+        crash_sink_of(&home.manager, probe.clone(), "agent:kid")
+            .handle_crash("agent:kid", "a trap");
+        assert_eq!(*probe.held.lock().unwrap(), [true]);
+        within(home.manager.shutdown()).await;
+    }
+
+    /// A loop stopped in the place of another is kept to be awaited only while it may still
+    /// run: the next loop stopped under that colon id lets go of one that has ended.
+    #[tokio::test]
+    async fn a_stopped_loop_that_has_ended_is_let_go_of() {
+        let home = managed();
+        assert!(serve(&home.manager, "kid", "agent:kid", async {}));
+        loops_ended(&home.manager).await;
+        for _ in 0..2 {
+            assert!(serve(
+                &home.manager,
+                "kid",
+                "agent:kid",
+                std::future::pending::<()>()
+            ));
+        }
+        assert_eq!(
+            lock(&home.manager.loops).stopping.len(),
+            1,
+            "only the loop stopped last"
+        );
+        within(home.manager.shutdown()).await;
+    }
+
+    /// A serve whose colon id is another agent's — its route and id pair, its route alone
+    /// (an agent registering it), or the child's bare id paired with another colon id — is
+    /// not served: it leaves what is another's alone and nothing of its own behind, retains
+    /// no loop, and says why.
+    #[tokio::test]
+    async fn a_serve_whose_colon_id_collides_is_not_served() {
+        for held in ["route and pair", "route", "bare id"] {
+            let lines = Arc::new(Lines::default());
+            let mut home = managed();
+            home.manager = home.manager.with_log(LogHandle::new(lines.clone()));
+            match held {
+                "route and pair" => route(&home.manager, "other", "agent:kid"),
+                "route" => assert!(home
+                    .manager
+                    .routing
+                    .register_child("agent:kid", "agent:root")),
+                _ => assert!(home.manager.bridge.register("agent:elsewhere", "kid")),
+            }
+            let (looping, started) = marked_serve();
+            assert!(!serve_routed(&home.manager, "kid", "agent:kid", looping));
+            assert_eq!(served_under(&home.manager, "agent:kid"), None, "{held}");
+            assert_eq!(lines.keys(), [log_keys::PERCHILD_COLON_COLLISION], "{held}");
+            let routed = home.manager.routing.agent_kind("agent:kid");
+            let bridge = &home.manager.bridge;
+            match held {
+                "route and pair" => {
+                    assert_eq!(routed, Some(AgentKind::Child));
+                    assert_eq!(
+                        bridge.resolve_owned("agent:kid"),
+                        Some(("other".to_string(), "agent:kid".to_string()))
+                    );
+                    assert_eq!(bridge.resolve_owned("kid"), None);
+                }
+                "route" => {
+                    assert_eq!(routed, Some(AgentKind::Child), "the other route stays");
+                    assert_eq!(bridge.resolve_owned("kid"), None, "its pair is undone");
+                    assert_eq!(bridge.resolve_owned("agent:kid"), None);
+                }
+                _ => {
+                    assert_eq!(routed, None, "its route is undone");
+                    assert_eq!(
+                        bridge.resolve_owned("kid"),
+                        Some(("kid".to_string(), "agent:elsewhere".to_string()))
+                    );
+                }
+            }
+            let_run().await;
+            assert!(!started.load(Ordering::SeqCst), "never started");
+        }
+    }
+
+    /// A child the tree shows failed or paused is still a child: its serve registers its
+    /// route and id pair, retains its loop and records it, and nothing of the child is torn
+    /// down or forgotten.
+    #[tokio::test]
+    async fn a_failed_or_paused_child_is_served() {
+        for status in [AgentStatus::Failed, AgentStatus::Paused] {
+            let home = managed();
+            home.index.upsert_turn(turn_of("kid", 1));
+            home.manager
+                .tree
+                .set_status(&AgentId("kid".to_string()), status)
+                .expect("kid is in the tree");
+            let (looping, started) = marked_serve();
+            let (retained, told) = marked_retain();
+            let serving = Serving::begin(&home.manager, "kid");
+            assert!(home.manager.spawn_serve_loop(
+                &serving,
+                "kid",
+                "agent:kid".to_string(),
+                Some("agent:root"),
+                retained,
+                looping
+            ));
+            assert!(told.load(Ordering::SeqCst));
+            within(async {
+                while !started.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert_eq!(
+                served_under(&home.manager, "agent:kid").as_deref(),
+                Some("kid")
+            );
+            assert_eq!(
+                home.manager.routing.agent_kind("agent:kid"),
+                Some(AgentKind::Child),
+                "still routed"
+            );
+            assert_eq!(
+                home.manager.bridge.resolve_owned("kid"),
+                Some(("kid".to_string(), "agent:kid".to_string()))
+            );
+            assert_eq!(turns_of(&home.index, "kid"), 1);
+            assert!(home.chats.forgotten().is_empty());
+        }
+    }
+
+    /// A loop retained under a colon id a loop is still retained under (two serves under
+    /// one colon id, which a witness that registers no routes allows) takes its place, and
+    /// that loop is stopped rather than let go of — none runs on out of the registry's
+    /// reach — and awaited by a shutdown.
+    #[tokio::test]
+    async fn a_loop_retained_in_the_place_of_another_stops_it() {
+        let home = managed();
+        add_child(&home, "newcomer");
+        let (alive, stopped) = tokio::sync::oneshot::channel::<()>();
+        assert!(serve(&home.manager, "kid", "agent:kid", async move {
+            let _alive = alive;
+            std::future::pending::<()>().await
+        }));
+        assert!(serve(
+            &home.manager,
+            "newcomer",
+            "agent:kid",
+            std::future::pending::<()>()
+        ));
+        within(stopped)
+            .await
+            .expect_err("the loop it took the place of is stopped, and told nothing");
+        assert_eq!(home.manager.active_loop_count(), 1);
+        assert_eq!(
+            served_under(&home.manager, "agent:kid").as_deref(),
+            Some("newcomer")
+        );
+        assert_eq!(lock(&home.manager.loops).stopping.len(), 1);
+
+        within(home.manager.shutdown()).await;
+        let registry = lock(&home.manager.loops);
+        assert!(registry.retained.is_empty() && registry.stopping.is_empty());
+    }
+
+    /// A loop stopped because another was retained in its place can be in the middle of
+    /// a step: a shutdown waits for it to end, as for the loops it stops itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_waits_for_a_loop_stopped_in_the_place_of_another() {
+        let home = managed();
+        add_child(&home, "newcomer");
+        let (looping, finish, written) = loop_in_a_step(&home.index, "kid");
+        retain_running(&home.manager, "kid", "agent:kid", looping);
+        assert!(serve(
+            &home.manager,
+            "newcomer",
+            "agent:kid",
+            std::future::pending::<()>()
+        ));
+        assert_eq!(lock(&home.manager.loops).stopping.len(), 1);
+
+        let manager = Arc::new(home.manager);
+        let shutting_down = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !shutting_down.is_finished(),
+            "the shutdown waits for the stopped loop, in its step"
+        );
+        finish.send(()).expect("the loop is still in its step");
+        within(shutting_down)
+            .await
+            .expect("the shutdown ends without a panic");
+        assert!(
+            written.load(Ordering::SeqCst),
+            "the loop ended its step before the shutdown returned"
+        );
     }
 }

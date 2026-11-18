@@ -732,7 +732,8 @@ mod tests {
             backend: ProviderBackend::OpenAiResponses,
             auth_scheme: None,
             backend_class: advance_runtime::config::InferenceBackendClass::CloudHttp,
-            embedding_model: None,
+            // The gateway always names the embedding model; the adapter has no default.
+            embedding_model: Some("text-embedding-3-small".into()),
             auth_source: advance_runtime::config::ProviderAuthSource::ApiKey,
             generate_timeout: None,
             reasoning_effort: None,

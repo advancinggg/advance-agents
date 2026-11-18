@@ -765,3 +765,32 @@ fn data_mode_is_a_set_subset() {
         )
         .is_ok());
 }
+
+// `memory` is whole-capability only: it passes down bare; a child that names a param is
+// refused even against a whole-capability parent (the grant would read narrower than it
+// is); and a restricted `memory` grant (one written by hand — no projection produces it)
+// covers nothing.
+#[test]
+fn memory_is_whole_capability_only() {
+    let v = SubsetValidatorImpl::new();
+    assert!(v
+        .validate(&parent("memory", vec![]), &draft("memory", vec![]))
+        .is_ok());
+    assert!(matches!(
+        v.validate(
+            &parent("memory", vec![]),
+            &draft("memory", vec![p("scope", "x")])
+        ),
+        Err(CapGrantError::SubsetViolation(_))
+    ));
+    let restricted = parent("memory", vec![p("scope", "x")]);
+    for child in [
+        draft("memory", vec![]),
+        draft("memory", vec![p("scope", "x")]),
+    ] {
+        assert!(matches!(
+            v.validate(&restricted, &child),
+            Err(CapGrantError::SubsetViolation(_))
+        ));
+    }
+}

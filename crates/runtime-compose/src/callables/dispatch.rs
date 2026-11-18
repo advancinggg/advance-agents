@@ -106,7 +106,11 @@ pub struct CallableDispatcher {
     inventory: RwLock<Option<Arc<dyn CallableInventoryReader>>>,
     wasm: RwLock<Option<Arc<dyn ToolRegistry>>>,
     mcp: RwLock<Option<McpDispatch>>,
-    gateway: RwLock<Option<Arc<cap_llm::LlmGateway>>>,
+    /// Not an owner: the gateway holds this dispatcher as its callable catalog, so an
+    /// owning handle back would keep the pair — and through the dispatcher the tool
+    /// registry, the fs handlers and the git commit queue — alive after every owner of
+    /// the composition has let go.
+    gateway: RwLock<Option<std::sync::Weak<cap_llm::LlmGateway>>>,
     web: RwLock<Option<(Arc<WebFamilyDispatcher>, Arc<dyn GrantCheck>)>>,
 }
 
@@ -150,8 +154,10 @@ impl CallableDispatcher {
         *self.repetition.write().unwrap_or_else(|e| e.into_inner()) = guard;
     }
 
+    /// The gateway whose turn transcript receives each callable result. Held weakly (see
+    /// the field): the composition owns the gateway for as long as a guest can call.
     pub fn bind_gateway(&self, gateway: Arc<cap_llm::LlmGateway>) {
-        *self.gateway.write().unwrap_or_else(|e| e.into_inner()) = Some(gateway);
+        *self.gateway.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&gateway));
     }
 
     pub fn bind_web(&self, dispatcher: Arc<WebFamilyDispatcher>, web_grant: Arc<dyn GrantCheck>) {
@@ -244,7 +250,8 @@ impl CallableDispatcher {
             self.gateway
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .clone(),
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade),
             ctx.transcript_scope.as_deref(),
         ) {
             gw.record_tool_result(&ctx.agent_id, scope, record_id, &event_name, &content);

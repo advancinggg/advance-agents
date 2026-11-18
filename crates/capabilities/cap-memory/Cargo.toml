@@ -39,7 +39,8 @@ r2d2 = { workspace = true }
 r2d2_sqlite = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# test-util: the paused clock (`start_paused`) the catch-up deadline is tested on.
+tokio = { workspace = true, features = ["test-util"] }
 # Temp dirs/files for the persistence + rusqlite round-trip tests (AC-40/41)
 # and the SAT-B post-processor writeback tests (T54-T60).
 tempfile = { workspace = true }

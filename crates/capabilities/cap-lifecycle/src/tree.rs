@@ -330,10 +330,10 @@ impl AgentTreeStore {
     /// consumers correctly invalidate caches). Absent id →
     /// `SpawnError::TreeStateInvalid` (same not-found style as `remove`) — its
     /// SOLE error path. The terminate-cascade top-down freeze TOLERATES this
-    /// (a concurrently-removed leaf: skip, no recurse); `handle_crash`
-    /// translates it to `LifecycleError::NotFound`. Used by the
+    /// (a concurrently-removed leaf: skip, no recurse). Used by the
     /// terminate-cascade top-down live-tree freeze (freeze a node before
-    /// reading its children) and `handle_crash` (flip to `Failed`).
+    /// reading its children); `handle_crash` flips a node to `Failed` through
+    /// [`Self::mark_failed`].
     pub fn set_status(&self, id: &AgentId, status: AgentStatus) -> Result<(), SpawnError> {
         let mut inner = self.inner.write().expect("poisoned");
         let node = inner
@@ -343,6 +343,39 @@ impl AgentTreeStore {
         node.status = status;
         inner.revision = inner.revision.saturating_add(1);
         Ok(())
+    }
+
+    /// Mark the node `id` `Failed` — its loop crashed — unless it is inside a
+    /// terminate: a terminate has marked it, or one of its ancestors,
+    /// `Terminated`. The freeze marks a subtree top-down, so a node below a
+    /// marked one is about to be marked too (and `insert_child` refuses a child
+    /// under a marked parent). Such a node is being torn down, and the mark is
+    /// final. Returns whether the node was marked (the revision bumps only
+    /// then). One step under the tree's lock, as the freeze's own marking is
+    /// ([`Self::set_status`]), so a crash racing a terminate neither undoes
+    /// nor runs ahead of its mark, which every reader of the tree takes for
+    /// "being torn down". Absent id → `SpawnError::TreeStateInvalid`, as
+    /// [`Self::set_status`]; `handle_crash` translates it to
+    /// `LifecycleError::NotFound`.
+    pub fn mark_failed(&self, id: &AgentId) -> Result<bool, SpawnError> {
+        let mut inner = self.inner.write().expect("poisoned");
+        let mut parent = match inner.nodes.get(id) {
+            None => return Err(SpawnError::TreeStateInvalid(format!("not found: {:?}", id))),
+            Some(node) if node.status == AgentStatus::Terminated => return Ok(false),
+            Some(node) => node.parent.clone(),
+        };
+        while let Some(ancestor) = parent {
+            match inner.nodes.get(&ancestor) {
+                Some(node) if node.status == AgentStatus::Terminated => return Ok(false),
+                Some(node) => parent = node.parent.clone(),
+                None => break,
+            }
+        }
+        if let Some(node) = inner.nodes.get_mut(id) {
+            node.status = AgentStatus::Failed;
+        }
+        inner.revision = inner.revision.saturating_add(1);
+        Ok(true)
     }
 
     /// Re-bind an existing node's handle (a rename). The id — and every store keyed by

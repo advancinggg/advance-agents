@@ -373,6 +373,61 @@ async fn t_wave12_set_context_assembler_late_binds_inject() {
     );
 }
 
+/// A late-bound assembler belongs to whoever bound it: the guard does not keep it alive
+/// (in a composition the assembler holds the gateway that, through the callable
+/// dispatcher, holds the guard), and once its owner has let go the guard still decides
+/// and injects nothing. An assembler given at construction is the guard's own.
+#[tokio::test]
+async fn a_late_bound_assembler_is_not_kept_alive_by_the_guard() {
+    let sig = ToolCallSignature {
+        tool_id: "fs::read".into(),
+        method: "read".into(),
+        params_hash: 0xDEAD_BEEF_DEAD_BEEF,
+    };
+    let guard_with_helpers = || {
+        let pi = MockPromptInjectionHelpers::new_arc();
+        RepetitionGuard::new(10, 3, RepetitionAction::WarnThenTerminate)
+            .with_prompt_injection_helpers(pi as Arc<dyn PromptInjectionHelpers>)
+    };
+
+    let bound = MockContextAssembler::new_arc();
+    let watch = Arc::downgrade(&bound);
+    let guard = guard_with_helpers();
+    assert!(guard.set_context_assembler(Arc::clone(&bound) as Arc<dyn ContextAssembler>));
+    assert_eq!(
+        Arc::strong_count(&bound),
+        1,
+        "the guard holds no owning handle"
+    );
+    drop(bound);
+    assert!(
+        watch.upgrade().is_none(),
+        "the assembler is gone with its owner"
+    );
+    let _ = guard.record_tool_call("agent-gone", sig.clone());
+    let _ = guard.record_tool_call("agent-gone", sig.clone());
+    assert!(
+        matches!(
+            guard.record_tool_call("agent-gone", sig.clone()),
+            RepetitionDecision::Warn(_)
+        ),
+        "the guard still decides"
+    );
+
+    let owned = MockContextAssembler::new_arc();
+    let guard = guard_with_helpers()
+        .with_context_assembler(Arc::clone(&owned) as Arc<dyn ContextAssembler>);
+    let watch = Arc::downgrade(&owned);
+    drop(owned);
+    let _ = guard.record_tool_call("agent-own", sig.clone());
+    let _ = guard.record_tool_call("agent-own", sig.clone());
+    let _ = guard.record_tool_call("agent-own", sig);
+    let kept = watch
+        .upgrade()
+        .expect("an assembler given at construction is the guard's own");
+    assert_eq!(kept.call_count(), 1, "and it still receives the warning");
+}
+
 /// Wave-12 T-RM-UNBOUND — discriminator: a guard whose assembler is NEVER bound
 /// still Warns but does NOT inject (fail-closed `(None,_)` arm == pre-Wave-12).
 #[tokio::test]

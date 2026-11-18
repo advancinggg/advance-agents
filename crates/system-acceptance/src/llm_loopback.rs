@@ -1169,6 +1169,7 @@ llm-providers:
   - id: {id}
     endpoint: {endpoint}
     api-key-secret: {secret}
+    embedding-model: {embedding_model}
     model-aliases:
       default: {model}
     cost-per-mtoken-in: 2.50
@@ -1196,9 +1197,15 @@ post-processor:
         model = default_model,
         endpoint = endpoint,
         secret = API_KEY_SECRET,
+        embedding_model = LOOPBACK_EMBEDDING_MODEL,
     );
     serde_yml::from_str(&yaml).expect("loopback runtime config deserializes")
 }
+
+/// The `embedding-model` the loopback provider entry names. The loopback is not
+/// OpenAI's own API, so it embeds only with an explicit model (a model id is never
+/// guessed for an endpoint); its `/v1/embeddings` handler answers any model.
+pub const LOOPBACK_EMBEDDING_MODEL: &str = "loopback-embed";
 
 /// Two-provider in-memory config: local first (optional sidecar command),
 /// cloud-http second at `http://harness-llm.test:{cloud_port}`.

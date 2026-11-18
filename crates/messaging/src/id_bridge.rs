@@ -231,6 +231,27 @@ impl AgentIdBridge {
         let removed_bare = reg.remove(bare_tree_key).is_some();
         removed_colon || removed_bare
     }
+
+    /// [`AgentIdBridge::unregister`], but only while `mailbox_key` and `bare_tree_key`
+    /// are still registered as one pair: a pair registered under either form for
+    /// another agent is left alone. Returns `true` iff the pair was removed.
+    pub fn unregister_pair(&self, mailbox_key: &str, bare_tree_key: &str) -> bool {
+        if self.members.contains_key(mailbox_key) || self.members.contains_key(bare_tree_key) {
+            return false;
+        }
+        let Ok(mut reg) = self.registered.write() else {
+            return false;
+        };
+        let pair = (bare_tree_key.to_string(), mailbox_key.to_string());
+        if reg.get(mailbox_key) != Some(&pair) {
+            return false;
+        }
+        reg.remove(mailbox_key);
+        if reg.get(bare_tree_key) == Some(&pair) {
+            reg.remove(bare_tree_key);
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +400,42 @@ mod tests {
         // After teardown the id can be RE-registered (a fresh spawn of the same id).
         assert!(b.register("agent:child-1", "child-1"));
         assert!(b.resolve_owned("agent:child-1").is_some());
+    }
+
+    /// `unregister_pair` removes a pair only while its two forms are still registered as
+    /// that pair: never another agent's pair under the same colon id or the same bare id,
+    /// never a seed class.
+    #[test]
+    fn unregister_pair_removes_only_that_pair() {
+        let b = AgentIdBridge::from_pairs([("agent:root", "root")]);
+        assert!(b.register("agent:helper", "kid"));
+        assert!(b.unregister_pair("agent:helper", "kid"));
+        assert!(b.resolve_owned("agent:helper").is_none());
+        assert!(b.resolve_owned("kid").is_none());
+        assert!(
+            !b.unregister_pair("agent:helper", "kid"),
+            "nothing left to remove"
+        );
+
+        // The colon id now paired with another agent, and the bare id with another colon id.
+        assert!(b.register("agent:helper", "newcomer"));
+        assert!(b.register("agent:kid", "kid"));
+        assert!(!b.unregister_pair("agent:helper", "kid"));
+        assert_eq!(
+            b.resolve_owned("agent:helper"),
+            Some(("newcomer".to_string(), "agent:helper".to_string()))
+        );
+        assert_eq!(
+            b.resolve_owned("newcomer"),
+            Some(("newcomer".to_string(), "agent:helper".to_string()))
+        );
+        assert_eq!(
+            b.resolve_owned("kid"),
+            Some(("kid".to_string(), "agent:kid".to_string()))
+        );
+
+        assert!(!b.unregister_pair("agent:root", "root"));
+        assert!(b.resolve_owned("agent:root").is_some());
     }
 
     // Parity marker (plan-eval r5/r6): MAX_BARE_ID_LEN MUST equal

@@ -354,10 +354,15 @@ impl ProviderAdapter for OpenAiAdapter {
         text: &str,
     ) -> Result<HttpRequest, LlmError> {
         let url = format!("{}/v1/embeddings", provider.endpoint.trim_end_matches('/'));
+        // The caller names the model (the gateway resolves it per entry — see
+        // `embedding_model_for`). No default is applied here: a model id is never
+        // guessed for an endpoint that may not serve it.
         let model = provider
             .embedding_model
             .as_deref()
-            .unwrap_or(OPENAI_EMBED_MODEL);
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| LlmError::ModelNotAvailable("embedding model unset".into()))?;
         let body = json!({
             "model": model,
             "input": text,
@@ -386,13 +391,22 @@ impl ProviderAdapter for OpenAiAdapter {
             // silently coerce to 0.0. A poisoned embedding would degrade
             // MODULE-004/010/011 retrieval quality without surfacing any
             // error. Reject malformed entries with ProviderError.
+            // An empty vector, one wider than any embedding model produces, or a
+            // value that is not a finite f32 (e.g. `1e39` overflows to infinity) is
+            // refused the same way (`validate_embedding`): it would be stored and
+            // compared as if it were a real embedding.
+            if arr.len() > super::MAX_EMBEDDING_DIMENSIONS {
+                return Err(LlmError::ProviderError("invalid response shape".into()));
+            }
             let mut embedding: Vec<f32> = Vec::with_capacity(arr.len());
             for v in arr {
                 let f = v
                     .as_f64()
+                    .map(|f| f as f32)
                     .ok_or_else(|| LlmError::ProviderError("invalid response shape".into()))?;
-                embedding.push(f as f32);
+                embedding.push(f);
             }
+            super::validate_embedding(&embedding)?;
             return Ok(embedding);
         }
         Err(map_status_to_llm_err(status, body))
@@ -1016,6 +1030,7 @@ mod tests {
         // Never on an embedding request.
         let p = ResolvedProvider {
             reasoning_effort: Some(ReasoningEffort::High),
+            embedding_model: Some("embed-small".into()),
             ..provider("https://gw.example")
         };
         let embed = OpenAiAdapter.build_embed_request(&p, "hello").unwrap();
@@ -1093,12 +1108,35 @@ mod tests {
     #[test]
     fn t_openai_build_embed_request_shape() {
         let adapter = OpenAiAdapter;
-        let p = provider("https://api.openai.com");
+        let p = ResolvedProvider {
+            embedding_model: Some("text-embedding-3-small".into()),
+            ..provider("https://api.openai.com")
+        };
         let req = adapter.build_embed_request(&p, "hello").unwrap();
         assert_eq!(req.url, "https://api.openai.com/v1/embeddings");
-        let body_str = std::str::from_utf8(&req.body).unwrap();
-        assert!(body_str.contains("text-embedding-3-small"));
-        assert!(body_str.contains("hello"));
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body["model"], "text-embedding-3-small");
+        assert_eq!(body["input"], "hello");
+    }
+
+    /// The adapter applies no default model: a request is built only for the model the
+    /// caller names, on OpenAI's own endpoint as much as anywhere else.
+    #[test]
+    fn t_openai_build_embed_request_needs_a_named_model() {
+        let adapter = OpenAiAdapter;
+        for model in [None, Some(String::new()), Some("   ".to_string())] {
+            for endpoint in ["https://api.openai.com", "https://gw.example"] {
+                let p = ResolvedProvider {
+                    embedding_model: model.clone(),
+                    ..provider(endpoint)
+                };
+                assert_eq!(
+                    adapter.build_embed_request(&p, "hello").unwrap_err(),
+                    LlmError::ModelNotAvailable("embedding model unset".into()),
+                    "{model:?} @ {endpoint}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1107,6 +1145,73 @@ mod tests {
         let body = br#"{"data":[{"embedding":[0.1, 0.2, 0.3]}]}"#;
         let v = adapter.parse_embed_response(200, body).unwrap();
         assert_eq!(v.len(), 3);
+    }
+
+    /// A vector that could not be compared as an embedding is refused, never returned:
+    /// empty, non-numeric, or with a value outside the finite f32 range.
+    #[test]
+    fn t_openai_parse_embed_response_refuses_unusable_vectors() {
+        let adapter = OpenAiAdapter;
+        for body in [
+            br#"{"data":[{"embedding":[]}]}"#.as_slice(),
+            br#"{"data":[{"embedding":[0.1, "x"]}]}"#.as_slice(),
+            br#"{"data":[{"embedding":[0.1, null]}]}"#.as_slice(),
+            br#"{"data":[{"embedding":[0.1, 1e39]}]}"#.as_slice(),
+            br#"{"data":[{"embedding":[-1e39]}]}"#.as_slice(),
+            br#"{"data":[]}"#.as_slice(),
+        ] {
+            assert_eq!(
+                adapter.parse_embed_response(200, body).unwrap_err(),
+                LlmError::ProviderError("invalid response shape".into()),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// A vector wider than any embedding model produces is refused, so one answer cannot
+    /// make every later recall scan arbitrarily expensive; the widest allowed is kept.
+    #[test]
+    fn t_openai_parse_embed_response_bounds_the_dimension() {
+        use crate::providers::MAX_EMBEDDING_DIMENSIONS;
+        let adapter = OpenAiAdapter;
+        let body_of = |dimensions: usize| {
+            serde_json::to_vec(&json!({ "data": [{ "embedding": vec![0.5; dimensions] }] }))
+                .unwrap()
+        };
+        assert_eq!(
+            adapter
+                .parse_embed_response(200, &body_of(MAX_EMBEDDING_DIMENSIONS))
+                .map(|vector| vector.len()),
+            Ok(MAX_EMBEDDING_DIMENSIONS)
+        );
+        assert_eq!(
+            adapter.parse_embed_response(200, &body_of(MAX_EMBEDDING_DIMENSIONS + 1)),
+            Err(LlmError::ProviderError("invalid response shape".into()))
+        );
+    }
+
+    /// The check every dialect and the local inference port share.
+    #[test]
+    fn validate_embedding_refuses_what_cannot_be_an_embedding() {
+        use crate::providers::{validate_embedding, MAX_EMBEDDING_DIMENSIONS};
+        let refused = Err(LlmError::ProviderError("invalid response shape".into()));
+        assert_eq!(validate_embedding(&[0.25, -0.5]), Ok(()));
+        // A zero vector is a vector: it compares to nothing (cosine undefined), so it is
+        // inert in the index rather than refused.
+        assert_eq!(validate_embedding(&[0.0, 0.0]), Ok(()));
+        assert_eq!(
+            validate_embedding(&vec![0.5; MAX_EMBEDDING_DIMENSIONS]),
+            Ok(())
+        );
+        assert_eq!(validate_embedding(&[]), refused);
+        assert_eq!(
+            validate_embedding(&vec![0.5; MAX_EMBEDDING_DIMENSIONS + 1]),
+            refused
+        );
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(validate_embedding(&[0.5, value]), refused, "{value}");
+        }
     }
 
     use crate::providers::sse::SseFrame;

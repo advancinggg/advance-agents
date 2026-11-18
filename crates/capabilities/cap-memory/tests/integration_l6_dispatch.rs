@@ -119,6 +119,7 @@ fn make_components(
         event_bus: Arc::new(NoopEventBus),
         sqlite_index: Arc::new(InMemorySqliteIndex::default()),
         embedder: Arc::new(StubEmbedder),
+        embedding_upkeep: Arc::default(),
         cursor_store: Arc::new(L6CursorStore::new()),
         fs_root: None,
         write_agent_id: None,

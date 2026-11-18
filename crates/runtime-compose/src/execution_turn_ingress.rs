@@ -52,4 +52,13 @@ impl ExecutionTurnIngress {
             spec,
         })
     }
+
+    /// [`Self::publish`] for a composition witness. Every external ingress (the Client
+    /// API, `POST /msg`, a channel) addresses the root agent only and a child is messaged
+    /// agent to agent, so a witness that needs a child's turn starts it here.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn publish_for_test(&self, message: Message) -> Result<(), MsgError> {
+        self.publish(message)
+    }
 }

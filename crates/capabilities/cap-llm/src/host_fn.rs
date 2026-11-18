@@ -650,6 +650,8 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
                 prompt_in_seed: guest.prompt_in_seed,
                 transcript: req.transcript,
                 callables_selected,
+                // The agent's own request: where it is served is where the agent chats.
+                caller: crate::gateway::Caller::AgentGuest,
             };
             let result = gateway.generate(llm_ctx).await;
             gateway.observe_guest_visible_error(&ctx.agent_id, result.as_ref().err());
@@ -716,6 +718,8 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
                 prompt_in_seed: guest.prompt_in_seed,
                 transcript: req.transcript,
                 callables_selected,
+                // The agent's own request: where it is served is where the agent chats.
+                caller: crate::gateway::Caller::AgentGuest,
             };
             // S4 final: a WIRED gateway takes the live path ONLY — no silent
             // buffered fallback on any live error (plan §1). An UNWIRED gateway

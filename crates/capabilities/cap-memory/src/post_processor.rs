@@ -29,6 +29,9 @@ use std::time::Duration;
 use crate::clock::Clock;
 use crate::cooldown::FailureCooldown;
 use crate::embedder::{Embedder, EmbedderError, StubEmbedder};
+use crate::embedding_upkeep::{
+    EmbeddingUpkeep, Standing, VectorRow, CATCH_UP_TIME, VECTORS_PER_TURN_END,
+};
 use crate::extractor::{
     BatchExtractor, BatchExtractorError, DescriptionUpdate, Extraction, ExtractionContext,
 };
@@ -39,7 +42,8 @@ use crate::l6::lease::{LeaseDecision, LeaseStore};
 use crate::l6::trigger::{L6TriggerEvaluator, L6TriggerState};
 use crate::reconcile::{MemoryAction, Reconciler, SimilarityIndex};
 use crate::sqlite_index::{
-    InMemorySqliteIndex, MemoryIndexRow, SqliteIndex, TaskIndexRow, TurnIndexRow,
+    InMemorySqliteIndex, IndexUnavailable, MemoryIndexRow, SqliteIndex, TaskIndexRow, TurnIndexRow,
+    RECENT_TURN_WINDOW,
 };
 use crate::store::MemoryStore;
 use crate::summary::{Summary, SummaryMeta};
@@ -155,6 +159,10 @@ pub struct Components {
     // tests also drive these seams directly. See MODULE-011 §3.6 / §3.8 note 12. ──
     pub sqlite_index: Arc<dyn SqliteIndex + Send + Sync>,
     pub embedder: Arc<dyn Embedder + Send + Sync>,
+    // ── The pacing of vector catch-up (embedding again a text that did not
+    // change): rests after a failed request or a model change. Process memory;
+    // clones of this bundle share it. See `embedding_upkeep`. ──
+    pub embedding_upkeep: Arc<EmbeddingUpkeep>,
     // ── Slice G (m011-slice-g): L6 cursor store shared between Step-5a flush
     // (via `L6Runnable.cursor_store`) and WIT `rollback-memory` reset (via
     // `RollbackMemoryHandler.cursor_store`). See AC-18 cap-memory-half closure
@@ -217,6 +225,7 @@ impl std::fmt::Debug for Components {
             .field("event_bus", &"<EventBusEmit>")
             .field("sqlite_index", &"<SqliteIndex>")
             .field("embedder", &"<Embedder>")
+            .field("embedding_upkeep", &"<EmbeddingUpkeep>")
             .field("cursor_store", &"<L6CursorStore>")
             .field("fs_root", &self.fs_root)
             .field("write_agent_id", &"<redacted>")
@@ -340,6 +349,7 @@ impl Components {
             // every existing `with_l6_defaults(...)` call site.
             sqlite_index: Arc::new(InMemorySqliteIndex::default()),
             embedder: Arc::new(StubEmbedder),
+            embedding_upkeep: Arc::new(EmbeddingUpkeep::new()),
             // Slice G (m011-slice-g): L6 cursor store seam default.
             // Signature UNCHANGED — body-only default-injection (slice-F
             // precedent). Future runtime-assembly slice MUST share this Arc
@@ -436,6 +446,7 @@ impl Components {
             // real embedder adapters are deferred (see MODULE-011 §3.6).
             sqlite_index: Arc::new(InMemorySqliteIndex::default()),
             embedder: Arc::new(StubEmbedder),
+            embedding_upkeep: Arc::new(EmbeddingUpkeep::new()),
             // Slice G (m011-slice-g): L6 cursor store seam default.
             // Signature UNCHANGED — body-only default-injection. Future
             // runtime-assembly slice MUST share this Arc with L6Runnable::new's
@@ -559,58 +570,135 @@ impl Components {
         agent_id: &str,
         turn: &TurnEntry,
     ) -> Result<(), EmbedderError> {
-        let text = format!("{}\n{}", turn.digest, turn.collapsed_view);
-        let embedding = self.embedder.embed(&text).await?;
+        let text = turn_embedding_text(&turn.digest, &turn.collapsed_view);
+        // The vector is stored WITH the model that produced it. The digest row is
+        // written in EVERY outcome, so the turn stays listed and countable:
+        // - a turn with no text has nothing to embed, and no request is made;
+        // - an embedder with nothing to embed with answers an empty vector;
+        // - a failed embedding request is reported to the caller AFTER the row is
+        //   written (it must not cost the turn its index row).
+        // In each case the row carries no new vector; a vector this same digest
+        // already has is kept rather than erased, and a later turn end fills the
+        // gap in ([`Self::heal_vectors`]).
+        let (embedded, failure) = if text.trim().is_empty() {
+            ((Vec::new(), None), None)
+        } else {
+            match self.embedder.embed_recorded(&text).await {
+                Ok(embedded) => (embedded, None),
+                Err(e) => ((Vec::new(), None), Some(e)),
+            }
+        };
+        // What catch-up is told is about the text that was asked about. Catch-up
+        // asks about the digest alone, which is that text unless the turn carried
+        // a collapsed view.
+        let row = VectorRow::Turn {
+            task_id: turn.task_id.clone(),
+            turn: turn.turn,
+        };
+        match &failure {
+            Some(failure) => self.note_failed_embedding(agent_id, failure, row.clone(), &text),
+            None if !embedded.0.is_empty() => self.embedding_upkeep.request_served(agent_id, &row),
+            None => {}
+        }
+        let (embedding, embedding_model) = match embedded {
+            (vector, _) if vector.is_empty() => self
+                .sqlite_index
+                .get_turn(agent_id, &turn.task_id, turn.turn)
+                .filter(|prev| prev.digest == turn.digest && !prev.embedding.is_empty())
+                .map(|prev| (prev.embedding, prev.embedding_model))
+                .unwrap_or((Vec::new(), None)),
+            embedded => embedded,
+        };
+        if !turn.digest.trim().is_empty() {
+            self.embedding_upkeep.row_written(
+                agent_id,
+                &row,
+                &turn_embedding_text(&turn.digest, ""),
+                embedding_model.as_deref(),
+            );
+        }
         self.sqlite_index.upsert_turn(TurnIndexRow {
             agent_id: agent_id.to_owned(),
             task_id: turn.task_id.clone(),
             turn: turn.turn,
             digest: turn.digest.clone(),
             embedding,
+            embedding_model,
             reference_count: turn.reference_count,
             updated_at: utc_now_string(&*self.clock),
         });
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     /// Slice F (AC-27, REQ-230): upsert a [`TaskIndexRow`] from a [`Summary`].
-    /// `brief_embedding` is recomputed via [`Embedder::embed`] ONLY if
+    /// `brief_embedding` is recomputed via [`Embedder::embed`] when
     /// `summary.brief` differs from the previously-stored row's
     /// `brief_snapshot` (string equality — deterministic substitute for
     /// semantic similarity in the absence of a real embedder; see
-    /// MODULE-011 §3.8 note 12 (d)). On first-write OR on textual change the
-    /// embedding is recomputed; on no-change the previously-stored embedding
-    /// is preserved verbatim (Option<Vec<f32>> clone).
+    /// MODULE-011 §3.8 note 12 (d)): on first-write OR on textual change the
+    /// brief is embedded right away. An UNCHANGED brief keeps its stored vector
+    /// verbatim, whatever model it is of. When that vector is missing or comes
+    /// from another model than the one in use, embedding the brief again is
+    /// catch-up, and catch-up is [`Self::heal_vectors`]' — for this task as for
+    /// every other task of the agent, whether or not it ever gets another turn.
+    ///
+    /// **Whose row**: the row is `summary.meta.agent_id`'s own
+    /// (`(agent_id, task_id)` — see [`TaskIndexRow`]). Another agent working
+    /// under the same task id has its own row, brief and vector; neither turn
+    /// end reads or rewrites the other's. `summary.meta.agent_id` is set by the
+    /// post-processor from its write id (Step 7), not by a guest.
     ///
     /// **In-memory-stub posture**: like [`bump_turn_reference`], the brief-
     /// change gate spans two lock acquisitions (`get_task` then `upsert_task`).
-    /// Concurrent `sync_task_index` calls for the same `task_id` could
-    /// theoretically clobber each other's brief snapshot. In production the
-    /// post-processor §2.11 serialization (1-per-agent) eliminates this for
-    /// per-agent tasks; cross-agent task sharing (PRD §11.3.3 — tasks span
-    /// agents) is the responsibility of the deferred rusqlite adapter which
-    /// will use SQL `INSERT ON CONFLICT` / `UPSERT` semantics. See §3.6 row
-    /// "In-memory `SqliteIndex` stub get-modify-upsert race posture".
-    ///
-    /// **Tenant-scoping**: `summary.meta.agent_id` is stored verbatim into
-    /// the row but the task table is keyed by `task_id` alone (per PRD
-    /// §11.3.3 — tasks span agents). `list_tasks_for_agent` filters by
-    /// `agent_id` for convenience. The deferred runtime-assembly slice MUST
-    /// ensure `summary.meta.agent_id` is populated by the trusted agent-loop
-    /// driver (not by guest-controlled WIT calls) before this method is
-    /// reachable — see §3.6 row "Task-table `agent_id` filtering vs
-    /// tenant-isolation posture".
+    /// The post-processor §2.11 serialization (1-per-agent) keeps two turn ends
+    /// of one agent from interleaving here. See §3.6 row "In-memory
+    /// `SqliteIndex` stub get-modify-upsert race posture".
     pub async fn sync_task_index(&self, summary: &Summary) -> Result<(), EmbedderError> {
-        let prev = self.sqlite_index.get_task(&summary.meta.task_id);
+        let agent_id = summary.meta.agent_id.as_str();
+        let prev = self.sqlite_index.get_task(agent_id, &summary.meta.task_id);
         let brief_changed = prev
             .as_ref()
             .map(|r| r.brief_snapshot != summary.brief)
             .unwrap_or(true);
-        let brief_embedding = if brief_changed {
-            Some(self.embedder.embed(&summary.brief).await?)
-        } else {
-            prev.as_ref().and_then(|r| r.brief_embedding.clone())
+        let has_text = !summary.brief.trim().is_empty();
+        let row = VectorRow::Task {
+            task_id: summary.meta.task_id.clone(),
         };
+        let mut failure = None;
+        let (brief_embedding, brief_embedding_model) = if !brief_changed {
+            // The same text: its vector stays, whatever model it is of.
+            prev.map(|row| (row.brief_embedding, row.brief_embedding_model))
+                .unwrap_or((None, None))
+        } else if !has_text {
+            // A brief with no text has no vector (and the one of its old text goes).
+            (None, None)
+        } else {
+            match self.embedder.embed_recorded(&summary.brief).await {
+                Ok((vector, model)) if !vector.is_empty() => {
+                    self.embedding_upkeep.request_served(agent_id, &row);
+                    (Some(vector), model)
+                }
+                // No vector for the new text — nothing to embed with (`Ok` empty), or
+                // the request failed (reported after the row is written). The vector
+                // of the previous text is dropped, never left standing for a brief it
+                // does not describe; a later turn end catches the row up.
+                outcome => {
+                    failure = outcome.err();
+                    if let Some(failure) = &failure {
+                        self.note_failed_embedding(agent_id, failure, row.clone(), &summary.brief);
+                    }
+                    (None, None)
+                }
+            }
+        };
+        if has_text {
+            self.embedding_upkeep.row_written(
+                agent_id,
+                &row,
+                &summary.brief,
+                brief_embedding_model.as_deref(),
+            );
+        }
         self.sqlite_index.upsert_task(TaskIndexRow {
             task_id: summary.meta.task_id.clone(),
             agent_id: summary.meta.agent_id.clone(),
@@ -619,8 +707,224 @@ impl Components {
             updated_at: utc_now_string(&*self.clock),
             brief_snapshot: summary.brief.clone(),
             brief_embedding,
+            brief_embedding_model,
         });
-        Ok(())
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Give a few of `agent_id`'s rows — task briefs and turn digests — a vector
+    /// of the model its queries are made with now, and say how many got one.
+    ///
+    /// A reader compares stored vectors with a query of the SAME model only. So a
+    /// row whose vector is missing (its request failed, or nothing could embed
+    /// when it was written), comes from another model (the agent's provider
+    /// changed) or from a model nobody recorded (an index written by an older
+    /// version) is invisible to recall and to task routing. Nothing else would
+    /// ever embed it again: a turn's digest never changes, and a task may never
+    /// get another turn. This does, a little per turn end:
+    ///
+    /// - at most [`VECTORS_PER_TURN_END`] rows per call, the most recently
+    ///   written first whichever table they are in — a task's brief is as recent
+    ///   as its last turn, so catch-up walks back through briefs and digests
+    ///   together and neither waits for the other to be done;
+    /// - turn rows only among the [`RECENT_TURN_WINDOW`] most recent (what a
+    ///   reader scans): the cost of a model change is bounded by the window and
+    ///   the number of tasks, never by the length of the history;
+    /// - only the vector and its model are written
+    ///   ([`SqliteIndex::set_task_brief_embedding`],
+    ///   [`SqliteIndex::set_turn_embedding`]), and only while the row still holds
+    ///   the text the vector was computed from; the row keeps its place in time;
+    /// - paced by [`crate::embedding_upkeep`]: nothing while catch-up rests; a
+    ///   text the service refuses is set aside, a text whose request fails while
+    ///   the service is answering is put off behind every other row, and either
+    ///   way the pass goes on behind it; two failures in a row end the pass and
+    ///   start a rest; a pass starts no request once it has run for
+    ///   [`CATCH_UP_TIME`], and ends by then in any case — a request still
+    ///   unanswered (the gateway's own retries included) is cut off and counts as
+    ///   failed — since the agent's next turn waits for the pass; and once nothing
+    ///   is left the index is not searched again until a row needs a vector.
+    ///
+    /// `Err` — why the pass stopped (the index could not be read or written, the
+    /// embedder named no model for a vector), or else the first thing that kept a
+    /// row from its vector (a request failed, a text was refused); the rows behind
+    /// a refused or put-off text were still embedded. An index that cannot be
+    /// read never counts as "nothing left": the agent is not settled by it.
+    ///
+    /// With nothing to embed with ([`Embedder::current_model`] is `None`) it
+    /// does nothing. The text embedded is the text the row holds — a brief, a
+    /// digest — which is exactly what [`Self::sync_task_index`] and
+    /// [`Self::sync_turn_index`] embed for a new one as long as the turn carries
+    /// no collapsed view (Step 7 writes none; a row keeps no view, so a turn that
+    /// did carry one is caught up from its digest alone).
+    pub async fn heal_vectors(&self, agent_id: &str) -> Result<usize, CatchUpError> {
+        let Some(model) = self.embedder.current_model() else {
+            return Ok(0);
+        };
+        let upkeep = &self.embedding_upkeep;
+        let started = self.clock.now();
+        // Asked at every turn end that has a model: this is also where a change of
+        // the model is noticed (and starts a rest).
+        if !upkeep.may_catch_up(agent_id, &model, started) || upkeep.is_settled(agent_id) {
+            return Ok(0);
+        }
+        // From each table, enough to find a full pass of open rows behind every
+        // text kept back.
+        let limit = VECTORS_PER_TURN_END + upkeep.kept_back(agent_id);
+        let index = self.sqlite_index.as_ref();
+        let listed = index
+            .list_tasks_not_of_model(agent_id, &model, limit)
+            .and_then(|tasks| {
+                index
+                    .list_turns_not_of_model(agent_id, &model, RECENT_TURN_WINDOW, limit)
+                    .map(|turns| (tasks, turns))
+            });
+        let (tasks, turns) = match listed {
+            Ok(listed) => listed,
+            Err(e) => {
+                // What is left is not known, which is not "nothing is left": the
+                // agent stays unsettled, and a failing index is not asked again at
+                // every turn end.
+                upkeep.rest(agent_id, self.clock.now());
+                return Err(e.into());
+            }
+        };
+        let mut open = Vec::new();
+        let mut put_off = Vec::new();
+        for row in tasks
+            .into_iter()
+            .map(StaleRow::Task)
+            .chain(turns.into_iter().map(StaleRow::Turn))
+        {
+            match upkeep.standing(agent_id, &row.key(), &row.text()) {
+                Standing::Open => open.push(row),
+                Standing::PutOff { place } => put_off.push((place, row)),
+                Standing::SetAside => {}
+            }
+        }
+        if open.is_empty() && put_off.is_empty() {
+            // Nothing is left but texts the service refused.
+            upkeep.settle(agent_id);
+            return Ok(0);
+        }
+        // Open rows, the most recently written first. The sort is stable: each
+        // table keeps its own order, and a brief goes before a digest of the same
+        // moment. Then the rows put off, the one put off longest ago first.
+        open.sort_by(|a, b| b.updated_at().cmp(a.updated_at()));
+        put_off.sort_by_key(|(place, _)| *place);
+        let rows = open
+            .into_iter()
+            .chain(put_off.into_iter().map(|(_, row)| row));
+        let mut asked = 0;
+        let mut served = 0;
+        let mut embedded = 0;
+        let mut kept_from_its_vector: Option<CatchUpError> = None;
+        // The pass is over by this moment of real time, whatever a request is doing
+        // then: the agent's next turn waits for it.
+        let deadline = tokio::time::Instant::now() + CATCH_UP_TIME;
+        for row in rows.take(VECTORS_PER_TURN_END) {
+            let running = self.clock.now().duration_since(started).unwrap_or_default();
+            if running >= CATCH_UP_TIME {
+                break;
+            }
+            let text = row.text();
+            let answer = match tokio::time::timeout_at(
+                deadline,
+                self.embedder.embed_recorded(&text),
+            )
+            .await
+            {
+                Ok(answer) => answer,
+                Err(_out_of_time) => {
+                    // Cut off: a failed request, and the end of the pass.
+                    asked += 1;
+                    upkeep.request_failed(agent_id, row.key(), &text, self.clock.now());
+                    kept_from_its_vector.get_or_insert(
+                        EmbedderError::Upstream(
+                            "no answer within the time a catch-up pass has".into(),
+                        )
+                        .into(),
+                    );
+                    break;
+                }
+            };
+            match answer {
+                Ok((vector, Some(produced))) if !vector.is_empty() => {
+                    asked += 1;
+                    served += 1;
+                    upkeep.request_served(agent_id, &row.key());
+                    match row.store(index, agent_id, &vector, &produced) {
+                        Ok(true) => embedded += 1,
+                        // The row holds another text by now: its writer embedded that.
+                        Ok(false) => {}
+                        Err(e) => {
+                            upkeep.rest(agent_id, self.clock.now());
+                            return Err(e.into());
+                        }
+                    }
+                    if produced != model {
+                        // The agent's model moved under this pass. The vector is
+                        // stored as what it is; the next turn end sees the change.
+                        break;
+                    }
+                }
+                // A vector of a model nobody names cannot be stored as one of the
+                // model in use, now or at the next turn end
+                // ([`Embedder::current_model`]): the embedder is at fault, and is
+                // not asked for the next one.
+                Ok((vector, None)) if !vector.is_empty() => {
+                    upkeep.rest(agent_id, self.clock.now());
+                    return Err(EmbedderError::Upstream(
+                        "the embedder named no model for the vector it returned".into(),
+                    )
+                    .into());
+                }
+                // Nothing to embed with any more.
+                Ok(_) => break,
+                // The service answered and refused this text: it is not asked about
+                // it again, and the rows behind it are not held up.
+                Err(e) if e.is_about_the_text() => {
+                    asked += 1;
+                    upkeep.set_aside(agent_id, row.key(), &text);
+                    kept_from_its_vector.get_or_insert(e.into());
+                }
+                Err(e) => {
+                    asked += 1;
+                    let resting =
+                        upkeep.request_failed(agent_id, row.key(), &text, self.clock.now());
+                    kept_from_its_vector.get_or_insert(e.into());
+                    if resting {
+                        break;
+                    }
+                }
+            }
+        }
+        if asked > 0 && served == 0 {
+            // Requests were made and no vector came of them. Whatever stands
+            // between these texts and their vectors, the next ones are not asked
+            // about right away.
+            upkeep.rest(agent_id, self.clock.now());
+        }
+        kept_from_its_vector.map_or(Ok(embedded), Err)
+    }
+
+    /// An embedding request for the text `row` of `agent_id` holds failed. A text
+    /// the service refused is set aside (catch-up does not ask about it again).
+    /// Any other failure goes by what the request before it showed
+    /// ([`EmbeddingUpkeep::request_failed`]): the text is put off, or — the
+    /// service is failing — catch-up rests.
+    fn note_failed_embedding(
+        &self,
+        agent_id: &str,
+        failure: &EmbedderError,
+        row: VectorRow,
+        text: &str,
+    ) {
+        if failure.is_about_the_text() {
+            self.embedding_upkeep.set_aside(agent_id, row, text);
+        } else {
+            self.embedding_upkeep
+                .request_failed(agent_id, row, text, self.clock.now());
+        }
     }
 
     /// Slice F (AC-24, REQ-159): mirror every entry's [`MemoryStatus`] into a
@@ -680,11 +984,108 @@ impl Components {
         if let Some(mut row) = self.sqlite_index.get_turn(agent_id, task_id, turn) {
             row.reference_count = row.reference_count.saturating_add(1);
             row.updated_at = utc_now_string(&*self.clock);
+            // The bump makes the row recent again: if its vector is not of the
+            // model in use, it is one more row to catch up on.
+            if !row.digest.trim().is_empty() {
+                self.embedding_upkeep.row_written(
+                    agent_id,
+                    &VectorRow::Turn {
+                        task_id: task_id.to_owned(),
+                        turn,
+                    },
+                    &turn_embedding_text(&row.digest, ""),
+                    row.embedding_model.as_deref(),
+                );
+            }
             // CRITICAL: do NOT recompute embedding here.
             self.sqlite_index.upsert_turn(row);
             true
         } else {
             false
+        }
+    }
+}
+
+/// The text a turn's vector is computed from: its digest, then its collapsed
+/// view. Step 7 leaves the collapsed view empty, so the digest an index row
+/// holds is all it takes to compute the vector again
+/// ([`Components::heal_vectors`]).
+fn turn_embedding_text(digest: &str, collapsed_view: &str) -> String {
+    format!("{digest}\n{collapsed_view}")
+}
+
+/// Why a pass of [`Components::heal_vectors`] stopped short or left a row out.
+#[derive(Debug, thiserror::Error)]
+pub enum CatchUpError {
+    /// An embedding request failed, or the service refused a text.
+    #[error(transparent)]
+    Embedding(#[from] EmbedderError),
+    /// The index could not be read or written.
+    #[error(transparent)]
+    Index(#[from] IndexUnavailable),
+}
+
+/// A row [`Components::heal_vectors`] found without a vector of the model in use.
+enum StaleRow {
+    Task(TaskIndexRow),
+    Turn(TurnIndexRow),
+}
+
+impl StaleRow {
+    fn key(&self) -> VectorRow {
+        match self {
+            StaleRow::Task(row) => VectorRow::Task {
+                task_id: row.task_id.clone(),
+            },
+            StaleRow::Turn(row) => VectorRow::Turn {
+                task_id: row.task_id.clone(),
+                turn: row.turn,
+            },
+        }
+    }
+
+    /// When the row was last written.
+    fn updated_at(&self) -> &str {
+        match self {
+            StaleRow::Task(row) => &row.updated_at,
+            StaleRow::Turn(row) => &row.updated_at,
+        }
+    }
+
+    /// The text the row's vector is computed from — what the turn end that wrote
+    /// the row embedded.
+    fn text(&self) -> String {
+        match self {
+            StaleRow::Task(row) => row.brief_snapshot.clone(),
+            StaleRow::Turn(row) => turn_embedding_text(&row.digest, ""),
+        }
+    }
+
+    /// Store `vector` (of `model`) on the row, provided the row still holds the
+    /// text the vector was computed from.
+    fn store(
+        &self,
+        index: &(dyn SqliteIndex + Send + Sync),
+        agent_id: &str,
+        vector: &[f32],
+        model: &str,
+    ) -> Result<bool, IndexUnavailable> {
+        match self {
+            StaleRow::Task(row) => index.set_task_brief_embedding(
+                agent_id,
+                &row.task_id,
+                &row.brief_snapshot,
+                vector,
+                model,
+            ),
+            StaleRow::Turn(row) => index.set_turn_embedding(
+                agent_id,
+                &row.task_id,
+                row.turn,
+                &row.digest,
+                vector,
+                model,
+            ),
         }
     }
 }
@@ -747,6 +1148,13 @@ pub const MAX_TASK_YAML_BYTES: u64 = 1024 * 1024;
 /// composes via `?` in Step 8.
 impl From<EmbedderError> for PostProcessorError {
     fn from(e: EmbedderError) -> Self {
+        PostProcessorError::StorageError(e.to_string())
+    }
+}
+
+/// A vector catch-up that stopped short (Step 8) is reported the same way.
+impl From<CatchUpError> for PostProcessorError {
+    fn from(e: CatchUpError) -> Self {
         PostProcessorError::StorageError(e.to_string())
     }
 }
@@ -1352,9 +1760,14 @@ impl PostProcessor {
 
     /// Step 8 (SAT-B / AC-45/46): drive the SQLite sync seams from within `run`
     /// using the Step-7 artifacts, keyed by the bare `write_id`. With the
-    /// default `StubEmbedder` these are infallible; a future real-embedder
-    /// `EmbedderError` maps to `StorageError` via `?` (the `From` impl). No
-    /// Step-7 artifacts (trace-only / skipped) ⇒ push-only (preserves tests).
+    /// default `StubEmbedder` these are infallible. A real embedder's
+    /// `EmbedderError` (a failed embedding request) maps to `StorageError` (the
+    /// `From` impl) and is returned only AFTER all three syncs ran: the turn row,
+    /// the task row and the memory rows are written either way, the failed vector
+    /// is simply absent. Last, a few older rows whose vector a query cannot use
+    /// are embedded again ([`Components::heal_vectors`]) — after this turn's own
+    /// rows, so they never wait on it. No Step-7 artifacts (trace-only /
+    /// skipped) ⇒ push-only (preserves tests).
     async fn step_8_sqlite_sync(
         &self,
         write_id: &str,
@@ -1364,9 +1777,13 @@ impl PostProcessor {
         let (Some(components), Some((summary, turn_entry))) = (&self.components, artifacts) else {
             return Ok(());
         };
-        components.sync_turn_index(write_id, turn_entry).await?;
-        components.sync_task_index(summary).await?;
+        let turn_synced = components.sync_turn_index(write_id, turn_entry).await;
+        let task_synced = components.sync_task_index(summary).await;
         components.sync_memory_index(write_id);
+        let caught_up = components.heal_vectors(write_id).await;
+        turn_synced?;
+        task_synced?;
+        caught_up?;
         Ok(())
     }
 
@@ -1556,8 +1973,10 @@ impl PostProcessorHook for PostProcessor {
         let artifacts = self
             .step_7_update_summary_and_turn_index(write_id, msg, extraction.as_ref())
             .await?;
-        self.step_8_sqlite_sync(write_id, artifacts.as_ref())
-            .await?;
+        // Step 8 fails only on an embedding request (its rows are written either
+        // way). Step 9 does not read the vector index, so that failure is reported
+        // after Step 9 ran — it must not also cost the turn its L6 evaluation.
+        let index_synced = self.step_8_sqlite_sync(write_id, artifacts.as_ref()).await;
         // Step 9 uses the BARE `write_id`, NOT the run() messaging agent_id
         // (SAT-C / audit r1 fix): now that Step-9 DISPATCHES into the L6
         // runnable, the runnable lists/commits the agent's MEMORY bucket — which
@@ -1569,6 +1988,6 @@ impl PostProcessorHook for PostProcessor {
         // (When `write_agent_id` is unset, `write_id == agent_id`, so the
         // pre-SAT-C single-id behaviour + every existing test is preserved.)
         self.step_9_evaluate_l6(write_id).await?;
-        Ok(())
+        index_synced
     }
 }

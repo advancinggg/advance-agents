@@ -25,6 +25,7 @@ use crate::agent_config::{active_capabilities_with, read_agent_yaml};
 use crate::api::{ComposeLog, ComposeLogLine};
 use crate::daemon::is_core_module;
 use crate::effective_capabilities::EffectiveCapabilities;
+use crate::execution_turn_ingress::ExecutionTurnIngress;
 use crate::perchild_daemon::PerChildLoopManager;
 
 pub use crate::composition::TEARDOWN_ORDER;
@@ -147,6 +148,9 @@ impl TurnGate {
 #[derive(Default)]
 pub struct ComposeProbe {
     record: Mutex<ProbeRecord>,
+    /// The messages whose turn the root loop ran to its end, and how each turn ended
+    /// ([`Self::root_turn_outcome`]).
+    root_turns_ended: Mutex<Vec<(String, advance_scheduler::TurnOutcome)>>,
 }
 
 impl ComposeProbe {
@@ -160,6 +164,28 @@ impl ComposeProbe {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// How the root loop's turn of message `message_id` ended, once the loop ran it to
+    /// its END: whatever the turn produced is dispatched and the whole turn-end
+    /// pipeline (the memory extraction, the index rows, their vectors) has returned.
+    /// `None` until then. A reply alone says less — it is dispatched before that
+    /// pipeline starts.
+    pub fn root_turn_outcome(&self, message_id: &str) -> Option<advance_scheduler::TurnOutcome> {
+        self.root_turns_ended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|(ended, _)| ended == message_id)
+            .map(|(_, outcome)| *outcome)
+    }
+
+    /// The observer that feeds [`Self::root_turn_outcome`]; the root loop reports to it
+    /// after its own observers.
+    pub(crate) fn root_turn_observer(
+        self: &Arc<Self>,
+    ) -> Arc<dyn advance_scheduler::hook::TurnObserver> {
+        Arc::new(RootTurnEnds(Arc::clone(self)))
     }
 
     pub(crate) fn update(&self, update: impl FnOnce(&mut ProbeRecord)) {
@@ -200,6 +226,22 @@ impl ComposeProbe {
     }
 }
 
+/// Notes each turn the root loop ran to its end, and how it ended
+/// ([`ComposeProbe::root_turn_outcome`]).
+struct RootTurnEnds(Arc<ComposeProbe>);
+
+impl advance_scheduler::hook::TurnObserver for RootTurnEnds {
+    fn on_turn_complete(&self, _agent_id: &str) {}
+
+    fn on_turn_end(&self, _agent_id: &str, end: &advance_scheduler::TurnEnd) {
+        self.0
+            .root_turns_ended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((end.message_id.clone(), end.outcome));
+    }
+}
+
 /// The objects a composition built (held weakly, so the record keeps nothing alive),
 /// the listeners it bound, and the steps its teardown ran.
 #[derive(Clone, Default)]
@@ -215,6 +257,8 @@ pub struct ProbeRecord {
     /// Git-family PR-1: the workspace repository's state after the step-1b bootstrap.
     pub git_repo_status: Option<advance_git::GitRepoStatus>,
     pub perchild_manager: Option<Weak<PerChildLoopManager>>,
+    /// The ingress every external message is published through (exists iff `messaging`).
+    pub execution_ingress: Option<Weak<ExecutionTurnIngress>>,
     pub run_manager: Option<Weak<RunManager>>,
     /// Its last drop joins the epoch ticker thread.
     pub component_runtime: Option<Weak<ComponentRuntime>>,

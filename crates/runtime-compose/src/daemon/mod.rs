@@ -424,10 +424,6 @@ pub(crate) async fn compose_graph(
             meta_maintainer: wiring_handles.meta_maintainer.clone(),
             host_registry: host.host_registry(),
             callable_registry: host.callable_registry(),
-            embedding_posture: crate::context_inspect::EmbeddingPosture {
-                active: gateway.has_embedding_provider(),
-                model: gateway.embedding_model_id(),
-            },
             assembler_model,
             llm_provider,
             runtime_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1123,6 +1119,16 @@ async fn try_spawn_agent_loop(
         ])),
         None => watch_observer,
     };
+    // Test-only: a probe is told each turn this loop ran to its end, after the loop's
+    // own observers. A composition without a probe is composed exactly as above.
+    #[cfg(feature = "test-support")]
+    let observer: Arc<dyn TurnObserver> = match extras.probe.as_ref() {
+        Some(probe) => Arc::new(crate::reap::CompositeTurnObserver::new(vec![
+            observer,
+            probe.root_turn_observer(),
+        ])),
+        None => observer,
+    };
     // Phase-3 kickoff: replace the default `MinimalRunBootstrap` with the real
     // `RunManagerBootstrap` (production path) — it mints the session run + publishes
     // its RunId into `session_cell` (the SAME cell + bare `cap_agent_id` the handler
@@ -1299,24 +1305,17 @@ async fn try_spawn_agent_loop(
             disp.bind_inventory(Arc::clone(&callable));
         }
         let identity_root = workspace.join(".agent");
-        // Live embedding: only when the provider config can embed (an OpenAI-
-        // compatible endpoint, or a local / mesh entry with an `embedding-model`).
-        // Then the assembler embeds the prompt once per turn and the recall /
-        // task-routing ports read the post-processor's SQLite index (written with
-        // the SAME gateway embedder). Otherwise the zero-vector stub stays and no
-        // `/v1/embeddings` round-trip is attempted.
-        let embedding_live = gateway.has_embedding_provider();
-        let embedding: Option<Arc<dyn advance_context_engine::EmbeddingPort>> = embedding_live
-            .then(|| {
-                Arc::new(crate::context_wiring::GatewayEmbedding::new(
-                    gateway.clone(),
-                )) as Arc<dyn advance_context_engine::EmbeddingPort>
-            });
-        let embedding_model = if embedding_live {
-            gateway.embedding_model_id()
-        } else {
-            None
-        };
+        // Live embedding FOLLOWS THIS AGENT'S CHAT PROVIDER: the agent's text is
+        // embedded only by the entry its chat requests are placed on, resolved on
+        // every call from the live provider config + the agent's `llm:` policy
+        // (never a posture frozen here at spawn, never another entry). When that
+        // entry serves embeddings the assembler embeds the prompt once per turn
+        // and the recall / task-routing ports read the post-processor's SQLite
+        // index (written through the SAME per-agent route). When it does not, no
+        // `/v1/embeddings` round-trip is attempted anywhere and the turn runs
+        // without a query vector.
+        let embedding =
+            crate::context_wiring::AgentEmbedding::over_gateway(gateway.clone(), &cap_agent_id);
         // Per-agent latest-assembly store (the Client API context inspector).
         // Shared with child loops when the composition root created one.
         let context_store = extras
@@ -1356,15 +1355,15 @@ async fn try_spawn_agent_loop(
             llm_model: (!assembler_model.is_empty()).then(|| assembler_model.clone()),
             memory_enabled: memory_store.is_some(),
             skills_enabled: skills_root.is_some(),
-            embedding_enabled: embedding_live,
+            // Re-read per assembly by the builder's live runtime-info reader.
+            embedding_enabled: (embedding.live_model)().is_some(),
         };
+        // The inspector answers for the root AND every child from one adapter:
+        // each agent's posture is its own route, asked at request time.
         context_inspect = Some(Arc::new(
             crate::context_inspect::ContextInspectAdapter::new(
                 context_store.clone(),
-                crate::context_inspect::EmbeddingPosture {
-                    active: embedding_live,
-                    model: embedding_model,
-                },
+                crate::context_inspect::gateway_embedding_posture(gateway.clone()),
                 memory_index.clone(),
                 &cap_agent_id,
             ),
@@ -1396,12 +1395,13 @@ async fn try_spawn_agent_loop(
                 // AGENTS.md identity: always-on for the agent workspace. Not
                 // capability-gated (unlike skills/memory). Missing file → empty Tier 1a.
                 identity_agent_root: Some(&identity_root),
-                embedding,
+                embedding: Some(embedding),
                 sqlite_index: memory_index.clone(),
                 runtime_info: Some(runtime_info),
                 report_sink: Some(context_store),
                 light_llm: Some(Arc::new(crate::context_wiring::GatewayLightLlm::new(
-                    gateway.clone(),
+                    &gateway,
+                    &cap_agent_id,
                 ))),
                 native_tools: Some(Arc::new(crate::context_wiring::GatewayNativeTools::new(
                     gateway.clone(),
@@ -1787,10 +1787,6 @@ pub async fn spawn_test_agent_loop(
             meta_maintainer: handles.meta_maintainer.clone(),
             host_registry: host.host_registry(),
             callable_registry: host.callable_registry(),
-            embedding_posture: crate::context_inspect::EmbeddingPosture {
-                active: gateway.has_embedding_provider(),
-                model: gateway.embedding_model_id(),
-            },
             assembler_model,
             llm_provider,
             runtime_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2369,12 +2365,13 @@ pub(crate) fn build_live_post_processor(
         // so no `StubBatchExtractor` / synthetic entries reach the live turn.
         return (Arc::new(cap_memory::PostProcessor::new()), None);
     };
-    // Coerce the concrete gateway to the trait object: clone to a concrete
-    // `Arc<LlmGateway>` first (so `Arc::clone`'s T is inferred as the concrete
-    // type), THEN let the next binding do the Arc<Concrete>→Arc<dyn> unsize
-    // coercion (a direct arg position / target-typed `Arc::clone` cannot).
-    let gw_concrete = Arc::clone(gateway);
-    let gw: Arc<dyn cap_llm::LlmGatewayInternal + Send + Sync> = gw_concrete;
+    // Every model call this pipeline makes for the agent — the extraction, a text
+    // file's description, the consolidation classifier — carries the agent's turn
+    // content, so each is made AS that agent: placed under its own `llm:` policy, on
+    // the entry its turns chat with, never on another agent's (the gateway's own trait
+    // surface would make them as the default agent, i.e. on the root's provider).
+    let agent_gateway = Arc::new(gateway.for_agent(write_agent_id));
+    let gw: Arc<dyn cap_llm::LlmGatewayInternal + Send + Sync> = agent_gateway.clone();
     let extractor: Arc<dyn cap_memory::BatchExtractor + Send + Sync> =
         Arc::new(crate::memory_extractor::LlmBatchExtractor::new(gw, None));
     let reconciler = cap_memory::Reconciler::from_concrete(
@@ -2422,11 +2419,10 @@ pub(crate) fn build_live_post_processor(
     // (`build_harness_live_post_processor` + `.with_vlm_indexer()`), so the harness e2e
     // witnesses reflect this production path.
     if let Some(vlm) = vlm {
-        // Concrete-clone-then-unsize: `VlmDescriptionIndexer::new` wants a BARE
-        // `Arc<dyn LlmGatewayInternal>` (not `+ Send + Sync`), so bind from a fresh
-        // concrete clone of `gateway` rather than reusing the `+ Send + Sync` `gw` at :1162.
-        let gw_vlm_concrete = Arc::clone(gateway);
-        let gw_vlm: Arc<dyn cap_llm::LlmGatewayInternal> = gw_vlm_concrete;
+        // The TEXT branch of the description dispatch chats through this handle, as the
+        // agent. (A pdf / image / video / audio goes to the shared `vlm` extractor, which
+        // picks the first image-capable entry of the home: CONTRACT-082 names no agent.)
+        let gw_vlm: Arc<dyn cap_llm::LlmGatewayInternal> = agent_gateway.clone();
         components = components.with_description_indexer(Arc::new(
             crate::vlm_indexer::VlmDescriptionIndexer::new(gw_vlm, vlm, workspace.to_path_buf())
                 .with_meta(meta_maintainer)
@@ -2439,11 +2435,9 @@ pub(crate) fn build_live_post_processor(
     // dispatch). Absent ⇒ no L6 handler (Step-9 emits consolidation_due only).
     if let Some(gq) = git_queue {
         // slice wave6-laneB: build the real LlmL6Classifier and INJECT it into
-        // attach_l6 (the system-acceptance harness injects StubL6Classifier). `gw`
-        // above was moved into the extractor, so coerce a fresh gateway handle for
-        // the classifier via the same concrete-clone-then-let unsize idiom (:1240).
-        let gw_l6_concrete = Arc::clone(gateway);
-        let gw_l6: Arc<dyn cap_llm::LlmGatewayInternal + Send + Sync> = gw_l6_concrete;
+        // attach_l6 (the system-acceptance harness injects StubL6Classifier). It
+        // classifies this agent's own memories, as the agent.
+        let gw_l6: Arc<dyn cap_llm::LlmGatewayInternal + Send + Sync> = agent_gateway.clone();
         let l6_classifier: Arc<dyn cap_memory::l6::L6Classifier + Send + Sync> =
             Arc::new(crate::l6_classifier::LlmL6Classifier::new(gw_l6, None));
         // Wave-9 Lane B: ALWAYS wire the real `ResolverStalenessProbe` on the production
@@ -2463,17 +2457,16 @@ pub(crate) fn build_live_post_processor(
             )),
         );
     }
-    // Context pipeline: when the gateway can embed, Step 8 (`sync_turn_index` /
-    // `sync_task_index`) stores REAL semantic vectors through the same
-    // `LlmGateway::embed` the context assembler queries with — one model on both
-    // sides, so recall + task routing match. Without an embedding-capable
-    // provider the deterministic `StubEmbedder` stays (rows the assembler's
-    // dim-checked cosine simply never matches).
-    if gateway.has_embedding_provider() {
-        components = components.with_embedder(Arc::new(
-            crate::context_wiring::GatewayMemoryEmbedder::new(Arc::clone(gateway)),
-        ));
-    }
+    // Context pipeline: Step 8 (`sync_turn_index` / `sync_task_index`) stores
+    // REAL semantic vectors through the same per-agent route the context
+    // assembler queries with — the agent's own chat provider, resolved per call —
+    // so both sides use one model and every vector is stored with that model's
+    // id. While the agent's chat provider serves no embeddings the embedder makes
+    // no request and the rows are written without a vector; they pick one up
+    // again once a route exists (tasks on their next turn).
+    components = components.with_embedder(Arc::new(
+        crate::context_wiring::GatewayMemoryEmbedder::new(Arc::clone(gateway), write_agent_id),
+    ));
     // The index the pipeline writes, shared with the assembler's read side.
     let index = components.sqlite_index();
     (

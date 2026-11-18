@@ -96,7 +96,9 @@ pub trait TerminateController: Send + Sync {
 
     /// AC-18 — parent-notification + tree state flip. MUST NOT persist agent
     /// state (M005 never had `new_state` to write; the agent-loop
-    /// state-journal is MODULE-014 `handle_trap`, out-of-M005-scope).
+    /// state-journal is MODULE-014 `handle_trap`, out-of-M005-scope). A crash
+    /// of an agent inside a terminate — marked `Terminated`, or below an agent
+    /// so marked — changes nothing and notifies no one.
     fn handle_crash(&self, crashed_agent_id: &str, reason: &str) -> Result<(), LifecycleError>;
 }
 
@@ -378,10 +380,18 @@ impl TerminateController for DefaultTerminateController {
         let crashed = AgentId(crashed_agent_id.to_string());
         // Flip to Failed FIRST. If the node is absent, map to NotFound and
         // NEVER notify — keeps the observable state consistent (no crash
-        // message for an agent that isn't `Failed`).
-        self.tree
-            .set_status(&crashed, AgentStatus::Failed)
+        // message for an agent that isn't `Failed`). Likewise a node inside a
+        // terminate — marked `Terminated`, or below a node so marked — is left
+        // as it is and no one is told: it is being torn down, and its loop's
+        // crash on the way out is no crash to report (`mark_failed` is atomic
+        // with the freeze's marking).
+        let marked = self
+            .tree
+            .mark_failed(&crashed)
             .map_err(|_| LifecycleError::NotFound(format!("agent {crashed_agent_id}")))?;
+        if !marked {
+            return Ok(());
+        }
         let snap = self.tree.snapshot();
         match snap.parent_of.get(&crashed).and_then(|p| p.clone()) {
             None => Ok(()), // Root crash: status set, no parent to notify.

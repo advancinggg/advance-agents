@@ -549,3 +549,40 @@ fn t_cgs_46_legitimate_high_bit_latin_still_allowed() {
     validate_capability_subset(&parent, &child)
         .expect("legitimate Latin/Unicode identifiers must still be accepted");
 }
+
+// =============================================================================
+// T-CGS-47..49 — `memory`: a whole-capability family. An agent's memory is its
+// own (every `agent-memory` call is keyed by the caller), so a child holds the
+// capability exactly when its parent does and nothing narrows it.
+// =============================================================================
+#[test]
+fn t_cgs_47_memory_passes_down_whole() {
+    let parent = vec![cap("fs", json!({})), cap("memory", Value::Null)];
+    for child_params in [Value::Null, json!({})] {
+        validate_capability_subset(&parent, &[cap("memory", child_params)])
+            .expect("a child may hold `memory` when its parent does");
+    }
+}
+
+#[test]
+fn t_cgs_48_memory_needs_the_parent_to_hold_it() {
+    let parent = vec![cap("fs", json!({})), cap("llm", json!({}))];
+    expect_subset_violation(validate_capability_subset(
+        &parent,
+        &[cap("memory", Value::Null)],
+    ));
+}
+
+/// `memory` takes no param, either way round. Both cases are refused where a
+/// capability is projected to grant params — `memory` accepts no param key — so
+/// neither reaches the subset rules. The rule that a child naming a param is
+/// refused even against a whole `memory` parent (checked before "a whole parent
+/// covers everything") is witnessed in `tests/subset.rs`
+/// (`memory_is_whole_capability_only`), on params no projection produces.
+#[test]
+fn t_cgs_49_memory_takes_no_params() {
+    let whole = vec![cap("memory", Value::Null)];
+    let with_params = vec![cap("memory", json!({"scope": "all"}))];
+    expect_subset_violation(validate_capability_subset(&whole, &with_params));
+    expect_subset_violation(validate_capability_subset(&with_params, &whole));
+}

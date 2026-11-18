@@ -25,7 +25,8 @@ use crate::backend_local::FailedSpawnBackend;
 use crate::backend_mesh::MeshRemoteAdapter;
 use crate::catalog::{CatalogTier, ModelProfile, ModelProfileCatalog, ProfileKey};
 use crate::gateway::{
-    ChatMessage, ChatParams, ChatRole, LlmGateway, LlmGatewayInternal, LlmRequestContext,
+    ChatMessage, ChatParams, ChatRole, EmbeddingUnavailable, LlmGateway, LlmGatewayInternal,
+    LlmRequestContext,
 };
 use crate::placement::{EndpointTelemetry, PlacementTelemetry, UserHardConstraint};
 use crate::retry::PartialRetry;
@@ -521,22 +522,177 @@ async fn t133_unauthorized_endpoint_never_dispatched() {
     assert_eq!(ok.chats.load(Ordering::SeqCst), 1);
 }
 
-#[tokio::test]
-async fn t133_embed_empty_alias_skips_unauthorized() {
+/// The two per-entry admission checks against `place` itself, over every combination of
+/// backend class, configured device, reported device, authorization and hard constraint:
+/// `admits_now` is exactly `place`'s filter, and `admits` — which reads the configuration
+/// alone — never rules out an entry `place` can return. (What decides "the one entry an
+/// agent chats on" must not be narrower than what the agent's requests can reach.)
+#[test]
+fn t133_entry_admission_agrees_with_placement() {
+    use crate::capability::CapabilityNeed;
+    use crate::placement::{admits, admits_now, candidates_for, place};
+
+    struct Tel {
+        device: Option<&'static str>,
+        authorized: bool,
+    }
+    impl PlacementTelemetry for Tel {
+        fn snapshot(&self, _endpoint_id: &str) -> Option<EndpointTelemetry> {
+            None
+        }
+        fn device_id(&self, _endpoint_id: &str) -> Option<String> {
+            self.device.map(str::to_string)
+        }
+        fn authorized(&self, _endpoint_id: &str) -> bool {
+            self.authorized
+        }
+    }
+
+    let classes = [
+        InferenceBackendClass::CloudHttp,
+        InferenceBackendClass::Local,
+        InferenceBackendClass::MeshRemote,
+        InferenceBackendClass::AgentCli,
+    ];
+    let devices = [None, Some("phone"), Some("mac")];
+    let pin = || UserHardConstraint::DevicePin("phone".into());
+    let constraint_sets: Vec<Vec<UserHardConstraint>> = vec![
+        vec![],
+        vec![UserHardConstraint::AlwaysLocal],
+        vec![UserHardConstraint::NeverCloud],
+        vec![pin()],
+        vec![UserHardConstraint::AlwaysLocal, pin()],
+        vec![UserHardConstraint::NeverCloud, pin()],
+        vec![
+            UserHardConstraint::AlwaysLocal,
+            UserHardConstraint::NeverCloud,
+        ],
+    ];
+    let need = CapabilityNeed {
+        tools: false,
+        output_schema: false,
+        image: false,
+        prompt_tokens_est: None,
+        max_tokens: None,
+    };
+    let catalog = ModelProfileCatalog::new();
+    let (mut placed, mut refused, mut static_only) = (0, 0, 0);
+    for class in classes {
+        for configured in devices {
+            for reported in devices {
+                for authorized in [true, false] {
+                    for constraints in &constraint_sets {
+                        let mut entry = provider("e", class, "llama", None);
+                        entry.device_id = configured.map(str::to_string);
+                        let tel = Tel {
+                            device: reported,
+                            authorized,
+                        };
+                        let cands = candidates_for(
+                            std::slice::from_ref(&entry),
+                            Some("llama"),
+                            &catalog,
+                            &need,
+                            &tel,
+                        )
+                        .expect("the entry serves the model");
+                        let placeable =
+                            matches!(place(&cands, constraints, &[], None), Ok(Some(_)));
+                        let case = format!(
+                            "{class:?} configured={configured:?} reported={reported:?} \
+                             authorized={authorized} {constraints:?}"
+                        );
+                        assert_eq!(
+                            admits_now(&entry, constraints, &tel),
+                            placeable,
+                            "admits_now is place's filter: {case}"
+                        );
+                        if placeable {
+                            placed += 1;
+                            assert!(
+                                admits(&entry, constraints),
+                                "admits rules out an entry place returns: {case}"
+                            );
+                        } else {
+                            refused += 1;
+                            if admits(&entry, constraints) {
+                                static_only += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // The matrix exercises both outcomes, and the static check is a strict superset (an
+    // unauthorized entry, or one whose device only telemetry knows, still counts).
+    assert!(placed > 0 && refused > 0 && static_only > 0);
+
+    // What the static check does rule out: the class a constraint excludes, and a
+    // configured device other than the pinned one.
+    let on = |class, device: Option<&str>| {
+        let mut entry = provider("e", class, "llama", None);
+        entry.device_id = device.map(str::to_string);
+        entry
+    };
+    let always_local = [UserHardConstraint::AlwaysLocal];
+    let never_cloud = [UserHardConstraint::NeverCloud];
+    assert!(admits(
+        &on(InferenceBackendClass::Local, None),
+        &always_local
+    ));
+    for class in [
+        InferenceBackendClass::CloudHttp,
+        InferenceBackendClass::MeshRemote,
+        InferenceBackendClass::AgentCli,
+    ] {
+        assert!(!admits(&on(class, None), &always_local), "{class:?}");
+    }
+    for (class, admitted) in [
+        (InferenceBackendClass::Local, true),
+        (InferenceBackendClass::MeshRemote, true),
+        (InferenceBackendClass::CloudHttp, false),
+        (InferenceBackendClass::AgentCli, false),
+    ] {
+        assert_eq!(
+            admits(&on(class, None), &never_cloud),
+            admitted,
+            "{class:?}"
+        );
+    }
+    assert!(admits(
+        &on(InferenceBackendClass::Local, Some("phone")),
+        &[pin()]
+    ));
+    assert!(admits(&on(InferenceBackendClass::Local, None), &[pin()]));
+    assert!(!admits(
+        &on(InferenceBackendClass::Local, Some("mac")),
+        &[pin()]
+    ));
+}
+
+/// A gateway over `[fast, slow]` local entries (both name an embedding model) where `fast` is
+/// not authorized. `aliases = false` strips both alias tables (the legacy literal-model shape).
+/// `slow` answers one chat request.
+fn embed_auth_rig(aliases: bool) -> (LlmGateway, Arc<ScriptedPort>, Arc<ScriptedPort>) {
     let denied = Arc::new(ScriptedPort::chat_only(vec![]));
     denied.allow_embed(vec![9.0]);
-    let ok = Arc::new(ScriptedPort::chat_only(vec![]));
+    let ok = Arc::new(ScriptedPort::chat_only(vec![Ok(ScriptedPort::ok(
+        "served",
+    ))]));
     ok.allow_embed(vec![0.1, 0.2]);
     let mut registry = InferenceBackendRegistry::new();
     registry.insert("fast", denied.clone());
     registry.insert("slow", ok.clone());
     let mut cfg = fixture_runtime_config();
     let mut fast = provider("fast", InferenceBackendClass::Local, "llama", None);
-    fast.model_aliases.clear();
     fast.embedding_model = Some("nomic-embed".into());
     let mut slow = provider("slow", InferenceBackendClass::Local, "llama", None);
-    slow.model_aliases.clear();
     slow.embedding_model = Some("nomic-embed".into());
+    if !aliases {
+        fast.model_aliases.clear();
+        slow.model_aliases.clear();
+    }
     cfg.llm_providers = vec![fast, slow];
     let gw = LlmGateway::new(
         Arc::new(MockRuntimeConfigProvider::new(cfg)),
@@ -551,14 +707,87 @@ async fn t133_embed_empty_alias_skips_unauthorized() {
         ttft: HashMap::from([("fast".into(), 1), ("slow".into(), 80)]),
         deny: HashSet::from(["fast".into()]),
     }));
-    let vec = gw.embed("hi").await.expect("authorized embed");
-    assert_eq!(vec, vec![0.1, 0.2]);
+    (gw, denied, ok)
+}
+
+/// Embedding follows where the agent's chat is served, authorization included: with `fast`
+/// not authorized the agent's own request is served by `slow`, so its embedding goes there
+/// too and the denied entry never receives text. Before that request, with two entries
+/// admitted, there is nothing to follow and nothing is sent.
+#[tokio::test]
+async fn t133_embed_follows_the_authorized_chat_endpoint() {
+    let (gw, denied, ok) = embed_auth_rig(true);
+    assert_eq!(
+        gw.embedding_route_for("test-agent"),
+        Err(EmbeddingUnavailable::ChatProviderUnknown)
+    );
+    assert_eq!(gw.embed_for_agent("test-agent", "hi").await, Ok(None));
+    assert_eq!(ok.embeds.load(Ordering::SeqCst), 0);
+
+    let mut own = ctx_for("llama", None, vec![], false, None, false);
+    own.caller = crate::gateway::Caller::AgentGuest;
+    gw.generate(own)
+        .await
+        .expect("the authorized entry serves it");
+    assert_eq!(ok.chats.load(Ordering::SeqCst), 1);
+    assert_eq!(denied.chats.load(Ordering::SeqCst), 0);
+
+    let embedded = gw
+        .embed_for_agent("test-agent", "hi")
+        .await
+        .expect("authorized embed")
+        .expect("the agent chats with `slow`, which names an embedding model");
+    assert_eq!(embedded.vector, vec![0.1, 0.2]);
+    assert_eq!(embedded.provider_id, "slow");
+    assert_eq!(embedded.model, "nomic-embed");
+    assert_eq!(
+        denied.embeds.load(Ordering::SeqCst),
+        0,
+        "the denied entry must not receive text"
+    );
+    assert_eq!(ok.embeds.load(Ordering::SeqCst), 1);
+}
+
+/// An entry the agent chatted on that is no longer authorized is not followed: the agent's
+/// own request cannot reach it any more, so nothing sent on its behalf does. The text
+/// reaches NEITHER entry — the authorized `slow` is not where this agent's chat was served,
+/// so it must not get the text either.
+#[tokio::test]
+async fn t133_embed_follows_no_entry_that_lost_its_authorization() {
+    let (gw, denied, ok) = embed_auth_rig(false);
+    assert_eq!(
+        gw.embedding_route_for("test-agent"),
+        Err(EmbeddingUnavailable::ChatProviderUnknown),
+        "two entries are admitted and none has served the agent"
+    );
+    assert_eq!(gw.embed_for_agent("test-agent", "hi").await, Ok(None));
+    // Its last request was served by `fast`, which has since lost its authorization:
+    // the reason names the entry and says it cannot be used now.
+    gw.test_agent_chats_on("test-agent", "fast");
+    assert_eq!(
+        gw.embedding_route_for("test-agent"),
+        Err(EmbeddingUnavailable::ChatProviderNotUsable {
+            provider_id: "fast".into(),
+        })
+    );
+    assert_eq!(gw.embed_for_agent("test-agent", "hi").await, Ok(None));
+    assert_eq!(
+        gw.embed("hi").await.unwrap_err(),
+        LlmError::ModelNotAvailable(
+            "embedding unavailable: chat provider fast is not usable at the moment (not authorized, or not on the device this agent is pinned to)"
+                .into()
+        )
+    );
     assert_eq!(
         denied.embeds.load(Ordering::SeqCst),
         0,
         "denied empty-alias embed provider must not receive text"
     );
-    assert_eq!(ok.embeds.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        ok.embeds.load(Ordering::SeqCst),
+        0,
+        "an entry the agent does not chat with must not receive text"
+    );
 }
 
 struct CountingMesh {
@@ -798,6 +1027,142 @@ async fn t133_failover_pre_first_token_gateway() {
     let d1 = fast.deadlines.lock().unwrap()[0];
     let d2 = slow.deadlines.lock().unwrap()[0];
     assert_eq!(d1, d2, "req.deadline must not refresh per hop");
+}
+
+/// A request of the agent's own that fails over is served by the entry that ANSWERED: that
+/// is the entry the agent chats on from then on, not the one placement tried first — so
+/// what the host sends for the agent (here its embedding) goes there, and the entry that
+/// refused gets nothing more.
+#[tokio::test]
+async fn t133_after_a_failover_the_agent_is_followed_to_the_entry_that_answered() {
+    let fast = Arc::new(ScriptedPort::chat_only(vec![Err(
+        InferenceBackendError::Provider("connection refused".into()),
+    )]));
+    fast.allow_embed(vec![9.0]);
+    let slow = Arc::new(ScriptedPort::chat_only(vec![Ok(ScriptedPort::ok(
+        "slow-ok",
+    ))]));
+    slow.allow_embed(vec![0.25, 0.5]);
+    let mut registry = InferenceBackendRegistry::new();
+    registry.insert("fast", fast.clone());
+    registry.insert("slow", slow.clone());
+    let mut providers = vec![
+        provider("fast", InferenceBackendClass::Local, "llama", None),
+        provider("slow", InferenceBackendClass::Local, "llama", None),
+    ];
+    providers[0].embedding_model = Some("fast-embed".into());
+    providers[1].embedding_model = Some("slow-embed".into());
+    let (gw, _, _, _) = gateway(
+        providers,
+        registry,
+        MapTel {
+            ttft: HashMap::from([("fast".into(), 1), ("slow".into(), 90)]),
+        },
+        ModelProfileCatalog::new(),
+        None,
+    );
+    assert_eq!(
+        gw.embedding_route_for("test-agent"),
+        Err(EmbeddingUnavailable::ChatProviderUnknown)
+    );
+    let mut own = ctx_for("llama", None, vec![], false, None, false);
+    own.caller = crate::gateway::Caller::AgentGuest;
+    assert_eq!(gw.generate(own).await.expect("failover").text, "slow-ok");
+    assert_eq!(fast.chats.load(Ordering::SeqCst), 1);
+    assert_eq!(slow.chats.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        gw.embedding_route_for("test-agent"),
+        Ok(crate::EmbeddingRoute {
+            provider_id: "slow".into(),
+            model: "slow-embed".into(),
+        })
+    );
+    let embedded = gw
+        .embed_for_agent("test-agent", "hi")
+        .await
+        .expect("embed")
+        .expect("the entry that answered embeds");
+    assert_eq!(embedded.provider_id, "slow");
+    assert_eq!(embedded.vector, vec![0.25, 0.5]);
+    assert_eq!(slow.embeds.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fast.embeds.load(Ordering::SeqCst),
+        0,
+        "the entry that did not serve the agent must not receive its text"
+    );
+}
+
+/// What a local backend answers is checked like a cloud provider's answer: a vector that
+/// cannot be an embedding — empty, wider than any model produces, or with a value that is
+/// not finite — is an error for the request, reported as one, and never returned to be
+/// stored.
+#[tokio::test]
+async fn t133_a_local_embedding_that_cannot_be_one_is_refused() {
+    let refused = Err(LlmError::ProviderError("invalid response shape".into()));
+    for (case, vector) in [
+        ("empty", vec![]),
+        ("not finite", vec![0.5, f32::NAN]),
+        ("infinite", vec![f32::INFINITY]),
+        (
+            "too wide",
+            vec![0.5; crate::providers::MAX_EMBEDDING_DIMENSIONS + 1],
+        ),
+    ] {
+        let port = Arc::new(ScriptedPort::chat_only(vec![]));
+        port.allow_embed(vector);
+        let mut registry = InferenceBackendRegistry::new();
+        registry.insert("on-device", port.clone());
+        let mut entry = provider("on-device", InferenceBackendClass::Local, "llama", None);
+        entry.embedding_model = Some("nomic-embed".into());
+        let (gw, _, _, bus) = gateway(
+            vec![entry],
+            registry,
+            MapTel {
+                ttft: HashMap::new(),
+            },
+            ModelProfileCatalog::new(),
+            None,
+        );
+        assert_eq!(
+            gw.embed_for_agent("test-agent", "hi").await,
+            refused,
+            "{case}"
+        );
+        assert_eq!(port.embeds.load(Ordering::SeqCst), 1, "{case}");
+        let types: Vec<String> = bus
+            .snapshot()
+            .iter()
+            .map(|e| e.event_type.clone())
+            .collect();
+        assert_eq!(types, vec![crate::LLM_REQUEST, crate::LLM_ERROR], "{case}");
+    }
+
+    // The widest vector a model produces is kept as it came.
+    let port = Arc::new(ScriptedPort::chat_only(vec![]));
+    port.allow_embed(vec![0.5; crate::providers::MAX_EMBEDDING_DIMENSIONS]);
+    let mut registry = InferenceBackendRegistry::new();
+    registry.insert("on-device", port);
+    let mut entry = provider("on-device", InferenceBackendClass::Local, "llama", None);
+    entry.embedding_model = Some("nomic-embed".into());
+    let (gw, _, _, _) = gateway(
+        vec![entry],
+        registry,
+        MapTel {
+            ttft: HashMap::new(),
+        },
+        ModelProfileCatalog::new(),
+        None,
+    );
+    let embedded = gw
+        .embed_for_agent("test-agent", "hi")
+        .await
+        .expect("embed")
+        .expect("the one local entry is the agent's");
+    assert_eq!(
+        embedded.vector.len(),
+        crate::providers::MAX_EMBEDDING_DIMENSIONS
+    );
 }
 
 #[tokio::test]

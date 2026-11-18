@@ -27,11 +27,36 @@ pub struct ContextSnapshot {
     pub sequence: u64,
 }
 
-/// The embedding posture the daemon resolved at spawn.
-#[derive(Clone, Debug, Default)]
+/// One agent's embedding posture: whether its chat provider serves embeddings
+/// right now, and with which model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EmbeddingPosture {
     pub active: bool,
     pub model: Option<String>,
+}
+
+/// Answers an agent's [`EmbeddingPosture`] by its BARE cap id at the moment it
+/// is asked. Embedding follows each agent's own chat provider, so the posture is
+/// per agent and changes with the provider config / the agent's `llm:` policy —
+/// never a value frozen at daemon start.
+pub type EmbeddingPostureSource = Arc<dyn Fn(&str) -> EmbeddingPosture + Send + Sync>;
+
+/// The live posture over the gateway's per-agent embedding route.
+pub fn gateway_embedding_posture(gateway: Arc<cap_llm::LlmGateway>) -> EmbeddingPostureSource {
+    Arc::new(
+        move |agent_id| match gateway.embedding_route_for(agent_id) {
+            Ok(route) => EmbeddingPosture {
+                active: true,
+                model: Some(route.model),
+            },
+            Err(_) => EmbeddingPosture::default(),
+        },
+    )
+}
+
+/// A posture that never changes (no LLM gateway, and tests).
+pub fn fixed_embedding_posture(posture: EmbeddingPosture) -> EmbeddingPostureSource {
+    Arc::new(move |_| posture.clone())
 }
 
 /// Latest-report-per-agent store. Sync, lock-copy-release; never does I/O.
@@ -87,6 +112,30 @@ impl ContextSnapshotStore {
             .max_by_key(|s| s.sequence)
             .cloned()
     }
+
+    /// The agent `bare_id` is gone: drop the report recorded under it and under each of
+    /// `colon_ids` (the colon ids it held), and every alias group it is in, so it is
+    /// not a known agent any more and an agent created later under one of its ids does
+    /// not answer with its report.
+    ///
+    /// A group with `bare_id` in it is one this agent registered: a bare id is never a
+    /// colon id (`agent:` is not a bare id). No other report is dropped — not that of
+    /// another id such a group ties `bare_id` to.
+    pub fn forget(&self, bare_id: &str, colon_ids: &[&str]) {
+        let mut ids = vec![bare_id];
+        ids.extend_from_slice(colon_ids);
+        self.forget_reports(&ids);
+        let mut guard = self.aliases.lock().unwrap_or_else(|p| p.into_inner());
+        guard.retain(|group| !group.iter().any(|alias| alias == bare_id));
+    }
+
+    /// Drop the report recorded under each of `ids`, and keep the ids known.
+    pub fn forget_reports(&self, ids: &[&str]) {
+        let mut guard = self.latest.lock().unwrap_or_else(|p| p.into_inner());
+        for id in ids {
+            guard.remove(*id);
+        }
+    }
 }
 
 impl AssemblyReportSink for ContextSnapshotStore {
@@ -112,7 +161,8 @@ impl AssemblyReportSink for ContextSnapshotStore {
 /// the row counts.
 pub struct ContextInspectAdapter {
     store: Arc<ContextSnapshotStore>,
-    embedding: EmbeddingPosture,
+    /// Asked with the inspected agent's bare id on every snapshot.
+    embedding: EmbeddingPostureSource,
     index: Option<Arc<dyn cap_memory::SqliteIndex + Send + Sync>>,
     /// The root's bare id (fallback when an alias group has no colon-free id).
     write_agent_id: String,
@@ -121,7 +171,7 @@ pub struct ContextInspectAdapter {
 impl ContextInspectAdapter {
     pub fn new(
         store: Arc<ContextSnapshotStore>,
-        embedding: EmbeddingPosture,
+        embedding: EmbeddingPostureSource,
         index: Option<Arc<dyn cap_memory::SqliteIndex + Send + Sync>>,
         write_agent_id: &str,
     ) -> Self {
@@ -235,64 +285,76 @@ impl ContextInspectProvider for ContextInspectAdapter {
         }
         let latest = self.store.snapshot(agent_id).map(|s| project_assembly(&s));
         let write_id = self.write_id_for(agent_id);
+        // Counted, not read: an agent's whole history, vectors and all, is not loaded at
+        // every look.
         let (turns, tasks) = match &self.index {
             Some(idx) => (
-                clamp_u32(idx.list_turns_for_agent(&write_id).len()),
-                clamp_u32(idx.list_tasks_for_agent(&write_id).len()),
+                clamp_u32(idx.count_turns_for_agent(&write_id)),
+                clamp_u32(idx.count_tasks_for_agent(&write_id)),
             ),
             None => (0, 0),
         };
+        // The posture of THIS agent, now: its bare id is what its `llm:` policy
+        // (and so its chat provider, which embedding follows) is keyed by.
+        let posture = (self.embedding)(&write_id);
         Ok(ClientContextSnapshot {
             agent_id: agent_id.to_string(),
             estimate: CONTEXT_TOKEN_ESTIMATE.to_string(),
             latest,
             embedding: ClientContextEmbedding {
-                active: self.embedding.active,
-                model: self.embedding.model.clone(),
+                active: posture.active,
+                model: posture.model,
             },
             index: ClientContextIndex { turns, tasks },
         })
     }
 }
 
+/// A report of a turn of `agent` that used `used` tokens (tests).
+#[cfg(test)]
+pub(crate) fn test_report(agent: &str, used: u32) -> AssemblyReport {
+    use advance_context_engine::{AssemblyHistoryReport, AssemblyRecallReport, AssemblySection};
+
+    AssemblyReport {
+        agent_id: agent.into(),
+        task_id: None,
+        message_id: "m-1".into(),
+        trace_id: Some("t-1".into()),
+        model: "gpt-4o".into(),
+        model_context_window: 128_000,
+        response_reserve: 19_200,
+        budget_tokens: 108_800,
+        used_tokens: used,
+        remaining_tokens: 108_800 - used,
+        progressive_mode: "wide".into(),
+        degraded: false,
+        tier1a_tokens: used / 2,
+        tier1b_tokens: 0,
+        tier2_tokens: used / 4,
+        tier3_tokens: used - used / 2 - used / 4,
+        sections: vec![AssemblySection {
+            tier: "1a".into(),
+            label: "Agent Identity".into(),
+            role: "system".into(),
+            tokens: used / 2,
+            bytes: used * 2,
+        }],
+        routing_method: "search".into(),
+        routing_confidence: 0.0,
+        is_new_task: true,
+        recall: AssemblyRecallReport::default(),
+        history: AssemblyHistoryReport::default(),
+        prompt_bytes: 12,
+        warnings: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use advance_context_engine::{AssemblyHistoryReport, AssemblyRecallReport, AssemblySection};
 
     fn report(agent: &str, used: u32) -> AssemblyReport {
-        AssemblyReport {
-            agent_id: agent.into(),
-            task_id: None,
-            message_id: "m-1".into(),
-            trace_id: Some("t-1".into()),
-            model: "gpt-4o".into(),
-            model_context_window: 128_000,
-            response_reserve: 19_200,
-            budget_tokens: 108_800,
-            used_tokens: used,
-            remaining_tokens: 108_800 - used,
-            progressive_mode: "wide".into(),
-            degraded: false,
-            tier1a_tokens: used / 2,
-            tier1b_tokens: 0,
-            tier2_tokens: used / 4,
-            tier3_tokens: used - used / 2 - used / 4,
-            sections: vec![AssemblySection {
-                tier: "1a".into(),
-                label: "Agent Identity".into(),
-                role: "system".into(),
-                tokens: used / 2,
-                bytes: used * 2,
-            }],
-            routing_method: "search".into(),
-            routing_confidence: 0.0,
-            is_new_task: true,
-            recall: AssemblyRecallReport::default(),
-            history: AssemblyHistoryReport::default(),
-            prompt_bytes: 12,
-            warnings: 0,
-        }
+        test_report(agent, used)
     }
 
     #[test]
@@ -308,10 +370,10 @@ mod tests {
 
         let adapter = ContextInspectAdapter::new(
             store.clone(),
-            EmbeddingPosture {
+            fixed_embedding_posture(EmbeddingPosture {
                 active: true,
                 model: Some("text-embedding-3-small".into()),
-            },
+            }),
             None,
             "root",
         );
@@ -329,14 +391,145 @@ mod tests {
         ));
     }
 
+    /// A forgotten agent is no longer known and answers with no report, under either
+    /// of its ids; an agent registered under the same ids afterwards starts at
+    /// sequence 1. Another agent is untouched — also one an alias group ties to an id
+    /// that is forgotten.
+    #[test]
+    fn a_forgotten_agent_is_unknown_and_leaves_no_report() {
+        let store = ContextSnapshotStore::new();
+        store.register_aliases(&["root".to_string(), "agent:root".to_string()]);
+        store.register_aliases(&["kid".to_string(), "agent:kid".to_string()]);
+        // A group that ties another agent's id to the root's (as v0.1.54 registered for a
+        // child refused for colliding with the root; now only a retained loop registers one).
+        store.register_aliases(&["default".to_string(), "agent:root".to_string()]);
+        store.record(report("agent:root", 100));
+        store.record(report("agent:kid", 200));
+        store.record(report("agent:kid", 300));
+
+        store.forget("kid", &["agent:kid"]);
+        assert!(!store.knows("kid") && !store.knows("agent:kid"));
+        assert!(store.snapshot("kid").is_none() && store.snapshot("agent:kid").is_none());
+        assert_eq!(
+            store.snapshot("root").expect("root").report.used_tokens,
+            100
+        );
+
+        store.register_aliases(&["kid".to_string(), "agent:kid".to_string()]);
+        assert!(
+            store.snapshot("kid").is_none(),
+            "nothing of the agent before"
+        );
+        store.record(report("agent:kid", 400));
+        let again = store.snapshot("kid").expect("the new agent's report");
+        assert_eq!((again.sequence, again.report.used_tokens), (1, 400));
+
+        // Forgetting an id an alias group ties to the root's drops that group and leaves
+        // the root alone.
+        store.forget("default", &[]);
+        assert!(!store.knows("default"));
+        assert_eq!(
+            store.snapshot("root").expect("root").report.used_tokens,
+            100
+        );
+        assert!(store.knows("root") && store.knows("agent:root"));
+
+        // A group the agent registered under a colon id another agent holds now goes
+        // with it; that agent's report and group stay.
+        store.register_aliases(&["gone".to_string(), "agent:helper".to_string()]);
+        store.register_aliases(&["newcomer".to_string(), "agent:helper".to_string()]);
+        store.record(report("agent:helper", 500));
+        store.forget("gone", &[]);
+        assert!(!store.knows("gone"));
+        assert_eq!(
+            store
+                .snapshot("newcomer")
+                .expect("the newcomer's report")
+                .report
+                .used_tokens,
+            500
+        );
+
+        // A colon id forgotten with the agent drops the report under it, and no group but
+        // the agent's own: one another agent registered with that colon id stays.
+        store.register_aliases(&["gone".to_string(), "agent:helper".to_string()]);
+        store.forget("gone", &["agent:helper"]);
+        assert!(!store.knows("gone"));
+        assert!(
+            store.snapshot("newcomer").is_none(),
+            "the report under it went"
+        );
+        assert!(store.knows("newcomer"), "the newcomer's group stays");
+    }
+
+    /// Dropping the reports of some ids keeps the ids known.
+    #[test]
+    fn forgetting_reports_keeps_the_ids_known() {
+        let store = ContextSnapshotStore::new();
+        store.register_aliases(&["kid".to_string(), "agent:kid".to_string()]);
+        store.record(report("agent:kid", 200));
+        store.forget_reports(&["kid", "agent:kid"]);
+        assert!(store.knows("kid"));
+        assert!(store.snapshot("kid").is_none());
+    }
+
     #[test]
     fn known_agent_without_assembly_has_no_latest() {
         let store = Arc::new(ContextSnapshotStore::new());
         store.register_aliases(&["root".to_string(), "agent:root".to_string()]);
-        let adapter = ContextInspectAdapter::new(store, EmbeddingPosture::default(), None, "root");
+        let adapter = ContextInspectAdapter::new(
+            store,
+            fixed_embedding_posture(EmbeddingPosture::default()),
+            None,
+            "root",
+        );
         let dto = adapter.snapshot("agent:root").unwrap();
         assert!(dto.latest.is_none());
         assert!(!dto.embedding.active);
+    }
+
+    /// The embedding posture is the INSPECTED agent's own, asked by its bare id
+    /// at snapshot time: two agents on different chat providers report different
+    /// postures from one adapter, and a change shows on the next snapshot.
+    #[test]
+    fn embedding_posture_is_per_agent_and_read_at_snapshot_time() {
+        let store = Arc::new(ContextSnapshotStore::new());
+        store.register_aliases(&["root".to_string(), "agent:root".to_string()]);
+        store.register_aliases(&["researcher".to_string(), "agent:researcher".to_string()]);
+        let root_model = Arc::new(Mutex::new(Some("embed-a".to_string())));
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let source: EmbeddingPostureSource = {
+            let (root_model, asked) = (root_model.clone(), asked.clone());
+            Arc::new(move |agent_id| {
+                asked.lock().unwrap().push(agent_id.to_string());
+                let model = match agent_id {
+                    "root" => root_model.lock().unwrap().clone(),
+                    _ => None,
+                };
+                EmbeddingPosture {
+                    active: model.is_some(),
+                    model,
+                }
+            })
+        };
+        let adapter = ContextInspectAdapter::new(store, source, None, "root");
+
+        // Either alias of the root resolves to its bare id.
+        let dto = adapter.snapshot("agent:root").unwrap();
+        assert!(dto.embedding.active);
+        assert_eq!(dto.embedding.model.as_deref(), Some("embed-a"));
+        // The child's chat provider serves no embeddings: its own posture.
+        let child = adapter.snapshot("researcher").unwrap();
+        assert!(!child.embedding.active);
+        assert_eq!(child.embedding.model, None);
+        // The root's provider changes: the next snapshot shows it.
+        *root_model.lock().unwrap() = None;
+        assert!(!adapter.snapshot("root").unwrap().embedding.active);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec!["root", "researcher", "root"],
+            "the source is asked with the bare id, once per snapshot"
+        );
     }
 
     #[test]
@@ -345,7 +538,12 @@ mod tests {
         store.register_aliases(&["root".to_string(), "agent:root".to_string()]);
         store.register_aliases(&["researcher".to_string(), "agent:researcher".to_string()]);
         store.record(report("agent:researcher", 40));
-        let adapter = ContextInspectAdapter::new(store, EmbeddingPosture::default(), None, "root");
+        let adapter = ContextInspectAdapter::new(
+            store,
+            fixed_embedding_posture(EmbeddingPosture::default()),
+            None,
+            "root",
+        );
         let dto = adapter.snapshot("researcher").unwrap();
         assert_eq!(dto.latest.expect("child assembled").used_tokens, 40);
         assert_eq!(dto.agent_id, "researcher");

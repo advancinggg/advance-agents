@@ -173,14 +173,43 @@ fn ac03_idempotent_second_terminate_not_found() {
 #[test]
 fn ac18_handle_crash_sets_failed_then_notifies() {
     let (_t, tree, rec, ctrl) = setup();
+    let revision = tree.revision();
     ctrl.handle_crash("gc", "panic").unwrap();
-    // status flipped to Failed.
+    // status flipped to Failed, as a tree mutation.
     assert_eq!(
         tree.get_node(&AgentId("gc".into())).unwrap().status,
         AgentStatus::Failed
     );
+    assert_eq!(tree.revision(), revision + 1);
     // parent notified with reason.
     assert!(rec.snapshot().iter().any(|c| c == "crash:child<-gc:panic"));
+}
+
+#[test]
+fn ac18_handle_crash_of_a_failed_or_paused_agent_fails_it() {
+    // Only a terminate's mark is final: a paused agent, or a failed one served
+    // again, that crashes fails, and its parent is told — and so does one
+    // below a paused or failed parent.
+    for status in [AgentStatus::Failed, AgentStatus::Paused] {
+        for marked in ["gc", "child"] {
+            let (_t, tree, rec, ctrl) = setup();
+            tree.set_status(&AgentId(marked.into()), status.clone())
+                .unwrap();
+            let revision = tree.revision();
+            ctrl.handle_crash("gc", "panic").unwrap();
+            assert_eq!(
+                tree.get_node(&AgentId("gc".into())).unwrap().status,
+                AgentStatus::Failed,
+                "{marked} {status:?}"
+            );
+            assert_eq!(tree.revision(), revision + 1, "{marked} {status:?}");
+            assert_eq!(
+                rec.snapshot(),
+                ["crash:child<-gc:panic".to_string()],
+                "{marked} {status:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -200,6 +229,65 @@ fn ac18_handle_crash_root_status_only_no_notify() {
         AgentStatus::Failed
     );
     assert!(!rec.snapshot().iter().any(|c| c.starts_with("crash:")));
+}
+
+#[test]
+fn ac18_handle_crash_of_a_terminated_agent_leaves_it_terminated() {
+    // The agent's loop crashes while its terminate is under way: the freeze
+    // has marked it, its cascade has not stopped its loop yet. The mark
+    // stays, and its parent is told nothing.
+    let (_t, tree, rec, ctrl) = setup();
+    tree.set_status(&AgentId("gc".into()), AgentStatus::Terminated)
+        .unwrap();
+    let revision = tree.revision();
+    ctrl.handle_crash("gc", "panic").unwrap();
+    assert_eq!(
+        tree.get_node(&AgentId("gc".into())).unwrap().status,
+        AgentStatus::Terminated
+    );
+    assert_eq!(tree.revision(), revision, "no tree mutation");
+    assert!(!rec.snapshot().iter().any(|c| c.starts_with("crash:")));
+}
+
+#[test]
+fn ac18_handle_crash_below_a_terminated_agent_leaves_it_alone() {
+    // A terminate of `child` is under way: its freeze has marked `child` and
+    // not yet reached `gc` nor `ggc` below it, whose loops crash. Both are
+    // inside the terminate: neither is marked failed (the freeze marks them
+    // next), and no one is told — their parents are being torn down too. So
+    // too when `gc` had failed before (a failed child is served again).
+    for gc_was in [AgentStatus::Active, AgentStatus::Failed] {
+        let (_t, tree, rec, ctrl) = setup();
+        let ws = tree.workspace_root().join("root/child/gc/ggc");
+        std::fs::create_dir_all(&ws).unwrap();
+        tree.insert_child(
+            &AgentId("gc".into()),
+            node("ggc", AgentKind::Child, Some("gc"), ws),
+        )
+        .unwrap();
+        tree.set_status(&AgentId("gc".into()), gc_was.clone())
+            .unwrap();
+        tree.set_status(&AgentId("child".into()), AgentStatus::Terminated)
+            .unwrap();
+        let revision = tree.revision();
+        for (crashed, stays) in [("gc", gc_was.clone()), ("ggc", AgentStatus::Active)] {
+            ctrl.handle_crash(crashed, "panic").unwrap();
+            assert_eq!(
+                tree.get_node(&AgentId(crashed.into())).unwrap().status,
+                stays,
+                "{crashed} (gc {gc_was:?})"
+            );
+        }
+        assert_eq!(
+            tree.revision(),
+            revision,
+            "no tree mutation (gc {gc_was:?})"
+        );
+        assert!(
+            !rec.snapshot().iter().any(|c| c.starts_with("crash:")),
+            "gc {gc_was:?}"
+        );
+    }
 }
 
 #[test]

@@ -115,23 +115,43 @@ pub trait ProviderAdapter: Send + Sync {
 
     fn parse_embed_response(&self, status: u16, body: &[u8]) -> Result<Vec<f32>, LlmError>;
 
-    /// Round-3 W6 fix: gateway's `select_embedding_provider` skips providers
-    /// whose adapter advertises `false`. Default `true`; only `AnthropicAdapter`
-    /// overrides to `false` (Anthropic ships no native embedding endpoint).
+    /// Whether this dialect has an embeddings endpoint at all. Default `true`; only
+    /// `AnthropicAdapter` answers `false`. Not what decides an embedding route: the
+    /// gateway's `embedding_model_for` reads the entry's backend and backend class,
+    /// and refuses an Anthropic Messages entry there.
     #[allow(dead_code)]
     fn supports_embedding(&self) -> bool {
         true
     }
 
-    /// Embedding-model identifier the adapter sends to upstream and that the
-    /// gateway records on `llm.request` / `llm.response` events. Slice B-2
-    /// hardcodes `text-embedding-3-small` for OpenAI-compatible per the
-    /// round-4 W2 accepted limitation; Slice C will read from
-    /// `LlmProviderConfig.embedding_model` once that field exists.
-    /// Anthropic returns `None` because it doesn't expose embeddings.
+    /// The embedding model this dialect's FIRST-PARTY endpoint serves when an
+    /// entry names no `embedding-model` (`text-embedding-3-small` on OpenAI's own
+    /// API). The gateway applies it only to that endpoint: for every other
+    /// endpoint speaking the dialect the entry's `embedding-model` is required,
+    /// so a model id is never guessed. Anthropic returns `None` because it
+    /// doesn't expose embeddings.
     fn embedding_model(&self) -> Option<&'static str> {
         None
     }
+}
+
+/// The widest embedding a provider's answer may carry. Above every embedding model in
+/// use (the widest produce 4096 values), and a bound on what one stored index row and one
+/// recall scan can cost.
+pub(crate) const MAX_EMBEDDING_DIMENSIONS: usize = 8192;
+
+/// Refuse a vector that cannot be an embedding — empty, wider than
+/// [`MAX_EMBEDDING_DIMENSIONS`], or carrying a value that is not finite. One check for
+/// every dialect and for the local inference port; the message is fixed and carries
+/// nothing of the answer.
+pub(crate) fn validate_embedding(vector: &[f32]) -> Result<(), LlmError> {
+    if vector.is_empty()
+        || vector.len() > MAX_EMBEDDING_DIMENSIONS
+        || vector.iter().any(|value| !value.is_finite())
+    {
+        return Err(LlmError::ProviderError("invalid response shape".into()));
+    }
+    Ok(())
 }
 
 /// Route a backend to its adapter (ADR 2026-07-22 D4). The historical

@@ -322,7 +322,10 @@ async fn module_011_t40_sync_task_index_brief_change_gate_uses_string_equality()
         .sync_task_index(&test_summary("task-001", "agent:r", "Initial", 1))
         .await
         .expect("sync 1 ok");
-    let row1 = components.sqlite_index.get_task("task-001").expect("row 1");
+    let row1 = components
+        .sqlite_index
+        .get_task("agent:r", "task-001")
+        .expect("row 1");
     assert_eq!(call_count.load(Ordering::SeqCst), 1, "first-write embeds");
     let e1 = row1.brief_embedding.clone().expect("brief_embedding 1");
     assert_eq!(row1.brief_snapshot, "Initial");
@@ -333,7 +336,10 @@ async fn module_011_t40_sync_task_index_brief_change_gate_uses_string_equality()
         .sync_task_index(&test_summary("task-001", "agent:r", "Initial", 2))
         .await
         .expect("sync 2 ok");
-    let row2 = components.sqlite_index.get_task("task-001").expect("row 2");
+    let row2 = components
+        .sqlite_index
+        .get_task("agent:r", "task-001")
+        .expect("row 2");
     assert_eq!(
         call_count.load(Ordering::SeqCst),
         1,
@@ -352,7 +358,10 @@ async fn module_011_t40_sync_task_index_brief_change_gate_uses_string_equality()
         .sync_task_index(&test_summary("task-001", "agent:r", "Revised", 3))
         .await
         .expect("sync 3 ok");
-    let row3 = components.sqlite_index.get_task("task-001").expect("row 3");
+    let row3 = components
+        .sqlite_index
+        .get_task("agent:r", "task-001")
+        .expect("row 3");
     assert_eq!(
         call_count.load(Ordering::SeqCst),
         2,

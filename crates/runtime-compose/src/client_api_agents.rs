@@ -837,23 +837,49 @@ impl AgentAdminProvider for AgentAdminAdapter {
 /// Bare-tree-id → served mailbox key (e.g. `root` → `agent:root`, `b` → `agent:b`).
 pub type MailboxKeyResolver = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
+/// Whether a terminate of the agent with a bare tree id may empty the mailbox under a colon
+/// key: the key is that agent's own or no one's
+/// ([`crate::perchild_daemon::PerChildLoopManager::may_flush`]). Called `(bare, key)`.
+pub type MailboxFlushCheck = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
 /// Colon-aware `MailboxCascade`: the terminate cascade hands BARE tree ids, but served mailboxes
 /// are colon-keyed, so both the flush and the parent notice resolve through the daemon's key
 /// resolver (the cap-lifecycle `MailboxFlushCascade` would probe a bare key that never exists).
 pub struct ColonMailboxCascade {
     store: Arc<MailboxStore>,
     resolver: MailboxKeyResolver,
+    flush_check: Option<MailboxFlushCheck>,
 }
 
 impl ColonMailboxCascade {
     pub fn new(store: Arc<MailboxStore>, resolver: MailboxKeyResolver) -> Self {
-        Self { store, resolver }
+        Self {
+            store,
+            resolver,
+            flush_check: None,
+        }
+    }
+
+    /// Flush only a key `check` finds the terminated agent's own or no one's. The key the
+    /// agent's handle resolves to can be another agent's: the root's, for a child whose id
+    /// maps onto it, or that of a child served under it and renamed since, which keeps its
+    /// colon id while its loop runs.
+    pub fn with_flush_check(mut self, check: MailboxFlushCheck) -> Self {
+        self.flush_check = Some(check);
+        self
     }
 }
 
 impl MailboxCascade for ColonMailboxCascade {
     fn flush_mailbox(&self, agent_id: &str) -> Result<(), LifecycleError> {
         let key = (self.resolver)(agent_id);
+        if self
+            .flush_check
+            .as_ref()
+            .is_some_and(|may_flush| !may_flush(agent_id, &key))
+        {
+            return Ok(());
+        }
         if let Some(mb) = self.store.get(&key) {
             mb.unfreeze();
             let mut budget = mb.depth().saturating_add(8);
@@ -903,7 +929,9 @@ impl MailboxCascade for ColonMailboxCascade {
 
 /// Compose the production `DefaultTerminateController` the agents family drives: real grant
 /// revoke, colon-aware mailbox flush, synchronous run cancel, containment-guarded Sub workspace
-/// removal, memory archiving, and (when the per-child manager exists) the serve-loop cascade.
+/// removal, memory archiving, and (when the per-child manager exists) the serve-loop cascade
+/// and the flush check that keeps the flush to the terminated agent's own mailbox.
+#[allow(clippy::too_many_arguments)]
 pub fn build_agent_terminate_controller(
     tree: AgentTreeStore,
     grant_store: Arc<GrantStore>,
@@ -912,11 +940,16 @@ pub fn build_agent_terminate_controller(
     workspace_root: PathBuf,
     resolver: MailboxKeyResolver,
     loop_cascade: Option<Arc<dyn LoopCascade>>,
+    flush_check: Option<MailboxFlushCheck>,
 ) -> DefaultTerminateController {
+    let mut mailboxes = ColonMailboxCascade::new(mailbox_store, resolver);
+    if let Some(check) = flush_check {
+        mailboxes = mailboxes.with_flush_check(check);
+    }
     let mut controller = DefaultTerminateController::new(
         tree,
         Arc::new(GrantRevokeCascade::new(grant_store)),
-        Arc::new(ColonMailboxCascade::new(mailbox_store, resolver)),
+        Arc::new(mailboxes),
         Arc::new(RunManagerCascade::new(run_manager)),
         Arc::new(FsWorkspaceCleanup::new(workspace_root)),
     )
@@ -1520,5 +1553,65 @@ post-processor:
             AgentId("root".into()),
             Arc::new(Cfg(std::sync::Arc::new(cfg))),
         )
+    }
+
+    /// The cascade's flush empties the key the agent resolves to only when the flush check
+    /// finds it the agent's own or no one's — asked with the agent's bare id and that key —
+    /// and without a check, always.
+    #[test]
+    fn a_flush_empties_only_what_the_check_finds_the_agents_own() {
+        let store = Arc::new(MailboxStore::new(
+            std::num::NonZeroUsize::new(8).expect("capacity"),
+        ));
+        let resolver: MailboxKeyResolver = Arc::new(|bare: &str| format!("agent:{bare}"));
+        let waiting = || store.get("agent:kid").map(|mailbox| mailbox.depth());
+        let deliver = || {
+            store
+                .get_or_create("agent:kid")
+                .expect("mailbox")
+                .deliver(Message {
+                    id: "for-kid".to_string(),
+                    kind: MessageKind::User,
+                    from: "user:test".to_string(),
+                    to: "agent:kid".to_string(),
+                    payload: b"hello".to_vec(),
+                    context: None,
+                    timestamp: std::time::SystemTime::now(),
+                    origin: None,
+                })
+                .expect("delivered");
+        };
+        deliver();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let elsewhere = {
+            let asked = asked.clone();
+            ColonMailboxCascade::new(store.clone(), resolver.clone()).with_flush_check(Arc::new(
+                move |bare: &str, key: &str| {
+                    asked
+                        .lock()
+                        .unwrap()
+                        .push((bare.to_string(), key.to_string()));
+                    false
+                },
+            ))
+        };
+        elsewhere.flush_mailbox("kid").expect("flushed");
+        assert_eq!(waiting(), Some(1), "another agent's: kept");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [("kid".to_string(), "agent:kid".to_string())]
+        );
+
+        ColonMailboxCascade::new(store.clone(), resolver.clone())
+            .with_flush_check(Arc::new(|_: &str, _: &str| true))
+            .flush_mailbox("kid")
+            .expect("flushed");
+        assert_eq!(waiting(), Some(0), "its own: emptied");
+
+        deliver();
+        ColonMailboxCascade::new(store.clone(), resolver)
+            .flush_mailbox("kid")
+            .expect("flushed");
+        assert_eq!(waiting(), Some(0), "no check: emptied");
     }
 }

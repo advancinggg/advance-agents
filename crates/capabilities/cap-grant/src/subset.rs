@@ -113,6 +113,19 @@ impl SubsetValidator for SubsetValidatorImpl {
             parse_tool_patterns(&child.params, "child")?;
         }
 
+        // `memory` is whole-capability only — an agent's memory is its own, there is nothing
+        // to narrow — so a `memory` child that names any param is refused whatever the parent
+        // holds: issued from a whole-capability parent it would otherwise make a grant that
+        // reads narrower than it is. (A restricted `memory` parent, which no projection
+        // produces, then covers nothing: a bare child would widen it, see below.)
+        if child.capability == "memory" && !child.params.is_empty() {
+            return Err(CapGrantError::SubsetViolation(
+                "memory is a whole-capability-only grant dimension; a memory grant carries no \
+                 params"
+                    .into(),
+            ));
+        }
+
         // Empty parent = whole-capability grant; any child params are subset.
         if parent.params.is_empty() {
             return Ok(());

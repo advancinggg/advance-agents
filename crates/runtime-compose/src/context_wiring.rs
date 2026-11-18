@@ -43,7 +43,7 @@
 //!   `StubSkillSummary` otherwise. So `# Available Skills` is no longer always
 //!   omitted in production.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -197,63 +197,225 @@ impl EmbeddingPort for StubEmbedding {
     }
 }
 
-/// Real `EmbeddingPort` wrapping cap-llm's `LlmGateway::embed` (`/v1/embeddings`).
+/// One agent's query embedder: the context-engine `EmbeddingPort` over
+/// [`LlmGateway::embed_for_agent`].
 ///
-/// **Live in production** when the gateway reports
-/// [`LlmGateway::has_embedding_provider`] (the daemon gates on it): the
-/// assembler embeds the prompt ONCE per turn (its memoizing wrapper) and
-/// shares the vector between the recall search, the L1 lookup and the task
-/// router. Without an embedding-capable provider the daemon keeps
-/// [`StubEmbedding`], so a config that cannot embed never pays a failing
-/// round-trip per turn. The SAME gateway backs [`GatewayMemoryEmbedder`] on the
-/// write side, so stored and query vectors come from one model.
+/// **Embedding follows chat.** The text is embedded ONLY by the provider this
+/// agent's chat requests are placed on — resolved on every call from the live
+/// provider config and the agent's live `llm:` policy, so a provider or policy
+/// change applies to the next turn without a restart. An agent whose chat
+/// provider serves no embeddings gets an error here WITHOUT any request being
+/// made; the assembler then runs the turn with no query vector (no recall, no
+/// routing call). The assembler embeds the prompt ONCE per turn (its memoizing
+/// wrapper) and shares the vector between the recall search, the L1 lookup and
+/// the task router. [`GatewayMemoryEmbedder`] is the write-side twin over the
+/// same route, so stored and query vectors come from one model.
 pub struct GatewayEmbedding {
     gateway: Arc<LlmGateway>,
+    /// The BARE cap agent id (the id the agent's `llm:` policy is keyed by).
+    agent_id: String,
+    /// The vectors this embedder returned most recently, each with the model
+    /// that produced it. See [`Self::query_model`].
+    produced: Arc<std::sync::Mutex<VecDeque<(Vec<f32>, String)>>>,
 }
+
+/// Query vectors a [`GatewayEmbedding`] remembers the model of. One assembly
+/// embeds its prompt once and reads the index right after, so the vector in
+/// hand is the newest; the rest is room for assemblies that overlap.
+const REMEMBERED_QUERY_VECTORS: usize = 8;
+
+/// Bit-for-bit equality of two vectors (`==` on floats would call two NaN
+/// payloads different and `0.0` / `-0.0` the same).
+fn same_vector(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
 impl GatewayEmbedding {
-    pub fn new(gateway: Arc<LlmGateway>) -> Self {
-        Self { gateway }
+    pub fn new(gateway: Arc<LlmGateway>, agent_id: &str) -> Self {
+        Self {
+            gateway,
+            agent_id: agent_id.to_string(),
+            produced: Arc::default(),
+        }
+    }
+
+    /// Which model produced a given query vector of this embedder.
+    ///
+    /// The route is resolved per call, so the model can differ from one call to
+    /// the next (a policy or provider change; an unpinned agent being served by
+    /// another entry). A reader that compares the query vector with stored
+    /// vectors must bind to the model of THAT vector — not to a later resolution
+    /// of the route, and not to whatever another call of this embedder returned
+    /// in between. So the answer is looked up by the vector itself: `None` for a
+    /// vector this embedder did not return (or no longer remembers), which a
+    /// reader must then compare with nothing.
+    pub fn query_model(&self) -> QueryVectorModel {
+        let produced = Arc::clone(&self.produced);
+        Arc::new(move |vector: &[f32]| {
+            produced
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .rev()
+                .find(|(known, _)| same_vector(known, vector))
+                .map(|(_, model)| model.clone())
+        })
     }
 }
 #[async_trait]
 impl EmbeddingPort for GatewayEmbedding {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, PortError> {
-        // `embed` is a `LlmGatewayInternal` trait method (CONTRACT-081), not an
-        // inherent method — the trait import above brings it into scope.
-        self.gateway
-            .embed(text)
-            .await
-            .map_err(|e| PortError(e.to_string()))
+        match self.gateway.embed_for_agent(&self.agent_id, text).await {
+            Ok(Some(embedded)) => {
+                let mut produced = self.produced.lock().unwrap_or_else(|p| p.into_inner());
+                // The same vector from another model replaces the older pairing.
+                produced.retain(|(known, _)| !same_vector(known, &embedded.vector));
+                if produced.len() == REMEMBERED_QUERY_VECTORS {
+                    produced.pop_front();
+                }
+                produced.push_back((embedded.vector.clone(), embedded.model));
+                Ok(embedded.vector)
+            }
+            Ok(None) => Err(PortError("no embedding route for this agent".to_string())),
+            Err(e) => Err(PortError(e.to_string())),
+        }
+    }
+}
+
+/// One agent's live embedding wiring for the production assembler: the query
+/// embedder plus the two model readings its consumers need.
+#[derive(Clone)]
+pub struct AgentEmbedding {
+    /// The query embedder ([`GatewayEmbedding`]).
+    pub port: Arc<dyn EmbeddingPort>,
+    /// The model that produced a query vector of `port` — what recall + task
+    /// routing bind stored vectors to ([`GatewayEmbedding::query_model`]).
+    pub query_model: QueryVectorModel,
+    /// The model the agent's route serves right now (`None` inside → no route):
+    /// the `# Runtime State` recall flag, re-read per assembly.
+    pub live_model: EmbeddingModelSource,
+}
+impl AgentEmbedding {
+    /// The wiring of `agent_id` (its BARE cap id) over the live gateway.
+    pub fn over_gateway(gateway: Arc<LlmGateway>, agent_id: &str) -> Self {
+        let port = GatewayEmbedding::new(Arc::clone(&gateway), agent_id);
+        Self {
+            query_model: port.query_model(),
+            live_model: embedding_model_source(gateway, agent_id),
+            port: Arc::new(port),
+        }
     }
 }
 
 /// The write-side twin of [`GatewayEmbedding`]: cap-memory's internal
-/// `Embedder` seam over the SAME `LlmGateway::embed`, installed into the live
+/// `Embedder` seam over the SAME per-agent route, installed into the live
 /// post-processor `Components` so `sync_turn_index` / `sync_task_index` store
-/// real semantic vectors (replacing the deterministic 8-dim `StubEmbedder`).
-/// Errors are mapped to a COARSE status string (the seam's redaction contract:
-/// never the upstream body / headers).
+/// real semantic vectors, each bound to the model that produced it.
+///
+/// With no embedding route (the agent's chat provider serves no embeddings)
+/// it answers an EMPTY vector and makes no request: the turn / task rows are
+/// still written, just without a vector. Errors are mapped to a COARSE status
+/// string (the seam's redaction contract: never the upstream body / headers).
+///
+/// Only an answer that is certainly about the text — the provider saying it is
+/// too long for the model — is reported as [`cap_memory::EmbedderError::Refused`],
+/// which cap-memory never asks about again under that model. Every other failure
+/// is `Upstream`: cap-memory then goes by whether the provider was answering a
+/// moment before (see `cap_memory::embedding_upkeep`), so a text a provider turns
+/// down in some other way is put off behind the other rows, not given up.
+///
+/// A catch-up request still unanswered when its pass runs out of time
+/// (`cap_memory::CATCH_UP_TIME`, retries included) is dropped where it stands: the
+/// HTTP request is cancelled, and — as for a cancelled preflight — its
+/// `llm.request` gets no closing `llm.response` or `llm.error`. Nothing is billed
+/// for an embedding either way.
 pub struct GatewayMemoryEmbedder {
     gateway: Arc<LlmGateway>,
+    /// The BARE cap agent id whose turns this post-processor indexes.
+    agent_id: String,
 }
 impl GatewayMemoryEmbedder {
-    pub fn new(gateway: Arc<LlmGateway>) -> Self {
-        Self { gateway }
+    pub fn new(gateway: Arc<LlmGateway>, agent_id: &str) -> Self {
+        Self {
+            gateway,
+            agent_id: agent_id.to_string(),
+        }
     }
 }
 #[async_trait]
 impl cap_memory::Embedder for GatewayMemoryEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, cap_memory::EmbedderError> {
-        self.gateway
-            .embed(text)
-            .await
-            .map_err(|e| cap_memory::EmbedderError::Upstream(e.variant_name().to_string()))
+        Ok(self.embed_recorded(text).await?.0)
+    }
+
+    async fn embed_recorded(
+        &self,
+        text: &str,
+    ) -> Result<(Vec<f32>, Option<String>), cap_memory::EmbedderError> {
+        match self.gateway.embed_for_agent(&self.agent_id, text).await {
+            Ok(Some(embedded)) => Ok((embedded.vector, Some(embedded.model))),
+            Ok(None) => Ok((Vec::new(), None)),
+            Err(e) => Err(memory_embedder_error(&e)),
+        }
+    }
+
+    fn current_model(&self) -> Option<String> {
+        live_embedding_model(&self.gateway, &self.agent_id)
     }
 }
 
-/// Rows scanned per recall read (most recent first by `updated_at`). Bounds the
-/// per-turn cosine pass over a long-lived agent's turn index.
-const MAX_INDEX_SCAN_ROWS: usize = 4096;
+/// What a failed embedding request of the gateway is to cap-memory: a refusal of
+/// the text when the provider said the text is too long, a failure of the request
+/// otherwise. The payload is the error's stable variant name, never its text.
+fn memory_embedder_error(error: &cap_llm::LlmError) -> cap_memory::EmbedderError {
+    let status = error.variant_name().to_string();
+    match error {
+        cap_llm::LlmError::ContextTooLong(_) => cap_memory::EmbedderError::Refused(status),
+        _ => cap_memory::EmbedderError::Upstream(status),
+    }
+}
+
+/// The embedding model `agent_id`'s vectors come from right now (`None` — the
+/// agent has no embedding route). Read from the live config + policy per call.
+pub fn live_embedding_model(gateway: &LlmGateway, agent_id: &str) -> Option<String> {
+    gateway
+        .embedding_route_for(agent_id)
+        .ok()
+        .map(|route| route.model)
+}
+
+/// A per-call answer to "which embedding model do this agent's query vectors
+/// come from right now?" (`None` — none). See [`live_embedding_model`].
+pub type EmbeddingModelSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// The [`EmbeddingModelSource`] of `agent_id` over the live gateway.
+pub fn embedding_model_source(gateway: Arc<LlmGateway>, agent_id: &str) -> EmbeddingModelSource {
+    let agent_id = agent_id.to_string();
+    Arc::new(move || live_embedding_model(&gateway, &agent_id))
+}
+
+/// Which embedding model produced a given query vector (`None` — not known).
+/// See [`GatewayEmbedding::query_model`].
+pub type QueryVectorModel = Arc<dyn Fn(&[f32]) -> Option<String> + Send + Sync>;
+
+/// Whether a stored vector may be compared with the query vector: only when both
+/// come from the SAME model. A row whose model is not recorded (written before
+/// vectors were bound to a model) is not comparable with a query of a known
+/// model — two models can share a dimension, and a cosine across them is noise
+/// that looks like a score. Only where NEITHER side names a model (an index read
+/// with no model binding, over rows of a harness embedder) does the comparison
+/// fall back to `cosine_similarity`'s dimension check alone.
+fn same_embedding_model(row_model: Option<&str>, query_model: Option<&str>) -> bool {
+    row_model == query_model
+}
+
+/// Rows a recall read looks at: the agent's most recent turn rows by
+/// `updated_at`, whatever model their vectors are of. Bounds the per-turn cosine
+/// pass over a long-lived agent's turn index. The post-processor keeps the
+/// vectors of exactly these rows in the model in use
+/// (`Components::heal_vectors` over `SqliteIndex::list_turns_not_of_model`), so
+/// the two share one number and one order.
+const MAX_INDEX_SCAN_ROWS: usize = cap_memory::RECENT_TURN_WINDOW;
 /// Recall hits rendered per kind + the similarity floor below which a hit is
 /// noise rather than context (cosine over real sentence embeddings).
 const RECALL_MAX_TURNS: usize = 5;
@@ -276,13 +438,39 @@ const RECALL_MIN_SIMILARITY: f32 = 0.3;
 ///
 /// Rows are read under the BARE `write_agent_id` (the id the post-processor
 /// writes under) whichever alias the assembler queries with; a query under an
-/// unknown id yields nothing. Rows embedded by a different model / dim than the
-/// query (e.g. legacy `StubEmbedder` rows) are skipped by `cosine_similarity`'s
-/// dim check — never ranked on a garbage score.
+/// unknown id yields nothing. A stored vector is compared with the query only
+/// when both come from the SAME embedding model (see
+/// [`Self::with_query_model`]): a row of another model, or of no recorded
+/// model, is skipped — never ranked on a garbage score — and a row of another
+/// dimension is skipped by `cosine_similarity`'s dim check.
 pub struct SqliteIndexRecall {
     index: Arc<dyn cap_memory::SqliteIndex + Send + Sync>,
     write_agent_id: String,
     query_aliases: Vec<String>,
+    /// Which model produced a query vector; `None` → no model binding (only
+    /// rows that record no model are compared, on dimension alone).
+    query_model: Option<QueryVectorModel>,
+}
+
+/// The model a search binds stored vectors to.
+enum QueryModel {
+    /// No binding installed: compare rows that record no model.
+    Unbound,
+    /// The model that produced the query vector.
+    Known(String),
+    /// A binding is installed and does not know this vector: compare nothing.
+    Unknown,
+}
+
+impl QueryModel {
+    /// What a comparable row's model must equal; `None` — compare nothing.
+    fn required_of_rows(&self) -> Option<Option<&str>> {
+        match self {
+            QueryModel::Unbound => Some(None),
+            QueryModel::Known(model) => Some(Some(model)),
+            QueryModel::Unknown => None,
+        }
+    }
 }
 
 impl SqliteIndexRecall {
@@ -295,27 +483,72 @@ impl SqliteIndexRecall {
             index,
             write_agent_id: write_agent_id.to_string(),
             query_aliases: query_aliases.to_vec(),
+            query_model: None,
         }
+    }
+
+    /// Bind stored vectors to the model the query vector comes from: a row
+    /// embedded by another model — or by one that was not recorded — is never
+    /// compared with the query, even when the two happen to share a dimension,
+    /// and a query vector the source does not know is compared with nothing.
+    /// Production always sets this (the agent's embedding model can change with
+    /// its chat provider).
+    pub fn with_query_model(mut self, source: QueryVectorModel) -> Self {
+        self.query_model = Some(source);
+        self
     }
 
     fn known(&self, agent_id: &str) -> bool {
         agent_id == self.write_agent_id || self.query_aliases.iter().any(|a| a == agent_id)
     }
 
-    /// Most recent `MAX_INDEX_SCAN_ROWS` turn rows (by `updated_at` desc).
-    fn recent_turns(&self) -> Vec<cap_memory::TurnIndexRow> {
-        let mut rows = self.index.list_turns_for_agent(&self.write_agent_id);
-        rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        rows.truncate(MAX_INDEX_SCAN_ROWS);
+    /// The model `query_embedding` comes from, read once per search.
+    fn query_model_of(&self, query_embedding: &[f32]) -> QueryModel {
+        match &self.query_model {
+            None => QueryModel::Unbound,
+            Some(source) => match source(query_embedding) {
+                Some(model) => QueryModel::Known(model),
+                None => QueryModel::Unknown,
+            },
+        }
+    }
+
+    /// Among the agent's `MAX_INDEX_SCAN_ROWS` most recent turn rows, those whose
+    /// vector may be compared with a query of `query_model`.
+    ///
+    /// The window is cut FIRST, by the index, over rows of every model and in the
+    /// order the catch-up lists them (`SqliteIndex::list_recent_turns`, the window of
+    /// `SqliteIndex::list_turns_not_of_model`), and only then narrowed to the
+    /// comparable rows. So the rows read are exactly the rows the catch-up keeps in
+    /// the model in use — cutting after the filter would reach back past the window
+    /// for rows that happen to be of the query's model — and no more of them are
+    /// read than the window.
+    fn recent_turns(&self, query_model: &QueryModel) -> Vec<cap_memory::TurnIndexRow> {
+        let Some(required) = query_model.required_of_rows() else {
+            return Vec::new();
+        };
+        let mut rows = self
+            .index
+            .list_recent_turns(&self.write_agent_id, MAX_INDEX_SCAN_ROWS);
+        rows.retain(|t| same_embedding_model(t.embedding_model.as_deref(), required));
         rows
     }
 
-    fn task_hits(&self, q: &[f32], include_default_partitions: bool) -> Vec<TaskHit> {
+    fn task_hits(
+        &self,
+        q: &[f32],
+        include_default_partitions: bool,
+        query_model: &QueryModel,
+    ) -> Vec<TaskHit> {
+        let Some(query_model) = query_model.required_of_rows() else {
+            return Vec::new();
+        };
         let mut hits: Vec<TaskHit> = self
             .index
             .list_tasks_for_agent(&self.write_agent_id)
             .into_iter()
             .filter(|t| include_default_partitions || !t.task_id.starts_with("_agent-"))
+            .filter(|t| same_embedding_model(t.brief_embedding_model.as_deref(), query_model))
             .filter_map(|t| {
                 let emb = t.brief_embedding.as_deref()?;
                 let sim = advance_context_engine::cosine_similarity(q, emb)?;
@@ -353,8 +586,9 @@ impl UnifiedSearchPort for SqliteIndexRecall {
         if !self.known(agent_id) || query_embedding.is_empty() {
             return Ok(UnifiedSearchResult::default());
         }
+        let query_model = self.query_model_of(query_embedding);
         let mut turns: Vec<TurnHit> = self
-            .recent_turns()
+            .recent_turns(&query_model)
             .into_iter()
             .filter_map(|t| {
                 let sim = advance_context_engine::cosine_similarity(query_embedding, &t.embedding)?;
@@ -379,7 +613,7 @@ impl UnifiedSearchPort for SqliteIndexRecall {
         });
         turns.truncate(RECALL_MAX_TURNS);
 
-        let mut tasks = self.task_hits(query_embedding, false);
+        let mut tasks = self.task_hits(query_embedding, false, &query_model);
         tasks.retain(|t| t.similarity >= RECALL_MIN_SIMILARITY);
         tasks.truncate(RECALL_MAX_TASKS);
 
@@ -403,7 +637,8 @@ impl TaskIndexPort for SqliteIndexRecall {
         if !self.known(agent_id) || query_embedding.is_empty() {
             return Ok(Vec::new());
         }
-        let mut hits = self.task_hits(query_embedding, false);
+        let query_model = self.query_model_of(query_embedding);
+        let mut hits = self.task_hits(query_embedding, false, &query_model);
         hits.truncate(n);
         Ok(hits)
     }
@@ -419,8 +654,9 @@ impl VectorIndexReader for SqliteIndexRecall {
         if !self.known(agent_id) || query_embedding.is_empty() {
             return Ok(Vec::new());
         }
+        let query_model = self.query_model_of(query_embedding);
         let mut hits: Vec<VectorHit> = self
-            .recent_turns()
+            .recent_turns(&query_model)
             .into_iter()
             .filter_map(|t| {
                 let score =
@@ -457,6 +693,22 @@ impl advance_context_engine::RetentionScorer for DatabaseRetentionScorer {
             has_decision: turn.has_decision,
         };
         advance_database::retention_score(&digest, chrono::DateTime::<chrono::Utc>::from(now))
+    }
+}
+
+/// Runtime facts for one agent whose `embedding_enabled` is read on EVERY
+/// assembly from the agent's live embedding route (it follows the agent's chat
+/// provider and can change without a restart); the rest is fixed at spawn.
+pub struct LiveRuntimeInfo {
+    pub view: RuntimeInfoView,
+    pub embedding_model: EmbeddingModelSource,
+}
+#[async_trait]
+impl RuntimeInfoReader for LiveRuntimeInfo {
+    async fn runtime_info(&self, _agent_id: &str) -> Option<RuntimeInfoView> {
+        let mut view = self.view.clone();
+        view.embedding_enabled = (self.embedding_model)().is_some();
+        Some(view)
     }
 }
 
@@ -497,13 +749,19 @@ impl LightLlmFallbackPort for StubLightLlm {
 /// Production residual tie-break: a short `chat()` that must return one of
 /// the candidate task ids. Chat errors / unparseable replies fall back to
 /// the first candidate so routing never aborts the turn.
+///
+/// The request carries the agent's query, so it is made as that agent
+/// ([`cap_llm::AgentGateway`]): on the entry its own turns chat with.
 pub struct GatewayLightLlm {
-    gateway: Arc<LlmGateway>,
+    gateway: cap_llm::AgentGateway,
 }
 
 impl GatewayLightLlm {
-    pub fn new(gateway: Arc<LlmGateway>) -> Self {
-        Self { gateway }
+    /// For `agent_id` (the BARE cap agent id).
+    pub fn new(gateway: &Arc<LlmGateway>, agent_id: &str) -> Self {
+        Self {
+            gateway: gateway.for_agent(agent_id),
+        }
     }
 }
 
@@ -1912,10 +2170,15 @@ pub struct ProductionAssemblerParts<'a> {
     pub pack_skills: Option<Arc<dyn SkillSummaryReader>>,
     /// `<workspace>/.agent` (AGENTS.md).
     pub identity_agent_root: Option<&'a Path>,
-    /// The LIVE query embedder ([`GatewayEmbedding`]) when the gateway has an
-    /// embedding-capable provider; `None` → [`StubEmbedding`] (no recall, no
-    /// routing call, no `/v1/embeddings` round-trip).
-    pub embedding: Option<Arc<dyn EmbeddingPort>>,
+    /// The agent's LIVE embedding wiring ([`AgentEmbedding::over_gateway`], set
+    /// whenever the daemon has an LLM gateway). Its embedder resolves the agent's
+    /// embedding route on every call — embedding follows the agent's chat
+    /// provider — so it is installed even when the agent has no route yet; recall
+    /// + task routing are bound to the model of each query vector, and the
+    /// `# Runtime State` recall flag is re-read per assembly. `None` →
+    /// [`StubEmbedding`] (no recall, no routing call, no `/v1/embeddings`
+    /// round-trip).
+    pub embedding: Option<AgentEmbedding>,
     /// The cap-memory SQLite index the live post-processor writes (turn + task
     /// embeddings). With `memory` + `embedding` it backs recall + task routing
     /// through [`SqliteIndexRecall`]; `None` → the empty-corpus ports.
@@ -1977,12 +2240,18 @@ pub fn build_context_assembler_for_agent_production(
         }),
         None => skill_summary,
     };
-    // The query embedder: live (`GatewayEmbedding`) only when the daemon says the
-    // provider can embed; otherwise the hermetic zero-vector stub.
+    // The query embedder: the agent's live `GatewayEmbedding` when the daemon
+    // wired one (it resolves the agent's embedding route per call, and answers an
+    // error without any request when the agent's chat provider cannot embed);
+    // otherwise the hermetic zero-vector stub.
     let embedding_live = embedding.is_some();
-    let embedding: Arc<dyn EmbeddingPort> = match embedding {
-        Some(e) => e,
-        None => Arc::new(StubEmbedding),
+    let (embedding, query_model, live_model): (Arc<dyn EmbeddingPort>, _, _) = match embedding {
+        Some(wiring) => (
+            wiring.port,
+            Some(wiring.query_model),
+            Some(wiring.live_model),
+        ),
+        None => (Arc::new(StubEmbedding), None, None),
     };
     let assembler = match memory {
         Some(store) => {
@@ -2017,11 +2286,16 @@ pub fn build_context_assembler_for_agent_production(
             let (unified_search, task_index): (Arc<dyn UnifiedSearchPort>, Arc<dyn TaskIndexPort>) =
                 match (&sqlite_index, embedding_live) {
                     (Some(idx), true) => {
-                        let recall = Arc::new(SqliteIndexRecall::new(
-                            idx.clone(),
-                            write_agent_id,
-                            query_aliases,
-                        ));
+                        let recall =
+                            SqliteIndexRecall::new(idx.clone(), write_agent_id, query_aliases);
+                        // Stored vectors are compared only with a query of the
+                        // SAME model (the agent's model follows its chat provider
+                        // and can change under a long-lived index): the model of
+                        // the query vector the embedder just returned.
+                        let recall = Arc::new(match query_model {
+                            Some(source) => recall.with_query_model(source),
+                            None => recall,
+                        });
                         (recall.clone(), recall)
                     }
                     _ => (
@@ -2079,7 +2353,13 @@ pub fn build_context_assembler_for_agent_production(
         ),
     };
     let assembler = match runtime_info {
-        Some(view) => assembler.with_runtime_info(Arc::new(StaticRuntimeInfo(view))),
+        Some(view) => match live_model {
+            Some(source) => assembler.with_runtime_info(Arc::new(LiveRuntimeInfo {
+                view,
+                embedding_model: source,
+            })),
+            None => assembler.with_runtime_info(Arc::new(StaticRuntimeInfo(view))),
+        },
         None => assembler,
     };
     let assembler = match report_sink {
@@ -2430,9 +2710,213 @@ mod tests {
             turn,
             digest: digest.into(),
             embedding: emb.to_vec(),
+            embedding_model: None,
             reference_count: 0,
             updated_at: at.into(),
         }
+    }
+
+    fn task_row(task: &str, brief: &str, emb: &[f32], model: Option<&str>) -> TaskIndexRow {
+        TaskIndexRow {
+            task_id: task.into(),
+            agent_id: "root".into(),
+            last_turn_at: "2026-06-15T00:00:00Z".into(),
+            turns_total: 1,
+            updated_at: "2026-06-15T00:00:00Z".into(),
+            brief_snapshot: brief.into(),
+            brief_embedding: Some(emb.to_vec()),
+            brief_embedding_model: model.map(str::to_string),
+        }
+    }
+
+    /// A stored vector is compared only with a query of the SAME embedding model.
+    /// Rows of another model never rank, even with the same dimension and
+    /// direction; neither do rows that record no model (written before vectors
+    /// carried one), nor anything when the model of the query vector is not
+    /// known. The model is the one that produced THAT query vector, so two
+    /// vectors of two models each read their own rows — whatever was embedded
+    /// in between.
+    #[tokio::test]
+    async fn sqlite_index_recall_compares_only_vectors_of_the_query_model() {
+        let idx = Arc::new(InMemorySqliteIndex::default());
+        let mut same = turn_row("t", 1, "same model", &[1.0, 0.0], "2026-06-16T00:00:01Z");
+        same.embedding_model = Some("embed-a".into());
+        let mut other = turn_row("t", 2, "other model", &[1.0, 0.0], "2026-06-16T00:00:02Z");
+        other.embedding_model = Some("embed-b".into());
+        let legacy = turn_row("t", 3, "no model", &[1.0, 0.0], "2026-06-16T00:00:03Z");
+        idx.upsert_turn(same);
+        idx.upsert_turn(other);
+        idx.upsert_turn(legacy);
+        idx.upsert_task(task_row("task-a", "brief a", &[1.0, 0.0], Some("embed-a")));
+        idx.upsert_task(task_row("task-b", "brief b", &[1.0, 0.0], Some("embed-b")));
+        idx.upsert_task(task_row("task-legacy", "brief l", &[1.0, 0.0], None));
+
+        // The query vector `[1, 0]` comes from embed-a, `[2, 0]` from embed-b (same
+        // direction: every row would score 1.0 if models were not told apart);
+        // `[3, 0]` is a vector the source does not know.
+        let source: QueryVectorModel = Arc::new(|vector: &[f32]| match vector {
+            [x, _] if *x == 1.0 => Some("embed-a".to_string()),
+            [x, _] if *x == 2.0 => Some("embed-b".to_string()),
+            _ => None,
+        });
+        let aliases = vec!["root".to_string()];
+        let recall = SqliteIndexRecall::new(idx.clone(), "root", &aliases).with_query_model(source);
+
+        let turn_ids = |res: &UnifiedSearchResult| {
+            let mut ids: Vec<String> = res.turns.iter().map(|t| t.id.clone()).collect();
+            ids.sort();
+            ids
+        };
+        let task_ids = |hits: &[TaskHit]| {
+            let mut ids: Vec<String> = hits.iter().map(|t| t.task_id.clone()).collect();
+            ids.sort();
+            ids
+        };
+
+        let res = recall.search("root", "q", &[1.0, 0.0]).await.unwrap();
+        assert_eq!(turn_ids(&res), vec!["t#turn-1"]);
+        assert_eq!(task_ids(&res.tasks), vec!["task-a"]);
+        let routed = recall
+            .top_n_by_similarity("root", &[1.0, 0.0], 5)
+            .await
+            .unwrap();
+        assert_eq!(task_ids(&routed), vec!["task-a"]);
+        let l1 = recall.lookup("root", &[1.0, 0.0]).await.unwrap();
+        let l1_ids: Vec<String> = l1.into_iter().map(|h| h.id).collect();
+        assert_eq!(l1_ids, vec!["t#turn-1"]);
+
+        // A query vector of the other model reads the other rows.
+        let res = recall.search("root", "q", &[2.0, 0.0]).await.unwrap();
+        assert_eq!(turn_ids(&res), vec!["t#turn-2"]);
+        assert_eq!(task_ids(&res.tasks), vec!["task-b"]);
+        // ... and the first one still reads its own (no shared "current model").
+        let res = recall.search("root", "q", &[1.0, 0.0]).await.unwrap();
+        assert_eq!(turn_ids(&res), vec!["t#turn-1"]);
+
+        // A vector of unknown model is compared with NOTHING — not with the rows
+        // of a known model, and not with the rows that record none.
+        let res = recall.search("root", "q", &[3.0, 0.0]).await.unwrap();
+        assert!(res.turns.is_empty() && res.tasks.is_empty(), "{res:?}");
+        assert!(recall
+            .top_n_by_similarity("root", &[3.0, 0.0], 5)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(recall.lookup("root", &[3.0, 0.0]).await.unwrap().is_empty());
+
+        // With no model binding at all (a harness index), only the rows that
+        // record no model are compared.
+        let unbound = SqliteIndexRecall::new(idx, "root", &aliases);
+        let res = unbound.search("root", "q", &[1.0, 0.0]).await.unwrap();
+        assert_eq!(turn_ids(&res), vec!["t#turn-3"]);
+        assert_eq!(task_ids(&res.tasks), vec!["task-legacy"]);
+    }
+
+    /// A recall read looks at the agent's most recent turn rows — the window the
+    /// post-processor keeps in the model in use — and no further back. A row older
+    /// than the window is not read even when it is the only row of the query's
+    /// model; and the window is the one `list_turns_not_of_model` cuts, row for row.
+    #[tokio::test]
+    async fn sqlite_index_recall_reads_the_window_the_catch_up_keeps_current() {
+        let idx = Arc::new(InMemorySqliteIndex::default());
+        let at = |second: usize| {
+            format!(
+                "2026-06-16T{:02}:{:02}:{:02}+00:00",
+                second / 3600,
+                second / 60 % 60,
+                second % 60
+            )
+        };
+        // The oldest rows: one of the query's model, and a perfect match; one of
+        // another model, which a catch-up that reached past the window would list.
+        let mut beyond = turn_row("old", 1, "beyond the window", &[1.0, 0.0], &at(0));
+        beyond.embedding_model = Some("embed-a".into());
+        idx.upsert_turn(beyond);
+        let mut stale_beyond = turn_row("old", 2, "stale beyond the window", &[1.0, 0.0], &at(0));
+        stale_beyond.embedding_model = Some("embed-b".into());
+        idx.upsert_turn(stale_beyond);
+        // Then a full window of rows of another model, and — as the most recent
+        // row but one — a row of the query's model.
+        for number in 1..=MAX_INDEX_SCAN_ROWS {
+            let mut row = turn_row("t", number as u32, "recent", &[1.0, 0.0], &at(number));
+            row.embedding_model = Some(
+                if number == MAX_INDEX_SCAN_ROWS - 1 {
+                    "embed-a"
+                } else {
+                    "embed-b"
+                }
+                .into(),
+            );
+            idx.upsert_turn(row);
+        }
+        let source: QueryVectorModel = Arc::new(|_: &[f32]| Some("embed-a".to_string()));
+        let aliases = vec!["root".to_string()];
+        let recall = SqliteIndexRecall::new(idx.clone(), "root", &aliases).with_query_model(source);
+
+        let res = recall.search("root", "q", &[1.0, 0.0]).await.unwrap();
+        let ids: Vec<&str> = res.turns.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![format!("t#turn-{}", MAX_INDEX_SCAN_ROWS - 1)],
+            "the row beyond the window is not read"
+        );
+
+        // The rows the catch-up would embed again for a query of `embed-a` are the
+        // rest of that same window: every row of it but the one read above — and not
+        // the row of another model beyond it.
+        let stale = idx
+            .list_turns_not_of_model("root", "embed-a", MAX_INDEX_SCAN_ROWS, usize::MAX)
+            .unwrap();
+        assert_eq!(stale.len(), MAX_INDEX_SCAN_ROWS - 1);
+        assert!(stale.iter().all(|row| row.task_id == "t"));
+        // The two read the same rows: the window the reader reads is the window the
+        // catch-up lists from.
+        let read: Vec<(String, u32)> = idx
+            .list_recent_turns("root", MAX_INDEX_SCAN_ROWS)
+            .into_iter()
+            .map(|row| (row.task_id, row.turn))
+            .collect();
+        assert_eq!(read.len(), MAX_INDEX_SCAN_ROWS);
+        assert!(read.iter().all(|(task, _)| task == "t"));
+    }
+
+    /// Only "the text is too long" is a refusal of the text; every other failure
+    /// of the gateway is a failed request. Neither carries the upstream's words.
+    #[test]
+    fn only_a_text_too_long_is_a_refusal_of_the_text() {
+        use cap_llm::LlmError;
+        let secret = "sk-secret body of the upstream".to_string();
+        let refused = memory_embedder_error(&LlmError::ContextTooLong(secret.clone()));
+        assert!(refused.is_about_the_text(), "{refused:?}");
+        assert_eq!(
+            refused.to_string(),
+            "the embedding service refused the text: context-too-long"
+        );
+        for failed in [
+            LlmError::RateLimited(secret.clone()),
+            LlmError::ProviderError(secret.clone()),
+            LlmError::ModelNotAvailable(secret.clone()),
+            LlmError::BudgetExceeded(secret.clone()),
+        ] {
+            let mapped = memory_embedder_error(&failed);
+            assert!(!mapped.is_about_the_text(), "{mapped:?}");
+            assert!(!mapped.to_string().contains("sk-secret"), "{mapped:?}");
+            assert!(
+                mapped.to_string().ends_with(failed.variant_name()),
+                "{mapped:?}"
+            );
+        }
+    }
+
+    /// Vectors are told apart bit for bit.
+    #[test]
+    fn same_vector_is_bit_for_bit() {
+        assert!(same_vector(&[1.0, -2.5], &[1.0, -2.5]));
+        assert!(!same_vector(&[1.0, -2.5], &[1.0, -2.5, 0.0]));
+        assert!(!same_vector(&[1.0], &[1.000_000_1]));
+        assert!(!same_vector(&[0.0], &[-0.0]), "distinct bit patterns");
+        assert!(same_vector(&[f32::NAN], &[f32::NAN]), "same bit pattern");
+        assert!(same_vector(&[], &[]));
     }
 
     /// `SqliteIndexRecall` ranks the turn / task rows the post-processor wrote by
@@ -2478,6 +2962,7 @@ mod tests {
             updated_at: "2026-06-16T00:00:03Z".into(),
             brief_snapshot: "default partition brief".into(),
             brief_embedding: Some(vec![1.0, 0.0]),
+            brief_embedding_model: None,
         });
         idx.upsert_task(TaskIndexRow {
             task_id: "deploy-task".into(),
@@ -2487,6 +2972,7 @@ mod tests {
             updated_at: "2026-06-15T00:00:00Z".into(),
             brief_snapshot: "ship the deploy pipeline".into(),
             brief_embedding: Some(vec![0.8, 0.2]),
+            brief_embedding_model: None,
         });
         let aliases = vec!["root".to_string(), "agent:root".to_string()];
         let recall = SqliteIndexRecall::new(idx, "root", &aliases);

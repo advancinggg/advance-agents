@@ -25,6 +25,7 @@
 pub mod clock;
 pub mod cooldown;
 pub mod embedder;
+pub mod embedding_upkeep;
 pub mod events;
 pub mod extractor;
 pub mod host_fn;
@@ -48,6 +49,9 @@ pub mod wit_impl;
 pub use clock::{clock_now_rfc3339_z, Clock, MutableClock, SystemClock};
 pub use cooldown::{FailureCooldown, DEFAULT_COOLDOWN_SECS};
 pub use embedder::{Embedder, EmbedderError, StubEmbedder, STUB_EMBEDDING_DIM};
+pub use embedding_upkeep::{
+    EmbeddingUpkeep, Standing, VectorRow, CATCH_UP_TIME, EMBEDDING_REST, VECTORS_PER_TURN_END,
+};
 pub use events::{
     l6_completed_event, l6_consolidation_due_event, memory_forget_event, memory_recall_at_event,
     memory_recall_event, memory_remember_event, memory_rollback_event, noop_bus, preview,
@@ -87,8 +91,8 @@ pub use persistence::{
     MAX_LINE_BYTES,
 };
 pub use post_processor::{
-    default_task_partition, Components, DescriptionIndexer, IndexedDescription, L6Dispatch,
-    PostProcessor,
+    default_task_partition, CatchUpError, Components, DescriptionIndexer, IndexedDescription,
+    L6Dispatch, PostProcessor,
 };
 pub use reconcile::{
     InMemorySimilarityIndex, MemoryAction, Reconciler, SimilarityIndex, DEFAULT_THRESHOLD,
@@ -100,8 +104,8 @@ pub use skill_candidate::{
     SkillCandidateStore, SKILL_CANDIDATES_FILENAME,
 };
 pub use sqlite_index::{
-    InMemorySqliteIndex, MemoryIndexRow, SqliteIndex, TaskIndexRow, TurnIndexRow,
-    MAX_INDEX_ROWS_PER_TABLE,
+    InMemorySqliteIndex, IndexUnavailable, MemoryIndexRow, SqliteIndex, TaskIndexRow, TurnIndexRow,
+    MAX_INDEX_ROWS_PER_TABLE, RECENT_TURN_WINDOW,
 };
 pub use sqlite_index_rusqlite::{RusqliteSqliteIndex, SqliteIndexError};
 pub use store::{

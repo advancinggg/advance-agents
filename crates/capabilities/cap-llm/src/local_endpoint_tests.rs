@@ -8,7 +8,9 @@ use advance_shared_types::inference::InferenceBackendRegistry;
 use cap_http::DefaultLocalInferenceTransport;
 
 use crate::backend_local::{spawn_inprocess_fixture, SidecarClient, StaticHandoffSupervisor};
-use crate::gateway::{ChatMessage, ChatParams, ChatRole, LlmGateway};
+use crate::gateway::{
+    ChatMessage, ChatParams, ChatRole, EmbeddingIncapable, EmbeddingUnavailable, LlmGateway,
+};
 use crate::test_support::{
     fixture_runtime_config, no_op_repetition_guard, MockEventBusEmit, MockHttpSecurityChain,
     MockRunBudget, MockRuntimeConfigProvider,
@@ -259,29 +261,81 @@ async fn t131_local_embed_uses_configured_model() {
     registry.insert("local", Arc::new(client));
     let mut cfg = fixture_runtime_config();
     cfg.llm_providers = vec![local_cfg()];
+    let chain = Arc::new(MockHttpSecurityChain::default());
     let gw = LlmGateway::new(
         Arc::new(MockRuntimeConfigProvider::new(cfg)),
-        Arc::new(MockHttpSecurityChain::default()),
+        chain.clone(),
         Arc::new(MockRunBudget::default()),
         Arc::new(MockEventBusEmit::default()),
         no_op_repetition_guard(),
         "test-agent".into(),
     )
     .with_inference_backends(registry);
-    let (vec, model) = gw.embed_recorded("hello").await.expect("embed");
-    assert_eq!(model, "nomic-embed");
-    assert_eq!(vec.len(), 2);
+    let embedded = gw
+        .embed_for_agent("test-agent", "hello")
+        .await
+        .expect("embed")
+        .expect("the local entry is the agent's chat provider and names a model");
+    assert_eq!(embedded.model, "nomic-embed");
+    assert_eq!(embedded.provider_id, "local");
+    assert_eq!(embedded.vector.len(), 2);
+    assert!(
+        chain.call_log.lock().unwrap().is_empty(),
+        "a local embedding never uses the cloud HTTP chain"
+    );
 }
 
-#[test]
-fn t131_local_without_embedding_model_is_skipped() {
+/// An agent that chats with a local entry naming no `embedding-model` has no embedding at
+/// all. Its text is NOT handed to the cloud entries configured after it: what is typed to a
+/// local model never leaves the device for an embedding.
+#[tokio::test]
+async fn t131_local_without_embedding_model_never_falls_back_to_a_cloud_entry() {
     let mut local = local_cfg();
     local.embedding_model = None;
     let mut cfg = fixture_runtime_config();
     let mut providers = vec![local];
-    providers.append(&mut cfg.llm_providers);
-    let resolved = crate::gateway::select_embedding_provider(&providers).expect("cloud embed");
-    assert_ne!(resolved.id, "local");
+    providers.append(&mut cfg.llm_providers); // [local, openai, anthropic]
+    cfg.llm_providers = providers;
+    let chain = Arc::new(MockHttpSecurityChain::default());
+    let bus = Arc::new(MockEventBusEmit::default());
+    let gw = LlmGateway::new(
+        Arc::new(MockRuntimeConfigProvider::new(cfg)),
+        chain.clone(),
+        Arc::new(MockRunBudget::default()),
+        bus.clone(),
+        no_op_repetition_guard(),
+        "test-agent".into(),
+    );
+    // Three entries are admitted and none has served the agent: nothing to follow yet.
+    assert_eq!(
+        gw.embedding_route_for("test-agent"),
+        Err(EmbeddingUnavailable::ChatProviderUnknown)
+    );
+    assert_eq!(
+        gw.embed_for_agent("test-agent", "private text").await,
+        Ok(None)
+    );
+    // The agent chats with the local entry.
+    gw.test_agent_chats_on("test-agent", "local");
+    assert_eq!(
+        gw.embedding_route_for("test-agent"),
+        Err(EmbeddingUnavailable::ProviderCannotEmbed {
+            provider_id: "local".into(),
+            reason: EmbeddingIncapable::NoEmbeddingModel,
+        })
+    );
+    assert_eq!(
+        gw.embed_for_agent("test-agent", "private text").await,
+        Ok(None)
+    );
+    assert!(
+        chain.call_log.lock().unwrap().is_empty(),
+        "the OpenAI entry the agent does not chat with must receive nothing"
+    );
+    assert!(
+        bus.snapshot().is_empty(),
+        "no llm.* event without a request"
+    );
 }
 
 #[tokio::test]

@@ -117,7 +117,8 @@ pub use credential::{CredentialFailure, ProviderCredentialSource};
 pub use error::{FailureClassNote, LlmError, SUBSCRIPTION_USAGE_LIMIT_CLASS};
 pub use events::{LLM_ERROR, LLM_REQUEST, LLM_RESPONSE, LLM_RETRY};
 pub use gateway::{
-    ChatDelta, ChatMessage, ChatParams, ChatResponse, ChatRole, LlmGateway, LlmGatewayInternal,
+    AgentGateway, ChatDelta, ChatMessage, ChatParams, ChatResponse, ChatRole, Embedded,
+    EmbeddingIncapable, EmbeddingRoute, EmbeddingUnavailable, LlmGateway, LlmGatewayInternal,
     LocalSidecarBinder, ToolCall, ToolDefinition, TranscriptMode,
 };
 pub use host_fn::{

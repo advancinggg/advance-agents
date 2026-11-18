@@ -127,6 +127,11 @@ pub mod log_keys {
     pub const PERCHILD_INVALID_COMPONENT_ID: &str = "perchild.invalid_component_id";
     /// stderr: a child is not served (its id collides with an existing agent).
     pub const PERCHILD_COLON_COLLISION: &str = "perchild.colon_collision";
+    /// stderr: the memory-index rows of a terminated child were not removed.
+    pub const PERCHILD_FORGET_FAILED: &str = "perchild.forget_failed";
+    /// stderr: a child is not served (terminated, or its id taken by another child, before
+    /// its serve began).
+    pub const PERCHILD_STALE_SERVE: &str = "perchild.stale_serve";
     /// stderr: an MCP server file or secret-ref could not serve.
     pub const MCP_WARN: &str = "mcp.warn";
     /// stderr: listing tools of an MCP server failed during warm-up.
@@ -316,6 +321,8 @@ pub mod log_keys {
         PERCHILD_LOAD_FAILED,
         PERCHILD_INVALID_COMPONENT_ID,
         PERCHILD_COLON_COLLISION,
+        PERCHILD_FORGET_FAILED,
+        PERCHILD_STALE_SERVE,
         MCP_WARN,
         MCP_LISTING_FAILED,
         MCP_STALE_FILE_REMOVED,

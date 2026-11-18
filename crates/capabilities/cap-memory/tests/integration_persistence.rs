@@ -261,6 +261,7 @@ fn turn_row(agent: &str, task: &str, t: u32) -> TurnIndexRow {
         turn: t,
         digest: format!("d-{t}"),
         embedding: vec![0.25_f32, -0.5, 1.0, 2.0, -3.0, 0.0, 4.5, 9.0],
+        embedding_model: Some("embed-model-a".into()),
         reference_count: 2,
         updated_at: "2026-06-06T00:00:00Z".into(),
     }
@@ -275,6 +276,7 @@ fn task_row(task: &str, agent: &str) -> TaskIndexRow {
         updated_at: "2026-06-06T00:00:00Z".into(),
         brief_snapshot: "brief".into(),
         brief_embedding: Some(vec![1.0_f32, 2.0]),
+        brief_embedding_model: Some("embed-model-a".into()),
     }
 }
 
@@ -303,7 +305,10 @@ fn t46_rusqlite_durable_across_reopen() {
         ix2.get_turn("agent:r", "task-1", 3),
         Some(turn_row("agent:r", "task-1", 3))
     );
-    assert_eq!(ix2.get_task("task-9"), Some(task_row("task-9", "agent:r")));
+    assert_eq!(
+        ix2.get_task("agent:r", "task-9"),
+        Some(task_row("task-9", "agent:r"))
+    );
     assert_eq!(
         ix2.get_memory("agent:r", "m-1"),
         Some(mem_row("agent:r", "m-1", "contested"))
@@ -332,7 +337,7 @@ fn t47_rusqlite_parity_with_in_memory() {
         assert_eq!(ix.list_turns_for_agent("agent:s").len(), 1);
         // missing → None.
         assert_eq!(ix.get_turn("agent:r", "task-1", 999), None);
-        assert_eq!(ix.get_task("absent"), None);
+        assert_eq!(ix.get_task("agent:r", "absent"), None);
         assert_eq!(ix.get_memory("agent:r", "absent"), None);
     }
 }

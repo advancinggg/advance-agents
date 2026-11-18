@@ -598,6 +598,7 @@ async fn l6_i_10_post_processor_step9_emit() {
         // that keep `Components`'s public-field contract intact.
         sqlite_index: Arc::new(cap_memory::InMemorySqliteIndex::default()),
         embedder: Arc::new(cap_memory::StubEmbedder),
+        embedding_upkeep: Arc::default(),
         // Slice G (m011-slice-g): L6 cursor store seam default — this test
         // does not dispatch WIT rollback-memory, so this field is a passive
         // placeholder keeping the public-field contract intact. The

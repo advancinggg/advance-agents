@@ -2724,9 +2724,10 @@ impl SystemUnderTestBuilder {
                 self.agent_id.clone(),
             )
             .await;
-            // Concrete-clone-then-unsize idiom (mirrors build_harness_live_post_processor):
-            // Arc<LlmGateway> coerces to the bare dyn trait object at a typed binding.
-            let gw: Arc<dyn cap_llm::LlmGatewayInternal + Send + Sync> = lp.gateway.clone();
+            // As production does (`build_live_post_processor`): the classification is
+            // asked as the agent it is for, on the entry that agent chats on.
+            let gw: Arc<dyn cap_llm::LlmGatewayInternal + Send + Sync> =
+                Arc::new(lp.gateway.for_agent(&self.agent_id));
             let classifier: Arc<dyn cap_memory::l6::L6Classifier + Send + Sync> =
                 Arc::new(advance_cli::l6_classifier::LlmL6Classifier::new(gw, None));
             (Some(lp), Some(classifier))
@@ -4121,13 +4122,25 @@ impl cap_llm::VlmExtractor for HarnessVlm {
 // ---------------------------------------------------------------------------
 
 /// Build the components-backed [`PostProcessor`] the `.with_live_memory()` axis
-/// installs — a faithful TEST-ONLY replica of production `build_live_post_processor`
+/// installs — a TEST-ONLY replica of production `build_live_post_processor`
 /// (cli `start.rs`) assembled from PUBLIC cap-memory blocks (zero product source
-/// change). Differs from production ONLY in that it roots Step-7 writeback + the
-/// durable index at the harness's resolved `memory_dir` directly (which may be a
-/// caller `.with_memory_dir()` override, not `<ws>/.agent/memory`), so the assembler
-/// read-root, the shared [`MemoryStore`] root, and the post-processor write-root all
-/// coincide. `write_agent_id` is the harness colon agent id (= the assembler's sole
+/// change). It differs from production in two ways:
+///
+/// - It roots Step-7 writeback + the durable index at the harness's resolved
+///   `memory_dir` directly (which may be a caller `.with_memory_dir()` override, not
+///   `<ws>/.agent/memory`), so the assembler read-root, the shared [`MemoryStore`]
+///   root, and the post-processor write-root all coincide.
+/// - It installs NO embedder. Production embeds a turn digest and a task brief on
+///   the agent's own chat provider (`GatewayMemoryEmbedder`) and records the model of
+///   each vector; here the rows carry cap-memory's stub vector with no model recorded,
+///   and no embedding request is made. (The loopback does answer `/v1/embeddings`, and
+///   its entry names an embedding model — but with one fixed vector for every text,
+///   which would bind every row to that model without telling one text from
+///   another.) So nothing in this harness witnesses where an embedding goes or which
+///   stored vectors a query may be compared with — the production composition tests do
+///   (`runtime-compose/tests/context_engine_home.rs`).
+///
+/// `write_agent_id` is the harness colon agent id (= the assembler's sole
 /// query alias), so the knowledge/index bucket aligns with the read side.
 #[allow(clippy::too_many_arguments)]
 fn build_harness_live_post_processor(
@@ -4163,10 +4176,10 @@ fn build_harness_live_post_processor(
     // MODULE-002-blob-backed `ResolverStalenessProbe`. False ⇒ the byte-identical empty-stub shim.
     with_real_l6_probe: bool,
 ) -> Arc<dyn advance_shared_types::memory::PostProcessorHook> {
-    // Concrete→trait coercion idiom (mirrors start.rs): clone to the concrete Arc
-    // first so T infers as LlmGateway, then let the typed binding unsize to dyn.
-    let gw_concrete = Arc::clone(gateway);
-    let gw: Arc<dyn cap_llm::LlmGatewayInternal + Send + Sync> = gw_concrete;
+    // As production does (`build_live_post_processor`): every model call the turn-end
+    // pipeline makes is made as the agent it is for, on the entry that agent chats on.
+    let agent_gateway = Arc::new(gateway.for_agent(write_agent_id));
+    let gw: Arc<dyn cap_llm::LlmGatewayInternal + Send + Sync> = agent_gateway.clone();
     let extractor: Arc<dyn BatchExtractor + Send + Sync> = Arc::new(
         advance_cli::memory_extractor::LlmBatchExtractor::new(gw, None),
     );
@@ -4211,10 +4224,9 @@ fn build_harness_live_post_processor(
     // (CONTRACT-081 text path); the image/pdf leg uses the harness `vlm`. Done BEFORE the
     // L6 block, which consumes `workspace_root`.
     if with_vlm_indexer {
-        // Concrete-clone-then-unsize idiom (mirrors gw above): VlmDescriptionIndexer::new
-        // wants a bare `Arc<dyn LlmGatewayInternal>`.
-        let gw_vlm_concrete = Arc::clone(gateway);
-        let gw_vlm: Arc<dyn cap_llm::LlmGatewayInternal> = gw_vlm_concrete;
+        // `VlmDescriptionIndexer::new` wants a bare `Arc<dyn LlmGatewayInternal>`; it
+        // gets the agent's handle, as the extractor above.
+        let gw_vlm: Arc<dyn cap_llm::LlmGatewayInternal> = agent_gateway.clone();
         components = components.with_description_indexer(Arc::new(
             advance_cli::vlm_indexer::VlmDescriptionIndexer::new(
                 gw_vlm,

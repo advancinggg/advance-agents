@@ -28,8 +28,8 @@ use crate::agent_loop::PublishingContextAssembler;
 use crate::api::log_keys;
 use crate::callables::CatalogHostFnInventory;
 use crate::compose_log::LogHandle;
-use crate::context_inspect::{ContextSnapshotStore, EmbeddingPosture};
-use crate::context_wiring::{GatewayEmbedding, GatewayLightLlm, PackSkillSummaryReader};
+use crate::context_inspect::ContextSnapshotStore;
+use crate::context_wiring::{AgentEmbedding, GatewayLightLlm, PackSkillSummaryReader};
 
 /// Shared production deps late-bound onto [`crate::perchild_daemon::PerChildLoopManager`]
 /// after the LLM gateway exists and before any child loop is served.
@@ -52,7 +52,6 @@ pub struct ChildContextDeps {
     pub meta_maintainer: Option<Arc<MetaMaintainer>>,
     pub host_registry: Arc<dyn HostRegistry>,
     pub callable_registry: Arc<dyn CallableRegistry>,
-    pub embedding_posture: EmbeddingPosture,
     pub assembler_model: String,
     pub llm_provider: Option<String>,
     pub runtime_version: String,
@@ -92,8 +91,10 @@ pub fn attach_child_context(
     );
     driver = driver.with_post_processor(post_processor);
 
-    deps.context_store
-        .register_aliases(&[cap_agent_id.to_string(), msg_agent_id.to_string()]);
+    // The alias group `{cap_agent_id, msg_agent_id}` of the context store is registered
+    // by the serve once the child's loop is retained (`PerChildLoopManager`), so a child
+    // that is never served — refused, or terminated while it was being served — leaves
+    // none behind.
 
     let agent_tree: Arc<dyn AgentTreeSnapshot> = match deps.agent_tree.clone() {
         Some(t) => t,
@@ -143,12 +144,9 @@ pub fn attach_child_context(
         .is_some()
         .then(|| workspace.join(".agent").join("memory"));
     let child_skills_root = has_cap(declared_caps, "skills").then(|| workspace.join(".agent"));
-    let embedding_live = deps.embedding_posture.active;
-    let embedding: Option<Arc<dyn advance_context_engine::EmbeddingPort>> =
-        embedding_live.then(|| {
-            Arc::new(GatewayEmbedding::new(deps.gateway.clone()))
-                as Arc<dyn advance_context_engine::EmbeddingPort>
-        });
+    // Embedding follows THIS child's chat provider (its own `llm:` policy),
+    // resolved per call — not the root's posture at daemon start.
+    let embedding = AgentEmbedding::over_gateway(deps.gateway.clone(), cap_agent_id);
 
     let runtime_info = advance_context_engine::RuntimeInfoView {
         runtime_version: deps.runtime_version.clone(),
@@ -161,7 +159,8 @@ pub fn attach_child_context(
         llm_model: (!deps.assembler_model.is_empty()).then(|| deps.assembler_model.clone()),
         memory_enabled: child_memory.is_some(),
         skills_enabled: child_skills_root.is_some(),
-        embedding_enabled: embedding_live,
+        // Re-read per assembly by the builder's live runtime-info reader.
+        embedding_enabled: (embedding.live_model)().is_some(),
     };
 
     let sqlite_index = child_index.or_else(|| deps.memory_index.clone());
@@ -189,11 +188,11 @@ pub fn attach_child_context(
                         as Arc<dyn advance_context_engine::ports::SkillSummaryReader>
                 }),
             identity_agent_root: Some(&identity_root),
-            embedding,
+            embedding: Some(embedding),
             sqlite_index,
             runtime_info: Some(runtime_info),
             report_sink: Some(deps.context_store.clone()),
-            light_llm: Some(Arc::new(GatewayLightLlm::new(deps.gateway.clone()))),
+            light_llm: Some(Arc::new(GatewayLightLlm::new(&deps.gateway, cap_agent_id))),
             native_tools: Some(Arc::new(crate::context_wiring::GatewayNativeTools::new(
                 deps.gateway.clone(),
             ))),

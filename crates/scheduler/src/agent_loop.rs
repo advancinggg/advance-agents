@@ -634,11 +634,19 @@ impl AgentLoopDriverImpl {
                     );
                     return (action_result.new_state, ended(TurnOutcome::Failed));
                 }
-                // Step 7: post-process (happy path). Error swallowed via `let _`.
-                let _ = self
+                // Step 7: post-process (happy path). A failure here never fails the
+                // turn — its reply is already dispatched — but it is logged: this is
+                // the one place a failed turn-end step (a memory write, an embedding
+                // request) is reported.
+                if let Err(e) = self
                     .post_processor
                     .run(agent_id, &msg, &action_result)
-                    .await;
+                    .await
+                {
+                    eprintln!(
+                        "AgentLoopDriverImpl::run_turn_once: post-process failed for agent_id={agent_id:?}: {e:?}"
+                    );
+                }
                 if let Some(active) = protected_turn.as_mut() {
                     if let Err(error) = active.finish_drained().await {
                         eprintln!(

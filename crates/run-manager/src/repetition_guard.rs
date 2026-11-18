@@ -14,7 +14,7 @@
 //! per_agent write lock.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 use advance_shared_types::event::Event;
 use advance_shared_types::repetition::{OutputHash, RepetitionDecision, ToolCallSignature};
@@ -66,7 +66,7 @@ pub struct RepetitionGuard {
     /// Set EITHER at construction (`with_context_assembler`) OR post-construction
     /// (`set_context_assembler`). `RepetitionGuard` is never `Clone`d (always
     /// `Arc::new`), so `OnceLock`-not-`Clone` is safe.
-    context_assembler: OnceLock<Arc<dyn ContextAssembler>>,
+    context_assembler: OnceLock<AssemblerSink>,
     prompt_injection_helpers: Option<Arc<dyn PromptInjectionHelpers>>,
     event_bus: Option<Arc<dyn EventBusEmit>>,
     run_resolver: Option<Arc<dyn AgentRunResolver>>,
@@ -75,6 +75,29 @@ pub struct RepetitionGuard {
     /// AC-13's `RepetitionGuardConfig.enabled=Some(false)` configuration.
     /// Defaults to `true` (Slice A/B behavior preserved).
     enabled: bool,
+}
+
+/// How the guard holds its inject sink.
+enum AssemblerSink {
+    /// Given at construction ([`RepetitionGuard::with_context_assembler`]): the guard
+    /// owns it.
+    Owned(Arc<dyn ContextAssembler>),
+    /// Bound after construction ([`RepetitionGuard::set_context_assembler`]): the
+    /// assembler belongs to its agent's loop and the guard is not an owner. In a
+    /// composition the assembler holds the LLM gateway, the gateway holds the callable
+    /// dispatcher and the dispatcher holds this guard, so an owning handle here would
+    /// keep all of them alive after every owner of the composition has let go.
+    Bound(Weak<dyn ContextAssembler>),
+}
+
+impl AssemblerSink {
+    /// The sink, while it is alive.
+    fn get(&self) -> Option<Arc<dyn ContextAssembler>> {
+        match self {
+            AssemblerSink::Owned(assembler) => Some(Arc::clone(assembler)),
+            AssemblerSink::Bound(assembler) => assembler.upgrade(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -128,7 +151,7 @@ impl RepetitionGuard {
     /// `OnceLock` cell on a fresh guard (the only existing callers set it once);
     /// a second set is a no-op (the cell keeps its first value).
     pub fn with_context_assembler(self, ca: Arc<dyn ContextAssembler>) -> Self {
-        let _ = self.context_assembler.set(ca);
+        let _ = self.context_assembler.set(AssemblerSink::Owned(ca));
         self
     }
 
@@ -139,8 +162,13 @@ impl RepetitionGuard {
     /// the per-agent assembler is built (`try_spawn_agent_loop`). Returns `true`
     /// if this call set the cell, `false` if it was already set (idempotent —
     /// the single-agent daemon sets it exactly once).
+    ///
+    /// The guard does not keep `ca` alive: whoever binds it (the agent's loop) owns
+    /// it, and once that owner lets go the guard injects nothing.
     pub fn set_context_assembler(&self, ca: Arc<dyn ContextAssembler>) -> bool {
-        self.context_assembler.set(ca).is_ok()
+        self.context_assembler
+            .set(AssemblerSink::Bound(Arc::downgrade(&ca)))
+            .is_ok()
     }
 
     /// Slice B builder — wires the `PromptInjectionHelpers` sanitization
@@ -209,7 +237,7 @@ impl RepetitionGuard {
                     // re-entrancy deadlock if a misbehaving ContextAssembler
                     // impl re-enters the guard.
                     match (
-                        self.context_assembler.get(),
+                        self.context_assembler.get().and_then(AssemblerSink::get),
                         self.prompt_injection_helpers.as_ref(),
                     ) {
                         (Some(ca), Some(pih)) => {
@@ -232,7 +260,7 @@ impl RepetitionGuard {
                                     TrustLevel::Untrusted,
                                 );
                                 inject_directive = Some(InjectDirective {
-                                    assembler: Arc::clone(ca),
+                                    assembler: ca,
                                     agent_id: agent_id.to_string(),
                                     wrapped_msg: wrapped,
                                 });

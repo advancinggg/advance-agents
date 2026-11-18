@@ -369,3 +369,77 @@ fn t_se_09_fail_closed_unrecognized_parent_key() {
         "expected SubsetViolation, got {err:?}"
     );
 }
+
+// =============================================================================
+// T-SE-10..T-SE-12 — `memory`: a Child's capability (held exactly when the
+//   parent holds it), never a Sub's (a Sub persists no memory).
+// =============================================================================
+fn spawn_child_with(
+    spawner: &DefaultSpawner,
+    capabilities: Vec<Capability>,
+) -> Result<AgentId, SpawnError> {
+    spawner.spawn_child(SpawnChildConfig {
+        handle: None,
+        parent_id: AgentId("root".to_string()),
+        child_id: AgentId("foo".to_string()),
+        child_workspace_path: PathBuf::from("agents/foo"),
+        capabilities,
+        template_ref: None,
+        binary: None,
+    })
+}
+
+#[test]
+fn t_se_10_spawn_child_holds_memory_when_its_parent_does() {
+    let parent_caps = vec![cap("fs", json!({})), cap("memory", json!({}))];
+    let (_tmp, tree, spawner) = setup_with_parent_caps(parent_caps);
+    let child = spawn_child_with(&spawner, vec![cap("memory", json!({}))])
+        .expect("a child may hold `memory` when its parent does");
+    let node = tree.get_node(&child).expect("the child node");
+    assert_eq!(
+        node.capabilities
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        ["memory"]
+    );
+}
+
+#[test]
+fn t_se_11_spawn_child_gets_no_memory_its_parent_lacks() {
+    let parent_caps = vec![cap("fs", json!({}))];
+    let (_tmp, tree, spawner) = setup_with_parent_caps(parent_caps);
+    let err = spawn_child_with(&spawner, vec![cap("memory", json!({}))])
+        .expect_err("`memory` is not the parent's to pass down");
+    assert!(
+        matches!(err, SpawnError::SubsetViolation(_)),
+        "expected SubsetViolation, got {err:?}"
+    );
+    assert_eq!(tree.len(), 1, "nothing was spawned");
+}
+
+#[test]
+fn t_se_12_spawn_sub_never_holds_memory() {
+    let parent_caps = vec![cap("fs", json!({})), cap("memory", json!({}))];
+    let (_tmp, tree, spawner) = setup_with_parent_caps(parent_caps);
+    let err = spawner
+        .spawn_sub(SpawnSubConfig {
+            parent_id: AgentId("root".to_string()),
+            capabilities: vec![cap("fs", json!({})), cap("memory", json!({}))],
+            template_ref: None,
+        })
+        .expect_err("a Sub persists no memory");
+    assert!(
+        matches!(err, SpawnError::SubsetViolation(_)),
+        "expected SubsetViolation, got {err:?}"
+    );
+    assert_eq!(tree.len(), 1, "nothing was spawned");
+    // The same Sub without `memory` is spawned.
+    spawner
+        .spawn_sub(SpawnSubConfig {
+            parent_id: AgentId("root".to_string()),
+            capabilities: vec![cap("fs", json!({}))],
+            template_ref: None,
+        })
+        .expect("a Sub without `memory`");
+}

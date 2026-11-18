@@ -2332,6 +2332,10 @@ pub(crate) async fn wire_capabilities_inner(
         debug_assert!(progress_lifecycle_staging.is_none());
         None
     };
+    probe_record!(probe, |record| record.execution_ingress =
+        progress_lifecycle
+            .as_ref()
+            .map(|activation| Arc::downgrade(&activation.execution_ingress)));
     let messaging_store = progress_lifecycle
         .as_ref()
         .map(|activation| activation.mailbox_store.clone());
@@ -3821,6 +3825,12 @@ pub(crate) async fn wire_capabilities_inner(
                             Arc::clone(mgr),
                         )) as Arc<dyn cap_lifecycle::terminate::LoopCascade>
                     });
+                let flush_check: Option<crate::client_api_agents::MailboxFlushCheck> =
+                    perchild_manager.as_ref().map(|mgr| {
+                        let mgr = Arc::clone(mgr);
+                        Arc::new(move |bare: &str, key: &str| mgr.may_flush(bare, key))
+                            as crate::client_api_agents::MailboxFlushCheck
+                    });
                 let terminator: Arc<dyn cap_lifecycle::TerminateController> =
                     Arc::new(crate::client_api_agents::build_agent_terminate_controller(
                         (**tree).clone(),
@@ -3830,6 +3840,7 @@ pub(crate) async fn wire_capabilities_inner(
                         workspace.to_path_buf(),
                         resolver,
                         loop_cascade,
+                        flush_check,
                     ));
                 // Pack lane P2: the pack workflow executor compensates a
                 // spawn through this SAME cascade (loop abort, run cancel, mailbox flush,
