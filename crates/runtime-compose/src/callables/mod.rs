@@ -1,4 +1,4 @@
-//! Layer 3 callable catalog + dispatch (ADR 2026-10-24 S2).
+//! Layer 3 callable catalog + dispatch (ADR 2026-10-24).
 
 pub mod catalog;
 pub mod dispatch;

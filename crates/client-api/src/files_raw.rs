@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use axum::body::{to_bytes, Body};
+use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{
     AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST,
@@ -528,9 +528,23 @@ fn expect_continue(headers: &HeaderMap) -> bool {
 
 const RAW_READ_CHUNK: usize = 64 * 1024;
 const RAW_READ_AHEAD: usize = 2;
-const PUT_DRAIN_MAX: usize = 1024 * 1024;
-const PUT_DRAIN_MS: u64 = 2_000;
 const PUT_RATE_GRACE_MS: u64 = 50;
+
+/// The longest the body of a PUT of `declared` bytes may take to arrive at no less than
+/// `min_rate_bps` bytes a second, with [`PUT_RATE_GRACE_MS`] more for its first byte (a day
+/// when `min_rate_bps` is 0).
+fn put_rate_deadline(declared: u64, min_rate_bps: u64) -> Duration {
+    if min_rate_bps == 0 {
+        return Duration::from_secs(86_400);
+    }
+    Duration::from_millis(
+        declared
+            .saturating_mul(1000)
+            .saturating_div(min_rate_bps)
+            .max(1)
+            .saturating_add(PUT_RATE_GRACE_MS),
+    )
+}
 
 struct BytesRx(tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>);
 
@@ -612,16 +626,53 @@ fn stream_path(
     Body::from_stream(BytesRx(rx))
 }
 
-async fn drain_or_expect(request: Request<Body>, expect: bool) {
+/// Read the body of a PUT answered without it — a replay, a key in progress or in conflict,
+/// a write already current or refused — before the answer goes: a connection closed with
+/// bytes of the request still unread sends a reset (RST), which can reach the client ahead of
+/// the answer and lose it. The body is read as the upload itself would be — its `declared`
+/// length (the write grant's size, checked before, or no more than an upload may be:
+/// [`drain_refused`]), within the upload's rate deadline ([`put_rate_deadline`]) and with no
+/// gap longer than `raw_stall_ms` — and kept nowhere: each chunk is let go of as it arrives. A
+/// client that asked `Expect: 100-continue` (`expect`) has sent no body yet, and is answered
+/// at once.
+async fn drain_or_expect(
+    request: Request<Body>,
+    expect: bool,
+    declared: u64,
+    config: &crate::ClientApiConfig,
+) {
     if expect {
         return;
     }
-    let body = request.into_body();
-    let _ = tokio::time::timeout(
-        Duration::from_millis(PUT_DRAIN_MS),
-        to_bytes(body, PUT_DRAIN_MAX),
-    )
-    .await;
+    let stall = Duration::from_millis(config.raw_stall_ms.max(1));
+    let deadline = Instant::now() + put_rate_deadline(declared, config.raw_min_rate_bps);
+    let mut stream = request.into_body().into_data_stream();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match tokio::time::timeout(stall.min(left), next_body_chunk(&mut stream)).await {
+            Ok(Ok(Some(_chunk))) => {}
+            // The end of the body, a broken one, a stall or the deadline.
+            _ => return,
+        }
+    }
+}
+
+/// [`drain_or_expect`] for a PUT refused before its length is checked against its grant —
+/// for its CSRF token, or for a length the grant does not have —: read a body whose `declared`
+/// length is no more than an upload may be (`max_upload_bytes`); one of no declared length, or
+/// a longer one, is not read, and its refusal goes at once.
+async fn drain_refused(
+    request: Request<Body>,
+    expect: bool,
+    declared: Option<u64>,
+    config: &crate::ClientApiConfig,
+) {
+    if let Some(declared) = declared.filter(|d| *d <= config.max_upload_bytes) {
+        drain_or_expect(request, expect, declared, config).await;
+    }
 }
 
 async fn raw_get_or_head(
@@ -860,10 +911,23 @@ pub async fn raw_put(
             )
         }
     };
+    let declared = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    let expect = expect_continue(&headers);
+    // The refusals from here on read the body first when its length is declared and no more
+    // than an upload may be ([`drain_refused`], [`drain_or_expect`]): answered with it unread,
+    // the connection would be closed with bytes of the request still in it, and the reset that
+    // sends can reach the client ahead of the answer. A body of no declared length, or a longer
+    // one, is not read: it is refused at once. Those above read nothing: a ticket that does not
+    // redeem gives no session to read for, and a refusal for want of a transfer slot would read
+    // past the bound the slots set.
     let origin = headers.get(ORIGIN).and_then(|v| v.to_str().ok());
     if origin.is_some() {
         let csrf = headers.get("x-csrf-token").and_then(|v| v.to_str().ok());
         if csrf != redeemed.session.csrf_token.as_deref() {
+            drain_refused(request, expect, declared, api.config()).await;
             return error_response(
                 api.as_ref(),
                 &redeemed.request_id,
@@ -873,10 +937,6 @@ pub async fn raw_put(
             );
         }
     }
-    let declared = headers
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
     let Some(declared) = declared else {
         return error_response(
             api.as_ref(),
@@ -887,6 +947,7 @@ pub async fn raw_put(
         );
     };
     if declared != redeemed.grant.size {
+        drain_refused(request, expect, Some(declared), api.config()).await;
         return error_response(
             api.as_ref(),
             &redeemed.request_id,
@@ -916,22 +977,35 @@ pub async fn raw_put(
         nonce_fingerprint(&redeemed.grant.nonce),
         now,
     );
+    // A replay, a key still in progress and a conflicting key are answered without the
+    // upload. Read it first, as `finish_put`'s early answers do ([`drain_or_expect`]): a
+    // connection closed with unread bytes sends a reset, which can reach the client ahead of
+    // the answer and lose it — the answer a retried upload is waiting for.
     match begin {
-        Begin::Replay(record) => replay_put(&redeemed, record.outcome),
-        Begin::InProgress => error_response(
-            api.as_ref(),
-            &redeemed.request_id,
-            &redeemed.family,
-            "RawPut",
-            ClientError::new(ClientErrorCode::IdempotencyInProgress, "in progress"),
-        ),
-        Begin::Conflict => error_response(
-            api.as_ref(),
-            &redeemed.request_id,
-            &redeemed.family,
-            "RawPut",
-            ClientError::new(ClientErrorCode::IdempotencyConflict, "conflict"),
-        ),
+        Begin::Replay(record) => {
+            drain_or_expect(request, expect, declared, api.config()).await;
+            replay_put(&redeemed, record.outcome)
+        }
+        Begin::InProgress => {
+            drain_or_expect(request, expect, declared, api.config()).await;
+            error_response(
+                api.as_ref(),
+                &redeemed.request_id,
+                &redeemed.family,
+                "RawPut",
+                ClientError::new(ClientErrorCode::IdempotencyInProgress, "in progress"),
+            )
+        }
+        Begin::Conflict => {
+            drain_or_expect(request, expect, declared, api.config()).await;
+            error_response(
+                api.as_ref(),
+                &redeemed.request_id,
+                &redeemed.family,
+                "RawPut",
+                ClientError::new(ClientErrorCode::IdempotencyConflict, "conflict"),
+            )
+        }
         Begin::Reserved(reservation) => {
             finish_put(api, redeemed, request, reservation, declared).await
         }
@@ -981,10 +1055,16 @@ async fn finish_put(
     reservation: Reservation,
     declared: u64,
 ) -> Response {
+    // Every answer below reads the body first, as the upload would ([`drain_or_expect`]).
+    // The first three cannot be reached through the routes — `raw_put` found the provider
+    // installed, and none is ever taken out; the ticket's path and oid were checked when it
+    // was minted —, and read it all the same.
+    let expect = expect_continue(request.headers());
     let provider = match provider_or_unavailable(api.files_provider_slot()) {
         Ok(p) => p,
         Err(e) => {
             drop(reservation);
+            drain_or_expect(request, expect, declared, api.config()).await;
             return error_response(
                 api.as_ref(),
                 &redeemed.request_id,
@@ -1003,6 +1083,7 @@ async fn finish_put(
         Ok(p) => p,
         Err(e) => {
             drop(reservation);
+            drain_or_expect(request, expect, declared, api.config()).await;
             return error_response(
                 api.as_ref(),
                 &redeemed.request_id,
@@ -1016,6 +1097,7 @@ async fn finish_put(
         Some(o) => o,
         None => {
             drop(reservation);
+            drain_or_expect(request, expect, declared, api.config()).await;
             return error_response(
                 api.as_ref(),
                 &redeemed.request_id,
@@ -1039,10 +1121,9 @@ async fn finish_put(
         base_oid: redeemed.grant.base_oid.clone(),
         batch: redeemed.grant.batch.clone(),
     };
-    let expect = expect_continue(request.headers());
     match provider.check_write(&actor, &target) {
         Ok(WriteCheck::AlreadyCurrent { oid: current, .. }) => {
-            drain_or_expect(request, expect).await;
+            drain_or_expect(request, expect, declared, api.config()).await;
             let result = crate::files::ClientFileWriteResult {
                 path: path.as_str().to_string(),
                 oid: current.as_str().to_string(),
@@ -1079,7 +1160,7 @@ async fn finish_put(
             } else {
                 drop(reservation);
             }
-            drain_or_expect(request, expect).await;
+            drain_or_expect(request, expect, declared, api.config()).await;
             return error_response(
                 api.as_ref(),
                 &redeemed.request_id,
@@ -1093,7 +1174,7 @@ async fn finish_put(
         Ok(s) => s,
         Err(e) => {
             drop(reservation);
-            drain_or_expect(request, expect).await;
+            drain_or_expect(request, expect, declared, api.config()).await;
             return error_response(
                 api.as_ref(),
                 &redeemed.request_id,
@@ -1104,17 +1185,7 @@ async fn finish_put(
         }
     };
     let stall = Duration::from_millis(api.config().raw_stall_ms.max(1));
-    let rate_deadline = if api.config().raw_min_rate_bps > 0 {
-        Duration::from_millis(
-            declared
-                .saturating_mul(1000)
-                .saturating_div(api.config().raw_min_rate_bps)
-                .max(1)
-                .saturating_add(PUT_RATE_GRACE_MS),
-        )
-    } else {
-        Duration::from_secs(86_400)
-    };
+    let rate_deadline = put_rate_deadline(declared, api.config().raw_min_rate_bps);
     let mut stream = request.into_body().into_data_stream();
     let mut hasher = advance_git::BlobHasher::new(declared);
     let mut got = 0u64;

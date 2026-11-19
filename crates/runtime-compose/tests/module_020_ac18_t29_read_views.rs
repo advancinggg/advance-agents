@@ -25,7 +25,7 @@ use advance_shared_types::event::Event;
 use advance_shared_types::traits::{EventBusEmit, LlmDeltaEvent, LlmDeltaFrame, LlmTerminalReason};
 use cap_grant::ChannelApprovalRequest;
 use cap_http::DefaultLeakDetector;
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
 use serde_json::{json, Value};
 use t29::{
     api, compose_home, deltas_ws, error_code, error_message, events_ws, grant_snapshot, has_data,
@@ -780,7 +780,10 @@ async fn module_020_ac18_t29_d_lifecycle_grant_tools_home_keeps_the_bound_views_
 
     let late = probe.record().late_tools.clone();
     let late = late.expect("late install ran");
-    assert!(late.iter().any(|name| name == "data"), "{late:?}");
+    // The inventory lists callables, one per method, under the name the model sees
+    // (`<tool-id>__<method>`, ADR 2026-10-24 V8): the `data` tool is `data__describe`, ….
+    assert!(late.iter().any(|name| name == "data__describe"), "{late:?}");
+    assert!(!late.iter().any(|name| name == "data"), "{late:?}");
     let tools = Http::get(addr, "/client/tools").session(&tok).send().await;
     assert_eq!(tools.status, 200, "{:?}", tools.body);
     let wasm: Vec<String> = tools
@@ -1060,7 +1063,9 @@ async fn module_020_ac18_unbound_history_adapter_serves_the_bound_window_over_a_
     config.websocket_addr = "127.0.0.1:0".parse().unwrap();
     let bus = EventBus::new(config).await.expect("EventBus");
     let read = bus.read_api().expect("read API");
-    let start = Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap();
+    // Dated a minute ago: the bus reads back only events inside its retention window
+    // (30 days by default), so a fixed calendar date ages out of the test.
+    let start = Utc::now() - chrono::Duration::minutes(1);
     for i in 0..130 {
         let mut event = Event::observability("run.progress", "agent", json!({}), None);
         event.id = format!("E{i}");

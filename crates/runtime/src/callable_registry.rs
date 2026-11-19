@@ -90,8 +90,8 @@ pub struct CallableOutcome {
 }
 
 /// Catalog entry used by `list-callables`, the native `tools` array, and the
-/// Tier-2 `# Available Tools` section. Names are identical across the three
-/// by construction.
+/// prompt's Tier-2 tools section. Names are identical across the three by
+/// construction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallableDefinition {
     pub name: String,

@@ -484,10 +484,19 @@ async fn module_001_ac31_t112c_native_tool_registered_and_in_inventory() {
     .expect("compose");
     let (addr, tok) = api(&rt);
     let tools = Http::get(addr, "/client/tools").session(&tok).send().await;
+    // The read view lists callables, one entry per method, under the name the model sees
+    // (`<tool-id>__<method>`, ADR 2026-10-24 V8) — not the bare tool id.
+    let names = wasm_names(&tools.body);
+    for method in ["echo", "panic"] {
+        let callable = format!("{ECHO_TOOL}__{method}");
+        assert!(
+            names.iter().any(|name| *name == callable),
+            "{callable} missing: {:?}",
+            tools.body
+        );
+    }
     assert!(
-        wasm_names(&tools.body)
-            .iter()
-            .any(|name| *name == ECHO_TOOL),
+        !names.iter().any(|name| *name == ECHO_TOOL),
         "{:?}",
         tools.body
     );

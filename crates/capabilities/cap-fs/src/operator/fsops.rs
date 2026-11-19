@@ -612,10 +612,11 @@ pub fn publish_noreplace(
 ) -> Result<(), FilesError> {
     let src = src_dir.as_fd();
     let dst = dst_dir.as_fd();
+    // Exactly one of the two blocks below is compiled, and it is the body's tail expression.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use rustix::fs::{renameat_with, RenameFlags};
-        return match renameat_with(src, src_name, dst, dst_name, RenameFlags::NOREPLACE) {
+        match renameat_with(src, src_name, dst, dst_name, RenameFlags::NOREPLACE) {
             Ok(()) => Ok(()),
             Err(e) if e == Errno::EXIST => Err(FilesError::TargetExists {
                 current_oid: None,
@@ -623,7 +624,7 @@ pub fn publish_noreplace(
             }),
             Err(e) if e == Errno::NOENT => Err(FilesError::NotFound),
             Err(e) => Err(io_err(e)),
-        };
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {

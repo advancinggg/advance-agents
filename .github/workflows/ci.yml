@@ -40,8 +40,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Exact-pin discipline: fail loudly rather than silently resolving a newer patch.
-  CARGO_NET_RETRY: "3"
+  # Runners now and then fail to resolve index.crates.io for a few seconds (the v0.1.55
+  # macOS job lost all three tries); more tries ride that out. Exact-pin discipline is
+  # `--locked`: it still fails loudly rather than silently resolving a newer patch.
+  CARGO_NET_RETRY: "10"
   RUST_BACKTRACE: "1"
 
 jobs:

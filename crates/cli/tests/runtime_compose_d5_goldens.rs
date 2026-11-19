@@ -44,11 +44,12 @@
 //! Update mode: `ADVANCE_UPDATE_D5_GOLDENS=1` writes every golden and then fails (update mode is
 //! never green). Every golden is pinned by sha256 (`BASELINE_GOLDEN_SHA256`, or the entry of the
 //! decided outcome in the pending constant that owns it), and the pin is checked before the
-//! comparison and before the D5 overlay is applied. A pin is edited in place only by a whole-tree
+//! comparison and before an overlay is applied. A pin is edited in place only by a whole-tree
 //! re-capture on a new base, for a golden whose only changed line is its `CAPTURED_ON` header
 //! (update mode labels every golden it writes; see `PendingExpectation`). Intended wire changes
-//! go through [`D5_CHANGE_MATRIX`] only, and the overlay is checked against the ADR D5 rows
-//! derived from each home's declarations, on the route-probe path itself.
+//! go through the change matrices only — [`D5_CHANGE_MATRIX`] (ADR 2026-10-03 D5) and
+//! [`V8_CHANGE_MATRIX`] (ADR 2026-10-24 V8) — and each overlay is checked against the lines its
+//! ADR derives from each home's declarations, on the route-probe path itself.
 //!
 //! Runs that compose take one of a few boot slots (spawn until settled), and the harness reads
 //! `runtime.lock` only clear of its 30 s in-place heartbeat rewrite.
@@ -498,6 +499,190 @@ fn check_overlay_against_adr(changes: &[HomeChange<'_>]) {
         assert!(
             missing.is_empty(),
             "a non-empty D5 overlay must cover every ADR D5 line; missing: {missing:?}"
+        );
+    }
+}
+
+// ── ADR 2026-10-24 V8 overlay for the route-probe goldens ─────────────────────────────────
+
+/// The callable-inventory overlay: ADR 2026-10-24 (Layer 3 callable dispatch) V8, the
+/// per-method WASM projection, with the read-view decision of its finding 18 (method
+/// entries; ADR 2026-10-24 finding 18, MODULE-020 `/client/tools`). A home whose tools answer an inventory (a deployed driver and `tools`) lists one
+/// `wasm` entry per tool method, under the name the model sees (`<tool-id>__<method>`), where
+/// the captured base listed one entry per tool; `mcp` and `skills` are unchanged. The homes
+/// without a driver or `tools` answer the D5 row-4 empty inventory, which V8 leaves alone.
+/// [`check_v8_overlay`] derives the lines from each home's declarations and checks every entry
+/// against the captured `before`, on the route-probe path itself, as the D5 rows are.
+const V8_CHANGE_MATRIX: &[D5Change] = &[D5Change {
+    homes: &["h2_all_capabilities"],
+    method: "GET",
+    path: "/client/tools",
+    before: TOOLS_PER_TOOL_H2,
+    after: TOOLS_PER_METHOD_H2,
+}];
+
+/// H2's captured inventory: one entry, the `data` tool.
+const TOOLS_PER_TOOL_H2: &str = r#"200 data {"mcp":[],"skills":[],"wasm":[{"description":"Structured data over frontmatter: describe the schema, query the index, and create / patch / delete / promote / demote / apply operations on entities. Every write is validated against the schema and committed by the host.","name":"data"}]}"#;
+/// H2's inventory under V8: the `data` tool's methods.
+const TOOLS_PER_METHOD_H2: &str = r#"200 data {"mcp":[],"skills":[],"wasm":[{"description":"The merged schema: aspects, fields, queries, views, operations","name":"data__describe"},{"description":"Run a named query (`query` + `args`) or an ad-hoc `filter`","name":"data__query"},{"description":"One record","name":"data__get"},{"description":"Add an inline item under a file (`parent`), or create a new Markdown file whose frontmatter is the record (`path`, optional `body`)","name":"data__create"},{"description":"Set / unset fields of a record","name":"data__patch"},{"description":"Delete a record: an inline item, or a file with every item it holds","name":"data__delete"},{"description":"Inline item → file, or file → directory","name":"data__promote"},{"description":"File → inline item of its parent","name":"data__demote"},{"description":"Versions of one record, newest first","name":"data__history"},{"description":"Run a pack operation (pure WASM reducer) in one transaction","name":"data__apply"}]}"#;
+
+/// The probe lines V8 changes, derived from `spec`'s declarations: the tools inventory of a home
+/// with a deployed driver and `tools` (the homes D5 row 4 leaves out).
+fn v8_targets(spec: &HomeSpec) -> Vec<(&'static str, &'static str)> {
+    if spec.driver && declares(spec, "tools") {
+        vec![("GET", "/client/tools")]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The `200 data` tools inventory `outcome` answers, as JSON.
+fn inventory(outcome: &str) -> Value {
+    let body = outcome
+        .strip_prefix("200 data ")
+        .unwrap_or_else(|| panic!("a tools inventory answers `200 data …`, not {outcome:?}"));
+    serde_json::from_str(body).expect("inventory JSON")
+}
+
+/// The description of the captured tool `tool`, from the tool itself: V8 lists what it
+/// declares. Only the tools a probe home's inventory captures have a source here.
+fn v8_tool_description(tool: &str) -> cap_tools::ToolDescription {
+    use cap_data::test_support::{
+        agenda_schema, AllowAll, DirWorkspaceFs, FixedClock, MemoryEntityIndex, SequentialIds,
+    };
+    use cap_tools::HostTool as _;
+    match tool {
+        "data" => {
+            let ws = tempfile::TempDir::new().expect("tempdir");
+            let store = cap_data::DataStore::new(
+                Arc::new(DirWorkspaceFs::new(ws.path().to_path_buf())),
+                Arc::new(MemoryEntityIndex::default()),
+                agenda_schema(),
+                Arc::new(SequentialIds::default()),
+                Arc::new(FixedClock::at("2026-09-17T08:00:00Z")),
+            );
+            cap_data::DataTool::new(Arc::new(store), Arc::new(AllowAll)).describe()
+        }
+        other => panic!("V8: no description source for the captured tool `{other}`"),
+    }
+}
+
+/// The `wasm` entries V8 lists for the captured entry `entry` (ADR 2026-10-24 D3 / V8,
+/// `cap_tools::method_tool_entries_from_infos`): one per method the tool's own description
+/// declares, in that order, named `<tool-id>__<method>` and described as the method is — as
+/// the tool is when the method has no description; a tool without methods keeps its entry.
+fn v8_entries_of(entry: &Value) -> Vec<Value> {
+    let tool = entry["name"].as_str().expect("an entry `name`");
+    let described = v8_tool_description(tool);
+    assert_eq!(
+        entry["description"].as_str(),
+        Some(described.description.as_str()),
+        "V8: the captured `{tool}` is not the tool its source describes"
+    );
+    if described.methods.is_empty() {
+        return vec![entry.clone()];
+    }
+    described
+        .methods
+        .iter()
+        .map(|method| {
+            let name = method.name.as_str();
+            assert!(
+                !name.is_empty()
+                    && !name.contains("__")
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "V8: `{tool}` declares the method `{name}`, which makes no callable name"
+            );
+            let description = method
+                .description
+                .as_deref()
+                .filter(|d| !d.is_empty())
+                .unwrap_or(&described.description);
+            serde_json::json!({ "description": description, "name": format!("{tool}__{name}") })
+        })
+        .collect()
+}
+
+/// The ADR 2026-10-24 V8 check of an overlay: every change targets a line [`v8_targets`] derives
+/// (never a D5 line), with the golden's captured `before`; its `after` is exactly `before` with
+/// each captured `wasm` entry replaced by the entries of its tool's methods ([`v8_entries_of`]),
+/// all named apart — nothing else of the inventory changes; no line is changed twice; and a
+/// non-empty overlay covers every derived line.
+fn check_v8_overlay(changes: &[HomeChange<'_>]) {
+    let mut derived = BTreeSet::new();
+    for spec in PROBE_HOMES {
+        for (method, path) in v8_targets(spec) {
+            assert!(
+                !d5_targets(spec)
+                    .iter()
+                    .any(|(_, m, p)| *m == method && *p == path),
+                "V8 line {method} {path} on {} is also a D5 line",
+                spec.label
+            );
+            derived.insert((spec.label, method, path));
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for change in changes {
+        let key = (change.home, change.method, change.path);
+        assert!(
+            derived.contains(&key),
+            "V8 overlay changes {} {} on {}, which V8 does not change for that home's \
+             declarations",
+            change.method,
+            change.path,
+            change.home
+        );
+        assert!(
+            seen.insert(key),
+            "V8 overlay changes {} {} on {} twice",
+            change.method,
+            change.path,
+            change.home
+        );
+        assert_eq!(
+            change.before,
+            golden_outcome(change.home, change.method, change.path),
+            "V8 overlay {} {} on {}: `before` is not the captured outcome",
+            change.method,
+            change.path,
+            change.home
+        );
+        let before = inventory(change.before);
+        let entries: Vec<Value> = before["wasm"]
+            .as_array()
+            .expect("a `wasm` list")
+            .iter()
+            .flat_map(v8_entries_of)
+            .collect();
+        let mut names = BTreeSet::new();
+        for entry in &entries {
+            let name = entry["name"].as_str().expect("an entry `name`");
+            assert!(
+                names.insert(name.to_owned()),
+                "V8: two callables of {} are named `{name}`",
+                change.home
+            );
+        }
+        let mut expected = before.clone();
+        expected["wasm"] = Value::Array(entries);
+        assert_eq!(
+            inventory(change.after),
+            expected,
+            "V8 overlay {} {} on {}: `after` must be the captured inventory with each tool's \
+             methods in its place, and nothing else changed",
+            change.method,
+            change.path,
+            change.home
+        );
+    }
+    if !changes.is_empty() {
+        let missing: Vec<_> = derived.difference(&seen).collect();
+        assert!(
+            missing.is_empty(),
+            "a non-empty V8 overlay must cover every V8 line; missing: {missing:?}"
         );
     }
 }
@@ -2569,18 +2754,22 @@ fn probe_home(spec: &HomeSpec) -> String {
 fn route_probe_golden(spec: &HomeSpec) {
     let actual = probe_home(spec);
     let name = format!("route_probe.{}.golden", spec.label);
-    let changes = expand_matrix(D5_CHANGE_MATRIX);
+    let d5 = expand_matrix(D5_CHANGE_MATRIX);
+    let v8 = expand_matrix(V8_CHANGE_MATRIX);
     assert!(
-        !update_mode() || changes.is_empty(),
-        "route-probe goldens are captured once and never re-captured once the D5 overlay is in \
-         use; change D5_CHANGE_MATRIX instead"
+        !update_mode() || (d5.is_empty() && v8.is_empty()),
+        "route-probe goldens are captured once and never re-captured once an overlay is in use; \
+         change D5_CHANGE_MATRIX or V8_CHANGE_MATRIX instead"
     );
     if !update_mode() {
-        // The ADR rows are enforced on the path that applies the overlay, so a filtered run
+        // The ADR lines are enforced on the path that applies the overlays, so a filtered run
         // (`cargo test … route_probe`) checks them too. (Skipped in update mode, where the
-        // overlay is empty and the other homes' goldens are being rewritten.)
-        check_overlay_against_adr(&changes);
+        // overlays are empty and the other homes' goldens are being rewritten.)
+        check_overlay_against_adr(&d5);
+        check_v8_overlay(&v8);
     }
+    // The overlays change disjoint lines: `check_v8_overlay` refuses a D5 line.
+    let changes: Vec<HomeChange<'_>> = d5.into_iter().chain(v8).collect();
     let mut goldens = Goldens::new();
     goldens.check_with_overlay(&name, &actual, |golden| {
         apply_overlay(&changes, spec.label, golden)
@@ -3120,5 +3309,126 @@ fn module_001_t111_ac30_d5_overlay_only_adr_rows() {
     assert!(
         std::panic::catch_unwind(|| check_overlay_against_adr(&with_health)).is_err(),
         "a line outside the ADR rows is refused"
+    );
+}
+
+/// The shipped V8 overlay obeys ADR 2026-10-24 V8 (see [`check_v8_overlay`]), and the check
+/// bites: a line V8 does not derive (H5's inventory, D5 row 4), a stale `before`, a bare tool id,
+/// an empty method, a name of no captured tool and a changed `mcp` are refused, while a minimal
+/// well-formed `after` passes.
+#[test]
+fn module_001_t111_ac30_v8_overlay_only_adr_lines() {
+    let shipped = expand_matrix(V8_CHANGE_MATRIX);
+    check_v8_overlay(&shipped);
+    let base = shipped[0];
+    // The message `check_v8_overlay` refuses `changes` with.
+    let refusal = |changes: &[HomeChange<'_>]| -> String {
+        let panic = std::panic::catch_unwind(|| check_v8_overlay(changes))
+            .expect_err("the overlay is refused");
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()
+    };
+    let refused_for = |changes: &[HomeChange<'_>], reason: &str, why: &str| {
+        let message = refusal(changes);
+        assert!(
+            message.contains(reason),
+            "{why}: refused for another reason: {message}"
+        );
+    };
+
+    let h5_before = golden_outcome(H5.label, "GET", "/client/tools");
+    refused_for(
+        &[HomeChange {
+            home: H5.label,
+            before: &h5_before,
+            ..base
+        }],
+        "which V8 does not change for that home's declarations",
+        "H5 (`tools` without a driver) answers the D5 row-4 inventory; V8 leaves it alone",
+    );
+    refused_for(&[base, base], "twice", "a line changed twice");
+    refused_for(
+        &[HomeChange {
+            before: "200 data {\"mcp\":[],\"skills\":[],\"wasm\":[]}",
+            ..base
+        }],
+        "`before` is not the captured outcome",
+        "a `before` that is not the captured outcome",
+    );
+
+    let shipped_after = inventory(base.after);
+    let with_wasm = |wasm: Value| {
+        let mut value = shipped_after.clone();
+        value["wasm"] = wasm;
+        format!("200 data {value}")
+    };
+    let entries = shipped_after["wasm"]
+        .as_array()
+        .expect("a `wasm` list")
+        .clone();
+    let mut reordered = entries.clone();
+    reordered.swap(0, 1);
+    let mut redescribed = entries.clone();
+    redescribed[0]["description"] = Value::from("another description");
+    let mut widened = entries.clone();
+    widened[0]["params"] = serde_json::json!({});
+    let mut doubled = entries.clone();
+    doubled.push(entries[0].clone());
+    let mut renamed = entries.clone();
+    renamed[0]["name"] = Value::from("other__describe");
+    let mut changed_mcp = shipped_after.clone();
+    changed_mcp["mcp"] = serde_json::json!([{ "name": "x" }]);
+    let mut extra_key = shipped_after.clone();
+    extra_key["extra"] = Value::Bool(true);
+    let afters = [
+        (
+            with_wasm(serde_json::json!([{ "description": "d", "name": "data" }])),
+            "the bare tool id",
+        ),
+        (
+            with_wasm(serde_json::json!([{ "description": "d", "name": "data__" }])),
+            "an empty method",
+        ),
+        (
+            with_wasm(Value::Array(entries[1..].to_vec())),
+            "a method left out",
+        ),
+        (with_wasm(Value::Array(reordered)), "methods out of order"),
+        (
+            with_wasm(Value::Array(redescribed)),
+            "a method described otherwise",
+        ),
+        (
+            with_wasm(Value::Array(widened)),
+            "an entry with another key",
+        ),
+        (with_wasm(Value::Array(doubled)), "a method listed twice"),
+        (
+            with_wasm(Value::Array(renamed)),
+            "a callable of no captured tool",
+        ),
+        (format!("200 data {changed_mcp}"), "a changed `mcp`"),
+        (
+            format!("200 data {extra_key}"),
+            "another key of the inventory",
+        ),
+    ];
+    for (after, why) in &afters {
+        refused_for(
+            &[HomeChange { after, ..base }],
+            "`after` must be the captured inventory with each tool's methods in its place",
+            why,
+        );
+    }
+    refused_for(
+        &[HomeChange {
+            after: "201 data {}",
+            ..base
+        }],
+        "a tools inventory answers `200 data …`",
+        "another status",
     );
 }

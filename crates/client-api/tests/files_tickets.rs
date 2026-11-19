@@ -691,6 +691,187 @@ async fn write_ticket_replay_reproduces_status_and_etag() {
     let _ = server.shutdown().await;
 }
 
+fn mint_write_of(api: &ClientApi, token: &str, path: &str, body: &[u8]) -> String {
+    let oid = advance_git::blob_oid_of_bytes(body);
+    let env = api.handle(
+        ClientRequest::post(
+            "/client/files:write-ticket",
+            json!({"path": path, "intent": "edit", "base_oid": oid, "size": body.len(), "oid": oid}),
+        )
+        .with_session(token),
+    );
+    assert!(env.is_ok(), "{:?}", env.error);
+    let ticket: ClientFileTicket = serde_json::from_value(env.data.unwrap()).unwrap();
+    ticket.ticket
+}
+
+/// Send the head of a PUT of `len` bytes to `path` on a new connection — with `extra` header
+/// lines — and nothing of its body.
+async fn put_head(
+    addr: std::net::SocketAddr,
+    path: &str,
+    len: usize,
+    extra: &str,
+) -> tokio::net::TcpStream {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "PUT {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAuthorization: Bearer tok\r\nContent-Length: {len}\r\n{extra}\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream
+}
+
+/// Nothing arrives on `stream` for 300 ms: the server has not answered.
+async fn assert_unanswered(stream: &mut tokio::net::TcpStream, what: &str) {
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        stream.read(&mut byte),
+    )
+    .await;
+    assert!(
+        read.is_err(),
+        "{what} was answered before its body arrived: {read:?}"
+    );
+}
+
+/// What arrives on `stream` until it is closed.
+async fn answer(mut stream: tokio::net::TcpStream) -> String {
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .await
+        .expect("the answer arrives on a connection that is closed, not reset");
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// A body the upload's own rate deadline gives seconds to arrive (2 MiB at the default
+/// 256 KiB/s is 8 s): long past the 300 ms in which a test sees whether an answer has gone.
+/// A body of a few bytes gets the deadline's 50 ms grace only, and is answered after it.
+fn slow_body() -> Vec<u8> {
+    vec![b'r'; 2 << 20]
+}
+
+/// A replayed upload is answered only once its body has been read, as the upload itself
+/// would be: answered first, the connection would be closed with the body unread, and the
+/// reset that sends can reach the client ahead of the answer. So a replay whose head has
+/// arrived, and its body not, is not answered yet.
+#[tokio::test]
+async fn write_ticket_replay_is_answered_once_its_body_is_read() {
+    let body = slow_body();
+    let api = api_with(MemoryFiles::ready(), RecordingSink::new());
+    mint(&api, "tok", Scope::operator_default(), "sess-a");
+    let ticket = mint_write_of(&api, "tok", "notes/replay.bin", &body);
+    let (server, addr, _api) = bind(api).await;
+    let path = format!("/client/files/raw/{ticket}");
+    let first = http(
+        addr,
+        "PUT",
+        &path,
+        &[("Authorization", "Bearer tok")],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(first.status, 200);
+
+    let mut replay = put_head(addr, &path, body.len(), "").await;
+    assert_unanswered(&mut replay, "a replay").await;
+    replay.write_all(&body).await.unwrap();
+    let text = answer(replay).await;
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(text.contains("idempotent_replay"), "{text}");
+    let _ = server.shutdown().await;
+}
+
+/// However long the body: a replay of 3 MiB is answered only once all of it has arrived.
+#[tokio::test]
+async fn write_ticket_replay_of_a_large_body_reads_all_of_it() {
+    let body = vec![b'x'; 3 << 20];
+    let api = api_with(MemoryFiles::ready(), RecordingSink::new());
+    mint(&api, "tok", Scope::operator_default(), "sess-a");
+    let ticket = mint_write_of(&api, "tok", "notes/big.bin", &body);
+    let (server, addr, _api) = bind(api).await;
+    let path = format!("/client/files/raw/{ticket}");
+    let first = http(
+        addr,
+        "PUT",
+        &path,
+        &[("Authorization", "Bearer tok")],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(first.status, 200);
+
+    let mut replay = put_head(addr, &path, body.len(), "").await;
+    replay.write_all(&body[..2 << 20]).await.unwrap();
+    assert_unanswered(&mut replay, "a replay with a third of its body to come").await;
+    replay.write_all(&body[2 << 20..]).await.unwrap();
+    let text = answer(replay).await;
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(text.contains("idempotent_replay"), "{text}");
+    let _ = server.shutdown().await;
+}
+
+/// An upload under a key another upload holds in progress is answered so only once its body
+/// has been read, too.
+#[tokio::test]
+async fn write_ticket_in_progress_is_answered_once_its_body_is_read() {
+    let body = slow_body();
+    let api = api_with(MemoryFiles::ready(), RecordingSink::new());
+    mint(&api, "tok", Scope::operator_default(), "sess-a");
+    let ticket = mint_write_of(&api, "tok", "notes/held.bin", &body);
+    let (server, addr, api) = bind(api).await;
+    let path = format!("/client/files/raw/{ticket}");
+    let mut holder = put_head(addr, &path, body.len(), "").await;
+    holder.write_all(&body[..1024]).await.unwrap();
+    let reserved = std::time::Instant::now();
+    while api.files_raw_idempotency().is_empty() {
+        assert!(
+            reserved.elapsed() < std::time::Duration::from_secs(10),
+            "the first upload holds its key"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let mut second = put_head(addr, &path, body.len(), "").await;
+    assert_unanswered(&mut second, "an upload whose key is in progress").await;
+    second.write_all(&body).await.unwrap();
+    let text = answer(second).await;
+    assert!(text.contains("idempotency_in_progress"), "{text}");
+
+    holder.write_all(&body[1024..]).await.unwrap();
+    let text = answer(holder).await;
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    let _ = server.shutdown().await;
+}
+
+/// A replay that asked `Expect: 100-continue` has sent no body, and is answered at once.
+#[tokio::test]
+async fn write_ticket_replay_that_expects_continue_is_answered_without_its_body() {
+    let api = api_with(MemoryFiles::ready(), RecordingSink::new());
+    mint(&api, "tok", Scope::operator_default(), "sess-a");
+    let ticket = mint_write(&api, "tok");
+    let (server, addr, _api) = bind(api).await;
+    let path = format!("/client/files/raw/{ticket}");
+    let first = http(
+        addr,
+        "PUT",
+        &path,
+        &[("Authorization", "Bearer tok")],
+        Some(b"hello"),
+    )
+    .await;
+    assert_eq!(first.status, 200);
+
+    let replay = put_head(addr, &path, 5, "Expect: 100-continue\r\n").await;
+    let text = tokio::time::timeout(std::time::Duration::from_secs(10), answer(replay))
+        .await
+        .expect("answered without its body");
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(text.contains("idempotent_replay"), "{text}");
+    let _ = server.shutdown().await;
+}
+
 #[test]
 fn write_ticket_store_is_separate() {
     use advance_client_api::idempotency::{Begin, IdempotencyScope};

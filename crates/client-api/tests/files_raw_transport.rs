@@ -891,6 +891,98 @@ async fn raw_put_browser_csrf() {
     let _ = server.shutdown().await;
 }
 
+/// Send the head of a PUT of `len` bytes to `path` on a new connection — with the header
+/// lines `extra` — and nothing of its body.
+async fn put_head(addr: SocketAddr, path: &str, len: u64, extra: &str) -> tokio::net::TcpStream {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "PUT {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: {len}\r\n{extra}\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream
+}
+
+/// Nothing arrives on `stream` for 300 ms: the server has not answered.
+async fn assert_unanswered(stream: &mut tokio::net::TcpStream, what: &str) {
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_millis(300), stream.read(&mut byte)).await;
+    assert!(
+        read.is_err(),
+        "{what} was answered before its body arrived: {read:?}"
+    );
+}
+
+/// What arrives on `stream` until it is closed — closed, not reset.
+async fn answer(mut stream: tokio::net::TcpStream) -> String {
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .await
+        .expect("the answer arrives on a connection that is closed, not reset");
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// A configuration under which a body of a few bytes may take seconds to arrive (1 byte a
+/// second, no stall before a minute): long past the 300 ms in which a test sees whether an
+/// answer has gone.
+fn patient() -> ClientApiConfig {
+    let mut cfg = ClientApiConfig::default();
+    cfg.raw_min_rate_bps = 1;
+    cfg.raw_stall_ms = 60_000;
+    cfg
+}
+
+/// A browser upload refused for its CSRF token is answered only once its body has been
+/// read, as the upload itself would be: answered first, the connection would be closed with
+/// the body unread, and the reset that sends can reach the client ahead of the refusal.
+#[tokio::test]
+async fn raw_put_csrf_refusal_is_answered_once_its_body_is_read() {
+    let mut cfg = patient();
+    cfg.allowed_origins = vec!["http://127.0.0.1:1".into()];
+    let api = api_parts(cfg, MemoryFiles::ready(), RecordingSink::new());
+    let ticket = mint_ticket(&api, "notes/a.md", true);
+    let (server, addr, _) = bind(api).await;
+    let path = format!("/client/files/raw/{ticket}");
+    let mut put = put_head(addr, &path, 5, "Origin: http://127.0.0.1:1\r\n").await;
+    assert_unanswered(&mut put, "a CSRF refusal").await;
+    put.write_all(b"hello").await.unwrap();
+    let text = answer(put).await;
+    assert!(text.starts_with("HTTP/1.1 403"), "{text}");
+    let _ = server.shutdown().await;
+}
+
+/// So is an upload refused for a length its grant does not have.
+#[tokio::test]
+async fn raw_put_length_refusal_is_answered_once_its_body_is_read() {
+    let api = api_parts(patient(), MemoryFiles::ready(), RecordingSink::new());
+    let ticket = mint_ticket(&api, "notes/a.md", true);
+    let (server, addr, _) = bind(api).await;
+    let path = format!("/client/files/raw/{ticket}");
+    let mut put = put_head(addr, &path, 4, "").await;
+    assert_unanswered(&mut put, "a length refusal").await;
+    put.write_all(b"hell").await.unwrap();
+    let text = answer(put).await;
+    assert!(text.contains("content_mismatch"), "{text}");
+    let _ = server.shutdown().await;
+}
+
+/// A refused upload declaring more than an upload may be is not read: it is refused at once.
+#[tokio::test]
+async fn raw_put_refusal_of_a_body_longer_than_an_upload_may_be_goes_at_once() {
+    let mut cfg = patient();
+    cfg.max_upload_bytes = 64;
+    let api = api_parts(cfg, MemoryFiles::ready(), RecordingSink::new());
+    let ticket = mint_ticket(&api, "notes/a.md", true);
+    let (server, addr, _) = bind(api).await;
+    let path = format!("/client/files/raw/{ticket}");
+    let put = put_head(addr, &path, 65, "").await;
+    let text = tokio::time::timeout(Duration::from_secs(2), answer(put))
+        .await
+        .expect("refused without its body");
+    assert!(text.contains("content_mismatch"), "{text}");
+    let _ = server.shutdown().await;
+}
+
 #[tokio::test]
 async fn raw_put_length_and_integrity() {
     let api = api_parts(

@@ -131,14 +131,22 @@ async fn bs1_t01_all_capabilities_registered() {
     let (host, _h) = wire_capabilities(builder, &ws).await.expect("wire");
 
     let reg = host.host_registry();
-    for (cap, ns) in [
-        ("secrets", "advance:runtime/agent-secrets@0.1.0"),
-        ("fs", "advance:runtime/agent-fs@0.1.0"),
-        ("tools", "advance:runtime/agent-tools@0.1.0"),
-        ("skills", "advance:runtime/agent-skills@0.1.0"),
-        ("memory", "advance:runtime/agent-memory@0.1.0"),
-        ("grant", "advance:runtime/agent-grant@0.1.0"),
-        ("llm", "advance:runtime/agent-llm@0.1.0"),
+    // `llm` also carries the Layer 3 dispatch interface: ADR 2026-10-24 D2 registers
+    // `agent-callables.list-callables` and `.invoke-callable` under `llm`.
+    for (cap, namespaces) in [
+        ("secrets", &["advance:runtime/agent-secrets@0.1.0"][..]),
+        ("fs", &["advance:runtime/agent-fs@0.1.0"][..]),
+        ("tools", &["advance:runtime/agent-tools@0.1.0"][..]),
+        ("skills", &["advance:runtime/agent-skills@0.1.0"][..]),
+        ("memory", &["advance:runtime/agent-memory@0.1.0"][..]),
+        ("grant", &["advance:runtime/agent-grant@0.1.0"][..]),
+        (
+            "llm",
+            &[
+                "advance:runtime/agent-llm@0.1.0",
+                "advance:runtime/agent-callables@0.1.0",
+            ][..],
+        ),
     ] {
         let specs = reg.lookup(cap);
         assert!(
@@ -146,8 +154,28 @@ async fn bs1_t01_all_capabilities_registered() {
             "BS1-T01: capability `{cap}` must be registered when declared active; got empty"
         );
         assert!(
-            specs.iter().all(|s| s.namespace == ns),
-            "BS1-T01: `{cap}` specs must use namespace `{ns}`; got: {specs:?}"
+            specs
+                .iter()
+                .all(|s| namespaces.contains(&s.namespace.as_str())),
+            "BS1-T01: `{cap}` specs must use the namespaces {namespaces:?}; got: {specs:?}"
+        );
+        for ns in namespaces {
+            assert!(
+                specs.iter().any(|s| s.namespace == *ns),
+                "BS1-T01: `{cap}` must register functions under `{ns}`; got: {specs:?}"
+            );
+        }
+    }
+    let llm = reg.lookup("llm");
+    let callables: Vec<&str> = llm
+        .iter()
+        .filter(|s| s.namespace == "advance:runtime/agent-callables@0.1.0")
+        .map(|s| s.name.as_str())
+        .collect();
+    for name in ["list-callables", "invoke-callable"] {
+        assert!(
+            callables.contains(&name),
+            "BS1-T01: `llm` must register `agent-callables.{name}`; got: {callables:?}"
         );
     }
 }
