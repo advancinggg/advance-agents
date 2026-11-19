@@ -165,9 +165,12 @@ fn batch_suffix(batch_id: &str) -> String {
 /// examples — a deterministic ASCII fallback keeps the AC-34 regex
 /// `^cl-[a-z0-9][a-z0-9-]*-[0-9a-f]{1,16}$` stable). Capped at 24 chars.
 fn topic_slug(entry: &MemoryEntry) -> String {
+    // A tag naming the agent an entry was handed over from tells where the entry came
+    // from, not what it is about ([`crate::store::FROM_AGENT_TAG_PREFIX`]).
     let joined = entry
         .tags
         .iter()
+        .filter(|t| !t.starts_with(crate::store::FROM_AGENT_TAG_PREFIX))
         .take(3)
         .cloned()
         .collect::<Vec<_>>()
@@ -258,6 +261,42 @@ mod tests {
         let b = L6ClusterBuilder::new();
         assert!(b.build_clusters(&[], "x").is_empty());
         assert!(b.build_clusters(&[e("e1", "solo", &[])], "x").is_empty());
+    }
+
+    /// A cluster of entries handed over is named after what they are about, not after the
+    /// agent they came from.
+    #[test]
+    fn a_provenance_tag_does_not_name_the_topic() {
+        let b = L6ClusterBuilder::new();
+        let entries = vec![
+            e(
+                "e1",
+                "shared content tokens here",
+                &["from-agent:kid", "pricing"],
+            ),
+            e(
+                "e2",
+                "shared content tokens here",
+                &["pricing", "from-agent:kid"],
+            ),
+        ];
+        let cl = b.build_clusters(&entries, "abcdef12");
+        assert_eq!(cl.len(), 1);
+        assert!(
+            cl[0].cluster_id.starts_with("cl-pricing-abcdef12"),
+            "got {}",
+            cl[0].cluster_id
+        );
+        let untagged = vec![
+            e("e1", "shared content tokens here", &["from-agent:kid"]),
+            e("e2", "shared content tokens here", &["from-agent:kid"]),
+        ];
+        let cl = b.build_clusters(&untagged, "abcdef12");
+        assert!(
+            cl[0].cluster_id.starts_with("cl-topic-"),
+            "got {}",
+            cl[0].cluster_id
+        );
     }
 
     #[test]

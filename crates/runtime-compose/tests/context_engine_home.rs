@@ -993,3 +993,122 @@ async fn a_turn_indexed_without_a_vector_gets_one_once_the_agent_can_embed() {
     })
     .await;
 }
+
+/// The knowledge a deleted agent learned is kept, as history, and its parent takes it over
+/// (owner decision 2026-11-17). On the production terminate path the fact the helper's turn
+/// extracted, held under the helper's id, ends under the root's — naming the helper — and
+/// the helper's id holds no knowledge, as the composition leaves the home on disk. The root
+/// recalls it, and its memory rows mirror it once its next turn has ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deleted_agent_hands_its_knowledge_over_to_its_parent() {
+    let home = memory_home(
+        &["messaging"],
+        &[(
+            MAIN,
+            entry(MAIN, MAIN_HOST, &["embedding-model: main-embed"]),
+        )],
+        &["provider: main"],
+    );
+    let peer = &Peer::with_facts(
+        &[
+            (ROOT_PROMPT, ROOT_DIGEST),
+            (HELPER_FIRST_PROMPT, HELPER_FIRST_DIGEST),
+        ],
+        &[(HELPER_FIRST_PROMPT, HELPER_FACT)],
+    );
+    serve(&home, peer, |client| async move {
+        client
+            .create_unpinned_child(HELPER, &["fs", "llm", "memory"])
+            .await;
+    })
+    .await;
+    give_child_the_default_driver(&home, HELPER);
+    let memory_root = home.home().join(".agent/memory");
+
+    let ids = Arc::new(Mutex::new(None));
+    let noted = ids.clone();
+    let knowledge_dir = memory_root.clone();
+    serve(&home, peer, |client| async move {
+        client.child_turn(HELPER_MAILBOX, HELPER_FIRST_PROMPT).await;
+        client.context_with_turns(Agent::Child(HELPER), 1).await;
+        let root_id = client.listed_id(Agent::Root).await.expect("the root");
+        let helper_id = client
+            .listed_id(Agent::Child(HELPER))
+            .await
+            .expect("the helper");
+        // Before the delete: the helper's turn left its fact under the helper's id.
+        let helper_file = knowledge_dir
+            .join(cap_memory::persistence::slug(&helper_id))
+            .join(cap_memory::persistence::KNOWLEDGE_JSONL_FILENAME);
+        let held = std::fs::read_to_string(&helper_file).unwrap_or_default();
+        assert!(
+            held.contains(HELPER_FACT),
+            "the helper's fact is held under its id: {held}"
+        );
+
+        client.delete_child(HELPER).await;
+        assert_eq!(client.listed_id(Agent::Child(HELPER)).await, None);
+        // The root's next turn ends: its memory rows mirror what it took over.
+        client.turn(ROOT_MAILBOX, ROOT_PROMPT).await;
+        client.context_with_turns(Agent::Root, 1).await;
+        *noted.lock().unwrap() = Some((root_id, helper_id));
+    })
+    .await;
+
+    // The composition is shut down, its last pass over the helper's records with it: read
+    // the home's knowledge as it is on disk.
+    let (root_id, helper_id) = ids.lock().unwrap().clone().expect("the ids were noted");
+    let store =
+        cap_memory::MemoryStore::open(&memory_root, cap_memory::DEFAULT_MAX_ACTIVE_PER_AGENT)
+            .expect("the home's knowledge");
+    assert!(
+        store.list(&helper_id).is_empty(),
+        "the deleted agent's id holds no knowledge: {:?}",
+        store.list(&helper_id)
+    );
+    let taken: Vec<cap_memory::MemoryEntry> = store
+        .list(&root_id)
+        .into_iter()
+        .filter(|entry| entry.content.contains(HELPER_FACT))
+        .collect();
+    assert_eq!(
+        taken.len(),
+        1,
+        "the root holds the helper's fact, once: {:?}",
+        store.list(&root_id)
+    );
+    assert_eq!(taken[0].agent_id, root_id);
+    assert!(
+        taken[0]
+            .tags
+            .contains(&format!("{}{helper_id}", cap_memory::FROM_AGENT_TAG_PREFIX)),
+        "the fact names the agent it came from: {:?}",
+        taken[0].tags
+    );
+    assert!(taken[0].is_active, "it is the root's knowledge now");
+    // The root recalls it as its own — what a guest's `recall` serves from
+    // (`MemoryStore::recall`) —, and the deleted helper's id recalls nothing.
+    let recalled: Vec<String> = store
+        .recall(&root_id, "staging password", 10)
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
+    assert!(
+        recalled.contains(&taken[0].id),
+        "the root recalls the helper's fact: {recalled:?}"
+    );
+    assert!(store.recall(&helper_id, "staging password", 10).is_empty());
+    // The root's memory rows mirror it since its turn ended; the deleted helper has none.
+    let index = RusqliteSqliteIndex::open(&home.home().join(".agent/memory/index.sqlite"))
+        .expect("the home's index");
+    let rows: Vec<String> = index
+        .list_memory_for_agent(&root_id)
+        .into_iter()
+        .map(|row| row.memory_id)
+        .collect();
+    assert!(
+        rows.contains(&taken[0].id),
+        "the root's memory rows mirror the fact it took over: {rows:?}"
+    );
+    assert!(index.list_memory_for_agent(&helper_id).is_empty());
+}

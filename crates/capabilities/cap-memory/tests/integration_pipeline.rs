@@ -481,3 +481,51 @@ async fn ac_11_user_preference_append_only() {
         "find_similar must NOT be invoked for the UserPreference branch"
     );
 }
+
+/// A tag the extraction model chose that reads as the store's provenance tag — which only a
+/// hand-over sets — is dropped from its entry, and the turn's knowledge lands all the same:
+/// with the tag, the store would refuse the entry, and the turn's later entries and steps
+/// would go with it.
+#[tokio::test]
+async fn an_extracted_tag_that_reads_as_a_provenance_tag_is_dropped_and_the_turn_goes_on() {
+    let similarity = Arc::new(InMemorySimilarityIndex::new());
+    let store = Arc::new(MemoryStore::new());
+    let mut named = fact_entry(
+        "f1",
+        "The helper reported a green build",
+        "2026-01-01T00:00:00Z",
+    );
+    named.tags = vec!["from-agent:helper".into(), "build".into()];
+    let mut spelt = fact_entry("f2", "Releases go out on Thursdays", "2026-01-01T00:00:01Z");
+    spelt.tags = vec!["From agent: helper".into()];
+    let plain = fact_entry("f3", "The staging host is slow", "2026-01-01T00:00:02Z");
+    let extraction = Extraction {
+        descriptions: vec![],
+        knowledge: vec![named, spelt, plain],
+        digest: None,
+    };
+    let pp = PostProcessor::with_components(build_components_with_extraction(
+        extraction,
+        Arc::clone(&similarity),
+        Arc::clone(&store),
+    ));
+    pp.run("agent:research", &fixture_message(), &fixture_result())
+        .await
+        .expect("the turn's post-processing goes on");
+
+    let held: Vec<(String, Vec<String>)> = store
+        .list("agent:research")
+        .into_iter()
+        .map(|entry| (entry.id, entry.tags))
+        .collect();
+    assert_eq!(
+        held,
+        [
+            ("f1".to_string(), vec!["build".to_string()]),
+            ("f2".to_string(), vec![]),
+            ("f3".to_string(), vec![]),
+        ]
+    );
+    let expected: Vec<String> = CANONICAL_STEPS.iter().map(|s| s.to_string()).collect();
+    assert_eq!(pp.trace_snapshot(), expected, "every step ran");
+}

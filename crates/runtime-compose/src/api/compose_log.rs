@@ -129,6 +129,11 @@ pub mod log_keys {
     pub const PERCHILD_COLON_COLLISION: &str = "perchild.colon_collision";
     /// stderr: the memory-index rows of a terminated child were not removed.
     pub const PERCHILD_FORGET_FAILED: &str = "perchild.forget_failed";
+    /// stdout: the knowledge entries of a terminated child were handed over to its heir, with
+    /// what the heir holds since.
+    pub const PERCHILD_HANDOVER: &str = "perchild.handover";
+    /// stderr: the knowledge entries of a terminated child were not handed over to its heir.
+    pub const PERCHILD_HANDOVER_FAILED: &str = "perchild.handover_failed";
     /// stderr: a child is not served (terminated, or its id taken by another child, before
     /// its serve began).
     pub const PERCHILD_STALE_SERVE: &str = "perchild.stale_serve";
@@ -322,6 +327,8 @@ pub mod log_keys {
         PERCHILD_INVALID_COMPONENT_ID,
         PERCHILD_COLON_COLLISION,
         PERCHILD_FORGET_FAILED,
+        PERCHILD_HANDOVER,
+        PERCHILD_HANDOVER_FAILED,
         PERCHILD_STALE_SERVE,
         MCP_WARN,
         MCP_LISTING_FAILED,

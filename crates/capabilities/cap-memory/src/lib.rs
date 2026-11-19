@@ -109,8 +109,8 @@ pub use sqlite_index::{
 };
 pub use sqlite_index_rusqlite::{RusqliteSqliteIndex, SqliteIndexError};
 pub use store::{
-    ForgetError, L6JournalEntry, L6JournalField, MemoryId, MemoryStore,
-    DEFAULT_MAX_ACTIVE_PER_AGENT, MAX_ENTRY_BYTES,
+    handed_over_from, ActiveCount, ForgetError, HandedOver, L6JournalEntry, L6JournalField,
+    MemoryId, MemoryStore, DEFAULT_MAX_ACTIVE_PER_AGENT, FROM_AGENT_TAG_PREFIX, MAX_ENTRY_BYTES,
 };
 pub use summary::{Confidence, Correction, Finding, KeyDecision, Summary, SummaryMeta};
 pub use task_storage::{

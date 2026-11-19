@@ -200,18 +200,20 @@ pub struct PerChildLoopManager {
     /// then forgets what those loops left ([`Self::shutdown`]). Queued under the
     /// `record_stores` lock, which [`Self::unbind`] empties it under.
     forget_at_shutdown: Mutex<Vec<AgentRecords>>,
-    /// Terminates under way ([`Self::abort_child`], counted by [`Terminating`]). One that
-    /// took its child's loop out of the registry before a shutdown took the registry
-    /// leaves the pass that shutdown must wait for only as it ends, so the shutdown waits
-    /// for every terminate under way first.
-    terminating: Mutex<usize>,
-    /// Told when the last terminate under way has ended.
-    terminates_ended: tokio::sync::Notify,
+    /// Terminates under way ([`TerminateScope`]): each teardown ([`Self::abort_child`]), and
+    /// each terminate cascade for the whole of it, from its start, before it marks its
+    /// subtree, to its end ([`Self::terminate_scope`]). One that took its child's
+    /// loop out of the registry before a shutdown took the registry leaves the pass that
+    /// shutdown must wait for only as it ends, and one between its stops and its teardowns
+    /// still needs the stores to forget its nodes in and hand their knowledge over through:
+    /// so a shutdown waits for every terminate under way before it lets go of them.
+    terminates: Arc<Terminates>,
 }
 
 /// The serve loops retained ([`PerChildLoopManager::spawn_serve_loop`]) and the serves
 /// under way ([`Serving`]), under one lock. A terminate cancels the serves of its child
-/// and takes its loops out in one step ([`PerChildLoopManager::abort_child`]), and a serve
+/// and takes its loops out in one step ([`PerChildLoopManager::stop_child`], or
+/// [`PerChildLoopManager::abort_child`] for a child not stopped first), and a serve
 /// retains its loop only if it is not cancelled, in one step too: so either the terminate
 /// finds the loop, or the serve finds itself cancelled.
 ///
@@ -231,6 +233,12 @@ struct LoopRegistry {
     /// Loops stopped because another was retained in their place under their colon id:
     /// aborted, and awaited by [`PerChildLoopManager::shutdown`].
     stopping: Vec<tokio::task::JoinHandle<()>>,
+    /// Loops a terminate stopped before its first step that can fail
+    /// ([`PerChildLoopManager::stop_child`]), each with the colon id it was retained
+    /// under: aborted, and kept until their child is torn down
+    /// ([`PerChildLoopManager::abort_child`]) — which needs those colon ids, and waits
+    /// for the loops in its pass — or a shutdown awaits them.
+    stopped: Vec<(String, Retained)>,
     /// The serves under way, by number: the bare id of the child served, and whether a
     /// terminate of that child has cancelled the serve.
     serving: HashMap<u64, (String, bool)>,
@@ -347,22 +355,34 @@ impl CrashCascadeSink for ServedCrashSink {
     }
 }
 
-/// One terminate under way ([`PerChildLoopManager::abort_child`]), counted until dropped.
-struct Terminating<'a>(&'a PerChildLoopManager);
+/// The terminates under way ([`PerChildLoopManager::terminate_scope`]).
+#[derive(Default)]
+struct Terminates {
+    under_way: Mutex<usize>,
+    /// Told when the last terminate under way has ended.
+    ended: tokio::sync::Notify,
+    /// Told when a shutdown finds a terminate under way and waits for it: what a test
+    /// watches for, rather than for a shutdown that has not ended yet.
+    #[cfg(test)]
+    waited_for: tokio::sync::Notify,
+}
 
-impl<'a> Terminating<'a> {
-    fn begin(manager: &'a PerChildLoopManager) -> Self {
-        *lock(&manager.terminating) += 1;
-        Self(manager)
+/// One terminate under way, counted until dropped ([`PerChildLoopManager::terminate_scope`]).
+pub struct TerminateScope(Arc<Terminates>);
+
+impl TerminateScope {
+    fn begin(terminates: &Arc<Terminates>) -> Self {
+        *lock(&terminates.under_way) += 1;
+        Self(terminates.clone())
     }
 }
 
-impl Drop for Terminating<'_> {
+impl Drop for TerminateScope {
     fn drop(&mut self) {
-        let mut under_way = lock(&self.0.terminating);
+        let mut under_way = lock(&self.0.under_way);
         *under_way -= 1;
         if *under_way == 0 {
-            self.0.terminates_ended.notify_waiters();
+            self.0.ended.notify_waiters();
         }
     }
 }
@@ -425,26 +445,36 @@ impl ChatRecord for cap_llm::LlmGateway {
 }
 
 /// Where the context engine keeps what it knows of an agent outside the agent's own
-/// workspace, keyed by the agent's id: the shared cap-memory index (turn digests, task
-/// briefs, memory rows, and their vectors), the gateway's record of the provider entry
-/// the agent chats on, and the store of last assembly reports.
-///
-/// The home's knowledge entries are not among them: the memory store keeps them under
-/// the agent's id by design, as it keeps a terminated sub-agent's archive.
+/// workspace, keyed by the agent's id: the shared cap-memory index (turn digests and their
+/// vectors, task briefs, and the memory rows that mirror the status of the agent's knowledge
+/// entries), the gateway's record of the provider entry the agent chats on and the store of
+/// last assembly reports — all forgotten when the agent is terminated —, and the home's
+/// knowledge entries, which are kept: they are history, and the agent's heir takes them over
+/// ([`AgentRecords::hand_over_knowledge`]). The heir recalls them from the knowledge store,
+/// as it recalls its own ([`cap_memory::MemoryStore::recall`]); its memory rows mirror them
+/// once its next turn ends (`PostProcessor::sync_memory_index`).
 #[derive(Clone)]
 struct RecordStores {
     chats: Arc<dyn ChatRecord>,
     memory_index: Option<Arc<dyn cap_memory::SqliteIndex + Send + Sync>>,
     context_store: Arc<crate::context_inspect::ContextSnapshotStore>,
+    /// The home's knowledge entries; `None` when the home keeps none.
+    knowledge: Option<Arc<cap_memory::MemoryStore>>,
 }
 
 /// What [`RecordStores`] hold under one agent's ids, held so it can be forgotten when
-/// the agent is terminated ([`PerChildLoopManager::forget_child`]): its bare id, and the
-/// colon ids it held then.
+/// the agent is terminated ([`PerChildLoopManager::forget_child`]): its bare id, the
+/// colon ids it held then, and the ancestors its knowledge entries may go to.
 #[derive(Clone)]
 struct AgentRecords {
     bare_id: String,
     colon_ids: Vec<String>,
+    /// The agent's ancestors, nearest first, read while the tree still held it
+    /// ([`PerChildLoopManager::ancestors_of`]): the first of them alive at a hand-over takes
+    /// its knowledge entries over. Empty when the tree no longer knew the agent.
+    ancestors: Vec<String>,
+    /// The tree, which tells at each hand-over which ancestors are alive.
+    tree: AgentTreeStore,
     stores: RecordStores,
     log: LogHandle,
 }
@@ -472,7 +502,10 @@ impl AgentRecords {
         self.forget_written();
     }
 
+    /// Forget what the agent's loop wrote under its bare id — its index rows and the entry
+    /// its guest was served by — and hand the knowledge entries it wrote over to its heir.
     fn forget_written(&self) {
+        self.hand_over_knowledge();
         self.stores.chats.forget_agent(&self.bare_id);
         let Some(index) = self.stores.memory_index.as_ref() else {
             return;
@@ -486,6 +519,185 @@ impl AgentRecords {
                 ),
             );
         }
+    }
+}
+
+impl AgentRecords {
+    /// Hand the agent's knowledge entries over to its heir ([`hand_over_along`]): the
+    /// knowledge of a terminated agent is kept, as history, and taken over by the nearest of
+    /// its ancestors alive — not marked terminated — when the hand-over runs (owner decision
+    /// 2026-11-17), which recalls them as its own; each hand-over is logged, with what the
+    /// heir holds since ([`log_keys::PERCHILD_HANDOVER`]). Best effort, as the archive of a
+    /// Sub's memory is: a hand-over that fails is logged, the entries it could not move stay
+    /// under the agent's id — or, when it failed half-way, under the heir's too —, and the
+    /// terminate goes on. The second pass, once the agent's aborted loops have ended, hands
+    /// over again what is under its id; an agent that had no loop has no second pass. The
+    /// teardown of an agent the tree no longer knew hands nothing over, and logs nothing: the
+    /// terminate that removed it read its ancestors while the tree still held it, and its
+    /// teardown and second pass hand over what is the agent's; what is under the id besides
+    /// is an agent's served under it since, or what an agent terminated before v0.1.57 left
+    /// there (known item 1.2).
+    fn hand_over_knowledge(&self) {
+        let Some(knowledge) = self.stores.knowledge.as_ref() else {
+            return;
+        };
+        let alive = |id: &str| {
+            self.tree
+                .get_node(&AgentId(id.to_string()))
+                .is_some_and(|node| node.status != AgentStatus::Terminated)
+        };
+        let outcome = hand_over_along(knowledge, &self.bare_id, &self.ancestors, alive);
+        self.report_hand_over(knowledge, outcome);
+    }
+
+    /// Log what a hand-over of the agent's knowledge entries did ([`Self::hand_over_knowledge`]):
+    /// one that reached an heir on stdout, with what the heir holds since; entries left
+    /// waiting, and a store that failed, on stderr; nothing when the agent held none, or the
+    /// tree no longer knew it.
+    fn report_hand_over(
+        &self,
+        knowledge: &cap_memory::MemoryStore,
+        outcome: Result<HandOverOutcome, HandOverFailure>,
+    ) {
+        match outcome {
+            Ok(HandOverOutcome::Nothing) | Err(HandOverFailure::Unknown) => {}
+            Ok(HandOverOutcome::WithHeir { heir, moved }) => {
+                let held = knowledge.active_count(&heir);
+                self.log.out(
+                    log_keys::PERCHILD_HANDOVER,
+                    format!(
+                        "perchild: the knowledge entries of terminated child {} are handed over \
+                         to {heir} (moved {}, active {}); {heir} holds active entries: {} of \
+                         its own, {} handed over to it",
+                        self.bare_id,
+                        moved.ids.len(),
+                        moved.active,
+                        held.own,
+                        held.handed_over
+                    ),
+                );
+            }
+            Ok(HandOverOutcome::WithMarkedHeir { heir, moved }) => self.log.err(
+                log_keys::PERCHILD_HANDOVER_FAILED,
+                format!(
+                    "perchild: the knowledge entries of terminated child {} (moved {}) wait \
+                     under {heir}, terminated meanwhile: no ancestor above it is alive",
+                    self.bare_id,
+                    moved.ids.len()
+                ),
+            ),
+            Err(HandOverFailure::NoAncestorAlive) => {
+                if !knowledge.list(&self.bare_id).is_empty() {
+                    self.log.err(
+                        log_keys::PERCHILD_HANDOVER_FAILED,
+                        format!(
+                            "perchild: the knowledge entries of terminated child {} stay under \
+                             its id: no ancestor of it is alive",
+                            self.bare_id
+                        ),
+                    );
+                }
+            }
+            Err(HandOverFailure::Store { from, to, error }) => self.log.err(
+                log_keys::PERCHILD_HANDOVER_FAILED,
+                format!(
+                    "perchild: the knowledge entries of terminated child {} are not handed \
+                     over from {from} to {to}: {error:?}",
+                    self.bare_id
+                ),
+            ),
+        }
+    }
+}
+
+/// Where [`hand_over_along`] left the knowledge entries of the agent.
+#[derive(Debug)]
+enum HandOverOutcome {
+    /// The agent held none.
+    Nothing,
+    /// The entries `moved` from the agent's id are with `heir`, alive when checked once they
+    /// were there.
+    WithHeir {
+        heir: String,
+        moved: cap_memory::HandedOver,
+    },
+    /// The entries `moved` from the agent's id wait under `heir`, marked terminated once they
+    /// were there, with no ancestor above it alive — not while the root heads the chain.
+    WithMarkedHeir {
+        heir: String,
+        moved: cap_memory::HandedOver,
+    },
+}
+
+/// Why [`hand_over_along`] left the entries under the agent's id.
+#[derive(Debug)]
+enum HandOverFailure {
+    /// No ancestor is on record: the tree no longer knew the agent at its teardown.
+    Unknown,
+    /// No ancestor on record is alive — not while the root heads the chain.
+    NoAncestorAlive,
+    /// The store could not move the entries `from` holds to `to`.
+    Store {
+        from: String,
+        to: String,
+        error: advance_shared_types::memory::PostProcessorError,
+    },
+}
+
+/// Hand the knowledge entries of `bare_id` over to the first of its `ancestors` (nearest
+/// first) that is `alive` ([`cap_memory::MemoryStore::hand_over`]), and check that heir
+/// again once they are there. A terminate marks an agent terminated before it tears it
+/// down, and hands its entries on when it does: an heir still alive after the hand-over is
+/// marked, if ever, after it, so its own terminate hands the entries on; one marked
+/// meanwhile may have handed its entries on already, so the entries just handed to it go on
+/// from here to the next ancestor alive ([`cap_memory::MemoryStore::hand_over_some`]) — only
+/// those: its own wait for its own teardown, as what a terminate has not torn down keeps its
+/// records. The root is never terminated, so a walk that reaches it ends there.
+fn hand_over_along(
+    knowledge: &cap_memory::MemoryStore,
+    bare_id: &str,
+    ancestors: &[String],
+    alive: impl Fn(&str) -> bool,
+) -> Result<HandOverOutcome, HandOverFailure> {
+    if ancestors.is_empty() {
+        return Err(HandOverFailure::Unknown);
+    }
+    let mut from = bare_id;
+    // What left the agent's id, and the heir marked meanwhile that holds it.
+    let mut first: Option<cap_memory::HandedOver> = None;
+    let mut marked: Option<&str> = None;
+    for heir in ancestors {
+        if !alive(heir) {
+            continue;
+        }
+        let moved = match &first {
+            None => knowledge.hand_over(from, heir),
+            Some(first) => knowledge.hand_over_some(from, heir, &first.ids),
+        }
+        .map_err(|error| HandOverFailure::Store {
+            from: from.to_string(),
+            to: heir.clone(),
+            error,
+        })?;
+        let handed = first.get_or_insert(moved);
+        if handed.ids.is_empty() {
+            return Ok(HandOverOutcome::Nothing);
+        }
+        if alive(heir) {
+            return Ok(HandOverOutcome::WithHeir {
+                heir: heir.clone(),
+                moved: handed.clone(),
+            });
+        }
+        marked = Some(heir.as_str());
+        from = heir.as_str();
+    }
+    match (marked, first) {
+        (Some(heir), Some(moved)) => Ok(HandOverOutcome::WithMarkedHeir {
+            heir: heir.to_string(),
+            moved,
+        }),
+        _ => Err(HandOverFailure::NoAncestorAlive),
     }
 }
 
@@ -535,8 +747,7 @@ impl PerChildLoopManager {
             record_stores: Mutex::new(None),
             sweeps: Mutex::new(Vec::new()),
             forget_at_shutdown: Mutex::new(Vec::new()),
-            terminating: Mutex::new(0),
-            terminates_ended: tokio::sync::Notify::new(),
+            terminates: Arc::new(Terminates::default()),
         }
     }
 
@@ -617,6 +828,7 @@ impl PerChildLoopManager {
             chats: deps.gateway.clone(),
             memory_index: deps.memory_index.clone(),
             context_store: deps.context_store.clone(),
+            knowledge: deps.memory_store.clone(),
         });
         *bound = Some(deps);
     }
@@ -648,23 +860,26 @@ impl PerChildLoopManager {
 
     /// Stop serving children, for an ordered shutdown: no child is served from now
     /// on, every child serve loop is aborted and awaited — with those stopped because
-    /// another took their place — the terminates under way are let end, what terminated
+    /// another took their place, and those a terminate stopped and has not torn down
+    /// yet — the terminates under way are let end, what terminated
     /// children left is forgotten ([`Self::forget_child`]), then the runtime, injector
     /// and context deps are released ([`Self::unbind`]). Idempotent.
     pub async fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        let (retained, stopping) = {
+        let (retained, stopping, stopped) = {
             let mut registry = lock(&self.loops);
             (
                 std::mem::take(&mut registry.retained),
                 std::mem::take(&mut registry.stopping),
+                std::mem::take(&mut registry.stopped),
             )
         };
         for retained in retained.values() {
             retained.handle.abort();
         }
         let handles = retained.into_values().map(|retained| retained.handle);
-        for handle in handles.chain(stopping) {
+        let stopped = stopped.into_iter().map(|(_, stopped)| stopped.handle);
+        for handle in handles.chain(stopping).chain(stopped) {
             let _ = handle.await;
         }
         // A terminate that took its child's loop out of the registry before it was taken
@@ -687,18 +902,30 @@ impl PerChildLoopManager {
         self.unbind();
     }
 
-    /// Wait until no terminate is under way ([`Terminating`]). A terminate does not wait
+    /// Wait until no terminate is under way ([`TerminateScope`]). A terminate does not wait
     /// for anything a shutdown holds: it ends.
     async fn no_terminate_under_way(&self) {
         loop {
-            let ended = self.terminates_ended.notified();
+            let ended = self.terminates.ended.notified();
             let mut ended = std::pin::pin!(ended);
             ended.as_mut().enable();
-            if *lock(&self.terminating) == 0 {
+            if *lock(&self.terminates.under_way) == 0 {
                 return;
             }
+            #[cfg(test)]
+            self.terminates.waited_for.notify_one();
             ended.await;
         }
+    }
+
+    /// Count a terminate as under way until the scope is dropped: a shutdown waits for it
+    /// before it lets go of the stores ([`Self::shutdown`]). The terminate cascade holds one
+    /// for the whole terminate, from its start, before it marks its subtree, to its end
+    /// ([`cap_lifecycle::LoopCascade::terminate_scope`]), so a node stopped before a
+    /// shutdown is still forgotten, and its knowledge handed over, when it is torn down
+    /// after; each teardown holds one too ([`Self::abort_child`]).
+    pub fn terminate_scope(&self) -> TerminateScope {
+        TerminateScope::begin(&self.terminates)
     }
 
     /// Install the tee-slice-T3 reap handle (observer path (ii)).
@@ -763,12 +990,56 @@ impl PerChildLoopManager {
         }
     }
 
+    /// seam (f) terminate, first step: stop the child's serve loops, and tear nothing down.
+    /// In one step under the registry's lock, as [`Self::abort_child`] takes them out:
+    /// cancel the serves of the child under way ([`Self::spawn_serve_loop`]) and abort
+    /// every loop retained for it, taking it out of those retained (so
+    /// `active_loop_count` decrements now) into those stopped, where the child's teardown
+    /// finds it. Nothing else is touched: the child's route and id pair, its mailbox and
+    /// what the context engine keeps under its ids stay as they are — the child holding
+    /// its ids, so no one else is served under them — until [`Self::abort_child`] tears it
+    /// down. A loop stopped here that ends on its own tears nothing down
+    /// ([`RouteCleanup`]), and one that traps reports no crash ([`ServedCrashSink`]): the
+    /// registry no longer retains it. Idempotent.
+    ///
+    /// For the terminate cascade, which stops every loop of the subtree before its first
+    /// step that can fail, and tears each node down only once that node's steps have
+    /// succeeded ([`cap_lifecycle::LoopCascade`]): a terminate that fails part-way leaves no
+    /// loop serving, and tears nothing down of a node it leaves in the tree but what its
+    /// own steps for that node removed (its runs, the messages its mailbox flush took). A
+    /// turn under way when its loop is stopped is cut off.
+    pub fn stop_child(&self, bare_id: &str) {
+        // Root-collision guard, as in `abort_child`: nothing of the root's is touched.
+        if self.routing.agent_kind(&(self.key_resolver)(bare_id)) == Some(AgentKind::Root) {
+            return;
+        }
+        let mut registry = lock(&self.loops);
+        for (served, cancelled) in registry.serving.values_mut() {
+            if served == bare_id {
+                *cancelled = true;
+            }
+        }
+        let mine: Vec<String> = registry
+            .retained
+            .iter()
+            .filter(|(_, retained)| retained.bare_id == bare_id)
+            .map(|(colon, _)| colon.clone())
+            .collect();
+        for colon in mine {
+            if let Some(retained) = registry.retained.remove(&colon) {
+                retained.handle.abort();
+                registry.stopped.push((colon, retained));
+            }
+        }
+    }
+
     /// seam (f) terminate: stop the child's serve loops and tear down its per-child
     /// state, colon-correctly. `terminate_child` hands cascades the BARE id, but the
     /// routing + mailbox are COLON-keyed. In one step under the registry's lock: (1) cancel
     /// the serves of the child under way ([`Self::spawn_serve_loop`]) and abort + REMOVE
     /// every loop retained for it (so `active_loop_count` decrements deterministically, not
-    /// on the async `abort()` landing); (2) when it had loops, reserve the pass that forgets
+    /// on the async `abort()` landing), taking with them those [`Self::stop_child`] stopped
+    /// for it; (2) when it had loops, reserve the pass that forgets
     /// what they write late, for the colon ids it was served under and the one it resolves
     /// to now ([`Self::reserve_pass`]); (3) for each of those ids — each only while it is
     /// the child's or no one's ([`Self::tear_down_under`]) — unregister its route + id-bridge
@@ -786,7 +1057,7 @@ impl PerChildLoopManager {
     /// a rename — so what is under a colon id is torn down only while the id bridge pairs
     /// it with this child or with no one.
     pub fn abort_child(&self, bare_id: &str) {
-        let _under_way = Terminating::begin(self);
+        let _under_way = self.terminate_scope();
         let resolved = (self.key_resolver)(bare_id);
         // Root-collision guard (mirrors `on_child_spawned`'s serve-path guard @below):
         // a child whose bare id mechanically maps onto the ROOT's colon (a guest
@@ -799,6 +1070,8 @@ impl PerChildLoopManager {
         if self.routing.agent_kind(&resolved) == Some(AgentKind::Root) {
             return;
         }
+        // Read while the tree still holds the child: the cascade removes it after this.
+        let ancestors = self.ancestors_of(bare_id);
         let (colons, aborted, pass) = {
             let mut registry = lock(&self.loops);
             for (served, cancelled) in registry.serving.values_mut() {
@@ -812,13 +1085,27 @@ impl PerChildLoopManager {
                 .filter(|(_, retained)| retained.bare_id == bare_id)
                 .map(|(colon, _)| colon.clone())
                 .collect();
-            let mut colons = Vec::new();
+            let mut colons: Vec<String> = Vec::new();
             let mut aborted = Vec::new();
+            // Those a stop took out first ([`Self::stop_child`]): aborted already, and
+            // under colon ids the child still holds.
+            for (colon, stopped) in std::mem::take(&mut registry.stopped) {
+                if stopped.bare_id != bare_id {
+                    registry.stopped.push((colon, stopped));
+                    continue;
+                }
+                aborted.push(stopped.handle);
+                if !colons.contains(&colon) {
+                    colons.push(colon);
+                }
+            }
             for colon in mine {
                 if let Some(retained) = registry.retained.remove(&colon) {
                     retained.handle.abort();
                     aborted.push(retained.handle);
-                    colons.push(colon);
+                    if !colons.contains(&colon) {
+                        colons.push(colon);
+                    }
                 }
             }
             // The id it resolves to now, unless a loop of another child is retained there.
@@ -831,15 +1118,36 @@ impl PerChildLoopManager {
             colons.retain(|colon| self.tear_down_under(bare_id, colon));
             (colons, aborted, pass)
         };
-        self.forget_child(bare_id, &colons, aborted, pass);
+        self.forget_child(bare_id, &colons, aborted, pass, ancestors);
+    }
+
+    /// The ancestors of `bare_id`, nearest first, up to the root: those its knowledge
+    /// entries may go to when it is terminated ([`AgentRecords::hand_over_knowledge`]).
+    /// Read while the tree still holds `bare_id` — the cascade tears a node down before it
+    /// removes it, and removes only leaves, so every ancestor is in the tree too —; empty
+    /// when the tree does not know `bare_id`.
+    fn ancestors_of(&self, bare_id: &str) -> Vec<String> {
+        let mut ancestors = Vec::new();
+        let mut at = self
+            .tree
+            .get_node(&AgentId(bare_id.to_string()))
+            .and_then(|node| node.parent);
+        while let Some(id) = at {
+            if ancestors.len() > self.tree.len() {
+                break;
+            }
+            at = self.tree.get_node(&id).and_then(|node| node.parent);
+            ancestors.push(id.0);
+        }
+        ancestors
     }
 
     /// Whether a terminate of the child `bare_id` may empty the mailbox under `colon`: it
     /// is the child's own or no one's — not the root's, not paired by the id bridge with
     /// another agent, no loop of another child retained under it — as the ids
     /// [`Self::abort_child`] tears down are. For the terminate cascade's mailbox flush,
-    /// which comes after [`Self::abort_child`] and resolves the child's colon id anew from
-    /// its handle ([`crate::client_api_agents::ColonMailboxCascade`]): a child renamed and
+    /// which comes after [`Self::stop_child`] and before [`Self::abort_child`], and
+    /// resolves the child's colon id anew from its handle ([`crate::client_api_agents::ColonMailboxCascade`]): a child renamed and
     /// still served under its old handle's colon id keeps its mailbox when another child
     /// that took that handle is terminated.
     pub fn may_flush(&self, bare_id: &str, colon: &str) -> bool {
@@ -919,7 +1227,9 @@ impl PerChildLoopManager {
     /// The terminated child `bare_id` is gone: forget what the context engine keeps
     /// under its bare id and the colon ids `colons` it held ([`AgentRecords`]), so an
     /// agent created later under the same ids starts with none of it — neither the turns
-    /// the earlier one could recall, nor the provider entry it chatted on.
+    /// the earlier one could recall, nor the provider entry it chatted on — and hand its
+    /// knowledge entries over to the first of its `ancestors` still alive
+    /// ([`Self::ancestors_of`], [`AgentRecords::hand_over_knowledge`]).
     ///
     /// Forgotten here and — when the child had serve loops, `aborted` — once more when
     /// those loops have ended, by the pass the terminate reserved for it before it tore
@@ -942,6 +1252,7 @@ impl PerChildLoopManager {
         colons: &[String],
         aborted: Vec<tokio::task::JoinHandle<()>>,
         pass: Option<ReservedPass>,
+        ancestors: Vec<String>,
     ) {
         let records = {
             let bound = lock(&self.record_stores);
@@ -950,6 +1261,8 @@ impl PerChildLoopManager {
                     let records = AgentRecords {
                         bare_id: bare_id.to_string(),
                         colon_ids: colons.to_vec(),
+                        ancestors,
+                        tree: self.tree.clone(),
                         stores,
                         log: self.log.clone(),
                     };
@@ -1431,10 +1744,11 @@ impl PerChildLoopManager {
     /// collides with another agent's. Then nothing of it is left registered, and `serve`
     /// is never spawned.
     ///
-    /// A terminate ([`Self::abort_child`]) cancels the serves of its child under way and
-    /// takes the child's loops out under the same lock: so either it finds the loop — and
-    /// tears down the route and the id pair registered with it — or the serve finds itself
-    /// cancelled and registers nothing, so no later serve meets a route a cancelled serve
+    /// A terminate ([`Self::stop_child`], [`Self::abort_child`]) cancels the serves of its
+    /// child under way and takes the child's loops out under the same lock: so either it
+    /// finds the loop — and its teardown ([`Self::abort_child`]) tears down the route and
+    /// the id pair registered with it — or the serve finds itself cancelled and registers
+    /// nothing, so no later serve meets a route a cancelled serve
     /// holds. A serve that began after a terminate of its child reads the tree after
     /// that terminate marked the child terminated (the cap-lifecycle cascade marks it
     /// before it stops the child's loop, and a crash of that loop leaves the mark), so the
@@ -1596,10 +1910,11 @@ fn same_workspace(canonical: &Path, workspace: &Path) -> bool {
 
 /// seam (f) glue: a cap-lifecycle [`cap_lifecycle::LoopCascade`] backed by the
 /// [`PerChildLoopManager`]. A `DefaultTerminateController` wired with
-/// `.with_loop_cascade(..)` uses it to abort a terminating child's serve loop + tear
-/// down its colon routing / mailbox. `abort_loop` forwards the BARE tree id
-/// `terminate_child` provides; `PerChildLoopManager::abort_child` finds the loops and the
-/// colon ids the child was served under.
+/// `.with_loop_cascade(..)` uses it to stop a terminating child's serve loop, and to tear
+/// down its colon routing / mailbox / records once the child's own cascade steps have
+/// succeeded. `stop_loop` and `abort_loop` forward the BARE tree id `terminate_child`
+/// provides; `PerChildLoopManager::stop_child` and `PerChildLoopManager::abort_child` find
+/// the loops and the colon ids the child was served under.
 ///
 /// Wired into `advance start` for the terminate controller of the Client API agents
 /// family (`DELETE /client/agents/{id}`), which the pack workflow executor's spawn
@@ -1620,8 +1935,16 @@ impl PerChildLoopCascade {
 }
 
 impl cap_lifecycle::LoopCascade for PerChildLoopCascade {
+    fn stop_loop(&self, agent_id: &str) {
+        self.manager.stop_child(agent_id);
+    }
+
     fn abort_loop(&self, agent_id: &str) {
         self.manager.abort_child(agent_id);
+    }
+
+    fn terminate_scope(&self) -> Option<Box<dyn Send>> {
+        Some(Box::new(self.manager.terminate_scope()))
     }
 }
 
@@ -1995,6 +2318,7 @@ mod tests {
         chats: Arc<Chats>,
         index: Arc<InMemorySqliteIndex>,
         reports: Arc<ContextSnapshotStore>,
+        knowledge: Arc<cap_memory::MemoryStore>,
     }
 
     fn managed() -> Managed {
@@ -2064,10 +2388,12 @@ mod tests {
         let chats = Arc::new(Chats::default());
         let index = Arc::new(InMemorySqliteIndex::default());
         let reports = Arc::new(ContextSnapshotStore::new());
+        let knowledge = Arc::new(cap_memory::MemoryStore::new());
         *lock(&manager.record_stores) = Some(RecordStores {
             chats: chats.clone(),
             memory_index: Some(index.clone()),
             context_store: reports.clone(),
+            knowledge: Some(knowledge.clone()),
         });
         Managed {
             _ws: ws,
@@ -2075,6 +2401,7 @@ mod tests {
             chats,
             index,
             reports,
+            knowledge,
         }
     }
 
@@ -2214,6 +2541,22 @@ mod tests {
             .expect("ends in time")
     }
 
+    /// Drive `shutdown` until it waits for a terminate under way ([`Terminates::waited_for`]),
+    /// within [`WAIT`]: a shutdown that ends first has let go of the stores while a
+    /// terminate was under way.
+    async fn waits_for_a_terminate(
+        manager: &PerChildLoopManager,
+        shutdown: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+    ) {
+        within(async {
+            tokio::select! {
+                () = manager.terminates.waited_for.notified() => {}
+                () = shutdown => panic!("the shutdown ended while a terminate was under way"),
+            }
+        })
+        .await;
+    }
+
     /// Join `thread`, which must end within [`WAIT`].
     fn joined<T>(thread: std::thread::JoinHandle<T>) -> T {
         let deadline = std::time::Instant::now() + WAIT;
@@ -2274,6 +2617,636 @@ mod tests {
             manager.store.get(colon).map(|mailbox| mailbox.depth()),
             Some(0),
             "the mailbox is drained"
+        );
+    }
+
+    /// A knowledge entry of `agent`'s.
+    fn knowledge_of(agent: &str, id: &str, content: &str) -> cap_memory::MemoryEntry {
+        cap_memory::MemoryEntry {
+            id: id.to_string(),
+            agent_id: agent.to_string(),
+            entry_type: cap_memory::MemoryType::Fact,
+            content: content.to_string(),
+            tags: Vec::new(),
+            created_at: "2026-11-17T00:00:00Z".to_string(),
+            task_origin: None,
+            is_active: true,
+            superseded_by: None,
+            status: cap_memory::MemoryStatus::Active,
+            supersession_reason: None,
+            cluster_id: None,
+            sources: Vec::new(),
+        }
+    }
+
+    fn knowledge_ids(home: &Managed, agent: &str) -> Vec<String> {
+        home.knowledge
+            .list(agent)
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    fn mark_terminated(home: &Managed, bare: &str) {
+        home.manager
+            .tree
+            .set_status(&AgentId(bare.to_string()), AgentStatus::Terminated)
+            .expect("the node is in the tree");
+    }
+
+    /// A terminated child's knowledge entries are kept, as history, and taken over by its
+    /// parent (owner decision 2026-11-17): under the parent's id, naming the child.
+    #[tokio::test]
+    async fn a_terminated_child_hands_its_knowledge_over_to_its_parent() {
+        let lines = Arc::new(Lines::default());
+        let mut home = managed();
+        home.manager = home.manager.with_log(LogHandle::new(lines.clone()));
+        home.knowledge
+            .insert("root", knowledge_of("root", "r1", "the root's own"))
+            .expect("insert");
+        home.knowledge
+            .insert("kid", knowledge_of("kid", "k1", "what the child learned"))
+            .expect("insert");
+        mark_terminated(&home, "kid");
+        home.manager.abort_child("kid");
+        assert!(
+            knowledge_ids(&home, "kid").is_empty(),
+            "the child holds none"
+        );
+        assert_eq!(knowledge_ids(&home, "root"), ["r1", "k1"]);
+        let taken = home
+            .knowledge
+            .get("root", "k1")
+            .expect("the parent holds it");
+        assert_eq!(taken.agent_id, "root");
+        assert_eq!(taken.tags, ["from-agent:kid"]);
+        let recalled: Vec<String> = home
+            .knowledge
+            .recall("root", "learned", 10)
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(recalled, ["k1"], "the parent recalls it as its own");
+        assert_eq!(lines.keys(), [log_keys::PERCHILD_HANDOVER]);
+        let line = lines.0.lock().unwrap()[0].1.clone();
+        assert_eq!(
+            line,
+            "perchild: the knowledge entries of terminated child kid are handed over to root \
+             (moved 1, active 1); root holds active entries: 1 of its own, 1 handed over to it"
+        );
+    }
+
+    /// A loop that is in the middle of a step when it is told to stop: it goes on to
+    /// remember one more entry of `agent`'s (`id`) before it reaches an await, where the
+    /// abort ends it. Returns the loop and the sender that lets the step finish.
+    fn remembering_in_a_step(
+        knowledge: &Arc<cap_memory::MemoryStore>,
+        agent: &'static str,
+        id: &'static str,
+    ) -> (tokio::task::JoinHandle<()>, mpsc::Sender<()>) {
+        let (in_step, entered) = mpsc::channel::<()>();
+        let (finish, may_finish) = mpsc::channel::<()>();
+        let knowledge = knowledge.clone();
+        let looping = tokio::spawn(async move {
+            in_step.send(()).expect("the test waits for the step");
+            may_finish
+                .recv_timeout(WAIT)
+                .expect("the test lets the step finish");
+            knowledge
+                .insert(
+                    agent,
+                    knowledge_of(agent, id, "learned at the end of a step"),
+                )
+                .expect("insert");
+            std::future::pending::<()>().await;
+        });
+        entered.recv_timeout(WAIT).expect("the loop is in its step");
+        (looping, finish)
+    }
+
+    /// A subtree's knowledge goes to the agent that outlives it, whichever pass runs last:
+    /// a grandchild's entries — and the one its loop writes late, once its parent, being
+    /// terminated with it, has been torn down — to the root, not to that parent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminated_subtree_hands_its_knowledge_over_to_the_agent_that_outlives_it() {
+        let home = managed();
+        let workspace = home._ws.path().join("root").join("kid").join("gc");
+        std::fs::create_dir_all(&workspace).expect("territory");
+        home.manager
+            .tree
+            .insert_child(
+                &AgentId("kid".to_string()),
+                AgentNode {
+                    id: AgentId("gc".to_string()),
+                    kind: AgentKind::Child,
+                    parent: Some(AgentId("kid".to_string())),
+                    workspace_path: workspace,
+                    capabilities: Vec::new(),
+                    template_ref: None,
+                    status: AgentStatus::Active,
+                },
+            )
+            .expect("grandchild node");
+        home.knowledge
+            .insert(
+                "gc",
+                knowledge_of("gc", "g1", "what the grandchild learned"),
+            )
+            .expect("insert");
+        home.knowledge
+            .insert("kid", knowledge_of("kid", "k1", "what the child learned"))
+            .expect("insert");
+        let (looping, finish) = remembering_in_a_step(&home.knowledge, "gc", "g-late");
+        route(&home.manager, "gc", "agent:gc");
+        retain_running(&home.manager, "gc", "agent:gc", looping);
+        mark_terminated(&home, "kid");
+        mark_terminated(&home, "gc");
+
+        // Post-order, each node torn down and then removed, as the cascade does.
+        home.manager.abort_child("gc");
+        let pass = pending_pass(&home.manager, "agent:gc");
+        home.manager
+            .tree
+            .remove(&AgentId("gc".to_string()))
+            .expect("a leaf");
+        home.manager.abort_child("kid");
+        home.manager
+            .tree
+            .remove(&AgentId("kid".to_string()))
+            .expect("a leaf");
+        assert_eq!(knowledge_ids(&home, "root"), ["g1", "k1"]);
+
+        finish.send(()).expect("the loop is still in its step");
+        within(closed(pass)).await;
+        assert!(knowledge_ids(&home, "gc").is_empty());
+        assert!(
+            knowledge_ids(&home, "kid").is_empty(),
+            "nothing goes to the parent terminated with it"
+        );
+        assert_eq!(knowledge_ids(&home, "root"), ["g1", "k1", "g-late"]);
+        let tags = |id: &str| home.knowledge.get("root", id).expect("held").tags;
+        assert_eq!(tags("g1"), ["from-agent:gc"]);
+        assert_eq!(tags("k1"), ["from-agent:kid"]);
+        assert_eq!(tags("g-late"), ["from-agent:gc"]);
+    }
+
+    /// A loop in the middle of a step when its child is terminated may write a knowledge
+    /// entry after the first pass: the second pass, once the loop has ended, hands it over
+    /// too — nothing is left under the child's id for an agent served there later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_knowledge_entry_written_late_is_handed_over_by_the_second_pass() {
+        let home = managed();
+        home.knowledge
+            .insert("kid", knowledge_of("kid", "k1", "what the child learned"))
+            .expect("insert");
+        let (looping, finish) = remembering_in_a_step(&home.knowledge, "kid", "late");
+        route(&home.manager, "kid", "agent:kid");
+        retain_running(&home.manager, "kid", "agent:kid", looping);
+        mark_terminated(&home, "kid");
+
+        home.manager.abort_child("kid");
+        assert_eq!(knowledge_ids(&home, "root"), ["k1"], "the first pass");
+        let pass = pending_pass(&home.manager, "agent:kid");
+        finish.send(()).expect("the loop is still in its step");
+        within(closed(pass)).await;
+        assert!(knowledge_ids(&home, "kid").is_empty(), "nothing is left");
+        assert_eq!(knowledge_ids(&home, "root"), ["k1", "late"]);
+    }
+
+    /// Add the grandchild `gc` below `kid` to the tree of `home`.
+    fn add_grandchild(home: &Managed) {
+        let workspace = home._ws.path().join("root").join("kid").join("gc");
+        std::fs::create_dir_all(&workspace).expect("territory");
+        home.manager
+            .tree
+            .insert_child(
+                &AgentId("kid".to_string()),
+                AgentNode {
+                    id: AgentId("gc".to_string()),
+                    kind: AgentKind::Child,
+                    parent: Some(AgentId("kid".to_string())),
+                    workspace_path: workspace,
+                    capabilities: Vec::new(),
+                    template_ref: None,
+                    status: AgentStatus::Active,
+                },
+            )
+            .expect("grandchild node");
+    }
+
+    /// The heir is found again at each hand-over: a grandchild terminated alone hands its
+    /// entries to its parent; once that parent has been terminated and torn down too — with
+    /// no loop, so with no second pass of its own —, the entry the grandchild's loop wrote
+    /// late goes to the root, not to the parent's id, which no agent holds any more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_entry_goes_past_an_heir_torn_down_since_the_first_pass() {
+        let home = managed();
+        add_grandchild(&home);
+        home.knowledge
+            .insert(
+                "gc",
+                knowledge_of("gc", "g1", "what the grandchild learned"),
+            )
+            .expect("insert");
+        home.knowledge
+            .insert("kid", knowledge_of("kid", "k1", "what the child learned"))
+            .expect("insert");
+        let (looping, finish) = remembering_in_a_step(&home.knowledge, "gc", "g-late");
+        route(&home.manager, "gc", "agent:gc");
+        retain_running(&home.manager, "gc", "agent:gc", looping);
+
+        mark_terminated(&home, "gc");
+        home.manager.abort_child("gc");
+        let pass = pending_pass(&home.manager, "agent:gc");
+        home.manager
+            .tree
+            .remove(&AgentId("gc".to_string()))
+            .expect("a leaf");
+        assert_eq!(knowledge_ids(&home, "kid"), ["k1", "g1"], "its parent's");
+
+        mark_terminated(&home, "kid");
+        home.manager.abort_child("kid");
+        home.manager
+            .tree
+            .remove(&AgentId("kid".to_string()))
+            .expect("a leaf");
+        assert_eq!(knowledge_ids(&home, "root"), ["k1", "g1"]);
+
+        finish.send(()).expect("the loop is still in its step");
+        within(closed(pass)).await;
+        assert!(knowledge_ids(&home, "gc").is_empty());
+        assert!(
+            knowledge_ids(&home, "kid").is_empty(),
+            "nothing goes to an agent torn down"
+        );
+        assert_eq!(knowledge_ids(&home, "root"), ["k1", "g1", "g-late"]);
+    }
+
+    /// An heir marked terminated since the first pass — its terminate stopped part-way and
+    /// left it in the tree for a retry — is passed over: the entry written late goes to the
+    /// next ancestor alive, and the heir keeps its own entries until its own teardown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_entry_passes_over_an_heir_marked_terminated_since_the_first_pass() {
+        let home = managed();
+        add_grandchild(&home);
+        home.knowledge
+            .insert("kid", knowledge_of("kid", "k1", "what the child learned"))
+            .expect("insert");
+        let (looping, finish) = remembering_in_a_step(&home.knowledge, "gc", "g-late");
+        route(&home.manager, "gc", "agent:gc");
+        retain_running(&home.manager, "gc", "agent:gc", looping);
+        mark_terminated(&home, "gc");
+        home.manager.abort_child("gc");
+        let pass = pending_pass(&home.manager, "agent:gc");
+        home.manager
+            .tree
+            .remove(&AgentId("gc".to_string()))
+            .expect("a leaf");
+
+        mark_terminated(&home, "kid");
+        finish.send(()).expect("the loop is still in its step");
+        within(closed(pass)).await;
+        assert_eq!(knowledge_ids(&home, "root"), ["g-late"]);
+        assert_eq!(
+            knowledge_ids(&home, "kid"),
+            ["k1"],
+            "the heir passed over keeps its own"
+        );
+
+        home.manager.abort_child("kid");
+        assert_eq!(knowledge_ids(&home, "root"), ["g-late", "k1"]);
+    }
+
+    /// An heir marked terminated between a hand-over to it and the check after — its own
+    /// terminate may have handed its entries on already — has the entries just handed to it
+    /// handed on, to the next ancestor alive, and only those: its own wait for its own
+    /// teardown.
+    #[test]
+    fn an_heir_terminated_during_a_hand_over_hands_on_only_the_entries_just_handed_to_it() {
+        let knowledge = cap_memory::MemoryStore::new();
+        knowledge
+            .insert("kid", knowledge_of("kid", "k1", "the heir's own"))
+            .expect("insert");
+        knowledge
+            .insert("gc", knowledge_of("gc", "g1", "the grandchild's"))
+            .expect("insert");
+        let checks = std::sync::Mutex::new(Vec::<String>::new());
+        let alive = |id: &str| {
+            let mut checks = checks.lock().unwrap();
+            checks.push(id.to_string());
+            // Alive when it is chosen; marked terminated by the time it is checked again.
+            !(id == "kid" && checks.iter().filter(|seen| *seen == "kid").count() > 1)
+        };
+        let ancestors = ["kid".to_string(), "root".to_string()];
+        let outcome = hand_over_along(&knowledge, "gc", &ancestors, alive);
+        assert!(
+            matches!(
+                &outcome,
+                Ok(HandOverOutcome::WithHeir { heir, moved }) if heir == "root" && moved.ids == ["g1"]
+            ),
+            "{outcome:?}"
+        );
+        assert!(knowledge.list("gc").is_empty());
+        assert_eq!(
+            ids_of(&knowledge, "kid"),
+            ["k1"],
+            "its own wait for its own teardown"
+        );
+        assert_eq!(ids_of(&knowledge, "root"), ["g1"]);
+        assert_eq!(*checks.lock().unwrap(), ["kid", "kid", "root", "root"]);
+    }
+
+    fn ids_of(knowledge: &cap_memory::MemoryStore, agent: &str) -> Vec<String> {
+        knowledge
+            .list(agent)
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    /// With no ancestor on record, or none alive, nothing moves; the entries handed to an
+    /// heir marked once it held them wait under it when no ancestor above it is alive; and
+    /// an agent that holds none hands nothing over.
+    #[test]
+    fn a_hand_over_without_an_heir_alive_leaves_the_entries_where_they_are() {
+        let knowledge = cap_memory::MemoryStore::new();
+        knowledge
+            .insert("gc", knowledge_of("gc", "g1", "the grandchild's"))
+            .expect("insert");
+        let ancestors = ["kid".to_string(), "root".to_string()];
+        assert!(matches!(
+            hand_over_along(&knowledge, "gc", &[], |_| true),
+            Err(HandOverFailure::Unknown)
+        ));
+        assert!(matches!(
+            hand_over_along(&knowledge, "gc", &ancestors, |_| false),
+            Err(HandOverFailure::NoAncestorAlive)
+        ));
+        assert_eq!(ids_of(&knowledge, "gc"), ["g1"]);
+
+        // kid is alive when chosen and marked by the time it is checked again; the root is
+        // never alive here.
+        let checked = std::sync::Mutex::new(0);
+        let alive = |id: &str| {
+            id == "kid" && {
+                let mut checked = checked.lock().unwrap();
+                *checked += 1;
+                *checked == 1
+            }
+        };
+        let outcome = hand_over_along(&knowledge, "gc", &ancestors, alive);
+        assert!(
+            matches!(
+                &outcome,
+                Ok(HandOverOutcome::WithMarkedHeir { heir, moved }) if heir == "kid" && moved.ids == ["g1"]
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(ids_of(&knowledge, "kid"), ["g1"]);
+        assert!(matches!(
+            hand_over_along(&knowledge, "gc", &ancestors, |_| true),
+            Ok(HandOverOutcome::Nothing)
+        ));
+    }
+
+    /// Records the stream and key of each line it is given.
+    #[derive(Default)]
+    struct Streams(Mutex<Vec<(crate::api::LogStream, &'static str)>>);
+
+    impl crate::api::ComposeLog for Streams {
+        fn line(&self, line: &crate::api::ComposeLogLine) {
+            self.0.lock().unwrap().push((line.stream, line.key));
+        }
+
+        fn ready(&self, line: &crate::api::ComposeLogLine) -> std::io::Result<()> {
+            self.line(line);
+            Ok(())
+        }
+    }
+
+    /// Each outcome of a hand-over is logged where it belongs: one that reached an heir on
+    /// stdout; entries left waiting under an heir marked meanwhile, or under the agent's id
+    /// with no ancestor alive, and a store that failed, on stderr; nothing when the agent held
+    /// none — with no ancestor alive either — or the tree no longer knew it.
+    #[tokio::test]
+    async fn each_hand_over_outcome_is_logged_where_it_belongs() {
+        use crate::api::LogStream::{Stderr, Stdout};
+        let home = managed();
+        let streams = Arc::new(Streams::default());
+        let records = AgentRecords {
+            bare_id: "kid".to_string(),
+            colon_ids: vec![],
+            ancestors: vec!["root".to_string()],
+            tree: home.manager.tree.clone(),
+            stores: RecordStores {
+                chats: home.chats.clone(),
+                memory_index: None,
+                context_store: home.reports.clone(),
+                knowledge: Some(home.knowledge.clone()),
+            },
+            log: LogHandle::new(streams.clone()),
+        };
+        let moved = cap_memory::HandedOver {
+            ids: vec!["k1".to_string()],
+            gained: 1,
+            active: 1,
+        };
+        let logged = |outcome| {
+            streams.0.lock().unwrap().clear();
+            records.report_hand_over(&home.knowledge, outcome);
+            streams.0.lock().unwrap().clone()
+        };
+        assert!(logged(Ok(HandOverOutcome::Nothing)).is_empty());
+        assert!(logged(Err(HandOverFailure::Unknown)).is_empty());
+        assert!(
+            logged(Err(HandOverFailure::NoAncestorAlive)).is_empty(),
+            "the agent holds none"
+        );
+        assert_eq!(
+            logged(Ok(HandOverOutcome::WithHeir {
+                heir: "root".to_string(),
+                moved: moved.clone(),
+            })),
+            [(Stdout, log_keys::PERCHILD_HANDOVER)]
+        );
+        assert_eq!(
+            logged(Ok(HandOverOutcome::WithMarkedHeir {
+                heir: "mid".to_string(),
+                moved,
+            })),
+            [(Stderr, log_keys::PERCHILD_HANDOVER_FAILED)]
+        );
+        assert_eq!(
+            logged(Err(HandOverFailure::Store {
+                from: "kid".to_string(),
+                to: "root".to_string(),
+                error: advance_shared_types::memory::PostProcessorError::LimitExceeded,
+            })),
+            [(Stderr, log_keys::PERCHILD_HANDOVER_FAILED)]
+        );
+        home.knowledge
+            .insert("kid", knowledge_of("kid", "k1", "what the child learned"))
+            .expect("insert");
+        assert_eq!(
+            logged(Err(HandOverFailure::NoAncestorAlive)),
+            [(Stderr, log_keys::PERCHILD_HANDOVER_FAILED)]
+        );
+    }
+
+    /// A shutdown that comes while a terminate's scope is held — between its stop of a node
+    /// and the node's teardown — waits for the scope: the node is forgotten, and its
+    /// knowledge handed over, while the stores are still bound; only then does the shutdown
+    /// let go of them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_waits_for_a_terminate_between_its_stops_and_its_teardowns() {
+        let home = managed();
+        home.knowledge
+            .insert("kid", knowledge_of("kid", "k1", "what the child learned"))
+            .expect("insert");
+        let looping = tokio::spawn(std::future::pending::<()>());
+        route(&home.manager, "kid", "agent:kid");
+        retain_running(&home.manager, "kid", "agent:kid", looping);
+        mark_terminated(&home, "kid");
+        let scope = home.manager.terminate_scope();
+        home.manager.stop_child("kid");
+
+        let shutdown = home.manager.shutdown();
+        let mut shutdown = std::pin::pin!(shutdown);
+        waits_for_a_terminate(&home.manager, shutdown.as_mut()).await;
+        home.manager.abort_child("kid");
+        drop(scope);
+        within(shutdown).await;
+        assert!(knowledge_ids(&home, "kid").is_empty());
+        assert_eq!(
+            knowledge_ids(&home, "root"),
+            ["k1"],
+            "handed over while the stores were bound"
+        );
+    }
+
+    /// A child the tree no longer knows when it is torn down — the terminate that removed it
+    /// hands its knowledge over — hands nothing over and raises no alarm: what is under its
+    /// id stays.
+    #[tokio::test]
+    async fn a_child_the_tree_no_longer_knows_keeps_its_knowledge_and_logs_nothing() {
+        let lines = Arc::new(Lines::default());
+        let mut home = managed();
+        home.manager = home.manager.with_log(LogHandle::new(lines.clone()));
+        home.knowledge
+            .insert("ghost", knowledge_of("ghost", "x1", "an orphan's"))
+            .expect("insert");
+        home.manager.abort_child("ghost");
+        assert_eq!(knowledge_ids(&home, "ghost"), ["x1"]);
+        assert!(knowledge_ids(&home, "root").is_empty());
+        assert!(lines.keys().is_empty(), "{:?}", lines.keys());
+    }
+
+    /// A grant revoke that holds the terminate it is a step of until the test lets it go.
+    struct HeldRevoke {
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl cap_lifecycle::GrantCascadeRevoke for HeldRevoke {
+        fn revoke_for_agent(&self, _agent_id: &str) -> Result<(), cap_lifecycle::LifecycleError> {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            let _ = self.release.lock().unwrap().recv();
+            Ok(())
+        }
+    }
+
+    /// The other cascade steps, which do nothing.
+    struct NoSteps;
+
+    impl cap_lifecycle::MailboxCascade for NoSteps {
+        fn flush_mailbox(&self, _agent_id: &str) -> Result<(), cap_lifecycle::LifecycleError> {
+            Ok(())
+        }
+
+        fn notify_parent_crash(
+            &self,
+            _parent_id: &str,
+            _child_id: &str,
+            _reason: &str,
+        ) -> Result<(), cap_lifecycle::LifecycleError> {
+            Ok(())
+        }
+    }
+
+    impl cap_lifecycle::RunCascade for NoSteps {
+        fn ensure_run(&self, _agent_id: &str) -> Result<(), cap_lifecycle::LifecycleError> {
+            Ok(())
+        }
+
+        fn cancel_run(&self, _agent_id: &str) -> Result<(), cap_lifecycle::LifecycleError> {
+            Ok(())
+        }
+    }
+
+    impl cap_lifecycle::WorkspaceCleanup for NoSteps {
+        fn remove_sub_workspace(
+            &self,
+            _workspace_path: &std::path::Path,
+        ) -> Result<(), cap_lifecycle::LifecycleError> {
+            Ok(())
+        }
+    }
+
+    /// The production terminate — `DefaultTerminateController` with this module's
+    /// [`PerChildLoopCascade`] — holds its scope while a step of it blocks: a shutdown that
+    /// comes then waits for it, and the child's knowledge is handed over while the stores
+    /// are bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_waits_for_a_production_terminate_held_up_in_a_step() {
+        use cap_lifecycle::TerminateController;
+        let Managed {
+            _ws,
+            manager,
+            knowledge,
+            ..
+        } = managed();
+        let manager = Arc::new(manager);
+        knowledge
+            .insert("kid", knowledge_of("kid", "k1", "what the child learned"))
+            .expect("insert");
+        route(&manager, "kid", "agent:kid");
+        retain_running(
+            &manager,
+            "kid",
+            "agent:kid",
+            tokio::spawn(std::future::pending::<()>()),
+        );
+        let (entered, held) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let steps = Arc::new(NoSteps);
+        let controller = cap_lifecycle::DefaultTerminateController::new(
+            manager.tree.clone(),
+            Arc::new(HeldRevoke {
+                entered: Mutex::new(Some(entered)),
+                release: Mutex::new(released),
+            }),
+            steps.clone(),
+            steps.clone(),
+            steps,
+        )
+        .with_loop_cascade(Arc::new(PerChildLoopCascade::new(manager.clone())));
+        let terminate = std::thread::spawn(move || controller.terminate_child("root", "kid"));
+        held.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the terminate reaches its grant revoke");
+
+        let shutdown = manager.shutdown();
+        let mut shutdown = std::pin::pin!(shutdown);
+        waits_for_a_terminate(&manager, shutdown.as_mut()).await;
+        release.send(()).expect("the revoke waits");
+        joined(terminate).expect("the terminate succeeds");
+        within(shutdown).await;
+        assert!(knowledge.list("kid").is_empty());
+        assert_eq!(
+            ids_of(&knowledge, "root"),
+            ["k1"],
+            "handed over while the stores were bound"
         );
     }
 
@@ -2819,6 +3792,7 @@ mod tests {
             chats: chats.clone(),
             memory_index: Some(home.index.clone()),
             context_store: home.reports.clone(),
+            knowledge: Some(home.knowledge.clone()),
         });
         add_child(&home, "newcomer");
         let (looping, finish, written) = loop_in_a_step(&home.index, "kid");
@@ -3019,6 +3993,7 @@ mod tests {
             chats: chats.clone(),
             memory_index: Some(home.index.clone()),
             context_store: home.reports.clone(),
+            knowledge: Some(home.knowledge.clone()),
         });
         home.index.upsert_turn(turn_of("kid", 1));
         let (looping, finish, written) = loop_in_a_step(&home.index, "kid");
@@ -3039,7 +4014,7 @@ mod tests {
             let manager = manager.clone();
             async move { manager.shutdown().await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        within(manager.terminates.waited_for.notified()).await;
         assert!(
             !shutting_down.is_finished(),
             "the shutdown waits for the terminate under way"
@@ -3113,7 +4088,7 @@ mod tests {
             }
         })
         .await;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        within(manager.terminates.waited_for.notified()).await;
         assert!(
             !shutting_down.is_finished(),
             "the shutdown waits for the terminate under way"
@@ -3148,6 +4123,7 @@ mod tests {
             chats: chats.clone(),
             memory_index: Some(home.index.clone()),
             context_store: home.reports.clone(),
+            knowledge: Some(home.knowledge.clone()),
         });
         home.index.upsert_turn(turn_of("kid", 1));
         let manager = Arc::new(home.manager);
@@ -3989,5 +4965,141 @@ mod tests {
             written.load(Ordering::SeqCst),
             "the loop ended its step before the shutdown returned"
         );
+    }
+
+    /// A terminate stops every loop of the subtree before its first step that can fail,
+    /// and tears a node down only once that node's steps have succeeded (MODULE-005
+    /// terminate-child flow). The stop cuts off a turn under way and tears nothing down: the
+    /// child's route and id pair, the message waiting in its mailbox, its rows, its report
+    /// and where it chats all stay until its teardown — and it leaves the loops of other
+    /// children alone. The teardown takes them, and its pass waits for the loop the stop
+    /// aborted, which may still be in a step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_child_keeps_its_route_mailbox_and_records_until_it_is_torn_down() {
+        let home = managed();
+        home.index.upsert_turn(turn_of("kid", 1));
+        home.reports.register_aliases(&aliases("kid"));
+        home.reports
+            .record(crate::context_inspect::test_report("agent:kid", 100));
+        route(&home.manager, "kid", "agent:kid");
+        let (looping, finish, written) = loop_in_a_step(&home.index, "kid");
+        retain_running(&home.manager, "kid", "agent:kid", looping);
+        retain_running(
+            &home.manager,
+            "other",
+            "agent:other",
+            tokio::spawn(std::future::pending::<()>()),
+        );
+
+        home.manager.stop_child("kid");
+        home.manager.stop_child("kid");
+        assert_eq!(served_under(&home.manager, "agent:kid"), None, "stopped");
+        assert_eq!(
+            home.manager.active_loop_count(),
+            1,
+            "the other child's runs"
+        );
+        assert_eq!(
+            served_under(&home.manager, "agent:other").as_deref(),
+            Some("other")
+        );
+        assert_eq!(lock(&home.manager.loops).stopped.len(), 1, "stopped once");
+        assert_eq!(
+            home.manager.routing.agent_kind("agent:kid"),
+            Some(AgentKind::Child),
+            "its route stays"
+        );
+        assert_eq!(
+            home.manager.bridge.resolve_owned("agent:kid"),
+            Some(("kid".to_string(), "agent:kid".to_string())),
+            "its id pair stays"
+        );
+        assert_eq!(
+            home.manager
+                .store
+                .get("agent:kid")
+                .map(|mailbox| mailbox.depth()),
+            Some(1),
+            "its message waits"
+        );
+        assert_eq!(turns_of(&home.index, "kid"), 1, "its rows stay");
+        assert!(
+            home.reports.snapshot("agent:kid").is_some(),
+            "its report stays"
+        );
+        assert!(home.chats.forgotten().is_empty(), "where it chats stays");
+        assert!(lock(&home.manager.sweeps).is_empty(), "no pass is pending");
+
+        home.manager.abort_child("kid");
+        assert_unrouted(&home.manager, "kid", "agent:kid");
+        assert_eq!(turns_of(&home.index, "kid"), 0, "forgotten at its teardown");
+        assert!(home.reports.snapshot("agent:kid").is_none());
+        assert!(lock(&home.manager.loops).stopped.is_empty());
+        let pass = pending_pass(&home.manager, "agent:kid");
+        assert!(
+            pass.has_changed().is_ok(),
+            "the stopped loop has not ended yet"
+        );
+        finish.send(()).expect("the loop is still in its step");
+        within(closed(pass)).await;
+        assert!(written.load(Ordering::SeqCst), "the step wrote its row");
+        assert_eq!(turns_of(&home.index, "kid"), 0, "and the row is forgotten");
+        assert_eq!(home.chats.forgotten(), ["kid", "kid"]);
+        assert_eq!(
+            served_under(&home.manager, "agent:other").as_deref(),
+            Some("other")
+        );
+    }
+
+    /// A stop cancels the serves of its child under way, as a terminate does: a serve that
+    /// comes to retain its loop after the stop finds itself cancelled, and registers
+    /// nothing.
+    #[tokio::test]
+    async fn a_stop_cancels_the_serves_of_its_child_under_way() {
+        let home = managed();
+        let serving = Serving::begin(&home.manager, "kid");
+        home.manager.stop_child("kid");
+        assert!(!home.manager.spawn_serve_loop(
+            &serving,
+            "kid",
+            "agent:kid".to_string(),
+            Some("agent:root"),
+            || {},
+            std::future::pending::<()>(),
+        ));
+        assert_not_registered(&home.manager, "kid", "agent:kid");
+        assert_eq!(home.manager.active_loop_count(), 0);
+        assert!(lock(&home.manager.loops).stopped.is_empty());
+    }
+
+    /// A loop a terminate stopped can be in the middle of a step, its child not torn down
+    /// yet — the terminate failed after the stop: a shutdown waits for it to end, as for
+    /// the loops it stops itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_waits_for_a_loop_a_terminate_stopped() {
+        let home = managed();
+        let (looping, finish, written) = loop_in_a_step(&home.index, "kid");
+        retain_running(&home.manager, "kid", "agent:kid", looping);
+        home.manager.stop_child("kid");
+
+        let manager = Arc::new(home.manager);
+        let shutting_down = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.shutdown().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !shutting_down.is_finished(),
+            "the shutdown waits for the stopped loop, in its step"
+        );
+        finish.send(()).expect("the loop is still in its step");
+        within(shutting_down)
+            .await
+            .expect("the shutdown ends without a panic");
+        assert!(
+            written.load(Ordering::SeqCst),
+            "the loop ended its step before the shutdown returned"
+        );
+        assert!(lock(&manager.loops).stopped.is_empty());
     }
 }

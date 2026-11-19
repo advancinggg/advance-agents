@@ -304,6 +304,49 @@ async fn module_011_t39_sync_memory_index_mirrors_all_5_statuses() {
     assert_eq!(by_id.get("e5"), Some(&"forgotten".to_owned()));
 }
 
+/// The entries a terminated agent hands over to its heir ([`MemoryStore::hand_over`]) are
+/// mirrored under the heir by its next sync, as its own are; the agent's own rows go with
+/// the index's `forget_agent` at its terminate.
+#[tokio::test]
+async fn module_011_entries_handed_over_are_mirrored_under_the_heir_at_its_next_sync() {
+    let store = Arc::new(MemoryStore::new());
+    let components = components_with_store(Arc::clone(&store));
+    let mut own = base_active_entry("r1");
+    own.agent_id = "root".into();
+    store.insert("root", own).expect("insert");
+    let mut learned = base_active_entry("k1");
+    learned.agent_id = "kid".into();
+    store.insert("kid", learned).expect("insert");
+    components.sync_memory_index("kid");
+    components.sync_memory_index("root");
+
+    store.hand_over("kid", "root").expect("hand over");
+    components
+        .sqlite_index
+        .forget_agent("kid")
+        .expect("forget the agent's rows");
+    components.sync_memory_index("root");
+
+    let mut rows: Vec<(String, String)> = components
+        .sqlite_index
+        .list_memory_for_agent("root")
+        .into_iter()
+        .map(|r| (r.memory_id, r.epistemic_status))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        [
+            ("k1".to_owned(), "active".to_owned()),
+            ("r1".to_owned(), "active".to_owned())
+        ]
+    );
+    assert!(components
+        .sqlite_index
+        .list_memory_for_agent("kid")
+        .is_empty());
+}
+
 // ────────────────────────────────────────────────────────────────────
 // T40 — AC-27 sync_task_index brief-change gate
 // ────────────────────────────────────────────────────────────────────

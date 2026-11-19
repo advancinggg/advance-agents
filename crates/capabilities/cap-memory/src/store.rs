@@ -18,7 +18,7 @@
 //! (wired via `Components::register_agent_memory`) so reads via WIT see the
 //! writes Step 5 made.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
@@ -90,6 +90,198 @@ pub const DEFAULT_MAX_ACTIVE_PER_AGENT: usize = 10_000;
 /// (WIT `remember` caps content at 1 MiB; L6 syntheses are far smaller).
 pub const MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 
+/// The tag by which an entry handed over to another agent names the agent that wrote it
+/// ([`MemoryStore::hand_over`]): `from-agent:<agent id>`. The store's own: [`MemoryStore::insert`]
+/// and a supersede refuse an entry with a tag that reads as one once spelt plainly (in any ASCII
+/// case, in styled or full-width letters, past invisible code points, with a look-alike colon or
+/// hyphen), so no agent can name another as the origin of what it writes, and the post-processor
+/// drops such a tag from the entries a model extracts before it writes them. The store reads
+/// it exactly ([`handed_over_from`]); an entry written before v0.1.57 with such a tag of its
+/// guest's keeps it, and reads as handed over.
+pub const FROM_AGENT_TAG_PREFIX: &str = "from-agent:";
+
+/// The agent `entry` was handed over from — the agent that wrote it — when it was handed over
+/// ([`FROM_AGENT_TAG_PREFIX`]).
+pub fn handed_over_from(entry: &MemoryEntry) -> Option<&str> {
+    entry
+        .tags
+        .iter()
+        .find_map(|t| t.strip_prefix(FROM_AGENT_TAG_PREFIX))
+}
+
+/// Whether `tag` reads as a [`FROM_AGENT_TAG_PREFIX`] tag once spelt plainly ([`plain`]): in
+/// any ASCII case; in full-width forms or mathematical alphanumeric letters (styled forms of
+/// the plain ones); past the default-ignorable — invisible — code points; with one of the
+/// colons listed for its colon; and with a run of the dashes, hyphens, underscores and blanks
+/// listed for its hyphen (White_Space, and the braille pattern blank) — those at the start and
+/// those before the colon skipped. Letters of other scripts, accented letters, other styled
+/// forms (circled, small capitals, …) and other signs that only look like a blank or a dash
+/// (box drawing, CJK letters, …) are not chased: the store reads the prefix exactly
+/// ([`handed_over_from`]), so such a tag is one of the writer's own, which names no agent to
+/// the store.
+pub(crate) fn reads_as_handed_over(tag: &str) -> bool {
+    let prefix = FROM_AGENT_TAG_PREFIX;
+    let mut folded = String::with_capacity(prefix.len() + 4);
+    for c in tag.chars() {
+        let c = match plain(c) {
+            Plain::Invisible => continue,
+            Plain::Separator => {
+                // Skipped at the start; a run reads as one hyphen.
+                if !folded.is_empty() && !folded.ends_with('-') {
+                    folded.push('-');
+                }
+                continue;
+            }
+            Plain::Colon => {
+                // The separators before a colon are dropped.
+                while folded.ends_with('-') {
+                    folded.pop();
+                }
+                ':'
+            }
+            Plain::Char(c) => c,
+        };
+        folded.push(c);
+        // Only separators at its end are ever dropped, so what is folded so far stays as it
+        // is once it ends in something else.
+        if folded.len() >= prefix.len() {
+            break;
+        }
+    }
+    folded.starts_with(prefix)
+}
+
+/// What a character of a tag is once spelt plainly ([`reads_as_handed_over`]).
+enum Plain {
+    /// A default-ignorable code point: a reader does not see it.
+    Invisible,
+    /// A dash, hyphen, minus, underscore or blank of those listed.
+    Separator,
+    /// A colon of those listed.
+    Colon,
+    /// Anything else, an ASCII letter in lower case.
+    Char(char),
+}
+
+/// `c` spelt plainly: a full-width form, or a mathematical alphanumeric letter — or one of the
+/// letterlike symbols that stand in that block for a letter of the prefix —, as its ASCII
+/// character; then classed ([`Plain`]).
+fn plain(c: char) -> Plain {
+    let c = match c {
+        // The full-width forms of ASCII letters and signs (U+FF01..=U+FF5E).
+        '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+        // The mathematical alphanumeric letters: thirteen styles of A–Z then a–z.
+        '\u{1D400}'..='\u{1D6A3}' => {
+            let k = (c as u32 - 0x1D400) % 52;
+            char::from_u32(if k < 26 {
+                'A' as u32 + k
+            } else {
+                'a' as u32 + k - 26
+            })
+            .unwrap_or(c)
+        }
+        // The letterlike symbols that stand in that block for letters of the prefix.
+        '\u{2130}' => 'E',
+        '\u{2131}' => 'F',
+        '\u{2133}' => 'M',
+        '\u{2115}' => 'N',
+        '\u{211B}'..='\u{211D}' => 'R',
+        '\u{210A}' => 'g',
+        '\u{212F}' => 'e',
+        '\u{2134}' => 'o',
+        c => c,
+    };
+    match c {
+        c if is_default_ignorable(c) => Plain::Invisible,
+        ':' | '\u{02D0}' | '\u{02F8}' | '\u{0589}' | '\u{05C3}' | '\u{0703}' | '\u{0704}'
+        | '\u{0903}' | '\u{0A83}' | '\u{16EC}' | '\u{1803}' | '\u{1809}' | '\u{205A}'
+        | '\u{2236}' | '\u{A4FD}' | '\u{A789}' | '\u{FE13}' | '\u{FE30}' | '\u{FE55}' => {
+            Plain::Colon
+        }
+        '-'
+        | '_'
+        | '\u{02CD}'
+        | '\u{02D7}'
+        | '\u{06D4}'
+        | '\u{1806}'
+        | '\u{2010}'..='\u{2015}'
+        | '\u{2017}'
+        | '\u{2043}'
+        | '\u{2212}'
+        | '\u{2796}'
+        // The braille pattern blank: shown as a blank, though not White_Space.
+        | '\u{2800}'
+        | '\u{2E17}'
+        | '\u{2E1A}'
+        | '\u{2E3A}'
+        | '\u{2E3B}'
+        | '\u{FE4D}'..='\u{FE4F}'
+        | '\u{FE58}'
+        | '\u{FE63}' => Plain::Separator,
+        c if c.is_whitespace() => Plain::Separator,
+        c => Plain::Char(c.to_ascii_lowercase()),
+    }
+}
+
+/// Unicode's `Default_Ignorable_Code_Point` (DerivedCoreProperties): the code points a
+/// reader does not see.
+fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// How many active entries of its own `bucket` holds — those handed over to its agent
+/// ([`handed_over_from`]) not counted: what `max_active_per_agent` is checked against when
+/// an entry is added (an insert, a supersede of an inactive entry).
+fn own_active(bucket: &[MemoryEntry]) -> usize {
+    bucket
+        .iter()
+        .filter(|e| e.is_active && handed_over_from(e).is_none())
+        .count()
+}
+
+/// The active entries an agent holds ([`MemoryStore::active_count`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActiveCount {
+    /// Those without the provenance tag ([`handed_over_from`]) — what the cap on active
+    /// entries bounds: the entries it wrote itself, and any handed over to it without the tag
+    /// (one too large to carry it). An entry written before v0.1.57 with the tag of its
+    /// guest's counts as handed over.
+    pub own: usize,
+    /// Those handed over to it ([`MemoryStore::hand_over`]), which the cap does not count.
+    pub handed_over: usize,
+}
+
+/// What a hand-over moved ([`MemoryStore::hand_over`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HandedOver {
+    /// The ids of the entries moved: the agent that handed them over holds none of them now,
+    /// and its heir holds every one.
+    pub ids: Vec<MemoryId>,
+    /// How many of them the heir did not hold already.
+    pub gained: usize,
+    /// How many of them are active.
+    pub active: usize,
+}
+
 pub struct MemoryStore {
     inner: Mutex<HashMap<String, Vec<MemoryEntry>>>,
     /// Per-agent L6-mutation journal (slice C — `rollback_l6`).
@@ -97,6 +289,9 @@ pub struct MemoryStore {
     /// Per-agent per-entry last-access timestamp (slice C — feeds
     /// `zero_access_30d` in the health snapshot's single O(N) pass).
     access: Mutex<HashMap<String, HashMap<String, SystemTime>>>,
+    /// The cap on an agent's active entries of its own ([`own_active`]: those handed over
+    /// to it not counted): an insert, and a supersede of an inactive entry, are refused once
+    /// they reach it (MODULE-011 §3.6).
     max_active_per_agent: usize,
     /// Inactive-tail retention window (slice `dev-task-mem-retention`). The
     /// forgotten/superseded tail is compacted to at most this many entries AND
@@ -186,13 +381,14 @@ impl MemoryStore {
     ///    it, `get(forgotten_id)` returns `None`. `recall` / `recall_at` are
     ///    unaffected (always `is_active`-filtered). This bounds the production
     ///    `remember`→`forget` DoS that previously grew the file without bound.
-    /// 2. **`max_active_per_agent` gates new ACTIVE inserts; active entries are
-    ///    never dropped by retention.** Hydration loads every on-disk active entry
+    /// 2. **`max_active_per_agent` gates new ACTIVE inserts — counting the agent's
+    ///    own active entries, not those handed over to it ([`Self::hand_over`]); active
+    ///    entries are never dropped by retention.** Hydration loads every on-disk active entry
     ///    plus the bounded inactive tail (`persistence::open` applies the same
     ///    inactive window during the streaming read). If a file was externally
     ///    enlarged or the active cap reduced between sessions, the existing active
-    ///    entries are kept and new active inserts stay blocked until the active
-    ///    count drops — the safe, lossless degradation.
+    ///    entries are kept and new active inserts stay blocked until the agent's own
+    ///    active count drops below the cap — the safe, lossless degradation.
     pub fn open(
         dir: impl Into<PathBuf>,
         max_active_per_agent: usize,
@@ -227,6 +423,21 @@ impl MemoryStore {
             )));
         }
         Ok(line)
+    }
+
+    /// Refuse an entry with a tag that reads as a [`FROM_AGENT_TAG_PREFIX`] tag
+    /// ([`reads_as_handed_over`]): only [`Self::hand_over`] sets one, so a guest's `remember`
+    /// cannot name another agent as the origin of what it writes — nor keep a hand-over from
+    /// naming the agent that wrote it.
+    fn refuse_reserved_tags(entry: &MemoryEntry) -> Result<(), PostProcessorError> {
+        match entry.tags.iter().find(|t| reads_as_handed_over(t)) {
+            Some(tag) => Err(PostProcessorError::Invalid(format!(
+                "entry {}: the tag {tag:?} is reserved: a tag that reads as \
+                 `{FROM_AGENT_TAG_PREFIX}…` names the agent an entry was handed over from",
+                entry.id
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Drop the OLDEST inactive entries (lowest index = earliest inserted) from
@@ -375,6 +586,7 @@ impl MemoryStore {
         entry
             .validate_invariants()
             .map_err(|e| PostProcessorError::Invalid(e.to_string()))?;
+        Self::refuse_reserved_tags(&entry)?;
         // Single-serialize: the per-entry write cap check yields the serialized
         // line, reused by the append fast-path below (no double serialization).
         let line = Self::check_entry_size(&entry)?;
@@ -397,8 +609,9 @@ impl MemoryStore {
             Vec::new()
         };
         let bucket = guard.entry(agent_id.to_string()).or_default();
-        let active_count = bucket.iter().filter(|e| e.is_active).count();
-        if entry.is_active && active_count >= self.max_active_per_agent {
+        // The cap bounds the active entries an agent wrote itself: those handed over to it
+        // ([`Self::hand_over`]) are not counted.
+        if entry.is_active && own_active(bucket) >= self.max_active_per_agent {
             return Err(PostProcessorError::LimitExceeded);
         }
         let id = entry.id.clone();
@@ -557,6 +770,193 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Hand every entry `from` holds over to `to`: the knowledge of a terminated agent,
+    /// kept as history and taken over by the agent that outlives it (owner decision
+    /// 2026-11-17; MODULE-011 §3.6). Each entry — active or not — moves into `to`'s bucket
+    /// under `to`'s id and keeps its status, task and sources, so `to` recalls an active one
+    /// as it recalls its own. It is tagged [`FROM_AGENT_TAG_PREFIX`]`<from>`, unless a tag of
+    /// that kind names the agent that wrote it already (it was handed over before), and its
+    /// L6 cluster id is cleared: it names a cluster of `from`'s, and `to`'s consolidation
+    /// clusters the entry anew. `from` is left with none.
+    ///
+    /// An entry `to` holds already, by id, is not added again, so a hand-over run again
+    /// finishes one that failed part-way. `to`'s file is written first — when it cannot be,
+    /// nothing changes —, then `from`'s is emptied — when it cannot be, or the process ends
+    /// between the two writes, both hold the entries (none is lost) until a hand-over runs
+    /// again; the store runs none by itself. Each write rewrites the whole file, under the
+    /// store's lock.
+    ///
+    /// The cap on active entries bounds those an agent writes itself ([`Self::active_count`]):
+    /// the entries handed over do not count against `to`'s, so `to` writes on as before, and
+    /// its active entries grow by the active ones it takes over — the root's by those of every
+    /// agent terminated below it. The inactive ones join `to`'s inactive tail under its
+    /// retention, compacted on this rewrite as on every one: past the window the earliest
+    /// inserted go, whoever wrote them, and the entries handed over count as inserted now,
+    /// after `to`'s own. An entry too large to carry the tag — within a few bytes of
+    /// [`MAX_ENTRY_BYTES`] — moves without it, and counts as `to`'s own. The entries' access
+    /// times go with them; `from`'s L6 journal is dropped, since what it would roll back is
+    /// no longer `from`'s. Returns what moved.
+    pub fn hand_over(&self, from: &str, to: &str) -> Result<HandedOver, PostProcessorError> {
+        self.move_entries(from, to, None)
+    }
+
+    /// Hand over to `to`, on the terms of [`Self::hand_over`], only those of `from`'s entries
+    /// whose id is among `ids` — the entries a hand-over to `from` has just moved, when `from`
+    /// turns out to be terminated too and they go on to the next heir —; `from` keeps the
+    /// rest, its own among them, for its own terminate to hand over. An id `from` does not
+    /// hold is passed over. Of `from`'s L6 journal, the records of the entries moved are
+    /// dropped.
+    pub fn hand_over_some(
+        &self,
+        from: &str,
+        to: &str,
+        ids: &[MemoryId],
+    ) -> Result<HandedOver, PostProcessorError> {
+        let only: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        self.move_entries(from, to, Some(&only))
+    }
+
+    /// [`Self::hand_over`] (`only` = `None`) and [`Self::hand_over_some`].
+    fn move_entries(
+        &self,
+        from: &str,
+        to: &str,
+        only: Option<&HashSet<&str>>,
+    ) -> Result<HandedOver, PostProcessorError> {
+        if from == to {
+            return Err(PostProcessorError::Invalid(format!(
+                "hand_over: agent {from} cannot hand its entries over to itself"
+            )));
+        }
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held_by_from = Self::snapshot(&guard, from);
+        let moving: Vec<&MemoryEntry> = held_by_from
+            .iter()
+            .filter(|e| only.is_none_or(|only| only.contains(e.id.as_str())))
+            .collect();
+        if moving.is_empty() {
+            return Ok(HandedOver::default());
+        }
+        let pre_to = Self::snapshot(&guard, to);
+        let held_by_to: HashSet<String> = pre_to.iter().map(|e| e.id.clone()).collect();
+        let tag = format!("{FROM_AGENT_TAG_PREFIX}{from}");
+        let taken: Vec<MemoryEntry> = moving
+            .iter()
+            .filter(|e| !held_by_to.contains(&e.id))
+            .map(|e| {
+                let mut entry = (*e).clone();
+                entry.agent_id = to.to_string();
+                entry.cluster_id = None;
+                if handed_over_from(&entry).is_none() {
+                    entry.tags.push(tag.clone());
+                    // An entry at the size cap moves untagged rather than not at all.
+                    if Self::check_entry_size(&entry).is_err() {
+                        entry.tags.pop();
+                    }
+                }
+                entry
+            })
+            .collect();
+        let moved = HandedOver {
+            ids: moving.iter().map(|e| e.id.clone()).collect(),
+            gained: taken.len(),
+            active: moving.iter().filter(|e| e.is_active).count(),
+        };
+        if moved.gained > 0 {
+            guard.entry(to.to_string()).or_default().extend(taken);
+            self.persist_or_restore(&mut guard, to, pre_to)
+                .map_err(|e| {
+                    PostProcessorError::Invalid(format!(
+                        "persist failed, nothing of {from} handed over to {to}: {e}"
+                    ))
+                })?;
+        }
+        let emptied = match only {
+            None => true,
+            Some(only) => {
+                let bucket = guard.entry(from.to_string()).or_default();
+                bucket.retain(|e| !only.contains(e.id.as_str()));
+                bucket.is_empty()
+            }
+        };
+        if emptied {
+            guard.remove(from);
+        }
+        self.persist_or_restore(&mut guard, from, held_by_from)
+            .map_err(|e| {
+                PostProcessorError::Invalid(format!(
+                    "persist failed, the entries of {from} are handed over to {to} and \
+                     still held by {from} too: {e}"
+                ))
+            })?;
+        drop(guard);
+        if let Some(p) = &self.persistence {
+            if moved.gained > 0 {
+                p.clear_pending(to);
+            }
+            p.clear_pending(from);
+        }
+        {
+            let mut access = self
+                .access
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(times) = access.get_mut(from) {
+                let taken: Vec<(String, SystemTime)> = moved
+                    .ids
+                    .iter()
+                    .filter_map(|id| times.remove_entry(id))
+                    .collect();
+                if emptied || times.is_empty() {
+                    access.remove(from);
+                }
+                if !taken.is_empty() {
+                    let into = access.entry(to.to_string()).or_default();
+                    for (id, at) in taken {
+                        into.entry(id).or_insert(at);
+                    }
+                }
+            }
+        }
+        {
+            let mut journal = self
+                .journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if emptied {
+                journal.remove(from);
+            } else if let Some(records) = journal.get_mut(from) {
+                let moved_ids: HashSet<&str> = moved.ids.iter().map(String::as_str).collect();
+                records.retain(|r| !moved_ids.contains(r.entry_id.as_str()));
+            }
+        }
+        Ok(moved)
+    }
+
+    /// The active entries `agent_id` holds: its own, which the cap on active entries bounds,
+    /// and those handed over to it ([`Self::hand_over`]).
+    pub fn active_count(&self, agent_id: &str) -> ActiveCount {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut count = ActiveCount::default();
+        for entry in guard.get(agent_id).into_iter().flatten() {
+            if !entry.is_active {
+                continue;
+            }
+            if handed_over_from(entry).is_some() {
+                count.handed_over += 1;
+            } else {
+                count.own += 1;
+            }
+        }
+        count
+    }
+
     /// Slice B in-process rollback: drop entries with `created_at > timestamp`.
     /// Full AC-18 git-backed rollback is deferred.
     ///
@@ -645,6 +1045,7 @@ impl MemoryStore {
                 // Per-entry write cap (slice dev-task-mem-retention): the new
                 // active entry must fit MAX_ENTRY_BYTES so its persisted line can
                 // never trip the boot read cap.
+                Self::refuse_reserved_tags(&new_entry)?;
                 let _ = Self::check_entry_size(&new_entry)?;
                 let new_id = new_entry.id.clone();
 
@@ -664,18 +1065,20 @@ impl MemoryStore {
                 // (b) compute the candidate end-state for the old entry and
                 // validate its invariants BEFORE applying — round-9 fix #2:
                 // otherwise partial-mutation can leak on validate_invariants
-                // failure. (c) active-count limit must account for Supersede's
-                // net-zero delta (old → inactive AND new → active = +1 - 1) —
-                // round-9 fix #3: pure-Insert is +1 (already checked in
-                // `insert()`); Supersede is net-zero IF old is currently
-                // active, else +1. Compute the net delta explicitly.
+                // failure. (c) the active-entry cap: a pure Insert is checked in
+                // `insert()`; a Supersede adds no active entry when the old one is
+                // active (old → inactive, new → active), and one otherwise — below.
                 let old_idx = bucket.iter().position(|e| e.id == old_id).ok_or_else(|| {
                     PostProcessorError::Invalid(format!("supersede old_id {} not found", old_id))
                 })?;
+                // A supersede of an active entry leaves the number of active entries as it
+                // was, and is never refused for the cap — nor by an agent past it (one whose
+                // cap was lowered since, one that superseded entries handed over to it: each
+                // new entry is its own, so its own entries pass the cap by those). One of an
+                // inactive entry adds an active entry of the agent's own, and is refused as an
+                // insert is.
                 let old_currently_active = bucket[old_idx].is_active;
-                let net_active_delta: isize = if old_currently_active { 0 } else { 1 };
-                let active_count = bucket.iter().filter(|e| e.is_active).count() as isize;
-                if active_count + net_active_delta > self.max_active_per_agent as isize {
+                if !old_currently_active && own_active(bucket) >= self.max_active_per_agent {
                     return Err(PostProcessorError::LimitExceeded);
                 }
                 // Build the candidate OLD-side post-state in a local clone
@@ -1519,5 +1922,528 @@ mod tests {
             store.get("a", "e").unwrap().cluster_id.is_none(),
             "prior cluster_id restored"
         );
+    }
+
+    fn ids(entries: &[MemoryEntry]) -> Vec<String> {
+        entries.iter().map(|e| e.id.clone()).collect()
+    }
+
+    /// Plant a directory where `agent`'s file is written through (its `.tmp`): every
+    /// rewrite of that file fails until it is removed. Returns its path.
+    fn block_rewrites_of(root: &std::path::Path, agent: &str) -> std::path::PathBuf {
+        let tmp = root.join(crate::persistence::slug(agent)).join(format!(
+            "{}.tmp",
+            crate::persistence::KNOWLEDGE_JSONL_FILENAME
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    /// A terminated agent's knowledge is taken over by its heir (owner decision 2026-11-17):
+    /// every entry, active or not, under the heir's id, tagged with the agent that held it,
+    /// unclustered, with its access time — on disk as in memory — and the agent is left with
+    /// none.
+    #[test]
+    fn hand_over_moves_every_entry_to_the_heir_and_leaves_the_agent_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), DEFAULT_MAX_ACTIVE_PER_AGENT).unwrap();
+        store
+            .insert(
+                "root",
+                fact("r1", "root", "the root's own", "2026-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        let mut known = fact("k1", "kid", "kid knows rust", "2026-01-02T00:00:00Z");
+        known.tags = vec!["lang".into()];
+        known.cluster_id = Some("cl-rust".into());
+        store.insert("kid", known).unwrap();
+        store
+            .insert(
+                "kid",
+                fact("k2", "kid", "kid forgot this", "2026-01-03T00:00:00Z"),
+            )
+            .unwrap();
+        store.forget("kid", "k2").unwrap();
+        let seen = SystemTime::now();
+        store.record_access("kid", "k1", seen);
+
+        assert_eq!(store.hand_over("kid", "root").unwrap().gained, 2);
+
+        let check = |store: &MemoryStore| {
+            assert!(store.list("kid").is_empty(), "the agent holds none");
+            assert_eq!(ids(&store.list("root")), ["r1", "k1", "k2"]);
+            let k1 = store.get("root", "k1").unwrap();
+            assert_eq!(k1.agent_id, "root");
+            assert_eq!(k1.tags, ["lang", "from-agent:kid"]);
+            assert_eq!(k1.cluster_id, None);
+            assert!(k1.is_active);
+            let k2 = store.get("root", "k2").unwrap();
+            assert_eq!((k2.is_active, k2.status), (false, MemoryStatus::Forgotten));
+            assert_eq!(k2.tags, ["from-agent:kid"]);
+            assert_eq!(ids(&store.recall("root", "rust", 10)), ["k1"]);
+        };
+        check(&store);
+        assert!(!store.is_zero_access_30d("root", "k1", seen));
+        drop(store);
+        check(&MemoryStore::open(dir.path(), DEFAULT_MAX_ACTIVE_PER_AGENT).unwrap());
+    }
+
+    /// An entry handed over before keeps naming the agent that wrote it: a grandchild's,
+    /// which its parent held when the parent was terminated in turn.
+    #[test]
+    fn hand_over_keeps_naming_the_agent_that_wrote_an_entry() {
+        let store = MemoryStore::new();
+        store
+            .insert(
+                "gc",
+                fact("g1", "gc", "the grandchild's", "2026-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        store
+            .insert(
+                "kid",
+                fact("k1", "kid", "the child's", "2026-01-02T00:00:00Z"),
+            )
+            .unwrap();
+        assert_eq!(store.hand_over("gc", "kid").unwrap().gained, 1);
+        assert_eq!(store.hand_over("kid", "root").unwrap().gained, 2);
+        assert_eq!(store.get("root", "g1").unwrap().tags, ["from-agent:gc"]);
+        assert_eq!(store.get("root", "k1").unwrap().tags, ["from-agent:kid"]);
+        assert!(store.list("gc").is_empty());
+        assert!(store.list("kid").is_empty());
+    }
+
+    /// Run again, a hand-over adds nothing: an entry the heir holds already, by id — as it
+    /// does after a hand-over that could not empty the agent — is not added twice.
+    #[test]
+    fn hand_over_run_again_adds_nothing() {
+        let store = MemoryStore::new();
+        store
+            .insert("kid", fact("k1", "kid", "once", "2026-01-01T00:00:00Z"))
+            .unwrap();
+        assert_eq!(store.hand_over("kid", "root").unwrap().gained, 1);
+        assert_eq!(store.hand_over("kid", "root").unwrap().gained, 0);
+        // The agent holds the entry again, as one whose file could not be emptied does.
+        store
+            .insert("kid", fact("k1", "kid", "once", "2026-01-01T00:00:00Z"))
+            .unwrap();
+        assert_eq!(store.hand_over("kid", "root").unwrap().gained, 0);
+        assert!(store.list("kid").is_empty());
+        assert_eq!(ids(&store.list("root")), ["k1"]);
+        assert_eq!(store.get("root", "k1").unwrap().tags, ["from-agent:kid"]);
+    }
+
+    /// A hand-over whose heir's file cannot be written changes nothing, in memory or on
+    /// disk.
+    #[test]
+    fn hand_over_that_cannot_write_the_heir_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), DEFAULT_MAX_ACTIVE_PER_AGENT).unwrap();
+        store
+            .insert(
+                "root",
+                fact("r1", "root", "the root's own", "2026-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        store
+            .insert(
+                "kid",
+                fact("k1", "kid", "the child's", "2026-01-02T00:00:00Z"),
+            )
+            .unwrap();
+        block_rewrites_of(dir.path(), "root");
+        assert!(store.hand_over("kid", "root").is_err());
+        let check = |store: &MemoryStore| {
+            assert_eq!(ids(&store.list("kid")), ["k1"]);
+            assert_eq!(ids(&store.list("root")), ["r1"]);
+            assert_eq!(store.get("kid", "k1").unwrap().agent_id, "kid");
+        };
+        check(&store);
+        drop(store);
+        check(&MemoryStore::open(dir.path(), DEFAULT_MAX_ACTIVE_PER_AGENT).unwrap());
+    }
+
+    /// A hand-over that cannot empty the agent's file leaves the entries with the heir and
+    /// with the agent too — in memory as on disk —, and a rerun finishes it.
+    #[test]
+    fn hand_over_that_cannot_empty_the_agent_is_finished_by_a_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), DEFAULT_MAX_ACTIVE_PER_AGENT).unwrap();
+        store
+            .insert(
+                "kid",
+                fact("k1", "kid", "the child's", "2026-01-02T00:00:00Z"),
+            )
+            .unwrap();
+        let blocked = block_rewrites_of(dir.path(), "kid");
+        assert!(store.hand_over("kid", "root").is_err());
+        let both = |store: &MemoryStore| {
+            assert_eq!(ids(&store.list("kid")), ["k1"]);
+            assert_eq!(ids(&store.list("root")), ["k1"]);
+        };
+        both(&store);
+        both(&MemoryStore::open(dir.path(), DEFAULT_MAX_ACTIVE_PER_AGENT).unwrap());
+        std::fs::remove_dir(&blocked).unwrap();
+        assert_eq!(store.hand_over("kid", "root").unwrap().gained, 0);
+        let done = |store: &MemoryStore| {
+            assert!(store.list("kid").is_empty());
+            assert_eq!(ids(&store.list("root")), ["k1"]);
+            assert_eq!(store.get("root", "k1").unwrap().tags, ["from-agent:kid"]);
+        };
+        done(&store);
+        drop(store);
+        done(&MemoryStore::open(dir.path(), DEFAULT_MAX_ACTIVE_PER_AGENT).unwrap());
+    }
+
+    /// An agent with no entries hands nothing over and writes nothing; and an agent cannot be
+    /// its own heir.
+    #[test]
+    fn hand_over_of_nothing_or_to_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), DEFAULT_MAX_ACTIVE_PER_AGENT).unwrap();
+        assert_eq!(store.hand_over("nobody", "root").unwrap().gained, 0);
+        assert!(!dir.path().join(crate::persistence::slug("nobody")).exists());
+        assert!(!dir.path().join(crate::persistence::slug("root")).exists());
+        store
+            .insert("kid", fact("k1", "kid", "mine", "2026-01-01T00:00:00Z"))
+            .unwrap();
+        assert!(store.hand_over("kid", "kid").is_err());
+        assert_eq!(ids(&store.list("kid")), ["k1"]);
+    }
+
+    /// The provenance tag is the store's own: an entry written with one is refused, so no
+    /// agent names another as the origin of what it remembers.
+    #[test]
+    fn insert_refuses_an_entry_that_names_an_agent_it_came_from() {
+        let store = MemoryStore::new();
+        let mut forged = fact("f1", "kid", "mine", "2026-01-01T00:00:00Z");
+        forged.tags.push(format!("{FROM_AGENT_TAG_PREFIX}root"));
+        assert!(matches!(
+            store.insert("kid", forged),
+            Err(PostProcessorError::Invalid(_))
+        ));
+        assert!(store.list("kid").is_empty());
+        let mut near = fact("f2", "kid", "mine", "2026-01-01T00:00:00Z");
+        near.tags.push("from-agents".to_string());
+        assert!(
+            store.insert("kid", near).is_ok(),
+            "only the prefix is reserved"
+        );
+    }
+
+    /// Nor does a superseding entry carry one.
+    #[test]
+    fn supersede_refuses_an_entry_that_names_an_agent_it_came_from() {
+        let store = MemoryStore::new();
+        store
+            .insert("kid", fact("f1", "kid", "old", "2026-01-01T00:00:00Z"))
+            .unwrap();
+        let mut forged = fact("f2", "kid", "new", "2026-02-01T00:00:00Z");
+        forged.tags.push(format!("{FROM_AGENT_TAG_PREFIX}root"));
+        let applied = store.apply_action(
+            "kid",
+            MemoryAction::Supersede {
+                old_id: "f1".into(),
+                new_entry: forged,
+                reason: SupersessionReason::Refinement,
+            },
+        );
+        assert!(matches!(applied, Err(PostProcessorError::Invalid(_))));
+        assert_eq!(ids(&store.list("kid")), ["f1"]);
+        assert!(store.get("kid", "f1").unwrap().is_active, "nothing changes");
+    }
+
+    /// A tag that reads as a provenance tag once spelt plainly is refused too: in another
+    /// case; past blanks or invisible code points; full-width or in mathematical letters;
+    /// with a listed colon; with a run of dashes, underscores or blanks for its hyphen, or
+    /// blanks before its colon. A tag that only begins alike is not, nor one in letters of
+    /// another script or accented ones, which the store does not chase.
+    #[test]
+    fn insert_refuses_a_tag_that_reads_as_naming_the_agent_it_came_from() {
+        let store = MemoryStore::new();
+        let forged = [
+            "From-Agent:root",
+            " from-agent:root",
+            "from-agent\u{FF1A}root",
+            "\u{200B}from-agent:root",
+            "from_agent:root",
+            "from agent:root",
+            "from\u{2010}agent:root",
+            "\u{FF46}\u{FF52}\u{FF4F}\u{FF4D}\u{FF0D}\u{FF41}\u{FF47}\u{FF45}\u{FF4E}\u{FF54}\u{FF1A}root",
+            "from - agent:root",
+            "from-agent :root",
+            "from  agent:root",
+            "- from-agent:root",
+            "from-agent\u{2066}:root",
+            "f\u{FE0F}rom-agent:root",
+            "\u{E0020}from-agent:root",
+            "from\u{3164}-agent:root",
+            "from-agent\u{A4FD}root",
+            "from\u{2017}agent:root",
+            "\u{1D41F}\u{1D42B}\u{1D428}\u{1D426}-\u{1D41A}\u{1D420}\u{1D41E}\u{1D427}\u{1D42D}:root",
+            "\u{2131}rom-ag\u{212F}nt:root",
+        ];
+        for (i, tag) in forged.into_iter().enumerate() {
+            let mut entry = fact(&format!("f{i}"), "kid", "mine", "2026-01-01T00:00:00Z");
+            entry.tags.push(tag.to_string());
+            assert!(
+                matches!(
+                    store.insert("kid", entry),
+                    Err(PostProcessorError::Invalid(_))
+                ),
+                "{tag:?}"
+            );
+        }
+        assert!(store.list("kid").is_empty());
+        let fine = [
+            "from-agents",
+            "from agent reports",
+            "agent:root",
+            "fromagent:root",
+            "from-agentx:root",
+            "fr\u{0301}om-agent:root",
+            "fr\u{043E}m-agent:root",
+        ];
+        for (i, tag) in fine.into_iter().enumerate() {
+            let mut entry = fact(&format!("n{i}"), "kid", "mine", "2026-01-01T00:00:00Z");
+            entry.tags.push(tag.to_string());
+            assert!(store.insert("kid", entry).is_ok(), "{tag:?}");
+        }
+    }
+
+    /// One forged tag for each look-alike the fold lists ([`plain`], [`is_default_ignorable`]):
+    /// every invisible range at both ends, every colon, every dash, hyphen, underscore and blank
+    /// (every range at both ends, and White_Space), every letterlike symbol in place of the
+    /// letter it stands for, and the prefix in every style of the mathematical alphanumeric
+    /// letters and in full-width forms — each reads as the prefix; and what only starts like it
+    /// does not.
+    #[test]
+    fn every_listed_look_alike_reads_as_the_prefix() {
+        fn ch(u: u32) -> char {
+            char::from_u32(u).unwrap()
+        }
+        fn ends(ranges: &[(u32, u32)]) -> Vec<char> {
+            ranges
+                .iter()
+                .flat_map(|&(lo, hi)| [ch(lo), ch(hi)])
+                .collect()
+        }
+        let mut forged: Vec<String> = Vec::new();
+        // Default_Ignorable_Code_Point, range by range.
+        for c in ends(&[
+            (0x00AD, 0x00AD),
+            (0x034F, 0x034F),
+            (0x061C, 0x061C),
+            (0x115F, 0x1160),
+            (0x17B4, 0x17B5),
+            (0x180B, 0x180F),
+            (0x200B, 0x200F),
+            (0x202A, 0x202E),
+            (0x2060, 0x206F),
+            (0x3164, 0x3164),
+            (0xFE00, 0xFE0F),
+            (0xFEFF, 0xFEFF),
+            (0xFFA0, 0xFFA0),
+            (0xFFF0, 0xFFF8),
+            (0x1BCA0, 0x1BCA3),
+            (0x1D173, 0x1D17A),
+            (0xE0000, 0xE0FFF),
+        ]) {
+            forged.push(format!("{c}from-agent:root"));
+            forged.push(format!("fr{c}om-agent{c}:root"));
+        }
+        // The colons, the full-width one among them.
+        for c in [
+            ':', '\u{02D0}', '\u{02F8}', '\u{0589}', '\u{05C3}', '\u{0703}', '\u{0704}',
+            '\u{0903}', '\u{0A83}', '\u{16EC}', '\u{1803}', '\u{1809}', '\u{205A}', '\u{2236}',
+            '\u{A4FD}', '\u{A789}', '\u{FE13}', '\u{FE30}', '\u{FE55}', '\u{FF1A}',
+        ] {
+            forged.push(format!("from-agent{c}root"));
+            forged.push(format!("from-agent -{c}root"));
+        }
+        // The dashes, hyphens, underscores and blanks: those listed (the full-width ones
+        // among them), and White_Space.
+        let mut separators = vec![
+            '-', '_', '\u{02CD}', '\u{02D7}', '\u{06D4}', '\u{1806}', '\u{2017}', '\u{2043}',
+            '\u{2212}', '\u{2796}', '\u{2800}', '\u{2E17}', '\u{2E1A}', '\u{2E3A}', '\u{2E3B}',
+            '\u{FE58}', '\u{FE63}', '\u{FF0D}', '\u{FF3F}',
+        ];
+        separators.extend(ends(&[(0x2010, 0x2015), (0xFE4D, 0xFE4F)]));
+        separators.extend([
+            ' ', '\t', '\u{00A0}', '\u{1680}', '\u{2000}', '\u{200A}', '\u{2028}', '\u{2029}',
+            '\u{202F}', '\u{205F}', '\u{3000}',
+        ]);
+        for c in separators {
+            forged.push(format!("from{c}agent:root"));
+            forged.push(format!("{c}from{c}{c}agent{c}:root"));
+        }
+        // The letterlike symbols, each in place of the letter it stands for.
+        for (c, letter) in [
+            ('\u{2130}', 'e'),
+            ('\u{2131}', 'f'),
+            ('\u{2133}', 'm'),
+            ('\u{2115}', 'n'),
+            ('\u{211B}', 'r'),
+            ('\u{211C}', 'r'),
+            ('\u{211D}', 'r'),
+            ('\u{210A}', 'g'),
+            ('\u{212F}', 'e'),
+            ('\u{2134}', 'o'),
+        ] {
+            let word = "from-agent";
+            let at = word.find(letter).unwrap();
+            forged.push(format!("{}{c}{}:root", &word[..at], &word[at + 1..]));
+        }
+        // The prefix in each of the thirteen styles, in upper and in lower case.
+        for style in 0..13u32 {
+            for case in [0u32, 26] {
+                let styled: String = "from-agent"
+                    .chars()
+                    .map(|c| match c {
+                        '-' => '-',
+                        c => ch(0x1D400 + 52 * style + case + (c as u32 - 'a' as u32)),
+                    })
+                    .collect();
+                forged.push(format!("{styled}:root"));
+            }
+        }
+        // In full-width forms.
+        let full: String = "from-agent:"
+            .chars()
+            .map(|c| ch(c as u32 + 0xFEE0))
+            .collect();
+        forged.push(format!("{full}root"));
+        for tag in &forged {
+            assert!(reads_as_handed_over(tag), "{tag:?}");
+        }
+        for tag in [
+            "from\u{2800}agents:root",
+            "\u{2800}fromagent:root",
+            "from-agent\u{2800}root",
+            "from-agent\u{2134}root",
+            "from\u{2500}agent:root",
+        ] {
+            assert!(!reads_as_handed_over(tag), "{tag:?}");
+        }
+    }
+
+    /// The cap on active entries bounds those an agent writes itself: an heir taken past its
+    /// cap writes on, up to its cap of its own; a supersede of an active entry — its own or
+    /// one handed over — is never refused for the cap; one of an inactive entry is, as an
+    /// insert is.
+    #[test]
+    fn hand_over_does_not_count_against_the_heirs_cap() {
+        let store = MemoryStore::with_limit(2);
+        store
+            .insert(
+                "root",
+                fact("r1", "root", "the root's own", "2026-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        store
+            .insert(
+                "kid",
+                fact("k1", "kid", "the child's first", "2026-01-02T00:00:00Z"),
+            )
+            .unwrap();
+        store
+            .insert(
+                "kid",
+                fact("k2", "kid", "the child's second", "2026-01-03T00:00:00Z"),
+            )
+            .unwrap();
+        let moved = store.hand_over("kid", "root").unwrap();
+        assert_eq!((moved.ids.len(), moved.gained, moved.active), (2, 2, 2));
+        assert_eq!(
+            store.active_count("root"),
+            ActiveCount {
+                own: 1,
+                handed_over: 2
+            }
+        );
+
+        store
+            .insert(
+                "root",
+                fact("r2", "root", "one more", "2026-01-04T00:00:00Z"),
+            )
+            .expect("the root writes on");
+        assert!(matches!(
+            store.insert(
+                "root",
+                fact("r3", "root", "past its cap", "2026-01-05T00:00:00Z")
+            ),
+            Err(PostProcessorError::LimitExceeded)
+        ));
+        let supersede = |old: &str, new: &str| {
+            store.apply_action(
+                "root",
+                MemoryAction::Supersede {
+                    old_id: old.into(),
+                    new_entry: fact(new, "root", "refined", "2026-01-06T00:00:00Z"),
+                    reason: SupersessionReason::Refinement,
+                },
+            )
+        };
+        supersede("k1", "r4").expect("an entry handed over is refined");
+        supersede("r1", "r5").expect("an entry of its own is refined, past its cap");
+        assert_eq!(
+            store.active_count("root"),
+            ActiveCount {
+                own: 3,
+                handed_over: 1
+            }
+        );
+        store.forget("root", "r2").unwrap();
+        assert!(matches!(
+            supersede("r2", "r6"),
+            Err(PostProcessorError::LimitExceeded)
+        ));
+    }
+
+    /// A hand-over of some entries moves only those it names that the agent holds — on disk
+    /// as in memory, with their access times — and leaves the agent the rest.
+    #[test]
+    fn hand_over_some_moves_only_the_entries_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), DEFAULT_MAX_ACTIVE_PER_AGENT).unwrap();
+        store
+            .insert(
+                "gc",
+                fact("g1", "gc", "the grandchild's", "2026-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        store
+            .insert(
+                "kid",
+                fact("k1", "kid", "the child's own", "2026-01-02T00:00:00Z"),
+            )
+            .unwrap();
+        assert_eq!(store.hand_over("gc", "kid").unwrap().ids, ["g1"]);
+        let seen = SystemTime::now();
+        store.record_access("kid", "g1", seen);
+        store.record_access("kid", "k1", seen);
+
+        let moved = store
+            .hand_over_some("kid", "root", &["g1".to_string(), "absent".to_string()])
+            .unwrap();
+        assert_eq!(
+            moved,
+            HandedOver {
+                ids: vec!["g1".to_string()],
+                gained: 1,
+                active: 1
+            }
+        );
+        let check = |store: &MemoryStore| {
+            assert_eq!(ids(&store.list("kid")), ["k1"]);
+            assert_eq!(ids(&store.list("root")), ["g1"]);
+            assert_eq!(store.get("root", "g1").unwrap().tags, ["from-agent:gc"]);
+        };
+        check(&store);
+        assert!(!store.is_zero_access_30d("root", "g1", seen));
+        assert!(!store.is_zero_access_30d("kid", "k1", seen));
+        drop(store);
+        check(&MemoryStore::open(dir.path(), DEFAULT_MAX_ACTIVE_PER_AGENT).unwrap());
     }
 }

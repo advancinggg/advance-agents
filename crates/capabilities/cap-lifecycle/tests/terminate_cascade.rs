@@ -1,12 +1,13 @@
 //! AC-03 / AC-18 / AC-20 — terminate-cascade (REQ-030/066/270).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use advance_shared_types::agent_tree::{AgentId, AgentKind, AgentNode, AgentStatus};
 use cap_lifecycle::{
-    AgentTreeStore, DefaultTerminateController, GrantCascadeRevoke, LifecycleError, MailboxCascade,
-    RunCascade, TerminateController, WorkspaceCleanup,
+    AgentTreeStore, DefaultTerminateController, GrantCascadeRevoke, LifecycleError, LoopCascade,
+    MailboxCascade, RunCascade, TerminateController, WorkspaceCleanup,
 };
 use tempfile::TempDir;
 
@@ -28,6 +29,63 @@ impl GrantCascadeRevoke for GRec {
     fn revoke_for_agent(&self, a: &str) -> Result<(), LifecycleError> {
         self.0.log(format!("revoke:{a}"));
         Ok(())
+    }
+}
+/// A grant revoke that fails for one agent while `failing` is set.
+struct FailingGRec {
+    rec: Arc<Rec>,
+    agent: &'static str,
+    failing: AtomicBool,
+}
+impl FailingGRec {
+    fn new(rec: &Arc<Rec>, agent: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            rec: rec.clone(),
+            agent,
+            failing: AtomicBool::new(true),
+        })
+    }
+}
+impl GrantCascadeRevoke for FailingGRec {
+    fn revoke_for_agent(&self, a: &str) -> Result<(), LifecycleError> {
+        self.rec.log(format!("revoke:{a}"));
+        if a == self.agent && self.failing.load(Ordering::SeqCst) {
+            return Err(LifecycleError::IoFailure(format!("revoke {a}")));
+        }
+        Ok(())
+    }
+}
+struct LRec(Arc<Rec>);
+impl LoopCascade for LRec {
+    fn stop_loop(&self, a: &str) {
+        self.0.log(format!("stop:{a}"));
+    }
+    fn abort_loop(&self, a: &str) {
+        self.0.log(format!("abort:{a}"));
+    }
+}
+/// A loop cascade that records its scope too: `scope-begin` when the cascade takes it —
+/// followed by `child:<status>`, the status of the node `child` then —, `scope-end` when the
+/// cascade lets go of it.
+struct LScoped(Arc<Rec>, AgentTreeStore);
+struct ScopeEnd(Arc<Rec>);
+impl Drop for ScopeEnd {
+    fn drop(&mut self) {
+        self.0.log("scope-end".to_string());
+    }
+}
+impl LoopCascade for LScoped {
+    fn stop_loop(&self, a: &str) {
+        self.0.log(format!("stop:{a}"));
+    }
+    fn abort_loop(&self, a: &str) {
+        self.0.log(format!("abort:{a}"));
+    }
+    fn terminate_scope(&self) -> Option<Box<dyn Send>> {
+        self.0.log("scope-begin".to_string());
+        self.0
+            .log(format!("child:{:?}", status_of(&self.1, "child").unwrap()));
+        Some(Box::new(ScopeEnd(self.0.clone())))
     }
 }
 struct MRec(Arc<Rec>);
@@ -78,6 +136,19 @@ fn setup() -> (
     Arc<Rec>,
     DefaultTerminateController,
 ) {
+    let (tmp, tree, rec) = setup_tree();
+    let ctrl = DefaultTerminateController::new(
+        tree.clone(),
+        Arc::new(GRec(rec.clone())),
+        Arc::new(MRec(rec.clone())),
+        Arc::new(RRec(rec.clone())),
+        Arc::new(WRec(rec.clone())),
+    );
+    (tmp, tree, rec, ctrl)
+}
+
+/// root → child → gc, with a recorder for every cascade step.
+fn setup_tree() -> (TempDir, AgentTreeStore, Arc<Rec>) {
     let tmp = TempDir::new().unwrap();
     let tree = AgentTreeStore::new(tmp.path().to_path_buf()).unwrap();
     let rws = tree.workspace_root().join("root");
@@ -99,14 +170,198 @@ fn setup() -> (
     )
     .unwrap();
     let rec = Arc::new(Rec::default());
-    let ctrl = DefaultTerminateController::new(
+    (tmp, tree, rec)
+}
+
+fn status_of(tree: &AgentTreeStore, id: &str) -> Option<AgentStatus> {
+    tree.get_node(&AgentId(id.into())).map(|n| n.status)
+}
+
+/// A controller over `tree` with every cascade step recorded in `rec`, the loop cascade
+/// included, revoking grants through `grant`.
+fn with_loops(
+    tree: &AgentTreeStore,
+    rec: &Arc<Rec>,
+    grant: Arc<dyn GrantCascadeRevoke>,
+) -> DefaultTerminateController {
+    DefaultTerminateController::new(
         tree.clone(),
-        Arc::new(GRec(rec.clone())),
+        grant,
         Arc::new(MRec(rec.clone())),
         Arc::new(RRec(rec.clone())),
         Arc::new(WRec(rec.clone())),
+    )
+    .with_loop_cascade(Arc::new(LRec(rec.clone())))
+}
+
+/// As [`with_loops`], with a loop cascade that records its scope too ([`LScoped`]).
+fn with_scoped_loops(
+    tree: &AgentTreeStore,
+    rec: &Arc<Rec>,
+    grant: Arc<dyn GrantCascadeRevoke>,
+) -> DefaultTerminateController {
+    DefaultTerminateController::new(
+        tree.clone(),
+        grant,
+        Arc::new(MRec(rec.clone())),
+        Arc::new(RRec(rec.clone())),
+        Arc::new(WRec(rec.clone())),
+    )
+    .with_loop_cascade(Arc::new(LScoped(rec.clone(), tree.clone())))
+}
+
+fn calls(steps: &[&str]) -> Vec<String> {
+    steps.iter().map(|s| s.to_string()).collect()
+}
+
+/// MODULE-005 terminate-child flow: every serve loop of the subtree is stopped, in removal
+/// order, before the cascade's first step that can fail; each node's loop is torn down once
+/// that node's steps have succeeded, right before its tree removal.
+#[test]
+fn ac03_terminate_stops_every_loop_before_any_step_that_can_fail() {
+    let (_t, tree, rec) = setup_tree();
+    let ctrl = with_loops(&tree, &rec, Arc::new(GRec(rec.clone())));
+    ctrl.terminate_child("root", "child").unwrap();
+    assert_eq!(
+        rec.snapshot(),
+        calls(&[
+            "stop:gc",
+            "stop:child",
+            "cancel:gc",
+            "flush:gc",
+            "revoke:gc",
+            "abort:gc",
+            "cancel:child",
+            "flush:child",
+            "revoke:child",
+            "abort:child",
+        ])
     );
-    (tmp, tree, rec, ctrl)
+    assert!(!tree.contains(&AgentId("child".into())));
+    assert!(!tree.contains(&AgentId("gc".into())));
+}
+
+/// A cascade that stops part-way — here at the grandchild's grant revoke, the first node in
+/// removal order — leaves no loop running, the child's included, whose own steps never ran;
+/// and it tears down the loop of no node it leaves in the tree: both stay, marked
+/// terminated, with their routing, mailbox and records — but for what the grandchild's steps
+/// that ran removed (its runs; its mailbox's messages).
+#[test]
+fn ac03_terminate_that_fails_at_the_first_node_stops_every_loop_and_tears_none_down() {
+    let (_t, tree, rec) = setup_tree();
+    let ctrl = with_loops(&tree, &rec, FailingGRec::new(&rec, "gc"));
+    let err = ctrl.terminate_child("root", "child").unwrap_err();
+    assert!(matches!(err, LifecycleError::IoFailure(_)), "{err:?}");
+    assert_eq!(
+        rec.snapshot(),
+        calls(&[
+            "stop:gc",
+            "stop:child",
+            "cancel:gc",
+            "flush:gc",
+            "revoke:gc"
+        ])
+    );
+    assert_eq!(status_of(&tree, "gc"), Some(AgentStatus::Terminated));
+    assert_eq!(status_of(&tree, "child"), Some(AgentStatus::Terminated));
+}
+
+/// A cascade that fails at a later node has removed the nodes before it, each torn down
+/// first; the failing node's loop is stopped and not torn down, and the node stays.
+#[test]
+fn ac03_terminate_that_fails_at_a_later_node_removes_the_nodes_before_it() {
+    let (_t, tree, rec) = setup_tree();
+    let ctrl = with_loops(&tree, &rec, FailingGRec::new(&rec, "child"));
+    let err = ctrl.terminate_child("root", "child").unwrap_err();
+    assert!(matches!(err, LifecycleError::IoFailure(_)), "{err:?}");
+    assert_eq!(
+        rec.snapshot(),
+        calls(&[
+            "stop:gc",
+            "stop:child",
+            "cancel:gc",
+            "flush:gc",
+            "revoke:gc",
+            "abort:gc",
+            "cancel:child",
+            "flush:child",
+            "revoke:child",
+        ])
+    );
+    assert!(!tree.contains(&AgentId("gc".into())));
+    assert_eq!(status_of(&tree, "child"), Some(AgentStatus::Terminated));
+}
+
+/// The cascade holds the loop cascade's scope across the whole terminate — from its start,
+/// before it marks the subtree, to after it tears down the last node — and lets go of it
+/// when it stops part-way, or is refused, too.
+#[test]
+fn ac03_terminate_holds_its_scope_from_its_start_to_its_end() {
+    let (_t, tree, rec) = setup_tree();
+    with_scoped_loops(&tree, &rec, Arc::new(GRec(rec.clone())))
+        .terminate_child("root", "child")
+        .unwrap();
+    let steps = rec.snapshot();
+    assert_eq!(
+        steps[..3].to_vec(),
+        calls(&["scope-begin", "child:Active", "stop:gc"]),
+        "taken before the subtree is marked"
+    );
+    assert_eq!(
+        steps[steps.len() - 2..].to_vec(),
+        calls(&["abort:child", "scope-end"])
+    );
+
+    let (_t, tree, rec) = setup_tree();
+    let failed = with_scoped_loops(&tree, &rec, FailingGRec::new(&rec, "gc"))
+        .terminate_child("root", "child");
+    assert!(failed.is_err());
+    assert_eq!(
+        rec.snapshot().last().map(String::as_str),
+        Some("scope-end"),
+        "let go of when it stops part-way too"
+    );
+
+    let (_t, tree, rec) = setup_tree();
+    let refused =
+        with_scoped_loops(&tree, &rec, Arc::new(GRec(rec.clone()))).terminate_child("gc", "child");
+    assert!(matches!(refused, Err(LifecycleError::PermissionDenied(_))));
+    assert_eq!(
+        rec.snapshot(),
+        calls(&["scope-begin", "child:Active", "scope-end"]),
+        "and when it is refused"
+    );
+}
+
+/// A terminate retried after one that failed part-way removes what that one left: every
+/// node is stopped again (a stop is idempotent) and torn down once its steps succeed.
+#[test]
+fn ac03_terminate_retried_after_a_part_way_failure_removes_the_rest() {
+    let (_t, tree, rec) = setup_tree();
+    let grant = FailingGRec::new(&rec, "gc");
+    let ctrl = with_loops(&tree, &rec, grant.clone());
+    ctrl.terminate_child("root", "child").unwrap_err();
+    let failed = rec.snapshot().len();
+
+    grant.failing.store(false, Ordering::SeqCst);
+    ctrl.terminate_child("root", "child").unwrap();
+    assert_eq!(
+        rec.snapshot()[failed..],
+        calls(&[
+            "stop:gc",
+            "stop:child",
+            "cancel:gc",
+            "flush:gc",
+            "revoke:gc",
+            "abort:gc",
+            "cancel:child",
+            "flush:child",
+            "revoke:child",
+            "abort:child",
+        ])
+    );
+    assert!(!tree.contains(&AgentId("child".into())));
+    assert!(!tree.contains(&AgentId("gc".into())));
 }
 
 #[test]

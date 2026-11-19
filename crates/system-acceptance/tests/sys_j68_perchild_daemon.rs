@@ -1422,6 +1422,197 @@ async fn sys_ac_281_terminate_stops_served_child() {
     );
 }
 
+const GC_BARE: &str = "gcfoo";
+const GC_COLON: &str = "agent:gcfoo";
+
+/// A grant revoke that fails for one agent while `failing` is set: the terminate leg
+/// failing part-way.
+struct FailingGrant {
+    agent: &'static str,
+    failing: std::sync::atomic::AtomicBool,
+}
+impl GrantCascadeRevoke for FailingGrant {
+    fn revoke_for_agent(&self, agent: &str) -> Result<(), LifecycleError> {
+        if agent == self.agent && self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(LifecycleError::IoFailure(format!("revoke {agent}")));
+        }
+        Ok(())
+    }
+}
+
+/// Leave a message for the agent served under `to` in its mailbox, as a send does.
+fn deliver_281(rig: &Rig281, from: &str, to: &str, id: &str) {
+    rig.store
+        .get_or_create(to)
+        .expect("mailbox")
+        .deliver(Message {
+            id: id.to_string(),
+            kind: MessageKind::Agent,
+            from: from.to_string(),
+            to: to.to_string(),
+            payload: vec![0x01],
+            context: None,
+            timestamp: std::time::SystemTime::now(),
+            origin: None,
+        })
+        .expect("deliver");
+}
+
+/// Whether the loop served under `colon` has run `turns` turns, waiting up to 3 s.
+async fn turns_reach(rig: &Rig281, colon: &str, turns: usize) -> bool {
+    for _ in 0..60 {
+        if rig.mgr.child_turns(colon) >= turns {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// SYS-AC-281 terminate failing part-way (MODULE-005 terminate-child flow): on the
+/// production `DefaultTerminateController` + `PerChildLoopCascade`, a parent → child →
+/// grandchild tree, both served, whose terminate fails at a grant revoke — at the
+/// grandchild, the first node in removal order, or at the child, after the grandchild was
+/// removed. Every loop of the subtree is stopped all the same: no turn runs after it.
+/// A node it leaves in the tree keeps its route, so a message sent to it after the failure
+/// waits in its mailbox, neither consumed nor drained (the cascade's flush of a node, before
+/// its grant revoke, takes only what waited then); a node it removed is torn down. A retry
+/// removes the rest: unrouted, drained, gone from the tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sys_ac_281_terminate_failing_part_way_stops_every_loop_and_leaves_the_rest_for_a_retry() {
+    for fails_at in [GC_BARE, CHILD_BARE] {
+        let rig = build_rig_281(CHILD_CORE, vec![], false, false).await;
+        DefaultSpawner::new(rig.bare_store.clone(), Arc::new(AllowAllSubset))
+            .with_spawn_observer(rig.mgr.clone() as Arc<dyn SpawnObserver>)
+            .spawn_child(SpawnChildConfig {
+                handle: None,
+                parent_id: AgentId(CHILD_BARE.to_string()),
+                child_id: AgentId(GC_BARE.to_string()),
+                child_workspace_path: PathBuf::from("children").join(GC_BARE),
+                capabilities: vec![],
+                template_ref: None,
+                binary: Some(CHILD_CORE.to_vec()),
+            })
+            .expect("spawn the grandchild");
+        for _ in 0..60 {
+            if rig.mgr.active_loop_count() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            rig.mgr.active_loop_count(),
+            2,
+            "child and grandchild served"
+        );
+        for (from, to) in [(PARENT_COLON, CHILD_COLON), (CHILD_COLON, GC_COLON)] {
+            deliver_281(&rig, from, to, &format!("{to}-live"));
+            assert!(turns_reach(&rig, to, 1).await, "{to} runs a turn");
+        }
+
+        let grant = Arc::new(FailingGrant {
+            agent: fails_at,
+            failing: std::sync::atomic::AtomicBool::new(true),
+        });
+        let controller = DefaultTerminateController::new(
+            rig.bare_store.clone(),
+            grant.clone(),
+            Arc::new(NoopMailbox),
+            Arc::new(NoopRun),
+            Arc::new(NoopWorkspace),
+        )
+        .with_loop_cascade(Arc::new(PerChildLoopCascade::new(rig.mgr.clone())));
+        let err = controller
+            .terminate_child(PARENT_BARE, CHILD_BARE)
+            .expect_err("the revoke fails");
+        assert!(matches!(err, LifecycleError::IoFailure(_)), "{err:?}");
+        assert_eq!(
+            rig.mgr.active_loop_count(),
+            0,
+            "every loop of the subtree is stopped (fails at {fails_at})"
+        );
+
+        let (kept, removed): (Vec<(&str, &str)>, Vec<(&str, &str)>) = if fails_at == GC_BARE {
+            (vec![(GC_BARE, GC_COLON), (CHILD_BARE, CHILD_COLON)], vec![])
+        } else {
+            (vec![(CHILD_BARE, CHILD_COLON)], vec![(GC_BARE, GC_COLON)])
+        };
+        let turns = |rig: &Rig281| [CHILD_COLON, GC_COLON].map(|colon| rig.mgr.child_turns(colon));
+        let turns_before = turns(&rig);
+        for (bare, colon) in &kept {
+            assert!(
+                rig.routing.agent_exists(colon),
+                "{colon} keeps its route (fails at {fails_at})"
+            );
+            assert_eq!(
+                rig.bare_store
+                    .get_node(&AgentId(bare.to_string()))
+                    .map(|node| node.status),
+                Some(AgentStatus::Terminated),
+                "{bare} stays, marked terminated (fails at {fails_at})"
+            );
+            deliver_281(&rig, PARENT_COLON, colon, &format!("{colon}-kept"));
+        }
+        for (bare, colon) in &removed {
+            assert!(
+                !rig.routing.agent_exists(colon),
+                "{colon} is torn down (fails at {fails_at})"
+            );
+            assert_eq!(
+                rig.store.get(colon).map(|mb| mb.depth()).unwrap_or(0),
+                0,
+                "{colon} is drained (fails at {fails_at})"
+            );
+            assert!(rig
+                .bare_store
+                .get_node(&AgentId(bare.to_string()))
+                .is_none());
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for (_, colon) in &kept {
+            assert_eq!(
+                rig.store.get(colon).map(|mb| mb.depth()),
+                Some(1),
+                "the message for {colon} waits, neither consumed nor drained (fails at \
+                 {fails_at})"
+            );
+        }
+        assert_eq!(
+            turns(&rig),
+            turns_before,
+            "no turn runs after the stop (fails at {fails_at})"
+        );
+
+        grant
+            .failing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        controller
+            .terminate_child(PARENT_BARE, CHILD_BARE)
+            .expect("the retry removes the rest");
+        for (bare, colon) in [(CHILD_BARE, CHILD_COLON), (GC_BARE, GC_COLON)] {
+            assert!(
+                !rig.routing.agent_exists(colon),
+                "{colon} (fails at {fails_at})"
+            );
+            assert_eq!(
+                rig.store.get(colon).map(|mb| mb.depth()).unwrap_or(0),
+                0,
+                "{colon} is drained (fails at {fails_at})"
+            );
+            assert!(rig
+                .bare_store
+                .get_node(&AgentId(bare.to_string()))
+                .is_none());
+        }
+        assert_eq!(rig.mgr.active_loop_count(), 0);
+        assert_eq!(
+            turns(&rig),
+            turns_before,
+            "and no turn ran (fails at {fails_at})"
+        );
+    }
+}
+
 /// SYS-AC-281 terminate discriminator: WITHOUT `.with_loop_cascade`, the same
 /// `terminate_child` removes the tree node but leaves the serve loop RUNNING —
 /// `active_loop_count` stays 1, routing still resolves, and a post-terminate send

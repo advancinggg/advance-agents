@@ -32,7 +32,9 @@
 //!   above turns about something else, and the model answers from what was recalled —
 //!   also after a restart, from the index on disk;
 //! - a turn indexed while its agent could not embed is recalled once it can;
-//! - a child agent recalls its own turns and nothing of its parent's.
+//! - a child agent recalls its own turns and nothing of its parent's;
+//! - the knowledge a real model extracts from a deleted agent's turn is taken over by its
+//!   parent, as history, and recalled by it.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -838,4 +840,114 @@ async fn a_child_agent_recalls_its_own_turns_and_nothing_of_its_parents() {
     assert_eq!(of_child.len(), 2, "the child's two turns");
     assert_rows_embedded(&of_root, live, dimensions);
     assert_rows_embedded(&of_child, live, dimensions);
+}
+
+/// The knowledge a real model extracts from an agent's turn is kept, as history, when the
+/// agent is deleted, and its parent takes it over (owner decision 2026-11-17): after the
+/// delete every entry the helper held is the root's, naming the helper, and the helper's id
+/// holds none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "calls a real model service; set the ADVANCE_LIVE_LLM_* variables"]
+async fn a_deleted_agents_knowledge_is_taken_over_by_its_parent() {
+    let Some(live) = live() else { return };
+    let live = &live;
+    let home = memory_home(
+        true,
+        &["messaging"],
+        &[live.entry(NEAR, true)],
+        &["provider: near"],
+    );
+    let tap = &Tap::new();
+    serve(&home, tap.security(), WAIT, |client| async move {
+        client
+            .create_child(HELPER, &["fs", "llm", "memory"], NEAR)
+            .await;
+    })
+    .await;
+    give_child_the_default_driver(&home, HELPER);
+    let memory_root = home.home().join(".agent/memory");
+
+    let seen = Arc::new(Mutex::new(None));
+    let noted = seen.clone();
+    let knowledge_root = memory_root.clone();
+    serve(&home, tap.security(), WAIT, |client| async move {
+        child_turn(tap, &client, live, HELPER_MAILBOX, ELEVATOR_FACT).await;
+        client.context_with_turns(Agent::Child(HELPER), 1).await;
+        let root = client.listed_id(Agent::Root).await.expect("the root");
+        let helper = client
+            .listed_id(Agent::Child(HELPER))
+            .await
+            .expect("the helper");
+        // Before the delete: what the model extracted from the helper's turn is held under
+        // the helper's id.
+        let held = knowledge_ids(&knowledge_root, &helper);
+        assert!(
+            !held.is_empty(),
+            "the model extracted no knowledge from the helper's turn"
+        );
+        client.delete_child(HELPER).await;
+        assert_eq!(client.listed_id(Agent::Child(HELPER)).await, None);
+        *noted.lock().unwrap() = Some((root, helper, held));
+    })
+    .await;
+
+    // The composition is shut down, its last pass over the helper's records with it: read
+    // the home's knowledge as it is on disk.
+    let (root, helper, held) = seen.lock().unwrap().clone().expect("the second start ran");
+    let store =
+        cap_memory::MemoryStore::open(&memory_root, cap_memory::DEFAULT_MAX_ACTIVE_PER_AGENT)
+            .expect("the home's knowledge");
+    assert!(
+        store.list(&helper).is_empty(),
+        "the deleted agent's id holds no knowledge: {:#?}",
+        store.list(&helper)
+    );
+    let of_root = store.list(&root);
+    let from = format!("{}{helper}", cap_memory::FROM_AGENT_TAG_PREFIX);
+    for id in &held {
+        let entry = of_root
+            .iter()
+            .find(|entry| &entry.id == id)
+            .unwrap_or_else(|| panic!("the root holds the helper's entry {id}: {of_root:#?}"));
+        assert_eq!(entry.agent_id, root);
+        assert!(
+            entry.tags.contains(&from),
+            "the entry names the helper: {:?}",
+            entry.tags
+        );
+    }
+    assert!(
+        of_root
+            .iter()
+            .any(|entry| mentions(&entry.content, &["elevator"])),
+        "what the helper learned about the elevator is the root's now: {of_root:#?}"
+    );
+    // The root recalls it as its own: what a guest's `recall` serves from.
+    let recalled = store.recall(&root, "elevator", 10);
+    assert!(
+        recalled.iter().any(|entry| held.contains(&entry.id)),
+        "the root recalls what the helper learned about the elevator: {recalled:#?}"
+    );
+    eprintln!(
+        "LIVE hand-over: the root holds the helper's {} entries and recalls {} of them",
+        held.len(),
+        recalled
+            .iter()
+            .filter(|entry| held.contains(&entry.id))
+            .count()
+    );
+}
+
+/// The ids of the knowledge entries `agent` holds, as its file in the home's store at
+/// `memory_root` has them — read while the composition runs: the file, not a second store.
+fn knowledge_ids(memory_root: &std::path::Path, agent: &str) -> Vec<String> {
+    let file = memory_root
+        .join(cap_memory::persistence::slug(agent))
+        .join(cap_memory::persistence::KNOWLEDGE_JSONL_FILENAME);
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|entry| entry["id"].as_str().map(str::to_string))
+        .collect()
 }

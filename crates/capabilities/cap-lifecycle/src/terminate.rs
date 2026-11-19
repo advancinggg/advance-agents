@@ -73,20 +73,41 @@ pub trait MemoryArchiver: Send + Sync {
     ) -> Result<(), LifecycleError>;
 }
 
-/// Cascade (seam f — MODULE-001-AC-22): abort a terminating agent's per-agent
-/// SERVE loop and tear down its dynamic routing + mailbox. `terminate_child`
+/// Cascade (seam f — MODULE-001-AC-22): stop a terminating agent's per-agent
+/// SERVE loop, then tear down its dynamic routing + mailbox. `terminate_child`
 /// operates on the BARE tree, but the loop-registry / colon routing / mailbox are
 /// COLON-keyed, so the impl (the cli-spine `PerChildLoopManager`-backed adapter)
 /// resolves bare→colon internally. Injected as `Option` on
 /// `DefaultTerminateController` (default `None` = byte-identical pre-existing
 /// teardown — there is no serve loop to tear down when unwired), so existing
-/// terminate behaviour is unchanged unless a loop cascade is wired in. Called per
-/// removed node BEFORE its mailbox flush + tree removal, so the aborted loop can
-/// never consume a message mid-termination.
+/// terminate behaviour is unchanged unless a loop cascade is wired in.
+///
+/// Two calls per node (MODULE-005 terminate-child flow): [`Self::stop_loop`] for
+/// every node of the subtree, in removal order, before the cascade's first step
+/// that can fail (each node's run cancel, mailbox flush, grant revoke and workspace
+/// removal); then [`Self::abort_loop`] for each node once those steps of that node
+/// have succeeded, right before its tree removal. A cascade that stops part-way
+/// leaves no loop serving a half-removed agent, and no stopped loop consumes a message
+/// mid-termination; a node it leaves in the tree keeps its routing and records — and its
+/// mailbox, unless the cascade's flush of it ran before the step that failed — for a
+/// retry to remove.
 pub trait LoopCascade: Send + Sync {
-    /// Abort `agent_id`'s serve loop (if any) and unregister its routing/mailbox.
-    /// `agent_id` is the BARE tree id — the impl maps it to the colon serve key.
+    /// Stop `agent_id`'s serve loop (if any), and tear nothing down: its routing, its
+    /// mailbox and what the agent is remembered by stay as they are until
+    /// [`Self::abort_loop`]. A turn under way is cut off. `agent_id` is the BARE tree id —
+    /// the impl maps it to the colon serve key.
+    fn stop_loop(&self, agent_id: &str);
+    /// Tear down what `agent_id`'s serve loop leaves: the loop itself (stopped here
+    /// when [`Self::stop_loop`] did not stop it), its routing and mailbox, and what
+    /// the agent is remembered by. `agent_id` is the BARE tree id.
     fn abort_loop(&self, agent_id: &str);
+    /// Held by the cascade for the whole of one terminate — from its start, before it marks
+    /// the subtree, to its end, after its last [`Self::abort_loop`], however it ends — and
+    /// dropped then: an implementation that lets go of what a teardown needs (a shutdown)
+    /// waits for it. `None` by default.
+    fn terminate_scope(&self) -> Option<Box<dyn Send>> {
+        None
+    }
 }
 
 pub trait TerminateController: Send + Sync {
@@ -146,9 +167,10 @@ impl DefaultTerminateController {
     }
 
     /// Inject the seam-f per-child serve-loop teardown port (additive builder; the
-    /// 5-arg `new()` signature is unchanged). When set, `terminate_child` aborts
-    /// each removed node's serve loop + unregisters its routing BEFORE flushing the
-    /// mailbox + removing the tree node.
+    /// 5-arg `new()` signature is unchanged). When set, `terminate_child` stops the
+    /// serve loop of every node of the subtree before the cascade's first step that
+    /// can fail, and tears each node's loop down — routing, mailbox, records — once
+    /// that node's steps have succeeded ([`LoopCascade`]).
     pub fn with_loop_cascade(mut self, loop_cascade: Arc<dyn LoopCascade>) -> Self {
         self.loop_cascade = Some(loop_cascade);
         self
@@ -186,6 +208,13 @@ impl DefaultTerminateController {
 
 impl TerminateController for DefaultTerminateController {
     fn terminate_child(&self, caller_id: &str, child_id: &str) -> Result<(), LifecycleError> {
+        // seam (f): held until this returns, however it returns — from before the subtree is
+        // marked, so a shutdown that comes while it is marked waits for the whole terminate:
+        // what lets go of the stores a teardown needs waits for it.
+        let _scope = self
+            .loop_cascade
+            .as_ref()
+            .and_then(|lc| lc.terminate_scope());
         if validate_agent_id(caller_id).is_err() {
             return Err(LifecycleError::PermissionDenied(format!(
                 "invalid caller id: {caller_id}"
@@ -251,6 +280,22 @@ impl TerminateController for DefaultTerminateController {
         let snap = self.tree.snapshot();
         let removal_order = Self::post_order(&snap, &child);
 
+        // seam (f): stop every serve loop of the subtree before the first step below that
+        // can fail (MODULE-005 terminate-child flow). Each of those steps can stop the
+        // cascade part-way (`?`); a loop still running then would serve on for an agent
+        // whose run, mailbox or grants are half torn down, and for the nodes after the
+        // failing one, which stay in the tree marked terminated. Stopping cannot fail and
+        // tears nothing down: what a node's loop leaves — its routing, mailbox and records —
+        // is torn down only once that node's own steps have succeeded (`abort_loop` below),
+        // so a node a failed terminate leaves in the tree keeps it, but for what the steps
+        // for that node that ran removed (its runs; its mailbox's messages, once flushed),
+        // and a retry removes the node. No stopped loop consumes a message mid-termination.
+        if let Some(lc) = &self.loop_cascade {
+            for id in &removal_order {
+                lc.stop_loop(&id.0);
+            }
+        }
+
         // Post-order cascade + remove (leaf-guaranteed). Every descendant is
         // in `removal_order` (the top-down freeze above guarantees no escapee),
         // so every node's run is cancelled, mailbox flushed, and grants
@@ -261,13 +306,6 @@ impl TerminateController for DefaultTerminateController {
                 .iter()
                 .find(|n| &n.id == id)
                 .map(|n| n.kind.clone());
-            // seam (f): abort this node's serve loop + unregister its dynamic
-            // routing FIRST — before the mailbox flush / tree removal — so the
-            // aborted loop cannot consume a message mid-termination. The impl maps
-            // the BARE id to the colon serve key and unfreezes-before-drain.
-            if let Some(lc) = &self.loop_cascade {
-                lc.abort_loop(&id.0);
-            }
             self.run.cancel_run(&id.0)?;
             self.mailbox.flush_mailbox(&id.0)?;
             self.grant.revoke_for_agent(&id.0)?;
@@ -330,6 +368,13 @@ impl TerminateController for DefaultTerminateController {
                         self.workspace.remove_sub_workspace(&node.workspace_path)?;
                     }
                 }
+            }
+            // seam (f): this node's steps that can fail have succeeded — tear down what its
+            // stopped loop leaves (routing, mailbox, records) while the node still holds its
+            // ids, right before it leaves the tree. The impl maps the BARE id to the colon
+            // serve key and unfreezes-before-drain.
+            if let Some(lc) = &self.loop_cascade {
+                lc.abort_loop(&id.0);
             }
             self.tree
                 .remove(id)

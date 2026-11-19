@@ -1541,7 +1541,11 @@ impl PostProcessor {
     /// Supersede / Skip). SAT-B: when `write_agent_id` is unset, `write_id ==`
     /// the `run()` agent_id, so the normalize is a no-op vs the pre-SAT-B
     /// behaviour (AC-10/AC-11 unaffected). `&ex.knowledge` is an immutable
-    /// borrow, so each entry is cloned before its `agent_id` is set.
+    /// borrow, so each entry is cloned before its `agent_id` is set. A tag the
+    /// model chose that reads as the store's provenance tag
+    /// ([`crate::store::FROM_AGENT_TAG_PREFIX`], which only a hand-over sets) is
+    /// dropped first, and the entry kept: the store would refuse the entry with
+    /// it, and this step would end the turn's post-processing there.
     async fn step_5_memory_reconciliation(
         &self,
         write_id: &str,
@@ -1554,6 +1558,17 @@ impl PostProcessor {
         for entry in &ex.knowledge {
             let mut e = entry.clone();
             e.agent_id = write_id.to_string();
+            e.tags.retain(|tag| {
+                let reserved = crate::store::reads_as_handed_over(tag);
+                if reserved {
+                    eprintln!(
+                        "cap-memory post-processor: dropping the tag {tag:?} of extracted entry \
+                         {}: it reads as the provenance tag only a hand-over sets",
+                        entry.id
+                    );
+                }
+                !reserved
+            });
             let action = components.reconciler.reconcile(write_id, &e);
             // SAT-C (068): inspect the action BEFORE it is moved into
             // `apply_action`, then increment the L6 ">=20 new entries"

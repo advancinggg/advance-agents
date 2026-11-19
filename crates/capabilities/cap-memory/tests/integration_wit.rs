@@ -498,3 +498,95 @@ async fn recall_with_limit_zero_caps_to_max_recall_limit() {
         other => panic!("expected Ok(Some(List)), got {:?}", other),
     }
 }
+
+/// What a guest's `recall` returns for `agent` and `query`: the ids of the entries.
+async fn recalled_ids(
+    recall: &advance_runtime::host_registry::HostFunctionSpec,
+    agent: &str,
+    query: &str,
+) -> Vec<String> {
+    let r = recall
+        .handler
+        .call(
+            ctx_for(agent),
+            vec![Val::String(query.into()), Val::U32(10)],
+            1,
+        )
+        .await
+        .expect("recall ok");
+    let Val::Result(Ok(Some(payload))) = &r[0] else {
+        panic!("expected Ok(Some(List)), got {:?}", r[0]);
+    };
+    let Val::List(items) = payload.as_ref() else {
+        panic!("expected Val::List, got {payload:?}");
+    };
+    items
+        .iter()
+        .map(|item| {
+            let Val::Record(fields) = item else {
+                panic!("expected a memory-entry record, got {item:?}");
+            };
+            match fields.iter().find(|(name, _)| name == "id") {
+                Some((_, Val::String(id))) => id.clone(),
+                other => panic!("expected the entry's id, got {other:?}"),
+            }
+        })
+        .collect()
+}
+
+/// The entries a terminated agent hands over to its heir ([`MemoryStore::hand_over`]) are
+/// the heir's to recall through the guest's own `recall`, as its own are, and no longer the
+/// terminated agent's. A guest cannot write the tag that names where an entry came from, in
+/// a look-alike spelling either.
+#[tokio::test]
+async fn recall_finds_the_entries_handed_over_to_the_agent() {
+    let (reg, store) = registry_with_store();
+    let specs = reg.lookup(CAPABILITY);
+    let remember = spec_named(&specs, "remember");
+    let recall = spec_named(&specs, "recall");
+    let r = remember
+        .handler
+        .call(
+            ctx_for("kid"),
+            vec![
+                Val::String("the staging password rotates on fridays".into()),
+                Val::List(vec![]),
+            ],
+            1,
+        )
+        .await
+        .expect("remember ok");
+    let Val::Result(Ok(Some(payload))) = &r[0] else {
+        panic!("expected Ok(Some(String)), got {:?}", r[0]);
+    };
+    let Val::String(id) = payload.as_ref() else {
+        panic!("expected the entry's id, got {payload:?}");
+    };
+    assert_eq!(recalled_ids(recall, "kid", "staging").await, [id.clone()]);
+
+    store.hand_over("kid", "root").expect("hand over");
+    assert_eq!(
+        recalled_ids(recall, "root", "staging").await,
+        [id.clone()],
+        "the heir recalls it"
+    );
+    assert!(recalled_ids(recall, "kid", "staging").await.is_empty());
+
+    let r = remember
+        .handler
+        .call(
+            ctx_for("kid"),
+            vec![
+                Val::String("mine".into()),
+                Val::List(vec![Val::String("From-Agent:root".into())]),
+            ],
+            1,
+        )
+        .await
+        .expect("remember dispatch ok");
+    assert!(
+        matches!(&r[0], Val::Result(Err(_))),
+        "a look-alike provenance tag is refused: {:?}",
+        r[0]
+    );
+}
