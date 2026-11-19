@@ -19,7 +19,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "advance-cli"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-cli",
  "advance-client-api",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "advance-client-api"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-client-api",
  "advance-database",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "advance-context-engine"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-shared-types",
  "async-trait",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "advance-core"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-client-api",
  "advance-context-engine",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "advance-cost-tracker"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-shared-types",
  "serde_json",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "advance-database"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-shared-types",
  "async-trait",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "advance-embedded-runtime-bridge"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-client-api",
  "advance-runtime",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "advance-event-bus"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-cost-tracker",
  "advance-scheduler",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "advance-genui"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "jsonschema",
  "schemars",
@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "advance-git"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-git",
  "advance-shared-types",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "advance-home"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-client-api",
  "advance-runtime",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "advance-messaging"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-runtime",
  "advance-shared-types",
@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "advance-observability-xtask"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "advance-pack-manager"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-shared-types",
  "async-trait",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "advance-reply-tracker"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-event-bus",
  "advance-messaging",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "advance-run-manager"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-run-manager",
  "advance-shared-types",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "advance-runtime"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-database",
  "advance-shared-types",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "advance-runtime-compose"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-client-api",
  "advance-context-engine",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "advance-scheduler"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-shared-types",
  "async-trait",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "advance-scheduler-auto-loop"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-git",
  "advance-scheduler",
@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "advance-shared-types"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-shared-types",
  "async-trait",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "build-agent"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "anyhow",
  "clap",
@@ -1118,7 +1118,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "cap-channel"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-runtime",
  "advance-shared-types",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "cap-data"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-shared-types",
  "async-trait",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "cap-fs"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-database",
  "advance-git",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "cap-grant"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-database",
  "advance-run-manager",
@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "cap-http"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-shared-types",
  "aho-corasick",
@@ -1243,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "cap-lifecycle"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-database",
  "advance-messaging",
@@ -1273,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "cap-llm"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-runtime",
  "advance-shared-types",
@@ -1300,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "cap-mcp"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-runtime",
  "advance-shared-types",
@@ -1319,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "cap-memory"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-runtime",
  "advance-shared-types",
@@ -1380,7 +1380,7 @@ dependencies = [
 
 [[package]]
 name = "cap-secrets"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-runtime",
  "advance-shared-types",
@@ -1404,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "cap-skills"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-git",
  "advance-runtime",
@@ -1454,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "cap-tools"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-context-engine",
  "advance-run-manager",
@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "cap-ui"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-database",
  "advance-runtime",
@@ -4723,7 +4723,7 @@ dependencies = [
 
 [[package]]
 name = "system-acceptance"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "advance-cli",
  "advance-client-api",
