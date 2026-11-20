@@ -1861,10 +1861,17 @@ impl TurnObserver for WatchTurnObserver {
         self.in_flight.store(false, Ordering::Release);
     }
 
+    fn on_turn_start(&self, agent_id: &str, message_id: &str) {
+        // The model calls of this turn belong to the message it executes: a Client API
+        // message's stream follows all of them, not only the first.
+        self.reply_registry.note_turn_start(agent_id, message_id);
+    }
+
     fn on_turn_end(&self, agent_id: &str, end: &advance_scheduler::TurnEnd) {
         // The turn has settled (dispatch finished or the turn failed), so the Client
         // API message it executed can take its redacted failure class here and only
-        // here: a client that stops waiting on that class never misses a reply.
+        // here: a client that stops waiting on that class never misses a reply. Its
+        // stream ends here too.
         self.reply_registry
             .note_turn_end(agent_id, &end.message_id, end.outcome);
     }

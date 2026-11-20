@@ -13,6 +13,7 @@ use advance_client_api::{
 };
 use advance_messaging::{MailboxStore, DEFAULT_CAPACITY};
 use advance_runtime::bootstrap::RuntimeHostBuilder;
+use advance_scheduler::TurnOutcome;
 
 const MINIMAL_RUNTIME_YAML: &str = "\
 wasm:
@@ -240,6 +241,8 @@ fn msg06_status_stream_key_none_until_recorded() {
     let ack: ClientMessageAck = serde_json::from_value(env.data.clone().unwrap()).unwrap();
     let st0 = get_status(&api, &ack.message_id);
     assert!(st0.stream_key.is_none());
+    // The serving loop starts the message's turn; its first model call names the stream.
+    replies.note_turn_start("agent:root", &ack.message_id);
     replies.record_stream_key("agent:root", "st_abc");
     let st1 = get_status(&api, &ack.message_id);
     assert_eq!(st1.stream_key.as_deref(), Some("st_abc"));
@@ -262,7 +265,9 @@ fn msg09_two_sends_isolate_stream_key_per_message_id() {
             .unwrap(),
     )
     .unwrap();
+    replies.note_turn_start("agent:root", &ack1.message_id);
     replies.record_stream_key("root", "st_one");
+    replies.note_turn_end("agent:root", &ack1.message_id, TurnOutcome::Completed);
     let ack2: ClientMessageAck = serde_json::from_value(
         send(&api, "agent:root", "b", "k-iso-2")
             .data
@@ -270,6 +275,7 @@ fn msg09_two_sends_isolate_stream_key_per_message_id() {
             .unwrap(),
     )
     .unwrap();
+    replies.note_turn_start("agent:root", &ack2.message_id);
     replies.record_stream_key("root", "st_two");
     assert_eq!(
         get_status(&api, &ack1.message_id).stream_key.as_deref(),
@@ -325,6 +331,10 @@ async fn msg07_production_wrap_status_sees_begin_on_gateway_sink() {
     let ack: ClientMessageAck = serde_json::from_value(env.data.clone().unwrap()).unwrap();
 
     let gw = handles.llm_gateway.as_ref().expect("llm: true ⇒ gateway");
+    // The serving loop starts the message's turn before its first model call.
+    handles
+        .reply_registry
+        .note_turn_start("agent:root", &ack.message_id);
     gw.delta_sink().publish(LlmDeltaEvent {
         agent_id: Arc::from("root"),
         stream_key: Arc::from("st_prodwrap"),
@@ -513,6 +523,8 @@ post-processor:
     mint(&api, "tok", vec![Scope::SendMessages, Scope::ReadMessages]);
     let env = send(&api, "agent:root", "hi", "k-c235");
     let ack: ClientMessageAck = serde_json::from_value(env.data.clone().unwrap()).unwrap();
+    // The serving loop starts the message's turn before the guest calls the model.
+    replies.note_turn_start("agent:root", &ack.message_id);
 
     let ctx = HostCallContext {
         agent_id: "root".into(),
@@ -540,4 +552,45 @@ post-processor:
     let page = hub.read_page(&key, 0);
     let concat: String = page.deltas.iter().map(|d| d.text.as_str()).collect();
     assert_eq!(concat, "hello");
+    assert!(
+        page.terminal.is_none(),
+        "the stream lasts as long as its turn"
+    );
+
+    // The turn's next model call (after a tool result, say) follows on the same stream.
+    let ctx = HostCallContext {
+        agent_id: "root".into(),
+        trace_id: "t-c235-2".into(),
+        turn_id: None,
+        transcript_scope: None,
+        capability: "llm".into(),
+        function: "agent-llm::generate".into(),
+        run_id: None,
+        iteration: None,
+    };
+    let vals = generate_h
+        .call(ctx, vec![Val::String("again".into())], 1)
+        .await
+        .expect("host fn");
+    assert!(
+        matches!(&vals[0], Val::Result(Ok(_))),
+        "generate ok: {:?}",
+        vals[0]
+    );
+    assert_eq!(
+        get_status(&api, &ack.message_id).stream_key.as_deref(),
+        Some(key.as_str())
+    );
+    // The stub answers "hello" to every call: the second call's text follows the first's,
+    // set apart by a blank line, on the message's one stream.
+    let page = hub.read_page(&key, 0);
+    let concat: String = page.deltas.iter().map(|d| d.text.as_str()).collect();
+    assert_eq!(concat, "hello\n\nhello");
+    assert!(page.terminal.is_none());
+    replies.note_turn_end("agent:root", &ack.message_id, TurnOutcome::Completed);
+    let page = hub.read_page(&key, 0);
+    assert!(
+        page.terminal.is_some(),
+        "the stream ends with its turn: {page:?}"
+    );
 }

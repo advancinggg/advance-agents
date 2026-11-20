@@ -26,6 +26,9 @@ use advance_messaging::{AgentAction, OutboundActionSink};
 use advance_scheduler::TurnOutcome;
 use advance_shared_types::mailbox::{DispatchError, Message};
 use advance_shared_types::outbound::DeliveryReport;
+use advance_shared_types::traits::{
+    LlmDeltaEvent, LlmDeltaFrame, LlmDeltaSink, LlmDeltaUsage, LlmTerminalReason,
+};
 
 use crate::api::log_keys;
 use crate::compose_log::LogHandle;
@@ -41,6 +44,362 @@ const STDOUT_PREVIEW_BYTES: usize = 4096;
 /// Reply value carried by a [`ReplyRegistry`] oneshot: `Some(bytes)` when the
 /// turn produced at least one action, `None` when it produced none.
 type ReplySlot = oneshot::Sender<Option<Vec<u8>>>;
+
+/// The most model calls one message's stream follows; a later call of the same turn is
+/// published on its own stream.
+const MAX_CALLS_PER_MESSAGE_STREAM: usize = 1024;
+
+/// Stream keys of calls whose message stream has ended, remembered so that what they still
+/// publish (a turn-end reap's `Terminal`, say) is dropped instead of reaching the hub. It holds
+/// every call of the longest message stream twice over, so one stream's end never forgets
+/// its own calls.
+const MAX_RETIRED_CALL_KEYS: usize = 2 * MAX_CALLS_PER_MESSAGE_STREAM;
+
+/// The most Client API messages waiting for their turn per agent; past it the oldest is
+/// forgotten (its turn, should it still run, then publishes its calls on their own streams).
+const MAX_PENDING_MESSAGES_PER_AGENT: usize = 256;
+
+/// The text between the replies of two model calls of one message's stream.
+const CALL_SEPARATOR: &str = "\n\n";
+
+/// The most text one delta of a stream of a message's own carries: its reply goes in pieces
+/// of at most this, so the hub keeps what fits its window and counts the rest dropped, as it
+/// does for a model call's deltas, instead of dropping a large reply whole. The hub never
+/// releases a tail that could begin a secret, and it holds whole deltas (MODULE-020-T24-h),
+/// so a reply that ends so loses the pieces that hold that tail: its last, or more when the
+/// tail spans pieces.
+const OWN_STREAM_DELTA_BYTES: usize = 16 * 1024;
+
+/// `text` in pieces of at most `max` bytes (at least one char each), cut at char boundaries.
+fn pieces(text: &str, max: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut end = max.min(rest.len());
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            end = rest.chars().next().map_or(rest.len(), char::len_utf8);
+        }
+        let (piece, tail) = rest.split_at(end);
+        out.push(piece);
+        rest = tail;
+    }
+    out
+}
+
+/// One model call of the turn that executes a Client API message.
+struct MergedCall {
+    /// Where the call's delta `seq` 0 lands on the message's stream.
+    base: u64,
+    /// The base of the call that began after this one: a delta of this call landing there
+    /// or later is dropped (it would land where the later call's text is). One landing
+    /// below it is routed to its own place (where the hub takes it, or counts it dropped
+    /// when its release floor has passed it).
+    limit: Option<u64>,
+    /// The call has published text: its next delta is not set apart from the earlier
+    /// calls' text again.
+    seen_text: bool,
+    /// The call's own `Terminal`, once published: its reason and settled usage.
+    terminal: Option<(LlmTerminalReason, Option<LlmDeltaUsage>)>,
+}
+
+/// The stream of one Client API message: every model call of the turn that executes it, on
+/// the stream key of the turn's first call (the key its status names). The first call's
+/// frames pass as they are; a later call's deltas follow on the same key, its text set
+/// apart from the earlier text by a blank line; no call's own `Terminal` reaches the hub.
+/// The stream's one `Terminal` is published when the turn ends.
+struct MessageStream {
+    message_id: String,
+    /// The agent id the turn's start named: the agent of a stream of the message's own,
+    /// when the turn opens none.
+    turn_agent: Arc<str>,
+    /// The agent id the first call's `Begin` carried (the hub's per-agent bookkeeping).
+    agent_id: Option<Arc<str>>,
+    /// The stream key of the turn's first call; `None` before it.
+    key: Option<Arc<str>>,
+    /// The next seq of the message's stream.
+    next_seq: u64,
+    calls: HashMap<Arc<str>, MergedCall>,
+    /// The call that began last.
+    latest: Option<Arc<str>>,
+    /// The stream shows text already.
+    has_text: bool,
+}
+
+impl MessageStream {
+    fn new(message_id: &str, turn_agent: &str) -> Self {
+        Self {
+            message_id: message_id.to_string(),
+            turn_agent: Arc::from(turn_agent),
+            agent_id: None,
+            key: None,
+            next_seq: 0,
+            calls: HashMap::new(),
+            latest: None,
+            has_text: false,
+        }
+    }
+
+    /// The `Terminal` that ends the stream at the end of its turn: the reason of the call
+    /// that began last, and the sum of the calls' settled usage. A call still open (its own
+    /// terminal not yet published) ends it `Reaped`, without usage; so does a call that
+    /// settled without usage leave the sum out. `None` when no call began.
+    fn terminal(&self) -> Option<LlmDeltaEvent> {
+        let key = self.key.clone()?;
+        let agent_id = self.agent_id.clone()?;
+        let settled: Option<Vec<(LlmTerminalReason, Option<LlmDeltaUsage>)>> =
+            self.calls.values().map(|call| call.terminal).collect();
+        let (reason, usage) = match settled {
+            Some(terminals) => {
+                let reason = self
+                    .latest
+                    .as_ref()
+                    .and_then(|latest| self.calls.get(latest))
+                    .and_then(|call| call.terminal)
+                    .map_or(LlmTerminalReason::Completed, |(reason, _)| reason);
+                let usage = terminals.iter().try_fold(
+                    LlmDeltaUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_usd: 0.0,
+                    },
+                    |sum, &(_, usage)| {
+                        usage.map(|usage| LlmDeltaUsage {
+                            input_tokens: sum.input_tokens.saturating_add(usage.input_tokens),
+                            output_tokens: sum.output_tokens.saturating_add(usage.output_tokens),
+                            cost_usd: sum.cost_usd + usage.cost_usd,
+                        })
+                    },
+                );
+                (reason, usage)
+            }
+            None => (LlmTerminalReason::Reaped, None),
+        };
+        Some(LlmDeltaEvent {
+            agent_id,
+            stream_key: key,
+            frame: LlmDeltaFrame::Terminal {
+                seq: self.next_seq,
+                reason,
+                usage,
+            },
+        })
+    }
+
+    /// The frames of a stream of the message's own on the fresh key `key`, for a turn that
+    /// opened no model stream: its `Begin`, the turn's dispatched reply (the bytes
+    /// `POST /msg` answers with, read as UTF-8) as its deltas when `end` has one, in pieces of
+    /// at most [`OWN_STREAM_DELTA_BYTES`], and its `Terminal`, without usage.
+    fn unopened(&self, key: &Arc<str>, end: StreamEnd<'_>) -> Vec<LlmDeltaEvent> {
+        let event = |frame| LlmDeltaEvent {
+            agent_id: Arc::clone(&self.turn_agent),
+            stream_key: Arc::clone(key),
+            frame,
+        };
+        let (reason, text) = match end {
+            StreamEnd::Replied(reply) => {
+                (LlmTerminalReason::Completed, String::from_utf8_lossy(reply))
+            }
+            StreamEnd::Ended(reason) => (reason, "".into()),
+        };
+        let mut frames = vec![event(LlmDeltaFrame::Begin {
+            run_id: None,
+            task_id: None,
+        })];
+        let mut seq = 0u64;
+        for piece in pieces(&text, OWN_STREAM_DELTA_BYTES) {
+            frames.push(event(LlmDeltaFrame::Delta {
+                seq,
+                text: piece.to_string(),
+            }));
+            seq += 1;
+        }
+        frames.push(event(LlmDeltaFrame::Terminal {
+            seq,
+            reason,
+            usage: None,
+        }));
+        frames
+    }
+}
+
+/// How a message stream ends when the turn opened no model stream of its own (one its calls
+/// opened ends with [`MessageStream::terminal`] either way).
+#[derive(Clone, Copy)]
+enum StreamEnd<'a> {
+    /// The turn dispatched this reply.
+    Replied(&'a [u8]),
+    /// The turn ended without a reply, or a later turn found its end unreported: the
+    /// reason its stream ends with.
+    Ended(LlmTerminalReason),
+}
+
+/// What the hub receives for one frame of a model call.
+enum Routed {
+    /// Not a call of a Client API message's turn: the frame as it came.
+    AsIs,
+    /// The first call of a message's turn: its `Begin` as it came, and the message now has
+    /// this stream key.
+    Opens(String),
+    /// A call of a message's turn: this frame, on the message's stream key.
+    Merged(LlmDeltaEvent),
+    /// Nothing: a later call's `Begin`, a call's own `Terminal`, an earlier call's delta
+    /// landing on a later call's seqs, or a frame of a call whose message stream has ended.
+    Nothing,
+}
+
+/// The message streams of the agents whose running turn executes a Client API message.
+#[derive(Default)]
+struct MessageStreams {
+    by_slot: HashMap<String, MessageStream>,
+    /// The agent slot of every call key of those streams.
+    slot_of_call: HashMap<Arc<str>, String>,
+    /// Keys of calls whose message stream has ended, oldest first.
+    retired: VecDeque<Arc<str>>,
+    retired_set: HashSet<Arc<str>>,
+}
+
+impl MessageStreams {
+    /// The stream of `slot`'s turn, removed with its calls (now retired).
+    fn take(&mut self, slot: &str) -> Option<MessageStream> {
+        let stream = self.by_slot.remove(slot)?;
+        for key in stream.calls.keys() {
+            self.slot_of_call.remove(key);
+            if self.retired_set.insert(Arc::clone(key)) {
+                self.retired.push_back(Arc::clone(key));
+            }
+        }
+        while self.retired.len() > MAX_RETIRED_CALL_KEYS {
+            if let Some(old) = self.retired.pop_front() {
+                self.retired_set.remove(&old);
+            }
+        }
+        Some(stream)
+    }
+
+    fn route(&mut self, slot: &str, event: &LlmDeltaEvent) -> Routed {
+        if self.retired_set.contains(&event.stream_key) {
+            return Routed::Nothing;
+        }
+        match &event.frame {
+            LlmDeltaFrame::Begin { .. } => {
+                let Some(stream) = self.by_slot.get_mut(slot) else {
+                    return Routed::AsIs;
+                };
+                if stream.calls.contains_key(&event.stream_key) {
+                    return Routed::Nothing;
+                }
+                if stream.calls.len() >= MAX_CALLS_PER_MESSAGE_STREAM {
+                    return Routed::AsIs;
+                }
+                let base = if stream.key.is_none() {
+                    0
+                } else {
+                    stream.next_seq
+                };
+                for call in stream.calls.values_mut() {
+                    call.limit.get_or_insert(base);
+                }
+                let opens = stream.key.is_none();
+                stream.calls.insert(
+                    Arc::clone(&event.stream_key),
+                    MergedCall {
+                        base,
+                        limit: None,
+                        seen_text: false,
+                        terminal: None,
+                    },
+                );
+                stream.latest = Some(Arc::clone(&event.stream_key));
+                self.slot_of_call
+                    .insert(Arc::clone(&event.stream_key), slot.to_string());
+                if opens {
+                    stream.key = Some(Arc::clone(&event.stream_key));
+                    stream.agent_id = Some(Arc::clone(&event.agent_id));
+                    Routed::Opens(stream.message_id.clone())
+                } else {
+                    Routed::Nothing
+                }
+            }
+            LlmDeltaFrame::Delta { seq, text } => {
+                let Some(stream) = self
+                    .slot_of_call
+                    .get(&event.stream_key)
+                    .and_then(|slot| self.by_slot.get_mut(slot))
+                else {
+                    return Routed::AsIs;
+                };
+                let (Some(key), Some(agent_id)) = (stream.key.clone(), stream.agent_id.clone())
+                else {
+                    return Routed::Nothing;
+                };
+                let has_text = stream.has_text;
+                let Some(call) = stream.calls.get_mut(&event.stream_key) else {
+                    return Routed::Nothing;
+                };
+                let at = call.base.saturating_add(*seq);
+                if call.limit.is_some_and(|limit| at >= limit) {
+                    return Routed::Nothing;
+                }
+                let text = if !text.is_empty() && !call.seen_text {
+                    call.seen_text = true;
+                    if has_text {
+                        format!("{CALL_SEPARATOR}{text}")
+                    } else {
+                        text.clone()
+                    }
+                } else {
+                    text.clone()
+                };
+                // The hub's rules apply to the stream as to any other. Text no reader has
+                // read yet is kept up to its window; a delta past it is dropped and counted
+                // in the pages' `dropped_count`, which tells a later reader its text is not
+                // whole. Its leak scan blocks text it will not release, one that holds a
+                // secret or a hold or scan past its bounds (`rejected_count`), redacts some
+                // (`redacted_count`), and never releases a tail that could begin a secret
+                // (MODULE-020-T24-h). Apart from these, the registry's own drop above and the
+                // call limit, a reader that keeps up with the stream reads all of its text.
+                if !text.trim().is_empty() {
+                    stream.has_text = true;
+                }
+                stream.next_seq = stream.next_seq.max(at.saturating_add(1));
+                Routed::Merged(LlmDeltaEvent {
+                    agent_id,
+                    stream_key: key,
+                    frame: LlmDeltaFrame::Delta { seq: at, text },
+                })
+            }
+            LlmDeltaFrame::Terminal { reason, usage, .. } => {
+                let Some(call) = self
+                    .slot_of_call
+                    .get(&event.stream_key)
+                    .and_then(|slot| self.by_slot.get_mut(slot))
+                    .and_then(|stream| stream.calls.get_mut(&event.stream_key))
+                else {
+                    return Routed::AsIs;
+                };
+                if call.terminal.is_none() {
+                    call.terminal = Some((*reason, *usage));
+                }
+                Routed::Nothing
+            }
+        }
+    }
+}
+
+/// A delta sink that keeps nothing: what a [`ReplyRegistry`] without an attached hub
+/// publishes.
+struct NoDeltaSink;
+
+impl LlmDeltaSink for NoDeltaSink {
+    fn is_wired(&self) -> bool {
+        false
+    }
+
+    fn publish(&self, _event: LlmDeltaEvent) {}
+}
 
 /// The kind of an agent's last failed model call while one of its Client API
 /// messages is in flight; it becomes a failure class only if the turn then
@@ -170,6 +529,12 @@ pub struct ReplyRegistry {
     /// Agent slots (`pending_slot`) whose running turn has delivered a reply
     /// ([`Self::fulfill`] with a payload). Taken at the turn's end: one entry per agent.
     replied_in_turn: Mutex<HashSet<String>>,
+    /// The stream of each Client API message whose turn is running: every model call of
+    /// that turn, on the key the message's status names. Held while its frames are
+    /// published, so the hub gets them in order and the stream's `Terminal` last.
+    message_streams: Mutex<MessageStreams>,
+    /// The hub the message streams are published to ([`StreamKeyAnnouncer::new`]).
+    delta_sink: Mutex<Option<Arc<dyn LlmDeltaSink>>>,
 }
 
 impl ReplyRegistry {
@@ -185,6 +550,8 @@ impl ReplyRegistry {
             failure_by_message: Mutex::new(MessageFailureClasses::default()),
             pending_model_failure: Mutex::new(HashMap::new()),
             replied_in_turn: Mutex::new(HashSet::new()),
+            message_streams: Mutex::new(MessageStreams::default()),
+            delta_sink: Mutex::new(None),
         }
     }
 
@@ -250,12 +617,19 @@ impl ReplyRegistry {
             }
         }
         let slot = self.pending_slot(agent_id);
-        self.pending_message
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(slot)
-            .or_default()
-            .push_back(message_id.to_string());
+        {
+            let mut pending = self
+                .pending_message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let queue = pending.entry(slot).or_default();
+            if !queue.iter().any(|id| id == message_id) {
+                queue.push_back(message_id.to_string());
+            }
+            while queue.len() > MAX_PENDING_MESSAGES_PER_AGENT {
+                queue.pop_front();
+            }
+        }
         let mut inflight = self
             .inflight_message
             .lock()
@@ -365,6 +739,128 @@ impl ReplyRegistry {
             .insert(self.pending_slot(agent_id), failure);
     }
 
+    /// The serving loop admitted `message_id` for `agent_id` (any alias) and its turn is
+    /// starting. When it is a Client API message waiting for its turn, every model call
+    /// the agent makes until the turn's reply is dispatched ([`Self::fulfill`]) or the
+    /// turn ends goes on the message's stream ([`Self::route_delta`]); any other
+    /// message's calls publish their own streams. A message stream a turn left open (its
+    /// end never reported) ends here, `Reaped` when no call opened it.
+    pub fn note_turn_start(&self, agent_id: &str, message_id: &str) {
+        let slot = self.pending_slot(agent_id);
+        let queued = self.take_pending(&slot, message_id);
+        let mut streams = self
+            .message_streams
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(stale) = streams.take(&slot) {
+            self.publish_stream_end(&stale, StreamEnd::Ended(LlmTerminalReason::Reaped));
+        }
+        if queued {
+            streams
+                .by_slot
+                .insert(slot, MessageStream::new(message_id, agent_id));
+        }
+    }
+
+    /// Remove `message_id` from `slot`'s queue of Client API messages waiting for their
+    /// turn; whether it was there.
+    fn take_pending(&self, slot: &str, message_id: &str) -> bool {
+        let mut pending = self
+            .pending_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(queue) = pending.get_mut(slot) else {
+            return false;
+        };
+        let before = queue.len();
+        queue.retain(|id| id != message_id);
+        let taken = queue.len() != before;
+        if queue.is_empty() {
+            pending.remove(slot);
+        }
+        taken
+    }
+
+    /// Publish what ends `stream` to the attached hub: the `Terminal` of the stream its
+    /// turn's calls opened; or, when they opened none, a stream of the message's own that
+    /// ends at once as `end` says, and which the message's status then names — so a client
+    /// following the message never waits on a stream that will not come. Without an
+    /// attached hub, nothing. Called with the message streams locked, so it follows every
+    /// frame of the stream.
+    fn publish_stream_end(&self, stream: &MessageStream, end: StreamEnd<'_>) {
+        let sink = self
+            .delta_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(sink) = sink else {
+            return;
+        };
+        let (frames, own_key) = match stream.terminal() {
+            Some(terminal) => (vec![terminal], None),
+            None => {
+                let key: Arc<str> = Arc::from(format!("st_{}", uuid::Uuid::new_v4().simple()));
+                (stream.unopened(&key, end), Some(key))
+            }
+        };
+        // The hub leaves containing a panic to its producers (cap-llm's tee does so for the
+        // frames it publishes): these frames are published from the turn end or the
+        // dispatch, which a panicking sink must not unwind.
+        let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for frame in frames {
+                sink.publish(frame);
+            }
+        }))
+        .is_ok();
+        if let (true, Some(key)) = (published, own_key) {
+            self.keys_by_message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(stream.message_id.clone())
+                .or_insert_with(|| key.to_string());
+        }
+    }
+
+    /// Route one frame of a model call to `hub` (the [`StreamKeyAnnouncer`] path): a call
+    /// of a turn that executes a Client API message goes on the message's stream; any
+    /// other frame passes as it came. Every `Begin` becomes the agent's last stream key.
+    /// The first call's `Begin` reaches the hub before the message's status names its
+    /// key, so a client that subscribes at once does not read it absent — unless the hub
+    /// refused the stream at its `Begin` (over its live-stream caps), which it does not say.
+    pub(crate) fn route_delta(&self, event: LlmDeltaEvent, hub: &dyn LlmDeltaSink) {
+        if matches!(event.frame, LlmDeltaFrame::Begin { .. }) {
+            let mut map = self
+                .last_stream_key
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for k in self.alias_keys(&event.agent_id) {
+                map.insert(k, event.stream_key.to_string());
+            }
+        }
+        let slot = self.pending_slot(&event.agent_id);
+        let mut streams = self
+            .message_streams
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match streams.route(&slot, &event) {
+            Routed::AsIs => {
+                drop(streams);
+                hub.publish(event);
+            }
+            Routed::Opens(message_id) => {
+                let key = event.stream_key.to_string();
+                hub.publish(event);
+                self.keys_by_message
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .entry(message_id)
+                    .or_insert(key);
+            }
+            Routed::Merged(merged) => hub.publish(merged),
+            Routed::Nothing => {}
+        }
+    }
+
     /// The turn that executed `message_id` for `agent_id` (any alias) has ended.
     ///
     /// The message is no longer in flight and its class is final, so later turns
@@ -413,6 +909,37 @@ impl ReplyRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .end(message_id, class);
+        // A message whose turn ended without starting (refused before its start) waits
+        // for no turn any more.
+        self.take_pending(&slot, message_id);
+        // A message's stream its dispatched reply did not end ends with its turn, after
+        // its class is final: a client that reads the status once the stream has ended
+        // sees the class. One no call opened ends as the class says.
+        let unopened = match class {
+            None => LlmTerminalReason::Completed,
+            Some(advance_client_api::FAILURE_CLASS_AGENT_ERROR) => LlmTerminalReason::Reaped,
+            Some(_) => LlmTerminalReason::ProviderError,
+        };
+        self.end_message_stream(&slot, Some(message_id), StreamEnd::Ended(unopened));
+    }
+
+    /// End the message stream of `slot`'s running turn — only if it is `message_id`'s,
+    /// when one is given — publishing what ends it to the attached hub
+    /// ([`Self::publish_stream_end`]).
+    fn end_message_stream(&self, slot: &str, message_id: Option<&str>, end: StreamEnd<'_>) {
+        let mut streams = self
+            .message_streams
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ends = streams
+            .by_slot
+            .get(slot)
+            .is_some_and(|stream| message_id.is_none_or(|id| stream.message_id == id));
+        if ends {
+            if let Some(stream) = streams.take(slot) {
+                self.publish_stream_end(&stream, end);
+            }
+        }
     }
 
     /// The redacted failure class of this Client API message, when it has one:
@@ -424,31 +951,22 @@ impl ReplyRegistry {
             .class(message_id)
     }
 
+    /// A model call of `agent_id` began on stream `key` (a `Begin` frame, published
+    /// nowhere): `key` becomes the agent's last stream key, and the stream key of the
+    /// Client API message its running turn executes when that turn had none yet. The hub
+    /// has no stream `key` this way: a client reading it finds it absent.
     pub fn record_stream_key(&self, agent_id: &str, key: &str) {
-        {
-            let mut map = self
-                .last_stream_key
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for k in self.alias_keys(agent_id) {
-                map.insert(k, key.to_string());
-            }
-        }
-        let mid = {
-            let slot = self.pending_slot(agent_id);
-            self.pending_message
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get_mut(&slot)
-                .and_then(|q| q.pop_front())
-        };
-        if let Some(mid) = mid {
-            self.keys_by_message
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .entry(mid)
-                .or_insert_with(|| key.to_string());
-        }
+        self.route_delta(
+            LlmDeltaEvent {
+                agent_id: Arc::from(agent_id),
+                stream_key: Arc::from(key),
+                frame: LlmDeltaFrame::Begin {
+                    run_id: None,
+                    task_id: None,
+                },
+            },
+            &NoDeltaSink,
+        );
     }
 
     pub fn last_stream_key(&self, agent_id: &str) -> Option<String> {
@@ -494,13 +1012,19 @@ impl ReplyRegistry {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             last.insert(agent_id.to_string(), reply.is_some());
         }
-        if reply.is_some() {
+        if let Some(bytes) = reply.as_deref() {
+            let slot = self.pending_slot(agent_id);
             // Dispatch runs inside the agent's turn, so this reply is the running
             // turn's: that turn's end records no failure class.
             self.replied_in_turn
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(self.pending_slot(agent_id));
+                .insert(slot.clone());
+            // The turn's model calls are over (what it does after its dispatch — memory,
+            // embeddings — are the host's calls, published nowhere) and its class is final
+            // (none): the message's stream ends now, not after those turn-end steps. A turn
+            // that opened no model stream gives the message a stream carrying this reply.
+            self.end_message_stream(&slot, None, StreamEnd::Replied(bytes));
         }
         if let Some(tx) = self.lock().remove(agent_id) {
             let _ = tx.send(reply);
@@ -559,17 +1083,26 @@ impl Default for ReplyRegistry {
     }
 }
 
-/// Records `Begin.stream_key` onto [`ReplyRegistry`] then forwards to the hub.
+/// The gateway's delta sink: routes every frame through the [`ReplyRegistry`] to the hub
+/// ([`ReplyRegistry::route_delta`]), so a Client API message's stream follows every model
+/// call of its turn, and records each `Begin` as the agent's last stream key.
 pub struct StreamKeyAnnouncer {
     inner: Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
     replies: Arc<ReplyRegistry>,
 }
 
 impl StreamKeyAnnouncer {
+    /// Route into `inner`, which also receives the `Terminal` of each message stream when
+    /// its turn ends. One announcer per registry: the registry keeps the hub of the last
+    /// announcer built over it for the `Terminal`s.
     pub fn new(
         inner: Arc<dyn advance_shared_types::traits::LlmDeltaSink>,
         replies: Arc<ReplyRegistry>,
     ) -> Self {
+        *replies
+            .delta_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&inner));
         Self { inner, replies }
     }
 }
@@ -594,15 +1127,7 @@ impl advance_shared_types::traits::LlmDeltaSink for StreamKeyAnnouncer {
     }
 
     fn publish(&self, event: advance_shared_types::traits::LlmDeltaEvent) {
-        let begin_key = matches!(
-            event.frame,
-            advance_shared_types::traits::LlmDeltaFrame::Begin { .. }
-        )
-        .then(|| (event.agent_id.to_string(), event.stream_key.to_string()));
-        self.inner.publish(event);
-        if let Some((agent_id, key)) = begin_key {
-            self.replies.record_stream_key(&agent_id, &key);
-        }
+        self.replies.route_delta(event, self.inner.as_ref());
     }
 }
 
@@ -905,20 +1430,629 @@ mod tests {
         assert_eq!(s, "你好 café 🚀");
     }
 
+    /// The frames a hub received, in order, as `(stream key, frame)`.
+    #[derive(Default)]
+    struct Hub(Mutex<Vec<(String, LlmDeltaFrame)>>);
+
+    impl LlmDeltaSink for Hub {
+        fn publish(&self, event: LlmDeltaEvent) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((event.stream_key.to_string(), event.frame));
+        }
+    }
+
+    impl Hub {
+        fn frames(&self) -> Vec<(String, LlmDeltaFrame)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// A registry routing into a recording hub, through the announcer the gateway holds.
+    fn routed() -> (Arc<ReplyRegistry>, Arc<Hub>, StreamKeyAnnouncer) {
+        let reg = Arc::new(ReplyRegistry::new());
+        let hub = Arc::new(Hub::default());
+        let sink =
+            StreamKeyAnnouncer::new(Arc::clone(&hub) as Arc<dyn LlmDeltaSink>, Arc::clone(&reg));
+        (reg, hub, sink)
+    }
+
+    fn frame(key: &str, frame: LlmDeltaFrame) -> LlmDeltaEvent {
+        LlmDeltaEvent {
+            agent_id: Arc::from("root"),
+            stream_key: Arc::from(key),
+            frame,
+        }
+    }
+
+    fn begin() -> LlmDeltaFrame {
+        LlmDeltaFrame::Begin {
+            run_id: None,
+            task_id: None,
+        }
+    }
+
+    fn delta(seq: u64, text: &str) -> LlmDeltaFrame {
+        LlmDeltaFrame::Delta {
+            seq,
+            text: text.to_string(),
+        }
+    }
+
+    fn end(seq: u64, reason: LlmTerminalReason, usage: Option<LlmDeltaUsage>) -> LlmDeltaFrame {
+        LlmDeltaFrame::Terminal { seq, reason, usage }
+    }
+
+    fn usage(input_tokens: u64, output_tokens: u64, cost_usd: f64) -> Option<LlmDeltaUsage> {
+        Some(LlmDeltaUsage {
+            input_tokens,
+            output_tokens,
+            cost_usd,
+        })
+    }
+
+    fn on(key: &str, frame: LlmDeltaFrame) -> (String, LlmDeltaFrame) {
+        (key.to_string(), frame)
+    }
+
     #[test]
-    fn overlapping_sends_fifo_bind_begins_in_order() {
-        let reg = ReplyRegistry::new();
+    fn a_message_stream_follows_every_model_call_of_its_turn() {
+        let (reg, hub, sink) = routed();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.note_turn_start("agent:root", "cmsg-1");
+        // The first call: its text, then tool calls.
+        sink.publish(frame("st_first", begin()));
+        assert_eq!(
+            reg.stream_key_for_message("cmsg-1").as_deref(),
+            Some("st_first")
+        );
+        sink.publish(frame("st_first", delta(0, "I'll list the files.")));
+        sink.publish(frame(
+            "st_first",
+            end(1, LlmTerminalReason::Completed, usage(10, 2, 0.25)),
+        ));
+        // The call after the tool results: the answer.
+        sink.publish(frame("st_second", begin()));
+        sink.publish(frame("st_second", delta(0, "There are 3 files.")));
+        sink.publish(frame(
+            "st_second",
+            end(1, LlmTerminalReason::Completed, usage(20, 5, 0.5)),
+        ));
+        // Until the turn ends: one Begin, both calls' text on the message's key, set apart,
+        // and no Terminal — a client reading the stream waits for the answer.
+        assert_eq!(
+            hub.frames(),
+            [
+                on("st_first", begin()),
+                on("st_first", delta(0, "I'll list the files.")),
+                on("st_first", delta(1, "\n\nThere are 3 files.")),
+            ]
+        );
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Completed);
+        assert_eq!(
+            hub.frames().last(),
+            Some(&on(
+                "st_first",
+                end(2, LlmTerminalReason::Completed, usage(30, 7, 0.75))
+            )),
+            "the stream ends with its turn, carrying both calls' usage"
+        );
+        assert_eq!(
+            reg.stream_key_for_message("cmsg-1").as_deref(),
+            Some("st_first")
+        );
+        // What the turn's calls still publish (a turn-end reap) never reaches the hub.
+        sink.publish(frame("st_second", end(1, LlmTerminalReason::Reaped, None)));
+        sink.publish(frame("st_first", delta(5, "late")));
+        assert_eq!(hub.frames().len(), 4, "{:?}", hub.frames());
+    }
+
+    #[test]
+    fn a_dispatched_reply_ends_the_message_stream_before_the_turn_end() {
+        let (reg, hub, sink) = routed();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.note_turn_start("agent:root", "cmsg-1");
+        sink.publish(frame("st_first", begin()));
+        sink.publish(frame("st_first", delta(0, "I'll check.")));
+        sink.publish(frame(
+            "st_first",
+            end(1, LlmTerminalReason::Completed, usage(1, 1, 0.5)),
+        ));
+        sink.publish(frame("st_second", begin()));
+        sink.publish(frame("st_second", delta(0, "Done.")));
+        sink.publish(frame(
+            "st_second",
+            end(1, LlmTerminalReason::Completed, usage(2, 1, 0.25)),
+        ));
+        // An empty batch leaves the class to the turn's end: the stream stays open.
+        reg.fulfill("root", None);
+        assert_eq!(hub.frames().len(), 3, "{:?}", hub.frames());
+        // The reply is dispatched: the stream ends at once, before the turn-end steps.
+        reg.fulfill("root", Some(b"Done.".to_vec()));
+        assert_eq!(
+            hub.frames().last(),
+            Some(&on(
+                "st_first",
+                end(2, LlmTerminalReason::Completed, usage(3, 2, 0.75))
+            ))
+        );
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Completed);
+        assert_eq!(
+            hub.frames().len(),
+            4,
+            "the turn's end publishes nothing more"
+        );
+        assert!(reg.failure_class_for_message("cmsg-1").is_none());
+        // A reply dispatched with no message stream open publishes nothing.
+        reg.fulfill("root", Some(b"again".to_vec()));
+        assert_eq!(hub.frames().len(), 4);
+    }
+
+    #[test]
+    fn a_late_delta_of_an_earlier_call_fills_its_place_and_never_the_later_calls() {
+        let (reg, hub, sink) = routed();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.note_turn_start("agent:root", "cmsg-1");
+        sink.publish(frame("st_a", begin()));
+        sink.publish(frame("st_a", delta(0, "one ")));
+        sink.publish(frame("st_a", delta(2, "three")));
+        // The next call begins after seq 2: its text starts at 3.
+        sink.publish(frame("st_b", begin()));
+        sink.publish(frame("st_b", delta(0, "answer")));
+        // The earlier call's seq 1 arrives late: it fills its own place.
+        sink.publish(frame("st_a", delta(1, "two ")));
+        // Its seq 3 would land on the later call's: dropped.
+        sink.publish(frame("st_a", delta(3, "late")));
+        assert_eq!(
+            hub.frames(),
+            [
+                on("st_a", begin()),
+                on("st_a", delta(0, "one ")),
+                on("st_a", delta(2, "three")),
+                on("st_a", delta(3, "\n\nanswer")),
+                on("st_a", delta(1, "two ")),
+            ]
+        );
+    }
+
+    /// The registry passes its calls' text whole, however long: the hub's window, not the
+    /// registry, bounds what it keeps for a reader that has not read it yet (a single delta
+    /// past the window, the hub drops whole).
+    #[test]
+    fn a_message_stream_carries_its_text_whole() {
+        let (reg, hub, sink) = routed();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.note_turn_start("agent:root", "cmsg-1");
+        let first = "\u{e9}".repeat(150 * 1024);
+        let second = "x".repeat(200 * 1024);
+        sink.publish(frame("st_a", begin()));
+        sink.publish(frame("st_a", delta(0, &first)));
+        sink.publish(frame("st_b", begin()));
+        sink.publish(frame("st_b", delta(0, &second)));
+        sink.publish(frame("st_b", delta(1, "tail")));
+        assert_eq!(
+            hub.frames(),
+            [
+                on("st_a", begin()),
+                on("st_a", delta(0, &first)),
+                on("st_a", delta(1, &format!("{CALL_SEPARATOR}{second}"))),
+                on("st_a", delta(2, "tail")),
+            ],
+            "no delta is cut: 500 KiB of text pass as they came"
+        );
+    }
+
+    #[test]
+    fn pieces_cut_at_char_boundaries_and_keep_every_byte() {
+        assert!(pieces("", 4).is_empty());
+        assert_eq!(pieces("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        // Two-byte chars: a piece backs off to a char boundary.
+        assert_eq!(
+            pieces("\u{e9}\u{e9}\u{e9}", 3),
+            ["\u{e9}", "\u{e9}", "\u{e9}"]
+        );
+        // A char wider than the bound goes whole.
+        assert_eq!(pieces("\u{1f600}a", 2), ["\u{1f600}", "a"]);
+        let long = "\u{e9}".repeat(OWN_STREAM_DELTA_BYTES) + "end";
+        let cut = pieces(&long, OWN_STREAM_DELTA_BYTES);
+        assert!(cut
+            .iter()
+            .all(|piece| piece.len() <= OWN_STREAM_DELTA_BYTES));
+        assert_eq!(cut.concat(), long);
+    }
+
+    #[test]
+    fn a_call_without_text_sets_nothing_apart() {
+        let (reg, hub, sink) = routed();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.note_turn_start("agent:root", "cmsg-1");
+        sink.publish(frame("st_a", begin()));
+        sink.publish(frame("st_a", delta(0, "")));
+        sink.publish(frame("st_a", end(1, LlmTerminalReason::Completed, None)));
+        sink.publish(frame("st_b", begin()));
+        sink.publish(frame("st_b", delta(0, "The answer.")));
+        sink.publish(frame("st_b", delta(1, " More.")));
+        sink.publish(frame(
+            "st_b",
+            end(2, LlmTerminalReason::Completed, usage(1, 1, 0.5)),
+        ));
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Completed);
+        assert_eq!(
+            hub.frames(),
+            [
+                on("st_a", begin()),
+                on("st_a", delta(0, "")),
+                on("st_a", delta(1, "The answer.")),
+                on("st_a", delta(2, " More.")),
+                // A call that settled without usage leaves the sum out.
+                on("st_a", end(3, LlmTerminalReason::Completed, None)),
+            ]
+        );
+    }
+
+    #[test]
+    fn overlapping_sends_bind_each_message_to_its_own_turn() {
+        let (reg, hub, sink) = routed();
         reg.note_pending_message("agent:root", "cmsg-1");
         reg.note_pending_message("agent:root", "cmsg-2");
-        reg.record_stream_key("root", "st_first");
-        reg.record_stream_key("root", "st_second");
+        reg.note_turn_start("agent:root", "cmsg-1");
+        sink.publish(frame("st_first", begin()));
+        sink.publish(frame(
+            "st_first",
+            end(0, LlmTerminalReason::Completed, None),
+        ));
+        sink.publish(frame("st_second", begin()));
+        sink.publish(frame("st_second", delta(0, "answer one")));
+        sink.publish(frame(
+            "st_second",
+            end(1, LlmTerminalReason::Completed, None),
+        ));
+        assert!(
+            reg.stream_key_for_message("cmsg-2").is_none(),
+            "a later call of turn 1 never binds message 2"
+        );
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Completed);
+        reg.note_turn_start("agent:root", "cmsg-2");
+        sink.publish(frame("st_third", begin()));
+        sink.publish(frame("st_third", delta(0, "answer two")));
         assert_eq!(
             reg.stream_key_for_message("cmsg-1").as_deref(),
             Some("st_first")
         );
         assert_eq!(
             reg.stream_key_for_message("cmsg-2").as_deref(),
+            Some("st_third")
+        );
+        // Turn 1's first call published no delta: its second call's text starts the stream.
+        assert_eq!(
+            hub.frames()[1..],
+            [
+                on("st_first", delta(0, "answer one")),
+                on("st_first", end(1, LlmTerminalReason::Completed, None)),
+                on("st_third", begin()),
+                on("st_third", delta(0, "answer two")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_turn_that_runs_no_client_api_message_publishes_its_calls_as_they_come() {
+        let (reg, hub, sink) = routed();
+        // Queued, but the turn now running executes another message (POST /msg, say).
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.note_turn_start("agent:root", "msg-other");
+        let calls = [
+            frame("st_a", begin()),
+            frame("st_a", delta(0, "x")),
+            frame("st_a", end(1, LlmTerminalReason::Completed, None)),
+            frame("st_b", begin()),
+            frame("st_b", end(0, LlmTerminalReason::Completed, None)),
+        ];
+        for call in calls.clone() {
+            sink.publish(call);
+        }
+        reg.note_turn_end("agent:root", "msg-other", TurnOutcome::Completed);
+        assert_eq!(
+            hub.frames(),
+            calls
+                .iter()
+                .map(|event| (event.stream_key.to_string(), event.frame.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(reg.stream_key_for_message("cmsg-1").is_none());
+        assert_eq!(reg.last_stream_key("agent:root").as_deref(), Some("st_b"));
+        // The queued message's own turn binds it.
+        reg.note_turn_start("agent:root", "cmsg-1");
+        sink.publish(frame("st_c", begin()));
+        assert_eq!(
+            reg.stream_key_for_message("cmsg-1").as_deref(),
+            Some("st_c")
+        );
+    }
+
+    #[test]
+    fn a_call_still_open_when_the_turn_ends_ends_the_stream_reaped() {
+        let (reg, hub, sink) = routed();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.note_turn_start("agent:root", "cmsg-1");
+        sink.publish(frame("st_first", begin()));
+        sink.publish(frame("st_first", delta(0, "partial")));
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Failed);
+        assert_eq!(
+            hub.frames().last(),
+            Some(&on("st_first", end(1, LlmTerminalReason::Reaped, None)))
+        );
+        // The last call's reason ends a stream whose calls all settled.
+        let (reg, hub, sink) = routed();
+        reg.note_pending_message("agent:root", "cmsg-2");
+        reg.note_turn_start("agent:root", "cmsg-2");
+        sink.publish(frame("st_a", begin()));
+        sink.publish(frame("st_a", delta(0, "I'll check.")));
+        sink.publish(frame(
+            "st_a",
+            end(1, LlmTerminalReason::Completed, usage(1, 1, 0.5)),
+        ));
+        sink.publish(frame("st_b", begin()));
+        sink.publish(frame(
+            "st_b",
+            end(0, LlmTerminalReason::ProviderError, usage(1, 0, 0.25)),
+        ));
+        reg.note_turn_end("agent:root", "cmsg-2", TurnOutcome::Failed);
+        assert_eq!(
+            hub.frames().last(),
+            Some(&on(
+                "st_a",
+                end(1, LlmTerminalReason::ProviderError, usage(2, 1, 0.75))
+            ))
+        );
+    }
+
+    #[test]
+    fn the_start_of_a_turn_ends_a_stream_its_turn_left_open() {
+        let (reg, hub, sink) = routed();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.note_pending_message("agent:root", "cmsg-2");
+        reg.note_turn_start("agent:root", "cmsg-1");
+        sink.publish(frame("st_first", begin()));
+        sink.publish(frame(
+            "st_first",
+            end(0, LlmTerminalReason::Completed, None),
+        ));
+        // No end is reported for cmsg-1's turn.
+        reg.note_turn_start("agent:root", "cmsg-2");
+        assert_eq!(
+            hub.frames().last(),
+            Some(&on("st_first", end(0, LlmTerminalReason::Completed, None)))
+        );
+        sink.publish(frame("st_second", begin()));
+        assert_eq!(
+            reg.stream_key_for_message("cmsg-2").as_deref(),
             Some("st_second")
+        );
+    }
+
+    /// A turn that opens no model stream gives its message a stream of its own, settled at
+    /// once: carrying the reply it dispatched, or empty, ending as the turn's class says.
+    #[test]
+    fn a_turn_that_opens_no_model_stream_gives_its_message_a_stream_of_its_own() {
+        let (reg, hub, _sink) = routed();
+        let own = |message: &str| {
+            let key = reg
+                .stream_key_for_message(message)
+                .expect("a key of its own");
+            assert!(key.starts_with("st_") && key.len() == 35, "{key}");
+            key
+        };
+        let frames_of = |key: &str| -> Vec<LlmDeltaFrame> {
+            hub.frames()
+                .into_iter()
+                .filter(|(on, _)| on == key)
+                .map(|(_, frame)| frame)
+                .collect()
+        };
+        // A dispatched reply: the stream ends at the dispatch, carrying it.
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.note_turn_start("agent:root", "cmsg-1");
+        reg.fulfill("agent:root", Some(b"Nothing to look up.".to_vec()));
+        let replied = own("cmsg-1");
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Completed);
+        assert_eq!(
+            frames_of(&replied),
+            [
+                begin(),
+                delta(0, "Nothing to look up."),
+                end(1, LlmTerminalReason::Completed, None),
+            ]
+        );
+        // No reply: empty, ending with the turn.
+        reg.note_pending_message("agent:root", "cmsg-2");
+        reg.note_turn_start("agent:root", "cmsg-2");
+        reg.fulfill("agent:root", None);
+        assert!(reg.stream_key_for_message("cmsg-2").is_none());
+        reg.note_turn_end("agent:root", "cmsg-2", TurnOutcome::Completed);
+        let quiet = own("cmsg-2");
+        assert_eq!(
+            frames_of(&quiet),
+            [begin(), end(0, LlmTerminalReason::Completed, None)]
+        );
+        // A failed turn: as its class says.
+        for (message, model_failed, reason) in [
+            ("cmsg-3", false, LlmTerminalReason::Reaped),
+            ("cmsg-4", true, LlmTerminalReason::ProviderError),
+        ] {
+            reg.note_pending_message("agent:root", message);
+            reg.note_turn_start("agent:root", message);
+            if model_failed {
+                reg.record_model_failure("agent:root");
+            }
+            reg.note_turn_end("agent:root", message, TurnOutcome::Failed);
+            assert!(reg.failure_class_for_message(message).is_some());
+            assert_eq!(frames_of(&own(message)), [begin(), end(0, reason, None)]);
+        }
+        // A turn whose end was never reported: the next turn's start ends it.
+        reg.note_pending_message("agent:root", "cmsg-5");
+        reg.note_turn_start("agent:root", "cmsg-5");
+        reg.note_turn_start("agent:root", "other");
+        assert_eq!(
+            frames_of(&own("cmsg-5")),
+            [begin(), end(0, LlmTerminalReason::Reaped, None)]
+        );
+        // A long reply goes in pieces, whole.
+        let long = "word ".repeat(OWN_STREAM_DELTA_BYTES / 2);
+        reg.note_pending_message("agent:root", "cmsg-6");
+        reg.note_turn_start("agent:root", "cmsg-6");
+        reg.fulfill("agent:root", Some(long.clone().into_bytes()));
+        let frames = frames_of(&own("cmsg-6"));
+        assert_eq!(frames.len(), 2 + 3, "a Begin, three pieces and a Terminal");
+        let mut text = String::new();
+        for (at, frame) in frames[1..4].iter().enumerate() {
+            let LlmDeltaFrame::Delta { seq, text: piece } = frame else {
+                panic!("a delta: {frame:?}");
+            };
+            assert_eq!(*seq, at as u64);
+            assert!(piece.len() <= OWN_STREAM_DELTA_BYTES);
+            text.push_str(piece);
+        }
+        assert_eq!(text, long);
+        assert_eq!(frames[4], end(3, LlmTerminalReason::Completed, None));
+    }
+
+    /// A stream of the message's own meets the real hub's rules as a model stream does: a reply
+    /// within the window reads whole; one past it keeps the window's pieces and names the rest
+    /// dropped; and the hub holds back a tail that could begin a secret (MODULE-020-T24-h; the
+    /// release's Known list), here the whole of a short reply ending in `s`. Each time the
+    /// terminal comes with the seq after the stream's last piece, so a reader can tell the
+    /// pieces it did not read.
+    #[test]
+    fn a_minted_stream_meets_the_real_hubs_window_and_hold() {
+        let hold: Arc<dyn Fn(&[u8], usize) -> Result<usize, ()> + Send + Sync> =
+            Arc::new(|buf: &[u8], max_canonical: usize| {
+                cap_http::canonical_facade::decoded_hold_split(buf, max_canonical)
+            });
+        let detector: Arc<dyn advance_shared_types::traits::LeakDetector> =
+            Arc::new(cap_http::DefaultLeakDetector::new());
+        let hub = Arc::new(advance_client_api::deltas::LlmDeltaHub::new(
+            Some(detector),
+            Some(hold),
+            Arc::new(advance_client_api::SystemClock),
+            None,
+        ));
+        let reg = Arc::new(ReplyRegistry::new());
+        let _sink =
+            StreamKeyAnnouncer::new(Arc::clone(&hub) as Arc<dyn LlmDeltaSink>, Arc::clone(&reg));
+        // The reply a client reads: the text, the first page's dropped count, the seq after the
+        // last item read, and the terminal's seq.
+        let read = |message: &str, reply: &str| {
+            reg.note_pending_message("agent:root", message);
+            reg.note_turn_start("agent:root", message);
+            reg.fulfill("agent:root", Some(reply.as_bytes().to_vec()));
+            let key = reg
+                .stream_key_for_message(message)
+                .expect("a stream of its own");
+            let (mut text, mut from, mut dropped, mut terminal) = (String::new(), 0, None, None);
+            loop {
+                let page = hub.read_page(&key, from);
+                assert!(!page.absent, "{message}: the stream is held");
+                dropped.get_or_insert(page.dropped_count);
+                terminal = terminal.or(page.terminal.as_ref().map(|t| t.seq));
+                for item in &page.deltas {
+                    text.push_str(&item.text);
+                    from = item.to_seq + 1;
+                }
+                if !page.page_limit_reached {
+                    break;
+                }
+            }
+            (text, dropped.unwrap_or(0), from, terminal)
+        };
+        let (text, dropped, read_to, terminal) = read("cmsg-1", "Done: 3 files.");
+        assert_eq!(
+            (text.as_str(), dropped, read_to, terminal),
+            ("Done: 3 files.", 0, 1, Some(1))
+        );
+
+        // `x` begins no Block or Redact pattern, so here the window, not the hold, decides
+        // what is kept.
+        let long = "x".repeat(300 * 1024);
+        let (text, dropped, read_to, terminal) = read("cmsg-2", &long);
+        assert_eq!(
+            text.len(),
+            16 * OWN_STREAM_DELTA_BYTES,
+            "the window's pieces"
+        );
+        assert_eq!(dropped, 3, "the three pieces past the window");
+        assert_eq!((read_to, terminal), (16, Some(19)));
+
+        let (text, dropped, read_to, terminal) = read("cmsg-3", "Done: 3 files");
+        assert_eq!(
+            (text.as_str(), dropped, read_to, terminal),
+            ("", 0, 0, Some(1)),
+            "the tail is held: the reader stops at seq 0, short of the terminal's 1"
+        );
+    }
+
+    /// Without an attached hub no stream is made up: the status names none.
+    #[test]
+    fn without_a_hub_a_turn_that_opens_no_stream_names_none() {
+        let reg = ReplyRegistry::new();
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.note_turn_start("agent:root", "cmsg-1");
+        reg.fulfill("agent:root", Some(b"hi".to_vec()));
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Completed);
+        assert!(reg.stream_key_for_message("cmsg-1").is_none());
+    }
+
+    /// A hub that, at each frame, reads what the registry tells a client: the message's
+    /// stream key and its failure class.
+    #[derive(Default)]
+    struct Witness {
+        reg: Mutex<Option<std::sync::Weak<ReplyRegistry>>>,
+        seen: Mutex<Vec<(LlmDeltaFrame, Option<String>, Option<String>)>>,
+    }
+
+    impl LlmDeltaSink for Witness {
+        fn publish(&self, event: LlmDeltaEvent) {
+            let reg = self
+                .reg
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|reg| reg.upgrade());
+            let reg = reg.expect("the registry");
+            self.seen.lock().unwrap().push((
+                event.frame,
+                reg.stream_key_for_message("cmsg-1"),
+                reg.failure_class_for_message("cmsg-1"),
+            ));
+        }
+    }
+
+    #[test]
+    fn a_client_finds_the_stream_once_the_hub_has_it_and_the_class_once_it_ends() {
+        let reg = Arc::new(ReplyRegistry::new());
+        let witness = Arc::new(Witness::default());
+        *witness.reg.lock().unwrap() = Some(Arc::downgrade(&reg));
+        let sink = StreamKeyAnnouncer::new(
+            Arc::clone(&witness) as Arc<dyn LlmDeltaSink>,
+            Arc::clone(&reg),
+        );
+        reg.note_pending_message("agent:root", "cmsg-1");
+        reg.note_turn_start("agent:root", "cmsg-1");
+        sink.publish(frame("st_first", begin()));
+        note(&reg).note_model_failure("root");
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Failed);
+        let seen = witness.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        // The hub had the Begin before the status named the key.
+        assert_eq!(seen[0].0, begin());
+        assert_eq!(seen[0].1, None);
+        // The class was final before the stream ended.
+        assert_eq!(seen[1].0, end(0, LlmTerminalReason::Reaped, None));
+        assert_eq!(seen[1].1.as_deref(), Some("st_first"));
+        assert_eq!(
+            seen[1].2.as_deref(),
+            Some(advance_client_api::FAILURE_CLASS_PROVIDER_ERROR)
         );
     }
 
@@ -926,12 +2060,20 @@ mod tests {
     fn stream_key_binds_to_pending_message_id() {
         let reg = ReplyRegistry::new();
         reg.note_pending_message("agent:root", "cmsg-1");
+        reg.record_stream_key("root", "st_early");
+        assert!(
+            reg.stream_key_for_message("cmsg-1").is_none(),
+            "a call before the message's turn starts is not its"
+        );
+        reg.note_turn_start("agent:root", "cmsg-1");
         reg.record_stream_key("root", "st_one");
         assert_eq!(
             reg.stream_key_for_message("cmsg-1").as_deref(),
             Some("st_one")
         );
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Completed);
         reg.note_pending_message("agent:root", "cmsg-2");
+        reg.note_turn_start("agent:root", "cmsg-2");
         reg.record_stream_key("root", "st_two");
         assert_eq!(
             reg.stream_key_for_message("cmsg-1").as_deref(),
@@ -1213,7 +2355,12 @@ mod tests {
         reg.forget_unpublished_message("agent:root", "cmsg-1");
         assert!(reg.inflight_message_id("agent:root").is_none());
         note(&reg).note_model_failure("root");
+        // Its turn, should it run after all, binds nothing.
+        reg.note_turn_start("agent:root", "cmsg-1");
+        reg.record_stream_key("root", "st_1");
+        reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Completed);
         reg.note_pending_message("agent:root", "cmsg-2");
+        reg.note_turn_start("agent:root", "cmsg-2");
         reg.record_stream_key("root", "st_2");
         assert!(reg.stream_key_for_message("cmsg-1").is_none());
         assert_eq!(

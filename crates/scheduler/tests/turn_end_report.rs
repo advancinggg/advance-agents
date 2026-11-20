@@ -67,10 +67,74 @@ impl MessageHandler for SequenceHandler {
     }
 }
 
-/// Records each turn end and each turn completion the loop reports, in order.
+/// Where a turn that never returns stops.
+#[derive(Clone, Copy, Debug)]
+enum Stuck {
+    /// It parks inside `handle_message`.
+    InTheGuest,
+    /// It panics inside `handle_message`.
+    Unwinding,
+    /// Its (empty) batch is dispatched; it parks in post-processing.
+    AfterDispatch,
+}
+
+/// Runs a turn that never returns ([`Stuck`]).
+struct StuckHandler {
+    sequence: Sequence,
+    stuck: Stuck,
+}
+
+#[async_trait]
+impl MessageHandler for StuckHandler {
+    async fn init(&self, _config: ComponentConfig) -> Result<Vec<u8>, HookError> {
+        self.sequence.lock().unwrap().push("init".into());
+        Ok(Vec::new())
+    }
+    async fn handle_message(
+        &self,
+        msg: &Message,
+        _state: Vec<u8>,
+    ) -> Result<ActionResult, HookError> {
+        self.sequence
+            .lock()
+            .unwrap()
+            .push(format!("handle {}", msg.id));
+        match self.stuck {
+            Stuck::InTheGuest => std::future::pending().await,
+            Stuck::Unwinding => panic!("the turn unwinds"),
+            Stuck::AfterDispatch => Ok(ActionResult {
+                new_state: Vec::new(),
+                actions: Vec::<AgentAction>::new(),
+            }),
+        }
+    }
+}
+
+/// Parks every post-processing step.
+struct ParkingPostProcessor;
+
+#[async_trait]
+impl PostProcessorHook for ParkingPostProcessor {
+    async fn run(
+        &self,
+        _agent_id: &str,
+        _msg: &Message,
+        _result: &ActionResult,
+    ) -> Result<(), PostProcessorError> {
+        std::future::pending().await
+    }
+}
+
+/// Records each turn start, turn end and turn completion the loop reports, in order.
 struct EndObserver(Sequence);
 
 impl TurnObserver for EndObserver {
+    fn on_turn_start(&self, agent_id: &str, message_id: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("start {agent_id} {message_id}"));
+    }
     fn on_turn_end(&self, agent_id: &str, end: &TurnEnd) {
         self.0.lock().unwrap().push(format!(
             "end {agent_id} {} {:?}",
@@ -262,15 +326,18 @@ async fn serve_turns(turns: usize, dispatcher: Arc<dyn AgentActionDispatcher>) -
 
 /// A guest error ends its turn `Failed`, a dispatched (empty) batch ends it `Completed`,
 /// each reported against the message the turn executed and before `on_turn_complete`.
+/// Each turn's start is reported first, against the same message, before the guest runs.
 #[tokio::test]
 async fn serve_reports_each_turn_end_before_turn_complete() {
     assert_eq!(
         serve_turns(2, Arc::new(OkDispatcher)).await,
         [
             "init",
+            &format!("start {AGENT} m1"),
             "handle m1 0",
             &format!("end {AGENT} m1 Failed"),
             "observed",
+            &format!("start {AGENT} m2"),
             "handle m2 1",
             &format!("end {AGENT} m2 Completed"),
             "observed",
@@ -285,12 +352,74 @@ async fn serve_reports_a_refused_dispatch_as_a_failed_turn() {
         serve_turns(2, Arc::new(FailingDispatcher)).await,
         [
             "init",
+            &format!("start {AGENT} m1"),
             "handle m1 0",
             &format!("end {AGENT} m1 Failed"),
             "observed",
+            &format!("start {AGENT} m2"),
             "handle m2 1",
             &format!("end {AGENT} m2 Failed"),
             "observed",
         ]
     );
+}
+
+/// A turn dropped after its start — its serving task aborted mid-turn, or the turn
+/// unwinding — reports its end as it is dropped, `Failed` until its actions were
+/// dispatched and `Completed` after; no completion follows.
+#[tokio::test]
+async fn a_turn_dropped_after_its_start_reports_its_end() {
+    for (stuck, outcome) in [
+        (Stuck::InTheGuest, "Failed"),
+        (Stuck::Unwinding, "Failed"),
+        (Stuck::AfterDispatch, "Completed"),
+    ] {
+        let sequence: Sequence = Arc::default();
+        let post_processor: Arc<dyn PostProcessorHook> = match stuck {
+            Stuck::AfterDispatch => Arc::new(ParkingPostProcessor),
+            _ => Arc::new(OkPostProcessor),
+        };
+        let driver = Arc::new(
+            AgentLoopDriverImpl::new(
+                Arc::new(ParkingMailbox {
+                    left: Mutex::new(1),
+                    issued: Mutex::new(0),
+                }),
+                Arc::new(OkAssembler),
+                post_processor,
+                Arc::new(OkDispatcher),
+                Arc::new(OkBootstrap),
+                Arc::new(StuckHandler {
+                    sequence: Arc::clone(&sequence),
+                    stuck,
+                }),
+            )
+            .with_turn_observer(Arc::new(EndObserver(Arc::clone(&sequence)))),
+        );
+        let serving = tokio::spawn({
+            let driver = Arc::clone(&driver);
+            async move { driver.serve(AGENT, cfg(), inst()).await }
+        });
+        if matches!(stuck, Stuck::Unwinding) {
+            assert!(serving.await.unwrap_err().is_panic());
+        } else {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !snapshot(&sequence).iter().any(|line| line == "handle m1") {
+                assert!(Instant::now() < deadline, "the turn never ran");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            serving.abort();
+            assert!(serving.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(
+            snapshot(&sequence),
+            [
+                "init",
+                &format!("start {AGENT} m1"),
+                "handle m1",
+                &format!("end {AGENT} m1 {outcome}"),
+            ],
+            "{stuck:?}"
+        );
+    }
 }

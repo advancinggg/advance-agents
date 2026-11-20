@@ -225,13 +225,25 @@ pub trait ProtectedTurnExecutionBoundary: Send + Sync {
 pub trait TurnObserver: Send + Sync {
     fn on_turn_complete(&self, agent_id: &str);
 
+    /// The serving loop admitted the inbound message `message_id` for execution and is
+    /// about to run its turn. Every model call the agent makes until
+    /// [`Self::on_turn_end`] reports the same message belongs to this turn. Fired only
+    /// for a turn whose end is then reported: never for a recv failure, a malformed
+    /// envelope, a protected turn retired without running or one refused before it
+    /// starts (that one still reports its end), and never on the single-turn
+    /// `run_agent` path. Default: nothing.
+    fn on_turn_start(&self, _agent_id: &str, _message_id: &str) {}
+
     /// How the turn that just ran ended, reported right BEFORE
     /// [`Self::on_turn_complete`] for every message the mailbox handed to the
     /// loop (a recv failure, a malformed envelope, or a protected turn retired
     /// as a detached batch entry never reach it). It fires after the turn's
     /// dispatch has settled, so an observer that marks a [`TurnOutcome::Failed`]
-    /// turn as "will not answer" can never precede that turn's reply. Default:
-    /// nothing.
+    /// turn as "will not answer" can never precede that turn's reply. A turn dropped
+    /// after its start (its serving task aborted mid-turn, or the turn unwinding)
+    /// reports its end as it is dropped — [`TurnOutcome::Failed`], or
+    /// [`TurnOutcome::Completed`] once its actions were dispatched — contained against
+    /// a panic here, and no [`Self::on_turn_complete`] follows. Default: nothing.
     fn on_turn_end(&self, _agent_id: &str, _end: &TurnEnd) {}
 }
 

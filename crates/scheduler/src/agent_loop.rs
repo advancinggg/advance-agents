@@ -54,6 +54,66 @@ use crate::types::{ComponentConfig, RestartPolicy, TrapError, WasmInstance};
 /// 1-4 from Slice A (MailboxReader, ContextAssembler, PostProcessorHook,
 /// AgentActionDispatcher); 5 from Slice B (RunBootstrap); 6 from Slice
 /// C (MessageHandler — 2-arg WIT `handle-message` abstraction per AC-15).
+/// The turn a serving loop reported started and has not reported ended. Dropped while it
+/// holds one — the loop's task was aborted mid-turn, or the turn unwound — it reports how
+/// that turn ended, so an observer told a turn started is always told it ended (no
+/// [`TurnObserver::on_turn_complete`] follows): [`TurnOutcome::Failed`], or
+/// [`TurnOutcome::Completed`] once its actions were dispatched.
+struct StartedTurn<'a> {
+    observer: Option<Arc<dyn TurnObserver>>,
+    agent_id: &'a str,
+    message_id: Option<String>,
+    outcome: TurnOutcome,
+}
+
+impl<'a> StartedTurn<'a> {
+    fn new(observer: Option<Arc<dyn TurnObserver>>, agent_id: &'a str) -> Self {
+        Self {
+            observer,
+            agent_id,
+            message_id: None,
+            outcome: TurnOutcome::Failed,
+        }
+    }
+
+    /// The turn of `message_id` was admitted: report its start.
+    fn start(&mut self, message_id: &str) {
+        if let Some(observer) = &self.observer {
+            observer.on_turn_start(self.agent_id, message_id);
+            self.message_id = Some(message_id.to_owned());
+            self.outcome = TurnOutcome::Failed;
+        }
+    }
+
+    /// The turn's actions were dispatched: dropped from here on, it delivered what it
+    /// produced.
+    fn dispatched(&mut self) {
+        self.outcome = TurnOutcome::Completed;
+    }
+
+    /// The turn returned: the loop reports its end itself.
+    fn returned(&mut self) {
+        self.message_id = None;
+    }
+}
+
+impl Drop for StartedTurn<'_> {
+    fn drop(&mut self) {
+        let (Some(observer), Some(message_id)) = (self.observer.as_ref(), self.message_id.take())
+        else {
+            return;
+        };
+        let end = TurnEnd {
+            message_id,
+            outcome: self.outcome,
+        };
+        // This can run while the turn unwinds, where a panic leaving a destructor aborts.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observer.on_turn_end(self.agent_id, &end);
+        }));
+    }
+}
+
 pub struct AgentLoopDriverImpl {
     /// MODULE-006 inverted trait — agent-loop polls mailbox via this.
     pub mailbox_reader: Arc<dyn MailboxReader>,
@@ -410,7 +470,16 @@ impl AgentLoopDriverImpl {
     /// which returns WITHOUT running `post_process` (the old `run_agent`
     /// `return`ed there). `run_agent` calls this once (discarding the returned
     /// state); `serve` calls it in a loop.
-    async fn run_turn_once(&self, agent_id: &str, state: Vec<u8>) -> (Vec<u8>, Option<TurnEnd>) {
+    ///
+    /// The serving loops pass `started`: an admitted turn's start is reported through it,
+    /// and should the turn be dropped before it returns, so is its end. `run_agent` passes
+    /// `None` and reports neither.
+    async fn run_turn_once(
+        &self,
+        agent_id: &str,
+        state: Vec<u8>,
+        started: Option<&mut StartedTurn<'_>>,
+    ) -> (Vec<u8>, Option<TurnEnd>) {
         // Step 3: receive the exact mailbox execution envelope. A protected
         // message keeps its move-only dequeue guard beside its identity until
         // immediately before guest execution; every pre-start early return lets
@@ -503,6 +572,12 @@ impl AgentLoopDriverImpl {
         } else {
             None
         };
+        // The turn is admitted: every path from here reports how it ended, so the
+        // observer learns which message the turn's model calls belong to.
+        let mut started = started;
+        if let Some(started) = started.as_deref_mut() {
+            started.start(&message_id);
+        }
         // Stage-F obs SLICE 1 — establish the per-chain `trace_id` at the universal
         // inbound admission point (right after recv, BEFORE the `msg.clone()` into
         // `AssemblyContext` and the `&msg` into `handle_message`). `ensure_chain_trace`
@@ -634,6 +709,9 @@ impl AgentLoopDriverImpl {
                     );
                     return (action_result.new_state, ended(TurnOutcome::Failed));
                 }
+                if let Some(started) = started {
+                    started.dispatched();
+                }
                 // Step 7: post-process (happy path). A failure here never fails the
                 // turn — its reply is already dispatched — but it is logged: this is
                 // the one place a failed turn-end step (a memory write, an embedding
@@ -729,8 +807,13 @@ impl AgentLoopDriverImpl {
             Some(s) => s,
             None => return,
         };
+        // A turn dropped before it returns reports its end from here.
+        let mut started = StartedTurn::new(self.turn_observer.clone(), agent_id);
         loop {
-            let (next, end) = self.run_turn_once(agent_id, state).await;
+            let (next, end) = self
+                .run_turn_once(agent_id, state, Some(&mut started))
+                .await;
+            started.returned();
             state = next;
             if let Some(observer) = &self.turn_observer {
                 if let Some(end) = end.as_ref() {
@@ -786,8 +869,12 @@ impl AgentLoopDriverImpl {
             Some(s) => s,
             None => return,
         };
+        let mut started = StartedTurn::new(self.turn_observer.clone(), agent_id);
         for turn in 1..=n {
-            let (next, end) = self.run_turn_once(agent_id, state).await;
+            let (next, end) = self
+                .run_turn_once(agent_id, state, Some(&mut started))
+                .await;
+            started.returned();
             state = next;
             if let Some(observer) = &self.turn_observer {
                 if let Some(end) = end.as_ref() {
@@ -827,7 +914,7 @@ impl AgentLoopDriver for AgentLoopDriverImpl {
             None => return,
         };
         // Single turn: the returned next-state is discarded.
-        let _ = self.run_turn_once(agent_id, state).await;
+        let _ = self.run_turn_once(agent_id, state, None).await;
     }
 
     async fn handle_trap(&self, agent_id: &str, trap: TrapError) {

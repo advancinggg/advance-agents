@@ -94,7 +94,9 @@ impl RecordingTurnObserver {
     /// How the turn of `agent_id` (the colon serve key) that executed message
     /// `message_id` ended, while it is among the agent's last [`TURN_ENDS_KEPT`]
     /// turns. A turn end is reported once the turn ran to its END — its turn-end
-    /// pipeline included — and before the turn is counted ([`Self::count`]).
+    /// pipeline included — and before the turn is counted ([`Self::count`]); a turn
+    /// dropped mid-way (its loop aborted) reports its end as it is dropped and is not
+    /// counted.
     /// `None`: no such turn has ended.
     pub fn turn_end_of(&self, agent_id: &str, message_id: &str) -> Option<TurnOutcome> {
         self.ends.lock().ok().and_then(|ends| {

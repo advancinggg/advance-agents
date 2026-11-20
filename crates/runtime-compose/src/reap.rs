@@ -48,6 +48,13 @@ impl TurnObserver for CompositeTurnObserver {
         }
     }
 
+    /// Forwarded in the same declaration order.
+    fn on_turn_start(&self, agent_id: &str, message_id: &str) {
+        for observer in &self.observers {
+            observer.on_turn_start(agent_id, message_id);
+        }
+    }
+
     /// Forwarded in the same declaration order, so a wrapped observer that marks
     /// a failed turn (the root's `WatchTurnObserver`) sees every turn end.
     fn on_turn_end(&self, agent_id: &str, end: &TurnEnd) {

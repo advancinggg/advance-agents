@@ -33,6 +33,10 @@ pub const CALLABLES_CORE: &[u8] =
 
 const POLL: Duration = Duration::from_millis(50);
 
+/// How long a stream's reader waits, once its terminal has arrived, for the seqs before it
+/// it has not read yet — the app's grace (`ClientAPIClient.terminalGraceNanoseconds`).
+const TERMINAL_GRACE: Duration = Duration::from_millis(1500);
+
 /// The longest a composition may take to shut down: it waits for the last pass over the
 /// records of an agent deleted while it was serving.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(120);
@@ -317,6 +321,19 @@ impl Client {
     /// END — the whole turn-end pipeline has returned, so every request the turn makes
     /// has been made — and require that it completed and failed in nothing.
     pub async fn turn(&self, mailbox: &str, payload: &str) {
+        self.turn_message(mailbox, payload).await;
+    }
+
+    /// [`Self::turn`], answering the id of the message the turn executed.
+    pub async fn turn_message(&self, mailbox: &str, payload: &str) -> String {
+        let id = self.send_message(mailbox, payload).await;
+        self.await_message_turn(&id).await;
+        id
+    }
+
+    /// Send `payload` to the root agent at `mailbox` as a Client API message, answering
+    /// its id at once, before its turn runs.
+    pub async fn send_message(&self, mailbox: &str, payload: &str) -> String {
         let key = format!("context-home-{}", nanos());
         let sent = Http::post(self.addr, "/client/messages")
             .session(&self.token)
@@ -324,12 +341,16 @@ impl Client {
             .json(json!({ "to": mailbox, "payload": payload }))
             .await;
         assert_eq!(sent.status, 200, "send: {:?}", sent.body);
-        let id = sent
-            .body
+        sent.body
             .pointer("/data/message_id")
             .and_then(Value::as_str)
             .unwrap_or_else(|| panic!("message_id missing: {:?}", sent.body))
-            .to_owned();
+            .to_owned()
+    }
+
+    /// Wait until the turn of message `id` ran to its END, and require that it completed
+    /// and failed in nothing.
+    pub async fn await_message_turn(&self, id: &str) {
         let deadline = Instant::now() + self.wait;
         let outcome = loop {
             // How THIS message's turn ended: the message status reads the agent's state,
@@ -356,6 +377,80 @@ impl Client {
             status.get("failure_class").is_none(),
             "the turn failed: {status}"
         );
+    }
+
+    /// Message `id`'s reply stream, read as a client reads it while the turn runs: the
+    /// message status polled until it names a stream key, then the stream read page by
+    /// page from its first seq until its terminal has arrived and every seq before it has
+    /// been read — or, the terminal come, [`TERMINAL_GRACE`] has passed (started again
+    /// whenever a page brings text), as the hub never releases a tail that could begin a
+    /// secret (MODULE-020-T24-h): the caller then finds the last item read short of the
+    /// terminal's seq. The last page comes back with every item read. A stream the hub no
+    /// longer serves fails: the hub lets an ended stream go 30 s after its terminal.
+    pub async fn read_message_stream(&self, id: &str) -> advance_client_api::LlmDeltaPage {
+        let deadline = Instant::now() + self.wait;
+        let mut grace_ends: Option<Instant> = None;
+        let key = loop {
+            let status = self.get(&format!("/client/messages/{id}")).await;
+            if let Some(key) = status.get("stream_key").and_then(Value::as_str) {
+                break key.to_owned();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "message {id} named no stream within {:?}: {status}",
+                self.wait
+            );
+            tokio::time::sleep(POLL).await;
+        };
+        let mut read = Vec::new();
+        let mut read_to = 0;
+        loop {
+            let mut page = self.delta_page(&key, read_to);
+            assert!(
+                !page.absent,
+                "the hub no longer serves stream {key} of message {id}"
+            );
+            let before = read_to;
+            if let Some(last) = page.deltas.last() {
+                read_to = last.to_seq + 1;
+            }
+            read.append(&mut page.deltas);
+            if page.page_limit_reached && read_to > before {
+                continue;
+            }
+            if !page.page_limit_reached && page.terminal.as_ref().is_some_and(|t| read_to >= t.seq)
+            {
+                page.deltas = read;
+                return page;
+            }
+            if !page.page_limit_reached && page.terminal.is_some() {
+                if read_to > before {
+                    grace_ends = None;
+                }
+                let ends = *grace_ends.get_or_insert_with(|| Instant::now() + TERMINAL_GRACE);
+                if Instant::now() >= ends {
+                    page.deltas = read;
+                    return page;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stream {key} of message {id} did not end within {:?}: {page:?}",
+                self.wait
+            );
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    /// A page of the delta stream `stream_key` from `from_seq`, as the hub serves it to a
+    /// client that subscribes to it.
+    pub fn delta_page(&self, stream_key: &str, from_seq: u64) -> advance_client_api::LlmDeltaPage {
+        self.probe
+            .record()
+            .llm_delta_hub
+            .and_then(|hub| hub.upgrade())
+            .expect("a home declaring `llm` has a delta hub")
+            .read_page(stream_key, from_seq)
     }
 
     /// The composition's LLM gateway.

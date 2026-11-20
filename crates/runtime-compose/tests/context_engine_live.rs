@@ -34,7 +34,9 @@
 //! - a turn indexed while its agent could not embed is recalled once it can;
 //! - a child agent recalls its own turns and nothing of its parent's;
 //! - the knowledge a real model extracts from a deleted agent's turn is taken over by its
-//!   parent, as history, and recalled by it.
+//!   parent, as history, and recalled by it;
+//! - when a real model answers a Client API message with a tool call first, the answer of
+//!   the call after the tool result reaches the stream the message's status names.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -950,4 +952,92 @@ fn knowledge_ids(memory_root: &std::path::Path, agent: &str) -> Vec<String> {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter_map(|entry| entry["id"].as_str().map(str::to_string))
         .collect()
+}
+
+const PLAN_FILE: &str = "garden-plan.md";
+const PLAN_TEXT: &str =
+    "# Garden plan\n\n1. Dig the beds\n2. Plant the tomatoes\n3. Water the seedlings\n";
+const READ_THE_PLAN: &str = "Use the read tool to open garden-plan.md in the workspace, then tell me how many numbered steps it lists.";
+
+/// The model calls `read` first and answers from the file after the tool result: the one
+/// stream the message's status names carries the turn's text through the answer, and ends
+/// once, completed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "calls a real model service; set the ADVANCE_LIVE_LLM_* variables"]
+async fn a_tool_turns_answer_reaches_the_stream_its_message_names() {
+    let Some(live) = live() else { return };
+    let live = &live;
+    let home = memory_home(true, &[], &[live.entry(NEAR, true)], &["provider: near"]);
+    std::fs::write(home.home().join(PLAN_FILE), PLAN_TEXT).expect("the plan");
+    let tap = &Tap::new();
+    serve(&home, tap.security(), WAIT, |client| async move {
+        let from = tap.len();
+        let id = client.send_message(ROOT_MAILBOX, READ_THE_PLAN).await;
+        // Read as the app reads it, while the turn runs: the steps after the reply's
+        // dispatch (extraction, consolidation, embeddings) can outlast the hub's linger.
+        let page = client.read_message_stream(&id).await;
+        client.await_message_turn(&id).await;
+        let trace = Trace {
+            said: READ_THE_PLAN.to_string(),
+            exchanges: tap.since(from),
+        };
+        trace.report("root");
+        trace.assert_answered();
+        trace.assert_asked_of(live);
+        let requests = trace.model_requests();
+        assert!(
+            requests.len() >= 2,
+            "the model was to call a tool first: {} model request(s)",
+            requests.len()
+        );
+        assert!(
+            requests[0].tool_calls().iter().any(|name| name == "read"),
+            "the first model call calls read: {:?}",
+            requests[0].tool_calls()
+        );
+        let answer = trace.answer();
+        assert!(!answer.trim().is_empty(), "the last model call answered");
+
+        let text: String = page.deltas.iter().map(|item| item.text.as_str()).collect();
+        let terminal = page.terminal.as_ref().expect("the stream ended");
+        assert_eq!(terminal.reason, "completed", "{terminal:?}");
+        // The hub never releases a tail that could begin a secret (MODULE-020-T24-h), and the
+        // default guest's `generate` tees a call's text as one delta when the call ends: an
+        // answer that ends in such a start (`… Water the seedlings`) is held back whole, and
+        // the stream ends short of its terminal's seq (the release's Known list). The answer
+        // was still merged into the message's stream: the terminal counts its delta.
+        let read_to = page.deltas.last().map_or(0, |item| item.to_seq + 1);
+        let held = read_to < terminal.seq;
+        let answer = answer.trim();
+        println!(
+            "LIVE stream of the message{}: {}",
+            if held {
+                " (the answer's delta held by the hub)"
+            } else {
+                ""
+            },
+            brief(&text, 400)
+        );
+        if held {
+            assert_eq!(
+                terminal.seq,
+                read_to + 1,
+                "only the answer's delta is held, after the earlier calls' text: {text:?}"
+            );
+            assert!(
+                !text.contains(answer),
+                "a held answer is not in the stream: {text:?}"
+            );
+        } else {
+            assert!(
+                text.contains(answer),
+                "the stream carries the answer of the call after the tool result: {text:?}"
+            );
+            assert!(
+                mentions(&text, &["3", "three"]),
+                "the answer counts the plan's steps: {text:?}"
+            );
+        }
+    })
+    .await;
 }
