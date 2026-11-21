@@ -3925,16 +3925,23 @@ async fn boot_loopback_for_sut(
                 cap_http::canonical_facade::decoded_hold_split(buf, max_canonical)
             });
         let clock: Arc<dyn advance_client_api::Clock> = Arc::new(advance_client_api::SystemClock);
-        let hub = Arc::new(match delta_tee_timing {
-            Some(timing) => advance_client_api::LlmDeltaHub::with_timing(
-                Some(det),
-                Some(hold),
-                clock,
-                None,
-                timing,
-            ),
-            None => advance_client_api::LlmDeltaHub::new(Some(det), Some(hold), clock, None),
-        });
+        let sweep: advance_client_api::DeltaCompletedMatchSweep =
+            Arc::new(|buf: &[u8], max_canonical: usize| {
+                cap_http::canonical_facade::decoded_region_has_completed_match(buf, max_canonical)
+            });
+        let hub = Arc::new(
+            match delta_tee_timing {
+                Some(timing) => advance_client_api::LlmDeltaHub::with_timing(
+                    Some(det),
+                    Some(hold),
+                    clock,
+                    None,
+                    timing,
+                ),
+                None => advance_client_api::LlmDeltaHub::new(Some(det), Some(hold), clock, None),
+            }
+            .with_completed_match_sweep(sweep),
+        );
         let lp = llm_loopback::LoopbackLlm::start_with_tee(
             responses, budget, repetition, bus, agent_id, hub,
         )

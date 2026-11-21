@@ -1,7 +1,9 @@
 //! A Client API message's stream follows its whole turn. A client reads the reply of a
 //! message on the one stream its status names. When the agent's first model call calls a
 //! tool, the answer comes from the call after the tool result: it is on that stream too,
-//! after the first call's text, and the stream ends once, with the turn's usage.
+//! after the first call's text, and the stream ends once, with the turn's usage. An answer
+//! that ends in what could begin a secret reads whole too: the hub holds that tail back only
+//! until the stream's complete terminal (MODULE-020-T24-h).
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -24,20 +26,29 @@ const PROMPT: &str = "how many steps does the plan have?";
 const PLAN: &str = "plan.md";
 const PREAMBLE: &str = "Let me read the plan.";
 const ANSWER: &str = "The plan has three steps.";
+/// An answer whose end could begin a secret: on v0.1.58 the hub held it back for good.
+const HELD_ANSWER: &str = "Three steps. Water the seedlings";
 const DIGEST: &str = "The user asked how many steps the plan has.";
 const READ_CALL_ID: &str = "call_read_plan";
 
 /// The model service: the agent's request for [`PROMPT`] gets [`PREAMBLE`] and a call of
-/// `read` on the plan; its request after the tool result gets [`ANSWER`]. A turn-end
+/// `read` on the plan; its request after the tool result gets `answer`. A turn-end
 /// extraction gets a digest, any other request of the host (the L6 consolidation) a plain
 /// answer, an embedding a vector.
-#[derive(Default)]
 struct Peer {
+    answer: &'static str,
     /// The agent's own model requests (not the extractions), in order.
     agent_requests: Mutex<Vec<Value>>,
 }
 
 impl Peer {
+    fn answering(answer: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            agent_requests: Mutex::new(Vec::new()),
+        })
+    }
+
     fn security(self: &Arc<Self>) -> LlmSecurityOverride {
         let public = vec!["8.8.8.8".parse::<IpAddr>().expect("public address")];
         LlmSecurityOverride {
@@ -85,7 +96,7 @@ impl HttpExecutor for Peer {
         let answered = answered_since_last_user(&body);
         self.agent_requests.lock().unwrap().push(body);
         Ok(json_response(if answered {
-            completion(json!({ "role": "assistant", "content": ANSWER }))
+            completion(json!({ "role": "assistant", "content": self.answer }))
         } else {
             let arguments = json!({ "path": PLAN }).to_string();
             let mut call = completion(json!({
@@ -161,6 +172,25 @@ fn answered_since_last_user(body: &Value) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tool_turns_answer_reaches_the_stream_its_message_names() {
+    tool_turn_reads_whole(ANSWER).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_ending_in_a_held_start_reads_whole() {
+    // The precondition: the wire layer's hold geometry holds this answer's tail.
+    let held_from =
+        cap_http::canonical_facade::decoded_hold_split(HELD_ANSWER.as_bytes(), 4 * 1024 * 1024)
+            .expect("the hold geometry");
+    assert!(
+        held_from < HELD_ANSWER.len(),
+        "{HELD_ANSWER:?} ends in a held start"
+    );
+    tool_turn_reads_whole(HELD_ANSWER).await;
+}
+
+/// A tool turn answering `answer`: the stream its message names reads both calls' text whole,
+/// to its completed terminal.
+async fn tool_turn_reads_whole(answer: &'static str) {
     let entry = format!(
         "  - id: main\n    endpoint: https://{HOST}\n    api-key-secret: main-api-key\n    model-aliases: {{ default: main-chat }}\n    cost-per-mtoken-in: 1.0\n    cost-per-mtoken-out: 2.0\n    rate-limit: {{ requests-per-minute: 1000, tokens-per-minute: 1000000 }}\n    embedding-model: main-embed\n"
     );
@@ -171,7 +201,7 @@ async fn a_tool_turns_answer_reaches_the_stream_its_message_names() {
         &["provider: main"],
     );
     std::fs::write(home.home().join(PLAN), "1. draft\n2. review\n3. ship\n").expect("the plan");
-    let peer = Arc::new(Peer::default());
+    let peer = Peer::answering(answer);
     context_home::serve(&home, peer.security(), WAIT, |client| {
         let peer = Arc::clone(&peer);
         async move {
@@ -187,8 +217,12 @@ async fn a_tool_turns_answer_reaches_the_stream_its_message_names() {
             let text: String = page.deltas.iter().map(|item| item.text.as_str()).collect();
             assert_eq!(
                 text,
-                format!("{PREAMBLE}\n\n{ANSWER}"),
+                format!("{PREAMBLE}\n\n{answer}"),
                 "both model calls of the turn, on the message's one stream"
+            );
+            assert_eq!(
+                (page.dropped_count, page.rejected_count, page.redacted_count),
+                (0, 0, 0)
             );
             let terminal = page
                 .terminal

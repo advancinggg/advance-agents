@@ -969,6 +969,7 @@ async fn module_001_ac30_t111_2_d5_llm_deltas_pages_carry_a_resume_cursor_withou
                     seq: 2,
                     reason: LlmTerminalReason::Completed,
                     usage: None,
+                    complete: false,
                 },
             },
         ],

@@ -102,6 +102,11 @@ pub enum HubEvent {
 /// `cap_http::canonical_facade::decoded_hold_split`): returns the SPLIT point;
 /// hold = input len − split. `Err` fails closed (`Blocked`-advance).
 pub type DeltaHoldSplit = Arc<dyn Fn(&[u8], usize) -> Result<usize, ()> + Send + Sync>;
+/// Injected completed-match sweep (composition root wraps
+/// `cap_http::canonical_facade::decoded_region_has_completed_match`, the wire layer's EOF
+/// rule): does the input hold a COMPLETED Block/Redact match? Consulted only at the end of a
+/// complete stream, before the tail it held back is released. `Err` fails closed (`Blocked`).
+pub type DeltaCompletedMatchSweep = Arc<dyn Fn(&[u8], usize) -> Result<bool, ()> + Send + Sync>;
 /// Injected observer (production: tracing-backed at the cli root; absent ⇒ no-op).
 pub type DeltaObserver = Arc<dyn Fn(HubEvent) + Send + Sync>;
 
@@ -449,6 +454,23 @@ struct EntryState {
     released: VecDeque<ReleasedItem>,
     released_bytes: usize,
     terminal: Option<LlmDeltaTerminal>,
+    /// The `seq` of the stream's first `Terminal`, when that one was complete: the stream's
+    /// end. Its producer published every delta below it, its text whole, and publishes
+    /// nothing after it.
+    closes_at: Option<u64>,
+    /// A committed step lost the scan's hold on the stream's text: it consumed its whole
+    /// input (blocked, collapsed by a redaction, or over the hold cap), or it released text
+    /// from an input that skipped a seq. The text after a consumed input may hold the rest
+    /// of a secret whose start went with it, and a seq that fills the skipped one later
+    /// changes the text that step judged. Such a stream never closes: its held tail stays
+    /// held.
+    scan_broken: bool,
+    /// The hub evicted the stream (`finalize_evicted_entry`) and dropped the text it had not
+    /// released, its held tail with it. A reader or a publisher that took the entry just
+    /// before its removal may still reach it, but no scan of it releases anything more: the
+    /// text that reaches it after the dropped tail would be scanned without that tail, and
+    /// may hold the rest of a secret whose start went with it.
+    finalized: bool,
     linger_deadline_ms: Option<u64>,
 }
 
@@ -466,8 +488,21 @@ impl EntryState {
             released: VecDeque::new(),
             released_bytes: 0,
             terminal: None,
+            closes_at: None,
+            scan_broken: false,
+            finalized: false,
             linger_deadline_ms: None,
         }
+    }
+
+    /// Whether the hub took every seq below `end`: each was published and admitted, so none
+    /// is missing and none was only dropped. `seen` records admitted seqs alone, exactly
+    /// (sorted, coalesced, never merged across a gap), so that is one range from 0.
+    fn took_every_seq_below(&self, end: u64) -> bool {
+        self.seen
+            .ranges
+            .first()
+            .is_some_and(|&(lo, hi)| lo == 0 && hi.saturating_add(1) >= end)
     }
 
     fn record_drop(&mut self, seq: u64) {
@@ -553,6 +588,7 @@ impl std::fmt::Debug for DeltaSubscriberPermit {
 pub struct LlmDeltaHub {
     detector: Option<Arc<dyn LeakDetector>>,
     hold_split: Option<DeltaHoldSplit>,
+    completed_match_sweep: Option<DeltaCompletedMatchSweep>,
     clock: Arc<dyn Clock>,
     observer: Option<DeltaObserver>,
     timing: DeltaTiming,
@@ -645,6 +681,7 @@ impl LlmDeltaHub {
         Self {
             detector,
             hold_split,
+            completed_match_sweep: None,
             clock,
             observer,
             timing,
@@ -655,6 +692,18 @@ impl LlmDeltaHub {
             #[cfg(feature = "test-support")]
             registry_acquisitions: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Attach the completed-match sweep. With it, the tail a stream held back because it
+    /// could begin a secret is released at the stream's end when all of these hold: its
+    /// `Terminal` was complete; the hub took every seq below that end; no step consumed its
+    /// whole input (a block, a redaction, a hold over its cap) or released text from an input
+    /// that skipped a seq; the hub has not evicted the stream; and the sweep finds no
+    /// completed match (cap-llm's EOF rule). Without it, such a tail is never released, as on
+    /// a stream whose `Terminal` is not complete.
+    pub fn with_completed_match_sweep(mut self, sweep: DeltaCompletedMatchSweep) -> Self {
+        self.completed_match_sweep = Some(sweep);
+        self
     }
 
     /// The ONE registry-map acquisition helper (pin C-10: `publish` performs exactly one).
@@ -764,6 +813,12 @@ impl LlmDeltaHub {
                 // (invariant 4's re-drain case): ignored, NOT counted.
                 return;
             }
+            if st.closes_at.is_some_and(|end| seq >= end) {
+                // At or past a complete stream's end: its producer publishes nothing there, so
+                // this is no text of the stream. Dropped AND counted, never released.
+                st.record_drop(seq);
+                return;
+            }
             if seq < st.floor {
                 // First-time content the window can no longer serve: dropped AND counted.
                 st.record_drop(seq);
@@ -798,6 +853,7 @@ impl LlmDeltaHub {
         seq: u64,
         reason: LlmTerminalReason,
         usage: Option<advance_shared_types::traits::LlmDeltaUsage>,
+        complete: bool,
     ) {
         enum TerminalPath {
             Unknown,
@@ -880,6 +936,7 @@ impl LlmDeltaHub {
                         reason: terminal_reason_str(reason).to_string(),
                         usage: usage_dto,
                     });
+                    st.closes_at = complete.then_some(seq);
                     st.linger_deadline_ms =
                         Some(now.saturating_add(self.timing.linger.as_millis() as u64));
                 }
@@ -902,6 +959,9 @@ impl LlmDeltaHub {
             st.pending.clear();
             st.pending_bytes = 0;
             st.hold_end_seq = None;
+            // No scan of the entry releases anything more. A scan in flight commits nothing
+            // either: its input is no longer the pending prefix (`commit_step`).
+            st.finalized = true;
             (hold_bytes > 0, beyond_hold)
         };
         if residual_hold {
@@ -953,10 +1013,36 @@ impl LlmDeltaHub {
                     cand_bytes += f.text.len();
                     cand_count += 1;
                 }
-                if cand_count == 0 {
+                let total = hold_count + cand_count;
+                // The stream's last step: its `Terminal` was complete, the hub took every seq below
+                // that end, no committed step lost the scan's hold on the text (`scan_broken`), and
+                // this input runs to the last pending frame, which is the stream's last seq. Every
+                // seq taken and not yet committed is pending (an evicted stream, whose pending text
+                // the hub dropped, is never scanned again), so the input runs unbroken from the
+                // floor to the end. No step before it consumed its input, and each one that
+                // released text had scanned an input that ran from the floor without a gap, keeping
+                // for the next step what could still begin a secret. So the hub has scanned the
+                // stream's whole text, in order: the text ends with this input, whose tail can no
+                // longer grow into a secret. A seq the hub dropped and never took keeps the stream
+                // from closing, wherever it lies. After the tail, the text went on; before it, the
+                // start of a secret may be gone, and the tail may hold its rest. The tail is then
+                // held for good, as it is after a step that lost the scan's hold.
+                let closing = total > 0
+                    && !st.scan_broken
+                    && st.closes_at.is_some_and(|end| {
+                        total == st.pending.len()
+                            && st.pending[total - 1].seq.checked_add(1) == Some(end)
+                            && st.took_every_seq_below(end)
+                    });
+                // An evicted stream releases nothing more (`finalized`). A hold with nothing
+                // after it is scanned again only for that last step, and only with the sweep,
+                // which settles it: every closing step then consumes its whole input, so the
+                // loop ends.
+                if st.finalized
+                    || (cand_count == 0 && !(closing && self.completed_match_sweep.is_some()))
+                {
                     None
                 } else {
-                    let total = hold_count + cand_count;
                     let mut input = String::new();
                     let mut frames: Vec<(u64, usize)> = Vec::with_capacity(total);
                     for f in st.pending[..total].iter() {
@@ -964,10 +1050,10 @@ impl LlmDeltaHub {
                         frames.push((f.seq, f.text.len()));
                     }
                     let span = (frames[0].0, frames[total - 1].0);
-                    Some((input, frames, span))
+                    Some((input, frames, span, closing))
                 }
             };
-            let Some((input, frames, span)) = snapshot else {
+            let Some((input, frames, span, closing)) = snapshot else {
                 break;
             };
             // Scan + hold geometry, outside every entry lock, serialized by the claim.
@@ -982,6 +1068,29 @@ impl LlmDeltaHub {
                             if hold >= DELTA_MAX_HOLD_BYTES {
                                 // Hold-cap overflow (pin xiii): closed with progress.
                                 Disposition::Blocked
+                            } else if hold > 0 && closing {
+                                // The stream's end: the held tail is released whole unless the
+                                // sweep finds a COMPLETED match (cap-llm's EOF rule, never
+                                // trusting the whole-string Clean). A hit or an `Err` blocks the
+                                // step's whole input: the tail, and the text before it in this
+                                // step, which a reader that read before the end has already.
+                                // (cap-llm, which releases its head as it goes, clears only its
+                                // hold.) Without a sweep the tail stays held.
+                                match &self.completed_match_sweep {
+                                    Some(sweep) => {
+                                        match sweep(input.as_bytes(), DELTA_MAX_CANONICAL_BYTES) {
+                                            Ok(false) => Disposition::Release {
+                                                ceiling: input.len(),
+                                                warned,
+                                            },
+                                            Ok(true) | Err(()) => Disposition::Blocked,
+                                        }
+                                    }
+                                    None => Disposition::Release {
+                                        ceiling: input.len() - hold,
+                                        warned,
+                                    },
+                                }
                             } else {
                                 Disposition::Release {
                                     ceiling: input.len() - hold,
@@ -1131,9 +1240,12 @@ impl LlmDeltaSink for LlmDeltaHub {
                 self.publish_begin(event.agent_id, event.stream_key, run_id)
             }
             LlmDeltaFrame::Delta { seq, text } => self.publish_delta(&event.stream_key, seq, text),
-            LlmDeltaFrame::Terminal { seq, reason, usage } => {
-                self.publish_terminal(&event.stream_key, seq, reason, usage)
-            }
+            LlmDeltaFrame::Terminal {
+                seq,
+                reason,
+                usage,
+                complete,
+            } => self.publish_terminal(&event.stream_key, seq, reason, usage, complete),
         }
     }
 
@@ -1182,10 +1294,22 @@ fn commit_step(
                 }
             }
             if release_count == 0 {
-                // Whole input became the live hold. THE VIABLE TAIL IS NEVER RELEASED —
+                // Whole input became the live hold. The viable tail is released only by the
+                // last step of a stream whose `Terminal` was complete, and only with the
+                // completed-match sweep attached (`run_scan_steps`); on any other stream
                 // terminal and post-terminal steps are ordinary steps.
                 st.hold_end_seq = Some(span.1);
                 return StepResult::HeldAll;
+            }
+            // Text judged across a skipped seq: a seq that fills the gap later changes the text
+            // this step judged, so the stream no longer closes. (A step that holds its whole
+            // input releases nothing, and the next one scans the filled gap with it.)
+            if frames[0].0 != st.floor
+                || frames
+                    .windows(2)
+                    .any(|w| w[0].0.checked_add(1) != Some(w[1].0))
+            {
+                st.scan_broken = true;
             }
             let kind = if warned {
                 ItemKind::Warned
@@ -1268,6 +1392,9 @@ fn commit_consume_all(
     }
     st.hold_end_seq = None;
     st.floor = span.1.saturating_add(1);
+    // The input went whole, with any start of a secret at its end: the text after it is
+    // scanned without that start, so the stream no longer closes.
+    st.scan_broken = true;
     st.evict_released_head_to_fit();
 }
 
@@ -1659,8 +1786,56 @@ mod tests {
                     output_tokens: 20,
                     cost_usd: cost,
                 }),
+                complete: false,
             },
         });
+    }
+
+    /// A `Terminal` whose producer claims completeness: nothing follows it.
+    fn terminal_complete(hub: &LlmDeltaHub, key: &str, seq: u64) {
+        hub.publish(LlmDeltaEvent {
+            agent_id: Arc::from("agent"),
+            stream_key: Arc::from(key),
+            frame: LlmDeltaFrame::Terminal {
+                seq,
+                reason: LlmTerminalReason::Completed,
+                usage: None,
+                complete: true,
+            },
+        });
+    }
+
+    /// A completed-match sweep that answers `verdict` and counts its calls.
+    fn counting_sweep(
+        verdict: Result<bool, ()>,
+    ) -> (
+        DeltaCompletedMatchSweep,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        (
+            Arc::new(move |_b: &[u8], _max: usize| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                verdict
+            }),
+            calls,
+        )
+    }
+
+    /// A clean detector over a hold from the last "AKIA", with `sweep` attached.
+    fn akia_hub_with_sweep(sweep: Option<DeltaCompletedMatchSweep>) -> Arc<LlmDeltaHub> {
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let hub = LlmDeltaHub::new(
+            Some(ScriptedDetector::clean()),
+            Some(hold_from_needle(b"AKIA")),
+            clock as Arc<dyn Clock>,
+            None,
+        );
+        Arc::new(match sweep {
+            Some(sweep) => hub.with_completed_match_sweep(sweep),
+            None => hub,
+        })
     }
 
     fn item_seqs(page: &LlmDeltaPage) -> Vec<u64> {
@@ -2199,7 +2374,7 @@ mod tests {
         let p = hub.read_page("s", 0);
         assert!(
             p.deltas.is_empty(),
-            "NO terminal release-all: the viable tail is never released"
+            "a terminal that is not complete releases nothing: the viable tail stays held"
         );
         assert!(
             p.terminal.is_some(),
@@ -2219,6 +2394,589 @@ mod tests {
             1,
             "one empty synthetic item for the contiguous run"
         );
+    }
+
+    // ── U-12-c a complete stream's end releases the tail it held (MODULE-020-T24-h, v0.1.59) ─
+    // Isolating mutations: no release at a complete terminal (the tail stays held); a release
+    // that skips the sweep; a release at a terminal that is not complete.
+    #[test]
+    fn u12c_a_complete_terminal_releases_the_held_tail_after_the_sweep() {
+        let (sweep, calls) = counting_sweep(Ok(false));
+        let hub = akia_hub_with_sweep(Some(sweep));
+        begin(&hub, "a", "s");
+        delta(&hub, "s", 0, "hello AKIA");
+        assert!(
+            hub.read_page("s", 0).deltas.is_empty(),
+            "held while more may follow"
+        );
+        terminal_complete(&hub, "s", 1);
+        let p = hub.read_page("s", 0);
+        assert_eq!(
+            joined_text(&p),
+            "hello AKIA",
+            "the stream ended: its tail is released"
+        );
+        assert_eq!(item_seqs(&p), vec![0]);
+        assert_eq!((p.rejected_count, p.dropped_count), (0, 0));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "swept once"
+        );
+        // A terminal that is not complete keeps the tail held (U-12), and is never swept.
+        let (sweep, calls) = counting_sweep(Ok(false));
+        let hub = akia_hub_with_sweep(Some(sweep));
+        begin(&hub, "a", "s");
+        delta(&hub, "s", 0, "hello AKIA");
+        terminal(&hub, "s", 1);
+        assert!(hub.read_page("s", 0).deltas.is_empty());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    // Isolating mutation: trusting the whole-string Clean at a complete end (no sweep, or a
+    // sweep hit or error that still releases).
+    #[test]
+    fn u12c_a_sweep_hit_or_error_at_a_complete_end_fails_closed() {
+        for verdict in [Ok(true), Err(())] {
+            // Read before the end: the head is released by an ordinary step, and the closing
+            // step over the held tail alone blocks it.
+            let (sweep, calls) = counting_sweep(verdict);
+            let hub = akia_hub_with_sweep(Some(sweep));
+            begin(&hub, "a", "s");
+            delta(&hub, "s", 0, "hello ");
+            delta(&hub, "s", 1, "AKIA");
+            assert_eq!(joined_text(&hub.read_page("s", 0)), "hello ");
+            terminal_complete(&hub, "s", 2);
+            let p = hub.read_page("s", 0);
+            assert_eq!(
+                joined_text(&p),
+                "hello ",
+                "{verdict:?}: the tail is never released"
+            );
+            assert_eq!(
+                p.rejected_count, 1,
+                "{verdict:?}: the held seq is blocked, counted"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            // Read only after the end: the closing step's whole input fails closed.
+            let (sweep, _) = counting_sweep(verdict);
+            let hub = akia_hub_with_sweep(Some(sweep));
+            begin(&hub, "a", "s");
+            delta(&hub, "s", 0, "hello ");
+            delta(&hub, "s", 1, "AKIA");
+            terminal_complete(&hub, "s", 2);
+            let p = hub.read_page("s", 0);
+            assert_eq!(
+                joined_text(&p),
+                "",
+                "{verdict:?}: nothing of the input is released"
+            );
+            assert_eq!(p.rejected_count, 2, "{verdict:?}");
+        }
+    }
+
+    // Isolating mutation: a closing step that stops before the last of a stream larger than one
+    // scan step (64 KiB), or that runs before the step reaching the last frame.
+    #[test]
+    fn u12c_a_complete_end_releases_the_tail_of_a_stream_past_one_step() {
+        let (sweep, calls) = counting_sweep(Ok(false));
+        let hub = akia_hub_with_sweep(Some(sweep));
+        begin(&hub, "a", "s");
+        let chunk = "y".repeat(30 * 1024);
+        for seq in 0..5 {
+            delta(&hub, "s", seq, &chunk);
+        }
+        delta(&hub, "s", 5, "end AKIA");
+        terminal_complete(&hub, "s", 6);
+        let mut text = String::new();
+        let mut from = 0;
+        loop {
+            let p = hub.read_page("s", from);
+            for item in &p.deltas {
+                text.push_str(&item.text);
+                from = item.to_seq + 1;
+            }
+            if !p.page_limit_reached {
+                break;
+            }
+        }
+        assert_eq!(text.len(), 5 * 30 * 1024 + "end AKIA".len());
+        assert!(text.ends_with("end AKIA"));
+        assert_eq!(from, 6, "every seq read, to the terminal's");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "swept at the end only"
+        );
+    }
+
+    // Isolating mutation: releasing at a complete end before the hub took every seq below it
+    // (a late seq could still join the tail).
+    #[test]
+    fn u12c_a_complete_end_waits_for_every_seq_below_it() {
+        let (sweep, _) = counting_sweep(Ok(false));
+        let hub = akia_hub_with_sweep(Some(sweep));
+        begin(&hub, "a", "s");
+        delta(&hub, "s", 1, "AKIA");
+        terminal_complete(&hub, "s", 2);
+        assert!(
+            hub.read_page("s", 0).deltas.is_empty(),
+            "seq 0 not yet published: still held"
+        );
+        delta(&hub, "s", 0, "hello ");
+        let p = hub.read_page("s", 0);
+        assert_eq!(joined_text(&p), "hello AKIA");
+        assert_eq!(item_seqs(&p), vec![0, 1]);
+    }
+
+    /// Reads `key` page by page from `*from`, adding the text to `text`; the last page.
+    fn read_on(hub: &LlmDeltaHub, key: &str, from: &mut u64, text: &mut String) -> LlmDeltaPage {
+        loop {
+            let p = hub.read_page(key, *from);
+            for item in &p.deltas {
+                text.push_str(&item.text);
+                *from = item.to_seq + 1;
+            }
+            if !p.page_limit_reached {
+                return p;
+            }
+        }
+    }
+
+    // Isolating mutation: counting a seq the hub dropped toward the end (published OR
+    // dropped). The hub dropped the start of a key (the pending window was full); the seq
+    // after it holds the key's rest and ends in a held start. Releasing that tail at the end
+    // would release the key's rest, which no step can scan whole.
+    #[test]
+    fn u12c_a_seq_dropped_before_the_held_tail_keeps_it_held() {
+        let (sweep, calls) = counting_sweep(Ok(false));
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let hub = Arc::new(
+            LlmDeltaHub::new(
+                Some(ScriptedDetector::blocking_on("AKIAIOSFODNN7EXAMPLE")),
+                Some(hold_from_needle(b"AKIA")),
+                clock as Arc<dyn Clock>,
+                None,
+            )
+            .with_completed_match_sweep(sweep),
+        );
+        begin(&hub, "a", "s");
+        let chunk = "y".repeat(30 * 1024);
+        for seq in 0..8 {
+            delta(&hub, "s", seq, &chunk);
+        }
+        let start = format!("{} my key AKIAIOSFOD", "z".repeat(16 * 1024));
+        delta(&hub, "s", 8, &start); // the pending window is full: dropped and counted
+        delta(&hub, "s", 9, "NN7EXAMPLE then AKIA");
+        terminal_complete(&hub, "s", 10);
+        let (mut from, mut text) = (0, String::new());
+        let p = read_on(&hub, "s", &mut from, &mut text);
+        assert_eq!(text, chunk.repeat(8), "the tail is held");
+        assert_eq!((from, p.dropped_count), (8, 1));
+        assert!(p.terminal.is_some());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "never swept"
+        );
+        // The dropped seq sent again lies below the floor now: dropped again, the tail held.
+        delta(&hub, "s", 8, &start);
+        let p = read_on(&hub, "s", &mut from, &mut text);
+        assert!(!text.contains("NN7EXAMPLE"), "no part of the key");
+        assert_eq!((from, p.dropped_count), (8, 1));
+    }
+
+    // Isolating mutation: refusing a seq the hub dropped once even after it took it. Sent again
+    // before any step released text past it (the one step since held its whole input), the
+    // seq joins the stream's text in order, and the stream is whole.
+    #[test]
+    fn u12c_a_dropped_seq_taken_when_sent_again_counts_toward_the_end() {
+        let (sweep, calls) = counting_sweep(Ok(false));
+        let hub = akia_hub_with_sweep(Some(sweep));
+        begin(&hub, "a", "s");
+        let chunk = "y".repeat(30 * 1024);
+        for seq in 0..8 {
+            delta(&hub, "s", seq, &chunk);
+        }
+        let middle = "w".repeat(16 * 1024 + 1);
+        delta(&hub, "s", 8, &middle); // the pending window is full: dropped and counted
+        let tail = format!("{} end AKIA", "z".repeat(10 * 1024));
+        delta(&hub, "s", 9, &tail);
+        terminal_complete(&hub, "s", 10);
+        let (mut from, mut text) = (0, String::new());
+        read_on(&hub, "s", &mut from, &mut text);
+        assert_eq!(
+            (text.len(), from),
+            (8 * 30 * 1024, 8),
+            "seq 8 missing: the tail is held"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        delta(&hub, "s", 8, &middle);
+        read_on(&hub, "s", &mut from, &mut text);
+        assert_eq!(text, format!("{}{middle}{tail}", chunk.repeat(8)));
+        assert_eq!(from, 10, "every seq read, to the terminal's");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "swept once, at the end"
+        );
+    }
+
+    // Guarded twice: the closing step's last frame is not the stream's last seq, and the hub
+    // never took that seq (either guard alone keeps this tail held). The text after the held
+    // tail was dropped (the pending window was full): releasing the tail would release a
+    // secret's start, and the dropped seq sent again would then be released alone.
+    #[test]
+    fn u12c_a_seq_dropped_after_the_held_tail_keeps_it_held() {
+        let (sweep, calls) = counting_sweep(Ok(false));
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let hub = Arc::new(
+            LlmDeltaHub::new(
+                Some(ScriptedDetector::blocking_on("AKIAIOSFODNN7EXAMPLE")),
+                Some(hold_from_needle(b"AKIA")),
+                clock as Arc<dyn Clock>,
+                None,
+            )
+            .with_completed_match_sweep(sweep),
+        );
+        begin(&hub, "a", "s");
+        let chunk = "y".repeat(30 * 1024);
+        for seq in 0..8 {
+            delta(&hub, "s", seq, &chunk);
+        }
+        delta(&hub, "s", 8, "my key is AKIAIOSFOD");
+        let rest = format!("NN7EXAMPLE {}", "z".repeat(20 * 1024));
+        delta(&hub, "s", 9, &rest); // the pending window is full: dropped and counted
+        terminal_complete(&hub, "s", 10);
+        let read_all = |from: &mut u64, text: &mut String, rejected: &mut u32| loop {
+            let p = hub.read_page("s", *from);
+            *rejected += p.rejected_count;
+            for item in &p.deltas {
+                text.push_str(&item.text);
+                *from = item.to_seq + 1;
+            }
+            if !p.page_limit_reached {
+                break p;
+            }
+        };
+        let (mut from, mut text, mut rejected) = (0, String::new(), 0);
+        let p = read_all(&mut from, &mut text, &mut rejected);
+        assert_eq!(text.len(), 8 * 30 * 1024, "the tail is held");
+        assert!(!text.contains("AKIA"));
+        assert_eq!(from, 8);
+        assert!(p.terminal.is_some());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "never swept"
+        );
+        // The dropped seq sent again joins the held tail, and the joined scan blocks the key.
+        delta(&hub, "s", 9, &rest);
+        read_all(&mut from, &mut text, &mut rejected);
+        assert!(
+            !text.contains("AKIA") && !text.contains("NN7EXAMPLE"),
+            "no part of the key"
+        );
+        assert_eq!(rejected, 2);
+    }
+
+    // Isolating mutation: counting a seq the hub dropped toward the end, here one inside the
+    // input (the dropped text would join the held tail to what follows it).
+    #[test]
+    fn u12c_a_seq_dropped_inside_the_input_keeps_the_tail_held() {
+        let (sweep, calls) = counting_sweep(Ok(false));
+        let hub = akia_hub_with_sweep(Some(sweep));
+        begin(&hub, "a", "s");
+        delta(&hub, "s", 0, "hello AKIAIO");
+        delta(&hub, "s", 1, &"q".repeat(DELTA_WINDOW_BYTES + 1)); // past the window: dropped
+        delta(&hub, "s", 2, "SFOD");
+        terminal_complete(&hub, "s", 3);
+        let p = hub.read_page("s", 0);
+        assert!(
+            p.deltas.is_empty(),
+            "held: the text went on in the dropped seq"
+        );
+        assert_eq!(p.dropped_count, 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    // Isolating mutations: closing a stream after a step that consumed its whole input, or not
+    // marking that step. The blocked step took a second key's start along with the first key;
+    // the next frame holds the second key's rest and ends in a held start. Releasing it at the
+    // end would release the key's rest. (A redaction's collapse consumes its input the same
+    // way.)
+    #[test]
+    fn u12c_a_step_that_consumed_its_input_keeps_the_next_tail_held() {
+        let (sweep, calls) = counting_sweep(Ok(false));
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let hub = Arc::new(
+            LlmDeltaHub::new(
+                Some(ScriptedDetector::blocking_on("AKIAIOSFODNN7EXAMPLE")),
+                Some(hold_from_needle(b"AKIA")),
+                clock as Arc<dyn Clock>,
+                None,
+            )
+            .with_completed_match_sweep(sweep),
+        );
+        begin(&hub, "a", "s");
+        delta(&hub, "s", 0, "first AKIAIOSFODNN7EXAMPLE second AKIAIOSFOD");
+        let p = hub.read_page("s", 0);
+        assert_eq!(joined_text(&p), "", "the first key is blocked");
+        assert_eq!(p.rejected_count, 1);
+        delta(&hub, "s", 1, "NN7EXAMPLE then AKIA");
+        terminal_complete(&hub, "s", 2);
+        let p = hub.read_page("s", 0);
+        assert_eq!(item_seqs(&p), vec![0], "the tail is held");
+        assert!(!joined_text(&p).contains("NN7EXAMPLE"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "never swept"
+        );
+    }
+
+    // Isolating mutations: closing a stream after a step that released text from an input that
+    // skipped a seq, or not marking that step. The step scanned seqs 0, 1 and 3, released seq 0
+    // and held the rest. Seq 2, sent after it, fills the gap inside the held tail and completes
+    // a key that starts in the released seq 0 (the needle stands for a key whose middle reads
+    // as a held start). No scan sees that key whole, so releasing the tail at the end would
+    // complete it for a reader.
+    #[test]
+    fn u12c_a_gap_a_step_released_across_keeps_the_tail_held() {
+        let (sweep, calls) = counting_sweep(Ok(false));
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let hub = Arc::new(
+            LlmDeltaHub::new(
+                Some(ScriptedDetector::blocking_on("ghp_XYZAKIA77")),
+                Some(hold_from_needle(b"AKIA")),
+                clock as Arc<dyn Clock>,
+                None,
+            )
+            .with_completed_match_sweep(sweep),
+        );
+        begin(&hub, "a", "s");
+        delta(&hub, "s", 0, "see ghp_XYZ");
+        delta(&hub, "s", 1, "AKIA");
+        delta(&hub, "s", 3, " end");
+        assert_eq!(joined_text(&hub.read_page("s", 0)), "see ghp_XYZ");
+        delta(&hub, "s", 2, "77");
+        terminal_complete(&hub, "s", 4);
+        let p = hub.read_page("s", 0);
+        assert_eq!(joined_text(&p), "see ghp_XYZ", "the tail is held");
+        assert_eq!((p.dropped_count, p.rejected_count), (0, 0));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "never swept"
+        );
+    }
+
+    // Isolating mutation: not marking a step whose input a redaction collapsed (the mark on the
+    // blocked step alone). The replacement keeps a second key's start; the next frame holds the
+    // key's rest and ends in a held start. Releasing it at the end would complete the key for a
+    // reader. (A hold over its cap, a hold split's `Err` and `scan_overflow` block the step, as
+    // the detector does in the test above.)
+    #[test]
+    fn u12c_a_step_whose_input_a_redaction_collapsed_keeps_the_next_tail_held() {
+        let (sweep, calls) = counting_sweep(Ok(false));
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let hub = Arc::new(
+            LlmDeltaHub::new(
+                Some(ScriptedDetector::scripted(vec![ScanResult::Redacted {
+                    redacted: "x [REDACTED] second AKIAIOSFOD".to_string(),
+                    findings: vec![finding("bearer")],
+                }])),
+                Some(hold_from_needle(b"AKIA")),
+                clock as Arc<dyn Clock>,
+                None,
+            )
+            .with_completed_match_sweep(sweep),
+        );
+        begin(&hub, "a", "s");
+        delta(
+            &hub,
+            "s",
+            0,
+            "x Bearer eyJhbGciOiJIUzI1NiJ9 second AKIAIOSFOD",
+        );
+        let p = hub.read_page("s", 0);
+        assert_eq!(joined_text(&p), "x [REDACTED] second AKIAIOSFOD");
+        assert_eq!(p.redacted_count, 1);
+        delta(&hub, "s", 1, "NN7EXAMPLE then AKIA");
+        terminal_complete(&hub, "s", 2);
+        let p = hub.read_page("s", 0);
+        assert_eq!(item_seqs(&p), vec![0], "the tail is held");
+        assert!(!joined_text(&p).contains("NN7EXAMPLE"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "never swept"
+        );
+    }
+
+    // Isolating mutations: scanning a stream after its eviction, or only keeping it from
+    // closing. Eviction drops the text the hub had not released, the held tail with it, while a
+    // reader or a publisher that took the entry just before its removal may still reach it (the
+    // test calls the eviction on an entry it leaves in the map, so its own publish and read reach
+    // the entry as theirs would). The text that comes after the dropped tail holds the rest of a
+    // key whose start was in the tail. At a complete end the closing step would release such
+    // text that ends in a held start; on a stream whose `Terminal` is not complete an ordinary
+    // step would release such text that ends in none.
+    #[test]
+    fn u12c_an_evicted_stream_releases_nothing_more() {
+        let (sweep, calls) = counting_sweep(Ok(false));
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let hub = Arc::new(
+            LlmDeltaHub::new(
+                Some(ScriptedDetector::blocking_on("AKIAIOSFODNN7EXAMPLE")),
+                Some(hold_from_needle(b"AKIA")),
+                clock as Arc<dyn Clock>,
+                None,
+            )
+            .with_completed_match_sweep(sweep),
+        );
+        let evict = |key: &str| {
+            let entry = hub.registry().map.get(key).cloned().expect("admitted");
+            hub.finalize_evicted_entry(&entry);
+        };
+        // A complete stream: seq 1 holds the key's start, and seq 2, below the end, comes late.
+        begin(&hub, "a", "c");
+        delta(&hub, "c", 0, "ok ");
+        delta(&hub, "c", 1, "AKIAIOSFOD");
+        assert_eq!(joined_text(&hub.read_page("c", 0)), "ok ");
+        terminal_complete(&hub, "c", 3);
+        evict("c");
+        delta(&hub, "c", 2, "NN7EXAMPLE then AKIA");
+        let p = hub.read_page("c", 0);
+        assert_eq!(item_seqs(&p), vec![0], "nothing after the eviction");
+        assert!(!joined_text(&p).contains("NN7EXAMPLE"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "never swept"
+        );
+        // A stream whose `Terminal` is not complete: a live call may publish after it.
+        begin(&hub, "a", "l");
+        delta(&hub, "l", 0, "ok ");
+        delta(&hub, "l", 1, "AKIAIOSFOD");
+        assert_eq!(joined_text(&hub.read_page("l", 0)), "ok ");
+        terminal(&hub, "l", 2);
+        evict("l");
+        delta(&hub, "l", 2, "NN7EXAMPLE then");
+        let p = hub.read_page("l", 0);
+        assert_eq!(item_seqs(&p), vec![0], "nothing after the eviction");
+        assert!(!joined_text(&p).contains("NN7EXAMPLE"));
+    }
+
+    // Isolating mutation: a closing step that does not run to the last pending frame. A
+    // producer that breaks its claim (a delta at its end, sent before its `Terminal`) would
+    // otherwise have the first step, cut by the 64 KiB step bound inside a key, released whole
+    // and the key's rest released alone after it.
+    #[test]
+    fn u12c_a_closing_step_runs_to_the_last_pending_frame() {
+        let (sweep, _) = counting_sweep(Ok(false));
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let hub = Arc::new(
+            LlmDeltaHub::new(
+                Some(ScriptedDetector::blocking_on("AKIAIOSFODNN7EXAMPLE")),
+                Some(hold_from_needle(b"AKIA")),
+                clock as Arc<dyn Clock>,
+                None,
+            )
+            .with_completed_match_sweep(sweep),
+        );
+        begin(&hub, "a", "s");
+        delta(&hub, "s", 0, &format!("{} AKIA", "y".repeat(60 * 1024)));
+        delta(
+            &hub,
+            "s",
+            1,
+            &format!("IOSFODNN7EXAMPLE {}", "z".repeat(10 * 1024)),
+        );
+        terminal_complete(&hub, "s", 1);
+        let p = hub.read_page("s", 0);
+        assert_eq!(joined_text(&p), "", "the joined scan blocks the key");
+        assert_eq!(p.rejected_count, 2);
+    }
+
+    // Isolating mutation: a closing step whose last frame need not be the stream's last seq.
+    // A producer that breaks its claim (a delta at its end, sent before its `Terminal`) would
+    // otherwise have the start of a key released at the end, its rest (past the end) dropped.
+    #[test]
+    fn u12c_a_closing_step_ends_at_the_streams_last_seq() {
+        let (sweep, calls) = counting_sweep(Ok(false));
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let hub = Arc::new(
+            LlmDeltaHub::new(
+                Some(ScriptedDetector::blocking_on("AKIAIOSFODNN7EXAMPLE")),
+                Some(hold_from_needle(b"AKIA")),
+                clock as Arc<dyn Clock>,
+                None,
+            )
+            .with_completed_match_sweep(sweep),
+        );
+        begin(&hub, "a", "s");
+        delta(&hub, "s", 0, "my key ");
+        delta(&hub, "s", 1, "AKIAIOSFOD");
+        terminal_complete(&hub, "s", 1);
+        delta(&hub, "s", 2, "NN7EXAMPLE"); // past the end: dropped and counted
+        let p = hub.read_page("s", 0);
+        assert_eq!(joined_text(&p), "my key ", "the tail is held");
+        assert_eq!(p.dropped_count, 1);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "never swept"
+        );
+    }
+
+    // Isolating mutation: a delta past a complete stream's end accepted (and released, or
+    // joined to the released tail).
+    #[test]
+    fn u12c_a_delta_past_a_complete_end_is_dropped_and_counted() {
+        let (sweep, _) = counting_sweep(Ok(false));
+        let hub = akia_hub_with_sweep(Some(sweep));
+        begin(&hub, "a", "s");
+        delta(&hub, "s", 0, "hello AKIA");
+        terminal_complete(&hub, "s", 1);
+        assert_eq!(joined_text(&hub.read_page("s", 0)), "hello AKIA");
+        delta(&hub, "s", 1, "1234SECRET rest");
+        delta(&hub, "s", 9, "later");
+        let p = hub.read_page("s", 0);
+        assert_eq!(
+            joined_text(&p),
+            "hello AKIA",
+            "nothing past the end is released"
+        );
+        assert_eq!(p.dropped_count, 2, "both counted");
+    }
+
+    // Isolating mutation: a hub without the sweep releasing at a complete end.
+    #[test]
+    fn u12c_without_the_sweep_a_complete_end_keeps_the_tail_held() {
+        let hub = akia_hub_with_sweep(None);
+        begin(&hub, "a", "s");
+        delta(&hub, "s", 0, "hello AKIA");
+        terminal_complete(&hub, "s", 1);
+        let p = hub.read_page("s", 0);
+        assert!(
+            p.deltas.is_empty(),
+            "fail closed: never released without the sweep"
+        );
+        assert_eq!((p.rejected_count, p.dropped_count), (0, 0));
+    }
+
+    // Isolating mutation: sweeping (or releasing whole) where nothing is held.
+    #[test]
+    fn u12c_a_complete_end_with_no_held_tail_is_not_swept() {
+        let (sweep, calls) = counting_sweep(Ok(true));
+        let hub = akia_hub_with_sweep(Some(sweep));
+        begin(&hub, "a", "s");
+        delta(&hub, "s", 0, "plain text.");
+        terminal_complete(&hub, "s", 1);
+        let p = hub.read_page("s", 0);
+        assert_eq!(joined_text(&p), "plain text.");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     // ── U-13 `scan_overflow` fail-closed (synthetic Blocked from a hot-lowered cap) ─

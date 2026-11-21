@@ -3290,12 +3290,25 @@ pub(crate) async fn wire_capabilities_inner(
                 Arc::new(|event| {
                     let _ = event; // observer: production would wire tracing here
                 });
-            Arc::new(advance_client_api::deltas::LlmDeltaHub::new(
-                Some(det),
-                Some(hold),
-                clock,
-                Some(observer),
-            ))
+            // The wire layer's EOF rule, for the end of a stream whose `Terminal` is complete
+            // (MODULE-020-T24-h): the tail held back as a possible secret's start is released
+            // unless the region holds a completed match.
+            let sweep: advance_client_api::DeltaCompletedMatchSweep =
+                Arc::new(|buf: &[u8], max_canonical: usize| {
+                    cap_http::canonical_facade::decoded_region_has_completed_match(
+                        buf,
+                        max_canonical,
+                    )
+                });
+            Arc::new(
+                advance_client_api::deltas::LlmDeltaHub::new(
+                    Some(det),
+                    Some(hold),
+                    clock,
+                    Some(observer),
+                )
+                .with_completed_match_sweep(sweep),
+            )
         };
         llm_delta_hub_opt = Some(Arc::clone(&llm_delta_hub));
         #[cfg(feature = "test-support")]

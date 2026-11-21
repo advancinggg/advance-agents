@@ -64,10 +64,11 @@ const CALL_SEPARATOR: &str = "\n\n";
 
 /// The most text one delta of a stream of a message's own carries: its reply goes in pieces
 /// of at most this, so the hub keeps what fits its window and counts the rest dropped, as it
-/// does for a model call's deltas, instead of dropping a large reply whole. The hub never
-/// releases a tail that could begin a secret, and it holds whole deltas (MODULE-020-T24-h),
-/// so a reply that ends so loses the pieces that hold that tail: its last, or more when the
-/// tail spans pieces.
+/// does for a model call's deltas, instead of dropping a large reply whole. The hub holds back
+/// a tail that could begin a secret, in whole deltas, until the stream ends (MODULE-020-T24-h);
+/// this stream's `Terminal` is complete, so when the hub took every piece and blocked or
+/// redacted none, its end-of-stream sweep then releases that tail unless it completes a
+/// secret. A reply past the window keeps it held: the hub dropped a piece.
 const OWN_STREAM_DELTA_BYTES: usize = 16 * 1024;
 
 /// `text` in pieces of at most `max` bytes (at least one char each), cut at char boundaries.
@@ -103,6 +104,9 @@ struct MergedCall {
     seen_text: bool,
     /// The call's own `Terminal`, once published: its reason and settled usage.
     terminal: Option<(LlmTerminalReason, Option<LlmDeltaUsage>)>,
+    /// That `Terminal` was complete: the call published its text whole (a buffered
+    /// `generate` call whose text went out uncut).
+    whole: bool,
 }
 
 /// The stream of one Client API message: every model call of the turn that executes it, on
@@ -126,6 +130,8 @@ struct MessageStream {
     latest: Option<Arc<str>>,
     /// The stream shows text already.
     has_text: bool,
+    /// The registry dropped text of a call: a delta that landed at or past its limit.
+    lost_text: bool,
 }
 
 impl MessageStream {
@@ -139,6 +145,7 @@ impl MessageStream {
             calls: HashMap::new(),
             latest: None,
             has_text: false,
+            lost_text: false,
         }
     }
 
@@ -177,6 +184,22 @@ impl MessageStream {
             }
             None => (LlmTerminalReason::Reaped, None),
         };
+        // Complete when the stream's text is whole: every call that put text on it ended with
+        // a complete terminal of its own (a buffered `generate` call whose text went out
+        // uncut), and the registry dropped none of it. Every delta forwarded has a seq below
+        // `next_seq`, and the stream's calls are retired with it, so nothing more is forwarded
+        // to its key. (The one exception: the stream shares its first call's key, and a frame
+        // of that call that comes once `MAX_RETIRED_CALL_KEYS` later keys have pushed it out
+        // of the retired set reaches the hub as it came. The hub drops such a delta at or past
+        // this seq, and ignores it on a seq it took. On a seq it dropped, the hub may take it,
+        // and then scans it in order with the text around it.) A live `stream` call
+        // never ends complete, nor does a call still open: a stream that either of them put
+        // text on ends as before, its held tail kept back.
+        let complete = !self.lost_text
+            && self
+                .calls
+                .values()
+                .all(|call| !call.seen_text || call.whole);
         Some(LlmDeltaEvent {
             agent_id,
             stream_key: key,
@@ -184,6 +207,7 @@ impl MessageStream {
                 seq: self.next_seq,
                 reason,
                 usage,
+                complete,
             },
         })
     }
@@ -216,10 +240,12 @@ impl MessageStream {
             }));
             seq += 1;
         }
+        // Complete: the stream's frames are published together, and nothing follows.
         frames.push(event(LlmDeltaFrame::Terminal {
             seq,
             reason,
             usage: None,
+            complete: true,
         }));
         frames
     }
@@ -310,6 +336,7 @@ impl MessageStreams {
                         limit: None,
                         seen_text: false,
                         terminal: None,
+                        whole: false,
                     },
                 );
                 stream.latest = Some(Arc::clone(&event.stream_key));
@@ -341,6 +368,10 @@ impl MessageStreams {
                 };
                 let at = call.base.saturating_add(*seq);
                 if call.limit.is_some_and(|limit| at >= limit) {
+                    // The call's text is cut: the stream does not end complete.
+                    if !text.is_empty() {
+                        stream.lost_text = true;
+                    }
                     return Routed::Nothing;
                 }
                 let text = if !text.is_empty() && !call.seen_text {
@@ -358,9 +389,14 @@ impl MessageStreams {
                 // in the pages' `dropped_count`, which tells a later reader its text is not
                 // whole. Its leak scan blocks text it will not release, one that holds a
                 // secret or a hold or scan past its bounds (`rejected_count`), redacts some
-                // (`redacted_count`), and never releases a tail that could begin a secret
-                // (MODULE-020-T24-h). Apart from these, the registry's own drop above and the
-                // call limit, a reader that keeps up with the stream reads all of its text.
+                // (`redacted_count`), and holds back a tail that could begin a secret until the
+                // stream's `Terminal` has come, complete, and the hub has taken every seq before
+                // it: its end-of-stream sweep then releases that tail unless it completes a
+                // secret (MODULE-020-T24-h). A stream whose text the hub or the registry dropped,
+                // whose text the hub blocked or redacted before that tail, or that a live call put
+                // text on, keeps that tail held. Apart from these, the
+                // registry's own drop above and the call limit, a reader that keeps up with the
+                // stream reads all of its text.
                 if !text.trim().is_empty() {
                     stream.has_text = true;
                 }
@@ -371,7 +407,12 @@ impl MessageStreams {
                     frame: LlmDeltaFrame::Delta { seq: at, text },
                 })
             }
-            LlmDeltaFrame::Terminal { reason, usage, .. } => {
+            LlmDeltaFrame::Terminal {
+                reason,
+                usage,
+                complete,
+                ..
+            } => {
                 let Some(call) = self
                     .slot_of_call
                     .get(&event.stream_key)
@@ -382,6 +423,7 @@ impl MessageStreams {
                 };
                 if call.terminal.is_none() {
                     call.terminal = Some((*reason, *usage));
+                    call.whole = *complete;
                 }
                 Routed::Nothing
             }
@@ -1480,8 +1522,39 @@ mod tests {
         }
     }
 
+    /// A model call's own terminal, as a live stream publishes it (not complete).
     fn end(seq: u64, reason: LlmTerminalReason, usage: Option<LlmDeltaUsage>) -> LlmDeltaFrame {
-        LlmDeltaFrame::Terminal { seq, reason, usage }
+        LlmDeltaFrame::Terminal {
+            seq,
+            reason,
+            usage,
+            complete: false,
+        }
+    }
+
+    /// A model call's own terminal, as a buffered `generate` call's tee publishes it once
+    /// its text went out whole: complete.
+    fn generated(
+        seq: u64,
+        reason: LlmTerminalReason,
+        usage: Option<LlmDeltaUsage>,
+    ) -> LlmDeltaFrame {
+        LlmDeltaFrame::Terminal {
+            seq,
+            reason,
+            usage,
+            complete: true,
+        }
+    }
+
+    /// The terminal the registry ends a message's stream with: complete.
+    fn closing(seq: u64, reason: LlmTerminalReason, usage: Option<LlmDeltaUsage>) -> LlmDeltaFrame {
+        LlmDeltaFrame::Terminal {
+            seq,
+            reason,
+            usage,
+            complete: true,
+        }
     }
 
     fn usage(input_tokens: u64, output_tokens: u64, cost_usd: f64) -> Option<LlmDeltaUsage> {
@@ -1510,14 +1583,14 @@ mod tests {
         sink.publish(frame("st_first", delta(0, "I'll list the files.")));
         sink.publish(frame(
             "st_first",
-            end(1, LlmTerminalReason::Completed, usage(10, 2, 0.25)),
+            generated(1, LlmTerminalReason::Completed, usage(10, 2, 0.25)),
         ));
         // The call after the tool results: the answer.
         sink.publish(frame("st_second", begin()));
         sink.publish(frame("st_second", delta(0, "There are 3 files.")));
         sink.publish(frame(
             "st_second",
-            end(1, LlmTerminalReason::Completed, usage(20, 5, 0.5)),
+            generated(1, LlmTerminalReason::Completed, usage(20, 5, 0.5)),
         ));
         // Until the turn ends: one Begin, both calls' text on the message's key, set apart,
         // and no Terminal — a client reading the stream waits for the answer.
@@ -1534,7 +1607,7 @@ mod tests {
             hub.frames().last(),
             Some(&on(
                 "st_first",
-                end(2, LlmTerminalReason::Completed, usage(30, 7, 0.75))
+                closing(2, LlmTerminalReason::Completed, usage(30, 7, 0.75))
             )),
             "the stream ends with its turn, carrying both calls' usage"
         );
@@ -1557,13 +1630,13 @@ mod tests {
         sink.publish(frame("st_first", delta(0, "I'll check.")));
         sink.publish(frame(
             "st_first",
-            end(1, LlmTerminalReason::Completed, usage(1, 1, 0.5)),
+            generated(1, LlmTerminalReason::Completed, usage(1, 1, 0.5)),
         ));
         sink.publish(frame("st_second", begin()));
         sink.publish(frame("st_second", delta(0, "Done.")));
         sink.publish(frame(
             "st_second",
-            end(1, LlmTerminalReason::Completed, usage(2, 1, 0.25)),
+            generated(1, LlmTerminalReason::Completed, usage(2, 1, 0.25)),
         ));
         // An empty batch leaves the class to the turn's end: the stream stays open.
         reg.fulfill("root", None);
@@ -1574,7 +1647,7 @@ mod tests {
             hub.frames().last(),
             Some(&on(
                 "st_first",
-                end(2, LlmTerminalReason::Completed, usage(3, 2, 0.75))
+                closing(2, LlmTerminalReason::Completed, usage(3, 2, 0.75))
             ))
         );
         reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Completed);
@@ -1675,7 +1748,7 @@ mod tests {
         sink.publish(frame("st_b", delta(1, " More.")));
         sink.publish(frame(
             "st_b",
-            end(2, LlmTerminalReason::Completed, usage(1, 1, 0.5)),
+            generated(2, LlmTerminalReason::Completed, usage(1, 1, 0.5)),
         ));
         reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Completed);
         assert_eq!(
@@ -1686,7 +1759,7 @@ mod tests {
                 on("st_a", delta(1, "The answer.")),
                 on("st_a", delta(2, " More.")),
                 // A call that settled without usage leaves the sum out.
-                on("st_a", end(3, LlmTerminalReason::Completed, None)),
+                on("st_a", closing(3, LlmTerminalReason::Completed, None)),
             ]
         );
     }
@@ -1706,7 +1779,7 @@ mod tests {
         sink.publish(frame("st_second", delta(0, "answer one")));
         sink.publish(frame(
             "st_second",
-            end(1, LlmTerminalReason::Completed, None),
+            generated(1, LlmTerminalReason::Completed, None),
         ));
         assert!(
             reg.stream_key_for_message("cmsg-2").is_none(),
@@ -1729,7 +1802,7 @@ mod tests {
             hub.frames()[1..],
             [
                 on("st_first", delta(0, "answer one")),
-                on("st_first", end(1, LlmTerminalReason::Completed, None)),
+                on("st_first", closing(1, LlmTerminalReason::Completed, None)),
                 on("st_third", begin()),
                 on("st_third", delta(0, "answer two")),
             ]
@@ -1781,7 +1854,8 @@ mod tests {
         reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Failed);
         assert_eq!(
             hub.frames().last(),
-            Some(&on("st_first", end(1, LlmTerminalReason::Reaped, None)))
+            Some(&on("st_first", end(1, LlmTerminalReason::Reaped, None))),
+            "the open call's text may have gone on: the stream ends not complete"
         );
         // The last call's reason ends a stream whose calls all settled.
         let (reg, hub, sink) = routed();
@@ -1791,21 +1865,82 @@ mod tests {
         sink.publish(frame("st_a", delta(0, "I'll check.")));
         sink.publish(frame(
             "st_a",
-            end(1, LlmTerminalReason::Completed, usage(1, 1, 0.5)),
+            generated(1, LlmTerminalReason::Completed, usage(1, 1, 0.5)),
         ));
         sink.publish(frame("st_b", begin()));
         sink.publish(frame(
             "st_b",
-            end(0, LlmTerminalReason::ProviderError, usage(1, 0, 0.25)),
+            generated(0, LlmTerminalReason::ProviderError, usage(1, 0, 0.25)),
         ));
         reg.note_turn_end("agent:root", "cmsg-2", TurnOutcome::Failed);
         assert_eq!(
             hub.frames().last(),
             Some(&on(
                 "st_a",
-                end(1, LlmTerminalReason::ProviderError, usage(2, 1, 0.75))
+                closing(1, LlmTerminalReason::ProviderError, usage(2, 1, 0.75))
             ))
         );
+    }
+
+    /// The registry's `Terminal` is complete only when the stream's text is whole: every call
+    /// that put text on it ended complete (a buffered `generate` call whose text went out
+    /// uncut), and the registry dropped none of it. A call that put no text on it does not
+    /// count.
+    #[test]
+    fn a_message_stream_ends_complete_only_when_its_text_is_whole() {
+        let run = |frames: &[LlmDeltaEvent]| {
+            let (reg, hub, sink) = routed();
+            reg.note_pending_message("agent:root", "cmsg-1");
+            reg.note_turn_start("agent:root", "cmsg-1");
+            for event in frames {
+                sink.publish(event.clone());
+            }
+            reg.note_turn_end("agent:root", "cmsg-1", TurnOutcome::Completed);
+            match hub.frames().last() {
+                Some((_, LlmDeltaFrame::Terminal { complete, .. })) => *complete,
+                other => panic!("no terminal: {other:?}"),
+            }
+        };
+        // Buffered calls, and a live call that put no text on the stream: complete.
+        assert!(run(&[
+            frame("st_a", begin()),
+            frame("st_a", delta(0, "I'll check.")),
+            frame("st_a", generated(1, LlmTerminalReason::Completed, None)),
+            frame("st_b", begin()),
+            frame("st_b", end(0, LlmTerminalReason::Completed, None)),
+            frame("st_c", begin()),
+            frame("st_c", delta(0, "Done.")),
+            frame("st_c", generated(1, LlmTerminalReason::Completed, None)),
+        ]));
+        // A live call's text: its terminal claims nothing, so neither does the stream's.
+        assert!(!run(&[
+            frame("st_a", begin()),
+            frame("st_a", delta(0, "I'll check.")),
+            frame("st_a", generated(1, LlmTerminalReason::Completed, None)),
+            frame("st_b", begin()),
+            frame("st_b", delta(0, "Done.")),
+            frame("st_b", end(1, LlmTerminalReason::Completed, None)),
+        ]));
+        // The registry dropped text of the first call: a delta landing on the second's seqs.
+        assert!(!run(&[
+            frame("st_a", begin()),
+            frame("st_a", delta(0, "one ")),
+            frame("st_b", begin()),
+            frame("st_a", delta(1, "two")),
+            frame("st_a", generated(2, LlmTerminalReason::Completed, None)),
+            frame("st_b", delta(0, "Done.")),
+            frame("st_b", generated(1, LlmTerminalReason::Completed, None)),
+        ]));
+        // An empty delta dropped there loses no text.
+        assert!(run(&[
+            frame("st_a", begin()),
+            frame("st_a", delta(0, "one ")),
+            frame("st_b", begin()),
+            frame("st_a", delta(1, "")),
+            frame("st_a", generated(2, LlmTerminalReason::Completed, None)),
+            frame("st_b", delta(0, "Done.")),
+            frame("st_b", generated(1, LlmTerminalReason::Completed, None)),
+        ]));
     }
 
     #[test]
@@ -1823,7 +1958,10 @@ mod tests {
         reg.note_turn_start("agent:root", "cmsg-2");
         assert_eq!(
             hub.frames().last(),
-            Some(&on("st_first", end(0, LlmTerminalReason::Completed, None)))
+            Some(&on(
+                "st_first",
+                closing(0, LlmTerminalReason::Completed, None)
+            ))
         );
         sink.publish(frame("st_second", begin()));
         assert_eq!(
@@ -1862,7 +2000,7 @@ mod tests {
             [
                 begin(),
                 delta(0, "Nothing to look up."),
-                end(1, LlmTerminalReason::Completed, None),
+                closing(1, LlmTerminalReason::Completed, None),
             ]
         );
         // No reply: empty, ending with the turn.
@@ -1874,7 +2012,7 @@ mod tests {
         let quiet = own("cmsg-2");
         assert_eq!(
             frames_of(&quiet),
-            [begin(), end(0, LlmTerminalReason::Completed, None)]
+            [begin(), closing(0, LlmTerminalReason::Completed, None)]
         );
         // A failed turn: as its class says.
         for (message, model_failed, reason) in [
@@ -1888,7 +2026,10 @@ mod tests {
             }
             reg.note_turn_end("agent:root", message, TurnOutcome::Failed);
             assert!(reg.failure_class_for_message(message).is_some());
-            assert_eq!(frames_of(&own(message)), [begin(), end(0, reason, None)]);
+            assert_eq!(
+                frames_of(&own(message)),
+                [begin(), closing(0, reason, None)]
+            );
         }
         // A turn whose end was never reported: the next turn's start ends it.
         reg.note_pending_message("agent:root", "cmsg-5");
@@ -1896,7 +2037,7 @@ mod tests {
         reg.note_turn_start("agent:root", "other");
         assert_eq!(
             frames_of(&own("cmsg-5")),
-            [begin(), end(0, LlmTerminalReason::Reaped, None)]
+            [begin(), closing(0, LlmTerminalReason::Reaped, None)]
         );
         // A long reply goes in pieces, whole.
         let long = "word ".repeat(OWN_STREAM_DELTA_BYTES / 2);
@@ -1915,29 +2056,127 @@ mod tests {
             text.push_str(piece);
         }
         assert_eq!(text, long);
-        assert_eq!(frames[4], end(3, LlmTerminalReason::Completed, None));
+        assert_eq!(frames[4], closing(3, LlmTerminalReason::Completed, None));
     }
 
-    /// A stream of the message's own meets the real hub's rules as a model stream does: a reply
-    /// within the window reads whole; one past it keeps the window's pieces and names the rest
-    /// dropped; and the hub holds back a tail that could begin a secret (MODULE-020-T24-h; the
-    /// release's Known list), here the whole of a short reply ending in `s`. Each time the
-    /// terminal comes with the seq after the stream's last piece, so a reader can tell the
-    /// pieces it did not read.
-    #[test]
-    fn a_minted_stream_meets_the_real_hubs_window_and_hold() {
+    /// A hub wired as in production: the real detector, hold geometry and end-of-stream sweep.
+    fn production_hub() -> Arc<advance_client_api::deltas::LlmDeltaHub> {
         let hold: Arc<dyn Fn(&[u8], usize) -> Result<usize, ()> + Send + Sync> =
             Arc::new(|buf: &[u8], max_canonical: usize| {
                 cap_http::canonical_facade::decoded_hold_split(buf, max_canonical)
             });
+        let sweep: advance_client_api::DeltaCompletedMatchSweep =
+            Arc::new(|buf: &[u8], max_canonical: usize| {
+                cap_http::canonical_facade::decoded_region_has_completed_match(buf, max_canonical)
+            });
         let detector: Arc<dyn advance_shared_types::traits::LeakDetector> =
             Arc::new(cap_http::DefaultLeakDetector::new());
-        let hub = Arc::new(advance_client_api::deltas::LlmDeltaHub::new(
-            Some(detector),
-            Some(hold),
-            Arc::new(advance_client_api::SystemClock),
-            None,
-        ));
+        Arc::new(
+            advance_client_api::deltas::LlmDeltaHub::new(
+                Some(detector),
+                Some(hold),
+                Arc::new(advance_client_api::SystemClock),
+                None,
+            )
+            .with_completed_match_sweep(sweep),
+        )
+    }
+
+    /// The real hub keeps a stream's held tail at its complete end when a step before it lost
+    /// the scan's hold on the text (MODULE-020-T24-h). Each stream takes every seq below its
+    /// end:
+    /// - a step scanned seqs 0, 1 and 3, released the start of a `ghp_` token in seq 0 and held
+    ///   the rest; seq 2, sent after that step, fills the gap and completes the token, so
+    ///   releasing the tail would complete the token for a reader;
+    /// - a step blocked an AWS key and took the start of a second one with it; the next seq
+    ///   holds the second key's rest and ends in a held start, so releasing it would give a
+    ///   reader that rest.
+    #[test]
+    fn the_real_hub_keeps_the_tail_of_a_stream_whose_scan_lost_its_hold() {
+        let hub = production_hub();
+        let send = |key: &str, frame: LlmDeltaFrame| {
+            hub.publish(LlmDeltaEvent {
+                agent_id: Arc::from("agent:root"),
+                stream_key: Arc::from(key),
+                frame,
+            })
+        };
+        let begin = |key: &str| {
+            send(
+                key,
+                LlmDeltaFrame::Begin {
+                    run_id: Some(format!("run-{key}")),
+                    task_id: None,
+                },
+            )
+        };
+        let delta = |key: &str, seq: u64, text: &str| {
+            send(
+                key,
+                LlmDeltaFrame::Delta {
+                    seq,
+                    text: text.to_string(),
+                },
+            )
+        };
+        let end = |key: &str, seq: u64| {
+            send(
+                key,
+                LlmDeltaFrame::Terminal {
+                    seq,
+                    reason: LlmTerminalReason::Completed,
+                    usage: None,
+                    complete: true,
+                },
+            )
+        };
+        // The text read from seq 0, and the page's rejected count.
+        let read = |key: &str| {
+            let page = hub.read_page(key, 0);
+            assert!(!page.page_limit_reached);
+            let text: String = page.deltas.iter().map(|i| i.text.as_str()).collect();
+            (text, page.rejected_count)
+        };
+
+        begin("gap");
+        delta("gap", 0, "see ghp_Ab12");
+        delta("gap", 1, "Cd34Ef56Hj78Kl90Mn12Op34Qr56sk");
+        delta("gap", 3, "-proj-xyz");
+        assert_eq!(
+            read("gap"),
+            ("see ghp_Ab12".to_string(), 0),
+            "the step releases seq 0 and holds the rest"
+        );
+        delta("gap", 2, "Qr");
+        end("gap", 4);
+        assert_eq!(
+            read("gap"),
+            ("see ghp_Ab12".to_string(), 0),
+            "the tail is held"
+        );
+
+        begin("blocked");
+        delta("blocked", 0, "first AKIAQ3EGRJ5TXV7WN2LP second AKIAQ3EGRJ");
+        assert_eq!(
+            read("blocked"),
+            (String::new(), 1),
+            "the first key is blocked"
+        );
+        delta("blocked", 1, "5TXV7WN2LP then AKIA");
+        end("blocked", 2);
+        let (text, _) = read("blocked");
+        assert!(!text.contains("5TXV7WN2LP"), "the tail is held");
+    }
+
+    /// A stream of the message's own meets the real hub's rules as a model stream does: a reply
+    /// within the window reads whole; one past it keeps the window's pieces and names the rest
+    /// dropped. A short reply ending in `s`, a tail that could begin a secret, reads whole too:
+    /// its terminal is complete, so the hub, wired as in production, sweeps that tail at the
+    /// stream's end and releases it (MODULE-020-T24-h). Each time the terminal comes with the
+    /// seq after the stream's last piece, so a reader can tell the pieces it did not read.
+    #[test]
+    fn a_minted_stream_meets_the_real_hubs_window_and_hold() {
+        let hub = production_hub();
         let reg = Arc::new(ReplyRegistry::new());
         let _sink =
             StreamKeyAnnouncer::new(Arc::clone(&hub) as Arc<dyn LlmDeltaSink>, Arc::clone(&reg));
@@ -1987,9 +2226,43 @@ mod tests {
         let (text, dropped, read_to, terminal) = read("cmsg-3", "Done: 3 files");
         assert_eq!(
             (text.as_str(), dropped, read_to, terminal),
-            ("", 0, 0, Some(1)),
-            "the tail is held: the reader stops at seq 0, short of the terminal's 1"
+            ("Done: 3 files", 0, 1, Some(1)),
+            "the held tail is released at the stream's end"
         );
+
+        // A reply past the window whose cut falls inside a key: its text went on past the held
+        // tail, so the tail is held for good and no part of the key is read.
+        let cut = 16 * OWN_STREAM_DELTA_BYTES;
+        let keyed = format!(
+            "{}AKIAIOSFOD{}",
+            "x".repeat(cut - 10),
+            "NN7EXAMPLE and more"
+        );
+        let (text, dropped, read_to, terminal) = read("cmsg-4", &keyed);
+        assert_eq!(text, "x".repeat(cut - OWN_STREAM_DELTA_BYTES));
+        assert_eq!((dropped, read_to, terminal), (1, 15, Some(17)));
+
+        // A reply past the window whose cut falls just before a key's rest: the hub dropped
+        // the piece with the key's start and took the piece after it, which carries the key's
+        // rest and ends in a held start. The hub never took the dropped piece, so that tail is
+        // held for good and no part of the key is read. (A piece of 3-byte chars is 16 383
+        // bytes, so sixteen of them leave the window 16 bytes: room for the last piece, not
+        // for the one before it.)
+        let wide = OWN_STREAM_DELTA_BYTES / 3;
+        let rest = "NN7EXAMPLE sk-";
+        let held_from = cap_http::canonical_facade::decoded_hold_split(rest.as_bytes(), 4 << 20)
+            .expect("the hold geometry");
+        assert!(
+            held_from < rest.len(),
+            "the last piece ends in a held start"
+        );
+        let keyed = format!(
+            "{}AKIAIOSFOD{rest}",
+            "\u{4e2d}".repeat(16 * wide + (OWN_STREAM_DELTA_BYTES - 10) / 3)
+        );
+        let (text, dropped, read_to, terminal) = read("cmsg-5", &keyed);
+        assert_eq!(text, "\u{4e2d}".repeat(16 * wide));
+        assert_eq!((dropped, read_to, terminal), (1, 16, Some(18)));
     }
 
     /// Without an attached hub no stream is made up: the status names none.
@@ -2048,7 +2321,7 @@ mod tests {
         assert_eq!(seen[0].0, begin());
         assert_eq!(seen[0].1, None);
         // The class was final before the stream ended.
-        assert_eq!(seen[1].0, end(0, LlmTerminalReason::Reaped, None));
+        assert_eq!(seen[1].0, closing(0, LlmTerminalReason::Reaped, None));
         assert_eq!(seen[1].1.as_deref(), Some("st_first"));
         assert_eq!(
             seen[1].2.as_deref(),

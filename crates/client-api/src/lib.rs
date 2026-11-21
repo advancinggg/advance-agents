@@ -81,11 +81,11 @@ pub use cursor::{
     SystemCursorClock, SEAL_TAG_FILE_TICKET,
 };
 pub use deltas::{
-    open_delta_cursor, resolve_stream_request, seal_delta_cursor, DeltaHoldSplit, DeltaObserver,
-    DeltaPumpExit, DeltaPumpExitObserver, DeltaSubscriberPermit, DeltaTiming, HubEvent,
-    LlmDeltaCursor, LlmDeltaHub, LlmDeltaItem, LlmDeltaPage, LlmDeltaStreamRequest,
-    LlmDeltaTerminal, LlmDeltaUsage, LlmDeltaWirePage, ReauthDeadline, DELTA_CURSOR_STREAM_DOMAIN,
-    LLM_DELTA_ABSENT_NOTE,
+    open_delta_cursor, resolve_stream_request, seal_delta_cursor, DeltaCompletedMatchSweep,
+    DeltaHoldSplit, DeltaObserver, DeltaPumpExit, DeltaPumpExitObserver, DeltaSubscriberPermit,
+    DeltaTiming, HubEvent, LlmDeltaCursor, LlmDeltaHub, LlmDeltaItem, LlmDeltaPage,
+    LlmDeltaStreamRequest, LlmDeltaTerminal, LlmDeltaUsage, LlmDeltaWirePage, ReauthDeadline,
+    DELTA_CURSOR_STREAM_DOMAIN, LLM_DELTA_ABSENT_NOTE,
 };
 pub use entities::{
     ClientAspect, ClientAspectField, ClientAspectFieldDisplay, ClientAspectOperation,

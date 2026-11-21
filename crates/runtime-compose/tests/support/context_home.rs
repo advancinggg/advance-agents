@@ -383,10 +383,12 @@ impl Client {
     /// message status polled until it names a stream key, then the stream read page by
     /// page from its first seq until its terminal has arrived and every seq before it has
     /// been read — or, the terminal come, [`TERMINAL_GRACE`] has passed (started again
-    /// whenever a page brings text), as the hub never releases a tail that could begin a
-    /// secret (MODULE-020-T24-h): the caller then finds the last item read short of the
-    /// terminal's seq. The last page comes back with every item read. A stream the hub no
-    /// longer serves fails: the hub lets an ended stream go 30 s after its terminal.
+    /// whenever a page brings text), for a stream whose tail the hub still holds (one that
+    /// could begin a secret, on a stream whose terminal is not complete or whose text the hub
+    /// dropped some of; MODULE-020-T24-h): the caller then finds the last item read short of
+    /// the terminal's seq. The last page
+    /// comes back with every item read. A stream the hub no longer serves fails: the hub lets
+    /// an ended stream go 30 s after its terminal.
     pub async fn read_message_stream(&self, id: &str) -> advance_client_api::LlmDeltaPage {
         let deadline = Instant::now() + self.wait;
         let mut grace_ends: Option<Instant> = None;

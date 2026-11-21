@@ -1001,43 +1001,75 @@ async fn a_tool_turns_answer_reaches_the_stream_its_message_names() {
         let text: String = page.deltas.iter().map(|item| item.text.as_str()).collect();
         let terminal = page.terminal.as_ref().expect("the stream ended");
         assert_eq!(terminal.reason, "completed", "{terminal:?}");
-        // The hub never releases a tail that could begin a secret (MODULE-020-T24-h), and the
-        // default guest's `generate` tees a call's text as one delta when the call ends: an
-        // answer that ends in such a start (`… Water the seedlings`) is held back whole, and
-        // the stream ends short of its terminal's seq (the release's Known list). The answer
-        // was still merged into the message's stream: the terminal counts its delta.
+        // The hub holds back a tail that could begin a secret only until the stream's
+        // complete terminal (MODULE-020-T24-h): an answer that ends in such a start
+        // (`… Water the seedlings`) reads whole too, every seq to the terminal's.
         let read_to = page.deltas.last().map_or(0, |item| item.to_seq + 1);
-        let held = read_to < terminal.seq;
         let answer = answer.trim();
-        println!(
-            "LIVE stream of the message{}: {}",
-            if held {
-                " (the answer's delta held by the hub)"
-            } else {
-                ""
-            },
-            brief(&text, 400)
+        println!("LIVE stream of the message: {}", brief(&text, 400));
+        assert_eq!(
+            read_to, terminal.seq,
+            "every seq read, to the terminal's: {text:?}"
         );
-        if held {
-            assert_eq!(
-                terminal.seq,
-                read_to + 1,
-                "only the answer's delta is held, after the earlier calls' text: {text:?}"
-            );
-            assert!(
-                !text.contains(answer),
-                "a held answer is not in the stream: {text:?}"
-            );
-        } else {
-            assert!(
-                text.contains(answer),
-                "the stream carries the answer of the call after the tool result: {text:?}"
-            );
-            assert!(
-                mentions(&text, &["3", "three"]),
-                "the answer counts the plan's steps: {text:?}"
-            );
-        }
+        assert!(
+            text.contains(answer),
+            "the stream carries the answer of the call after the tool result: {text:?}"
+        );
+        assert!(
+            mentions(&text, &["3", "three"]),
+            "the answer counts the plan's steps: {text:?}"
+        );
+    })
+    .await;
+}
+
+const SAY_THE_LINE: &str =
+    "Reply with only these three words, exactly as written, with no punctuation: Water the seedlings";
+
+/// A real model's answer that ends in what could begin a secret (`… seedlings` ends in `s`)
+/// reaches the message's stream whole: the hub holds that tail back only until the stream's
+/// complete terminal, then releases it, as its end-of-stream sweep finds no secret
+/// (MODULE-020-T24-h; on v0.1.58 such an answer was held back for good).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "calls a real model service; set the ADVANCE_LIVE_LLM_* variables"]
+async fn an_answer_ending_in_a_held_start_reaches_the_stream_whole() {
+    let Some(live) = live() else { return };
+    let live = &live;
+    let home = memory_home(true, &[], &[live.entry(NEAR, true)], &["provider: near"]);
+    let tap = &Tap::new();
+    serve(&home, tap.security(), WAIT, |client| async move {
+        let from = tap.len();
+        let id = client.send_message(ROOT_MAILBOX, SAY_THE_LINE).await;
+        let page = client.read_message_stream(&id).await;
+        client.await_message_turn(&id).await;
+        let trace = Trace {
+            said: SAY_THE_LINE.to_string(),
+            exchanges: tap.since(from),
+        };
+        trace.report("root");
+        trace.assert_answered();
+        trace.assert_asked_of(live);
+        let answer = trace.answer();
+        let answer = answer.trim();
+        // The precondition: the wire layer's hold geometry holds this answer's tail.
+        let held_from =
+            cap_http::canonical_facade::decoded_hold_split(answer.as_bytes(), 4 * 1024 * 1024)
+                .expect("the hold geometry");
+        assert!(
+            held_from < answer.len(),
+            "the model's answer {answer:?} ends in no held start: run again"
+        );
+        let text: String = page.deltas.iter().map(|item| item.text.as_str()).collect();
+        let terminal = page.terminal.as_ref().expect("the stream ended");
+        let read_to = page.deltas.last().map_or(0, |item| item.to_seq + 1);
+        println!("LIVE stream of the message: {text:?}; held from byte {held_from} of the answer");
+        assert_eq!(terminal.reason, "completed", "{terminal:?}");
+        assert_eq!(read_to, terminal.seq, "every seq read: {text:?}");
+        assert_eq!(text.trim(), answer, "the answer, whole");
+        assert_eq!(
+            (page.dropped_count, page.rejected_count, page.redacted_count),
+            (0, 0, 0)
+        );
     })
     .await;
 }

@@ -1057,6 +1057,7 @@ fn d_terminal(hub: &LlmDeltaHub, key: &str, seq: u64) {
                 output_tokens: 20,
                 cost_usd: 0.01,
             }),
+            complete: false,
         },
     });
 }

@@ -291,11 +291,16 @@ impl TeeState {
     }
 
     /// Publish the terminal frame at most once, and only for a stream that began.
+    /// `complete`: this stream publishes nothing after the frame (see
+    /// [`advance_shared_types::traits::LlmDeltaFrame::Terminal`]): true for a buffered
+    /// `generate` call, never for a live stream, whose polls may still drain released
+    /// ranges after its terminal.
     pub(crate) fn publish_terminal(
         &self,
         seq: u64,
         reason: advance_shared_types::traits::LlmTerminalReason,
         usage: Option<advance_shared_types::traits::LlmDeltaUsage>,
+        complete: bool,
     ) {
         // NOTE (AUDIT round 11): no `is_live()` early return before the CAS. `is_live`
         // ANDs the sink's `is_wired` with the `disabled` latch, and `disabled` DOES flip
@@ -322,7 +327,12 @@ impl TeeState {
         {
             return;
         }
-        let frame = advance_shared_types::traits::LlmDeltaFrame::Terminal { seq, reason, usage };
+        let frame = advance_shared_types::traits::LlmDeltaFrame::Terminal {
+            seq,
+            reason,
+            usage,
+            complete,
+        };
         if self
             .begin_published
             .load(std::sync::atomic::Ordering::Acquire)
@@ -412,13 +422,18 @@ impl GenerateTee {
             // Same 256 KiB guest-visible bound as WIT encode / C235 window.
             // A single uncapped Delta larger than DELTA_WINDOW_BYTES is dropped
             // whole by the hub (pending-full), so concat would be empty.
+            let whole = text.len() <= TEE_TEXT_MAX;
             let text = cap_tee_text(text);
             tee.publish_delta(self.seq, text);
             self.seq = self.seq.saturating_add(1);
+            // Complete when the call's text went out whole: its one delta is published, and
+            // nothing follows it. A text cut at the bound is not whole: the cut may split a
+            // secret, so its terminal claims nothing, and a consumer keeps holding the tail.
             tee.publish_terminal(
                 self.seq,
                 advance_shared_types::traits::LlmTerminalReason::Completed,
                 usage,
+                whole,
             );
         }
         self.closed = true;
@@ -453,10 +468,12 @@ impl Drop for GenerateTee {
         }
         self.closed = true;
         if let Some(tee) = &self.inner {
+            // Complete: a call that failed published no delta, and none follows.
             tee.publish_terminal(
                 self.seq,
                 advance_shared_types::traits::LlmTerminalReason::ProviderError,
                 self.fail_usage,
+                true,
             );
         }
     }
@@ -1233,7 +1250,8 @@ impl Settlement {
             // a consumer cannot read this as "the stream produced no deltas".
             // (AUDIT round 9: an earlier comment here described a fallback to the
             // settled delta count, which this code never did.)
-            tee.publish_terminal(tee_seq.unwrap_or(0), reason, usage);
+            // Never complete: a poll may still drain released ranges after this frame.
+            tee.publish_terminal(tee_seq.unwrap_or(0), reason, usage, false);
         }
         true
     }
@@ -2495,6 +2513,22 @@ mod tee_state_tests {
             .collect();
         assert_eq!(concat.len(), TEE_TEXT_MAX);
         assert!(!concat.contains('y'));
+        let terminal = |rec: &Recorder| {
+            rec.frames().into_iter().find_map(|f| match f {
+                LlmDeltaFrame::Terminal { seq, complete, .. } => Some((seq, complete)),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            terminal(&rec),
+            Some((1, false)),
+            "a cut text is not whole: its terminal claims nothing"
+        );
+        // A text at the bound goes out whole.
+        let rec = Arc::new(Recorder::default());
+        let mut tee = GenerateTee::open(rec.clone() as Arc<dyn LlmDeltaSink>, "a", None, None);
+        tee.succeed(&"x".repeat(TEE_TEXT_MAX), None);
+        assert_eq!(terminal(&rec), Some((1, true)));
     }
 
     #[test]
@@ -2513,7 +2547,7 @@ mod tee_state_tests {
         assert!(!tee.is_live(), "an unwired sink must never be live");
         tee.publish_begin(None, None);
         tee.publish_delta(0, "hello");
-        tee.publish_terminal(1, LlmTerminalReason::Completed, None);
+        tee.publish_terminal(1, LlmTerminalReason::Completed, None, false);
         // Nothing to observe — the point is that the caller's `is_live()` guard
         // short-circuits before any text copy or envelope construction.
         assert!(!tee.is_live());
@@ -2525,7 +2559,7 @@ mod tee_state_tests {
     fn t119_no_terminal_without_begin() {
         let rec = Arc::new(Recorder::default());
         let tee = tee_with(rec.clone());
-        tee.publish_terminal(0, LlmTerminalReason::ProviderError, None);
+        tee.publish_terminal(0, LlmTerminalReason::ProviderError, None, false);
         assert!(
             rec.frames().is_empty(),
             "a stream that never began must publish nothing, got {:?}",
@@ -2540,9 +2574,9 @@ mod tee_state_tests {
         let tee = tee_with(rec.clone());
         tee.publish_begin(Some("run-1".into()), None);
         tee.publish_delta(0, "a");
-        tee.publish_terminal(1, LlmTerminalReason::Completed, None);
-        tee.publish_terminal(1, LlmTerminalReason::Reaped, None);
-        tee.publish_terminal(1, LlmTerminalReason::Abandoned, None);
+        tee.publish_terminal(1, LlmTerminalReason::Completed, None, false);
+        tee.publish_terminal(1, LlmTerminalReason::Reaped, None, false);
+        tee.publish_terminal(1, LlmTerminalReason::Abandoned, None, false);
         let terminals: Vec<_> = rec
             .frames()
             .into_iter()
@@ -2585,7 +2619,7 @@ mod tee_state_tests {
         let rec = Arc::new(Recorder::default());
         let tee = tee_with(rec.clone());
         // Settlement wins before the owner ever publishes `Begin`.
-        tee.publish_terminal(0, LlmTerminalReason::Reaped, None);
+        tee.publish_terminal(0, LlmTerminalReason::Reaped, None, false);
         assert!(
             rec.frames().is_empty(),
             "nothing may reach the sink before Begin"
@@ -2606,7 +2640,7 @@ mod tee_state_tests {
             }
         ));
         // The latch is spent: a second settlement cannot double-publish.
-        tee.publish_terminal(0, LlmTerminalReason::Completed, None);
+        tee.publish_terminal(0, LlmTerminalReason::Completed, None, false);
         assert_eq!(rec.frames().len(), 2, "terminal stays exactly-once");
     }
 
@@ -2626,7 +2660,7 @@ mod tee_state_tests {
         );
         assert!(!tee.is_live());
         tee.publish_delta(1, "after");
-        tee.publish_terminal(2, LlmTerminalReason::Completed, None);
+        tee.publish_terminal(2, LlmTerminalReason::Completed, None, false);
         let frames = rec.frames();
         assert_eq!(
             frames.len(),
@@ -2655,7 +2689,7 @@ mod tee_state_tests {
         }
         let t_term = tee.clone();
         handles.push(std::thread::spawn(move || {
-            t_term.publish_terminal(32, LlmTerminalReason::Completed, None)
+            t_term.publish_terminal(32, LlmTerminalReason::Completed, None, false)
         }));
         for h in handles {
             h.join().unwrap();

@@ -371,12 +371,14 @@ pub enum LlmDeltaFrame {
     },
     /// Exactly one guest-visible delta, at the moment the guest received it.
     Delta { seq: u64, text: String },
-    /// Published at most once per stream that published a `Begin`. `seq` is the number
-    /// of guest-visible deltas allocated AT SETTLEMENT TIME.
+    /// Published at most once per stream that published a `Begin`. For a model call's
+    /// stream, `seq` is the number of guest-visible deltas allocated AT SETTLEMENT TIME;
+    /// for a stream whose `Terminal` is `complete`, it is the stream's end.
     ///
-    /// **It is a settlement-time watermark ONLY — not a ceiling, not a floor, not a
-    /// completeness claim.** On a successful stream the producer does not discard
-    /// already-released ranges, so further deltas can legitimately arrive afterwards.
+    /// **Unless `complete` is set, it is a settlement-time watermark ONLY — not a
+    /// ceiling, not a floor, not a completeness claim.** On a successful stream the
+    /// producer does not discard already-released ranges, so further deltas can
+    /// legitimately arrive afterwards.
     /// Their `seq` may be BELOW, EQUAL TO, or ABOVE this value: the producer reads its
     /// counter WITHOUT incrementing it while a poller allocates and publishes outside
     /// the state lock, so whichever side wins the emission race decides. Any consumer
@@ -397,6 +399,21 @@ pub enum LlmDeltaFrame {
         /// could have known about. `commit` returns `()`, so even `Some` records
         /// nothing about the implementer's acceptance of the charge.
         usage: Option<LlmDeltaUsage>,
+        /// The producer's completeness claim: it published every delta of this stream
+        /// before this frame, each with a `seq` below `seq`, the stream's text whole (none of
+        /// it cut or dropped on the way), and publishes no frame for the stream after it. So
+        /// `seq` is then the stream's end, and a consumer may release text it held back only
+        /// because more could follow. A producer sets it only where nothing can follow: a
+        /// buffered `generate` call whose text went out uncut (one delta, then this frame;
+        /// this frame alone when the call failed); a stream it closes itself once it has
+        /// stopped forwarding to it, when it forwarded each call's text whole; or a stream
+        /// whose text it writes itself, whole, before this frame. A consumer may still keep the
+        /// tail back: the hub does when it did not take a seq below the end (one it dropped
+        /// past its window, say), when it blocked or redacted text before the tail, when it
+        /// released text it had scanned across a seq that came later, and when it evicted the
+        /// stream. A live `stream` / `poll-stream` call never sets it, as a poll may still
+        /// drain released ranges after its terminal.
+        complete: bool,
     },
 }
 
@@ -474,8 +491,11 @@ pub struct LlmDeltaUsage {
 ///    **Consumers MUST accept every post-terminal `Delta` unconditionally, whatever its
 ///    `seq`, and MUST de-duplicate on the `(stream_key, seq)` pair alone.** `Terminal`
 ///    is an absorbing latch ONLY against a second `Terminal` — never against deltas,
-///    in either `seq` direction. One guarantee the producer DOES give: `Begin` always
-///    precedes `Terminal` for a stream, because a terminal settling before `Begin`
+///    in either `seq` direction. The one exception is a `Terminal` whose `complete` is
+///    set: its producer published every delta of the stream before it, all below its
+///    `seq`, and publishes nothing after it, so a consumer MAY refuse a delta that
+///    arrives after it at or past its `seq`. One guarantee the producer DOES give:
+///    `Begin` always precedes `Terminal` for a stream, because a terminal settling before `Begin`
 ///    ships is parked and flushed immediately after it under the same ordering guard.
 ///    No ordering is promised ACROSS streams.
 /// 5. **At-most-once, not at-least-once.** A disabled tee (invariant 3) or a bounded

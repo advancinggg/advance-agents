@@ -519,11 +519,20 @@ post-processor:
 
     fn assert_reaped(term: &LlmDeltaEvent) {
         match &term.frame {
-            LlmDeltaFrame::Terminal { reason, usage, .. } => {
+            LlmDeltaFrame::Terminal {
+                reason,
+                usage,
+                complete,
+                ..
+            } => {
                 assert_eq!(
                     *reason,
                     LlmTerminalReason::Reaped,
                     "turn-end reap must label the terminal Reaped"
+                );
+                assert!(
+                    !complete,
+                    "a live stream's terminal is never complete: a poll may still drain"
                 );
                 assert!(
                     usage.is_some(),
@@ -1153,6 +1162,7 @@ database:
                 seq: 1,
                 reason: LlmTerminalReason::Completed,
                 usage: None,
+                complete: false,
             },
         });
 

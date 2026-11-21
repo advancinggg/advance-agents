@@ -7663,10 +7663,17 @@ mod tests {
             })
             .collect();
         assert_eq!(concat, "hello");
-        assert!(matches!(
-            frames.last(),
-            Some(LlmDeltaFrame::Terminal { .. })
-        ));
+        assert!(
+            matches!(
+                frames.last(),
+                Some(LlmDeltaFrame::Terminal {
+                    seq: 1,
+                    complete: true,
+                    ..
+                })
+            ),
+            "a generate call's terminal ends its stream: {frames:?}"
+        );
     }
 
     #[tokio::test]
@@ -7740,8 +7747,15 @@ mod tests {
             1
         );
         assert!(
-            matches!(frames.last(), Some(LlmDeltaFrame::Terminal { .. })),
-            "fail after Begin must close Terminal, got {frames:?}"
+            matches!(
+                frames.last(),
+                Some(LlmDeltaFrame::Terminal {
+                    seq: 0,
+                    complete: true,
+                    ..
+                })
+            ),
+            "fail after Begin must close Terminal, complete, got {frames:?}"
         );
     }
 
