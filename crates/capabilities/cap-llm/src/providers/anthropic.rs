@@ -578,6 +578,16 @@ mod tests {
         }
     }
 
+    /// A transient code beside an overflow message vetoes it, as on every 400 path.
+    #[test]
+    fn t_anthropic_map_status_400_transient_code_vetoes_the_overflow_message() {
+        let body = br#"{"error":{"type":"invalid_request_error","code":"server_error","message":"prompt is too long: 213413 tokens > 200000 maximum"}}"#;
+        match map_anthropic_status(400, body) {
+            LlmError::ProviderError(detail) => assert_eq!(detail, "http 400"),
+            other => panic!("expected ProviderError(\"http 400\"), got {other:?}"),
+        }
+    }
+
     #[test]
     fn t_anthropic_map_status_400_unrelated_invalid_request() {
         let body = br#"{"error":{"type":"invalid_request_error","message":"messages array cannot be empty"}}"#;
@@ -835,8 +845,14 @@ fn map_anthropic_status(status: u16, body: &[u8]) -> LlmError {
             // "context" anywhere (e.g. JSON field names).
             if let Ok(v) = serde_json::from_str::<Value>(body_str) {
                 let err_type = v["error"]["type"].as_str().unwrap_or("");
+                let err_code = v["error"]["code"].as_str().unwrap_or("");
                 let err_msg = v["error"]["message"].as_str().unwrap_or("");
-                if err_type == "invalid_request_error" && is_context_overflow_message(err_msg) {
+                // Under the transient veto, as every 400 path is (MODULE-009). The
+                // Anthropic envelope has no code; a proxy's transient code vetoes the message.
+                if err_type == "invalid_request_error"
+                    && !crate::providers::is_transient_error_type_5xx(err_code)
+                    && is_context_overflow_message(err_msg)
+                {
                     return LlmError::ContextTooLong(err_msg.to_string());
                 }
             }

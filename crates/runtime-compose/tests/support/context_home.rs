@@ -233,7 +233,8 @@ pub async fn serve<F, Fut>(
             llm_security: Some(security),
             ..ComposeFailpoints::default()
         });
-    let rt = tokio::time::timeout(Duration::from_secs(180), compose(options, Vec::new()))
+    // A hang guard. A full parallel run composes many homes at once; one took over 180 s.
+    let rt = tokio::time::timeout(Duration::from_secs(600), compose(options, Vec::new()))
         .await
         .expect("compose in time")
         .expect("compose");
@@ -545,6 +546,17 @@ impl Client {
             "pin the root agent to {provider}: {:?}",
             updated.body
         );
+    }
+
+    /// Update the provider entry `id` (`POST /client/providers/{id}:update`) with `body`.
+    /// The edit reaches the running config through its watcher; nothing is restarted.
+    pub async fn update_provider(&self, id: &str, body: Value) {
+        let updated = Http::post(self.addr, format!("/client/providers/{id}:update"))
+            .session(&self.token)
+            .idempotency_key(format!("update-{id}-{}", nanos()))
+            .json(body)
+            .await;
+        assert_eq!(updated.status, 200, "update {id}: {:?}", updated.body);
     }
 
     /// The immutable id the agents family lists for `agent` — the id its index rows are

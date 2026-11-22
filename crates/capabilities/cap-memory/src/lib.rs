@@ -43,6 +43,7 @@ pub mod store;
 pub mod summary;
 pub mod task_storage;
 pub mod turn_index;
+pub mod turn_log;
 pub mod wit_error;
 pub mod wit_impl;
 

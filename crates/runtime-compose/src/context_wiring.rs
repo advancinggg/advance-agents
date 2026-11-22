@@ -1331,7 +1331,7 @@ impl L6ConsolidationReader for StubL6Consolidation {
 const MAX_HISTORY_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Reject a `task_id` that is unsafe to substitute into the
-/// `{memory_root}/tasks/{task_id}/…` path: empty, over-long, containing a path
+/// `{tasks_root}/{task_id}/…` path: empty, over-long, containing a path
 /// separator / `..` traversal sequence / control char, or any non-slug char.
 fn is_safe_task_id(task_id: &str) -> bool {
     !task_id.is_empty()
@@ -1384,13 +1384,13 @@ fn read_capped_under(root: &Path, path: &Path, max_bytes: u64) -> Option<String>
 }
 
 /// Real cap-memory-backed L2/L3/L4 reader over the agent's persisted task
-/// artifacts (`{memory_root}/tasks/{task_id}/{turn-index,summary}.yaml`). Bound
-/// at construction to the agent's memory root + its query-alias set ({bare cap
+/// artifacts (`{tasks_root}/{task_id}/{turn-index,summary}.yaml`, PRD §11.2). Bound
+/// at construction to the agent's tasks root + its query-alias set ({bare cap
 /// write-id, colon routing-id}); the `task_id` is supplied per read (the reader
 /// trait arg). Production content is SAT-B-gated (SAT-B's PostProcessor writes
 /// these files); absent / oversize / invalid / id-mismatched → empty.
 ///
-/// **Cross-AGENT isolation (enforced here)**: the per-agent `memory_root` + the
+/// **Cross-AGENT isolation (enforced here)**: the per-agent `tasks_root` + the
 /// `agent_matches` embedded-id check confine every read to the REQUESTING
 /// agent's OWN tasks — a sender cannot make this reader surface another agent's
 /// history.
@@ -1410,7 +1410,7 @@ fn read_capped_under(root: &Path, path: &Path, max_bytes: u64) -> Option<String>
 /// daemon all INBOUND paths set `context: None` → `task_id` empty → this reader
 /// is inert; only `notify-agent` activates it.)
 pub struct CapMemoryHistoryReader {
-    memory_root: PathBuf,
+    tasks_root: PathBuf,
     query_aliases: Vec<String>,
     /// The `_agent-{write_id}` partition the post-processor writes under when a
     /// turn carries no task id. A read with an EMPTY `task_id` resolves to it, so
@@ -1424,9 +1424,10 @@ pub struct CapMemoryHistoryReader {
 const MAX_L2_DIGESTS: usize = 12;
 
 impl CapMemoryHistoryReader {
-    pub fn new(memory_root: PathBuf, query_aliases: Vec<String>) -> Self {
+    /// `tasks_root` holds the task directories (`<workspace>/.agent/tasks/active`).
+    pub fn new(tasks_root: PathBuf, query_aliases: Vec<String>) -> Self {
         Self {
-            memory_root,
+            tasks_root,
             query_aliases,
             default_task_partition: None,
         }
@@ -1463,18 +1464,18 @@ impl CapMemoryHistoryReader {
         if !is_safe_task_id(task_id) {
             return None;
         }
-        Some(self.memory_root.join("tasks").join(task_id))
+        Some(self.tasks_root.join(task_id))
     }
 
     fn load_turn_index(&self, task_id: &str) -> Option<TurnIndex> {
         let path = self.task_dir(task_id)?.join("turn-index.yaml");
-        let raw = read_capped_under(&self.memory_root, &path, MAX_HISTORY_FILE_BYTES)?;
+        let raw = read_capped_under(&self.tasks_root, &path, MAX_HISTORY_FILE_BYTES)?;
         serde_yml::from_str::<TurnIndex>(&raw).ok()
     }
 
     fn load_summary(&self, task_id: &str) -> Option<Summary> {
         let path = self.task_dir(task_id)?.join("summary.yaml");
-        let raw = read_capped_under(&self.memory_root, &path, MAX_HISTORY_FILE_BYTES)?;
+        let raw = read_capped_under(&self.tasks_root, &path, MAX_HISTORY_FILE_BYTES)?;
         serde_yml::from_str::<Summary>(&raw).ok()
     }
 }
@@ -1551,6 +1552,106 @@ impl L2DigestReader for CapMemoryHistoryReader {
                 collapsed_view: t.collapsed_view,
             })
             .collect())
+    }
+}
+
+/// The most bytes of a task's turn log a read of its recent turns reads.
+const MAX_RECENT_LOG_BYTES: u64 = 8 * 1024 * 1024;
+
+#[async_trait]
+impl advance_context_engine::RecentTurnsReader for CapMemoryHistoryReader {
+    /// The last `count` turns the task's index holds for this agent, each with its lines of the
+    /// turn log (read from the log's end) and the file versions it read. A turn comes with its
+    /// lines only when the read got every line its entry's `log_offset` names; otherwise it
+    /// comes without, and ⑯ loads it as its digest.
+    async fn read_recent_turns(
+        &self,
+        _agent_id: &str,
+        task_id: &str,
+        count: usize,
+    ) -> Result<Vec<advance_context_engine::RecentTurn>, PortError> {
+        let Some(task_id) = self.resolve_task_id(task_id) else {
+            return Ok(Vec::new());
+        };
+        let Some(index) = self.load_turn_index(task_id) else {
+            return Ok(Vec::new());
+        };
+        let Some(dir) = self.task_dir(task_id) else {
+            return Ok(Vec::new());
+        };
+        let mut turns: Vec<cap_memory::turn_index::TurnEntry> = index
+            .turns
+            .into_iter()
+            .filter(|t| t.task_id == task_id && self.agent_matches(&t.agent_id))
+            .collect();
+        let recent = turns.split_off(turns.len().saturating_sub(count));
+        let wanted: std::collections::BTreeSet<u32> = recent.iter().map(|t| t.turn).collect();
+        let mut lines = cap_memory::turn_log::read_turns_from_tail(
+            &dir.join(advance_shared_types::turn_log::TURN_LOG_FILENAME),
+            &wanted,
+            MAX_RECENT_LOG_BYTES,
+        );
+        Ok(recent
+            .into_iter()
+            .map(|t| {
+                let expected = match t.log_offset {
+                    cap_memory::turn_index::LogOffset { start_line: 0, .. } => None,
+                    cap_memory::turn_index::LogOffset {
+                        start_line,
+                        end_line,
+                    } => end_line
+                        .checked_sub(start_line)
+                        .and_then(|span| usize::try_from(span).ok())
+                        .map(|span| span + 1),
+                };
+                let (messages, marks) = lines
+                    .remove(&t.turn)
+                    .filter(|got| Some(got.len()) == expected)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|line| (line.message, line.l0))
+                    .unzip();
+                advance_context_engine::RecentTurn {
+                    turn_id: u64::from(t.turn),
+                    timestamp: t.timestamp,
+                    digest: t.digest,
+                    read_file_versions: advance_context_engine::TurnReadFileVersions {
+                        entries: t
+                            .read_file_versions
+                            .into_iter()
+                            .map(|v| {
+                                (
+                                    std::path::PathBuf::from(v.path),
+                                    advance_context_engine::BlobId(v.blob_id),
+                                )
+                            })
+                            .collect(),
+                    },
+                    messages,
+                    marks,
+                }
+            })
+            .collect())
+    }
+}
+
+/// The current version of a file of the agent's workspace, as git names it — what a recent
+/// turn's recorded `read_file_versions` are checked against. A file that is gone, is no
+/// regular file, leaves the workspace or is too large has none (the turn counts as stale).
+pub struct WorkspaceBlobReader {
+    pub root: PathBuf,
+}
+
+#[async_trait]
+impl advance_context_engine::GitBlobReader for WorkspaceBlobReader {
+    async fn current_blob(
+        &self,
+        path: &Path,
+    ) -> Result<Option<advance_context_engine::BlobId>, PortError> {
+        Ok(path
+            .to_str()
+            .and_then(|raw| advance_shared_types::turn_log::workspace_blob_id(&self.root, raw))
+            .map(advance_context_engine::BlobId))
     }
 }
 
@@ -2126,7 +2227,11 @@ pub fn build_context_assembler_for_agent_with_pack_skills(
     pack_skills: Option<Arc<dyn SkillSummaryReader>>,
     identity_agent_root: Option<&Path>,
 ) -> Arc<dyn ContextAssembler> {
+    // These builders read the task directories under `<memory_root>/tasks` (their
+    // documented layout); the daemon passes the live tasks root through the parts.
+    let tasks_root = memory_root.map(|root| root.join("tasks"));
     build_context_assembler_for_agent_production(ProductionAssemblerParts {
+        workspace_root: None,
         event_bus,
         callable_inventory,
         host_fn_inventory,
@@ -2135,6 +2240,7 @@ pub fn build_context_assembler_for_agent_with_pack_skills(
         write_agent_id,
         query_aliases,
         memory_root,
+        tasks_root: tasks_root.as_deref(),
         skills_agent_root,
         decomposition,
         pack_skills,
@@ -2145,6 +2251,7 @@ pub fn build_context_assembler_for_agent_with_pack_skills(
         report_sink: None,
         light_llm: None,
         native_tools: None,
+        chat_model: None,
     })
 }
 
@@ -2162,8 +2269,15 @@ pub struct ProductionAssemblerParts<'a> {
     pub write_agent_id: &'a str,
     /// `{bare write-id, colon routing-id}` — the ids the assembler may query with.
     pub query_aliases: &'a [String],
-    /// `<workspace>/.agent/memory` (activates the L2/L3/L4 history readers).
+    /// `<workspace>/.agent/memory` (the L5 synthesis reader).
     pub memory_root: Option<&'a Path>,
+    /// The directory holding the task directories (`<workspace>/.agent/tasks/active`,
+    /// PRD §11.2) the live post-processor writes; activates the L2/L3/L4 history
+    /// readers and the ⑯ recent turns.
+    pub tasks_root: Option<&'a Path>,
+    /// The agent's workspace: a recent turn that read a file since changed there is loaded
+    /// as its digest.
+    pub workspace_root: Option<&'a Path>,
     /// `<workspace>/.agent` when `skills` is declared.
     pub skills_agent_root: Option<&'a Path>,
     pub decomposition: Arc<dyn DecompositionReader>,
@@ -2192,6 +2306,10 @@ pub struct ProductionAssemblerParts<'a> {
     /// Compact `# Available Tools` when the agent's placement is native
     /// (ADR 2026-10-24 D6). `None` → full form (`NeverNativeTools`).
     pub native_tools: Option<Arc<dyn NativeToolsPort>>,
+    /// D5: the model the agent chats on, read at every assembly, whose window
+    /// is the budget ([`gateway_chat_model_source`]). `None` → the assembly
+    /// context's model and the family table.
+    pub chat_model: Option<advance_context_engine::ChatModelSource>,
 }
 
 /// The production agent-level builder the daemon calls (every frozen
@@ -2208,6 +2326,8 @@ pub fn build_context_assembler_for_agent_production(
         write_agent_id,
         query_aliases,
         memory_root,
+        tasks_root,
+        workspace_root,
         skills_agent_root,
         decomposition,
         pack_skills,
@@ -2218,6 +2338,7 @@ pub fn build_context_assembler_for_agent_production(
         report_sink,
         light_llm,
         native_tools,
+        chat_model,
     } = parts;
     // The skill-summary reader is INDEPENDENT of the memory capability. `Some` →
     // the real DiskSkillSummaryReader over the agent's on-disk activated skills;
@@ -2255,28 +2376,30 @@ pub fn build_context_assembler_for_agent_production(
     };
     let assembler = match memory {
         Some(store) => {
-            // Real L2/L3/L4 history readers ONLY when a memory_root is supplied
+            // Real L2/L3/L4 history readers ONLY when a tasks_root is supplied
             // (capability already gated by this `Some` arm). The SAME reader Arc
             // backs all three trait slots. An empty `task_id` (every production
             // inbound turn) resolves to the agent's default partition — the SAME
             // `_agent-{write_id}` Step 7 writes under — so the history a turn
             // produced is read back by the next.
-            let (l2, l3, l4): (
+            let (l2, l3, l4, recent): (
                 Arc<dyn L2DigestReader>,
                 Arc<dyn L3EpochReader>,
                 Arc<dyn L4TaskSummaryReader>,
-            ) = match memory_root {
+                Option<Arc<dyn advance_context_engine::RecentTurnsReader>>,
+            ) = match tasks_root {
                 Some(root) => {
                     let reader = Arc::new(
                         CapMemoryHistoryReader::new(root.to_path_buf(), query_aliases.to_vec())
                             .with_default_task_partition(write_agent_id),
                     );
-                    (reader.clone(), reader.clone(), reader)
+                    (reader.clone(), reader.clone(), reader.clone(), Some(reader))
                 }
                 None => (
                     Arc::new(StubL2Digest),
                     Arc::new(StubL3Epoch),
                     Arc::new(StubL4TaskSummary),
+                    None,
                 ),
             };
             // Recall + task routing read the post-processor's SQLite index when
@@ -2303,7 +2426,7 @@ pub fn build_context_assembler_for_agent_production(
                         real_task_index(query_aliases),
                     ),
                 };
-            build_impl_with_all_ports(
+            let built = build_impl_with_all_ports(
                 event_bus,
                 callable_inventory,
                 host_fn_inventory,
@@ -2325,7 +2448,11 @@ pub fn build_context_assembler_for_agent_production(
                 agent_identity.clone(),
                 query_aliases, // Wave-12 Lane A: colon/bare alias bridge (⑬ + Tier-3)
                 decomposition,
-            )
+            );
+            match recent {
+                Some(reader) => built.with_recent_turns(reader),
+                None => built,
+            }
         }
         // No-memory path: the all-stub data ports (byte-identical to
         // `build_context_assembler`'s port set), PLUS the (real-or-stub)
@@ -2366,6 +2493,12 @@ pub fn build_context_assembler_for_agent_production(
         Some(sink) => assembler.with_report_sink(sink),
         None => assembler,
     };
+    let assembler = match workspace_root {
+        Some(root) => assembler.with_git_blob_reader(Arc::new(WorkspaceBlobReader {
+            root: root.to_path_buf(),
+        })),
+        None => assembler,
+    };
     let assembler = match memory_root {
         Some(root) => assembler.with_l5_synthesis(Arc::new(DiskL5SynthesisReader::new(
             root.to_path_buf(),
@@ -2381,7 +2514,42 @@ pub fn build_context_assembler_for_agent_production(
         Some(port) => assembler.with_native_tools_port(port),
         None => assembler,
     };
+    let assembler = match chat_model {
+        Some(source) => assembler.with_chat_model_source(source),
+        None => assembler,
+    };
     Arc::new(assembler)
+}
+
+/// The production [`advance_context_engine::ChatModelSource`] of `agent_id` (the BARE cap
+/// agent id): [`LlmGateway::chat_model_for`] on the live config and policy, so a provider
+/// edit, a pin or a policy change sets the next assembly's budget without a restart.
+pub fn gateway_chat_model_source(
+    gateway: Arc<LlmGateway>,
+    agent_id: &str,
+) -> advance_context_engine::ChatModelSource {
+    let agent_id = agent_id.to_string();
+    Arc::new(move || {
+        gateway
+            .chat_model_for(&agent_id)
+            .map(|chat| advance_context_engine::ChatModelWindow {
+                provider_id: chat.provider_id,
+                model: chat.model,
+                declared: chat.window.map(|(tokens, by)| {
+                    (
+                        tokens,
+                        match by {
+                            cap_llm::ChatWindowSource::Provider => {
+                                advance_context_engine::WindowSource::Provider
+                            }
+                            cap_llm::ChatWindowSource::Profile => {
+                                advance_context_engine::WindowSource::Profile
+                            }
+                        },
+                    )
+                }),
+            })
+    })
 }
 
 /// Production `NativeToolsPort`: the gateway's would-be native placement for
@@ -3100,7 +3268,7 @@ mod tests {
         .unwrap();
 
         let aliases = vec!["root".to_string(), "agent:root".to_string()];
-        let reader = CapMemoryHistoryReader::new(root.to_path_buf(), aliases.clone())
+        let reader = CapMemoryHistoryReader::new(root.join("tasks"), aliases.clone())
             .with_default_task_partition("root");
         let digests = reader.read_digests("agent:root", "").await.unwrap();
         assert_eq!(digests.len(), MAX_L2_DIGESTS, "bounded by the rerank cap");
@@ -3117,12 +3285,67 @@ mod tests {
         );
 
         // Without the default partition an empty task id reads nothing (pre-fix).
-        let bare = CapMemoryHistoryReader::new(root.to_path_buf(), aliases);
+        let bare = CapMemoryHistoryReader::new(root.join("tasks"), aliases);
         assert!(bare
             .read_digests("agent:root", "")
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// ⑯ loads a turn whole or not at all (MODULE-010 B1): a turn comes with its lines only
+    /// when the read got every line its entry's `log_offset` names. Turn 2's entry names three
+    /// lines and the log's last one does not parse: it comes without lines, and ⑯ loads it as
+    /// its digest. Turn 1 comes whole.
+    #[tokio::test]
+    async fn a_recent_turn_comes_with_its_lines_only_when_every_one_was_read() {
+        use advance_context_engine::RecentTurnsReader as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(advance_shared_types::turn_log::TURN_LOG_FILENAME),
+            concat!(
+                "{\"turn\":1,\"seq\":0,\"ts\":\"t\",\"role\":\"user\",\"content\":\"one\"}\n",
+                "{\"turn\":1,\"seq\":1,\"ts\":\"t\",\"role\":\"assistant\",\"content\":\"done\"}\n",
+                "{\"turn\":2,\"seq\":0,\"ts\":\"t\",\"role\":\"user\",\"content\":\"two\"}\n",
+                "{\"turn\":2,\"seq\":1,\"ts\":\"t\",\"role\":\"assistant\",\"content\":\"half\"}\n",
+                "{\"turn\":2,\"seq\":2,\"ts\"\n",
+            ),
+        )
+        .unwrap();
+        let mut first = entry("t1", 1, "turn one", "2026-11-21T10:00:00Z");
+        first.log_offset = LogOffset {
+            start_line: 1,
+            end_line: 2,
+        };
+        let mut second = entry("t1", 2, "turn two", "2026-11-21T10:01:00Z");
+        second.log_offset = LogOffset {
+            start_line: 3,
+            end_line: 5,
+        };
+        let index = TurnIndex {
+            meta: TurnIndexMeta {
+                last_epoch_turn: 0,
+                last_epoch_at: String::new(),
+            },
+            turns: vec![first, second],
+            epochs: vec![],
+        };
+        std::fs::write(
+            dir.join("turn-index.yaml"),
+            serde_yml::to_string(&index).unwrap(),
+        )
+        .unwrap();
+        let reader =
+            CapMemoryHistoryReader::new(tmp.path().to_path_buf(), vec!["root".to_string()]);
+        let turns = reader.read_recent_turns("root", "t1", 2).await.unwrap();
+        let lines: Vec<(u64, usize)> = turns
+            .iter()
+            .map(|t| (t.turn_id, t.messages.len()))
+            .collect();
+        assert_eq!(lines, [(1, 2), (2, 0)]);
+        assert_eq!(turns[1].digest, "turn two");
     }
 
     fn fact(id: &str, agent: &str, content: &str) -> MemoryEntry {

@@ -242,4 +242,10 @@ pub trait PostProcessorHook: Send + Sync {
         msg: &Message,
         result: &ActionResult,
     ) -> Result<(), PostProcessorError>;
+
+    /// The turn of `msg` failed — its guest trapped or returned an error, or its actions could
+    /// not be dispatched — so [`Self::run`] does not run for it. An implementer that keeps a
+    /// record of every turn records this one too (cap-memory logs it, MODULE-011 Step 0); the
+    /// default does nothing. It cannot fail the turn, which has failed already.
+    async fn turn_failed(&self, _agent_id: &str, _msg: &Message) {}
 }

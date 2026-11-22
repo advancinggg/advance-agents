@@ -849,6 +849,7 @@ impl WiredProviderAdmin {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            model_context_windows: entry.model_context_windows.clone(),
             embedding_model: entry.embedding_model.clone(),
             auth_scheme: entry.auth_scheme.map(|a| auth_scheme_str(a).to_string()),
             auth_source: (entry.auth_source != ProviderAuthSource::ApiKey)
@@ -2091,6 +2092,14 @@ fn sidecar_value(s: &ClientProviderSidecar) -> Value {
     Value::Mapping(m)
 }
 
+fn windows_value(windows: &std::collections::BTreeMap<String, u32>) -> Value {
+    let mut m = Mapping::new();
+    for (model, window) in windows {
+        m.insert(key(model), Value::from(*window));
+    }
+    Value::Mapping(m)
+}
+
 fn aliases_value(aliases: &std::collections::BTreeMap<String, String>) -> Value {
     let mut m = Mapping::new();
     for (k, v) in aliases {
@@ -2207,6 +2216,12 @@ fn create_mapping(req: &ClientCreateProviderRequest, secret: &str) -> Value {
     }
     m.insert(key("api-key-secret"), key(secret));
     m.insert(key("model-aliases"), aliases_value(&req.model_aliases));
+    if !req.model_context_windows.is_empty() {
+        m.insert(
+            key("model-context-windows"),
+            windows_value(&req.model_context_windows),
+        );
+    }
     if let Some(model) = &req.embedding_model {
         m.insert(key("embedding-model"), key(model));
     }
@@ -2257,6 +2272,15 @@ fn update_mapping(provider_id: &str, req: &ClientUpdateProviderRequest) -> Value
     }
     if let Some(aliases) = &req.model_aliases {
         m.insert(key("model-aliases"), aliases_value(aliases));
+    }
+    // The table is replaced whole; an empty one removes the key (a null value is removed).
+    if let Some(windows) = &req.model_context_windows {
+        let value = if windows.is_empty() {
+            Value::Null
+        } else {
+            windows_value(windows)
+        };
+        m.insert(key("model-context-windows"), value);
     }
     if let Some(model) = &req.embedding_model {
         m.insert(key("embedding-model"), key(model));
@@ -3753,6 +3777,7 @@ database:
             model_aliases: [("llama".to_string(), "llama".to_string())]
                 .into_iter()
                 .collect(),
+            model_context_windows: Default::default(),
             embedding_model: None,
             auth_scheme: None,
             api_key_secret: None,
@@ -4205,6 +4230,92 @@ database:
             .value;
         assert_eq!(local.generate_timeout_secs, Some(900));
         assert_eq!(local.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    /// MODULE-010 D5: the models' windows are written under the runtime's spelling, read back
+    /// by the strict loader, echoed by the summary, kept by an update that does not name them,
+    /// replaced whole by one that does, and removed by an empty table.
+    #[test]
+    fn model_context_windows_round_trip_through_create_update_and_the_summary() {
+        let f = Fixture::new();
+        let admin = f.admin();
+        let table = |pairs: &[(&str, u32)]| -> std::collections::BTreeMap<String, u32> {
+            pairs.iter().map(|(m, w)| (m.to_string(), *w)).collect()
+        };
+        let created = admin
+            .create_provider(&ClientCreateProviderRequest {
+                model_context_windows: table(&[(
+                    "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+                    1_048_576,
+                )]),
+                ..keyed_create("windows")
+            })
+            .expect("created")
+            .value;
+        assert_eq!(
+            created.model_context_windows,
+            table(&[("deepseek-ai/DeepSeek-V4.1-Flash-1017", 1_048_576)])
+        );
+        let text = document(&f);
+        assert!(text.contains("model-context-windows:"), "{text}");
+        assert!(
+            text.contains("deepseek-ai/DeepSeek-V4.1-Flash-1017: 1048576"),
+            "{text}"
+        );
+        let entry = f.entry("windows").expect("on disk");
+        assert_eq!(entry.model_context_windows, created.model_context_windows);
+        assert_eq!(admin.get_provider("windows").unwrap(), created);
+
+        let kept = update(
+            &admin,
+            "windows",
+            ClientUpdateProviderRequest {
+                endpoint: Some("https://proxy.example.com".into()),
+                ..Default::default()
+            },
+        )
+        .expect("kept");
+        assert_eq!(kept.model_context_windows, created.model_context_windows);
+
+        let replaced = update(
+            &admin,
+            "windows",
+            ClientUpdateProviderRequest {
+                model_context_windows: Some(table(&[("m", 200_000)])),
+                ..Default::default()
+            },
+        )
+        .expect("replaced");
+        assert_eq!(replaced.model_context_windows, table(&[("m", 200_000)]));
+        assert_eq!(
+            f.entry("windows").unwrap().model_context_windows,
+            table(&[("m", 200_000)])
+        );
+
+        let cleared = update(
+            &admin,
+            "windows",
+            ClientUpdateProviderRequest {
+                model_context_windows: Some(Default::default()),
+                ..Default::default()
+            },
+        )
+        .expect("cleared");
+        assert!(cleared.model_context_windows.is_empty());
+        assert!(f.entry("windows").unwrap().model_context_windows.is_empty());
+        let text = document(&f);
+        assert!(!text.contains("model-context-windows"), "{text}");
+        let wire = serde_json::to_value(&cleared).unwrap();
+        assert!(wire.get("model_context_windows").is_none(), "{wire}");
+
+        // A table the loader refuses never reaches the document.
+        let before = document(&f);
+        let refused = admin.create_provider(&ClientCreateProviderRequest {
+            model_context_windows: table(&[("m", 0)]),
+            ..keyed_create("refused")
+        });
+        assert!(refused.is_err(), "a zero window is refused");
+        assert_eq!(document(&f), before);
     }
 
     /// A setting the entry would not be able to take is refused before the document changes,

@@ -430,12 +430,21 @@ fn map_status_to_llm_err(status: u16, body: &[u8]) -> LlmError {
     let body_str = std::str::from_utf8(body).unwrap_or("");
     match status {
         400 => {
-            // Try to detect context_length_exceeded.
+            // Try to detect context_length_exceeded. A transient type or code vetoes it,
+            // as it does every overflow reading (`is_context_overflow_refusal`).
             if let Ok(v) = serde_json::from_str::<Value>(body_str) {
-                if v["error"]["type"].as_str() == Some("context_length_exceeded") {
+                if v["error"]["type"].as_str() == Some("context_length_exceeded")
+                    && crate::providers::is_context_overflow_refusal(body)
+                {
                     let msg = v["error"]["message"].as_str().unwrap_or("context too long");
                     return LlmError::ContextTooLong(msg.to_string());
                 }
+            }
+            // MODULE-010 S6: every other overflow envelope — OpenAI's code, the message of an
+            // `invalid_request_error` as NEAR AI and DeepSeek send it — maps to the static
+            // reason, so the gateway sends the request once more, smaller.
+            if crate::providers::is_context_overflow_refusal(body) {
+                return LlmError::ContextTooLong("context too long".into());
             }
             LlmError::ProviderError(format!("http 400: {}", truncate(body_str, 200)))
         }
@@ -452,12 +461,9 @@ fn map_status_to_llm_err(status: u16, body: &[u8]) -> LlmError {
             // grok-repass Item 3 (see providers/mod.rs predicates + the
             // anthropic arm's rationale). This arm ADDITIONALLY accepts the
             // `context_length_exceeded` type on 5xx, separator-normalized
-            // (any kebab/camel/spaced spelling). DELIBERATE BOUNDARY (audit
-            // round 3): the 400 arm above keeps its historical EXACT-literal
-            // acceptance — 400-path byte-identity is a lane obligation, so
-            // the same proxy spelling classifies differently on 400 vs 5xx;
-            // that widened asymmetry is accepted and disclosed here, and
-            // changing the 400 arms is /spec territory, not this lane's.
+            // (any kebab/camel/spaced spelling). The 400 arm above accepts
+            // the same signals since MODULE-010 S6, its message probe
+            // co-gated by `invalid_request_error`.
             // STATIC reason only — this does not widen the 400/404 body-echo
             // surface the doc above guards, and the Responses CHAT/SSE
             // routing is unchanged (the Responses EMBED path reaches this
@@ -568,25 +574,45 @@ mod tests {
         ));
     }
 
-    /// Audit round 3 — CONTROL pinning the DELIBERATE 400-vs-5xx boundary:
-    /// the 400 arm keeps its historical exact-literal acceptance (the lane's
-    /// 400-path byte-identity obligation), so a non-canonical spelling that
-    /// the 5xx arm accepts falls through to the plain 400 mapping. Green
-    /// before and after; it exists so the disclosed asymmetry is tested,
-    /// not just prose.
+    /// MODULE-010 S6 — the 400 arm: the exact literal type keeps the upstream message it
+    /// always carried; every other overflow refusal
+    /// ([`crate::providers::is_context_overflow_refusal`]) maps to the static reason; any
+    /// other 400 keeps the plain mapping.
     #[test]
-    fn t_grok3_openai_400_keeps_exact_literal_type_acceptance() {
+    fn s6_openai_400_overflow_refusals_map_to_context_too_long() {
         let canonical = br#"{"error":{"type":"context_length_exceeded","message":"too long"}}"#;
-        assert!(matches!(
-            map_status_to_llm_err(400, canonical),
-            LlmError::ContextTooLong(_)
-        ));
+        match map_status_to_llm_err(400, canonical) {
+            LlmError::ContextTooLong(msg) => assert_eq!(msg, "too long"),
+            other => panic!("expected ContextTooLong, got {other:?}"),
+        }
+        // Witnessed on NEAR AI 2026-11-21.
+        let near = br#"{"error":{"message":"This model's maximum context length is 32768 tokens. However, your prompt contains at least 32769 input tokens, which exceeds this limit even without any output tokens. Please reduce the length of the input prompt. (parameter=input_tokens, value=32769)","type":"invalid_request_error","param":null,"code":null}}"#;
         let kebab = br#"{"error":{"type":"context-length-exceeded","message":"too long"}}"#;
-        match map_status_to_llm_err(400, kebab) {
-            LlmError::ProviderError(msg) => {
-                assert!(msg.starts_with("http 400"), "pre-lane 400 behaviour: {msg}")
+        let openai_code = br#"{"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"This model's maximum context length is 128000 tokens."}}"#;
+        for body in [near.as_slice(), kebab.as_slice(), openai_code.as_slice()] {
+            match map_status_to_llm_err(400, body) {
+                LlmError::ContextTooLong(msg) => {
+                    assert_eq!(msg, "context too long");
+                }
+                other => panic!("expected ContextTooLong, got {other:?}"),
             }
-            other => panic!("400 arm must keep exact-literal acceptance, got {other:?}"),
+        }
+        // Witnessed on NEAR AI 2026-11-21: a completion budget past the window is a parameter
+        // error, not an overflow of the request.
+        let max_tokens = br#"{"error":{"message":"Provider failed for model 'deepseek-ai/DeepSeek-V4.1-Flash-1017': max_tokens=2000000 cannot be greater than max_model_len=1048576. Please request fewer output tokens. (parameter=max_tokens, value=2000000)","type":"invalid_request_error","param":null,"code":null}}"#;
+        let other = br#"{"error":{"type":"invalid_request_error","message":"unknown parameter"}}"#;
+        // A transient code vetoes even the exact literal type, as it vetoes every overflow
+        // reading.
+        let transient = br#"{"error":{"type":"context_length_exceeded","code":"server_error","message":"too long"}}"#;
+        for body in [
+            max_tokens.as_slice(),
+            other.as_slice(),
+            transient.as_slice(),
+        ] {
+            match map_status_to_llm_err(400, body) {
+                LlmError::ProviderError(msg) => assert!(msg.starts_with("http 400"), "{msg}"),
+                other => panic!("expected the plain 400 mapping, got {other:?}"),
+            }
         }
     }
 

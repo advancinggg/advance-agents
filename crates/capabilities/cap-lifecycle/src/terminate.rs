@@ -71,6 +71,22 @@ pub trait MemoryArchiver: Send + Sync {
         sub_workspace: &std::path::Path,
         parent_workspace: &std::path::Path,
     ) -> Result<(), LifecycleError>;
+
+    /// MODULE-010 D4 (owner decision 2026-11-17: a terminated Sub or Child is archived to
+    /// its parent, its history as its knowledge) — move the task history of the terminated
+    /// agent `agent_id` (the `.agent/tasks/` of `agent_workspace`: the turn logs, summaries
+    /// and turn indexes of its tasks, PRD §11.2) to `parent_workspace`'s
+    /// `.agent/tasks/archived-agents/<agent_id>/`. Best effort at the cascade call-site, as
+    /// [`Self::archive_sub_memory`] is. The default archives nothing.
+    fn archive_agent_tasks(
+        &self,
+        agent_id: &str,
+        agent_workspace: &std::path::Path,
+        parent_workspace: &std::path::Path,
+    ) -> Result<(), LifecycleError> {
+        let _ = (agent_id, agent_workspace, parent_workspace);
+        Ok(())
+    }
 }
 
 /// Cascade (seam f — MODULE-001-AC-22): stop a terminating agent's per-agent
@@ -206,6 +222,63 @@ impl DefaultTerminateController {
     }
 }
 
+impl DefaultTerminateController {
+    /// Hand the task history of the terminated `id` to its parent, when an archiver is wired
+    /// and `id` is a Sub or a Child (MODULE-010 D4). `false` only when it could not be
+    /// handed over: the failure is logged, and the history stays in the agent's workspace.
+    fn archive_history(
+        &self,
+        snap: &advance_shared_types::agent_tree::AgentTreeSnapshotData,
+        id: &AgentId,
+        kind: Option<&AgentKind>,
+    ) -> bool {
+        let Some(archiver) = &self.memory_archiver else {
+            return true;
+        };
+        if !matches!(kind, Some(AgentKind::Sub | AgentKind::Child)) {
+            return true;
+        }
+        let Some(node) = snap.nodes.iter().find(|n| &n.id == id) else {
+            return true;
+        };
+        let parent_ws = node.parent.as_ref().and_then(|pid| {
+            snap.nodes
+                .iter()
+                .find(|n| &n.id == pid)
+                .map(|n| n.workspace_path.clone())
+        });
+        let Some(parent_ws) = parent_ws else {
+            eprintln!(
+                "cap-lifecycle: no parent workspace found for {:?} during the archive of its \
+                 task history; the history stays in its workspace",
+                id.0
+            );
+            return false;
+        };
+        match archiver.archive_agent_tasks(&id.0, &node.workspace_path, &parent_ws) {
+            // A history the archiver left — where an older release kept it, say — stays,
+            // and so does a Sub's workspace.
+            Ok(()) if crate::task_history_left(&node.workspace_path) => {
+                eprintln!(
+                    "cap-lifecycle: {:?} still holds task history after its archive; it stays in \
+                     its workspace",
+                    id.0
+                );
+                false
+            }
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "cap-lifecycle: archive_agent_tasks failed for {:?}; its task history \
+                     stays in its workspace: {e}",
+                    id.0
+                );
+                false
+            }
+        }
+    }
+}
+
 impl TerminateController for DefaultTerminateController {
     fn terminate_child(&self, caller_id: &str, child_id: &str) -> Result<(), LifecycleError> {
         // seam (f): held until this returns, however it returns — from before the subtree is
@@ -309,6 +382,15 @@ impl TerminateController for DefaultTerminateController {
             self.run.cancel_run(&id.0)?;
             self.mailbox.flush_mailbox(&id.0)?;
             self.grant.revoke_for_agent(&id.0)?;
+            // MODULE-010 D4: a terminated Sub or Child hands its task history to its parent
+            // ([`MemoryArchiver::archive_agent_tasks`]) before a Sub's workspace is removed —
+            // and before the Client API removes a Child's `.agent/`, once the cascade is done.
+            // Post-order: what a descendant handed over is in this agent's history already,
+            // so it moves on with it. As with the memory archive, a Sub whose history could
+            // not be archived keeps its workspace; a Child's history stays where it was (the
+            // Client API delete keeps the `.agent/` of a Child whose history is still there,
+            // `task_history_left`).
+            let history_ok = self.archive_history(&snap, id, kind.as_ref());
             if kind == Some(AgentKind::Sub) {
                 if let Some(node) = snap.nodes.iter().find(|n| &n.id == id) {
                     // M011-AC-29: archive this Sub's memory into its parent's
@@ -364,7 +446,7 @@ impl TerminateController for DefaultTerminateController {
                             }
                         }
                     };
-                    if archive_ok {
+                    if archive_ok && history_ok {
                         self.workspace.remove_sub_workspace(&node.workspace_path)?;
                     }
                 }

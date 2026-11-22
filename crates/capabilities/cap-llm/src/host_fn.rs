@@ -608,7 +608,7 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
             // records nothing. The transcript is keyed by the host-owned
             // transcript scope, never by the trusted turn (which only feeds
             // attribution above).
-            let guest = gateway.guest_messages(
+            let mut guest = gateway.guest_messages(
                 &ctx.agent_id,
                 ctx.transcript_scope.as_deref(),
                 &req.prompt,
@@ -631,6 +631,9 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
                     return Ok(vec![encode_llm_result(Err(e))]);
                 }
             };
+            // MODULE-010 S6: the request fits the model's window before it is sent.
+            gateway.fit_guest_request(&ctx.agent_id, &mut guest, &params);
+            let seed_len = guest.seed_len;
             let llm_ctx = LlmRequestContext {
                 agent_id: ctx.agent_id.clone(),
                 task_id: attribution.task_id,
@@ -653,7 +656,15 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
                 // The agent's own request: where it is served is where the agent chats.
                 caller: crate::gateway::Caller::AgentGuest,
             };
-            let result = gateway.generate(llm_ctx).await;
+            // MODULE-010 S6: a request the provider refuses as too long is sent once more,
+            // fitted to 80 % of its size; a second refusal goes back to the guest.
+            let sent = llm_ctx.clone();
+            let mut result = gateway.generate(llm_ctx).await;
+            if matches!(result, Err(LlmError::ContextTooLong(_))) {
+                if let Some(smaller) = gateway.refit_after_overflow(sent, seed_len) {
+                    result = gateway.generate(smaller).await;
+                }
+            }
             gateway.observe_guest_visible_error(&ctx.agent_id, result.as_ref().err());
             Ok(vec![encode_llm_result(result)])
         })
@@ -676,7 +687,7 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
             let attribution = freeze_request_attribution(&ctx, req.task_id, turn_cost.as_deref())?;
             // Same seed ++ transcript ++ prompt as generate (ADR 2026-10-24 D4),
             // including the prompt-sent-once rule and the transcript scope.
-            let guest = gateway.guest_messages(
+            let mut guest = gateway.guest_messages(
                 &ctx.agent_id,
                 ctx.transcript_scope.as_deref(),
                 &req.prompt,
@@ -699,6 +710,9 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
                     return Ok(vec![encode_stream_result(Err(e))]);
                 }
             };
+            // MODULE-010 S6: the request fits the model's window before it is sent.
+            gateway.fit_guest_request(&ctx.agent_id, &mut guest, &params);
+            let seed_len = guest.seed_len;
             let llm_ctx = LlmRequestContext {
                 agent_id: ctx.agent_id.clone(),
                 task_id: attribution.task_id,
@@ -728,8 +742,17 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
             // witness suite keep working; production IS wired (cli `wiring.rs`),
             // so this branch is not reachable there. The distinction is explicit,
             // not error-string sniffing.
+            // MODULE-010 S6: a request the provider refuses as too long is sent once more,
+            // fitted to 80 % of its size; a second refusal goes back to the guest.
+            let sent = llm_ctx.clone();
             if gateway.has_live_streaming() {
-                return match gateway.stream_begin_live(llm_ctx, &registry).await {
+                let mut begun = gateway.stream_begin_live(llm_ctx, &registry).await;
+                if matches!(begun, Err(LlmError::ContextTooLong(_))) {
+                    if let Some(smaller) = gateway.refit_after_overflow(sent, seed_len) {
+                        begun = gateway.stream_begin_live(smaller, &registry).await;
+                    }
+                }
+                return match begun {
                     Ok(handle) => {
                         gateway.observe_guest_visible_error(&ctx.agent_id, None);
                         Ok(vec![encode_stream_result(Ok(handle))])
@@ -740,7 +763,13 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
                     }
                 };
             }
-            match gateway.stream_begin(llm_ctx).await {
+            let mut begun = gateway.stream_begin(llm_ctx).await;
+            if matches!(begun, Err(LlmError::ContextTooLong(_))) {
+                if let Some(smaller) = gateway.refit_after_overflow(sent, seed_len) {
+                    begun = gateway.stream_begin(smaller).await;
+                }
+            }
+            match begun {
                 Ok(ready) => {
                     let deltas = crate::stream::chunk_text_into_deltas(&ready.response.text);
                     match registry.insert(deltas, ready) {

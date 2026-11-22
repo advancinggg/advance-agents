@@ -33,6 +33,7 @@ use advance_shared_types::inference::{
     InferenceMessage, InferenceStream, InferenceStreamClass, InferenceTextDelta, InferenceTool,
     SidecarHandoff,
 };
+use advance_shared_types::model_window::{family_context_window, request_budget};
 use advance_shared_types::process_policy::ProcessPolicy;
 use advance_shared_types::repetition::{OutputHash, RepetitionDecision};
 use advance_shared_types::security_validator::{
@@ -40,6 +41,9 @@ use advance_shared_types::security_validator::{
     HttpStreamingChain, LeakDetector, SecretResolutionReason, SsrfError, TransportErrorKind,
 };
 use advance_shared_types::traits::{EventBusEmit, RepetitionGuardCheck, RunBudget};
+use advance_shared_types::turn_log::{
+    annotate_transcript, l0_replacement, L0Mark, TranscriptMessage, TranscriptToolCall,
+};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
@@ -150,6 +154,108 @@ impl ChatMessage {
 struct AgentTranscript {
     scope: String,
     messages: Vec<ChatMessage>,
+    /// The messages that are results of calls that failed — refused, or an error — by index
+    /// ([`LlmGateway::record_tool_outcome`]). The L0 rules pass them by, and the turn log marks
+    /// them.
+    failed: std::collections::BTreeSet<usize>,
+    /// MODULE-010 S6 — the L0 mark of each message, index for index (PRD §11.3.3), set again
+    /// after every message the turn records: the next call of the turn reads the marks instead
+    /// of judging the transcript again.
+    marks: Vec<L0Mark>,
+}
+
+impl AgentTranscript {
+    fn new(scope: &str) -> Self {
+        Self {
+            scope: scope.to_string(),
+            messages: Vec::new(),
+            failed: std::collections::BTreeSet::new(),
+            marks: Vec::new(),
+        }
+    }
+
+    /// The transcript as the turn log and the L0 rules read it.
+    fn transcript(&self) -> Vec<TranscriptMessage> {
+        self.messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| TranscriptMessage {
+                role: chat_role_name(m.role).to_string(),
+                content: m.content.clone(),
+                tool_calls: m
+                    .tool_calls
+                    .iter()
+                    .map(|c| TranscriptToolCall {
+                        id: c.id.clone(),
+                        name: c.name.clone(),
+                        arguments: c.arguments.clone(),
+                    })
+                    .collect(),
+                tool_call_id: m.tool_call_id.clone(),
+                is_error: self.failed.contains(&i),
+            })
+            .collect()
+    }
+
+    /// Mark the transcript after it recorded a message (PRD §11.3.3: L0 runs after every LLM
+    /// call, so the next call loads the annotation). The marks judge the calls the model made
+    /// and what it concluded: a result is judged by its call, so its text is not copied.
+    fn mark_l0(&mut self) {
+        let view: Vec<TranscriptMessage> = self
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| TranscriptMessage {
+                role: chat_role_name(m.role).to_string(),
+                content: if m.role == ChatRole::Assistant {
+                    m.content.clone()
+                } else {
+                    String::new()
+                },
+                tool_calls: m
+                    .tool_calls
+                    .iter()
+                    .map(|c| TranscriptToolCall {
+                        id: c.id.clone(),
+                        name: c.name.clone(),
+                        arguments: c.arguments.clone(),
+                    })
+                    .collect(),
+                tool_call_id: m.tool_call_id.clone(),
+                is_error: self.failed.contains(&i),
+            })
+            .collect();
+        self.marks = annotate_transcript(&view);
+    }
+
+    /// The transcript in its L0 view: a message an L0 mark shortens carries the short text
+    /// instead of its own, and keeps its role, its tool calls and its tool-call id, so no
+    /// provider sees an orphan result.
+    fn l0_view(&self) -> Vec<ChatMessage> {
+        self.messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| match self.marks.get(i).and_then(l0_replacement) {
+                Some(text) => ChatMessage {
+                    role: m.role,
+                    content: text,
+                    tool_call_id: m.tool_call_id.clone(),
+                    tool_calls: m.tool_calls.clone(),
+                },
+                None => m.clone(),
+            })
+            .collect()
+    }
+}
+
+/// The wire name of a chat role (the turn log's `role`).
+pub(crate) fn chat_role_name(role: ChatRole) -> &'static str {
+    match role {
+        ChatRole::System => "system",
+        ChatRole::User => "user",
+        ChatRole::Assistant => "assistant",
+        ChatRole::Tool => "tool",
+    }
 }
 
 /// A guest `generate` / `stream` request body plus whether the assembled seed
@@ -160,6 +266,9 @@ pub(crate) struct GuestMessages {
     /// guest prompt, so the prompt was not appended again and the recorder
     /// must not copy it into the transcript either.
     pub prompt_in_seed: bool,
+    /// How many of the leading `messages` are the assembled seed's (MODULE-010 S6: the fit
+    /// takes the seed's history out first, and cuts only the turn's own results).
+    pub seed_len: usize,
 }
 
 fn assembled_to_chat(m: &LlmMessage) -> ChatMessage {
@@ -560,6 +669,10 @@ pub struct LlmGateway {
     /// scope and resets. Dropped by [`LlmGateway::end_turn`] when the trusted
     /// turn is cleared or destroyed, or when the unprotected invocation returns.
     transcripts: Arc<Mutex<HashMap<String, AgentTranscript>>>,
+    /// The transcript of each agent's last ended turn, kept for the post-processor to log
+    /// (PRD §11.4) until it takes it ([`Self::take_turn_transcript`]) or the agent's next
+    /// invocation begins ([`Self::begin_invocation`]).
+    ended_transcripts: Arc<Mutex<HashMap<String, AgentTranscript>>>,
     /// Small-witness 2026-06-11 — the §1.4.3c AGENT-TIER retry overrides,
     /// installed via [`Self::with_retry_overrides`] (non-trait inherent;
     /// CONTRACT-081 frozen). `None` (every plain `new` caller) keeps all three
@@ -651,7 +764,8 @@ pub(crate) fn plan_usage_status_error(plan_entry: bool, status: u16, err: LlmErr
 /// the chain's bound). Shared by the live owner task and the streamed arm of a buffered call.
 const MAX_IGNORE_STREAK: u32 = 1024;
 
-/// How much of a refused streamed answer's body is read to look for an error code.
+/// How much of a refused streamed answer's body is read to look for an error code, or for
+/// a 400's word that the request overflowed the window.
 const REFUSED_BODY_MAX_BYTES: usize = 64 * 1024;
 
 /// How long that read may take. The refusal is already decided by its status; the body only
@@ -662,7 +776,8 @@ const REFUSED_BODY_READ_BOUND: Duration = Duration::from_secs(5);
 /// code can select a fixed reason. Best effort: at most [`REFUSED_BODY_MAX_BYTES`], for at
 /// most [`REFUSED_BODY_READ_BOUND`] and never past `not_after`; a transport error, the end of
 /// the body or either bound ends the read with whatever arrived. The bytes are only ever
-/// looked up in a closed table — nothing of them reaches an error, an event or a log.
+/// looked up in a closed table, or tested by [`crate::providers::is_context_overflow_refusal`]
+/// (MODULE-010 S6) — nothing of them reaches an error, an event or a log.
 async fn read_refused_body(
     body: &mut dyn advance_shared_types::security_validator::HttpBodyStream,
     not_after: Option<tokio::time::Instant>,
@@ -703,6 +818,7 @@ impl LlmGateway {
             default_agent_id,
             assembled: Arc::new(Mutex::new(HashMap::new())),
             transcripts: Arc::new(Mutex::new(HashMap::new())),
+            ended_transcripts: Arc::new(Mutex::new(HashMap::new())),
             retry_overrides: None,
             streaming_chain: None,
             delta_sink: Arc::new(advance_shared_types::traits::NotWiredDeltaSink),
@@ -1809,6 +1925,28 @@ impl NoChatEntry {
     }
 }
 
+/// The model an agent chats on and the window its entry gives for it
+/// ([`LlmGateway::chat_model_for`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatModel {
+    /// The entry the agent chats on.
+    pub provider_id: String,
+    /// The model id a request of the agent's own that names none is sent with; empty when
+    /// the entry lists no models and the agent's policy names none.
+    pub model: String,
+    /// The entry's window for `model`, in tokens, and where it comes from.
+    pub window: Option<(u32, ChatWindowSource)>,
+}
+
+/// Where [`ChatModel::window`] comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatWindowSource {
+    /// The entry's `model-context-windows` figure for the model.
+    Provider,
+    /// The context window of the entry's catalog profile (`profile-id`).
+    Profile,
+}
+
 impl LlmGateway {
     /// The ONE entry `agent_id` chats on among `providers` — the list its `llm:` policy
     /// leaves — under its hard `constraints`. Everything the host sends on the agent's
@@ -1891,6 +2029,10 @@ impl LlmGateway {
     /// inheriting the entry of the agent that held the id before.
     pub fn forget_agent(&self, agent_id: &str) {
         self.chats_served.forget(agent_id);
+        self.ended_transcripts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(agent_id);
     }
 
     /// The entries a chat request may be placed on: the caller agent's `llm:` policy
@@ -1986,6 +2128,64 @@ impl LlmGateway {
         self.embedding_plan(agent_id).map(|plan| EmbeddingRoute {
             provider_id: plan.provider_cfg.id,
             model: plan.model,
+        })
+    }
+
+    /// The model `agent_id` (the BARE cap agent id) chats on, and the context window its
+    /// entry gives for it (MODULE-010 D5, PRD §11.3.5 `get_context_window`). Reads the live
+    /// config and policy on every call; makes no request.
+    ///
+    /// The entry is [`Self::chat_entry`]'s. The model is the one a request of the agent's own
+    /// that names no model is sent with: the model its `llm:` policy names — bound through the
+    /// entry's aliases, or as it stands when the entry lists no such model — else the entry's
+    /// default. An agent chatting on the entry its last request reached, whose policy names a
+    /// model of another entry, gets this entry's default ([`Self::providers_for`]). The window
+    /// is the entry's `model-context-windows` figure for that model, else the window of the
+    /// entry's catalog profile; `None` when neither gives one (the caller then reads the
+    /// model family's).
+    ///
+    /// `None` when the agent has no chat entry: its policy admits none, or several and none of
+    /// them has served it yet, or the entry is not usable right now.
+    pub fn chat_model_for(&self, agent_id: &str) -> Option<ChatModel> {
+        let cfg = self.config_provider.current();
+        let mut ctx = LlmRequestContext {
+            agent_id: agent_id.to_string(),
+            ..Default::default()
+        };
+        let providers = self.apply_agent_policy(&mut ctx, &cfg.llm_providers).ok()?;
+        let entry = self
+            .chat_entry(agent_id, &providers, &ctx.user_constraints)
+            .ok()?;
+        let p = &entry.provider;
+        let policy_model = ctx.params.model.clone();
+        let model = match crate::placement::bind_model(p, policy_model.as_deref()) {
+            Some(bound) => Some(bound),
+            None if entry.known_from == ChatEntrySource::Served
+                && policy_model
+                    .as_deref()
+                    .is_some_and(|m| !crate::placement::places_model_on(&providers, m, &p.id)) =>
+            {
+                crate::placement::bind_model(p, None)
+            }
+            None => policy_model,
+        }
+        .unwrap_or_default();
+        let window = p
+            .model_context_windows
+            .get(&model)
+            .map(|w| (*w, ChatWindowSource::Provider))
+            .or_else(|| {
+                p.profile_id.as_ref()?;
+                crate::capability::descriptor_for(p, &self.catalog)
+                    .ok()?
+                    .max_context
+                    .filter(|w| *w > 0)
+                    .map(|w| (w, ChatWindowSource::Profile))
+            });
+        Some(ChatModel {
+            provider_id: p.id.clone(),
+            model,
+            window,
         })
     }
 
@@ -2433,18 +2633,32 @@ impl LlmGateway {
                     };
                     if head.status != 200 {
                         // A refused head of a ChatGPT sign-in entry may name a plan-usage
-                        // code (a usage limit arrives as a 429), so a bounded part of its
-                        // body is read before it is dropped. Every other entry drops the
-                        // body unread and is classified by status alone.
-                        let coded = if plan_entry {
-                            let refused = read_refused_body(body.as_mut(), Some(dl)).await;
-                            crate::plan_usage::reason_for_error_body(&refused)
+                        // code (a usage limit arrives as a 429), and a 400 of any entry may
+                        // say the request does not fit the model's window (MODULE-010 S6: the
+                        // handler then sends it once more, smaller), so for those a bounded
+                        // part of the body is read before it is dropped. Every other refusal
+                        // drops the body unread and is classified by status alone.
+                        let refused = if plan_entry || head.status == 400 {
+                            Some(read_refused_body(body.as_mut(), Some(dl)).await)
                         } else {
                             None
                         };
                         drop(body);
+                        let coded = refused
+                            .as_deref()
+                            .filter(|_| plan_entry)
+                            .and_then(crate::plan_usage::reason_for_error_body);
+                        let too_long = head.status == 400
+                            && refused
+                                .as_deref()
+                                .is_some_and(crate::providers::is_context_overflow_refusal);
                         let err = match coded {
                             Some(reason) => crate::plan_usage::plan_error(reason),
+                            None if too_long => plan_usage_status_error(
+                                plan_entry,
+                                head.status,
+                                crate::LlmError::ContextTooLong("context too long".into()),
+                            ),
                             None => {
                                 let err = match head.status {
                                     401 | 403 => crate::LlmError::ProviderError(
@@ -3022,6 +3236,7 @@ impl LlmGateway {
         mode: TranscriptMode,
     ) -> GuestMessages {
         let mut messages = self.seed_messages(agent_id);
+        let seed_len = messages.len();
         let prompt_in_seed = mode == TranscriptMode::Continue
             && !prompt.is_empty()
             && messages
@@ -3041,7 +3256,59 @@ impl LlmGateway {
         GuestMessages {
             messages,
             prompt_in_seed,
+            seed_len,
         }
+    }
+
+    /// MODULE-010 S6 — the tokens a request of `agent_id`'s own may take: the window of the
+    /// model it chats on ([`Self::chat_model_for`]: its entry's declared figure, else the model
+    /// family's) less the response reserve (PRD §11.3.5 `budget = model_limit -
+    /// response_reserve`), as its turn's assembly was budgeted. `None` when the agent has no
+    /// chat model yet, or neither knows its window: the gateway then fits a request only once a
+    /// provider refused it as too long.
+    pub fn chat_budget_for(&self, agent_id: &str) -> Option<usize> {
+        let chat = self.chat_model_for(agent_id)?;
+        let window = match chat.window {
+            Some((window, _)) => window as usize,
+            None => family_context_window(&chat.model)?,
+        };
+        Some(request_budget(window))
+    }
+
+    /// MODULE-010 S6 — fit a guest request into the agent's budget ([`crate::turn_fit`]):
+    /// the seed's history goes first, then the turn's oldest results. `None` when the budget is
+    /// not known ([`Self::chat_budget_for`]).
+    pub(crate) fn fit_guest_request(
+        &self,
+        agent_id: &str,
+        guest: &mut GuestMessages,
+        params: &ChatParams,
+    ) -> Option<crate::turn_fit::Fit> {
+        let budget = self.chat_budget_for(agent_id)?;
+        let tools = params.tools.as_deref().unwrap_or(&[]);
+        Some(crate::turn_fit::fit_request(
+            &mut guest.messages,
+            &mut guest.seed_len,
+            tools,
+            budget,
+        ))
+    }
+
+    /// MODULE-010 S6 — the one retry of a guest request a provider refused as too long:
+    /// `sent`, fitted to 80 % of its own size, within the agent's budget when that is known
+    /// ([`crate::turn_fit::retry_budget`]). `None` when the fit frees nothing; the refusal then
+    /// goes back to the guest.
+    pub(crate) fn refit_after_overflow(
+        &self,
+        mut sent: LlmRequestContext,
+        mut seed_len: usize,
+    ) -> Option<LlmRequestContext> {
+        let tools = sent.params.tools.as_deref().unwrap_or(&[]);
+        let sent_tokens = crate::turn_fit::request_tokens(&sent.messages, tools);
+        let budget =
+            crate::turn_fit::retry_budget(sent_tokens, self.chat_budget_for(&sent.agent_id));
+        let fit = crate::turn_fit::fit_request(&mut sent.messages, &mut seed_len, tools, budget);
+        (fit.tokens_after < fit.tokens_before).then_some(sent)
     }
 
     /// Append the guest prompt (if any) and the assistant reply to the turn
@@ -3062,13 +3329,11 @@ impl LlmGateway {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let slot = guard
             .entry(agent_id.to_string())
-            .or_insert_with(|| AgentTranscript {
-                scope: scope.to_string(),
-                messages: Vec::new(),
-            });
+            .or_insert_with(|| AgentTranscript::new(scope));
         if slot.scope != scope {
             slot.scope = scope.to_string();
             slot.messages.clear();
+            slot.failed.clear();
         }
         if !prompt.is_empty() {
             slot.messages.push(ChatMessage::new(ChatRole::User, prompt));
@@ -3077,11 +3342,11 @@ impl LlmGateway {
             response.text.clone(),
             response.tool_calls.clone(),
         ));
+        slot.mark_l0();
     }
 
-    /// ADR 2026-10-24 D4 — append a callable result. Matching `call-id` on the
-    /// last assistant's `tool_calls` becomes a tool-role message; otherwise a
-    /// user message so no provider sees an orphan tool result.
+    /// ADR 2026-10-24 D4 — append the result of a callable that succeeded
+    /// ([`Self::record_tool_outcome`]).
     pub fn record_tool_result(
         &self,
         agent_id: &str,
@@ -3089,6 +3354,24 @@ impl LlmGateway {
         call_id: &str,
         name: &str,
         content: &str,
+    ) {
+        self.record_tool_outcome(agent_id, scope, call_id, name, content, false);
+    }
+
+    /// ADR 2026-10-24 D4 — append a callable result. One whose `call-id` the last
+    /// assistant's `tool_calls` hold, and no tool message answered yet, becomes a
+    /// tool-role message; any other a user note (` (failed)` after the tool's name
+    /// when it failed), so no provider sees an orphan tool result. `is_error`: the
+    /// call failed — the dispatcher refused it, or it ended in an error — so it
+    /// read and changed nothing (MODULE-010 S6: the L0 rules pass it by).
+    pub fn record_tool_outcome(
+        &self,
+        agent_id: &str,
+        scope: &str,
+        call_id: &str,
+        name: &str,
+        content: &str,
+        is_error: bool,
     ) {
         if scope.is_empty() {
             return;
@@ -3099,36 +3382,83 @@ impl LlmGateway {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let slot = guard
             .entry(agent_id.to_string())
-            .or_insert_with(|| AgentTranscript {
-                scope: scope.to_string(),
-                messages: Vec::new(),
-            });
+            .or_insert_with(|| AgentTranscript::new(scope));
         if slot.scope != scope {
             slot.scope = scope.to_string();
             slot.messages.clear();
+            slot.failed.clear();
         }
         let msg = if pending_tool_call(&slot.messages, call_id) {
             ChatMessage::tool(call_id, content)
         } else {
-            ChatMessage::new(ChatRole::User, format!("[tool result: {name}]\n{content}"))
+            let failed = if is_error { " (failed)" } else { "" };
+            ChatMessage::new(
+                ChatRole::User,
+                format!("[tool result: {name}{failed}]\n{content}"),
+            )
         };
+        if is_error && msg.role == ChatRole::Tool {
+            slot.failed.insert(slot.messages.len());
+        }
         slot.messages.push(msg);
+        slot.mark_l0();
     }
 
-    /// Drop the transcript for `(agent_id, scope)` if it is the active slot,
-    /// and clear the assembled seed for that agent (adversarial-r9 W1).
+    /// End the transcript for `(agent_id, scope)` if it is the active slot, and clear the
+    /// assembled seed for that agent (adversarial-r9 W1). No later call of the turn reads the
+    /// transcript again; it is kept, as the agent's ended turn, only for the post-processor to
+    /// log ([`Self::take_turn_transcript`]).
     pub fn end_turn(&self, agent_id: &str, scope: &str) {
         let mut guard = self
             .transcripts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.get(agent_id).is_some_and(|slot| slot.scope == scope) {
-            guard.remove(agent_id);
+            if let Some(slot) = guard.remove(agent_id) {
+                self.ended_transcripts
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(agent_id.to_string(), slot);
+            }
         }
+        drop(guard);
         self.assembled
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(agent_id);
+    }
+
+    /// An invocation of `agent_id`'s guest is starting: drop the transcript of its previous
+    /// turn if nothing took it (a turn whose dispatch failed is not post-processed), so what
+    /// this invocation's post-processor logs is this invocation's own turn.
+    pub fn begin_invocation(&self, agent_id: &str) {
+        self.ended_transcripts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(agent_id);
+    }
+
+    /// PRD §11.4: the transcript of `agent_id`'s last turn, for the post-processor to log —
+    /// the ended turn's, or, for a trusted turn that is post-processed before it ends, the
+    /// active one's (no call of the turn is left to read it). Taking it empties it.
+    pub fn take_turn_transcript(&self, agent_id: &str) -> Vec<ChatMessage> {
+        self.take_turn_record(agent_id)
+            .map(|slot| slot.messages)
+            .unwrap_or_default()
+    }
+
+    /// [`Self::take_turn_transcript`], with the turn's failed results.
+    fn take_turn_record(&self, agent_id: &str) -> Option<AgentTranscript> {
+        let mut active = self
+            .transcripts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ended = self
+            .ended_transcripts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(agent_id);
+        ended.or_else(|| active.remove(agent_id))
     }
 
     /// Whether this agent's resolved placement serializes a native `tools`
@@ -3162,13 +3492,16 @@ impl LlmGateway {
         }
     }
 
+    /// The turn transcript of `(agent_id, scope)` as the next call sends it: its L0 view
+    /// (MODULE-010 S6, PRD §11.3.3 "所有加载都经过 L0 处理"). The turn log keeps it as it was
+    /// recorded ([`Self::take_turn_transcript`]).
     fn transcript_messages(&self, agent_id: &str, scope: &str) -> Vec<ChatMessage> {
         let guard = self
             .transcripts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match guard.get(agent_id) {
-            Some(slot) if slot.scope == scope => slot.messages.clone(),
+            Some(slot) if slot.scope == scope => slot.l0_view(),
             _ => Vec::new(),
         }
     }
@@ -6921,6 +7254,7 @@ mod tests {
             generate_timeout_secs: None,
             reasoning_effort: None,
             system_messages: None,
+            model_context_windows: Default::default(),
         };
         let cap1 = build_http_cap(&p1, &cfg1).unwrap();
         assert_eq!(
@@ -6974,6 +7308,7 @@ mod tests {
             generate_timeout_secs: None,
             reasoning_effort: None,
             system_messages: None,
+            model_context_windows: Default::default(),
         };
         let cap2 = build_http_cap(&p2, &cfg2).unwrap();
         assert_eq!(
@@ -7037,6 +7372,7 @@ mod tests {
                     generate_timeout_secs: None,
                     reasoning_effort: None,
                     system_messages: None,
+                    model_context_windows: Default::default(),
                 },
             )
         };
@@ -7776,3 +8112,14 @@ mod tests {
 
 #[cfg(test)]
 mod preflight_provider_tests;
+
+impl advance_shared_types::turn_log::TurnTranscriptSource for LlmGateway {
+    fn take_turn_transcript(
+        &self,
+        agent_id: &str,
+    ) -> Vec<advance_shared_types::turn_log::TranscriptMessage> {
+        self.take_turn_record(agent_id)
+            .map(|slot| slot.transcript())
+            .unwrap_or_default()
+    }
+}

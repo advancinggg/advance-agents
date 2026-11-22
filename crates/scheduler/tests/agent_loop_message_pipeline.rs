@@ -206,6 +206,11 @@ impl PostProcessorHook for RecordingPostProcessor {
         *self.captured_action_count.lock().unwrap() = Some(result.actions.len());
         Ok(())
     }
+
+    async fn turn_failed(&self, _agent_id: &str, msg: &Message) {
+        record(&self.rec, "turn_failed");
+        *self.captured_msg_id.lock().unwrap() = Some(msg.id.clone());
+    }
 }
 
 #[tokio::test]
@@ -333,6 +338,128 @@ async fn turn_persistence_finalizer_failure_skips_dispatch_and_post_process() {
             "begin_turn",
             "handle_message",
             "finish_turn",
+            "turn_failed",
+        ]
+    );
+}
+
+/// Refuses every batch, after recording it.
+struct RefusingDispatcher(Recorder);
+
+#[async_trait]
+impl AgentActionDispatcher for RefusingDispatcher {
+    async fn dispatch(
+        &self,
+        _agent_id: &str,
+        _source: &Message,
+        _actions: &[AgentAction],
+    ) -> Result<advance_shared_types::outbound::DeliveryReport, DispatchError> {
+        record(&self.0, "dispatch");
+        Err(DispatchError::TargetNotFound("nowhere".into()))
+    }
+}
+
+/// Fails every turn, as a guest that traps does.
+struct TrappingHandler(Recorder);
+
+#[async_trait]
+impl MessageHandler for TrappingHandler {
+    async fn init(&self, _config: ComponentConfig) -> Result<Vec<u8>, HookError> {
+        record(&self.0, "init");
+        Ok(Vec::new())
+    }
+    async fn handle_message(
+        &self,
+        _msg: &Message,
+        _state: Vec<u8>,
+    ) -> Result<ActionResult, HookError> {
+        record(&self.0, "handle_message");
+        Err(HookError::Failure("trapped".into()))
+    }
+}
+
+/// MODULE-010 B1: a turn that fails — its actions could not be dispatched, its guest failed,
+/// or (above) its persistence finalizer failed — is handed to the post-processor as failed
+/// (`turn_failed`), which logs it; `run` is not called for it.
+#[tokio::test]
+async fn a_turn_that_fails_is_handed_to_the_post_processor_as_failed() {
+    let config = || ComponentConfig {
+        id: "agent-failed-test".into(),
+        config_data: None,
+        trigger_context: None,
+    };
+    let instance = || WasmInstance::new(ComponentId::new("agent-failed-test".into()).unwrap());
+    let post_processor = |rec: &Recorder, msg_id: &Arc<Mutex<Option<String>>>| {
+        Arc::new(RecordingPostProcessor {
+            rec: rec.clone(),
+            captured_msg_id: Arc::clone(msg_id),
+            captured_action_count: Arc::new(Mutex::new(None)),
+        })
+    };
+    let assembler = |rec: &Recorder| {
+        Arc::new(RecordingAssembler {
+            rec: rec.clone(),
+            captured_msg_id: Arc::new(Mutex::new(None)),
+        })
+    };
+
+    // The dispatch is refused.
+    let rec: Recorder = Arc::new(Mutex::new(Vec::new()));
+    let failed_msg_id = Arc::new(Mutex::new(None));
+    AgentLoopDriverImpl::new(
+        Arc::new(RecordingMailbox(rec.clone())),
+        assembler(&rec),
+        post_processor(&rec, &failed_msg_id),
+        Arc::new(RefusingDispatcher(rec.clone())),
+        Arc::new(RecordingBootstrap(rec.clone())),
+        Arc::new(RecordingMessageHandler {
+            rec: rec.clone(),
+            captured_msg_id: Arc::new(Mutex::new(None)),
+        }),
+    )
+    .run_agent("agent:failed", config(), instance())
+    .await;
+    assert_eq!(
+        *rec.lock().unwrap(),
+        [
+            "bootstrap",
+            "init",
+            "recv",
+            "assemble",
+            "handle_message",
+            "dispatch",
+            "turn_failed",
+        ]
+    );
+    assert_eq!(
+        failed_msg_id.lock().unwrap().as_deref(),
+        Some(CANNED_MSG_ID)
+    );
+
+    // The guest fails.
+    let rec: Recorder = Arc::new(Mutex::new(Vec::new()));
+    AgentLoopDriverImpl::new(
+        Arc::new(RecordingMailbox(rec.clone())),
+        assembler(&rec),
+        post_processor(&rec, &Arc::new(Mutex::new(None))),
+        Arc::new(RecordingDispatcher {
+            rec: rec.clone(),
+            captured_action_count: Arc::new(Mutex::new(None)),
+        }),
+        Arc::new(RecordingBootstrap(rec.clone())),
+        Arc::new(TrappingHandler(rec.clone())),
+    )
+    .run_agent("agent:failed", config(), instance())
+    .await;
+    assert_eq!(
+        *rec.lock().unwrap(),
+        [
+            "bootstrap",
+            "init",
+            "recv",
+            "assemble",
+            "handle_message",
+            "turn_failed",
         ]
     );
 }

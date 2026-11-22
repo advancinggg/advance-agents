@@ -885,3 +885,91 @@ async fn t_rebuild_module002_t64_index_md_is_ordinary_content() {
     assert_eq!(row.content_preview.as_deref(), Some("# Index\nnav"));
     assert!(report.content_rows >= 1);
 }
+
+/// MODULE-010 B1: the entries cap-memory moved out of `turn-index.yaml` to the archive beside
+/// it are rebuilt too. An entry the index holds is the index's, and of an entry the archive
+/// holds twice, the later copy; neither reads as an id collision. A line of the archive that
+/// does not parse is reported.
+#[tokio::test(flavor = "current_thread")]
+async fn t_rebuild_06b_turn_index_archive() {
+    let ws = tempdir();
+    let root = ws.path().to_path_buf();
+    make_agent_root(&root, "");
+    write_turn_index_yaml(
+        &root,
+        "",
+        "task-001",
+        "turns:\n- turn: 3\n  timestamp: \"2026-03-23T12:00:00.000Z\"\n  digest: \"third, as indexed\"\n  collapsed_view: \"third body\"\n",
+    );
+    std::fs::write(
+        root.join(".agent/tasks/active/task-001/turn-index-archive.jsonl"),
+        concat!(
+            "{\"turn\":1,\"timestamp\":\"2026-03-23T10:00:00.000Z\",\"digest\":\"first, moved once\"}\n",
+            "{\"turn\":2,\"timestamp\":\"2026-03-23T11:00:00.000Z\",\"digest\":\"second, moved once\"}\n",
+            "not an entry\n",
+            "{\"turn\":1,\"timestamp\":\"2026-03-23T10:00:00.000Z\",\"digest\":\"first, moved again\"}\n",
+            "{\"turn\":3,\"timestamp\":\"2026-03-23T12:00:00.000Z\",\"digest\":\"third, as archived\"}\n",
+        ),
+    )
+    .unwrap();
+    let handle = db_at(&root.join(".runtime").join("index.db"));
+    let rebuilder = build_impl(handle.clone(), ConstEmbedder::new(), root);
+    let report = rebuilder.rebuild_full().await.unwrap();
+    assert_eq!(report.turn_rows, 3, "{:?}", report.errors);
+    let conn = handle.get_conn().unwrap();
+    let digest = |turn: i64| -> String {
+        conn.query_row(
+            "SELECT digest FROM turn_index WHERE task_id = 'task-001' AND turn = ?1",
+            [turn],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(digest(1), "first, moved again");
+    assert_eq!(digest(2), "second, moved once");
+    assert_eq!(digest(3), "third, as indexed");
+    assert!(
+        report.errors.iter().all(|e| !e.contains("collision")),
+        "{:?}",
+        report.errors
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.contains("turn-index-archive.jsonl line 3")),
+        "{:?}",
+        report.errors
+    );
+}
+
+/// MODULE-010 B1: a task's archive is rebuilt when its index does not parse, and when its index
+/// is gone.
+#[tokio::test(flavor = "current_thread")]
+async fn t_rebuild_06c_an_archive_without_a_readable_index() {
+    let ws = tempdir();
+    let root = ws.path().to_path_buf();
+    make_agent_root(&root, "");
+    write_turn_index_yaml(&root, "", "task-001", "turns: [not a list of entries\n");
+    std::fs::write(
+        root.join(".agent/tasks/active/task-001/turn-index-archive.jsonl"),
+        "{\"turn\":1,\"timestamp\":\"2026-03-23T10:00:00.000Z\",\"digest\":\"first, beside a broken index\"}\n",
+    )
+    .unwrap();
+    let gone = root.join(".agent/tasks/active/task-002");
+    std::fs::create_dir_all(&gone).unwrap();
+    std::fs::write(
+        gone.join("turn-index-archive.jsonl"),
+        "{\"turn\":4,\"timestamp\":\"2026-03-23T13:00:00.000Z\",\"digest\":\"fourth, its index gone\"}\n",
+    )
+    .unwrap();
+    let handle = db_at(&root.join(".runtime").join("index.db"));
+    let rebuilder = build_impl(handle.clone(), ConstEmbedder::new(), root);
+    let report = rebuilder.rebuild_full().await.unwrap();
+    assert_eq!(report.turn_rows, 2, "{:?}", report.errors);
+    assert!(
+        report.errors.iter().any(|e| e.contains("parse")),
+        "{:?}",
+        report.errors
+    );
+}

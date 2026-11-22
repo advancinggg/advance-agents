@@ -54,6 +54,7 @@ fn mesh_cfg() -> LlmProviderConfig {
         generate_timeout_secs: None,
         reasoning_effort: None,
         system_messages: None,
+        model_context_windows: Default::default(),
     }
 }
 
@@ -330,6 +331,7 @@ async fn t135_gateway_resolve_returns_local_prefix() {
         generate_timeout_secs: None,
         reasoning_effort: None,
         system_messages: None,
+        model_context_windows: Default::default(),
     };
     let mut cfg = fixture_runtime_config();
     cfg.llm_providers = vec![local];

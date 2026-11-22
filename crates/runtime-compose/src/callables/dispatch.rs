@@ -254,7 +254,14 @@ impl CallableDispatcher {
                 .and_then(std::sync::Weak::upgrade),
             ctx.transcript_scope.as_deref(),
         ) {
-            gw.record_tool_result(&ctx.agent_id, scope, record_id, &event_name, &content);
+            gw.record_tool_outcome(
+                &ctx.agent_id,
+                scope,
+                record_id,
+                &event_name,
+                &content,
+                is_error,
+            );
         }
         result
     }

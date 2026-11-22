@@ -47,8 +47,15 @@ fn map_status_static(status: u16, body: &[u8]) -> LlmError {
     }
     match status {
         400 => {
+            // The exact type literal only, no message probe — under the transient veto every
+            // 400 path applies (MODULE-009): a transient code beside the literal makes the body
+            // contradictory, and it stays `ProviderError`.
             if let Ok(v) = serde_json::from_slice::<Value>(body) {
-                if v["error"]["type"].as_str() == Some("context_length_exceeded") {
+                if v["error"]["type"].as_str() == Some("context_length_exceeded")
+                    && !crate::providers::is_transient_error_type_5xx(
+                        v["error"]["code"].as_str().unwrap_or(""),
+                    )
+                {
                     return LlmError::ContextTooLong("context too long".into());
                 }
             }
@@ -683,6 +690,22 @@ mod tests {
         let message_only = br#"{"error":{"message":"prompt is too long for the context window"}}"#;
         assert!(matches!(
             map_status_static(400, message_only),
+            LlmError::ProviderError(msg) if msg == "http 400"
+        ));
+    }
+
+    /// The exact type beside a transient code is a contradictory body: it stays
+    /// `ProviderError`, as on the chat-completions path.
+    #[test]
+    fn responses_400_exact_type_beside_a_transient_code_is_not_an_overflow() {
+        let plain = br#"{"error":{"type":"context_length_exceeded","message":"too long"}}"#;
+        assert!(matches!(
+            map_status_static(400, plain),
+            LlmError::ContextTooLong(_)
+        ));
+        let vetoed = br#"{"error":{"type":"context_length_exceeded","code":"server_error","message":"too long"}}"#;
+        assert!(matches!(
+            map_status_static(400, vetoed),
             LlmError::ProviderError(msg) if msg == "http 400"
         ));
     }

@@ -6,7 +6,9 @@
 //! captured at `84a82451` (owner ruling 2026-10-03: the schema changed on the main line after
 //! v0.1.26, `api_version` did not), and it is re-captured only when a deliberate client-api
 //! contract change regenerates the artifacts with `gen_client_sdk --write`, never for a
-//! change of the composition library.
+//! change of the composition library. It was re-captured when the providers family gained
+//! `model_context_windows` and the context family its model and history fields, all optional
+//! (MODULE-010; `api_version` unchanged).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,7 +16,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 const LANE_BASE: &str = include_str!("fixtures/sdk_artifacts_lane_base.sha256");
-const SCHEMA_HASH: &str = "9a10e1702510baf50d2be1a1e9ebc90820dcd1b320d45389824917b46f4883aa";
+const SCHEMA_HASH: &str = "8334ac49e67056584ba3f4a2c8059cf0de95bc8832826d0135622213da3cb6ef";
 const API_VERSION: &str = "2026-09-17";
 
 fn artifacts_dir() -> PathBuf {

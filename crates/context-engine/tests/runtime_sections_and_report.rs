@@ -389,3 +389,124 @@ async fn model_window_override_wins_over_table() {
     asm.assemble(ctx).await.unwrap();
     assert_eq!(sink.0.lock().unwrap()[0].model_context_window, 32_000);
 }
+
+/// MODULE-010 D5 (PRD §11.3.5 `model_limit = llm_gateway.get_context_window()`): the budget
+/// is the window of the model the agent chats on, read at every assembly. The entry's own
+/// figure wins over the family table; with no figure the family table answers for THAT
+/// model; with no chat entry the assembly context's model is used; Tier 1b ⑦ and the report
+/// name the entry and model.
+#[tokio::test]
+async fn the_budget_is_the_window_of_the_model_the_agent_chats_on() {
+    use advance_context_engine::{ChatModelWindow, WindowSource};
+    let chat: Arc<Mutex<Option<ChatModelWindow>>> = Arc::new(Mutex::new(Some(ChatModelWindow {
+        provider_id: "along".into(),
+        model: "deepseek-ai/DeepSeek-V4.1-Flash-1017".into(),
+        declared: Some((1_048_576, WindowSource::Provider)),
+    })));
+    let source = {
+        let chat = chat.clone();
+        Arc::new(move || chat.lock().unwrap().clone())
+    };
+    let sink = Arc::new(CapturingSink::default());
+    let asm = assembler(
+        Arc::new(NullEmbedding),
+        Arc::new(NullTaskIndex),
+        Arc::new(NullUnifiedSearch),
+        Arc::new(NullL4TaskSummary),
+        Arc::new(NullL5Synthesis),
+    )
+    .with_runtime_info(Arc::new(FixtureRuntimeInfo(runtime_view())))
+    .with_chat_model_source(source)
+    .with_report_sink(sink.clone());
+    let run = |model: &str| {
+        let mut ctx = stub_ctx();
+        ctx.model = model.into();
+        ctx
+    };
+
+    // 1. The entry's declared window: 1 048 576, reserve capped at 30 000.
+    let out = asm.assemble(run("stub-model")).await.unwrap();
+    let state = &out.messages[idx_of(&out.messages, "# Runtime State")].content;
+    assert!(
+        state.contains("- llm: along / deepseek-ai/DeepSeek-V4.1-Flash-1017"),
+        "{state}"
+    );
+    assert!(
+        state.contains("- context window: 1048576 tokens (prompt budget 1018576)"),
+        "{state}"
+    );
+    {
+        let reports = sink.0.lock().unwrap();
+        let r = reports.last().unwrap();
+        assert_eq!(r.model, "deepseek-ai/DeepSeek-V4.1-Flash-1017");
+        assert_eq!(r.model_provider.as_deref(), Some("along"));
+        assert_eq!(r.model_context_window, 1_048_576);
+        assert_eq!(r.response_reserve, 30_000);
+        assert_eq!(r.budget_tokens, 1_018_576);
+        assert_eq!(r.model_window_source, "provider");
+        assert_eq!(r.progressive_mode, "wide");
+    }
+
+    // 2. No figure: the family table for the CHAT model, not for the context's model.
+    *chat.lock().unwrap() = Some(ChatModelWindow {
+        provider_id: "openai".into(),
+        model: "claude-sonnet-4".into(),
+        declared: None,
+    });
+    asm.assemble(run("stub-model")).await.unwrap();
+    {
+        let reports = sink.0.lock().unwrap();
+        let r = reports.last().unwrap();
+        assert_eq!(
+            (
+                r.model.as_str(),
+                r.model_context_window,
+                r.model_window_source.as_str()
+            ),
+            ("claude-sonnet-4", 200_000, "family")
+        );
+    }
+
+    // 3. No chat entry yet: the context's model; unknown to the table → fail-safe-small.
+    *chat.lock().unwrap() = None;
+    let out = asm.assemble(run("stub-model")).await.unwrap();
+    let state = &out.messages[idx_of(&out.messages, "# Runtime State")].content;
+    assert!(
+        state.contains("- llm: openai / gpt-4o"),
+        "the wiring's own ⑦: {state}"
+    );
+    {
+        let reports = sink.0.lock().unwrap();
+        let r = reports.last().unwrap();
+        assert_eq!(r.model, "stub-model");
+        assert_eq!(r.model_provider, None);
+        assert_eq!(r.model_context_window, 8_192);
+        assert_eq!(r.model_window_source, "fallback");
+    }
+
+    // 4. The composition root's fixed window still wins over every source.
+    *chat.lock().unwrap() = Some(ChatModelWindow {
+        provider_id: "along".into(),
+        model: "deepseek-ai/DeepSeek-V4.1-Flash-1017".into(),
+        declared: Some((1_048_576, WindowSource::Provider)),
+    });
+    let fixed_sink = Arc::new(CapturingSink::default());
+    let fixed_chat = chat.clone();
+    let fixed = assembler(
+        Arc::new(NullEmbedding),
+        Arc::new(NullTaskIndex),
+        Arc::new(NullUnifiedSearch),
+        Arc::new(NullL4TaskSummary),
+        Arc::new(NullL5Synthesis),
+    )
+    .with_chat_model_source(Arc::new(move || fixed_chat.lock().unwrap().clone()))
+    .with_model_context_window(Some(32_000))
+    .with_report_sink(fixed_sink.clone());
+    fixed.assemble(run("stub-model")).await.unwrap();
+    let reports = fixed_sink.0.lock().unwrap();
+    let r = reports.last().unwrap();
+    assert_eq!(
+        (r.model_context_window, r.model_window_source.as_str()),
+        (32_000, "override")
+    );
+}

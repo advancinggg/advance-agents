@@ -2940,3 +2940,111 @@ fn a_sign_in_entry_budget_is_capped_at_the_streamed_exchange_lifetime() {
     .expect("an API-key entry takes 900 s");
     assert_eq!(cfg.llm_providers[0].generate_timeout_secs, Some(900));
 }
+
+// ── `model-context-windows` on a provider entry (MODULE-010 D5) ─────────────────────────────
+
+#[test]
+fn model_context_windows_parse_on_every_class_and_are_empty_by_default() {
+    for class in ["cloud-http", "local", "mesh-remote", "agent-cli"] {
+        let cfg = load_knob_yaml(&provider_knob_yaml("gw", class, ""))
+            .unwrap_or_else(|e| panic!("{class} without the key: {e}"));
+        assert!(
+            cfg.llm_providers[0].model_context_windows.is_empty(),
+            "{class}"
+        );
+        let cfg = load_knob_yaml(&provider_knob_yaml(
+            "gw",
+            class,
+            "    model-context-windows:\n      m: 1048576\n      deepseek-ai/DeepSeek-V4.1-Flash-1017: 1\n",
+        ))
+        .unwrap_or_else(|e| panic!("{class}: {e}"));
+        let p = &cfg.llm_providers[0];
+        assert_eq!(
+            p.model_context_windows.get("m"),
+            Some(&1_048_576),
+            "{class}"
+        );
+        assert_eq!(
+            p.model_context_windows
+                .get("deepseek-ai/DeepSeek-V4.1-Flash-1017"),
+            Some(&1),
+            "{class}"
+        );
+        assert!(
+            format!("{p:?}").contains("model_context_windows"),
+            "Debug names the key"
+        );
+    }
+    let at_most: String = (0..MAX_MODEL_CONTEXT_WINDOWS)
+        .map(|i| format!("      model-{i}: {MAX_MODEL_CONTEXT_WINDOW}\n"))
+        .collect();
+    let cfg = load_knob_yaml(&provider_knob_yaml(
+        "gw",
+        "cloud-http",
+        &format!("    model-context-windows:\n{at_most}"),
+    ))
+    .expect("the largest table loads");
+    assert_eq!(
+        cfg.llm_providers[0].model_context_windows.len(),
+        MAX_MODEL_CONTEXT_WINDOWS
+    );
+    assert_eq!(
+        (
+            MAX_MODEL_CONTEXT_WINDOW,
+            MAX_MODEL_CONTEXT_WINDOWS,
+            MAX_MODEL_CONTEXT_WINDOW_ID_LEN
+        ),
+        (100_000_000, 64, 256)
+    );
+}
+
+#[test]
+fn model_context_windows_refuse_zero_oversized_and_bad_tables() {
+    let too_many: String = (0..=MAX_MODEL_CONTEXT_WINDOWS)
+        .map(|i| format!("      model-{i}: 1000\n"))
+        .collect();
+    let long_id = "m".repeat(MAX_MODEL_CONTEXT_WINDOW_ID_LEN + 1);
+    let cases: Vec<(String, &str)> = vec![
+        (
+            "    model-context-windows:\n      m: 0\n".to_string(),
+            "model-context-windows: the window of m must be 1..=100000000 tokens",
+        ),
+        (
+            "    model-context-windows:\n      m: 100000001\n".to_string(),
+            "model-context-windows: the window of m must be 1..=100000000 tokens",
+        ),
+        (
+            "    model-context-windows:\n      m: -5\n".to_string(),
+            "model-context-windows",
+        ),
+        (
+            "    model-context-windows:\n      m: \"128000\"\n".to_string(),
+            "model-context-windows",
+        ),
+        (
+            "    model-context-windows:\n      \" \": 1000\n".to_string(),
+            "a model id is empty, too long or holds a control character",
+        ),
+        (
+            format!("    model-context-windows:\n      {long_id}: 1000\n"),
+            "a model id is empty, too long or holds a control character",
+        ),
+        (
+            format!("    model-context-windows:\n{too_many}"),
+            "model-context-windows lists more than 64 models",
+        ),
+        (
+            "    model-context-windows: 128000\n".to_string(),
+            "model-context-windows",
+        ),
+    ];
+    for (block, want) in cases {
+        let err = load_knob_yaml(&provider_knob_yaml("gw", "cloud-http", &block))
+            .expect_err(&format!("must refuse {block:?}"));
+        assert!(err.contains(want), "{block:?}: {err}");
+    }
+    let mut table = std::collections::BTreeMap::new();
+    assert_eq!(model_context_windows_refusal(&table), None);
+    table.insert("m".to_string(), 0);
+    assert!(model_context_windows_refusal(&table).is_some());
+}

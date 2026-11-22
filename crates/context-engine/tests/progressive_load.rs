@@ -94,6 +94,20 @@ fn t_mode_boundaries() {
     assert_eq!(model_context_window("claude-3-5-sonnet-20241022"), 200_000);
     assert_eq!(model_context_window("gpt-4o-2024-11-20"), 128_000);
     assert_eq!(model_context_window("gpt-4"), 8_192);
+    // D5: DeepSeek V4 is a 1M family (NEAR lists 1 048 576); older DeepSeek stays at 128K.
+    assert_eq!(
+        model_context_window("deepseek-ai/DeepSeek-V4.1-Flash-1017"),
+        1_048_576
+    );
+    assert_eq!(model_context_window("deepseek-chat"), 128_000);
+    assert_eq!(
+        advance_context_engine::family_context_window("totally-made-up"),
+        None
+    );
+    assert_eq!(
+        advance_context_engine::family_context_window("claude-3-5-sonnet-20241022"),
+        Some(200_000)
+    );
     // response_reserve = min(limit*0.15, 30_000), integer math.
     assert_eq!(response_reserve(SMALL_MODEL_WINDOW), 1_228); // 8192*15/100
     assert_eq!(response_reserve(200_000), 30_000); // capped
@@ -130,14 +144,16 @@ fn t_model_window_prefix_match_is_documented_behavior() {
 /// tag suffixes normalize onto the same rows.
 #[test]
 fn t_model_window_extended_families_and_normalization() {
-    assert_eq!(model_context_window("gpt-5"), 400_000);
-    assert_eq!(model_context_window("gpt-5-mini-2026-01-01"), 400_000);
+    // 400K in all, of which at most 272K input.
+    assert_eq!(model_context_window("gpt-5"), 272_000);
+    assert_eq!(model_context_window("gpt-5-mini-2026-01-01"), 272_000);
     assert_eq!(model_context_window("gpt-4.1-mini"), 1_000_000);
     assert_eq!(model_context_window("o4-mini"), 200_000);
     assert_eq!(model_context_window("claude-sonnet-4-5"), 200_000);
     assert_eq!(model_context_window("gemini-2.5-pro"), 1_000_000);
     assert_eq!(model_context_window("deepseek-chat"), 128_000);
-    assert_eq!(model_context_window("qwen3-235b"), 128_000);
+    // The Qwen3 open models serve 32K natively.
+    assert_eq!(model_context_window("qwen3-235b"), 32_768);
     assert_eq!(model_context_window("qwen2.5-7b-instruct"), 32_768);
     assert_eq!(model_context_window("llama-3.1-8b"), 128_000);
     assert_eq!(model_context_window("kimi-k2-0905"), 128_000);
@@ -150,6 +166,68 @@ fn t_model_window_extended_families_and_normalization() {
     assert_eq!(model_context_window("llama3.1:70b"), 128_000);
     assert_eq!(model_context_window("GPT-4O-LATEST"), 128_000);
     assert_eq!(model_context_window("mistral-large-latest"), 128_000);
+    // Where a family ships several windows, the members with the smaller one get it.
+    assert_eq!(model_context_window("gpt-5-chat-latest"), 128_000);
+    assert_eq!(model_context_window("o1-mini"), 128_000);
+    assert_eq!(model_context_window("o1-preview-2024-09-12"), 128_000);
+    assert_eq!(model_context_window("o1"), 200_000);
+    assert_eq!(model_context_window("claude-2.1"), 100_000);
+    assert_eq!(model_context_window("claude-instant-1.2"), 100_000);
+    assert_eq!(model_context_window("qwen3-max"), 128_000);
+    assert_eq!(model_context_window("qwen-plus"), 128_000);
+    assert_eq!(model_context_window("mistral-small-latest"), 32_768);
+    assert_eq!(model_context_window("mistral-medium-2505"), 128_000);
+    assert_eq!(model_context_window("moonshot-v1-8k"), 8_192);
+    assert_eq!(model_context_window("moonshot-v1-32k"), 32_768);
+    assert_eq!(model_context_window("moonshot-v1-128k"), 128_000);
+    assert_eq!(model_context_window("gemma-3-27b-it"), 32_768);
+    assert_eq!(model_context_window("gemma-2-9b"), 8_192);
+    assert_eq!(model_context_window("gpt-5.1-chat-latest"), 128_000);
+    assert_eq!(model_context_window("gpt-5.1"), 272_000);
+    assert_eq!(model_context_window("qwen-max"), 32_768);
+    assert_eq!(model_context_window("qwen-max-2025-01-25"), 32_768);
+    assert_eq!(model_context_window("mistral-large-2402"), 32_768);
+    assert_eq!(model_context_window("mistral-large-2411"), 128_000);
+    assert_eq!(model_context_window("mistral-medium-2312"), 32_768);
+    assert_eq!(model_context_window("glm-4v"), 2_048);
+    assert_eq!(model_context_window("glm-4v-plus-0111"), 8_192);
+    assert_eq!(model_context_window("glm-4-airx"), 8_192);
+    assert_eq!(model_context_window("glm-4-air"), 128_000);
+    assert_eq!(model_context_window("glm-4.5v"), 64_000);
+    assert_eq!(model_context_window("glm-4.1v-thinking-flash"), 64_000);
+    assert_eq!(model_context_window("gpt-3.5-turbo-instruct"), 4_096);
+    assert_eq!(model_context_window("gpt-3.5-turbo-0125"), 16_385);
+    assert_eq!(model_context_window("gemini-2.5-flash-preview-tts"), 8_192);
+    assert_eq!(model_context_window("gemini-2.5-flash-image"), 32_000);
+    assert_eq!(
+        model_context_window("gemini-2.0-flash-preview-image-generation"),
+        32_000
+    );
+    assert_eq!(model_context_window("gemini-2.5-flash"), 1_000_000);
+    assert_eq!(
+        model_context_window("deepseek-ai/deepseek-coder-6.7b-instruct"),
+        4_096
+    );
+    assert_eq!(
+        model_context_window("deepseek-ai/deepseek-coder-7b-instruct-v1.5"),
+        4_096
+    );
+    assert_eq!(
+        model_context_window("gemini-2.5-flash-native-audio-preview-12-2025"),
+        32_768
+    );
+    assert_eq!(
+        model_context_window("gemini-live-2.5-flash-native-audio"),
+        32_768
+    );
+    assert_eq!(
+        model_context_window("gemini-3.1-flash-live-preview"),
+        32_768
+    );
+    assert_eq!(
+        model_context_window("deepseek-coder-v2-lite-instruct"),
+        128_000
+    );
 }
 
 // ── t_assembler_mode_select — Integration: assemble() bounds Tier-3 ────────

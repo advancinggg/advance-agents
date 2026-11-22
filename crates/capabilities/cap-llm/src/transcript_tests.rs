@@ -806,3 +806,464 @@ async fn the_stream_path_sends_and_records_the_prompt_once() {
         "the recorded transcript does not repeat the prompt"
     );
 }
+
+// ── MODULE-010 S6: the L0 view, the fit to the window, one retry after a too-long refusal ────
+
+const COMPLETIONS: &str = "/v1/chat/completions";
+
+/// The openai fixture entry's default model: what a request of the agent's own that names no
+/// model is sent with, so the model the agent chats on.
+const DEFAULT_MODEL: &str = "gpt-4o-2024-08-06";
+
+fn ok_text_with_call(content: &str, id: &str, name: &str, arguments: &str) -> HttpResponse {
+    let body = serde_json::json!({
+        "choices": [{
+            "message": {
+                "content": content,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 8},
+        "model": "gpt-4o-mini",
+    });
+    HttpResponse {
+        status: 200,
+        headers: vec![],
+        body: serde_json::to_vec(&body).unwrap(),
+    }
+}
+
+/// How NEAR AI refuses an input past the model's window (witnessed 2026-11-21 on its vLLM
+/// stack): a 400 `invalid_request_error` with no code, the overflow said in the message.
+const NEAR_TOO_LONG: &[u8] = br#"{"error":{"message":"This model's maximum context length is 32768 tokens. However, your prompt contains at least 32769 input tokens, which exceeds this limit even without any output tokens. Please reduce the length of the input prompt. (parameter=input_tokens, value=32769)","type":"invalid_request_error","param":null,"code":null}}"#;
+
+fn too_long() -> HttpResponse {
+    HttpResponse {
+        status: 400,
+        headers: vec![],
+        body: NEAR_TOO_LONG.to_vec(),
+    }
+}
+
+/// A gateway whose head entry declares `window` tokens for its default model, the entry the
+/// agent chats on.
+fn gateway_with_window(
+    chain: &Arc<MockHttpSecurityChain>,
+    window: Option<u32>,
+) -> Arc<crate::gateway::LlmGateway> {
+    use crate::test_support::{
+        fixture_runtime_config, no_op_repetition_guard, MockRunBudget, MockRuntimeConfigProvider,
+    };
+    let mut cfg = fixture_runtime_config();
+    if let Some(window) = window {
+        cfg.llm_providers[0]
+            .model_context_windows
+            .insert(DEFAULT_MODEL.into(), window);
+    }
+    let gw = crate::gateway::LlmGateway::new(
+        Arc::new(MockRuntimeConfigProvider::new(cfg)),
+        Arc::clone(chain) as Arc<dyn advance_shared_types::security_validator::HttpSecurityChain>,
+        Arc::new(MockRunBudget::default()),
+        Arc::new(MockEventBusEmit::default()),
+        no_op_repetition_guard(),
+        "test-agent".into(),
+    );
+    let gw = Arc::new(gw);
+    gw.test_agent_chats_on(AGENT, "openai");
+    gw
+}
+
+fn publish_seed(gw: &crate::gateway::LlmGateway, history_bytes: usize) {
+    let mut seed = vec![LlmMessage {
+        role: "system".into(),
+        content: IDENTITY.into(),
+    }];
+    if history_bytes > 0 {
+        seed.push(LlmMessage {
+            role: "system".into(),
+            content: format!(
+                "{}{}",
+                advance_shared_types::context::RECENT_TURNS_HEADING,
+                "h".repeat(history_bytes)
+            ),
+        });
+    }
+    gw.publish_assembled(AGENT, Arc::from(seed));
+}
+
+fn bodies(chain: &MockHttpSecurityChain) -> Vec<Vec<Value>> {
+    chain
+        .call_log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| messages_json(&r.body))
+        .collect()
+}
+
+/// The content of the tool-role message answering `call_id`.
+fn tool_content(body: &[Value], call_id: &str) -> String {
+    body.iter()
+        .find(|m| m["role"] == "tool" && m["tool_call_id"] == call_id)
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or_else(|| panic!("no tool message for {call_id}: {body:?}"))
+        .to_string()
+}
+
+fn carries_history(body: &[Value]) -> bool {
+    body.iter().any(|m| {
+        m["content"]
+            .as_str()
+            .is_some_and(advance_shared_types::context::is_tier3_history)
+    })
+}
+
+fn generate_handler(gw: &Arc<crate::gateway::LlmGateway>) -> AgentLlmGenerateHandler {
+    AgentLlmGenerateHandler {
+        gateway: Arc::clone(gw),
+        turn_cost: None,
+    }
+}
+
+/// PRD §11.3.3 Step A: a file the turn read again reaches the next call once — the older
+/// result is superseded, and keeps its role and its tool-call id.
+#[tokio::test]
+async fn l0_a_file_read_twice_reaches_the_next_call_once() {
+    let chain = Arc::new(MockHttpSecurityChain::default());
+    chain.push_response(
+        COMPLETIONS,
+        Ok(ok_tools("c1", "read", r#"{"path":"plan.md"}"#)),
+    );
+    chain.push_response(
+        COMPLETIONS,
+        Ok(ok_tools("c2", "read", r#"{"path":"plan.md"}"#)),
+    );
+    chain.push_response(COMPLETIONS, Ok(ok_text("done", 30, 2)));
+    let gw = test_gateway_with(Arc::new(MockEventBusEmit::default()), Arc::clone(&chain));
+    publish_seed(&gw, 0);
+    let handler = generate_handler(&gw);
+    let ctx = turn_ctx();
+    expect_ok(
+        &handler
+            .call(ctx.clone(), vec![prompt_val("plan it")], 1)
+            .await
+            .unwrap(),
+    );
+    gw.record_tool_result(AGENT, TURN, "c1", "read", "PLAN: the first version");
+    expect_ok(
+        &handler
+            .call(ctx.clone(), vec![prompt_val("")], 1)
+            .await
+            .unwrap(),
+    );
+    gw.record_tool_result(AGENT, TURN, "c2", "read", "PLAN: the second version");
+    expect_ok(&handler.call(ctx, vec![prompt_val("")], 1).await.unwrap());
+
+    let bodies = bodies(&chain);
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(tool_content(&bodies[1], "c1"), "PLAN: the first version");
+    assert_eq!(
+        tool_content(&bodies[2], "c1"),
+        "[superseded: a later read of plan.md replaces this result]"
+    );
+    assert_eq!(tool_content(&bodies[2], "c2"), "PLAN: the second version");
+    // The turn log keeps what the view shortens.
+    let raw = gw.take_turn_transcript(AGENT);
+    assert!(raw.iter().any(|m| m.content == "PLAN: the first version"));
+}
+
+/// PRD §11.3.3 Steps B and C: a read a later write of the file made stale reaches the next
+/// call as its skeleton — the call, and the model's conclusion after it.
+#[tokio::test]
+async fn l0_a_read_a_later_write_made_stale_is_sent_as_its_skeleton() {
+    let chain = Arc::new(MockHttpSecurityChain::default());
+    chain.push_response(
+        COMPLETIONS,
+        Ok(ok_tools("c1", "read", r#"{"path":"plan.md"}"#)),
+    );
+    chain.push_response(
+        COMPLETIONS,
+        Ok(ok_text_with_call(
+            "The plan has three steps. I add a fourth.",
+            "c2",
+            "write",
+            r#"{"path":"plan.md","content":"four steps"}"#,
+        )),
+    );
+    chain.push_response(COMPLETIONS, Ok(ok_text("done", 30, 2)));
+    let gw = test_gateway_with(Arc::new(MockEventBusEmit::default()), Arc::clone(&chain));
+    publish_seed(&gw, 0);
+    let handler = generate_handler(&gw);
+    let ctx = turn_ctx();
+    expect_ok(
+        &handler
+            .call(ctx.clone(), vec![prompt_val("extend the plan")], 1)
+            .await
+            .unwrap(),
+    );
+    gw.record_tool_result(AGENT, TURN, "c1", "read", "1. Sow 2. Water 3. Wait");
+    expect_ok(
+        &handler
+            .call(ctx.clone(), vec![prompt_val("")], 1)
+            .await
+            .unwrap(),
+    );
+    gw.record_tool_result(AGENT, TURN, "c2", "write", "wrote plan.md");
+    expect_ok(&handler.call(ctx, vec![prompt_val("")], 1).await.unwrap());
+
+    let bodies = bodies(&chain);
+    assert_eq!(tool_content(&bodies[1], "c1"), "1. Sow 2. Water 3. Wait");
+    assert_eq!(
+        tool_content(&bodies[2], "c1"),
+        "[collapsed] read(path=plan.md) → The plan has three steps."
+    );
+    assert_eq!(tool_content(&bodies[2], "c2"), "wrote plan.md");
+}
+
+/// A request inside the window is sent with its history.
+#[tokio::test]
+async fn a_request_inside_the_window_keeps_the_seed_history() {
+    let chain = Arc::new(MockHttpSecurityChain::default());
+    chain.push_response(COMPLETIONS, Ok(ok_text("ok", 30, 2)));
+    let gw = gateway_with_window(&chain, Some(100_000));
+    publish_seed(&gw, 8_000);
+    expect_ok(
+        &generate_handler(&gw)
+            .call(turn_ctx(), vec![prompt_val("go")], 1)
+            .await
+            .unwrap(),
+    );
+    assert!(carries_history(&bodies(&chain)[0]));
+}
+
+/// Over the window, the seed's Tier 3 history goes first; the identity and the prompt stay.
+#[tokio::test]
+async fn an_over_window_request_takes_the_seed_history_out_first() {
+    let chain = Arc::new(MockHttpSecurityChain::default());
+    chain.push_response(COMPLETIONS, Ok(ok_text("ok", 30, 2)));
+    // 2 000 tokens less the 300-token reserve: no room for 8 KB of history.
+    let gw = gateway_with_window(&chain, Some(2_000));
+    assert_eq!(gw.chat_budget_for(AGENT), Some(1_700));
+    publish_seed(&gw, 8_000);
+    expect_ok(
+        &generate_handler(&gw)
+            .call(turn_ctx(), vec![prompt_val("go")], 1)
+            .await
+            .unwrap(),
+    );
+    let body = &bodies(&chain)[0];
+    assert!(!carries_history(body), "{body:?}");
+    assert_eq!(body[0]["content"], IDENTITY);
+    assert_eq!(body.last().unwrap()["content"], "go");
+}
+
+/// Then the turn's oldest results are cut to one line; the last two stay whole.
+#[tokio::test]
+async fn then_the_turns_oldest_results_are_cut_and_its_last_two_kept() {
+    let chain = Arc::new(MockHttpSecurityChain::default());
+    for (id, path) in [("c1", "a.md"), ("c2", "b.md"), ("c3", "c.md")] {
+        let args = serde_json::json!({ "path": path }).to_string();
+        chain.push_response(COMPLETIONS, Ok(ok_tools(id, "read", &args)));
+    }
+    chain.push_response(COMPLETIONS, Ok(ok_text("done", 30, 2)));
+    let gw = gateway_with_window(&chain, Some(2_000));
+    publish_seed(&gw, 0);
+    let handler = generate_handler(&gw);
+    let ctx = turn_ctx();
+    expect_ok(
+        &handler
+            .call(ctx.clone(), vec![prompt_val("read three")], 1)
+            .await
+            .unwrap(),
+    );
+    for id in ["c1", "c2", "c3"] {
+        gw.record_tool_result(AGENT, TURN, id, "read", &"r".repeat(3_000));
+        expect_ok(
+            &handler
+                .call(ctx.clone(), vec![prompt_val("")], 1)
+                .await
+                .unwrap(),
+        );
+    }
+    let bodies = bodies(&chain);
+    assert_eq!(bodies.len(), 4);
+    // Two results fit whole.
+    assert_eq!(tool_content(&bodies[2], "c1").len(), 3_000);
+    // Three do not: the oldest is cut, the last two are whole.
+    assert_eq!(
+        tool_content(&bodies[3], "c1"),
+        "[cut to fit the model's context window: the result of read(path=a.md), 3000 bytes]"
+    );
+    assert_eq!(tool_content(&bodies[3], "c2").len(), 3_000);
+    assert_eq!(tool_content(&bodies[3], "c3").len(), 3_000);
+}
+
+/// A request the provider refuses as too long is sent once more, fitted to 80 % of its size:
+/// without the history the window it was budgeted with did not rule out.
+#[tokio::test]
+async fn a_request_refused_as_too_long_is_sent_once_more_smaller() {
+    let chain = Arc::new(MockHttpSecurityChain::default());
+    chain.push_response(COMPLETIONS, Ok(too_long()));
+    chain.push_response(COMPLETIONS, Ok(ok_text("answered", 30, 2)));
+    let gw = test_gateway_with(Arc::new(MockEventBusEmit::default()), Arc::clone(&chain));
+    publish_seed(&gw, 8_000);
+    expect_ok(
+        &generate_handler(&gw)
+            .call(turn_ctx(), vec![prompt_val("go")], 1)
+            .await
+            .unwrap(),
+    );
+    let bodies = bodies(&chain);
+    assert_eq!(bodies.len(), 2);
+    assert!(carries_history(&bodies[0]));
+    assert!(!carries_history(&bodies[1]));
+    assert_eq!(bodies[1][0]["content"], IDENTITY);
+    assert_eq!(bodies[1].last().unwrap()["content"], "go");
+}
+
+/// A second refusal goes back to the guest; nothing is sent a third time.
+#[tokio::test]
+async fn a_second_too_long_refusal_goes_back_to_the_guest() {
+    let chain = Arc::new(MockHttpSecurityChain::default());
+    chain.push_response(COMPLETIONS, Ok(too_long()));
+    chain.push_response(COMPLETIONS, Ok(too_long()));
+    let gw = test_gateway_with(Arc::new(MockEventBusEmit::default()), Arc::clone(&chain));
+    publish_seed(&gw, 8_000);
+    let out = generate_handler(&gw)
+        .call(turn_ctx(), vec![prompt_val("go")], 1)
+        .await
+        .unwrap();
+    assert!(matches!(out.as_slice(), [Val::Result(Err(_))]), "{out:?}");
+    assert_eq!(bodies(&chain).len(), 2);
+}
+
+/// A refused request with nothing to take out goes back to the guest at once.
+#[tokio::test]
+async fn a_too_long_refusal_with_nothing_to_cut_is_not_sent_again() {
+    let chain = Arc::new(MockHttpSecurityChain::default());
+    chain.push_response(COMPLETIONS, Ok(too_long()));
+    let gw = test_gateway_with(Arc::new(MockEventBusEmit::default()), Arc::clone(&chain));
+    publish_seed(&gw, 0);
+    let out = generate_handler(&gw)
+        .call(turn_ctx(), vec![prompt_val("go")], 1)
+        .await
+        .unwrap();
+    assert!(matches!(out.as_slice(), [Val::Result(Err(_))]), "{out:?}");
+    assert_eq!(bodies(&chain).len(), 1);
+}
+
+/// The stream path takes the same one retry: its first head is refused as too long, the
+/// second begins without the history.
+#[tokio::test]
+async fn a_stream_refused_as_too_long_begins_once_more_smaller() {
+    let chain = Arc::new(MockHttpSecurityChain::default());
+    chain.push_stream(COMPLETIONS, 400, vec![Ok(NEAR_TOO_LONG.to_vec())]);
+    let body = serde_json::json!({
+        "choices": [{"message": {"content": "streamed answer"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+        "model": "gpt-4o-mini",
+    });
+    chain.push_response(
+        COMPLETIONS,
+        Ok(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: serde_json::to_vec(&body).unwrap(),
+        }),
+    );
+    let gw = test_gateway_with(Arc::new(MockEventBusEmit::default()), Arc::clone(&chain));
+    publish_seed(&gw, 8_000);
+    let stream = AgentLlmStreamHandler {
+        gateway: Arc::clone(&gw),
+        registry: Arc::new(StreamRegistry::new()),
+        turn_cost: None,
+    };
+    let out = stream
+        .call(turn_ctx(), vec![prompt_val("go")], 1)
+        .await
+        .unwrap();
+    assert!(
+        matches!(out.as_slice(), [Val::Result(Ok(Some(_)))]),
+        "the second begin returns a handle: {out:?}"
+    );
+    let bodies = bodies(&chain);
+    assert_eq!(bodies.len(), 2);
+    assert!(carries_history(&bodies[0]));
+    assert!(!carries_history(&bodies[1]));
+}
+
+/// MODULE-010 B1: the result of a call that failed reads and changes nothing. A write the
+/// dispatcher refused leaves the earlier read of the file whole, and the turn log marks the
+/// refused result.
+#[tokio::test]
+async fn l0_a_refused_write_leaves_the_read_before_it_whole() {
+    let chain = Arc::new(MockHttpSecurityChain::default());
+    chain.push_response(
+        COMPLETIONS,
+        Ok(ok_tools("c1", "read", r#"{"path":"plan.md"}"#)),
+    );
+    chain.push_response(
+        COMPLETIONS,
+        Ok(ok_text_with_call(
+            "The plan has three steps. I add a fourth.",
+            "c2",
+            "write",
+            r#"{"path":"plan.md","content":"four steps"}"#,
+        )),
+    );
+    chain.push_response(COMPLETIONS, Ok(ok_text("done", 30, 2)));
+    let gw = test_gateway_with(Arc::new(MockEventBusEmit::default()), Arc::clone(&chain));
+    publish_seed(&gw, 0);
+    let handler = generate_handler(&gw);
+    let ctx = turn_ctx();
+    expect_ok(
+        &handler
+            .call(ctx.clone(), vec![prompt_val("extend the plan")], 1)
+            .await
+            .unwrap(),
+    );
+    gw.record_tool_result(AGENT, TURN, "c1", "read", "1. Sow 2. Water 3. Wait");
+    expect_ok(
+        &handler
+            .call(ctx.clone(), vec![prompt_val("")], 1)
+            .await
+            .unwrap(),
+    );
+    gw.record_tool_outcome(AGENT, TURN, "c2", "write", "refused: not granted", true);
+    expect_ok(&handler.call(ctx, vec![prompt_val("")], 1).await.unwrap());
+
+    let bodies = bodies(&chain);
+    assert_eq!(tool_content(&bodies[2], "c1"), "1. Sow 2. Water 3. Wait");
+    assert_eq!(tool_content(&bodies[2], "c2"), "refused: not granted");
+    let logged =
+        advance_shared_types::turn_log::TurnTranscriptSource::take_turn_transcript(&*gw, AGENT);
+    let results: Vec<(Option<&str>, bool)> = logged
+        .iter()
+        .filter(|m| m.role == "tool")
+        .map(|m| (m.tool_call_id.as_deref(), m.is_error))
+        .collect();
+    assert_eq!(results, [(Some("c1"), false), (Some("c2"), true)]);
+}
+
+/// A result for a call the transcript does not hold goes in as a user note; when its call
+/// failed, the note says so.
+#[tokio::test]
+async fn a_failed_result_for_no_pending_call_says_it_failed() {
+    let chain = Arc::new(MockHttpSecurityChain::default());
+    let gw = test_gateway_with(Arc::new(MockEventBusEmit::default()), Arc::clone(&chain));
+    gw.record_tool_outcome(AGENT, TURN, "zz", "write", "refused: not granted", true);
+    let logged =
+        advance_shared_types::turn_log::TurnTranscriptSource::take_turn_transcript(&*gw, AGENT);
+    let last = logged.last().expect("the result is recorded");
+    assert_eq!(last.role, "user");
+    assert!(
+        last.content.starts_with("[tool result: write (failed)]"),
+        "{}",
+        last.content
+    );
+}

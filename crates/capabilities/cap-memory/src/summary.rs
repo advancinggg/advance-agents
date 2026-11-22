@@ -73,7 +73,7 @@ pub struct Correction {
     pub content: String,
 }
 
-/// Per-task L4 summary stored at `.agent/memory/tasks/{task_id}/summary.yaml`.
+/// Per-task L4 summary stored at `.agent/tasks/active/{task_id}/summary.yaml` (PRD §11.2).
 /// 7 top-level fields + `_meta` block matching MODULE-011 §1.3.3.
 ///
 /// **Bounded-input responsibility**: every `Vec<T>` and `String` field

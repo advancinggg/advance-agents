@@ -43,6 +43,7 @@ fn local_cfg() -> LlmProviderConfig {
         generate_timeout_secs: None,
         reasoning_effort: None,
         system_messages: None,
+        model_context_windows: Default::default(),
     }
 }
 

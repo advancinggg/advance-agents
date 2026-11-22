@@ -101,8 +101,8 @@ pub use auto_bootstrap::{
 };
 pub use cap_grant_adapter::{CapGrantSubsetAdapter, SubsetCheckedComponentSubmit};
 pub use cascade_adapters::{
-    FsMemoryArchiver, FsWorkspaceCleanup, GrantRevokeCascade, MailboxFlushCascade,
-    RunManagerCascade,
+    task_history_left, FsMemoryArchiver, FsWorkspaceCleanup, GrantRevokeCascade,
+    MailboxFlushCascade, RunManagerCascade,
 };
 pub use checkpoint::{
     CheckpointController, CheckpointEntry, DefaultCheckpointController, NamedCheckpointGate,

@@ -21,7 +21,8 @@ use advance_shared_types::mailbox::{ActionResult, Message, MessageContext, Messa
 use advance_shared_types::memory::PostProcessorHook;
 use cap_memory::post_processor::CANONICAL_STEPS;
 use cap_memory::summary::{Summary, SummaryMeta};
-use cap_memory::turn_index::{Importance, LogOffset, TurnEntry};
+use cap_memory::task_storage::TASK_TURN_INDEX_FILENAME;
+use cap_memory::turn_index::{Importance, LogOffset, TurnEntry, TurnIndex, TurnIndexMeta};
 use cap_memory::{
     CatchUpError, Components, Embedder, EmbedderError, Extraction, FailureCooldown,
     InMemorySimilarityIndex, InMemorySqliteIndex, IndexUnavailable, MemoryEntry, MemoryIndexRow,
@@ -412,7 +413,7 @@ fn rig(model: Option<&str>) -> Rig {
     }
 }
 
-/// A turn as Step 7 hands it to the index: a digest, no collapsed view.
+/// A turn as Step 7 hands it to the index, with a digest and no collapsed view.
 fn turn(turn: u32, digest: &str) -> TurnEntry {
     TurnEntry {
         turn,
@@ -990,6 +991,116 @@ async fn turn_rows_of_another_model_are_embedded_again_a_few_per_turn_end() {
         rig.index.searches(),
         one_pass().repeat(rig.index.passes()),
         "bounded searches"
+    );
+}
+
+/// Write `turns` as the `turn-index.yaml` of the task directory `dir`.
+fn write_turn_index(dir: &std::path::Path, turns: &[TurnEntry]) {
+    std::fs::create_dir_all(dir).expect("the task directory");
+    let index = TurnIndex {
+        meta: TurnIndexMeta {
+            last_epoch_turn: 0,
+            last_epoch_at: String::new(),
+        },
+        turns: turns.to_vec(),
+        epochs: Vec::new(),
+    };
+    let yaml = serde_yml::to_string(&index).expect("the index as YAML");
+    std::fs::write(dir.join(TASK_TURN_INDEX_FILENAME), yaml).expect("write the index");
+}
+
+/// A turn is caught up from the text its turn end embedded: its digest, then its
+/// collapsed view. The row keeps no view, so catch-up reads it back from the
+/// `turn-index.yaml` of the row's task, where Step 7 wrote it (MODULE-010 B1), or from
+/// the index's archive when the index moved the turn out (an entry in both is the
+/// index's). A turn whose view cannot be read back is caught up from its digest alone,
+/// and catch-up creates nothing: here a turn neither its task's index nor its archive
+/// holds, a turn of a task whose directory is a link, a turn its task's index holds for
+/// another agent, and a turn of a task with no directory.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_turn_is_caught_up_from_its_digest_and_the_view_its_task_keeps() {
+    let tasks = tempfile::tempdir().expect("the tasks root");
+    let elsewhere = tempfile::tempdir().expect("a directory outside it");
+    let rig = rig(Some("embed-a"));
+    let rig = Rig {
+        c: rig.c.with_tasks_root(tasks.path()),
+        ..rig
+    };
+    let entry = |task: &str, n: u32, digest: &str, view: &str| {
+        let mut entry = turn(n, digest);
+        entry.task_id = task.into();
+        entry.collapsed_view = view.into();
+        entry
+    };
+    let kept = entry(
+        "t1",
+        1,
+        "digest one",
+        "[user] \"plan the beds\"\n→ \"done\"",
+    );
+    let dropped = entry("t1", 2, "digest two", "[user] \"water them\"\n→ \"done\"");
+    let linked = entry("t2", 1, "digest three", "[user] \"prune\"\n→ \"done\"");
+    let foreign = entry("t4", 1, "digest five", "[user] \"sow\"\n→ \"done\"");
+    let homeless = entry("t3", 1, "digest four", "[user] \"weed\"\n→ \"done\"");
+    let archived = entry("t1", 3, "digest six", "[user] \"harvest\"\n→ \"done\"");
+    write_turn_index(&tasks.path().join("t1"), std::slice::from_ref(&kept));
+    let mut stale = kept.clone();
+    stale.collapsed_view = "an older view".into();
+    cap_memory::task_storage::append_turn_index_archive(
+        &tasks
+            .path()
+            .join("t1")
+            .join(cap_memory::task_storage::TASK_TURN_INDEX_ARCHIVE_FILENAME),
+        &[stale, archived.clone()],
+    )
+    .expect("the index's archive");
+    write_turn_index(&elsewhere.path().join("t2"), std::slice::from_ref(&linked));
+    std::os::unix::fs::symlink(elsewhere.path().join("t2"), tasks.path().join("t2"))
+        .expect("link t2 into the tasks root");
+    let mut of_another_agent = foreign.clone();
+    of_another_agent.agent_id = "b".into();
+    write_turn_index(&tasks.path().join("t4"), &[of_another_agent]);
+    let rows = [&kept, &dropped, &linked, &foreign, &homeless, &archived];
+    for row in rows {
+        rig.tick();
+        rig.c.sync_turn_index("a", row).await.unwrap();
+    }
+    let written = rig.embedder.requests();
+    assert_eq!(
+        rig.embedder.requested(),
+        rows.map(|row| format!("{}\n{}", row.digest, row.collapsed_view)),
+        "each turn end embeds the digest and then the view"
+    );
+    // Every row is of the model in use (and catch-up has seen it).
+    assert_eq!(rig.c.heal_vectors("a").await.unwrap(), 0);
+
+    // The model changes; once the rest is over, every row is caught up.
+    rig.embedder.set_model(Some("embed-bb"));
+    assert_eq!(rig.c.heal_vectors("a").await.unwrap(), 0);
+    rig.rest();
+    assert_eq!(rig.c.heal_vectors("a").await.unwrap(), rows.len());
+    let mut caught_up = rig.embedder.requested()[written..].to_vec();
+    caught_up.sort();
+    assert_eq!(
+        caught_up,
+        [
+            "digest five\n".to_string(),
+            "digest four\n".to_string(),
+            format!("digest one\n{}", kept.collapsed_view),
+            format!("digest six\n{}", archived.collapsed_view),
+            "digest three\n".to_string(),
+            "digest two\n".to_string(),
+        ]
+    );
+    assert_eq!(
+        rig.turn_row(1).embedding,
+        ScriptedEmbedder::vector("embed-bb", &format!("digest one\n{}", kept.collapsed_view)),
+        "the vector the turn end would compute"
+    );
+    assert!(
+        !tasks.path().join("t3").exists(),
+        "catch-up creates nothing"
     );
 }
 
@@ -2075,7 +2186,7 @@ fn pipeline(
         Arc::new(FailureCooldown::new(600)),
         clock,
     )
-    .with_fs_root(root)
+    .with_tasks_root(root.join("tasks"))
     .with_write_agent_id(write_id)
     .with_embedder(embedder)
     .with_sqlite_index(index);
@@ -2136,12 +2247,25 @@ async fn a_refused_embedding_request_does_not_cost_the_turn_its_index_or_step_9(
         .await
         .expect("run Ok");
     assert_eq!(index.list_turns_for_agent("a").len(), 3);
+    // Each vector is computed from the digest and the collapsed view Step 7 wrote in
+    // the task's `turn-index.yaml` (MODULE-010 B1) — turn 1's, caught up, as well.
+    let yaml = std::fs::read_to_string(root.join("tasks/t1").join(TASK_TURN_INDEX_FILENAME))
+        .expect("the task's turn index");
+    let written: TurnIndex = serde_yml::from_str(&yaml).expect("a turn index");
     for n in 1..=3 {
         let row = index.get_turn("a", "t1", n).expect("turn row");
         assert_eq!(row.embedding_model.as_deref(), Some("embed-a"), "turn {n}");
+        let view = &written
+            .turns
+            .iter()
+            .find(|entry| entry.turn == n)
+            .expect("the turn's entry")
+            .collapsed_view;
+        assert!(view.contains("hello"), "turn {n}: {view:?}");
         assert_eq!(
             row.embedding,
-            ScriptedEmbedder::vector("embed-a", "Refactored the tokenizer\n")
+            ScriptedEmbedder::vector("embed-a", &format!("Refactored the tokenizer\n{view}")),
+            "turn {n}"
         );
     }
     let task = index.get_task("a", "t1").expect("task row");

@@ -2,8 +2,10 @@
 //!
 //! Proves the read-path mechanism: `assemble()` runs `unified_search` over a
 //! POPULATED `AgentSearchCorpus` with a REAL deterministic `HashingEmbedding`
-//! and folds an omit-when-empty, boundary-marked recall section into Tier-3
-//! (after the 2→3 cache breakpoint). This is NOT a SYS-AC flip (satellite) —
+//! and folds an omit-when-empty, boundary-marked recall section in as the last
+//! section of Tier 2, right before the 2→3 cache breakpoint (PRD §11.3.2 ⑮: Tier 2's
+//! ⑭-⑮ change every turn; owner decision D2, 2026-11-17). This is NOT a SYS-AC flip
+//! (satellite) —
 //! production stays byte-identical (empty corpus → no section), proven by the
 //! `empty_corpus_yields_no_recall_section` discriminator.
 
@@ -141,11 +143,13 @@ async fn recall_reaches_prompt_over_populated_corpus() {
         "memory hit: {recall}"
     );
 
-    // POSITIONAL Tier-3 placement: recall sits AFTER the 2->3 cache breakpoint
-    // (query-dependent recall must never bust the Tier-2 cache).
-    assert!(
-        recall_idx > breakpoint2_index(&res.messages),
-        "recall must land in Tier-3 (after the 2->3 breakpoint)"
+    // POSITIONAL placement (PRD §11.3.2 ⑮, owner decision D2): recall is the last
+    // section of Tier 2, right before the 2->3 cache breakpoint — after the task summary,
+    // so what stays the same across the task's turns comes first.
+    assert_eq!(
+        recall_idx + 1,
+        breakpoint2_index(&res.messages),
+        "recall is Tier 2's last section, right before the 2->3 breakpoint"
     );
 }
 

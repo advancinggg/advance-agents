@@ -277,7 +277,7 @@ impl Epoch {
 }
 
 /// Combined per-task turn index. Stored at
-/// `.agent/memory/tasks/{task_id}/turn-index.yaml`. MODULE-011 §1.3.4.
+/// `.agent/tasks/active/{task_id}/turn-index.yaml` (PRD §11.2). MODULE-011 §1.3.4.
 ///
 /// **Bounded-input responsibility**: `turns: Vec<TurnEntry>`, `epochs:
 /// Vec<Epoch>`, plus every nested `Vec<u32>` and `String` field is

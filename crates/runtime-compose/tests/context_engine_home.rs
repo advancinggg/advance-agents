@@ -24,14 +24,26 @@
 //!   once the agent chats on an entry that embeds, and is recalled from then on.
 //! - Deleting an agent removes what the home's index holds under its id, and nothing of
 //!   another agent.
+//! - The prompt budget is the window of the model the agent chats on: the window its entry
+//!   declares for that model, an edit of which applies from the next turn on; without one, a
+//!   model of no known family gets the small-model fallback.
+//! - Every turn is logged under its task (`.agent/tasks/active/<task>/llm-turns.jsonl`) — the
+//!   prompt, each tool call, its result and each reply, one line each, numbered from 1 and
+//!   never rewritten — and its turn-index entry locates it by line and records what it did:
+//!   its tool use, the files it named, the version of each file it read, its collapsed view.
+//!   A later turn that names one of those files is a reference to it.
+//! - The next turns carry the last turns of the task whole — the prompt, each tool call, its
+//!   result, the reply — until a file a turn read changes: that turn is then carried as its
+//!   digest.
 //!
 //! A turn is awaited to its END — the reply and the whole turn-end pipeline — before
 //! anything it sent is looked at, so no request it makes is missed.
 
 use std::future::Future;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use advance_runtime_compose::test_support::fixture::{FixtureHome, ROOT_MAILBOX};
 use advance_runtime_compose::test_support::LlmSecurityOverride;
@@ -57,6 +69,9 @@ const OTHER_HOST: &str = "other.example.test";
 /// The longest a scripted turn, with the turn-end pipeline after it, may take.
 const WAIT: Duration = Duration::from_secs(90);
 
+/// The id of the `read` call a scripted read makes.
+const READ_CALL_ID: &str = "call_read_scripted";
+
 // ---------------------------------------------------------------------------
 // The scripted peer
 // ---------------------------------------------------------------------------
@@ -79,11 +94,21 @@ struct Sent {
 /// - Every embedding request is answered with the SAME vector, so any stored row is as
 ///   close as can be to any query: whether a row is recalled depends only on whether a
 ///   vector was stored and may be compared, never on ranking.
+/// - The turn of a prompt scripted to read a file calls `read` on it in its first round and
+///   answers with the scripted conclusion once the result is back.
 struct Peer {
     /// `(prompt, the digest of its turn)`.
     turns: Vec<(&'static str, &'static str)>,
     /// `(prompt, a fact the extraction of its turn yields)`.
     facts: Vec<(&'static str, &'static str)>,
+    /// `(prompt, the path its turn reads, the conclusion it answers with)`.
+    reads: Vec<(&'static str, &'static str, &'static str)>,
+    /// `(prompt, the paths its turn reads one after the other, the conclusion it answers
+    /// with)`.
+    loops: Vec<(&'static str, &'static [&'static str], &'static str)>,
+    /// The prompts whose turn sees its first request after its last read refused as too
+    /// long, as NEAR AI refuses it ([`NEAR_TOO_LONG`]).
+    refuse_once: Mutex<Vec<&'static str>>,
     chats: Mutex<Vec<Sent>>,
     embeddings: Mutex<Vec<Sent>>,
 }
@@ -97,12 +122,78 @@ impl Peer {
         turns: &[(&'static str, &'static str)],
         facts: &[(&'static str, &'static str)],
     ) -> Arc<Self> {
+        Self::scripted(turns, facts, &[])
+    }
+
+    fn with_reads(
+        turns: &[(&'static str, &'static str)],
+        reads: &[(&'static str, &'static str, &'static str)],
+    ) -> Arc<Self> {
+        Self::scripted(turns, &[], reads)
+    }
+
+    fn scripted(
+        turns: &[(&'static str, &'static str)],
+        facts: &[(&'static str, &'static str)],
+        reads: &[(&'static str, &'static str, &'static str)],
+    ) -> Arc<Self> {
         Arc::new(Self {
             turns: turns.to_vec(),
             facts: facts.to_vec(),
+            reads: reads.to_vec(),
+            loops: Vec::new(),
+            refuse_once: Mutex::new(Vec::new()),
             chats: Mutex::new(Vec::new()),
             embeddings: Mutex::new(Vec::new()),
         })
+    }
+
+    /// A peer whose `loops` prompts read several files one after the other, and whose
+    /// `refuse_once` prompts see their first request after the last read refused as too long.
+    fn with_read_loops(
+        turns: &[(&'static str, &'static str)],
+        reads: &[(&'static str, &'static str, &'static str)],
+        loops: &[(&'static str, &'static [&'static str], &'static str)],
+        refuse_once: &[&'static str],
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            turns: turns.to_vec(),
+            facts: Vec::new(),
+            reads: reads.to_vec(),
+            loops: loops.to_vec(),
+            refuse_once: Mutex::new(refuse_once.to_vec()),
+            chats: Mutex::new(Vec::new()),
+            embeddings: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The answer of a `loops` turn to `sent`: its next read, the refusal as too long once,
+    /// then its conclusion. `None` for any other request.
+    fn read_loop_step(&self, sent: &Sent) -> Option<HttpResponse> {
+        if is_extraction(&sent.body) {
+            return None;
+        }
+        let (prompt, paths, conclusion) = self
+            .loops
+            .iter()
+            .find(|(prompt, _, _)| last_user(&sent.body).contains(prompt))?;
+        let done = results_since_last_user(&sent.body);
+        if let Some(path) = paths.get(done) {
+            return Some(json_response(
+                200,
+                read_call_as(&format!("call_read_{done}"), path),
+            ));
+        }
+        let mut armed = self.refuse_once.lock().unwrap();
+        if let Some(i) = armed.iter().position(|armed| armed == prompt) {
+            armed.remove(i);
+            return Some(HttpResponse {
+                status: 400,
+                headers: vec![("Content-Type".into(), "application/json".into())],
+                body: NEAR_TOO_LONG.as_bytes().to_vec(),
+            });
+        }
+        Some(json_response(200, text_completion(conclusion)))
     }
 
     fn chats(&self) -> Vec<Sent> {
@@ -174,7 +265,22 @@ impl HttpExecutor for Peer {
                 json_response(200, json!({ "data": [{ "embedding": [0.6, 0.8] }] }))
             }
             "v1/chat/completions" => {
-                let content = if is_extraction(&sent.body) {
+                if let Some(response) = self.read_loop_step(&sent) {
+                    self.chats.lock().unwrap().push(sent);
+                    return Ok(response);
+                }
+                let read = self
+                    .reads
+                    .iter()
+                    .filter(|_| !is_extraction(&sent.body))
+                    .find(|(prompt, _, _)| last_user(&sent.body).contains(prompt));
+                let content = if let Some((_, path, conclusion)) = read {
+                    if !answered_since_last_user(&sent.body) {
+                        self.chats.lock().unwrap().push(sent);
+                        return Ok(json_response(200, read_call(path)));
+                    }
+                    conclusion.to_string()
+                } else if is_extraction(&sent.body) {
                     let turn = contents(&sent.body);
                     let digest = self
                         .turns
@@ -219,6 +325,91 @@ fn json_response(status: u16, body: Value) -> HttpResponse {
         headers: vec![("Content-Type".into(), "application/json".into())],
         body: serde_json::to_vec(&body).expect("response json"),
     }
+}
+
+/// The messages of a chat body.
+fn messages_of(body: &Value) -> Vec<Value> {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The content of the last user message of a chat body.
+fn last_user(body: &Value) -> String {
+    messages_of(body)
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|message| message.get("content").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Whether a tool result follows the last user message of a chat body.
+fn answered_since_last_user(body: &Value) -> bool {
+    let messages = messages_of(body);
+    let last_user = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"));
+    messages[last_user.map_or(0, |i| i + 1)..]
+        .iter()
+        .any(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+}
+
+/// How many tool results follow the last user message of a chat body.
+fn results_since_last_user(body: &Value) -> usize {
+    let messages = messages_of(body);
+    let last_user = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"));
+    messages[last_user.map_or(0, |i| i + 1)..]
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        .count()
+}
+
+/// A chat completion that answers `content`.
+fn text_completion(content: &str) -> Value {
+    json!({
+        "id": "chatcmpl-scripted",
+        "object": "chat.completion",
+        "model": "scripted-model",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": content },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 12, "completion_tokens": 3 }
+    })
+}
+
+/// A chat completion that calls `read` on `path`.
+fn read_call(path: &str) -> Value {
+    read_call_as(READ_CALL_ID, path)
+}
+
+/// A chat completion that calls `read` on `path`, as the call `id`.
+fn read_call_as(id: &str, path: &str) -> Value {
+    json!({
+        "id": "chatcmpl-read",
+        "object": "chat.completion",
+        "model": "scripted-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": "read", "arguments": json!({ "path": path }).to_string() }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": { "prompt_tokens": 12, "completion_tokens": 5 }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -804,13 +995,17 @@ fn assert_everything_went_to(peer: &Peer, host: &str) {
     }
 }
 
-/// `prompt` was never sent for embedding.
+/// Whether `prompt` was sent for embedding as a recall query: alone. A turn's own
+/// vector quotes its prompt too, in the turn's collapsed view after its digest (PRD
+/// §11.3, the L1 layer), so a mention inside another text is no query.
+fn embedded_as_query(peer: &Peer, prompt: &str) -> bool {
+    peer.embedded_texts().iter().any(|input| input == prompt)
+}
+
+/// `prompt` was never sent for embedding as a recall query.
 fn assert_not_embedded(peer: &Peer, prompt: &str) {
     assert!(
-        !peer
-            .embedded_texts()
-            .iter()
-            .any(|input| input.contains(prompt)),
+        !embedded_as_query(peer, prompt),
         "{prompt:?} was sent for embedding: {:#?}",
         peer.embeddings()
     );
@@ -856,6 +1051,21 @@ async fn an_agent_free_to_chat_on_several_entries_embeds_where_it_is_served() {
             "the second turn recalls the first: {second}"
         );
         assert!(second.contains("- recall: semantic"), "{second}");
+        // The second prompt was embedded as a query (the form the checks above and below
+        // look for), and the first turn's own vector quotes its prompt in its view.
+        assert!(
+            embedded_as_query(peer, SECOND_PROMPT),
+            "{:#?}",
+            peer.embeddings()
+        );
+        let quoted = format!("[user] \"{FIRST_PROMPT}\"");
+        assert!(
+            peer.embedded_texts()
+                .iter()
+                .any(|input| input.starts_with(FIRST_DIGEST) && input.contains(&quoted)),
+            "{:#?}",
+            peer.embeddings()
+        );
 
         // From its first reply on, everything of the agent's goes where it was served:
         // the digest of the first turn, the second prompt, the second digest, and the
@@ -1111,4 +1321,657 @@ async fn a_deleted_agent_hands_its_knowledge_over_to_its_parent() {
         "the root's memory rows mirror the fact it took over: {rows:?}"
     );
     assert!(index.list_memory_for_agent(&helper_id).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The budget follows the model the agent chats on
+// ---------------------------------------------------------------------------
+
+const GARDEN_PROMPT: &str = "the greenhouse is watered on tuesdays";
+const GARDEN_SECOND_PROMPT: &str = "which day is the greenhouse watered?";
+const GARDEN_THIRD_PROMPT: &str = "who waters the greenhouse?";
+
+/// The latest assembly of the root agent's context, once its index holds `turns` turns.
+async fn latest_assembly(client: &context_home::Client, turns: u64) -> Value {
+    let context = client.context_with_turns(Agent::Root, turns).await;
+    context
+        .get("latest")
+        .cloned()
+        .unwrap_or_else(|| panic!("no assembly recorded: {context}"))
+}
+
+/// Wait until the running config gives the root agent `window` for the model it chats on:
+/// the config watcher has applied an edit of the provider list.
+async fn wait_for_root_window(client: &context_home::Client, window: Option<u32>) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let live = client
+            .gateway()
+            .chat_model_for("root")
+            .and_then(|model| model.window)
+            .map(|(tokens, _)| tokens);
+        if live == window {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the root agent's window is still {live:?}, not {window:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_budget_is_the_window_of_the_model_the_agent_chats_on() {
+    let home = memory_home(
+        &[],
+        &[(
+            MAIN,
+            entry(
+                MAIN,
+                MAIN_HOST,
+                &["model-context-windows: { main-chat: 1048576 }"],
+            ),
+        )],
+        &["provider: main"],
+    );
+    let peer = &Peer::new(&[]);
+    serve(&home, peer, |client| async move {
+        // The window the agent's entry declares for the model it chats on.
+        client.turn(ROOT_MAILBOX, GARDEN_PROMPT).await;
+        let latest = latest_assembly(&client, 1).await;
+        assert_eq!(latest["model_provider"], json!(MAIN), "{latest}");
+        assert_eq!(latest["model"], json!("main-chat"), "{latest}");
+        assert_eq!(latest["model_context_window"], json!(1_048_576), "{latest}");
+        assert_eq!(latest["model_window_source"], json!("provider"), "{latest}");
+        assert_eq!(latest["response_reserve"], json!(30_000), "{latest}");
+        assert_eq!(latest["budget_tokens"], json!(1_018_576), "{latest}");
+        let prompt = peer.turn_prompt(GARDEN_PROMPT);
+        assert!(prompt.contains("- llm: main / main-chat\n"), "{prompt}");
+        assert!(
+            prompt.contains("- context window: 1048576 tokens (prompt budget 1018576)\n"),
+            "{prompt}"
+        );
+
+        // An edit of the entry applies from the next turn on, with nothing restarted.
+        client
+            .update_provider(
+                MAIN,
+                json!({ "model_context_windows": { "main-chat": 200_000 } }),
+            )
+            .await;
+        wait_for_root_window(&client, Some(200_000)).await;
+        client.turn(ROOT_MAILBOX, GARDEN_SECOND_PROMPT).await;
+        let latest = latest_assembly(&client, 2).await;
+        assert_eq!(latest["model_context_window"], json!(200_000), "{latest}");
+        assert_eq!(latest["model_window_source"], json!("provider"), "{latest}");
+        assert_eq!(latest["budget_tokens"], json!(170_000), "{latest}");
+
+        // Without a declared window, a model of no known family gets the small-model
+        // fallback — still on the agent's own entry.
+        client
+            .update_provider(MAIN, json!({ "model_context_windows": {} }))
+            .await;
+        wait_for_root_window(&client, None).await;
+        client.turn(ROOT_MAILBOX, GARDEN_THIRD_PROMPT).await;
+        let latest = latest_assembly(&client, 3).await;
+        assert_eq!(latest["model_provider"], json!(MAIN), "{latest}");
+        assert_eq!(latest["model_context_window"], json!(8_192), "{latest}");
+        assert_eq!(latest["model_window_source"], json!("fallback"), "{latest}");
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Every turn is logged under its task, and indexed by line
+// ---------------------------------------------------------------------------
+
+const PLAN_PATH: &str = "notes/plan.md";
+const PLAN_TEXT: &str = "Step one: water the seedlings.\nStep two: label the trays.\n";
+/// `git hash-object` of [`PLAN_TEXT`].
+const PLAN_BLOB: &str = "eea8a7d39d0a25fd06266426aefcacca83d9ebb1";
+const PLAN_PROMPT: &str = "read the greenhouse plan";
+const PLAN_DIGEST: &str = "The user asked for the greenhouse plan.";
+const PLAN_CONCLUSION: &str = "The plan has two steps. Watering comes first.";
+const PLAN_FOLLOW_UP: &str = "is notes/plan.md still current?";
+const PLAN_FOLLOW_UP_DIGEST: &str = "The user asked whether the plan is current.";
+
+/// The root agent's one task directory, `.agent/tasks/active/<task>`.
+fn root_task_dir(home: &FixtureHome) -> PathBuf {
+    let active = home.home().join(".agent/tasks/active");
+    let dirs: Vec<PathBuf> = std::fs::read_dir(&active)
+        .unwrap_or_else(|e| panic!("{active:?}: {e}"))
+        .map(|entry| entry.expect("a directory entry").path())
+        .filter(|path| path.is_dir())
+        .collect();
+    assert_eq!(dirs.len(), 1, "one task directory: {dirs:?}");
+    dirs[0].clone()
+}
+
+/// Every line of the task's turn log, parsed.
+fn turn_log(dir: &Path) -> Vec<Value> {
+    std::fs::read_to_string(dir.join("llm-turns.jsonl"))
+        .expect("the turn log")
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("{line}: {e}")))
+        .collect()
+}
+
+/// The entries of the task's turn index.
+fn turn_entries(dir: &Path) -> Vec<Value> {
+    let yaml = std::fs::read_to_string(dir.join("turn-index.yaml")).expect("the turn index");
+    let index: Value = serde_yml::from_str(&yaml).expect("the turn index parses");
+    index["turns"].as_array().cloned().unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turns_are_logged_under_their_task_and_indexed_by_line() {
+    let home = memory_home(
+        &[],
+        &[(MAIN, entry(MAIN, MAIN_HOST, &[]))],
+        &["provider: main"],
+    );
+    let plan = home.home().join(PLAN_PATH);
+    std::fs::create_dir_all(plan.parent().expect("a parent")).expect("the notes directory");
+    std::fs::write(&plan, PLAN_TEXT).expect("the plan");
+    let peer = &Peer::with_reads(
+        &[
+            (PLAN_PROMPT, PLAN_DIGEST),
+            (PLAN_FOLLOW_UP, PLAN_FOLLOW_UP_DIGEST),
+        ],
+        &[(PLAN_PROMPT, PLAN_PATH, PLAN_CONCLUSION)],
+    );
+    serve(&home, peer, |client| async move {
+        client.turn(ROOT_MAILBOX, PLAN_PROMPT).await;
+        client.context_with_turns(Agent::Root, 1).await;
+        client.turn(ROOT_MAILBOX, PLAN_FOLLOW_UP).await;
+        client.context_with_turns(Agent::Root, 2).await;
+    })
+    .await;
+
+    // The task layout of PRD §11.2; nothing is written under the memory directory.
+    assert!(
+        !home.home().join(".agent/memory/tasks").exists(),
+        "no task directory under .agent/memory"
+    );
+    let dir = root_task_dir(&home);
+    assert!(dir.join("summary.yaml").is_file(), "{dir:?}");
+
+    // Turn 1 is the prompt, the read call, its result and the conclusion; turn 2 the
+    // prompt and the reply.
+    let log = turn_log(&dir);
+    let shape: Vec<(u64, u64, &str)> = log
+        .iter()
+        .map(|line| {
+            (
+                line["turn"].as_u64().expect("turn"),
+                line["seq"].as_u64().expect("seq"),
+                line["role"].as_str().expect("role"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (1, 0, "user"),
+            (1, 1, "assistant"),
+            (1, 2, "tool"),
+            (1, 3, "assistant"),
+            (2, 0, "user"),
+            (2, 1, "assistant"),
+        ],
+        "{log:#?}"
+    );
+    assert_eq!(log[0]["content"], json!(PLAN_PROMPT), "{log:#?}");
+    assert_eq!(log[1]["tool_calls"][0]["name"], json!("read"), "{log:#?}");
+    assert_eq!(log[2]["tool_call_id"], json!(READ_CALL_ID), "{log:#?}");
+    assert!(
+        log[2]["content"]
+            .as_str()
+            .is_some_and(|result| result.contains("water the seedlings")),
+        "the read result is logged: {log:#?}"
+    );
+    assert!(log[2].get("l0").is_none(), "a lone read is kept: {log:#?}");
+    assert_eq!(log[3]["content"], json!(PLAN_CONCLUSION), "{log:#?}");
+    assert_eq!(log[4]["content"], json!(PLAN_FOLLOW_UP), "{log:#?}");
+    assert_eq!(log[5]["content"], json!("noted"), "{log:#?}");
+
+    // Each entry locates its turn by line and records what the turn did.
+    let turns = turn_entries(&dir);
+    assert_eq!(turns.len(), 2, "{turns:#?}");
+    let (first, second) = (&turns[0], &turns[1]);
+    assert_eq!(first["turn"], json!(1), "{first}");
+    assert_eq!(
+        first["log_offset"],
+        json!({ "start_line": 1, "end_line": 4 }),
+        "{first}"
+    );
+    assert_eq!(
+        second["log_offset"],
+        json!({ "start_line": 5, "end_line": 6 }),
+        "{second}"
+    );
+    assert_eq!(first["digest"], json!(PLAN_DIGEST), "{first}");
+    assert_eq!(first["has_user_instruction"], json!(true), "{first}");
+    assert_eq!(first["has_tool_use"], json!(true), "{first}");
+    assert_eq!(second["has_tool_use"], json!(false), "{second}");
+    assert_eq!(first["content_identifiers"], json!([PLAN_PATH]), "{first}");
+    assert_eq!(
+        first["read_file_versions"],
+        json!([{ "path": PLAN_PATH, "blob_id": PLAN_BLOB }]),
+        "{first}"
+    );
+    assert_eq!(
+        first["collapsed_view"],
+        json!(format!(
+            "[user] \"{PLAN_PROMPT}\"\n[assistant] read(\"{PLAN_PATH}\")\n→ \"The plan has two steps.\""
+        )),
+        "{first}"
+    );
+    for field in [
+        "tokens_digest",
+        "tokens_collapse_excerpt",
+        "tokens_l0_processed",
+    ] {
+        assert!(
+            first[field].as_u64().is_some_and(|tokens| tokens > 0),
+            "{field}: {first}"
+        );
+    }
+    // Turn 2 names the file turn 1 read: turn 1 gained a reference.
+    assert_eq!(first["reference_count"], json!(1), "{first}");
+    assert_eq!(second["reference_count"], json!(0), "{second}");
+}
+
+// ---------------------------------------------------------------------------
+// The last turns are carried whole until a file they read changes
+// ---------------------------------------------------------------------------
+
+const STEPS_PROMPT: &str = "how many steps does the plan have?";
+const STEPS_DIGEST: &str = "The user asked how many steps the plan has.";
+const LABEL_PROMPT: &str = "who labels the trays?";
+const LABEL_DIGEST: &str = "The user asked who labels the trays.";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_last_turns_are_carried_whole_until_a_file_they_read_changes() {
+    // A window the turns fit in whole (an undeclared `main-chat` gets the 8_192 fallback,
+    // whose budget loads digests only).
+    let home = memory_home(
+        &[],
+        &[(
+            MAIN,
+            entry(
+                MAIN,
+                MAIN_HOST,
+                &["model-context-windows: { main-chat: 1048576 }"],
+            ),
+        )],
+        &["provider: main"],
+    );
+    let plan = home.home().join(PLAN_PATH);
+    std::fs::create_dir_all(plan.parent().expect("a parent")).expect("the notes directory");
+    std::fs::write(&plan, PLAN_TEXT).expect("the plan");
+    let peer = &Peer::with_reads(
+        &[
+            (PLAN_PROMPT, PLAN_DIGEST),
+            (STEPS_PROMPT, STEPS_DIGEST),
+            (LABEL_PROMPT, LABEL_DIGEST),
+        ],
+        &[(PLAN_PROMPT, PLAN_PATH, PLAN_CONCLUSION)],
+    );
+    let plan_path = plan.clone();
+    serve(&home, peer, |client| async move {
+        client.turn(ROOT_MAILBOX, PLAN_PROMPT).await;
+        client.context_with_turns(Agent::Root, 1).await;
+
+        // The next turn carries turn 1 whole: the prompt, the read and its result, the reply.
+        client.turn(ROOT_MAILBOX, STEPS_PROMPT).await;
+        let latest = latest_assembly(&client, 2).await;
+        let second = peer.turn_prompt(STEPS_PROMPT);
+        let recent = second
+            .split_once("# Recent Turns")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| panic!("no recent turns: {second}"));
+        assert!(recent.contains("## Turn 1 · "), "{recent}");
+        assert!(recent.contains(&format!("user: {PLAN_PROMPT}")), "{recent}");
+        assert!(
+            recent.contains(&format!("assistant → read({{\"path\":\"{PLAN_PATH}\"}})")),
+            "{recent}"
+        );
+        assert!(
+            recent.contains("water the seedlings"),
+            "the result: {recent}"
+        );
+        assert!(
+            recent.contains(&format!("assistant: {PLAN_CONCLUSION}")),
+            "{recent}"
+        );
+        assert!(
+            second.find("# Recent Turns") < second.find(STEPS_PROMPT),
+            "the history comes before the prompt"
+        );
+        assert_eq!(latest["history"]["recent_turns"], json!(1), "{latest}");
+        assert_eq!(
+            latest["history"]["recent_turn_digests"],
+            json!(0),
+            "{latest}"
+        );
+
+        // The plan changes: turn 1 read a version that is gone, so it is carried as its
+        // digest; turn 2 read nothing and is carried whole.
+        std::fs::write(&plan_path, "Step one: repot the seedlings.\n").expect("edit the plan");
+        client.turn(ROOT_MAILBOX, LABEL_PROMPT).await;
+        let latest = latest_assembly(&client, 3).await;
+        let third = peer.turn_prompt(LABEL_PROMPT);
+        let recent = third
+            .split_once("# Recent Turns")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| panic!("no recent turns: {third}"));
+        assert!(
+            !recent.contains("## Turn 1 · "),
+            "turn 1 is stale: {recent}"
+        );
+        assert!(!third.contains("water the seedlings"), "{third}");
+        assert!(recent.contains("## Turn 2 · "), "{recent}");
+        assert!(
+            recent.contains(&format!("user: {STEPS_PROMPT}")),
+            "{recent}"
+        );
+        let digests = third
+            .split_once("# Recent Turn Digests")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| panic!("no digests: {third}"));
+        assert!(digests.contains(PLAN_DIGEST), "{digests}");
+        assert_eq!(latest["history"]["recent_turns"], json!(1), "{latest}");
+        assert_eq!(
+            latest["history"]["recent_turn_digests"],
+            json!(1),
+            "{latest}"
+        );
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// S6: a turn's later requests carry its reads L0-processed and fit the window
+// ---------------------------------------------------------------------------
+
+/// How NEAR AI refuses an input past the model's window (witnessed 2026-11-21 on its vLLM
+/// stack): a 400 `invalid_request_error` with no code, the overflow said in the message.
+const NEAR_TOO_LONG: &str = r#"{"error":{"message":"This model's maximum context length is 32768 tokens. However, your prompt contains at least 32769 input tokens, which exceeds this limit even without any output tokens. Please reduce the length of the input prompt. (parameter=input_tokens, value=32769)","type":"invalid_request_error","param":null,"code":null}}"#;
+const TWICE_PROMPT: &str = "read the greenhouse plan twice to be sure";
+const TWICE_DIGEST: &str = "The user asked to read the plan twice.";
+const TWICE_CONCLUSION: &str = "Both reads agree. Watering comes first.";
+
+/// The contents of the tool results of a chat body, in order.
+fn tool_results(body: &Value) -> Vec<String> {
+    messages_of(body)
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        .map(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// MODULE-010 S6 — within a turn, a file read again reaches the model once: the next request
+/// carries the older result as superseded (PRD §11.3.3 L0), while the turn log keeps both as
+/// they were; a request the provider refuses as too long is sent once more without the
+/// history, and the turn completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tool_loop_sends_collapsed_reads_and_survives_one_overflow() {
+    // A window the first turn fits in whole, so the second turn's seed carries it.
+    let home = memory_home(
+        &[],
+        &[(
+            MAIN,
+            entry(
+                MAIN,
+                MAIN_HOST,
+                &["model-context-windows: { main-chat: 1048576 }"],
+            ),
+        )],
+        &["provider: main"],
+    );
+    let plan = home.home().join(PLAN_PATH);
+    std::fs::create_dir_all(plan.parent().expect("a parent")).expect("the notes directory");
+    std::fs::write(&plan, PLAN_TEXT).expect("the plan");
+    let peer = &Peer::with_read_loops(
+        &[(PLAN_PROMPT, PLAN_DIGEST), (TWICE_PROMPT, TWICE_DIGEST)],
+        &[(PLAN_PROMPT, PLAN_PATH, PLAN_CONCLUSION)],
+        &[(TWICE_PROMPT, &[PLAN_PATH, PLAN_PATH], TWICE_CONCLUSION)],
+        &[TWICE_PROMPT],
+    );
+    serve(&home, peer, |client| async move {
+        client.turn(ROOT_MAILBOX, PLAN_PROMPT).await;
+        client.context_with_turns(Agent::Root, 1).await;
+        client.turn(ROOT_MAILBOX, TWICE_PROMPT).await;
+        client.context_with_turns(Agent::Root, 2).await;
+    })
+    .await;
+
+    let requests: Vec<Value> = peer
+        .chats()
+        .into_iter()
+        .filter(|sent| !is_extraction(&sent.body) && last_user(&sent.body).contains(TWICE_PROMPT))
+        .map(|sent| sent.body)
+        .collect();
+    // The read, the read again, the request refused as too long, and its retry.
+    assert_eq!(requests.len(), 4, "{requests:#?}");
+    assert!(tool_results(&requests[0]).is_empty());
+    let second = tool_results(&requests[1]);
+    assert!(
+        second.len() == 1 && second[0].contains("water the seedlings"),
+        "{second:?}"
+    );
+    // The second read supersedes the first: the plan reaches the model once.
+    let refused = tool_results(&requests[2]);
+    assert_eq!(
+        refused,
+        vec![
+            format!("[superseded: a later read of {PLAN_PATH} replaces this result]"),
+            second[0].clone()
+        ]
+    );
+    assert!(
+        contents(&requests[2]).contains("# Recent Turns"),
+        "the refused request carried the history"
+    );
+    // The retry is the same turn, without the history.
+    assert!(
+        !contents(&requests[3]).contains("# Recent Turns"),
+        "{}",
+        contents(&requests[3])
+    );
+    assert_eq!(tool_results(&requests[3]), refused);
+
+    // The turn completed: its log keeps both reads whole, marks the older one, and ends with
+    // the conclusion.
+    let log = turn_log(&root_task_dir(&home));
+    let turn: Vec<&Value> = log.iter().filter(|line| line["turn"] == json!(2)).collect();
+    let reads: Vec<&&Value> = turn
+        .iter()
+        .filter(|line| line["role"] == json!("tool"))
+        .collect();
+    assert_eq!(reads.len(), 2, "{turn:#?}");
+    for line in &reads {
+        assert!(
+            line["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("water the seedlings")),
+            "{line}"
+        );
+    }
+    assert_eq!(reads[0]["l0"]["action"], json!("superseded"), "{turn:#?}");
+    assert_eq!(
+        turn.last().expect("a line")["content"],
+        json!(TWICE_CONCLUSION),
+        "{turn:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D4: a deleted agent's task history is archived to its parent
+// ---------------------------------------------------------------------------
+
+/// The one directory in `dir`.
+fn only_dir(dir: &Path) -> PathBuf {
+    let dirs: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{dir:?}: {e}"))
+        .map(|entry| entry.expect("a directory entry").path())
+        .filter(|path| path.is_dir())
+        .collect();
+    assert_eq!(dirs.len(), 1, "one directory in {dir:?}: {dirs:?}");
+    dirs[0].clone()
+}
+
+/// MODULE-010 D4 (owner decision 2026-11-17) — on the production terminate path, a deleted
+/// Child hands its task history to its parent. The helper's turn is logged in its own
+/// `.agent/tasks/active/<task>/`. After the delete, that log is in the root's
+/// `.agent/tasks/archived-agents/<the helper's id>/active/<task>/`, whole, and the helper's directory
+/// holds no history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deleted_childs_task_history_is_archived_to_its_parent() {
+    let home = memory_home(
+        &["messaging"],
+        &[(
+            MAIN,
+            entry(MAIN, MAIN_HOST, &["embedding-model: main-embed"]),
+        )],
+        &["provider: main"],
+    );
+    let peer = &Peer::new(&[(HELPER_FIRST_PROMPT, HELPER_FIRST_DIGEST)]);
+    serve(&home, peer, |client| async move {
+        client
+            .create_unpinned_child(HELPER, &["fs", "llm", "memory"])
+            .await;
+    })
+    .await;
+    give_child_the_default_driver(&home, HELPER);
+    let helper_tasks = home.home().join(HELPER).join(".agent/tasks");
+
+    let noted = Arc::new(Mutex::new(None));
+    let note = noted.clone();
+    let tasks = helper_tasks.clone();
+    serve(&home, peer, |client| async move {
+        client.child_turn(HELPER_MAILBOX, HELPER_FIRST_PROMPT).await;
+        client.context_with_turns(Agent::Child(HELPER), 1).await;
+        let helper_id = client
+            .listed_id(Agent::Child(HELPER))
+            .await
+            .expect("the helper");
+        // Before the delete: the helper's turn is logged in its own task directory.
+        let task = only_dir(&tasks.join("active"));
+        let log =
+            std::fs::read_to_string(task.join("llm-turns.jsonl")).expect("the helper's turn log");
+        assert!(log.contains(HELPER_FIRST_PROMPT), "{log}");
+        // A task where an older release kept it, put there after the helper's wiring moved what
+        // it found: the delete's archiver moves it over before it archives the history.
+        let older = tasks
+            .parent()
+            .expect("the helper's .agent")
+            .join("memory/tasks/task-older");
+        std::fs::create_dir_all(&older).expect("the older task");
+        std::fs::write(older.join("llm-turns.jsonl"), OLDER_TASK_LOG).expect("its turn log");
+
+        client.delete_child(HELPER).await;
+        assert_eq!(client.listed_id(Agent::Child(HELPER)).await, None);
+        let task = task
+            .file_name()
+            .expect("a task directory name")
+            .to_os_string();
+        *note.lock().unwrap() = Some((helper_id, task, log));
+    })
+    .await;
+
+    let (helper_id, task, log) = noted.lock().unwrap().clone().expect("noted");
+    let archived = home.home().join(".agent/tasks/archived-agents");
+    assert_eq!(
+        only_dir(&archived).file_name(),
+        Some(std::ffi::OsStr::new(&helper_id)),
+        "the history is archived under the helper's id"
+    );
+    let kept = std::fs::read_to_string(
+        archived
+            .join(&helper_id)
+            .join("active")
+            .join(&task)
+            .join("llm-turns.jsonl"),
+    )
+    .expect("the archived turn log");
+    assert_eq!(kept, log, "the turn log is archived whole");
+    let older = std::fs::read_to_string(
+        archived
+            .join(&helper_id)
+            .join("active/task-older/llm-turns.jsonl"),
+    )
+    .expect("the older release's task, archived");
+    assert_eq!(older, OLDER_TASK_LOG);
+    assert!(
+        !helper_tasks.exists(),
+        "the helper's directory holds no history after the delete"
+    );
+    assert!(
+        !helper_tasks
+            .parent()
+            .expect("the helper's .agent")
+            .join("memory/tasks")
+            .exists(),
+        "nor where an older release kept it"
+    );
+}
+
+/// The turn log of the task an older release left in the helper's `.agent/memory/tasks/`.
+const OLDER_TASK_LOG: &str = "{\"turn\":1}\n";
+
+/// MODULE-010 D4 — a Child whose history could not be archived keeps it. The root's
+/// `.agent/tasks/archived-agents` is a file, so the archive fails; after the delete the
+/// helper's turn log is still in its own `.agent/tasks/active/<task>/`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deleted_childs_history_stays_when_its_archive_fails() {
+    let home = memory_home(
+        &["messaging"],
+        &[(
+            MAIN,
+            entry(MAIN, MAIN_HOST, &["embedding-model: main-embed"]),
+        )],
+        &["provider: main"],
+    );
+    let peer = &Peer::new(&[(HELPER_FIRST_PROMPT, HELPER_FIRST_DIGEST)]);
+    serve(&home, peer, |client| async move {
+        client
+            .create_unpinned_child(HELPER, &["fs", "llm", "memory"])
+            .await;
+    })
+    .await;
+    give_child_the_default_driver(&home, HELPER);
+    let helper_tasks = home.home().join(HELPER).join(".agent/tasks");
+    let blocked = home.home().join(".agent/tasks/archived-agents");
+
+    let tasks = helper_tasks.clone();
+    let block = blocked.clone();
+    serve(&home, peer, |client| async move {
+        client.child_turn(HELPER_MAILBOX, HELPER_FIRST_PROMPT).await;
+        client.context_with_turns(Agent::Child(HELPER), 1).await;
+        let task = only_dir(&tasks.join("active"));
+        let log =
+            std::fs::read_to_string(task.join("llm-turns.jsonl")).expect("the helper's turn log");
+        assert!(log.contains(HELPER_FIRST_PROMPT), "{log}");
+        std::fs::create_dir_all(block.parent().expect("the root's tasks")).unwrap();
+        std::fs::write(&block, b"not a directory").unwrap();
+
+        client.delete_child(HELPER).await;
+        assert_eq!(client.listed_id(Agent::Child(HELPER)).await, None);
+    })
+    .await;
+
+    assert!(blocked.is_file(), "nothing was archived");
+    let task = only_dir(&helper_tasks.join("active"));
+    let log =
+        std::fs::read_to_string(task.join("llm-turns.jsonl")).expect("the helper's turn log stays");
+    assert!(log.contains(HELPER_FIRST_PROMPT), "{log}");
 }

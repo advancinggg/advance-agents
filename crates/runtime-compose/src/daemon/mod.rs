@@ -1305,6 +1305,11 @@ async fn try_spawn_agent_loop(
             disp.bind_inventory(Arc::clone(&callable));
         }
         let identity_root = workspace.join(".agent");
+        // The task directories the history readers read (PRD §11.2) — the ones the live
+        // post-processor writes.
+        let tasks_root = memory_root
+            .as_ref()
+            .map(|_| cap_memory::turn_log::tasks_root(&workspace));
         // Live embedding FOLLOWS THIS AGENT'S CHAT PROVIDER: the agent's text is
         // embedded only by the entry its chat requests are placed on, resolved on
         // every call from the live provider config + the agent's `llm:` policy
@@ -1381,6 +1386,8 @@ async fn try_spawn_agent_loop(
                 write_agent_id: &cap_agent_id,
                 query_aliases: &[cap_agent_id.clone(), msg_agent_id.clone()],
                 memory_root: memory_root.as_deref(),
+                tasks_root: tasks_root.as_deref(),
+                workspace_root: Some(workspace),
                 // skills-J26 reader satellite: activates the real DiskSkillSummaryReader
                 // (Some iff `skills` declared — already gated in wiring.rs).
                 skills_agent_root: skills_root.as_deref(),
@@ -1406,6 +1413,10 @@ async fn try_spawn_agent_loop(
                 native_tools: Some(Arc::new(crate::context_wiring::GatewayNativeTools::new(
                     gateway.clone(),
                 ))),
+                chat_model: Some(crate::context_wiring::gateway_chat_model_source(
+                    gateway.clone(),
+                    &cap_agent_id,
+                )),
             },
         );
         // Wave-12 (SYS-AC-122): LATE-BIND THIS per-agent assembler into the
@@ -2389,6 +2400,10 @@ pub(crate) fn build_live_post_processor(
         cap_memory::DEFAULT_COOLDOWN_SECS,
     ));
     let clock = Arc::new(cap_memory::SystemClock);
+    // MODULE-010 B1: a task's files moved from `.agent/memory/tasks/` to
+    // `.agent/tasks/active/`. What an older release kept there moves over before the
+    // agent's first turn, so each task goes on where it stopped.
+    cap_memory::turn_log::adopt_legacy_tasks(workspace);
     let mem_root = workspace.join(".agent").join("memory");
     let mut components = cap_memory::Components::wired(
         extractor,
@@ -2398,7 +2413,11 @@ pub(crate) fn build_live_post_processor(
         clock,
         event_bus_ss,
     )
-    .with_fs_root(mem_root.clone())
+    .with_tasks_root(cap_memory::turn_log::tasks_root(workspace))
+    .with_workspace_root(workspace.to_path_buf())
+    .with_transcript_source(
+        gateway.clone() as Arc<dyn advance_shared_types::turn_log::TurnTranscriptSource>
+    )
     .with_write_agent_id(write_agent_id);
     // Prefer the composition-root shared index (one writer for root + children).
     // Else open the on-disk rusqlite file; degrade to the in-memory default

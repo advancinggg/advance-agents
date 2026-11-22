@@ -269,6 +269,9 @@ impl Rig {
             report_sink: Some(Arc::clone(&self.reports) as _),
             light_llm: None,
             native_tools: None,
+            chat_model: None,
+            tasks_root: None,
+            workspace_root: None,
         })
     }
 

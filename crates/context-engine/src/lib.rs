@@ -120,6 +120,11 @@ pub use ports::{
     AssemblyHistoryReport, AssemblyRecallReport, AssemblyReport, AssemblyReportSink,
     AssemblySection, RuntimeInfoReader, RuntimeInfoView,
 };
+// D5 — the model the agent chats on and its window.
+pub use ports::{ChatModelSource, ChatModelWindow, WindowSource};
+// ⑯ — the recent turns of the task.
+pub use ports::{NoRecentTurns, RecentTurn, RecentTurnsReader};
+pub use tier3::family_context_window;
 // Slice D — new ports + carriers (AC-06 / AC-08 / AC-17).
 pub use ports::{
     BlobId, CheckedTurn, DigestOnlyView, EpochSummary, GitBlobReader, GlobalMemoryRecord,

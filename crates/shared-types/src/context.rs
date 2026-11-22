@@ -44,6 +44,31 @@ pub struct LlmMessage {
     pub content: String,
 }
 
+/// The first line of the ⑯ section of the task's recent turns in an assembled context.
+pub const RECENT_TURNS_HEADING: &str = "# Recent Turns\n";
+/// The first line of the section of the task's recent-turn digests (L2).
+pub const RECENT_TURN_DIGESTS_HEADING: &str = "# Recent Turn Digests\n";
+/// The first line of the section of the task's epoch summary (L3).
+pub const EPOCH_SUMMARY_HEADING: &str = "# Epoch Summary\n";
+
+/// The first lines of the Tier 3 history sections of an assembled context: the task's recent
+/// turns, their digests and its epoch summary. The context engine opens each of these system
+/// messages with one of them, and no other; the gateway takes these sections out first when a
+/// turn's request outgrows the model's window (MODULE-010 S6), so Tier 1 and Tier 2, the
+/// cache prefix, stay as they were sent.
+pub const TIER3_HISTORY_HEADINGS: [&str; 3] = [
+    RECENT_TURNS_HEADING,
+    RECENT_TURN_DIGESTS_HEADING,
+    EPOCH_SUMMARY_HEADING,
+];
+
+/// Whether `content` is one of the Tier 3 history sections ([`TIER3_HISTORY_HEADINGS`]).
+pub fn is_tier3_history(content: &str) -> bool {
+    TIER3_HISTORY_HEADINGS
+        .iter()
+        .any(|heading| content.starts_with(heading))
+}
+
 /// MODULE-010 §2.3:385-394 — per-tier token accounting. Four fields mirror
 /// §1.3 tier model (Tier 1a static / 1b dynamic / Tier 2 session / Tier 3
 /// per-call). Tier 4 compression metadata is not materialized here —

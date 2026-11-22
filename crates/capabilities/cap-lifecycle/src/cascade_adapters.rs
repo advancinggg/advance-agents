@@ -263,6 +263,18 @@ const AGENT_MEMORY_REL: &str = ".agent/memory";
 /// to avoid a cap-lifecycle → cap-memory dependency edge).
 const ARCHIVE_SUBDIR: &str = "archive";
 const KNOWLEDGE_FILE: &str = "knowledge.jsonl";
+/// The task history of an agent workspace (PRD §11.2: `active/<task-id>/`, `archived/`).
+const AGENT_TASKS_REL: &str = ".agent/tasks";
+/// Where an older OSS release kept an agent's task directories. The agent's wiring moves
+/// them to `.agent/tasks/active/` (cap-memory `turn_log::adopt_legacy_tasks`); an agent that
+/// never ran on a later release may still hold them here.
+const LEGACY_AGENT_TASKS_REL: &str = ".agent/memory/tasks";
+/// Where a parent keeps the task history of the agents archived to it (MODULE-010 D4):
+/// `.agent/tasks/archived-agents/<agent-id>/`, beside the PRD's `active/` and `archived/` (the
+/// agent's own tasks), so an archived agent's id never meets one of the parent's task ids.
+const AGENTS_ARCHIVED_SUBDIR: &str = "archived-agents";
+/// How many names `<agent-id>`, `<agent-id>.2`, … an archive of task history tries.
+const MAX_TASK_ARCHIVE_SLOTS: usize = 1_000;
 
 impl FsMemoryArchiver {
     pub fn new() -> Self {
@@ -374,6 +386,196 @@ impl MemoryArchiver for FsMemoryArchiver {
         }
         Ok(())
     }
+
+    /// MODULE-010 D4 — move `agent_workspace/.agent/tasks/` to
+    /// `parent_workspace/.agent/tasks/archived-agents/<agent_id>/` whole: its `active/`,
+    /// `archived/` and `archived-agents/` directories as they are, so what a descendant handed
+    /// over to the agent moves on with it (`archived-agents/<agent>/archived-agents/<descendant>/…`).
+    /// The first free name of
+    /// `<agent_id>`, `<agent_id>.2`, … is taken, so a reused id never overwrites an earlier
+    /// archive; `.` is outside the agent-id charset, so such a name is never another agent's id. A rename moves it at once; across file systems it is copied — directories and
+    /// regular files only, a link is never followed — then removed. Nothing is archived when
+    /// the agent has no task history, when the history holds no file, or when
+    /// `.agent/tasks` is not a directory of its own (a link in its place is left alone).
+    fn archive_agent_tasks(
+        &self,
+        agent_id: &str,
+        agent_workspace: &Path,
+        parent_workspace: &Path,
+    ) -> Result<(), LifecycleError> {
+        for p in [agent_workspace, parent_workspace] {
+            if p.components().any(|c| matches!(c, Component::ParentDir)) {
+                return Err(LifecycleError::InvalidTarget(format!(
+                    "archive_agent_tasks: path {} contains a `..` component",
+                    p.display()
+                )));
+            }
+        }
+        if !is_safe_component(agent_id) {
+            return Err(LifecycleError::InvalidTarget(format!(
+                "archive_agent_tasks: agent id {agent_id:?} is not a safe directory name"
+            )));
+        }
+        let src = agent_workspace.join(AGENT_TASKS_REL);
+        match std::fs::symlink_metadata(&src) {
+            Ok(md) if md.is_dir() => {}
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(LifecycleError::IoFailure(format!(
+                    "archive_agent_tasks stat {}: {e}",
+                    src.display()
+                )));
+            }
+        }
+        if !holds_a_file(&src)? {
+            return Ok(());
+        }
+        let archive = parent_workspace
+            .join(AGENT_TASKS_REL)
+            .join(AGENTS_ARCHIVED_SUBDIR);
+        // What exists of the path is checked before anything is made in it, and the whole path
+        // after: no directory is made through a link.
+        crate::workspace::symlink_check(parent_workspace, &archive).map_err(|e| {
+            LifecycleError::IoFailure(format!("archive symlink_check {}: {e}", archive.display()))
+        })?;
+        std::fs::create_dir_all(&archive).map_err(|e| {
+            LifecycleError::IoFailure(format!("archive mkdir {}: {e}", archive.display()))
+        })?;
+        crate::workspace::symlink_check(parent_workspace, &archive).map_err(|e| {
+            LifecycleError::IoFailure(format!("archive symlink_check {}: {e}", archive.display()))
+        })?;
+        let dst = free_task_archive_slot(&archive, agent_id)?;
+        match std::fs::rename(&src, &dst) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                copy_tree(&src, &dst)?;
+                std::fs::remove_dir_all(&src).map_err(|e| {
+                    LifecycleError::IoFailure(format!(
+                        "archive remove {} after its copy: {e}",
+                        src.display()
+                    ))
+                })
+            }
+            Err(e) => Err(LifecycleError::IoFailure(format!(
+                "archive move {} to {}: {e}",
+                src.display(),
+                dst.display()
+            ))),
+        }
+    }
+}
+
+/// MODULE-010 D4 — whether `workspace` still holds a task history: its `.agent/tasks`, or the
+/// `.agent/memory/tasks` an older release kept it in, is a directory of its own (not a link)
+/// with a regular file below it. Once a terminated agent's
+/// history went to its parent ([`FsMemoryArchiver`]'s `archive_agent_tasks`) it holds none; a
+/// caller about to remove the workspace or its `.agent/` keeps them while it does, so a
+/// history whose archive failed is not lost. A history that cannot be read counts as one.
+pub fn task_history_left(workspace: &Path) -> bool {
+    [AGENT_TASKS_REL, LEGACY_AGENT_TASKS_REL].iter().any(|rel| {
+        let tasks = workspace.join(rel);
+        std::fs::symlink_metadata(&tasks).is_ok_and(|md| md.is_dir())
+            && holds_a_file(&tasks).unwrap_or(true)
+    })
+}
+
+/// Whether the directory `dir` holds a regular file anywhere below it (links not followed).
+fn holds_a_file(dir: &Path) -> Result<bool, LifecycleError> {
+    let rd = std::fs::read_dir(dir).map_err(|e| {
+        LifecycleError::IoFailure(format!("archive read_dir {}: {e}", dir.display()))
+    })?;
+    for ent in rd {
+        let ent = ent.map_err(|e| {
+            LifecycleError::IoFailure(format!("archive dir entry under {}: {e}", dir.display()))
+        })?;
+        match std::fs::symlink_metadata(ent.path()) {
+            Ok(md) if md.is_file() => return Ok(true),
+            Ok(md) if md.is_dir() => {
+                if holds_a_file(&ent.path())? {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+/// The first of `archive/<agent_id>`, `archive/<agent_id>.2`, … that does not exist.
+fn free_task_archive_slot(archive: &Path, agent_id: &str) -> Result<PathBuf, LifecycleError> {
+    for n in 1..=MAX_TASK_ARCHIVE_SLOTS {
+        let name = if n == 1 {
+            agent_id.to_string()
+        } else {
+            format!("{agent_id}.{n}")
+        };
+        let candidate = archive.join(name);
+        match std::fs::symlink_metadata(&candidate) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Err(e) => {
+                return Err(LifecycleError::IoFailure(format!(
+                    "archive stat {}: {e}",
+                    candidate.display()
+                )));
+            }
+            Ok(_) => {}
+        }
+    }
+    Err(LifecycleError::IoFailure(format!(
+        "archive: no free name for {agent_id:?} under {}",
+        archive.display()
+    )))
+}
+
+/// Copy the directory `src` to `dst`, which does not exist yet: its directories and regular
+/// files only — a link, or any other entry, is left behind and never followed. A copy that
+/// fails part-way is removed (`dst` is this call's own), so the history stays whole only where
+/// it was.
+fn copy_tree(src: &Path, dst: &Path) -> Result<(), LifecycleError> {
+    std::fs::create_dir(dst)
+        .map_err(|e| LifecycleError::IoFailure(format!("archive mkdir {}: {e}", dst.display())))?;
+    copy_entries(src, dst).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(dst);
+    })
+}
+
+/// [`copy_tree`]'s entries of `src` into the directory `dst`.
+fn copy_entries(src: &Path, dst: &Path) -> Result<(), LifecycleError> {
+    let rd = std::fs::read_dir(src).map_err(|e| {
+        LifecycleError::IoFailure(format!("archive read_dir {}: {e}", src.display()))
+    })?;
+    for ent in rd {
+        let ent = ent.map_err(|e| {
+            LifecycleError::IoFailure(format!("archive dir entry under {}: {e}", src.display()))
+        })?;
+        let from = ent.path();
+        let to = dst.join(ent.file_name());
+        match std::fs::symlink_metadata(&from) {
+            Ok(md) if md.is_dir() => copy_tree(&from, &to)?,
+            Ok(md) if md.is_file() => copy_file_new(&from, &to).map_err(|e| {
+                LifecycleError::IoFailure(format!(
+                    "archive copy {} to {}: {e}",
+                    from.display(),
+                    to.display()
+                ))
+            })?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Copy the regular file `from` to `to`, which must not exist yet. So on a volume that ignores
+/// case, two names that differ only in case fail the copy instead of one replacing the other.
+fn copy_file_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut src = std::fs::File::open(from)?;
+    let mut dst = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    std::io::copy(&mut src, &mut dst)?;
+    Ok(())
 }
 
 /// A single path component safe to use as a literal directory name.
@@ -457,4 +659,50 @@ fn append_into(src: &Path, dst: &Path, parent_root: &Path) -> Result<(), Lifecyc
         })?;
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod copy_tree_tests {
+    use super::copy_tree;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A copy never writes over a file that is there already.
+    #[test]
+    fn a_copy_never_writes_over_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("from.jsonl");
+        let taken = tmp.path().join("taken.jsonl");
+        std::fs::write(&from, "new").unwrap();
+        std::fs::write(&taken, "old").unwrap();
+        assert!(super::copy_file_new(&from, &taken).is_err());
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "old");
+        let fresh = tmp.path().join("fresh.jsonl");
+        super::copy_file_new(&from, &fresh).unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "new");
+    }
+
+    /// A copy that fails part-way leaves nothing where it copied to, and the source whole.
+    #[test]
+    fn a_copy_that_fails_part_way_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("tasks");
+        std::fs::create_dir_all(src.join("active/task-a")).unwrap();
+        std::fs::write(src.join("active/task-a/llm-turns.jsonl"), "a").unwrap();
+        let locked = src.join("active/task-a/turn-index.yaml");
+        std::fs::write(&locked, "b").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&locked).is_ok() {
+            // Run as root: the file stays readable, so no copy of it fails.
+            return;
+        }
+        let dst = tmp.path().join("archived");
+        assert!(copy_tree(&src, &dst).is_err());
+        assert!(!dst.exists(), "nothing is left of the copy");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::read_to_string(&locked).unwrap(), "b");
+        assert_eq!(
+            std::fs::read_to_string(src.join("active/task-a/llm-turns.jsonl")).unwrap(),
+            "a"
+        );
+    }
 }

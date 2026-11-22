@@ -367,17 +367,93 @@ pub(crate) fn is_transient_error_type_5xx(err_type: &str) -> bool {
 /// arm stays message-probe-only deliberately: its vendor vocabulary signals
 /// overflow via invalid_request_error + message, with neither an overflow
 /// type nor a code field.
-/// The pre-existing 400 arms (openai's exact-literal acceptance, responses'
-/// exact-type-only shape) are untouched — the lane's 400-path byte-identity
-/// obligation — so on 400 a non-canonical spelling still falls through
-/// (pinned by the openai 400-boundary control). Disclosed, accepted; a
-/// 400-arm change belongs to a /spec pass.
+/// On 400 the openai arm accepts the same structured signals since MODULE-010
+/// S6 ([`is_context_overflow_refusal`]), its message probe co-gated by
+/// `invalid_request_error`; the responses arm keeps its exact-type-only shape.
 pub(crate) fn normalize_error_type(err_type: &str) -> String {
     err_type
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>()
         .to_ascii_lowercase()
+}
+
+/// MODULE-010 S6 — whether the body of a 400 refusal says the request does not fit the
+/// model's context window, in the envelope OpenAI-compatible services and Anthropic share:
+/// `error.type` or `error.code` `context_length_exceeded` in any spelling (OpenAI sends the
+/// code), or an `invalid_request_error` whose message is an overflow-complete phrase
+/// ([`is_context_overflow_message_5xx`]) — as NEAR AI's vLLM stack sends it (witnessed
+/// 2026-11-21: "This model's maximum context length is 32768 tokens. However, your prompt
+/// contains at least 32769 input tokens, …", type `invalid_request_error`, code null). A
+/// transient type or code vetoes it, as on the 5xx path. A completion budget past the window
+/// ("max_tokens=… cannot be greater than max_model_len=…") is a parameter error, not an
+/// overflow of the request, and stays out. The bytes only select the fixed reason of the
+/// caller: nothing of them reaches an error, an event or a log.
+pub(crate) fn is_context_overflow_refusal(body: &[u8]) -> bool {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let err = &v["error"];
+    let err_type = err["type"].as_str().unwrap_or("");
+    let err_code = err["code"].as_str().unwrap_or("");
+    let err_msg = err["message"].as_str().unwrap_or("");
+    if is_transient_error_type_5xx(err_type) || is_transient_error_type_5xx(err_code) {
+        return false;
+    }
+    normalize_error_type(err_type) == "contextlengthexceeded"
+        || normalize_error_type(err_code) == "contextlengthexceeded"
+        || (normalize_error_type(err_type) == "invalidrequesterror"
+            && is_context_overflow_message_5xx(err_msg))
+}
+
+#[cfg(test)]
+mod overflow_refusal_tests {
+    use super::is_context_overflow_refusal;
+
+    #[test]
+    fn the_overflow_refusals_of_real_services_are_recognised() {
+        let rows: [(&[u8], bool); 9] = [
+            // NEAR AI (vLLM), witnessed 2026-11-21.
+            (br#"{"error":{"message":"This model's maximum context length is 32768 tokens. However, your prompt contains at least 32769 input tokens, which exceeds this limit even without any output tokens. Please reduce the length of the input prompt. (parameter=input_tokens, value=32769)","type":"invalid_request_error","param":null,"code":null}}"#, true),
+            // OpenAI: the code names the overflow.
+            (
+                br#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"invalid_request_error","param":"messages","code":"context_length_exceeded"}}"#,
+                true,
+            ),
+            // Anthropic: an invalid request whose message says the prompt is too long.
+            (
+                br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213413 tokens > 200000 maximum"}}"#,
+                true,
+            ),
+            // The type in another spelling.
+            (br#"{"error":{"type":"context-length-exceeded"}}"#, true),
+            // NEAR AI, witnessed 2026-11-21: a completion budget past the window.
+            (br#"{"error":{"message":"Provider failed for model 'deepseek-ai/DeepSeek-V4.1-Flash-1017': max_tokens=2000000 cannot be greater than max_model_len=1048576. Please request fewer output tokens. (parameter=max_tokens, value=2000000)","type":"invalid_request_error","param":null,"code":null}}"#, false),
+            // A transient type or code vetoes every other signal.
+            (
+                br#"{"error":{"type":"rate_limit_error","code":"context_length_exceeded","message":"context length"}}"#,
+                false,
+            ),
+            // On 400 an overflow phrase needs an invalid request around it.
+            (
+                br#"{"error":{"type":"BadRequestError","message":"This model's maximum context length is 4096 tokens."}}"#,
+                false,
+            ),
+            (
+                br#"{"error":{"type":"invalid_request_error","message":"context too busy"}}"#,
+                false,
+            ),
+            (b"not json", false),
+        ];
+        for (body, expected) in rows {
+            assert_eq!(
+                is_context_overflow_refusal(body),
+                expected,
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
 }
 
 #[cfg(test)]

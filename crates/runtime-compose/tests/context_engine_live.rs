@@ -500,6 +500,11 @@ fn mentions(text: &str, words: &[&str]) -> bool {
 /// Run a turn of the root agent to its end and return what crossed the network.
 async fn root_turn(tap: &Tap, client: &Client, live: &Live, say: &str) -> Trace {
     let from = tap.len();
+    let _report = ReportOnPanic {
+        tap,
+        from,
+        said: say,
+    };
     client.turn(ROOT_MAILBOX, say).await;
     let trace = Trace {
         said: say.to_string(),
@@ -511,9 +516,82 @@ async fn root_turn(tap: &Tap, client: &Client, live: &Live, say: &str) -> Trace 
     trace
 }
 
+/// Reports what crossed the network since `from` when the turn panics, so a failed live turn
+/// still shows each request's status, a refused one's error body, and the messages of the
+/// last chat request with its answer.
+struct ReportOnPanic<'a> {
+    tap: &'a Tap,
+    from: usize,
+    said: &'a str,
+}
+
+impl Drop for ReportOnPanic<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let trace = Trace {
+            said: self.said.to_string(),
+            exchanges: self.tap.since(self.from),
+        };
+        trace.report("the failed turn");
+        for exchange in trace.exchanges.iter().filter(|e| e.status != Some(200)) {
+            println!(
+                "    refused {:?}: {}",
+                exchange.status,
+                brief(&exchange.response.to_string(), 400)
+            );
+        }
+        let Some(last) = trace.exchanges.iter().rev().find(|e| e.is_chat()) else {
+            return;
+        };
+        let messages = last
+            .request
+            .get("messages")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        let tools = last
+            .request
+            .get("tools")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        println!(
+            "    the last request: {} messages, {tools} tools offered",
+            messages.len()
+        );
+        for message in messages {
+            let text = |key: &str| message.get(key).and_then(Value::as_str).unwrap_or("-");
+            let calls = message
+                .get("tool_calls")
+                .map_or("-".to_string(), |calls| brief(&calls.to_string(), 120));
+            println!(
+                "      {} {} calls={calls} {:?}",
+                text("role"),
+                text("tool_call_id"),
+                brief(text("content"), 90)
+            );
+        }
+        // Its answer, each text in it replaced by its length.
+        let mut answer = last.response.clone();
+        if let Some(message) = answer.pointer_mut("/choices/0/message") {
+            for key in ["content", "reasoning_content", "reasoning"] {
+                if let Some(len) = message.get(key).and_then(Value::as_str).map(str::len) {
+                    message[key] = Value::String(format!("<{len} bytes>"));
+                }
+            }
+        }
+        println!("    its answer: {}", brief(&answer.to_string(), 600));
+    }
+}
+
 /// Run a turn of the child at `mailbox` to its end and return what crossed the network.
 async fn child_turn(tap: &Tap, client: &Client, live: &Live, mailbox: &str, say: &str) -> Trace {
     let from = tap.len();
+    let _report = ReportOnPanic {
+        tap,
+        from,
+        said: say,
+    };
     client.child_turn(mailbox, say).await;
     let trace = Trace {
         said: say.to_string(),
@@ -523,6 +601,50 @@ async fn child_turn(tap: &Tap, client: &Client, live: &Live, mailbox: &str, say:
     trace.assert_answered();
     trace.assert_asked_of(live);
     trace
+}
+
+/// A request's size by the workspace's `bytes / 4` estimate, as the gateway's fit counts it:
+/// each message's role, content, tool calls and tool-call id, and the tools it offers.
+fn estimated_tokens(request: &Value) -> usize {
+    let text = |value: &Value| value.as_str().map_or(0, str::len);
+    let messages: usize = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|message| {
+            let calls: usize = message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|call| {
+                    text(&call["id"])
+                        + text(&call["function"]["name"])
+                        + text(&call["function"]["arguments"])
+                })
+                .sum();
+            text(&message["role"])
+                + text(&message["content"])
+                + calls
+                + text(&message["tool_call_id"])
+        })
+        .sum();
+    let tools: usize = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|tool| {
+            let function = &tool["function"];
+            text(&function["name"])
+                + text(&function["description"])
+                + function
+                    .get("parameters")
+                    .map_or(0, |p| p.to_string().len())
+        })
+        .sum();
+    advance_shared_types::token_estimate::tokens_from_bytes(messages + tools)
 }
 
 /// The turn rows the home's index holds for `agent_id`, read from disk once the
@@ -1072,4 +1194,266 @@ async fn an_answer_ending_in_a_held_start_reaches_the_stream_whole() {
         );
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// S6: a turn's later requests carry its reads L0-processed and fit the window
+// ---------------------------------------------------------------------------
+
+/// The contents of the tool results a model request carries, in order.
+fn tool_results(request: &Value) -> Vec<String> {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+                .map(|message| {
+                    message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The tool results of the turn log of the root agent's one task, in order.
+fn logged_results(home: &FixtureHome) -> Vec<String> {
+    let active = home.home().join(".agent/tasks/active");
+    let tasks: Vec<std::path::PathBuf> = std::fs::read_dir(&active)
+        .unwrap_or_else(|e| panic!("the task directories: {}", e.kind()))
+        .map(|entry| entry.expect("a directory entry").path())
+        .filter(|path| path.is_dir())
+        .collect();
+    assert_eq!(tasks.len(), 1, "one task: {tasks:?}");
+    std::fs::read_to_string(tasks[0].join("llm-turns.jsonl"))
+        .expect("the turn log")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("a log line"))
+        .filter(|line| line["role"] == "tool")
+        .map(|line| line["content"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+const READ_TWICE: &str = "Use the read tool to open garden-plan.md. Then use the read tool to open garden-plan.md a second time, to double-check it. Then tell me how many numbered steps it lists.";
+
+/// MODULE-010 S6 — a real tool turn that reads the same file twice: the request after the
+/// second read carries the first as superseded (PRD §11.3.3 L0, Step A), and the service
+/// takes it — each tool message still answers its call; the turn log keeps both reads whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "calls a real model service; set the ADVANCE_LIVE_LLM_* variables"]
+async fn a_real_tool_turn_sends_a_file_it_read_twice_once() {
+    let Some(live) = live() else { return };
+    let live = &live;
+    let home = memory_home(true, &[], &[live.entry(NEAR, true)], &["provider: near"]);
+    std::fs::write(home.home().join(PLAN_FILE), PLAN_TEXT).expect("the plan");
+    let tap = &Tap::new();
+    serve(&home, tap.security(), WAIT, |client| async move {
+        let trace = root_turn(tap, &client, live, READ_TWICE).await;
+        trace.report("root");
+        trace.assert_answered();
+        trace.assert_asked_of(live);
+        let requests = trace.model_requests();
+        let reads: usize = requests
+            .iter()
+            .map(|request| {
+                request
+                    .tool_calls()
+                    .iter()
+                    .filter(|name| *name == "read")
+                    .count()
+            })
+            .sum();
+        assert!(
+            reads >= 2,
+            "the model was to read the plan twice, it made {reads} read call(s): run again"
+        );
+        let collapsed = requests
+            .iter()
+            .find(|request| {
+                tool_results(&request.request).iter().any(|result| {
+                    result.starts_with("[superseded: a later read of ")
+                        && result.contains(PLAN_FILE)
+                })
+            })
+            .unwrap_or_else(|| {
+                let seen: Vec<Vec<String>> = requests
+                    .iter()
+                    .map(|request| {
+                        tool_results(&request.request)
+                            .iter()
+                            .map(|result| brief(result, 80))
+                            .collect()
+                    })
+                    .collect();
+                panic!("no request carries the first read superseded: {seen:?}")
+            });
+        let results = tool_results(&collapsed.request);
+        println!(
+            "LIVE tool results of the request after the second read: {:?}",
+            results
+                .iter()
+                .map(|result| brief(result, 80))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            results
+                .iter()
+                .any(|result| result.contains("Plant the tomatoes")),
+            "the later read is carried whole: {results:?}"
+        );
+        assert_eq!(collapsed.status, Some(200), "the service took the request");
+        assert!(
+            mentions(&trace.answer(), &["3", "three"]),
+            "the answer counts the plan's steps: {}",
+            trace.answer()
+        );
+    })
+    .await;
+    let logged = logged_results(&home);
+    assert!(
+        logged
+            .iter()
+            .filter(|result| result.contains("Plant the tomatoes"))
+            .count()
+            >= 2,
+        "the turn log keeps both reads whole: {:?}",
+        logged
+            .iter()
+            .map(|result| brief(result, 80))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Four lists: the default driver offers its tools for eight rounds of a turn, and asks once
+/// more without them.
+const SHELF_FILES: [(&str, &str); 4] = [
+    ("shelf-a.md", "Marigold"),
+    ("shelf-b.md", "Sunflower"),
+    ("shelf-c.md", "Lavender"),
+    ("shelf-d.md", "Peony"),
+];
+const READ_THE_SHELVES: &str = "Use the read tool to open shelf-a.md, then shelf-b.md, then shelf-c.md, then shelf-d.md. Then tell me the first word of the last line of shelf-d.md.";
+/// The window the entry declares for the chat model, so a request may take 4_590 tokens (the
+/// window less the reserve). The turn's seed (about 900 tokens) and three shelf lists of about
+/// 1_000 tokens each fit in that; with the fourth list the request does not.
+const SMALL_WINDOW: u32 = 5_400;
+
+/// A made-up shelf list of about 3.8 KB, whose last line starts with `last`. It stays under
+/// the 4 KiB an agent's `fs.read` returns of a file, so a result holds the whole list.
+fn shelf_text(shelf: &str, last: &str) -> String {
+    let mut text = String::new();
+    for n in 1..=55 {
+        text.push_str(&format!(
+            "Line {n} of {shelf}: a packet of heirloom seeds, sorted by colour.\n"
+        ));
+    }
+    text.push_str(&format!("{last} closes the list.\n"));
+    text
+}
+
+/// MODULE-010 S6 — the request of a real tool turn that outgrows the window the entry
+/// declares for the model is fitted before it is sent: its oldest tool result is cut to one
+/// line, the last two stay whole, and the service takes it — the cut result still answers
+/// its call. The turn log keeps every result whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "calls a real model service; set the ADVANCE_LIVE_LLM_* variables"]
+async fn a_real_tool_turn_is_fitted_to_the_window_its_entry_declares() {
+    let Some(live) = live() else { return };
+    let live = &live;
+    let (id, mut item, key) = live.entry(NEAR, true);
+    item.push_str(&format!(
+        "    model-context-windows: {{ \"{}\": {SMALL_WINDOW} }}\n",
+        live.chat_model
+    ));
+    let home = memory_home(true, &[], &[(id, item, key)], &["provider: near"]);
+    for (file, last) in SHELF_FILES {
+        std::fs::write(home.home().join(file), shelf_text(file, last)).expect("a shelf list");
+    }
+    let tap = &Tap::new();
+    serve(&home, tap.security(), WAIT, |client| async move {
+        let trace = root_turn(tap, &client, live, READ_THE_SHELVES).await;
+        trace.report("root");
+        trace.assert_answered();
+        trace.assert_asked_of(live);
+        let requests = trace.model_requests();
+        println!(
+            "LIVE request sizes (bytes / 4): {:?}",
+            requests
+                .iter()
+                .map(|request| estimated_tokens(&request.request))
+                .collect::<Vec<_>>()
+        );
+        let cut_prefix = "[cut to fit the model's context window: the result of read(path=";
+        // The reads' results: a `list` or `scan` the model calls first is not one.
+        let read_results = |request: &Value| -> Vec<String> {
+            tool_results(request)
+                .into_iter()
+                .filter(|result| {
+                    result.starts_with(cut_prefix) || result.contains("closes the list.")
+                })
+                .collect()
+        };
+        let fitted = requests
+            .iter()
+            .find(|request| {
+                tool_results(&request.request)
+                    .iter()
+                    .any(|result| result.starts_with(cut_prefix))
+            })
+            .unwrap_or_else(|| {
+                let seen: Vec<Vec<String>> = requests
+                    .iter()
+                    .map(|request| {
+                        tool_results(&request.request)
+                            .iter()
+                            .map(|result| brief(result, 80))
+                            .collect()
+                    })
+                    .collect();
+                panic!("no request was fitted: {seen:?}")
+            });
+        let results = read_results(&fitted.request);
+        println!(
+            "LIVE tool results of the fitted request: {:?}",
+            results
+                .iter()
+                .map(|result| brief(result, 100))
+                .collect::<Vec<_>>()
+        );
+        assert!(results.len() >= 3, "{results:?}");
+        assert!(
+            results[0].starts_with(cut_prefix) && results[0].contains("shelf-"),
+            "the oldest read's result is cut to the line naming its call: {:?}",
+            brief(&results[0], 120)
+        );
+        for result in &results[results.len() - 2..] {
+            assert!(
+                result.contains("closes the list."),
+                "the last two results are whole: {:?}",
+                brief(result, 120)
+            );
+        }
+        assert_eq!(
+            fitted.status,
+            Some(200),
+            "the service took the fitted request"
+        );
+        assert!(!trace.answer().trim().is_empty(), "the turn was answered");
+    })
+    .await;
+    let logged = logged_results(&home);
+    for (file, _) in SHELF_FILES {
+        assert!(
+            logged
+                .iter()
+                .any(|result| result.contains(&format!("of {file}:"))
+                    && result.contains("closes the list.")),
+            "the turn log keeps every result whole: {file}"
+        );
+    }
 }

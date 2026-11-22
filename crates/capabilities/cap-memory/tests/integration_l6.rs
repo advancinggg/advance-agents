@@ -608,7 +608,9 @@ async fn l6_i_10_post_processor_step9_emit() {
         cursor_store: Arc::new(cap_memory::L6CursorStore::new()),
         // Slice satB-postproc: write-path seam fields — this test is trace-only
         // for Steps 7/8 (no fs_root) and uses the run() agent id (no override).
-        fs_root: None,
+        tasks_root: None,
+        workspace_root: None,
+        transcript_source: None,
         write_agent_id: None,
         // Slice satC-l6: no in-process L6 dispatch (this test asserts Step-9
         // emit only, via the InMemoryEmitter above).

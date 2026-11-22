@@ -4211,7 +4211,7 @@ fn build_harness_live_post_processor(
         clock,
         event_bus,
     )
-    .with_fs_root(mem_root.to_path_buf())
+    .with_tasks_root(mem_root.join("tasks"))
     .with_write_agent_id(write_agent_id);
     // Durable 254: swap in the on-disk rusqlite index; degrade to the in-memory
     // default (+ log) on open error — never fail the turn pipeline (mirrors start.rs).

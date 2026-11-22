@@ -664,6 +664,7 @@ impl AgentLoopDriverImpl {
                     (self.turn_persistence_boundary.as_ref(), turn_lease.as_ref())
                 {
                     if let Err(e) = boundary.finish_turn(agent_id, lease_id).await {
+                        self.post_processor.turn_failed(agent_id, &msg).await;
                         if let Some(active) = protected_turn.as_mut() {
                             let _ = active.finish_destroyed().await;
                         }
@@ -683,7 +684,8 @@ impl AgentLoopDriverImpl {
                 // Step 6: dispatch. M006's dispatcher internally invokes the
                 // ActionValidator (CONTRACT-113) gate per ARCH §4.2. On error,
                 // log + return `new_state` WITHOUT post_process — preserving the
-                // pre-Phase-2 `run_agent` dispatch-error early-return EXACTLY.
+                // pre-Phase-2 `run_agent` dispatch-error early-return — once the
+                // post-processor has logged the failed turn (`turn_failed`).
                 // Step-3 (CONTRACT-051 seam extension): pass the source inbound
                 // `msg` so the in-host channel reply path can build a per-message
                 // `OutboundTarget` from `msg.origin.channel_metadata`. The
@@ -695,6 +697,7 @@ impl AgentLoopDriverImpl {
                     .dispatch(agent_id, &msg, &action_result.actions)
                     .await
                 {
+                    self.post_processor.turn_failed(agent_id, &msg).await;
                     if let Some(active) = protected_turn.as_mut() {
                         if let Err(finish_error) = active.finish_drained().await {
                             eprintln!(
@@ -736,6 +739,7 @@ impl AgentLoopDriverImpl {
                 (action_result.new_state, ended(TurnOutcome::Completed))
             }
             Err(HookError::Failure(reason)) => {
+                self.post_processor.turn_failed(agent_id, &msg).await;
                 if let (Some(boundary), Some(lease_id)) =
                     (self.turn_persistence_boundary.as_ref(), turn_lease.as_ref())
                 {
@@ -753,6 +757,7 @@ impl AgentLoopDriverImpl {
                 (state, ended(TurnOutcome::Failed))
             }
             Err(e) => {
+                self.post_processor.turn_failed(agent_id, &msg).await;
                 if let (Some(boundary), Some(lease_id)) =
                     (self.turn_persistence_boundary.as_ref(), turn_lease.as_ref())
                 {

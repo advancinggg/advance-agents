@@ -1588,6 +1588,53 @@ struct TurnIndexYaml {
     turns: Vec<TurnEntry>,
 }
 
+/// Where cap-memory moves a task's oldest turn-index entries to keep `turn-index.yaml` under
+/// its read cap (MODULE-010 B1): one JSON entry per line, beside it.
+const TURN_INDEX_ARCHIVE_FILENAME: &str = "turn-index-archive.jsonl";
+/// The most bytes of one turn-index archive the rebuild reads.
+const MAX_TURN_INDEX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The entries of the turn-index archive at `path`, oldest first; none when it is missing, a
+/// link or not a regular file. A line that does not parse is reported and skipped, and so is
+/// what lies past [`MAX_TURN_INDEX_ARCHIVE_BYTES`].
+fn read_turn_index_archive(path: &Path, stats: &mut ScannerStats) -> Vec<TurnEntry> {
+    use std::io::BufRead;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Vec::new();
+    };
+    if !meta.file_type().is_file() {
+        return Vec::new();
+    }
+    if meta.len() > MAX_TURN_INDEX_ARCHIVE_BYTES {
+        stats.errors.push(format!(
+            "{}: larger than {MAX_TURN_INDEX_ARCHIVE_BYTES} bytes; reading that much of it",
+            path.display()
+        ));
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            stats.errors.push(format!("read {}: {e}", path.display()));
+            return Vec::new();
+        }
+    };
+    let reader = std::io::BufReader::new(std::io::Read::take(file, MAX_TURN_INDEX_ARCHIVE_BYTES));
+    let mut out = Vec::new();
+    for (i, line) in reader.split(b'\n').enumerate() {
+        let Ok(line) = line else { break };
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<TurnEntry>(&line) {
+            Ok(entry) => out.push(entry),
+            Err(e) => stats
+                .errors
+                .push(format!("parse {} line {}: {e}", path.display(), i + 1)),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct TurnEntry {
     #[serde(default)]
@@ -1661,7 +1708,8 @@ where
         task_dirs.sort();
         for task_dir in task_dirs {
             let yaml_path = task_dir.join("turn-index.yaml");
-            if !yaml_path.is_file() {
+            let archive_path = task_dir.join(TURN_INDEX_ARCHIVE_FILENAME);
+            if !yaml_path.is_file() && !archive_path.is_file() {
                 continue;
             }
             let task_id = match task_dir.file_name() {
@@ -1675,25 +1723,41 @@ where
                 ));
                 continue;
             }
-            let body = match read_capped_yaml(&yaml_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    stats
-                        .errors
-                        .push(format!("read {}: {e}", yaml_path.display()));
-                    continue;
+            // An index that is missing or cannot be read leaves its archive rebuilt alone.
+            let indexed: Vec<TurnEntry> = if yaml_path.is_file() {
+                match read_capped_yaml(&yaml_path) {
+                    Ok(body) => match serde_yml::from_str::<TurnIndexYaml>(&body) {
+                        Ok(parsed) => parsed.turns,
+                        Err(e) => {
+                            stats
+                                .errors
+                                .push(format!("parse {}: {e}", yaml_path.display()));
+                            Vec::new()
+                        }
+                    },
+                    Err(e) => {
+                        stats
+                            .errors
+                            .push(format!("read {}: {e}", yaml_path.display()));
+                        Vec::new()
+                    }
                 }
+            } else {
+                Vec::new()
             };
-            let parsed: TurnIndexYaml = match serde_yml::from_str(&body) {
-                Ok(s) => s,
-                Err(e) => {
-                    stats
-                        .errors
-                        .push(format!("parse {}: {e}", yaml_path.display()));
-                    continue;
-                }
-            };
-            for entry in &parsed.turns {
+            // The entries the index moved out to its archive are rebuilt with its own. An entry
+            // the index still holds is the index's (a failure between the archive's append and
+            // the index's write leaves one in both), and of an entry the archive holds twice
+            // (moved out again after such a failure), the later copy.
+            let mut archived: std::collections::BTreeMap<i64, TurnEntry> =
+                std::collections::BTreeMap::new();
+            for entry in read_turn_index_archive(&archive_path, &mut stats) {
+                archived.insert(entry.turn, entry);
+            }
+            for entry in &indexed {
+                archived.remove(&entry.turn);
+            }
+            for entry in indexed.iter().chain(archived.values()) {
                 if !entry.agent_id.is_empty() && entry.agent_id != terr.agent_id {
                     stats.errors.push(format!(
                         "turn-index.yaml at {} turn {}: agent_id mismatch (entry={:?}, territory={:?}); skipping",
@@ -1742,10 +1806,14 @@ where
                     unit_separator(),
                     entry.turn
                 );
-                let embed_source = if entry.collapsed_view.is_empty() {
-                    entry.digest.clone()
+                // The text the turn end embedded (cap-memory's `turn_embedding_text`):
+                // the digest, then the L0 collapsed view on its own line. A turn with
+                // neither is not embedded, as at its end.
+                let joined = format!("{}\n{}", entry.digest, entry.collapsed_view);
+                let embed_source = if joined.trim().is_empty() {
+                    String::new()
                 } else {
-                    format!("{} {}", entry.digest, entry.collapsed_view)
+                    joined
                 };
                 let embedding = embed_or_skip(
                     embedder,

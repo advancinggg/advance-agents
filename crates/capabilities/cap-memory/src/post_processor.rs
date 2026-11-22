@@ -20,7 +20,9 @@ use std::time::SystemTime;
 use advance_runtime::host_registry::HostRegistry;
 use advance_shared_types::mailbox::{ActionResult, Message};
 use advance_shared_types::memory::{PostProcessorError, PostProcessorHook};
+use advance_shared_types::token_estimate::tokens_from_bytes_u32;
 use advance_shared_types::traits::EventBusEmit;
+use advance_shared_types::turn_log::{TurnTranscriptSource, TURN_LOG_FILENAME};
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -50,6 +52,10 @@ use crate::summary::{Summary, SummaryMeta};
 use crate::task_storage::{TASK_SUMMARY_FILENAME, TASK_TURN_INDEX_FILENAME};
 use crate::turn_index::{
     apply_turn_digest, GitAssociation, Importance, LogOffset, TurnEntry, TurnIndex, TurnIndexMeta,
+};
+use crate::turn_log::{
+    append_turn_log_known, bump_references, fill_turn_features, prompt_from_payload, KnownLogs,
+    LoggedTurn, FAILED_TURN_NOTE,
 };
 
 /// 9 canonical step labels — verbatim from MODULE-011 §1.3.5.
@@ -155,7 +161,7 @@ pub struct Components {
     // ── Slice F: SQLite-index + Embedder seams (cap-memory-internal; NOT in
     // shared-types / NOT in ARCHITECTURE §6.1). Drives 4 public `sync_*` /
     // `bump_turn_reference` methods. Slice satB-postproc calls the `sync_*`
-    // methods from `PostProcessor::run` Step 8 (when an fs_root is configured);
+    // methods from `PostProcessor::run` Step 8 (when a tasks root is configured);
     // tests also drive these seams directly. See MODULE-011 §3.6 / §3.8 note 12. ──
     pub sqlite_index: Arc<dyn SqliteIndex + Send + Sync>,
     pub embedder: Arc<dyn Embedder + Send + Sync>,
@@ -168,12 +174,20 @@ pub struct Components {
     // `RollbackMemoryHandler.cursor_store`). See AC-18 cap-memory-half closure
     // in §3.8 note 13 + the cursor-store-sharing HARD REQUIREMENT in §3.6. ──
     pub cursor_store: Arc<L6CursorStore>,
-    // ── Slice satB-postproc (SAT-B): the cap-memory memory root
-    // (= `<workspace>/.agent/memory`) for Step-7 on-disk writeback. `None`
-    // (the default for `with_l6_defaults` / `wired`) keeps Steps 7/8 on the
-    // trace-only path so the rootless in-memory test suite is unaffected; the
-    // composition root sets it via `with_fs_root`. ──
-    pub fs_root: Option<PathBuf>,
+    // ── The directory that holds the task directories (PRD §11.2:
+    // `<workspace>/.agent/tasks/active`). Step 0 logs the turn to
+    // `<tasks_root>/{task_id}/llm-turns.jsonl`; Step 7 writes `summary.yaml` and
+    // `turn-index.yaml` beside it. `None` (the default for `with_l6_defaults` /
+    // `wired`) keeps Steps 0/7/8 on the trace-only path so the rootless in-memory
+    // test suite is unaffected; the composition root sets it via `with_tasks_root`. ──
+    pub tasks_root: Option<PathBuf>,
+    // ── The agent's workspace root, the root a tool call's `path` is relative
+    // to: Step 7 records the git blob id of each file the turn read under it
+    // (`read_file_versions`). `None` ⇒ no version is recorded. ──
+    pub workspace_root: Option<PathBuf>,
+    // ── The host's record of the turn that just ran (the LLM gateway), which
+    // Step 0 takes and logs. `None` ⇒ the log holds the inbound message only. ──
+    pub transcript_source: Option<Arc<dyn TurnTranscriptSource>>,
     // ── Slice satB-postproc (SAT-B): the BARE cap id the post-processor writes
     // under (store/index/file ops). `run()` receives the COLON messaging id
     // (`agent:root`) but the shared `MemoryStore`/WIT handlers key the write
@@ -227,7 +241,15 @@ impl std::fmt::Debug for Components {
             .field("embedder", &"<Embedder>")
             .field("embedding_upkeep", &"<EmbeddingUpkeep>")
             .field("cursor_store", &"<L6CursorStore>")
-            .field("fs_root", &self.fs_root)
+            .field("tasks_root", &self.tasks_root)
+            .field("workspace_root", &self.workspace_root)
+            .field(
+                "transcript_source",
+                &self
+                    .transcript_source
+                    .as_ref()
+                    .map(|_| "<TurnTranscriptSource>"),
+            )
             .field("write_agent_id", &"<redacted>")
             .field(
                 "l6_handler",
@@ -359,7 +381,9 @@ impl Components {
             // Slice satB-postproc: write-path seam defaults. Body-only injection
             // (slice-F/G precedent) — signature UNCHANGED. `None` ⇒ trace-only
             // Steps 7/8 + run()-agent_id writes (rootless tests unaffected).
-            fs_root: None,
+            tasks_root: None,
+            workspace_root: None,
+            transcript_source: None,
             write_agent_id: None,
             // Slice satC-l6 (SAT-C): no in-process L6 dispatch by default
             // (Step-9 emits consolidation_due only) — body-only injection,
@@ -453,8 +477,10 @@ impl Components {
             // `cursor_store` arg per the # Cursor-store sharing rustdoc above.
             cursor_store: Arc::new(L6CursorStore::new()),
             // Slice satB-postproc: write-path seam defaults (see with_l6_defaults).
-            // The composition root sets these via with_fs_root / with_write_agent_id.
-            fs_root: None,
+            // The composition root sets these via with_tasks_root / with_write_agent_id.
+            tasks_root: None,
+            workspace_root: None,
+            transcript_source: None,
             write_agent_id: None,
             // Slice satC-l6 (SAT-C): no in-process L6 dispatch by default; the
             // cli composition root attaches a handler via `with_l6_handler`.
@@ -467,14 +493,29 @@ impl Components {
 
     // ────────────────────────────────────────────────────────────────────
     // Slice satB-postproc (SAT-B) — write-path seam builders (consuming).
-    // Composition root: `Components::wired(..).with_fs_root(..).with_sqlite_index(..).with_write_agent_id(..)`.
+    // Composition root: `Components::wired(..).with_tasks_root(..).with_sqlite_index(..).with_write_agent_id(..)`.
     // ────────────────────────────────────────────────────────────────────
 
-    /// SAT-B (AC-45): set the cap-memory memory root (`<workspace>/.agent/memory`)
-    /// that Step 7 writes `summary.yaml` / `turn-index.yaml` under
-    /// (`<fs_root>/tasks/{task_id}/`). Absent ⇒ Steps 7/8 stay trace-only.
-    pub fn with_fs_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.fs_root = Some(root.into());
+    /// PRD §11.2: set the directory that holds the task directories
+    /// (`<workspace>/.agent/tasks/active`). Step 0 logs each turn to
+    /// `<root>/{task_id}/llm-turns.jsonl`; Step 7 writes `summary.yaml` /
+    /// `turn-index.yaml` beside it. Absent ⇒ Steps 0/7/8 stay trace-only.
+    pub fn with_tasks_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.tasks_root = Some(root.into());
+        self
+    }
+
+    /// Set the agent's workspace root, which a tool call's `path` is relative to: Step 7
+    /// records the git blob id of each file a turn read under it (`read_file_versions`).
+    pub fn with_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.workspace_root = Some(root.into());
+        self
+    }
+
+    /// Set where Step 0 takes the transcript of the turn that just ran from (the LLM
+    /// gateway). Absent ⇒ a turn's log holds its inbound message only.
+    pub fn with_transcript_source(mut self, source: Arc<dyn TurnTranscriptSource>) -> Self {
+        self.transcript_source = Some(source);
         self
     }
 
@@ -537,7 +578,7 @@ impl Components {
     // from `PostProcessor::run` Step 8 (`step_8_sqlite_sync`) after Step 7
     // materializes the per-turn `TurnEntry` / `Summary` and resolves the
     // task_id (from `msg.context.task_id`, or an `_agent-<write_id>` fallback),
-    // keyed by the bare `write_id`. When no `fs_root` is configured (the
+    // keyed by the bare `write_id`. When no tasks root is configured (the
     // rootless test path), Step 8 stays push-only, so the AC-08 9-step
     // canonical trace is preserved on every branch. See MODULE-011 §3.6 / §3.8 note 12.
     // ────────────────────────────────────────────────────────────────────
@@ -589,8 +630,8 @@ impl Components {
             }
         };
         // What catch-up is told is about the text that was asked about. Catch-up
-        // asks about the digest alone, which is that text unless the turn carried
-        // a collapsed view.
+        // asks about the same text — the digest, and the view it reads back from
+        // the task's `turn-index.yaml` — unless that view cannot be read back.
         let row = VectorRow::Turn {
             task_id: turn.task_id.clone(),
             turn: turn.turn,
@@ -610,12 +651,10 @@ impl Components {
             embedded => embedded,
         };
         if !turn.digest.trim().is_empty() {
-            self.embedding_upkeep.row_written(
-                agent_id,
-                &row,
-                &turn_embedding_text(&turn.digest, ""),
-                embedding_model.as_deref(),
-            );
+            // What catch-up asks about for the row is the text just asked about: Step 7
+            // wrote the view beside the digest in the task's `turn-index.yaml`.
+            self.embedding_upkeep
+                .row_written(agent_id, &row, &text, embedding_model.as_deref());
         }
         self.sqlite_index.upsert_turn(TurnIndexRow {
             agent_id: agent_id.to_owned(),
@@ -751,11 +790,12 @@ impl Components {
     /// read never counts as "nothing left": the agent is not settled by it.
     ///
     /// With nothing to embed with ([`Embedder::current_model`] is `None`) it
-    /// does nothing. The text embedded is the text the row holds — a brief, a
-    /// digest — which is exactly what [`Self::sync_task_index`] and
-    /// [`Self::sync_turn_index`] embed for a new one as long as the turn carries
-    /// no collapsed view (Step 7 writes none; a row keeps no view, so a turn that
-    /// did carry one is caught up from its digest alone).
+    /// does nothing. The text embedded is the one [`Self::sync_task_index`] and
+    /// [`Self::sync_turn_index`] embed for a new row: a task's brief, a turn's
+    /// digest and then its collapsed view. A turn row keeps no view, so the view is
+    /// read back from the `turn-index.yaml` of the row's task, where Step 7 wrote it
+    /// (MODULE-010 B1). A turn whose view cannot be read back is caught up from its
+    /// digest alone (see `TurnViews`).
     pub async fn heal_vectors(&self, agent_id: &str) -> Result<usize, CatchUpError> {
         let Some(model) = self.embedder.current_model() else {
             return Ok(0);
@@ -790,10 +830,16 @@ impl Components {
         };
         let mut open = Vec::new();
         let mut put_off = Vec::new();
+        // A turn's vector is computed from its digest and its collapsed view; the row
+        // keeps no view, so it is read back from the task's `turn-index.yaml`.
+        let mut views = TurnViews::new(self.tasks_root.as_deref(), agent_id);
         for row in tasks
             .into_iter()
             .map(StaleRow::Task)
-            .chain(turns.into_iter().map(StaleRow::Turn))
+            .chain(turns.into_iter().map(|row| {
+                let view = views.view(&row.task_id, row.turn);
+                StaleRow::Turn(row, view)
+            }))
         {
             match upkeep.standing(agent_id, &row.key(), &row.text()) {
                 Standing::Open => open.push(row),
@@ -993,7 +1039,10 @@ impl Components {
                         task_id: task_id.to_owned(),
                         turn,
                     },
-                    &turn_embedding_text(&row.digest, ""),
+                    &turn_embedding_text(
+                        &row.digest,
+                        &TurnViews::new(self.tasks_root.as_deref(), agent_id).view(task_id, turn),
+                    ),
                     row.embedding_model.as_deref(),
                 );
             }
@@ -1007,9 +1056,9 @@ impl Components {
 }
 
 /// The text a turn's vector is computed from: its digest, then its collapsed
-/// view. Step 7 leaves the collapsed view empty, so the digest an index row
-/// holds is all it takes to compute the vector again
-/// ([`Components::heal_vectors`]).
+/// view (PRD §11.3, the L1 layer; Step 7 writes the view since MODULE-010 B1). An
+/// index row keeps the digest alone; [`Components::heal_vectors`] reads the view
+/// back from the task's `turn-index.yaml` to compute the vector again.
 fn turn_embedding_text(digest: &str, collapsed_view: &str) -> String {
     format!("{digest}\n{collapsed_view}")
 }
@@ -1028,7 +1077,8 @@ pub enum CatchUpError {
 /// A row [`Components::heal_vectors`] found without a vector of the model in use.
 enum StaleRow {
     Task(TaskIndexRow),
-    Turn(TurnIndexRow),
+    /// A turn row, and the collapsed view read back for it ([`TurnViews`]).
+    Turn(TurnIndexRow, String),
 }
 
 impl StaleRow {
@@ -1037,7 +1087,7 @@ impl StaleRow {
             StaleRow::Task(row) => VectorRow::Task {
                 task_id: row.task_id.clone(),
             },
-            StaleRow::Turn(row) => VectorRow::Turn {
+            StaleRow::Turn(row, _) => VectorRow::Turn {
                 task_id: row.task_id.clone(),
                 turn: row.turn,
             },
@@ -1048,16 +1098,16 @@ impl StaleRow {
     fn updated_at(&self) -> &str {
         match self {
             StaleRow::Task(row) => &row.updated_at,
-            StaleRow::Turn(row) => &row.updated_at,
+            StaleRow::Turn(row, _) => &row.updated_at,
         }
     }
 
     /// The text the row's vector is computed from — what the turn end that wrote
-    /// the row embedded.
+    /// the row embedded, as far as the view could be read back.
     fn text(&self) -> String {
         match self {
             StaleRow::Task(row) => row.brief_snapshot.clone(),
-            StaleRow::Turn(row) => turn_embedding_text(&row.digest, ""),
+            StaleRow::Turn(row, view) => turn_embedding_text(&row.digest, view),
         }
     }
 
@@ -1078,7 +1128,7 @@ impl StaleRow {
                 vector,
                 model,
             ),
-            StaleRow::Turn(row) => index.set_turn_embedding(
+            StaleRow::Turn(row, _) => index.set_turn_embedding(
                 agent_id,
                 &row.task_id,
                 row.turn,
@@ -1088,6 +1138,83 @@ impl StaleRow {
             ),
         }
     }
+}
+
+/// The collapsed views of an agent's turns, read back from their tasks'
+/// `turn-index.yaml` for [`Components::heal_vectors`]: each task's file once a
+/// pass, with the same bounds and checks as Step 7's own read. Nothing is created.
+/// A turn whose view cannot be read back has none, and is caught up from its
+/// digest alone: with no tasks root, a task id that is not one safe segment, a
+/// tasks root or task directory that is missing or a link (the task files a
+/// release before MODULE-010 B1 wrote stay where it wrote them), an index entry
+/// that is gone or was written for another agent, or a view longer than Step 7
+/// writes.
+struct TurnViews<'a> {
+    tasks_root: Option<&'a Path>,
+    agent_id: &'a str,
+    read: std::collections::HashMap<String, std::collections::HashMap<u32, String>>,
+}
+
+impl<'a> TurnViews<'a> {
+    fn new(tasks_root: Option<&'a Path>, agent_id: &'a str) -> Self {
+        Self {
+            tasks_root,
+            agent_id,
+            read: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The collapsed view of `turn` of `task_id`, or an empty one.
+    fn view(&mut self, task_id: &str, turn: u32) -> String {
+        let (tasks_root, agent_id) = (self.tasks_root, self.agent_id);
+        self.read
+            .entry(task_id.to_string())
+            .or_insert_with(|| read_turn_views(tasks_root, agent_id, task_id))
+            .get(&turn)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// The collapsed views `agent_id`'s turns of `task_id` have in the task's
+/// `turn-index.yaml`, by turn ([`TurnViews`]).
+fn read_turn_views(
+    tasks_root: Option<&Path>,
+    agent_id: &str,
+    task_id: &str,
+) -> std::collections::HashMap<u32, String> {
+    let mut views = std::collections::HashMap::new();
+    let Some(tasks_root) = tasks_root else {
+        return views;
+    };
+    if sanitize_task_segment(task_id).as_deref() != Some(task_id) {
+        return views;
+    }
+    let real_dir =
+        |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir());
+    let dir = tasks_root.join(task_id);
+    if !real_dir(tasks_root) || !real_dir(&dir) {
+        return views;
+    }
+    match (tasks_root.canonicalize(), dir.canonicalize()) {
+        (Ok(root), Ok(canon)) if canon.starts_with(&root) => {}
+        _ => return views,
+    }
+    // The archive's entries first: an entry in both is the index's.
+    let archived = crate::task_storage::load_turn_index_archive(
+        &dir.join(crate::task_storage::TASK_TURN_INDEX_ARCHIVE_FILENAME),
+    );
+    for entry in archived
+        .into_iter()
+        .chain(load_turn_index(&dir.join(TASK_TURN_INDEX_FILENAME)).turns)
+    {
+        if entry.agent_id == agent_id
+            && entry.collapsed_view.len() <= crate::turn_log::MAX_COLLAPSED_VIEW_BYTES
+        {
+            views.insert(entry.turn, entry.collapsed_view);
+        }
+    }
+    views
 }
 
 /// Slice F private helper: ISO-8601 UTC timestamp routed through the
@@ -1172,7 +1299,7 @@ pub fn default_task_partition(write_id: &str) -> Option<String> {
 /// Returns `Some(clean)` only for a single safe path component; rejects empty,
 /// `.`/`..`, a leading `.`, any `/`/`\`/NUL, or an absolute/multi-component
 /// form. A rejected value is NEVER silently redirected — Step 7 skips the write.
-fn sanitize_task_segment(raw: &str) -> Option<String> {
+pub(crate) fn sanitize_task_segment(raw: &str) -> Option<String> {
     if raw.is_empty()
         || raw == "."
         || raw == ".."
@@ -1192,34 +1319,32 @@ fn sanitize_task_segment(raw: &str) -> Option<String> {
     }
 }
 
-/// SAT-B (AC-45 / D4 / W3): compose `<fs_root>/tasks/{task_id}` and confine it
-/// under `fs_root` against symlink escape. `task_id` MUST already be sanitized
-/// (single safe segment). Creates the dir (so the atomic write lands), rejects a
-/// symlinked task dir, and asserts the canonicalized dir stays under the
-/// canonicalized `fs_root`. Returns `None` (write skipped) on any breach.
+/// SAT-B (AC-45 / D4 / W3): compose `<tasks_root>/{task_id}` and confine it
+/// under `tasks_root` against symlink escape. `task_id` MUST already be sanitized
+/// (single safe segment). Creates the dirs (so the atomic writes land), rejects a
+/// symlinked tasks root or task dir, and asserts the canonicalized dir stays under
+/// the canonicalized `tasks_root`. Returns `None` (write skipped) on any breach.
 ///
 /// Residual TOCTOU: a check-then-write window remains; full elimination needs
 /// `openat`/`O_NOFOLLOW` descriptor-relative I/O — out of scope for a single
-/// sanitized segment under the agent's own `.agent/memory` (documented at the gate).
-fn confined_task_dir(fs_root: &Path, task_id: &str) -> Option<PathBuf> {
-    let tasks = fs_root.join("tasks");
-    // Audit r7: reject a pre-planted `tasks` PARENT symlink BEFORE create_dir_all
-    // (else `create_dir_all` would mkdir through it, outside fs_root). The
-    // canonical `starts_with` check below is the backstop for any deeper symlink;
-    // a concurrent post-canonicalize parent swap remains the documented TOCTOU
-    // residual (full closure needs descriptor-relative openat/mkdirat — out of scope).
-    if std::fs::symlink_metadata(&tasks)
+/// sanitized segment under the agent's own `.agent/tasks/active` (documented at the gate).
+fn confined_task_dir(tasks_root: &Path, task_id: &str) -> Option<PathBuf> {
+    // Audit r7: reject a pre-planted symlinked root BEFORE create_dir_all (else
+    // `create_dir_all` would mkdir through it). The canonical `starts_with` check
+    // below is the backstop for any deeper symlink; a concurrent post-canonicalize
+    // parent swap remains the documented TOCTOU residual.
+    if std::fs::symlink_metadata(tasks_root)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
     {
-        eprintln!("cap-memory post-processor: refusing symlinked `tasks` parent {tasks:?}; skipping write");
+        eprintln!("cap-memory post-processor: refusing symlinked tasks root {tasks_root:?}; skipping write");
         return None;
     }
-    if let Err(e) = std::fs::create_dir_all(&tasks) {
-        eprintln!("cap-memory post-processor: create tasks dir {tasks:?} failed: {e}");
+    if let Err(e) = std::fs::create_dir_all(tasks_root) {
+        eprintln!("cap-memory post-processor: create tasks root {tasks_root:?} failed: {e}");
         return None;
     }
-    let dir = tasks.join(task_id);
+    let dir = tasks_root.join(task_id);
     // Reject a pre-existing symlinked task dir outright.
     if let Ok(meta) = std::fs::symlink_metadata(&dir) {
         if meta.file_type().is_symlink() {
@@ -1232,18 +1357,75 @@ fn confined_task_dir(fs_root: &Path, task_id: &str) -> Option<PathBuf> {
         return None;
     }
     // Canonical confinement: the realpath of the task dir MUST stay under the
-    // realpath of fs_root (catches any symlink in the chain that escapes).
-    let (Ok(canon_root), Ok(canon_dir)) = (fs_root.canonicalize(), dir.canonicalize()) else {
+    // realpath of the tasks root (catches any symlink in the chain that escapes).
+    let (Ok(canon_root), Ok(canon_dir)) = (tasks_root.canonicalize(), dir.canonicalize()) else {
         eprintln!("cap-memory post-processor: canonicalize failed for {dir:?}; skipping write");
         return None;
     };
     if !canon_dir.starts_with(&canon_root) {
         eprintln!(
-            "cap-memory post-processor: task dir {canon_dir:?} escapes fs_root {canon_root:?}; skipping write"
+            "cap-memory post-processor: task dir {canon_dir:?} escapes the tasks root {canon_root:?}; skipping write"
         );
         return None;
     }
     Some(dir)
+}
+
+/// The task a turn is written under, resolved THREE-WAY from `msg.context.task_id`
+/// (D3 / Codex W2): absent ⇒ the agent's default partition `_agent-{write_id}`;
+/// present + valid ⇒ it; present + malicious ⇒ `None` (the write is SKIPPED, never
+/// silently redirected under `_agent-*`).
+fn resolve_task_id(write_id: &str, msg: &Message) -> Option<String> {
+    match msg.context.as_ref().and_then(|c| c.task_id.clone()) {
+        None => {
+            let partition = default_task_partition(write_id);
+            if partition.is_none() {
+                eprintln!(
+                    "cap-memory post-processor: write_id {write_id:?} unsanitizable for a default task partition; skipping on-disk write"
+                );
+            }
+            partition
+        }
+        Some(raw) => {
+            let safe = sanitize_task_segment(&raw);
+            if safe.is_none() {
+                eprintln!(
+                    "cap-memory post-processor: rejecting malicious task_id {raw:?} (NOT redirected); skipping on-disk write"
+                );
+            }
+            safe
+        }
+    }
+}
+
+/// The YAML of `index`, and the oldest turn entries it no longer holds: while it is larger
+/// than three quarters of [`MAX_TASK_YAML_BYTES`] (the cap the next turn's read applies; the
+/// rest is room for the turns to come), its oldest tenth moves out. Without this, an index past
+/// the cap would read back as empty and the next turn would overwrite it. The caller appends
+/// what moved out to the task's turn-index archive
+/// ([`crate::task_storage::TASK_TURN_INDEX_ARCHIVE_FILENAME`]), so the index and its archive
+/// hold every entry between them; turn numbers carry on from the newest entry.
+fn turn_index_yaml(index: &mut TurnIndex) -> Result<(String, Vec<TurnEntry>), PostProcessorError> {
+    let mut moved_out = Vec::new();
+    loop {
+        let yaml = serde_yml::to_string(&*index).map_err(|e| {
+            PostProcessorError::StorageError(format!("serialize turn-index.yaml: {e}"))
+        })?;
+        if yaml.len() as u64 <= MAX_TASK_YAML_BYTES / 4 * 3 || index.turns.len() <= 1 {
+            return Ok((yaml, moved_out));
+        }
+        let excess = (index.turns.len() / 10).max(1);
+        moved_out.extend(index.turns.drain(..excess));
+    }
+}
+
+/// What Step 7 wrote, for Step 8: the task summary, the new turn entry, and the older
+/// turns that gained a reference (7b.iv).
+#[derive(Debug)]
+struct TurnArtifacts {
+    summary: Summary,
+    entry: TurnEntry,
+    referenced: Vec<u32>,
 }
 
 /// SAT-B (AC-45 / R12): read a YAML file with the [`MAX_TASK_YAML_BYTES`] size
@@ -1348,6 +1530,8 @@ pub struct PostProcessor {
     summary_calls: Arc<Mutex<u64>>,
     turn_index_calls: Arc<Mutex<u64>>,
     components: Option<Components>,
+    /// What Step 0's last append left of each turn log ([`KnownLogs`]).
+    known_logs: Arc<KnownLogs>,
 }
 
 impl PostProcessor {
@@ -1361,6 +1545,7 @@ impl PostProcessor {
             summary_calls: Arc::new(Mutex::new(0)),
             turn_index_calls: Arc::new(Mutex::new(0)),
             components: Some(components),
+            known_logs: Arc::default(),
         }
     }
 
@@ -1606,21 +1791,22 @@ impl PostProcessor {
         Ok(())
     }
 
-    /// Step 7 (SAT-B / AC-45): when an `fs_root` is configured, materialize a
-    /// per-turn `Summary` + `TurnEntry` and atomically write `summary.yaml` +
-    /// `turn-index.yaml` under `<fs_root>/tasks/{task_id}/`. The in-memory
-    /// `summary_calls` / `turn_index_calls` counters are ALWAYS bumped (the
-    /// slice-F pipeline-counter tests rely on this), independent of fs writes.
-    /// task_id is resolved THREE-WAY from `msg.context.task_id`: absent ⇒ derive
-    /// `_agent-{write_id}`; present + valid ⇒ use it; present + malicious ⇒ SKIP
-    /// the write (never redirect). Returns the materialized artifacts for Step 8
-    /// (or `None` when trace-only / no fs_root / skipped task_id).
+    /// Step 7 (SAT-B / AC-45; PRD §11.4 7a/7b): when Step 0 logged the turn under a
+    /// task directory, materialize a per-turn `Summary` + `TurnEntry` and atomically
+    /// write `summary.yaml` + `turn-index.yaml` under `<tasks_root>/{task_id}/`. The
+    /// entry locates the turn in the log and carries the features derived from it
+    /// ([`fill_turn_features`]); the older turns it refers to gain a reference (7b.iv).
+    /// The in-memory `summary_calls` / `turn_index_calls` counters are ALWAYS bumped
+    /// (the slice-F pipeline-counter tests rely on this), independent of fs writes.
+    /// Returns the materialized artifacts for Step 8 (or `None` when trace-only / no
+    /// tasks root / a refused task id).
     async fn step_7_update_summary_and_turn_index(
         &self,
         write_id: &str,
         msg: &Message,
         extraction: Option<&Extraction>,
-    ) -> Result<Option<(Summary, TurnEntry)>, PostProcessorError> {
+        logged: Option<&LoggedTurn>,
+    ) -> Result<Option<TurnArtifacts>, PostProcessorError> {
         self.push(STEP_7);
         self.update_summary_inner();
         self.update_turn_index_inner();
@@ -1628,53 +1814,23 @@ impl PostProcessor {
         let Some(components) = &self.components else {
             return Ok(None);
         };
-        let Some(fs_root) = components.fs_root.as_ref() else {
+        // Step 0 resolved the task and its directory; without a tasks root, or for a
+        // task id it refused, there is nothing to write.
+        let Some(logged) = logged else {
             return Ok(None);
         };
         let Some(ex) = extraction else {
             return Ok(None);
         };
-
-        // THREE-WAY task_id resolution (D3 / Codex W2): distinguish true absence
-        // (derive a per-agent default partition) from a present-but-malicious
-        // value (SKIP — never silently redirect under `_agent-*`).
-        let task_id = match msg.context.as_ref().and_then(|c| c.task_id.clone()) {
-            None => match default_task_partition(write_id) {
-                Some(s) => s,
-                None => {
-                    eprintln!(
-                        "cap-memory post-processor Step 7: write_id {write_id:?} unsanitizable for a default task partition; skipping on-disk write"
-                    );
-                    return Ok(None);
-                }
-            },
-            Some(raw) => match sanitize_task_segment(&raw) {
-                Some(safe) => safe,
-                None => {
-                    eprintln!(
-                        "cap-memory post-processor Step 7: rejecting malicious task_id {raw:?} (NOT redirected); skipping on-disk write"
-                    );
-                    return Ok(None);
-                }
-            },
-        };
-
-        let Some(task_dir) = confined_task_dir(fs_root, &task_id) else {
-            return Ok(None);
-        };
-        let turn_index_path = task_dir.join(TASK_TURN_INDEX_FILENAME);
-        let summary_path = task_dir.join(TASK_SUMMARY_FILENAME);
+        let task_id = logged.task_id.clone();
+        let turn_index_path = logged.task_dir.join(TASK_TURN_INDEX_FILENAME);
+        let summary_path = logged.task_dir.join(TASK_SUMMARY_FILENAME);
         let ts = utc_now_string(&*components.clock);
 
         // ── turn-index.yaml (append one TurnEntry) ──
         let mut turn_index = load_turn_index(&turn_index_path);
-        let next_turn = turn_index
-            .turns
-            .last()
-            .map(|t| t.turn.saturating_add(1))
-            .unwrap_or(1);
         let mut entry = TurnEntry {
-            turn: next_turn,
+            turn: logged.turn,
             timestamp: ts.clone(),
             agent_id: write_id.to_string(),
             task_id: task_id.clone(),
@@ -1687,15 +1843,14 @@ impl PostProcessor {
             has_tool_use: false,
             has_decision: false,
             importance: Importance::Normal,
-            // digest + git fields filled by `apply_turn_digest` below.
+            // digest + git fields filled by `apply_turn_digest`, the rest by
+            // `fill_turn_features` below.
             digest: String::new(),
             collapsed_view: String::new(),
             git_commit: String::new(),
             git_diff_summary: String::new(),
             git_checkpoints: Vec::new(),
             reference_count: 0,
-            // Honest empty/zero stubs for the deferred-posture fields (no producer
-            // from the 4 inputs — slice-A "schema scaffold, fields deferred" posture).
             content_identifiers: Vec::new(),
             read_file_versions: Vec::new(),
             tokens_digest: 0,
@@ -1707,10 +1862,44 @@ impl PostProcessor {
         // fallback). `apply_turn_digest` sets the REAL digest (from the
         // extraction, or a deterministic mechanical fallback) + empty git fields.
         apply_turn_digest(&mut entry, ex, &GitAssociation::none());
+        fill_turn_features(
+            &mut entry,
+            logged,
+            msg,
+            components.workspace_root.as_deref(),
+        );
+        entry.tokens_digest = tokens_from_bytes_u32(entry.digest.len());
+        // 7b.iv: the older turns this turn refers to gain a reference.
+        let referenced = bump_references(&mut turn_index.turns, &entry, &logged.prompt);
         turn_index.turns.push(entry.clone());
-        let ti_yaml = serde_yml::to_string(&turn_index).map_err(|e| {
-            PostProcessorError::StorageError(format!("serialize turn-index.yaml: {e}"))
-        })?;
+        let (mut ti_yaml, moved_out) = turn_index_yaml(&mut turn_index)?;
+        if !moved_out.is_empty() {
+            // The entries go to the archive before the index is written without them: a
+            // failure in between leaves an entry in both, never in neither. When the archive
+            // cannot take them, the index keeps them while it still reads back whole; past its
+            // read cap they are dropped, and stderr says so.
+            let archive = turn_index_path
+                .with_file_name(crate::task_storage::TASK_TURN_INDEX_ARCHIVE_FILENAME);
+            if let Err(e) = crate::task_storage::append_turn_index_archive(&archive, &moved_out) {
+                eprintln!(
+                    "cap-memory post-processor Step 7: archiving {} index entries of task {task_id:?} failed: {e}",
+                    moved_out.len()
+                );
+                let dropped = moved_out.len();
+                let mut whole = turn_index.clone();
+                let mut turns = moved_out;
+                turns.append(&mut whole.turns);
+                whole.turns = turns;
+                match serde_yml::to_string(&whole) {
+                    Ok(yaml) if yaml.len() as u64 <= MAX_TASK_YAML_BYTES => ti_yaml = yaml,
+                    _ => eprintln!(
+                        "cap-memory post-processor Step 7: the index of task {task_id:?} cannot keep \
+                         them under its {MAX_TASK_YAML_BYTES}-byte read cap; its {dropped} oldest \
+                         entries are dropped"
+                    ),
+                }
+            }
+        }
         crate::persistence::atomic_write(&turn_index_path, ti_yaml.as_bytes())
             .map_err(|e| PostProcessorError::StorageError(e.to_string()))?;
 
@@ -1754,7 +1943,78 @@ impl PostProcessor {
         crate::persistence::atomic_write(&summary_path, s_yaml.as_bytes())
             .map_err(|e| PostProcessorError::StorageError(e.to_string()))?;
 
-        Ok(Some((summary, entry)))
+        Ok(Some(TurnArtifacts {
+            summary,
+            entry,
+            referenced,
+        }))
+    }
+
+    /// Step 0 (PRD §11.4 precondition — the turn log is on disk as soon as
+    /// `handle-message` returns): log the turn to `<tasks_root>/{task_id}/
+    /// llm-turns.jsonl` — the inbound message, then what the host recorded of the turn
+    /// ([`TurnTranscriptSource`]), one line per message with its L0 annotation — and
+    /// note the lines it occupies. The transcript is taken first, whatever happens
+    /// next, so it can never be logged as another turn's. `None` when trace-only, with
+    /// no tasks root, or for a task id Step 7 would refuse; a failed append is logged
+    /// and leaves the turn's range `0..=0`. (No trace label: the 9-step trace contract
+    /// is the PRD's Steps 1–9.)
+    ///
+    /// `failed`: the turn failed (`PostProcessorHook::turn_failed`). Its messages are logged,
+    /// then [`FAILED_TURN_NOTE`], and nothing else is done with it.
+    fn step_0_log_turn(&self, write_id: &str, msg: &Message, failed: bool) -> Option<LoggedTurn> {
+        let components = self.components.as_ref()?;
+        let transcript = components
+            .transcript_source
+            .as_ref()
+            .map(|source| source.take_turn_transcript(write_id))
+            .unwrap_or_default();
+        let tasks_root = components.tasks_root.as_ref()?;
+        let task_id = resolve_task_id(write_id, msg)?;
+        let task_dir = confined_task_dir(tasks_root, &task_id)?;
+        let next_indexed = load_turn_index(&task_dir.join(TASK_TURN_INDEX_FILENAME))
+            .turns
+            .last()
+            .map(|t| t.turn.saturating_add(1))
+            .unwrap_or(1);
+        let mut logged = LoggedTurn::new(
+            task_id,
+            task_dir,
+            next_indexed,
+            prompt_from_payload(&msg.payload),
+            transcript,
+        );
+        if failed {
+            logged
+                .messages
+                .push(advance_shared_types::turn_log::TranscriptMessage::new(
+                    "system",
+                    FAILED_TURN_NOTE,
+                ));
+            logged
+                .marks
+                .push(advance_shared_types::turn_log::L0Mark::Keep);
+        }
+        let ts = utc_now_string(&*components.clock);
+        let log = logged.task_dir.join(TURN_LOG_FILENAME);
+        match append_turn_log_known(
+            &self.known_logs,
+            &log,
+            next_indexed,
+            &ts,
+            &logged.messages,
+            &logged.marks,
+        ) {
+            Ok((turn, range)) => {
+                logged.turn = turn;
+                logged.log_offset = range;
+            }
+            Err(e) => eprintln!(
+                "cap-memory post-processor Step 0: logging turn {next_indexed} of task {:?} failed: {e}",
+                logged.task_id
+            ),
+        }
+        Some(logged)
     }
 
     fn update_summary_inner(&self) {
@@ -1786,14 +2046,18 @@ impl PostProcessor {
     async fn step_8_sqlite_sync(
         &self,
         write_id: &str,
-        artifacts: Option<&(Summary, TurnEntry)>,
+        artifacts: Option<&TurnArtifacts>,
     ) -> Result<(), PostProcessorError> {
         self.push(STEP_8);
-        let (Some(components), Some((summary, turn_entry))) = (&self.components, artifacts) else {
+        let (Some(components), Some(artifacts)) = (&self.components, artifacts) else {
             return Ok(());
         };
-        let turn_synced = components.sync_turn_index(write_id, turn_entry).await;
-        let task_synced = components.sync_task_index(summary).await;
+        let turn_synced = components.sync_turn_index(write_id, &artifacts.entry).await;
+        // 7b.iv → Step 8: the rows of the older turns that gained a reference.
+        for turn in &artifacts.referenced {
+            components.bump_turn_reference(write_id, &artifacts.entry.task_id, *turn);
+        }
+        let task_synced = components.sync_task_index(&artifacts.summary).await;
         components.sync_memory_index(write_id);
         let caught_up = components.heal_vectors(write_id).await;
         turn_synced?;
@@ -1968,8 +2232,6 @@ impl PostProcessorHook for PostProcessor {
         result: &ActionResult,
     ) -> Result<(), PostProcessorError> {
         self.reset_observers();
-        self.step_1_collect_changes(agent_id, msg, result).await?;
-        let extraction = self.step_2_batch_llm_call(agent_id, msg, result).await?;
         // SAT-B: resolve the BARE write id (colon-msg-id → bare-cap-id bucket fix).
         // A `None` override ⇒ write_id == the run() agent_id (preserves every
         // existing test where the id is already consistent).
@@ -1978,6 +2240,9 @@ impl PostProcessorHook for PostProcessor {
             .as_ref()
             .and_then(|c| c.write_agent_id.as_deref())
             .unwrap_or(agent_id);
+        let logged = self.step_0_log_turn(write_id, msg, false);
+        self.step_1_collect_changes(agent_id, msg, result).await?;
+        let extraction = self.step_2_batch_llm_call(agent_id, msg, result).await?;
         self.step_3_writeback_descriptions(write_id, extraction.as_ref())
             .await?;
         self.step_4_fs_dedup(write_id, extraction.as_ref()).await?;
@@ -1986,7 +2251,12 @@ impl PostProcessorHook for PostProcessor {
         self.step_6_write_knowledge_jsonl(write_id, extraction.as_ref())
             .await?;
         let artifacts = self
-            .step_7_update_summary_and_turn_index(write_id, msg, extraction.as_ref())
+            .step_7_update_summary_and_turn_index(
+                write_id,
+                msg,
+                extraction.as_ref(),
+                logged.as_ref(),
+            )
             .await?;
         // Step 8 fails only on an embedding request (its rows are written either
         // way). Step 9 does not read the vector index, so that failure is reported
@@ -2004,5 +2274,17 @@ impl PostProcessorHook for PostProcessor {
         // pre-SAT-C single-id behaviour + every existing test is preserved.)
         self.step_9_evaluate_l6(write_id).await?;
         index_synced
+    }
+
+    /// MODULE-011 Step 0 for a turn that failed (D3: every turn is logged): what the host
+    /// recorded of it, then [`FAILED_TURN_NOTE`]. Steps 1–9 do not run, so it gets no digest
+    /// and no index entry; the next turn is numbered after it.
+    async fn turn_failed(&self, agent_id: &str, msg: &Message) {
+        let write_id = self
+            .components
+            .as_ref()
+            .and_then(|c| c.write_agent_id.as_deref())
+            .unwrap_or(agent_id);
+        let _ = self.step_0_log_turn(write_id, msg, true);
     }
 }

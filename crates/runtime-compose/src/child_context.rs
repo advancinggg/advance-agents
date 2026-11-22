@@ -143,6 +143,9 @@ pub fn attach_child_context(
     let child_memory_root = child_memory
         .is_some()
         .then(|| workspace.join(".agent").join("memory"));
+    let child_tasks_root = child_memory
+        .is_some()
+        .then(|| cap_memory::turn_log::tasks_root(workspace));
     let child_skills_root = has_cap(declared_caps, "skills").then(|| workspace.join(".agent"));
     // Embedding follows THIS child's chat provider (its own `llm:` policy),
     // resolved per call — not the root's posture at daemon start.
@@ -177,6 +180,8 @@ pub fn attach_child_context(
             write_agent_id: cap_agent_id,
             query_aliases: &[cap_agent_id.to_string(), msg_agent_id.to_string()],
             memory_root: child_memory_root.as_deref(),
+            tasks_root: child_tasks_root.as_deref(),
+            workspace_root: Some(workspace),
             skills_agent_root: child_skills_root.as_deref(),
             decomposition,
             pack_skills: deps
@@ -196,6 +201,10 @@ pub fn attach_child_context(
             native_tools: Some(Arc::new(crate::context_wiring::GatewayNativeTools::new(
                 deps.gateway.clone(),
             ))),
+            chat_model: Some(crate::context_wiring::gateway_chat_model_source(
+                deps.gateway.clone(),
+                cap_agent_id,
+            )),
         },
     );
 

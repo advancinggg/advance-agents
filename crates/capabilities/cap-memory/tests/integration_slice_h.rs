@@ -58,7 +58,7 @@ fn t05_a_task_storage_files_const_re_exported() {
     assert_eq!(TASK_TURN_INDEX_FILENAME, "turn-index.yaml");
     assert_eq!(TASK_DECOMPOSITION_FILENAME, "decomposition.yaml");
     // Dir template too.
-    assert_eq!(TASK_STORAGE_DIR_TEMPLATE, ".agent/memory/tasks/{task_id}/");
+    assert_eq!(TASK_STORAGE_DIR_TEMPLATE, ".agent/tasks/active/{task_id}/");
 }
 
 // ─────────────────────────────────────────────────────────────────────────

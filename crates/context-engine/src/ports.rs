@@ -464,6 +464,51 @@ pub trait L6ConsolidationReader: Send + Sync {
     ) -> Result<Vec<GlobalMemoryRecord>, PortError>;
 }
 
+/// ⑯ — one recent turn of the agent's task, as its turn log holds it (PRD §11.3.5 "同 Task
+/// 近期窗口"). The assembler loads it whole — L0-processed: what a later step of the same turn
+/// superseded or made stale is shortened (PRD §11.3.3) — or, when a file it read has changed
+/// since or it does not fit, as its digest.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecentTurn {
+    pub turn_id: u64,
+    /// When the turn ran (UTC, RFC 3339).
+    pub timestamp: String,
+    pub digest: String,
+    /// The files the turn read, at the versions it read (PRD §11.2.1 `read_file_versions`).
+    pub read_file_versions: TurnReadFileVersions,
+    /// The turn's messages as logged, oldest first; empty when the log holds none of them.
+    pub messages: Vec<advance_shared_types::turn_log::TranscriptMessage>,
+    /// The L0 mark of each message, index for index.
+    pub marks: Vec<advance_shared_types::turn_log::L0Mark>,
+}
+
+/// ⑯ — the last turns of a task (PRD §11.3.5): up to `count`, oldest first. An empty `task_id`
+/// is the agent's default task. A reader error degrades to no recent turns (§2.8).
+#[async_trait]
+pub trait RecentTurnsReader: Send + Sync {
+    async fn read_recent_turns(
+        &self,
+        agent_id: &str,
+        task_id: &str,
+        count: usize,
+    ) -> Result<Vec<RecentTurn>, PortError>;
+}
+
+/// The reader of an agent without a turn log: no recent turns.
+pub struct NoRecentTurns;
+
+#[async_trait]
+impl RecentTurnsReader for NoRecentTurns {
+    async fn read_recent_turns(
+        &self,
+        _agent_id: &str,
+        _task_id: &str,
+        _count: usize,
+    ) -> Result<Vec<RecentTurn>, PortError> {
+        Ok(Vec::new())
+    }
+}
+
 /// AC-08 — current git blob id by path. **B1: no upstream §6.1 CONTRACT.**
 /// `Ok(None)` means the path no longer exists in the current working tree
 /// (genuine staleness); `Err` is an I/O / lookup failure that the staleness
@@ -649,7 +694,58 @@ pub struct AssemblyHistoryReport {
     pub l3_epoch: bool,
     pub l4_task_summary: bool,
     pub l5_related_briefs: u32,
+    /// ⑯ recent turns of the task loaded whole (L0-processed).
+    pub recent_turns: u32,
+    /// ⑯ recent turns loaded as their digest: a file they read has changed since, they did
+    /// not fit, or the mode loads digests only.
+    pub recent_turn_digests: u32,
 }
+
+/// The model an agent chats on, and the context window its provider entry gives for it
+/// (MODULE-010 D5, PRD §11.3.5 `llm_gateway.get_context_window()`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatModelWindow {
+    /// The provider entry the agent chats on.
+    pub provider_id: String,
+    /// The model id that entry is sent for the agent's own requests that name none: the
+    /// model its `llm:` policy names, else the entry's default. Empty when neither exists.
+    pub model: String,
+    /// The window the entry gives for `model`, and where it comes from.
+    pub declared: Option<(u32, WindowSource)>,
+}
+
+/// Where the window an assembly budgets with comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowSource {
+    /// The chat entry's `model-context-windows` figure for the model.
+    Provider,
+    /// The context window of the chat entry's catalog profile.
+    Profile,
+    /// The model family's published window (`tier3::family_context_window`).
+    Family,
+    /// No source knows the model: the fail-safe-small window.
+    Fallback,
+    /// The composition root's fixed window (`with_model_context_window`).
+    Override,
+}
+
+impl WindowSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowSource::Provider => "provider",
+            WindowSource::Profile => "profile",
+            WindowSource::Family => "family",
+            WindowSource::Fallback => "fallback",
+            WindowSource::Override => "override",
+        }
+    }
+}
+
+/// Reads, at every assembly, the model the assembler's agent chats on, from the live
+/// provider config and the agent's live `llm:` policy. `None` = the agent has no chat entry
+/// yet (one free to chat on several entries before any served it): the assembly falls back
+/// to the composition root's model.
+pub type ChatModelSource = std::sync::Arc<dyn Fn() -> Option<ChatModelWindow> + Send + Sync>;
 
 /// The full per-turn assembly report. Emitted once per successful `assemble()`
 /// through [`AssemblyReportSink`] AFTER the result is built.
@@ -660,7 +756,14 @@ pub struct AssemblyReport {
     pub message_id: String,
     pub trace_id: Option<String>,
     pub model: String,
+    /// The provider entry `model` is on; `None` when the agent has no chat entry yet.
+    #[serde(default)]
+    pub model_provider: Option<String>,
     pub model_context_window: u32,
+    /// Where `model_context_window` comes from: `provider` | `profile` | `family` |
+    /// `fallback` | `override` ([`WindowSource`]).
+    #[serde(default)]
+    pub model_window_source: String,
     pub response_reserve: u32,
     pub budget_tokens: u32,
     /// `tier1a + tier1b + tier2 + tier3`.

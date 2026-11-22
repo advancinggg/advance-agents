@@ -64,6 +64,8 @@ pub(crate) mod executor;
 // Crate-internal — consumed by host_fn's stream/poll-stream handlers + gateway's
 // stream_begin/stream_finish; not part of the CONTRACT-081 public surface.
 pub(crate) mod stream;
+// MODULE-010 S6 — a turn's requests stay inside the model's window.
+pub(crate) mod turn_fit;
 
 #[cfg(test)]
 mod agent_cli_tests;
@@ -117,9 +119,9 @@ pub use credential::{CredentialFailure, ProviderCredentialSource};
 pub use error::{FailureClassNote, LlmError, SUBSCRIPTION_USAGE_LIMIT_CLASS};
 pub use events::{LLM_ERROR, LLM_REQUEST, LLM_RESPONSE, LLM_RETRY};
 pub use gateway::{
-    AgentGateway, ChatDelta, ChatMessage, ChatParams, ChatResponse, ChatRole, Embedded,
-    EmbeddingIncapable, EmbeddingRoute, EmbeddingUnavailable, LlmGateway, LlmGatewayInternal,
-    LocalSidecarBinder, ToolCall, ToolDefinition, TranscriptMode,
+    AgentGateway, ChatDelta, ChatMessage, ChatModel, ChatParams, ChatResponse, ChatRole,
+    ChatWindowSource, Embedded, EmbeddingIncapable, EmbeddingRoute, EmbeddingUnavailable,
+    LlmGateway, LlmGatewayInternal, LocalSidecarBinder, ToolCall, ToolDefinition, TranscriptMode,
 };
 pub use host_fn::{
     register_agent_llm, register_agent_llm_with_turn_cost, AgentLlmGenerateHandler,

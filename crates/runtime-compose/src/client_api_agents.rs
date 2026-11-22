@@ -74,7 +74,7 @@ use advance_shared_types::mailbox::{Message, MessageKind};
 use cap_grant::GrantStore;
 use cap_lifecycle::spawn::{SpawnChildConfig, Spawner, SpawnerSubsetGate};
 use cap_lifecycle::templates::TemplateResolver;
-use cap_lifecycle::terminate::{LoopCascade, MailboxCascade, TerminateController};
+use cap_lifecycle::terminate::{LoopCascade, MailboxCascade, MemoryArchiver, TerminateController};
 use cap_lifecycle::{
     atomic_write, AgentTreeStore, DefaultTerminateController, FsMemoryArchiver, FsWorkspaceCleanup,
     GrantRevokeCascade, LifecycleError, RunManagerCascade, SpawnError,
@@ -764,12 +764,24 @@ impl AgentAdminProvider for AgentAdminAdapter {
         // agent-managed — the `.agent/` marker is removed. Sub workspaces were removed by the
         // cascade. With `remove_workspace`, the target's whole directory (which contains every
         // descendant territory) is removed.
+        //
+        // MODULE-010 D4: the cascade handed each removed agent's task history to its parent. One
+        // whose history is still in place — its archive failed, which the archiver logged —
+        // keeps it: a Child keeps its `.agent/`, and with `remove_workspace` the target's
+        // directory stays too (the result says `workspace_removed: false`).
+        let unarchived: Vec<&AgentNode> = removed_nodes
+            .iter()
+            .filter(|n| cap_lifecycle::task_history_left(&n.workspace_path))
+            .collect();
         let mut workspace_removed = false;
-        if request.remove_workspace {
+        if request.remove_workspace && unarchived.is_empty() {
             self.guarded_remove_dir_all(&node.workspace_path)?;
             workspace_removed = true;
         } else {
             for removed in removed_nodes.iter().filter(|n| n.kind == AgentKind::Child) {
+                if unarchived.iter().any(|kept| kept.id == removed.id) {
+                    continue;
+                }
                 self.guarded_remove_dir_all(&removed.workspace_path.join(AGENT_DIR))?;
             }
         }
@@ -953,11 +965,43 @@ pub fn build_agent_terminate_controller(
         Arc::new(RunManagerCascade::new(run_manager)),
         Arc::new(FsWorkspaceCleanup::new(workspace_root)),
     )
-    .with_memory_archiver(Arc::new(FsMemoryArchiver::new()));
+    .with_memory_archiver(Arc::new(AdoptingArchiver(FsMemoryArchiver::new())));
     if let Some(cascade) = loop_cascade {
         controller = controller.with_loop_cascade(cascade);
     }
     controller
+}
+
+/// MODULE-010 D4 — the history archiver of the daemon's terminate cascade: the Client API
+/// delete's, and a pack workflow's when it undoes a spawn. Before it moves an agent's task
+/// history to its parent, the task directories an older release kept in `.agent/memory/tasks/`
+/// move to `.agent/tasks/active/` (`cap_memory::turn_log::adopt_legacy_tasks`), as the daemon's
+/// wiring of the agent does. So an agent that never ran on this release — parked, or failing to
+/// load — is archived whole. What cannot move stays, and the delete keeps it
+/// (`cap_lifecycle::task_history_left`).
+struct AdoptingArchiver(FsMemoryArchiver);
+
+impl MemoryArchiver for AdoptingArchiver {
+    fn archive_sub_memory(
+        &self,
+        sub_id: &str,
+        sub_workspace: &std::path::Path,
+        parent_workspace: &std::path::Path,
+    ) -> Result<(), LifecycleError> {
+        self.0
+            .archive_sub_memory(sub_id, sub_workspace, parent_workspace)
+    }
+
+    fn archive_agent_tasks(
+        &self,
+        agent_id: &str,
+        agent_workspace: &std::path::Path,
+        parent_workspace: &std::path::Path,
+    ) -> Result<(), LifecycleError> {
+        cap_memory::turn_log::adopt_legacy_tasks(agent_workspace);
+        self.0
+            .archive_agent_tasks(agent_id, agent_workspace, parent_workspace)
+    }
 }
 
 /// Late-install the agents provider into an already-bound `Arc<ClientApi>`.
@@ -1328,6 +1372,31 @@ pub fn project_config_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MODULE-010 D4 — an agent that never ran on this release still has its task files where
+    /// an older one kept them; the delete's archiver moves them over first, so the parent gets
+    /// them.
+    #[test]
+    fn the_delete_archives_the_task_files_an_older_release_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("root");
+        let agent = tmp.path().join("kid");
+        let legacy = agent.join(".agent/memory/tasks/t1");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(
+            legacy.join("summary.yaml"),
+            "brief: sort the seed packets\n",
+        )
+        .unwrap();
+        AdoptingArchiver(FsMemoryArchiver::new())
+            .archive_agent_tasks("kid", &agent, &parent)
+            .unwrap();
+        assert!(parent
+            .join(".agent/tasks/archived-agents/kid/active/t1/summary.yaml")
+            .is_file());
+        assert!(!cap_lifecycle::task_history_left(&agent));
+    }
 
     #[test]
     fn projects_capability_shapes() {

@@ -4,7 +4,7 @@
 //! watches for file changes via `notify`, and publishes updates to subscribers via
 //! `tokio::sync::mpsc`.
 
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -935,6 +935,49 @@ pub struct LlmProviderConfig {
     /// stream, image and preflight request of this entry sends its system messages. `None` and
     /// [`SystemMessages::Separate`] send them as they stand.
     pub system_messages: Option<SystemMessages>,
+    /// `model-context-windows`: the context window, in tokens, of models this entry serves,
+    /// keyed by model id (a value of `model-aliases`, or a name the entry takes as it stands).
+    /// The context engine budgets an agent's turn with the window of the model the agent chats
+    /// on: this entry's figure for that model when it gives one, else the window of the entry's
+    /// catalog profile, else the model family's published window. Each window is
+    /// 1..=[`MAX_MODEL_CONTEXT_WINDOW`]; at most [`MAX_MODEL_CONTEXT_WINDOWS`] models. Empty =
+    /// none declared.
+    pub model_context_windows: BTreeMap<String, u32>,
+}
+
+/// The largest `model-context-windows` figure an entry may declare, in tokens.
+pub const MAX_MODEL_CONTEXT_WINDOW: u32 = 100_000_000;
+/// How many models one entry's `model-context-windows` may list.
+pub const MAX_MODEL_CONTEXT_WINDOWS: usize = 64;
+/// The longest model id `model-context-windows` takes, in bytes.
+pub const MAX_MODEL_CONTEXT_WINDOW_ID_LEN: usize = 256;
+
+/// Why `windows` is not a valid `model-context-windows` table, if it is not. The Client API
+/// provider admin applies the same bounds (`client-api::provider_admin::
+/// validate_model_context_windows`), so both refuse the same tables.
+pub fn model_context_windows_refusal(windows: &BTreeMap<String, u32>) -> Option<String> {
+    if windows.len() > MAX_MODEL_CONTEXT_WINDOWS {
+        return Some(format!(
+            "model-context-windows lists more than {MAX_MODEL_CONTEXT_WINDOWS} models"
+        ));
+    }
+    for (model, window) in windows {
+        if model.trim().is_empty()
+            || model.len() > MAX_MODEL_CONTEXT_WINDOW_ID_LEN
+            || model.chars().any(char::is_control)
+        {
+            return Some(
+                "model-context-windows: a model id is empty, too long or holds a control character"
+                    .into(),
+            );
+        }
+        if *window == 0 || *window > MAX_MODEL_CONTEXT_WINDOW {
+            return Some(format!(
+                "model-context-windows: the window of {model} must be 1..={MAX_MODEL_CONTEXT_WINDOW} tokens"
+            ));
+        }
+    }
+    None
 }
 
 impl LlmProviderConfig {
@@ -1004,6 +1047,8 @@ struct LlmProviderConfigRaw {
     reasoning_effort: Option<String>,
     #[serde(rename = "system-messages", default)]
     system_messages: Option<String>,
+    #[serde(rename = "model-context-windows", default)]
+    model_context_windows: BTreeMap<String, u32>,
 }
 
 impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
@@ -1182,6 +1227,9 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
                 return Err(why.into());
             }
         }
+        if let Some(why) = model_context_windows_refusal(&raw.model_context_windows) {
+            return Err(why);
+        }
         Ok(Self {
             id: raw.id,
             endpoint: raw.endpoint,
@@ -1206,6 +1254,7 @@ impl TryFrom<LlmProviderConfigRaw> for LlmProviderConfig {
             generate_timeout_secs: raw.generate_timeout_secs,
             reasoning_effort,
             system_messages,
+            model_context_windows: raw.model_context_windows,
         })
     }
 }
@@ -1245,6 +1294,7 @@ impl fmt::Debug for LlmProviderConfig {
             .field("generate_timeout_secs", &self.generate_timeout_secs)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("system_messages", &self.system_messages)
+            .field("model_context_windows", &self.model_context_windows)
             .finish()
     }
 }

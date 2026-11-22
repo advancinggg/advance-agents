@@ -413,6 +413,10 @@ impl MessageHandler for WasmMessageHandler {
                 .ok_or_else(|| HookError::Failure("handle_message called before init".into()))?
         };
         let mut owned = OwnedWasmInstance::new(pair, &self.store_in_guest_call)?;
+        // What this invocation's post-processor logs is this invocation's turn only.
+        if let Some(gw) = &self.llm_gateway {
+            gw.begin_invocation(&self.agent_id);
+        }
         let trusted_turn_id = self
             .active_turn
             .lock()

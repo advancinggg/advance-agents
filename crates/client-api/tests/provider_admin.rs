@@ -117,6 +117,7 @@ fn summary(id: &str, selected: bool) -> ClientProviderSummary {
         model_aliases: [("fast".to_string(), format!("{id}-fast"))]
             .into_iter()
             .collect(),
+        model_context_windows: Default::default(),
         embedding_model: None,
         auth_scheme: None,
         auth_source: None,

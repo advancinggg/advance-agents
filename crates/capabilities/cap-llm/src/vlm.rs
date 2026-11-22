@@ -628,6 +628,7 @@ mod tests {
             generate_timeout_secs: None,
             reasoning_effort: None,
             system_messages: None,
+            model_context_windows: Default::default(),
         };
         let mut cfg = fixture_runtime_config();
         cfg.llm_providers.insert(0, local);
@@ -682,6 +683,7 @@ mod tests {
             generate_timeout_secs: None,
             reasoning_effort: None,
             system_messages: None,
+            model_context_windows: Default::default(),
         };
         let mut cfg = fixture_runtime_config();
         cfg.llm_providers = vec![local];
@@ -740,6 +742,7 @@ mod tests {
             generate_timeout_secs: None,
             reasoning_effort: None,
             system_messages: None,
+            model_context_windows: Default::default(),
         };
         let png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 

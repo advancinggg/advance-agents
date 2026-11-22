@@ -79,6 +79,13 @@ pub struct ClientContextHistory {
     pub l3_epoch: bool,
     pub l4_task_summary: bool,
     pub l5_related_briefs: u32,
+    /// Recent turns of the task loaded whole (L0-processed).
+    #[serde(default)]
+    pub recent_turns: u32,
+    /// Recent turns loaded as their digest (a file they read changed, they did not fit, or
+    /// the mode loads digests only).
+    #[serde(default)]
+    pub recent_turn_digests: u32,
 }
 
 /// The latest assembled prompt of an agent.
@@ -94,7 +101,17 @@ pub struct ClientContextAssembly {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     pub model: String,
+    /// The provider entry `model` is on — the entry the agent chats on. Absent when the
+    /// agent has no chat entry yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
     pub model_context_window: u32,
+    /// Where `model_context_window` comes from: `provider` (the entry's
+    /// `model_context_windows`), `profile` (its catalog profile), `family` (the model
+    /// family's published window), `fallback` (an unknown model: the fail-safe-small
+    /// window) or `override`. Empty from a daemon older than v0.1.60.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model_window_source: String,
     pub response_reserve: u32,
     pub budget_tokens: u32,
     /// `tier1a + tier1b + tier2 + tier3`.

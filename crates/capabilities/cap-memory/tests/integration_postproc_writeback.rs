@@ -6,11 +6,12 @@
 //! invalid-index guard. AC-43/44 (extractor + composition gate) are unit-tested
 //! in `crates/cli/src/memory_extractor.rs` + the cli gate test.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use advance_shared_types::mailbox::{ActionResult, Message, MessageContext, MessageKind};
 use advance_shared_types::memory::PostProcessorHook;
+use advance_shared_types::turn_log::{TranscriptMessage, TranscriptToolCall, TurnTranscriptSource};
 use cap_memory::{
     post_processor::{CANONICAL_STEPS, MAX_TASK_YAML_BYTES},
     BatchExtractor, BatchExtractorError, Components, Extraction, FailureCooldown,
@@ -119,7 +120,7 @@ async fn t54_writeback_to_disk_under_task_dir() {
         Some("Refactored the tokenizer"),
     )));
     let components = ok_components(Arc::clone(&store), extr)
-        .with_fs_root(&root)
+        .with_tasks_root(root.join("tasks"))
         .with_write_agent_id("a");
     let pp = PostProcessor::with_components(components);
 
@@ -176,7 +177,7 @@ async fn t54b_summary_brief_bootstrap_then_cadence_holds() {
     // trait-object clone into Components (x.clone() + typed let — the coercion-safe form).
     let extr_dyn: Arc<dyn BatchExtractor + Send + Sync> = extr.clone();
     let components = ok_components(Arc::clone(&store), extr_dyn)
-        .with_fs_root(&root)
+        .with_tasks_root(root.join("tasks"))
         .with_write_agent_id("agent:research");
     let pp = PostProcessor::with_components(components);
     let summary_path = root.join("tasks").join("tb").join("summary.yaml");
@@ -225,7 +226,7 @@ async fn t55a_rootless_is_trace_only_with_counters() {
         "agent:research",
         Some("d"),
     )));
-    // NO with_fs_root → Steps 7/8 stay trace-only.
+    // NO with_tasks_root → Steps 0/7/8 stay trace-only.
     let pp = PostProcessor::with_components(ok_components(store, extr));
 
     pp.run("agent:research", &message(Some("t1")), &result())
@@ -256,7 +257,7 @@ async fn t55b_absent_task_id_derives_agent_partition() {
         Some("d"),
     )));
     let components = ok_components(Arc::clone(&store), extr)
-        .with_fs_root(&root)
+        .with_tasks_root(root.join("tasks"))
         .with_write_agent_id("agentX");
     let pp = PostProcessor::with_components(components);
 
@@ -293,7 +294,7 @@ async fn t56_security_traversal_symlink_and_present_malicious() {
         )));
         let pp = PostProcessor::with_components(
             ok_components(store, extr)
-                .with_fs_root(&root)
+                .with_tasks_root(root.join("tasks"))
                 .with_write_agent_id("a"),
         );
         pp.run("a", &message(Some("../../etc/evil")), &result())
@@ -318,7 +319,7 @@ async fn t56_security_traversal_symlink_and_present_malicious() {
             )));
             let pp = PostProcessor::with_components(
                 ok_components(store, extr)
-                    .with_fs_root(&root)
+                    .with_tasks_root(root.join("tasks"))
                     .with_write_agent_id("a"),
             );
             pp.run("a", &message(Some("linked")), &result())
@@ -340,7 +341,7 @@ async fn t56_security_traversal_symlink_and_present_malicious() {
         )));
         let pp = PostProcessor::with_components(
             ok_components(store, extr)
-                .with_fs_root(&root)
+                .with_tasks_root(root.join("tasks"))
                 .with_write_agent_id("a"),
         );
         pp.run("a", &message(Some("bad/seg")), &result())
@@ -379,7 +380,7 @@ async fn t57_durable_rusqlite_index_round_trips_across_reopen() {
     let idx = Arc::new(RusqliteSqliteIndex::open(&db).expect("open rusqlite index"));
 
     let components = ok_components(Arc::clone(&store), extr)
-        .with_fs_root(&root)
+        .with_tasks_root(root.join("tasks"))
         .with_write_agent_id("a")
         .with_sqlite_index(idx.clone());
     let pp = PostProcessor::with_components(components);
@@ -425,7 +426,7 @@ async fn t58_llm_failure_fallback_still_writes_mechanical_digest() {
         BatchExtractorError::LlmFailure("upstream 503".into()),
     ));
     let components = ok_components(Arc::clone(&store), extr)
-        .with_fs_root(&root)
+        .with_tasks_root(root.join("tasks"))
         .with_write_agent_id("a");
     let pp = PostProcessor::with_components(components);
 
@@ -459,7 +460,7 @@ async fn t59_writes_under_bare_id_not_colon_id() {
         Some("d"),
     )));
     let components = ok_components(Arc::clone(&store), extr)
-        .with_fs_root(&root)
+        .with_tasks_root(root.join("tasks"))
         .with_write_agent_id("bare");
     let pp = PostProcessor::with_components(components);
 
@@ -504,7 +505,7 @@ async fn t60a_oversize_turn_index_is_capped_not_deserialized() {
     )));
     let pp = PostProcessor::with_components(
         ok_components(store, extr)
-            .with_fs_root(&root)
+            .with_tasks_root(root.join("tasks"))
             .with_write_agent_id("a"),
     );
 
@@ -553,7 +554,7 @@ async fn t60b_invalid_turn_index_starts_fresh() {
     )));
     let pp = PostProcessor::with_components(
         ok_components(store, extr)
-            .with_fs_root(&root)
+            .with_tasks_root(root.join("tasks"))
             .with_write_agent_id("a"),
     );
 
@@ -605,7 +606,7 @@ fn bad_turn_entry() -> TurnEntry {
 // ── audit r6 (C1/C2): symlink hardening — write-escape + read-DoS ──
 
 /// Audit r6 C1: a pre-planted `<task_dir>/turn-index.yaml.tmp` SYMLINK pointing
-/// outside `fs_root` must NOT be followed by the atomic writer — the outside
+/// outside the tasks root must NOT be followed by the atomic writer — the outside
 /// target stays untouched and a real (regular-file) turn-index.yaml is written.
 #[cfg(unix)]
 #[tokio::test]
@@ -626,7 +627,7 @@ async fn t56b_tmp_symlink_write_escape_is_neutralized() {
         Some("d"),
     )));
     let components = ok_components(Arc::clone(&store), extr)
-        .with_fs_root(&root)
+        .with_tasks_root(root.join("tasks"))
         .with_write_agent_id("a");
     let pp = PostProcessor::with_components(components);
 
@@ -678,7 +679,7 @@ async fn t60c_symlink_yaml_leaf_is_refused_and_replaced() {
         Some("d"),
     )));
     let components = ok_components(Arc::clone(&store), extr)
-        .with_fs_root(&root)
+        .with_tasks_root(root.join("tasks"))
         .with_write_agent_id("a");
     let pp = PostProcessor::with_components(components);
 
@@ -731,7 +732,7 @@ async fn t60d_fifo_yaml_leaf_is_refused_not_blocked() {
         Some("d"),
     )));
     let components = ok_components(Arc::clone(&store), extr)
-        .with_fs_root(&root)
+        .with_tasks_root(root.join("tasks"))
         .with_write_agent_id("a");
     let pp = PostProcessor::with_components(components);
 
@@ -755,4 +756,342 @@ async fn t60d_fifo_yaml_leaf_is_refused_not_blocked() {
         "FIFO leaf replaced by a regular file"
     );
     assert_eq!(read_turn_index(&ti).turns.len(), 1);
+}
+
+// ── B1 S2: Step 0 logs the turn under its task; Step 7 indexes it by line ──
+
+/// A gateway stand-in holding one turn's transcript.
+struct HeldTranscript(Mutex<Vec<TranscriptMessage>>);
+
+impl TurnTranscriptSource for HeldTranscript {
+    fn take_turn_transcript(&self, agent_id: &str) -> Vec<TranscriptMessage> {
+        assert_eq!(
+            agent_id, "a",
+            "the transcript is taken under the bare write id"
+        );
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+fn read_then_answer() -> Vec<TranscriptMessage> {
+    vec![
+        TranscriptMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: vec![TranscriptToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"a.txt"}"#.into(),
+            }],
+            tool_call_id: None,
+            is_error: false,
+        },
+        TranscriptMessage {
+            role: "tool".into(),
+            content: "hello".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("c1".into()),
+            is_error: false,
+        },
+        TranscriptMessage::new("assistant", "It says hello."),
+    ]
+}
+
+#[tokio::test]
+async fn t61_step0_logs_each_turn_and_step7_indexes_it_by_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    std::fs::write(ws.join("a.txt"), b"hello\n").unwrap();
+    let root = ws.join(".agent/memory");
+    let tasks = ws.join(".agent/tasks/active");
+    let store = Arc::new(MemoryStore::open(&root, DEFAULT_MAX_ACTIVE_PER_AGENT).unwrap());
+    let extr = Arc::new(StubBatchExtractor::with_extraction(extraction(
+        "a",
+        Some("Read a.txt"),
+    )));
+    let source = Arc::new(HeldTranscript(Mutex::new(read_then_answer())));
+    let pp = PostProcessor::with_components(
+        ok_components(store, extr)
+            .with_tasks_root(&tasks)
+            .with_workspace_root(ws)
+            .with_transcript_source(source.clone())
+            .with_write_agent_id("a"),
+    );
+    pp.run("a", &message(Some("t1")), &result())
+        .await
+        .expect("run Ok");
+    // The transcript was taken: the next turn logs its own message only.
+    pp.run("a", &message(Some("t1")), &result())
+        .await
+        .expect("run Ok");
+    assert!(source.0.lock().unwrap().is_empty());
+
+    let dir = tasks.join("t1");
+    let log = std::fs::read_to_string(dir.join("llm-turns.jsonl")).unwrap();
+    let lines: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let shape: Vec<(u64, &str)> = lines
+        .iter()
+        .map(|l| (l["turn"].as_u64().unwrap(), l["role"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (1, "user"),
+            (1, "assistant"),
+            (1, "tool"),
+            (1, "assistant"),
+            (2, "user"),
+        ],
+        "{log}"
+    );
+    assert_eq!(lines[0]["content"], "hello from the user", "{log}");
+
+    let ti = read_turn_index(&dir.join("turn-index.yaml"));
+    assert_eq!(ti.turns.len(), 2);
+    assert_eq!(
+        ti.turns[0].log_offset,
+        LogOffset {
+            start_line: 1,
+            end_line: 4
+        }
+    );
+    assert_eq!(
+        ti.turns[1].log_offset,
+        LogOffset {
+            start_line: 5,
+            end_line: 5
+        }
+    );
+    assert!(ti.turns[0].has_user_instruction && ti.turns[0].has_tool_use);
+    assert!(!ti.turns[1].has_tool_use);
+    assert_eq!(ti.turns[0].content_identifiers, ["a.txt"]);
+    assert_eq!(ti.turns[0].read_file_versions.len(), 1);
+    assert_eq!(
+        ti.turns[0].read_file_versions[0].blob_id,
+        "ce013625030ba8dba906f756967f9e9ca394464a"
+    );
+    assert!(ti.turns[0].tokens_digest > 0 && ti.turns[0].tokens_l0_processed > 0);
+    // Nothing was written under the memory directory's old task layout.
+    assert!(!root.join("tasks").exists());
+}
+
+#[tokio::test]
+async fn t62_a_refused_task_id_logs_nothing_and_still_takes_the_transcript() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join(".agent/memory");
+    let tasks = tmp.path().join(".agent/tasks/active");
+    let store = Arc::new(MemoryStore::open(&root, DEFAULT_MAX_ACTIVE_PER_AGENT).unwrap());
+    let extr = Arc::new(StubBatchExtractor::with_extraction(extraction(
+        "a",
+        Some("d"),
+    )));
+    let source = Arc::new(HeldTranscript(Mutex::new(read_then_answer())));
+    let pp = PostProcessor::with_components(
+        ok_components(store, extr)
+            .with_tasks_root(&tasks)
+            .with_transcript_source(source.clone())
+            .with_write_agent_id("a"),
+    );
+    pp.run("a", &message(Some("../escape")), &result())
+        .await
+        .expect("run Ok");
+    assert!(
+        source.0.lock().unwrap().is_empty(),
+        "a refused turn's transcript is never left for the next turn"
+    );
+    assert!(
+        std::fs::read_dir(&tasks).map_or(true, |mut d| d.next().is_none()),
+        "no task directory"
+    );
+}
+
+/// MODULE-010 B1: a turn that failed is logged too — what the host recorded, then the failure
+/// note — and gets no index entry; the next turn is numbered after it.
+#[tokio::test]
+async fn t63_a_failed_turn_is_logged_with_its_note_and_not_indexed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    let root = ws.join(".agent/memory");
+    let tasks = ws.join(".agent/tasks/active");
+    let store = Arc::new(MemoryStore::open(&root, DEFAULT_MAX_ACTIVE_PER_AGENT).unwrap());
+    let extr = Arc::new(StubBatchExtractor::with_extraction(extraction(
+        "a",
+        Some("Read a.txt"),
+    )));
+    let source = Arc::new(HeldTranscript(Mutex::new(read_then_answer())));
+    let pp = PostProcessor::with_components(
+        ok_components(store, extr)
+            .with_tasks_root(&tasks)
+            .with_transcript_source(source.clone())
+            .with_write_agent_id("a"),
+    );
+    pp.turn_failed("a", &message(Some("t1"))).await;
+    assert!(
+        source.0.lock().unwrap().is_empty(),
+        "the failed turn's transcript was taken"
+    );
+    pp.run("a", &message(Some("t1")), &result())
+        .await
+        .expect("run Ok");
+
+    let dir = tasks.join("t1");
+    let log = std::fs::read_to_string(dir.join("llm-turns.jsonl")).unwrap();
+    let lines: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let shape: Vec<(u64, &str)> = lines
+        .iter()
+        .map(|l| (l["turn"].as_u64().unwrap(), l["role"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (1, "user"),
+            (1, "assistant"),
+            (1, "tool"),
+            (1, "assistant"),
+            (1, "system"),
+            (2, "user"),
+        ],
+        "{log}"
+    );
+    assert_eq!(
+        lines[4]["content"],
+        cap_memory::turn_log::FAILED_TURN_NOTE,
+        "{log}"
+    );
+    let ti = read_turn_index(&dir.join("turn-index.yaml"));
+    assert_eq!(ti.turns.len(), 1, "the failed turn gets no index entry");
+    assert_eq!(ti.turns[0].turn, 2);
+    assert_eq!(
+        ti.turns[0].log_offset,
+        LogOffset {
+            start_line: 6,
+            end_line: 6
+        }
+    );
+}
+
+/// A seeded index entry of task `t1`, with a view of 500 bytes.
+fn seeded_entry(turn: u32) -> TurnEntry {
+    TurnEntry {
+        turn,
+        task_id: "t1".into(),
+        log_offset: LogOffset {
+            start_line: 0,
+            end_line: 0,
+        },
+        digest: format!("digest of turn {turn}"),
+        collapsed_view: "v".repeat(500),
+        ..bad_turn_entry()
+    }
+}
+
+/// An index of `t1` whose YAML is just over three quarters of the read cap.
+fn index_past_three_quarters() -> (TurnIndex, String) {
+    let mut index = TurnIndex {
+        meta: TurnIndexMeta {
+            last_epoch_turn: 0,
+            last_epoch_at: String::new(),
+        },
+        turns: vec![seeded_entry(1)],
+        epochs: Vec::new(),
+    };
+    let one = serde_yml::to_string(&index).unwrap().len() as u64;
+    index.turns.push(seeded_entry(2));
+    let per_entry = serde_yml::to_string(&index).unwrap().len() as u64 - one;
+    let count = MAX_TASK_YAML_BYTES / 4 * 3 / per_entry + 20;
+    index.turns = (1..=u32::try_from(count).unwrap())
+        .map(seeded_entry)
+        .collect();
+    let yaml = serde_yml::to_string(&index).unwrap();
+    let len = yaml.len() as u64;
+    assert!(
+        len > MAX_TASK_YAML_BYTES / 4 * 3 && len < MAX_TASK_YAML_BYTES,
+        "{len}"
+    );
+    (index, yaml)
+}
+
+fn archive_components(ws: &std::path::Path) -> PostProcessor {
+    let store = Arc::new(
+        MemoryStore::open(&ws.join(".agent/memory"), DEFAULT_MAX_ACTIVE_PER_AGENT).unwrap(),
+    );
+    let extr = Arc::new(StubBatchExtractor::with_extraction(extraction(
+        "a",
+        Some("Read a.txt"),
+    )));
+    PostProcessor::with_components(
+        ok_components(store, extr)
+            .with_tasks_root(ws.join(".agent/tasks/active"))
+            .with_write_agent_id("a"),
+    )
+}
+
+/// MODULE-010 B1: `turn-index.yaml` stays under its read cap by moving its oldest tenth to
+/// `turn-index-archive.jsonl` beside it. The index and its archive hold every entry between
+/// them, oldest first.
+#[tokio::test]
+async fn t64_an_index_past_three_quarters_of_its_cap_moves_its_oldest_tenth_to_its_archive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join(".agent/tasks/active/t1");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (index, yaml) = index_past_three_quarters();
+    std::fs::write(dir.join("turn-index.yaml"), &yaml).unwrap();
+    let seeded = index.turns.len();
+
+    archive_components(tmp.path())
+        .run("a", &message(Some("t1")), &result())
+        .await
+        .expect("run Ok");
+
+    let archived = cap_memory::task_storage::load_turn_index_archive(
+        &dir.join(cap_memory::task_storage::TASK_TURN_INDEX_ARCHIVE_FILENAME),
+    );
+    assert_eq!(archived.len(), (seeded + 1) / 10, "the oldest tenth");
+    let archived_turns: Vec<u32> = archived.iter().map(|t| t.turn).collect();
+    let oldest: Vec<u32> = (1..=u32::try_from(archived.len()).unwrap()).collect();
+    assert_eq!(archived_turns, oldest);
+    assert_eq!(archived[0].digest, "digest of turn 1");
+    assert_eq!(archived[0].collapsed_view, "v".repeat(500));
+    let ti = read_turn_index(&dir.join("turn-index.yaml"));
+    assert_eq!(ti.turns.len() + archived.len(), seeded + 1);
+    assert_eq!(
+        ti.turns[0].turn as usize,
+        archived.len() + 1,
+        "the index goes on where its archive stops"
+    );
+    assert_eq!(ti.turns.last().unwrap().turn as usize, seeded + 1);
+    assert!(
+        std::fs::metadata(dir.join("turn-index.yaml"))
+            .unwrap()
+            .len()
+            <= MAX_TASK_YAML_BYTES / 4 * 3
+    );
+}
+
+/// When the archive cannot take the entries, the index keeps them while it still reads back
+/// whole.
+#[tokio::test]
+async fn t65_an_index_whose_archive_fails_keeps_its_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join(".agent/tasks/active/t1");
+    let archive = dir.join(cap_memory::task_storage::TASK_TURN_INDEX_ARCHIVE_FILENAME);
+    std::fs::create_dir_all(&archive).unwrap();
+    let (index, yaml) = index_past_three_quarters();
+    std::fs::write(dir.join("turn-index.yaml"), &yaml).unwrap();
+
+    archive_components(tmp.path())
+        .run("a", &message(Some("t1")), &result())
+        .await
+        .expect("run Ok");
+
+    assert!(archive.is_dir(), "nothing was archived");
+    let ti = read_turn_index(&dir.join("turn-index.yaml"));
+    assert_eq!(ti.turns.len(), index.turns.len() + 1);
+    assert_eq!(ti.turns[0].turn, 1);
 }

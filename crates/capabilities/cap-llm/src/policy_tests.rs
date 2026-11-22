@@ -86,6 +86,7 @@ fn cloud(id: &str, endpoint: &str, aliases: &[(&str, &str)]) -> LlmProviderConfi
         generate_timeout_secs: None,
         reasoning_effort: None,
         system_messages: None,
+        model_context_windows: Default::default(),
     }
 }
 
@@ -1980,4 +1981,83 @@ async fn a_call_made_for_an_agent_without_a_provider_is_sent_nowhere() {
     ));
     assert!(urls(&chain).is_empty(), "nothing may leave the gateway");
     assert!(bus.snapshot().is_empty(), "no event without a request");
+}
+
+// ── MODULE-010 D5: the model an agent chats on and its window ────────────────────────────────
+
+fn chat_model(provider_id: &str, model: &str, window: Option<u32>) -> Option<crate::ChatModel> {
+    Some(crate::ChatModel {
+        provider_id: provider_id.into(),
+        model: model.into(),
+        window: window.map(|w| (w, crate::ChatWindowSource::Provider)),
+    })
+}
+
+/// The window an agent's turn is budgeted with is that of the model it chats on: the entry
+/// its policy pins (or that served it), the model a request of its own naming none is sent
+/// with, and the figure that entry declares for that model. Read live on every call.
+#[tokio::test]
+async fn chat_model_follows_the_chat_entry_the_policy_model_and_the_declared_window() {
+    let mut providers = three_clouds();
+    providers[1]
+        .model_context_windows
+        .insert("gpt-4o-eu".into(), 1_048_576);
+    let rig = embed_rig(providers);
+    // Free to chat on all three: no chat model before one of them served the agent.
+    assert_eq!(rig.gateway.chat_model_for("root"), None);
+    // Pinned: the entry's default model, with the figure the entry declares for it.
+    rig.policy.set("researcher", pin("eu"));
+    assert_eq!(
+        rig.gateway.chat_model_for("researcher"),
+        chat_model("eu", "gpt-4o-eu", Some(1_048_576))
+    );
+    // A model the policy names by one of the entry's aliases binds to its id; no figure.
+    rig.policy.set(
+        "writer",
+        AgentLlmPolicy {
+            provider: Some("openai".into()),
+            model: Some("gpt4o".into()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        rig.gateway.chat_model_for("writer"),
+        chat_model("openai", "gpt-4o-2024-08-06", None)
+    );
+    // A model the entry does not list is sent as it stands, so that is the model.
+    rig.policy.set(
+        "writer",
+        AgentLlmPolicy {
+            provider: Some("openai".into()),
+            model: Some("o3-mini".into()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        rig.gateway.chat_model_for("writer"),
+        chat_model("openai", "o3-mini", None)
+    );
+    // The unpinned agent chats where its own request was served.
+    serve_own_request(&rig, "root", Some("gpt4o")).await;
+    assert_eq!(
+        rig.gateway.chat_model_for("root"),
+        chat_model("openai", "gpt-4o-2024-08-06", None)
+    );
+    // A live config edit applies to the next read, with no restart.
+    let mut cfg = fixture_runtime_config();
+    let mut edited = three_clouds();
+    edited[0]
+        .model_context_windows
+        .insert("gpt-4o-2024-08-06".into(), 200_000);
+    cfg.llm_providers = edited;
+    rig.config.set_config(cfg);
+    assert_eq!(
+        rig.gateway.chat_model_for("root"),
+        chat_model("openai", "gpt-4o-2024-08-06", Some(200_000))
+    );
+    // A pin to an entry no longer configured leaves the agent no chat model.
+    rig.policy.set("researcher", pin("gone"));
+    assert_eq!(rig.gateway.chat_model_for("researcher"), None);
+    // Nothing left the gateway for any of these reads but the one served request.
+    assert_eq!(urls(&rig.chain).len(), 1);
 }

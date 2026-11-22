@@ -382,6 +382,12 @@ pub struct ClientProviderSummary {
     pub endpoint: String,
     /// Alias key → concrete model id.
     pub model_aliases: BTreeMap<String, String>,
+    /// The context window, in tokens, of models this entry serves, by model id (YAML
+    /// `model-context-windows`): what the context engine budgets an agent's turn with when the
+    /// agent chats on this entry with that model. 1..=`MAX_MODEL_CONTEXT_WINDOW` each, at most
+    /// `MAX_MODEL_CONTEXT_WINDOWS` models. Empty = none declared.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_context_windows: BTreeMap<String, u32>,
     /// Models this provider can call right now (probe / sign-in / configured local id).
     /// Separate from `model_aliases` (operator alias table). Empty when unknown.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -457,6 +463,12 @@ pub struct ClientCreateProviderRequest {
     pub endpoint: Option<String>,
     /// Non-empty.
     pub model_aliases: BTreeMap<String, String>,
+    /// The context window, in tokens, of models this entry serves, by model id (YAML
+    /// `model-context-windows`): what the context engine budgets an agent's turn with when the
+    /// agent chats on this entry with that model. 1..=`MAX_MODEL_CONTEXT_WINDOW` each, at most
+    /// `MAX_MODEL_CONTEXT_WINDOWS` models. Absent = none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_context_windows: BTreeMap<String, u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -523,6 +535,13 @@ pub struct ClientUpdateProviderRequest {
     pub endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_aliases: Option<BTreeMap<String, String>>,
+    /// The context window, in tokens, of models this entry serves, by model id (YAML
+    /// `model-context-windows`): what the context engine budgets an agent's turn with when the
+    /// agent chats on this entry with that model. 1..=`MAX_MODEL_CONTEXT_WINDOW` each, at most
+    /// `MAX_MODEL_CONTEXT_WINDOWS` models. Replaces the
+    /// whole table; `{}` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_windows: Option<BTreeMap<String, u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -586,6 +605,7 @@ impl ClientUpdateProviderRequest {
             && self.backend.is_none()
             && self.endpoint.is_none()
             && self.model_aliases.is_none()
+            && self.model_context_windows.is_none()
             && self.embedding_model.is_none()
             && self.auth_scheme.is_none()
             && self.api_key_secret.is_none()
@@ -749,6 +769,41 @@ pub fn validate_model_aliases(aliases: &BTreeMap<String, String>) -> Result<(), 
             if s.is_empty() || s.len() > MAX_MODEL_ALIAS_LEN || s.chars().any(|c| c.is_control()) {
                 return Err(invalid("invalid model alias"));
             }
+        }
+    }
+    Ok(())
+}
+
+/// The largest `model_context_windows` figure, in tokens (the runtime loader's
+/// `MAX_MODEL_CONTEXT_WINDOW`).
+pub const MAX_MODEL_CONTEXT_WINDOW: u32 = 100_000_000;
+/// How many models `model_context_windows` may list (the loader's `MAX_MODEL_CONTEXT_WINDOWS`).
+pub const MAX_MODEL_CONTEXT_WINDOWS: usize = 64;
+
+/// The longest model id `model_context_windows` takes, in bytes (the loader's
+/// `MAX_MODEL_CONTEXT_WINDOW_ID_LEN`).
+pub const MAX_MODEL_CONTEXT_WINDOW_ID_LEN: usize = 256;
+
+/// A `model_context_windows` table: at most [`MAX_MODEL_CONTEXT_WINDOWS`] models, each id
+/// 1..=[`MAX_MODEL_CONTEXT_WINDOW_ID_LEN`] bytes without control characters and not blank, each
+/// window 1..=[`MAX_MODEL_CONTEXT_WINDOW`] — the bounds the runtime loader applies.
+pub fn validate_model_context_windows(windows: &BTreeMap<String, u32>) -> Result<(), ClientError> {
+    if windows.len() > MAX_MODEL_CONTEXT_WINDOWS {
+        return Err(invalid(
+            "model_context_windows must have at most 64 entries",
+        ));
+    }
+    for (model, window) in windows {
+        if model.trim().is_empty()
+            || model.len() > MAX_MODEL_CONTEXT_WINDOW_ID_LEN
+            || model.chars().any(|c| c.is_control())
+        {
+            return Err(invalid("invalid model_context_windows model id"));
+        }
+        if *window == 0 || *window > MAX_MODEL_CONTEXT_WINDOW {
+            return Err(invalid(
+                "model_context_windows windows must be 1..=100000000",
+            ));
         }
     }
     Ok(())
@@ -999,6 +1054,7 @@ pub fn validate_create_request(req: &ClientCreateProviderRequest) -> Result<(), 
         None => {}
     }
     validate_model_aliases(&req.model_aliases)?;
+    validate_model_context_windows(&req.model_context_windows)?;
     if let Some(model) = &req.embedding_model {
         validate_optional_string(model, "invalid embedding_model")?;
     }
@@ -1117,6 +1173,9 @@ pub fn validate_update_request(req: &ClientUpdateProviderRequest) -> Result<(), 
     }
     if let Some(aliases) = &req.model_aliases {
         validate_model_aliases(aliases)?;
+    }
+    if let Some(windows) = &req.model_context_windows {
+        validate_model_context_windows(windows)?;
     }
     if let Some(model) = &req.embedding_model {
         validate_optional_string(model, "invalid embedding_model")?;
@@ -1801,6 +1860,70 @@ mod tests {
                 .to_client_warning()
                 .code,
             WARNING_PREFLIGHT_SKIPPED
+        );
+    }
+
+    /// MODULE-010 D5: an entry declares its models' windows. Create and update take the same
+    /// table rules as the runtime loader (1..=100 000 000 tokens each, at most 64 models,
+    /// a non-blank id without control characters); an update replaces the whole table.
+    #[test]
+    fn model_context_windows_follow_the_loader_rules() {
+        let mut r = create_req();
+        r.model_context_windows = [("claude-sonnet-4-5".to_string(), 1_000_000u32)]
+            .into_iter()
+            .collect();
+        assert!(validate_create_request(&r).is_ok());
+        for bad in [0u32, MAX_MODEL_CONTEXT_WINDOW + 1] {
+            r.model_context_windows = [("m".to_string(), bad)].into_iter().collect();
+            assert!(validate_create_request(&r).is_err(), "window {bad}");
+        }
+        for id in [" ", "a\u{7}b"] {
+            r.model_context_windows = [(id.to_string(), 1000u32)].into_iter().collect();
+            assert!(validate_create_request(&r).is_err(), "id {id:?}");
+        }
+        // An id of up to 256 bytes, the runtime loader's bound — longer than a model alias.
+        for (len, ok) in [
+            (MAX_MODEL_ALIAS_LEN + 1, true),
+            (MAX_MODEL_CONTEXT_WINDOW_ID_LEN, true),
+            (MAX_MODEL_CONTEXT_WINDOW_ID_LEN + 1, false),
+        ] {
+            r.model_context_windows = [("m".repeat(len), 1000u32)].into_iter().collect();
+            assert_eq!(
+                validate_create_request(&r).is_ok(),
+                ok,
+                "an id of {len} bytes"
+            );
+        }
+        r.model_context_windows = (0..=MAX_MODEL_CONTEXT_WINDOWS)
+            .map(|i| (format!("m{i}"), 1000u32))
+            .collect();
+        assert!(validate_create_request(&r).is_err(), "too many");
+        r.model_context_windows.pop_last();
+        assert!(validate_create_request(&r).is_ok(), "64 is the bound");
+
+        let mut u = ClientUpdateProviderRequest::default();
+        assert!(u.is_empty());
+        u.model_context_windows = Some(std::collections::BTreeMap::new());
+        assert!(
+            !u.is_empty(),
+            "an update that clears the table is not empty"
+        );
+        assert!(validate_update_request(&u).is_ok());
+        u.model_context_windows = Some([("m".to_string(), 0u32)].into_iter().collect());
+        assert!(validate_update_request(&u).is_err());
+
+        // The wire form: absent when empty, a map of numbers when set.
+        let mut view = ClientProviderSummary::default();
+        assert!(!serde_json::to_string(&view)
+            .unwrap()
+            .contains("model_context_windows"));
+        view.model_context_windows = [("m".to_string(), 1_048_576u32)].into_iter().collect();
+        assert!(serde_json::to_string(&view)
+            .unwrap()
+            .contains(r#""model_context_windows":{"m":1048576}"#));
+        assert_eq!(
+            (MAX_MODEL_CONTEXT_WINDOW, MAX_MODEL_CONTEXT_WINDOWS),
+            (100_000_000, 64)
         );
     }
 }
