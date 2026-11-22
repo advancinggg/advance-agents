@@ -120,6 +120,7 @@ impl ContextAssembler for StubAssembler {
                 tier2: 0,
                 tier3: 0,
             },
+            task_id: None,
         })
     }
     fn inject_tier3_warning(&self, _agent_id: &str, _msg: &str) {}

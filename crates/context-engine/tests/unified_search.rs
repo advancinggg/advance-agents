@@ -44,6 +44,8 @@ impl UnifiedSearchPort for Search {
                     similarity: 0.7,
                     timestamp: SystemTime::UNIX_EPOCH,
                     snippet: None,
+                    turn: None,
+                    retention: None,
                 },
                 TurnHit {
                     id: "turn-cross".into(),
@@ -51,6 +53,8 @@ impl UnifiedSearchPort for Search {
                     similarity: 0.6,
                     timestamp: SystemTime::UNIX_EPOCH,
                     snippet: None,
+                    turn: None,
+                    retention: None,
                 },
             ],
             contents: vec![ContentHit {

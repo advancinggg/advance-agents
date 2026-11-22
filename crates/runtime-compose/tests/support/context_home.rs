@@ -114,21 +114,21 @@ pub fn is_extraction(body: &Value) -> bool {
     contents(body).contains("memory-extraction assistant")
 }
 
-/// The turns an assembled prompt recalls: the items of the `## Related Turns` list of its
-/// `# Recalled Context` section, one `- {id} ({score}) — {digest}` line each, best first.
-/// Empty when the prompt has no such section. (A digest also shows in the task summary
-/// and the recent-turn digests of a prompt, recalled or not — only this list says it was
+/// The turns an assembled prompt recalls from the agent's other tasks: the items of its
+/// `# Related Turns` section (MODULE-010 §1.4.3 ⑯) — a `- {task}#turn-{n} ({score}) —
+/// {digest}` line for each turn recalled as its digest, then a `## Turn {n} of {task} ·
+/// {time}` heading for each turn loaded whole. Empty when the prompt has no such
+/// section. (A digest also shows in the task summary, the related task briefs and the
+/// recent-turn digests of a prompt, recalled or not — only this section says the turn was
 /// recalled.)
 pub fn recalled_turns(prompt: &str) -> Vec<&str> {
-    let Some((_, section)) = prompt.split_once("# Recalled Context") else {
+    let Some((_, section)) = prompt.split_once("# Related Turns\n") else {
         return Vec::new();
     };
-    let Some((_, turns)) = section.split_once("## Related Turns\n") else {
-        return Vec::new();
-    };
-    turns
+    let section = section.split("\n# ").next().unwrap_or_default();
+    section
         .lines()
-        .take_while(|line| line.starts_with("- "))
+        .filter(|line| line.starts_with("- ") || line.starts_with("## Turn "))
         .collect()
 }
 

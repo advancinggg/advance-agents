@@ -542,6 +542,33 @@ impl RusqliteSqliteIndex {
         collect_rows(rows)
     }
 
+    /// `agent_id`'s turn rows of `task_id` ([`SqliteIndex::list_turns_for_task`]), read
+    /// through the table's `(agent_id, task_id, turn)` key.
+    pub fn try_list_turns_for_task(
+        &self,
+        agent_id: &str,
+        task_id: &str,
+        window: usize,
+    ) -> Result<Vec<TurnIndexRow>, SqliteIndexError> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| SqliteIndexError::Pool(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent_id, task_id, turn, digest, embedding, reference_count, updated_at,
+                    embedding_model
+                 FROM cap_turn_index WHERE agent_id = ?1 AND task_id = ?2
+                 ORDER BY turn DESC LIMIT ?3",
+            )
+            .map_err(|e| SqliteIndexError::Sql(e.to_string()))?;
+        let window = i64::try_from(window).unwrap_or(i64::MAX);
+        let rows = stmt
+            .query_map(params![agent_id, task_id, window], row_to_turn)
+            .map_err(|e| SqliteIndexError::Sql(e.to_string()))?;
+        collect_rows(rows)
+    }
+
     pub fn try_list_tasks(&self, agent_id: &str) -> Result<Vec<TaskIndexRow>, SqliteIndexError> {
         let conn = self
             .pool
@@ -599,6 +626,15 @@ impl SqliteIndex for RusqliteSqliteIndex {
     }
     fn list_turns_for_agent(&self, agent_id: &str) -> Vec<TurnIndexRow> {
         self.try_list_turns(agent_id).unwrap_or_default()
+    }
+    fn list_turns_for_task(
+        &self,
+        agent_id: &str,
+        task_id: &str,
+        window: usize,
+    ) -> Vec<TurnIndexRow> {
+        self.try_list_turns_for_task(agent_id, task_id, window)
+            .unwrap_or_default()
     }
     fn list_tasks_for_agent(&self, agent_id: &str) -> Vec<TaskIndexRow> {
         self.try_list_tasks(agent_id).unwrap_or_default()

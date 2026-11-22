@@ -74,6 +74,7 @@
 pub mod assembler;
 pub mod boundary_marker;
 pub mod corpus_ingest;
+pub mod history_select;
 pub mod inventory;
 pub mod knowledge_map;
 pub mod knowledge_map_reader;
@@ -100,7 +101,8 @@ pub mod unified_search;
 pub mod vector_search;
 pub mod warning_queue;
 
-pub use assembler::{ContextAssemblerImpl, INPUT_VALIDATION_PREFIX};
+pub use assembler::{mint_task_id, ContextAssemblerImpl, INPUT_VALIDATION_PREFIX};
+pub use history_select::{HIGH_SCORE_THRESHOLD, LOW_SCORE_THRESHOLD, TASK_TURN_CANDIDATES};
 pub use inventory::{
     AlwaysNativeTools, HostFnEntry, HostFnInventoryReader, NativeToolsPort, NeverNativeTools,
 };
@@ -115,6 +117,7 @@ pub use ports::{
     SkillSummaryEntry, SkillSummaryReader, SubtaskView, TaskHit, TaskIndexPort, TaskSynthesis,
     TurnHit, UnifiedSearchPort, UnifiedSearchResult,
 };
+pub use recall_section::{MAX_RELATED_TASK_BRIEFS, RELATED_TASK_MIN_THRESHOLD};
 // Runtime-info sections + the per-turn assembly report (Client API inspector).
 pub use ports::{
     AssemblyHistoryReport, AssemblyRecallReport, AssemblyReport, AssemblyReportSink,
@@ -141,7 +144,7 @@ pub use sanitize::{attach_flags_to_record, layer1_flag};
 pub use staleness::{check_and_demote, is_turn_stale, StalenessCheckError, MAX_TRACKED_PATHS};
 pub use task_router::{
     ContextError, TaskRouter, TaskRoutingDecision, TaskRoutingOutcome, AMBIGUITY_GAP,
-    ROUTING_METHOD_LLM, ROUTING_METHOD_SEARCH, TASK_MATCH_THRESHOLD,
+    ROUTING_METHOD_CURRENT, ROUTING_METHOD_LLM, ROUTING_METHOD_SEARCH, TASK_MATCH_THRESHOLD,
 };
 pub use tier1::{build_tier1a, build_tier1b};
 pub use tier1_children::{

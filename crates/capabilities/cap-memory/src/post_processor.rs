@@ -762,10 +762,11 @@ impl Components {
     /// ever embed it again: a turn's digest never changes, and a task may never
     /// get another turn. This does, a little per turn end:
     ///
-    /// - at most [`VECTORS_PER_TURN_END`] rows per call, the most recently
-    ///   written first whichever table they are in — a task's brief is as recent
-    ///   as its last turn, so catch-up walks back through briefs and digests
-    ///   together and neither waits for the other to be done;
+    /// - at most [`VECTORS_PER_TURN_END`] rows per call: the task briefs first,
+    ///   then the turn rows, each the most recently written first. Task routing
+    ///   compares every message with the briefs of all the agent's tasks, so a
+    ///   brief of another model leaves routing short of its task (MODULE-010
+    ///   §1.4.2); the briefs are few, one per task, and are caught up first;
     /// - turn rows only among the [`RECENT_TURN_WINDOW`] most recent (what a
     ///   reader scans): the cost of a model change is bounded by the window and
     ///   the number of tasks, never by the length of the history;
@@ -852,10 +853,13 @@ impl Components {
             upkeep.settle(agent_id);
             return Ok(0);
         }
-        // Open rows, the most recently written first. The sort is stable: each
-        // table keeps its own order, and a brief goes before a digest of the same
-        // moment. Then the rows put off, the one put off longest ago first.
-        open.sort_by(|a, b| b.updated_at().cmp(a.updated_at()));
+        // Open rows: the briefs, then the digests, each the most recently written
+        // first. Then the rows put off, the one put off longest ago first.
+        open.sort_by(|a, b| {
+            a.is_turn()
+                .cmp(&b.is_turn())
+                .then_with(|| b.updated_at().cmp(a.updated_at()))
+        });
         put_off.sort_by_key(|(place, _)| *place);
         let rows = open
             .into_iter()
@@ -1094,6 +1098,11 @@ impl StaleRow {
         }
     }
 
+    /// Whether the row is a turn's (else a task's brief).
+    fn is_turn(&self) -> bool {
+        matches!(self, StaleRow::Turn(..))
+    }
+
     /// When the row was last written.
     fn updated_at(&self) -> &str {
         match self {
@@ -1293,6 +1302,13 @@ impl From<CatchUpError> for PostProcessorError {
 /// not a safe path segment (Step 7 then skips the write as well).
 pub fn default_task_partition(write_id: &str) -> Option<String> {
     sanitize_task_segment(write_id).map(|s| format!("_agent-{s}"))
+}
+
+/// Whether `task_id` is an agent's default partition ([`default_task_partition`]): the turns
+/// no task was settled for. It is no task: routing never chooses it, and it is no related
+/// task. Its turns are recalled as other tasks' turns are.
+pub fn is_default_task_partition(task_id: &str) -> bool {
+    task_id.starts_with("_agent-")
 }
 
 /// SAT-B (AC-45 / D4): validate a guest-controllable task-id path SEGMENT.

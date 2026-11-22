@@ -768,3 +768,36 @@ fn t_reconcile_rewrite_on_insert_after_failed_open_compaction() {
         "inactive tail bounded after reconcile"
     );
 }
+
+/// PRD §11.3.5 — one task's latest turn rows, latest first and at most `window` of them,
+/// of that agent alone: the rusqlite index reads them as the in-memory one does.
+#[test]
+fn t47b_rusqlite_lists_a_tasks_latest_turns_as_in_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let rusql = RusqliteSqliteIndex::open(dir.path().join("ix.sqlite3")).unwrap();
+    let inmem = InMemorySqliteIndex::default();
+
+    for ix in [&rusql as &dyn SqliteIndex, &inmem as &dyn SqliteIndex] {
+        for t in [2, 5, 1, 4, 3] {
+            ix.upsert_turn(turn_row("agent:r", "task-1", t));
+        }
+        ix.upsert_turn(turn_row("agent:r", "task-2", 9));
+        ix.upsert_turn(turn_row("agent:s", "task-1", 7));
+        let turns = |window: usize| -> Vec<u32> {
+            ix.list_turns_for_task("agent:r", "task-1", window)
+                .iter()
+                .map(|row| row.turn)
+                .collect()
+        };
+        assert_eq!(turns(3), [5, 4, 3]);
+        assert_eq!(turns(10), [5, 4, 3, 2, 1]);
+        assert!(turns(0).is_empty());
+        assert_eq!(ix.list_turns_for_task("agent:s", "task-1", 10).len(), 1);
+        assert!(ix.list_turns_for_task("agent:r", "absent", 10).is_empty());
+        // Each row comes whole.
+        assert_eq!(
+            ix.list_turns_for_task("agent:r", "task-2", 1),
+            [turn_row("agent:r", "task-2", 9)]
+        );
+    }
+}

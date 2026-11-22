@@ -218,6 +218,23 @@ pub trait SqliteIndex: Send + Sync {
         self.list_tasks_for_agent(agent_id).len()
     }
 
+    /// `agent_id`'s `window` latest turn rows of `task_id` (the highest turn numbers), latest
+    /// first: what a search of one task's turns reads (PRD §11.3.5 "WHERE task_id = 当前
+    /// task"). Empty when the index cannot be read, as [`Self::list_turns_for_agent`]. An
+    /// index that keeps its rows outside memory reads no more of them than the window.
+    fn list_turns_for_task(
+        &self,
+        agent_id: &str,
+        task_id: &str,
+        window: usize,
+    ) -> Vec<TurnIndexRow> {
+        let mut rows = self.list_turns_for_agent(agent_id);
+        rows.retain(|row| row.task_id == task_id);
+        rows.sort_by(|a, b| b.turn.cmp(&a.turn));
+        rows.truncate(window);
+        rows
+    }
+
     /// `agent_id`'s `window` most recently updated turn rows, most recent first, ties
     /// in time broken by task and then turn: the rows a recall read looks at
     /// ([`RECENT_TURN_WINDOW`]) — the same window, row for row, that

@@ -426,7 +426,7 @@ async fn each_agents_prompt_is_embedded_only_by_its_own_chat_provider() {
         "one request, to root's chat provider only"
     );
     let text = prompt_text(&assembled.messages);
-    assert!(text.contains("# Recalled Context"), "{text}");
+    assert!(text.contains("# Related Turns"), "{text}");
     assert!(text.contains("root turn embedded by alpha"), "{text}");
     assert!(
         !text.contains("root turn embedded by beta"),
@@ -512,7 +512,10 @@ async fn an_agent_on_a_chat_only_provider_sends_its_prompt_nowhere() {
     );
     let text = prompt_text(&assembled.messages);
     assert!(text.contains("a private draft"), "the prompt still arrives");
-    assert!(!text.contains("# Recalled Context"), "{text}");
+    assert!(
+        !text.contains("# Recalled Context") && !text.contains("# Related Turns"),
+        "nothing is recalled: {text}"
+    );
     assert!(
         text.contains("- recall: disabled (no embedding model is available to this agent)"),
         "{text}"
@@ -617,7 +620,10 @@ async fn re_pinning_an_agent_moves_its_embedding_on_the_next_turn() {
         .expect("assembles");
     assert!(rig.upstream.take().is_empty());
     let text = prompt_text(&assembled.messages);
-    assert!(!text.contains("# Recalled Context"), "{text}");
+    assert!(
+        !text.contains("# Recalled Context") && !text.contains("# Related Turns"),
+        "nothing is recalled: {text}"
+    );
     assert!(text.contains("- recall: disabled"), "{text}");
     assert!(!inspector.snapshot("writer").unwrap().embedding.active);
 }

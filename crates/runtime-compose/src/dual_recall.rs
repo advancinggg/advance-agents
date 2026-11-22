@@ -83,6 +83,8 @@ fn map_turn(t: advance_database::TurnHit) -> TurnHit {
         similarity: t.similarity,
         timestamp: SystemTime::from(t.timestamp),
         snippet: None,
+        turn: None,
+        retention: None,
     }
 }
 

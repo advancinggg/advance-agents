@@ -199,6 +199,8 @@ impl UnifiedSearchPort for RankingUnifiedSearch {
                     similarity: s,
                     timestamp: t.timestamp,
                     snippet: None,
+                    turn: None,
+                    retention: None,
                 })
             })
             .collect();

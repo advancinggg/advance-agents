@@ -69,8 +69,8 @@ pub use advance_context_engine::ports::PortError as CePortError;
 // cap-memory data. context-engine stays read-only (these are reused, not edited).
 use advance_context_engine::{
     build_agent_search_corpus, AgentSearchCorpus, ContextAssemblerImpl, CorpusDoc, CorpusDocKind,
-    CosineTaskIndex, HostFnEntry, HostFnInventoryReader, IndexedTask, KnowledgeRecord,
-    NativeToolsPort, ProjectingKnowledgeMap, RankingUnifiedSearch,
+    HostFnEntry, HostFnInventoryReader, KnowledgeRecord, NativeToolsPort, ProjectingKnowledgeMap,
+    RankingUnifiedSearch,
 };
 // Wave-20 Lane `search`: the MODULE-004 dense+sparse read path + its cross-crate
 // adapter. Only the non-hit types are imported (TaskHit/ContentHit/etc. collide
@@ -186,9 +186,10 @@ impl KnowledgeMapReader for StubKnowledgeMap {
 }
 
 /// Embedding port — hermetic stub: a fixed zero vector (never a real
-/// `/v1/embeddings` round-trip on the witness turn). The downstream
-/// task_index/unified_search stubs return empty, so the embedding value is
-/// inert; routing degrades to `NewTask`.
+/// `/v1/embeddings` round-trip on the witness turn). The downstream stubs leave
+/// the value inert: the search finds nothing, and the task index answers an
+/// error, so routing does not settle and, with no current task, the turn stays
+/// in the agent's default partition.
 struct StubEmbedding;
 #[async_trait]
 impl EmbeddingPort for StubEmbedding {
@@ -450,6 +451,9 @@ pub struct SqliteIndexRecall {
     /// Which model produced a query vector; `None` → no model binding (only
     /// rows that record no model are compared, on dimension alone).
     query_model: Option<QueryVectorModel>,
+    /// The tasks' turn indexes, which hold what the retention formula weighs; `None` → the
+    /// turns recall finds are unscored (they load as their digests).
+    history: Option<Arc<CapMemoryHistoryReader>>,
 }
 
 /// The model a search binds stored vectors to.
@@ -484,6 +488,7 @@ impl SqliteIndexRecall {
             write_agent_id: write_agent_id.to_string(),
             query_aliases: query_aliases.to_vec(),
             query_model: None,
+            history: None,
         }
     }
 
@@ -498,8 +503,54 @@ impl SqliteIndexRecall {
         self
     }
 
+    /// Score the turns recall finds by the PRD §11.3.4 retention formula, from what each
+    /// task's turn index records of them (`history`); ⑯ keeps a found turn by its score.
+    pub fn with_task_history(mut self, history: Arc<CapMemoryHistoryReader>) -> Self {
+        self.history = Some(history);
+        self
+    }
+
+    /// Give each of `hits` that names its turn the turn's retention score at this read: one
+    /// read of each task's turn index. Without the tasks' indexes, or for a turn its task's
+    /// index does not hold, the hit stays unscored.
+    fn score_turns(&self, hits: &mut [TurnHit]) {
+        let Some(history) = &self.history else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        let mut by_task: std::collections::BTreeMap<String, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for hit in hits.iter() {
+            if let Some(turn) = hit.turn.and_then(|t| u32::try_from(t).ok()) {
+                by_task.entry(hit.task_id.clone()).or_default().push(turn);
+            }
+        }
+        for (task, turns) in by_task {
+            let scores = history.retention_of(&task, &turns, now);
+            for hit in hits.iter_mut().filter(|hit| hit.task_id == task) {
+                hit.retention = hit
+                    .turn
+                    .and_then(|t| u32::try_from(t).ok())
+                    .and_then(|t| scores.get(&t).copied());
+            }
+        }
+    }
+
     fn known(&self, agent_id: &str) -> bool {
         agent_id == self.write_agent_id || self.query_aliases.iter().any(|a| a == agent_id)
+    }
+
+    /// Whether one of the agent's tasks routing may enter (not a default partition, not
+    /// an `auto:` task) has a brief vector, of whatever model.
+    fn has_task_brief_vector(&self) -> bool {
+        self.index
+            .list_tasks_for_agent(&self.write_agent_id)
+            .iter()
+            .any(|t| {
+                !cap_memory::is_default_task_partition(&t.task_id)
+                    && !t.task_id.starts_with("auto:")
+                    && t.brief_embedding.as_ref().is_some_and(|v| !v.is_empty())
+            })
     }
 
     /// The model `query_embedding` comes from, read once per search.
@@ -547,7 +598,9 @@ impl SqliteIndexRecall {
             .index
             .list_tasks_for_agent(&self.write_agent_id)
             .into_iter()
-            .filter(|t| include_default_partitions || !t.task_id.starts_with("_agent-"))
+            .filter(|t| {
+                include_default_partitions || !cap_memory::is_default_task_partition(&t.task_id)
+            })
             .filter(|t| same_embedding_model(t.brief_embedding_model.as_deref(), query_model))
             .filter_map(|t| {
                 let emb = t.brief_embedding.as_deref()?;
@@ -575,21 +628,30 @@ fn parse_rfc3339(s: &str) -> Option<std::time::SystemTime> {
         .map(|dt| std::time::SystemTime::from(dt.with_timezone(&chrono::Utc)))
 }
 
-#[async_trait]
-impl UnifiedSearchPort for SqliteIndexRecall {
-    async fn search(
+impl SqliteIndexRecall {
+    /// Recall over the index (PRD §11.3.1 `unified_search`): other tasks' turns — the
+    /// [`RECALL_MAX_TURNS`] most similar to the query from [`RECALL_MIN_SIMILARITY`] up,
+    /// each scored by retention — and the briefs of the [`RECALL_MAX_TASKS`] most similar
+    /// tasks from the same similarity up. `exclude` (the task the turn runs in) is left out
+    /// before the lists are cut. A default partition's turns (the turns no task was settled
+    /// for: every turn from before turns ran in tasks, a control, system or auto message's,
+    /// and one routing could not settle while the agent had no task) are recalled as any
+    /// other task's; a default partition is no related task.
+    fn search_excluding(
         &self,
         agent_id: &str,
-        _query: &str,
         query_embedding: &[f32],
-    ) -> Result<UnifiedSearchResult, PortError> {
+        exclude: Option<&str>,
+    ) -> UnifiedSearchResult {
         if !self.known(agent_id) || query_embedding.is_empty() {
-            return Ok(UnifiedSearchResult::default());
+            return UnifiedSearchResult::default();
         }
+        let other_task = |task_id: &str| Some(task_id) != exclude;
         let query_model = self.query_model_of(query_embedding);
         let mut turns: Vec<TurnHit> = self
             .recent_turns(&query_model)
             .into_iter()
+            .filter(|t| other_task(&t.task_id))
             .filter_map(|t| {
                 let sim = advance_context_engine::cosine_similarity(query_embedding, &t.embedding)?;
                 if sim < RECALL_MIN_SIMILARITY || t.digest.trim().is_empty() {
@@ -602,6 +664,8 @@ impl UnifiedSearchPort for SqliteIndexRecall {
                     timestamp: parse_rfc3339(&t.updated_at)
                         .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
                     snippet: Some(t.digest),
+                    turn: Some(u64::from(t.turn)),
+                    retention: None,
                 })
             })
             .collect();
@@ -612,18 +676,170 @@ impl UnifiedSearchPort for SqliteIndexRecall {
                 .then_with(|| a.id.cmp(&b.id))
         });
         turns.truncate(RECALL_MAX_TURNS);
+        // "语义 top-N → retention_score rerank": the top-N are scored; ⑯ reranks them.
+        self.score_turns(&mut turns);
 
         let mut tasks = self.task_hits(query_embedding, false, &query_model);
+        tasks.retain(|t| other_task(&t.task_id));
         tasks.retain(|t| t.similarity >= RECALL_MIN_SIMILARITY);
         tasks.truncate(RECALL_MAX_TASKS);
 
-        Ok(UnifiedSearchResult {
+        UnifiedSearchResult {
             tasks,
             turns,
             contents: Vec::new(),
             memories: Vec::new(),
-        })
+        }
     }
+}
+
+#[async_trait]
+impl UnifiedSearchPort for SqliteIndexRecall {
+    async fn search(
+        &self,
+        agent_id: &str,
+        _query: &str,
+        query_embedding: &[f32],
+    ) -> Result<UnifiedSearchResult, PortError> {
+        Ok(self.search_excluding(agent_id, query_embedding, None))
+    }
+
+    /// Other tasks' turns and briefs: the task the turn runs in is left out before the
+    /// lists are cut, so its own turns and its brief take no place in them. A turn that runs
+    /// in no task runs in the agent's default partition, which is left out the same way.
+    async fn search_other_tasks(
+        &self,
+        agent_id: &str,
+        _query: &str,
+        query_embedding: &[f32],
+        current_task_id: Option<&str>,
+    ) -> Result<UnifiedSearchResult, PortError> {
+        let current = match current_task_id {
+            Some(task) => Some(task.to_string()),
+            None => cap_memory::default_task_partition(&self.write_agent_id),
+        };
+        Ok(self.search_excluding(agent_id, query_embedding, current.as_deref()))
+    }
+
+    /// PRD §11.3.5 "同 Task 较早历史": the task's latest [`MAX_INDEX_SCAN_ROWS`] turn rows
+    /// (`WHERE task_id = 当前 task`; an empty id is the agent's default partition), searched
+    /// two ways — the `limit` most similar to the query vector (rows of the query's model
+    /// only, as every read here), and the `limit` whose digests carry the query's keywords
+    /// with the most weight, a keyword weighing less the more of the task's digests carry it
+    /// (`ln(rows / rows with it)`: one in every digest weighs nothing) — then scored by the
+    /// retention formula. The keywords are the query's words as MODULE-004's sparse path
+    /// takes them (`advance_database::fts_adapter::extract_keywords`); a digest's words are
+    /// split the same way.
+    async fn search_task_turns(
+        &self,
+        agent_id: &str,
+        task_id: &str,
+        query: &str,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Option<Vec<TurnHit>>, PortError> {
+        if !self.known(agent_id) || limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let task = if task_id.is_empty() {
+            match cap_memory::default_task_partition(&self.write_agent_id) {
+                Some(partition) => partition,
+                None => return Ok(Some(Vec::new())),
+            }
+        } else {
+            task_id.to_string()
+        };
+        let rows: Vec<cap_memory::TurnIndexRow> = self
+            .index
+            .list_turns_for_task(&self.write_agent_id, &task, MAX_INDEX_SCAN_ROWS)
+            .into_iter()
+            .filter(|row| row.task_id == task && !row.digest.trim().is_empty())
+            .collect();
+
+        // The semantic half.
+        let mut similarity: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+        if !query_embedding.is_empty() {
+            let query_model = self.query_model_of(query_embedding);
+            if let Some(required) = query_model.required_of_rows() {
+                for row in &rows {
+                    if !same_embedding_model(row.embedding_model.as_deref(), required) {
+                        continue;
+                    }
+                    if let Some(sim) =
+                        advance_context_engine::cosine_similarity(query_embedding, &row.embedding)
+                    {
+                        similarity.insert(row.turn, sim);
+                    }
+                }
+            }
+        }
+        let mut semantic: Vec<(&cap_memory::TurnIndexRow, f32)> = rows
+            .iter()
+            .filter_map(|row| similarity.get(&row.turn).map(|sim| (row, *sim)))
+            .collect();
+        semantic.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| b.0.turn.cmp(&a.0.turn)));
+        semantic.truncate(limit);
+
+        // The keyword half.
+        let keywords = advance_database::fts_adapter::extract_keywords(query);
+        let words: Vec<std::collections::HashSet<String>> =
+            rows.iter().map(|row| digest_words(&row.digest)).collect();
+        let weight = |keyword: &String| -> f64 {
+            let with = words.iter().filter(|w| w.contains(keyword)).count();
+            if with == 0 {
+                0.0
+            } else {
+                (rows.len() as f64 / with as f64).ln()
+            }
+        };
+        let weights: Vec<f64> = keywords.iter().map(weight).collect();
+        let mut keyword: Vec<(&cap_memory::TurnIndexRow, f64)> = rows
+            .iter()
+            .zip(&words)
+            .filter_map(|(row, w)| {
+                let score: f64 = keywords
+                    .iter()
+                    .zip(&weights)
+                    .filter(|(k, _)| w.contains(*k))
+                    .map(|(_, weight)| weight)
+                    .sum();
+                (score > 0.0).then_some((row, score))
+            })
+            .collect();
+        keyword.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| b.0.turn.cmp(&a.0.turn)));
+        keyword.truncate(limit);
+
+        let mut seen = std::collections::HashSet::new();
+        let mut hits: Vec<TurnHit> = semantic
+            .into_iter()
+            .map(|(row, _)| row)
+            .chain(keyword.into_iter().map(|(row, _)| row))
+            .filter(|row| seen.insert(row.turn))
+            .map(|row| TurnHit {
+                id: format!("{}#turn-{}", row.task_id, row.turn),
+                task_id: row.task_id.clone(),
+                similarity: similarity.get(&row.turn).copied().unwrap_or(0.0),
+                timestamp: parse_rfc3339(&row.updated_at)
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                snippet: Some(row.digest.clone()),
+                turn: Some(u64::from(row.turn)),
+                retention: None,
+            })
+            .collect();
+        self.score_turns(&mut hits);
+        Ok(Some(hits))
+    }
+}
+
+/// A digest's words as the keyword search compares them: split as
+/// `advance_database::fts_adapter::extract_keywords` splits a query (whitespace and ASCII punctuation),
+/// ASCII-lowercased.
+fn digest_words(digest: &str) -> std::collections::HashSet<String> {
+    digest
+        .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 #[async_trait]
@@ -639,8 +855,38 @@ impl TaskIndexPort for SqliteIndexRecall {
         }
         let query_model = self.query_model_of(query_embedding);
         let mut hits = self.task_hits(query_embedding, false, &query_model);
+        // Routing never enters an `auto:` task, so hits of those alone are none.
+        if hits.iter().all(|hit| hit.task_id.starts_with("auto:")) && self.has_task_brief_vector() {
+            // The agent has task briefs, but none of the query's embedding model (its
+            // model changed, and the upkeep has not re-embedded them yet): routing cannot
+            // tell whether the message belongs to one of them, so it does not settle.
+            return Err(PortError(
+                "no task brief of the query's embedding model".into(),
+            ));
+        }
         hits.truncate(n);
         Ok(hits)
+    }
+
+    /// The agent's task with the latest `last_turn_at`. Every turn end writes its task's
+    /// row (MODULE-011 Step 8), so that is the task its latest turn ran in. A default
+    /// partition, an `auto:` task and a row whose time does not parse are no current task;
+    /// a tie in time goes to the greater task id.
+    async fn current_task(&self, agent_id: &str) -> Result<Option<String>, PortError> {
+        if !self.known(agent_id) {
+            return Ok(None);
+        }
+        Ok(self
+            .index
+            .list_tasks_for_agent(&self.write_agent_id)
+            .into_iter()
+            .filter(|t| {
+                !cap_memory::is_default_task_partition(&t.task_id)
+                    && !t.task_id.starts_with("auto:")
+            })
+            .filter_map(|t| Some((parse_rfc3339(&t.last_turn_at)?, t.task_id)))
+            .max()
+            .map(|(_, task_id)| task_id))
     }
 }
 
@@ -721,7 +967,11 @@ impl RuntimeInfoReader for StaticRuntimeInfo {
     }
 }
 
-/// Task-index port — hermetic stub: no candidates.
+/// Task-index port of an agent without the shared SQLite index (no memory capability, or
+/// an index that is not shared): it holds no task, and a task routing minted could never be
+/// found again. So routing does not settle (an error) and has no current task: the turn
+/// stays in the agent's default partition, as before turns ran in tasks, rather than
+/// starting a task of its own for every message.
 struct StubTaskIndex;
 #[async_trait]
 impl TaskIndexPort for StubTaskIndex {
@@ -731,13 +981,13 @@ impl TaskIndexPort for StubTaskIndex {
         _query_embedding: &[f32],
         _n: usize,
     ) -> Result<Vec<TaskHit>, PortError> {
-        Ok(Vec::new())
+        Err(PortError("no task index".into()))
     }
 }
 
-/// Light-LLM tie-break fallback — stub returning the first candidate (the
-/// tie-break is only reached with ≥2 candidates sharing a timestamp, which the
-/// empty task_index never produces).
+/// Light-LLM tie-break fallback — stub answering the first candidate, as the
+/// production port does when its call fails. A build given no light model
+/// keeps it.
 struct StubLightLlm;
 #[async_trait]
 impl LightLlmFallbackPort for StubLightLlm {
@@ -1480,6 +1730,48 @@ impl CapMemoryHistoryReader {
     }
 }
 
+impl CapMemoryHistoryReader {
+    /// The PRD §11.3.4 retention score at `now` of each turn of `task_id` numbered in
+    /// `turns` that the task's turn index holds for this agent.
+    pub fn retention_of(
+        &self,
+        task_id: &str,
+        turns: &[u32],
+        now: std::time::SystemTime,
+    ) -> std::collections::HashMap<u32, f32> {
+        use advance_context_engine::RetentionScorer as _;
+        let Some(index) = self.load_turn_index(task_id) else {
+            return std::collections::HashMap::new();
+        };
+        index
+            .turns
+            .into_iter()
+            .filter(|t| {
+                t.task_id == task_id && self.agent_matches(&t.agent_id) && turns.contains(&t.turn)
+            })
+            .map(|t| {
+                (
+                    t.turn,
+                    DatabaseRetentionScorer.retention_score(&retention_view(&t), now),
+                )
+            })
+            .collect()
+    }
+}
+
+/// What the retention formula weighs of a turn, as its task's turn index records it.
+fn retention_view(t: &cap_memory::turn_index::TurnEntry) -> advance_context_engine::TurnDigestView {
+    advance_context_engine::TurnDigestView {
+        timestamp: parse_rfc3339(&t.timestamp).unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        importance: importance_tag(&t.importance).to_string(),
+        reference_count: t.reference_count,
+        has_user_instruction: t.has_user_instruction,
+        has_user_correction: t.has_user_correction,
+        has_tool_use: t.has_tool_use,
+        has_decision: t.has_decision,
+    }
+}
+
 fn importance_tag(i: &cap_memory::turn_index::Importance) -> &'static str {
     match i {
         cap_memory::turn_index::Importance::Critical => "critical",
@@ -1524,16 +1816,7 @@ impl L2DigestReader for CapMemoryHistoryReader {
                 .into_iter()
                 .rev()
                 .map(|t| {
-                    let digest = advance_context_engine::TurnDigestView {
-                        timestamp: parse_rfc3339(&t.timestamp)
-                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-                        importance: importance_tag(&t.importance).to_string(),
-                        reference_count: t.reference_count,
-                        has_user_instruction: t.has_user_instruction,
-                        has_user_correction: t.has_user_correction,
-                        has_tool_use: t.has_tool_use,
-                        has_decision: t.has_decision,
-                    };
+                    let digest = retention_view(&t);
                     advance_context_engine::RerankItem::new(t, digest)
                 })
                 .collect();
@@ -1570,28 +1853,62 @@ impl advance_context_engine::RecentTurnsReader for CapMemoryHistoryReader {
         task_id: &str,
         count: usize,
     ) -> Result<Vec<advance_context_engine::RecentTurn>, PortError> {
+        Ok(self.read_entries(task_id, |mut turns| {
+            turns.split_off(turns.len().saturating_sub(count))
+        }))
+    }
+
+    /// The turns of `task_id` numbered in `turns`, read as [`Self::read_recent_turns`] reads
+    /// the last ones.
+    async fn read_turns(
+        &self,
+        _agent_id: &str,
+        task_id: &str,
+        turns: &[u64],
+    ) -> Result<Vec<advance_context_engine::RecentTurn>, PortError> {
+        Ok(self.read_entries(task_id, |entries| {
+            entries
+                .into_iter()
+                .filter(|t| turns.contains(&u64::from(t.turn)))
+                .collect()
+        }))
+    }
+}
+
+impl CapMemoryHistoryReader {
+    /// The entries of `task_id`'s index this agent wrote, oldest first, narrowed by `pick`,
+    /// each with its lines of the turn log (read from the log's end) and the file versions it
+    /// read. A turn comes with its lines only when the read got every line its entry's
+    /// `log_offset` names; otherwise it comes without, and ⑯ loads it as its digest.
+    fn read_entries(
+        &self,
+        task_id: &str,
+        pick: impl FnOnce(
+            Vec<cap_memory::turn_index::TurnEntry>,
+        ) -> Vec<cap_memory::turn_index::TurnEntry>,
+    ) -> Vec<advance_context_engine::RecentTurn> {
         let Some(task_id) = self.resolve_task_id(task_id) else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         let Some(index) = self.load_turn_index(task_id) else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         let Some(dir) = self.task_dir(task_id) else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
-        let mut turns: Vec<cap_memory::turn_index::TurnEntry> = index
+        let turns: Vec<cap_memory::turn_index::TurnEntry> = index
             .turns
             .into_iter()
             .filter(|t| t.task_id == task_id && self.agent_matches(&t.agent_id))
             .collect();
-        let recent = turns.split_off(turns.len().saturating_sub(count));
+        let recent = pick(turns);
         let wanted: std::collections::BTreeSet<u32> = recent.iter().map(|t| t.turn).collect();
         let mut lines = cap_memory::turn_log::read_turns_from_tail(
             &dir.join(advance_shared_types::turn_log::TURN_LOG_FILENAME),
             &wanted,
             MAX_RECENT_LOG_BYTES,
         );
-        Ok(recent
+        recent
             .into_iter()
             .map(|t| {
                 let expected = match t.log_offset {
@@ -1631,7 +1948,7 @@ impl advance_context_engine::RecentTurnsReader for CapMemoryHistoryReader {
                     marks,
                 }
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -2074,17 +2391,6 @@ fn real_unified_search(aliases: &[String]) -> Arc<dyn UnifiedSearchPort> {
     Arc::new(RankingUnifiedSearch::new(corpora))
 }
 
-/// Real `TaskIndexPort`, alias-keyed. **Empty rows this slice** (see
-/// [`real_unified_search`]) → byte-identical-behavior to [`StubTaskIndex`]
-/// (router degrades to `NewTask`).
-fn real_task_index(aliases: &[String]) -> Arc<dyn TaskIndexPort> {
-    let mut rows: HashMap<String, Vec<IndexedTask>> = HashMap::new();
-    for alias in aliases {
-        rows.insert(alias.clone(), Vec::new());
-    }
-    Arc::new(CosineTaskIndex::new(rows))
-}
-
 /// The agent-level composition entry both production (`start.rs`) and the
 /// system-acceptance harness call. When `memory` is `Some` (the agent declared
 /// the memory capability — the gate is the store's presence, owned by the single
@@ -2382,6 +2688,10 @@ pub fn build_context_assembler_for_agent_production(
             // inbound turn) resolves to the agent's default partition — the SAME
             // `_agent-{write_id}` Step 7 writes under — so the history a turn
             // produced is read back by the next.
+            // Recall reads the post-processor's index only with a live embedder
+            // (below); with it, the task's earlier turns are the ones the message
+            // recalls.
+            let mut history_reader: Option<Arc<CapMemoryHistoryReader>> = None;
             let (l2, l3, l4, recent): (
                 Arc<dyn L2DigestReader>,
                 Arc<dyn L3EpochReader>,
@@ -2393,6 +2703,14 @@ pub fn build_context_assembler_for_agent_production(
                         CapMemoryHistoryReader::new(root.to_path_buf(), query_aliases.to_vec())
                             .with_default_task_partition(write_agent_id),
                     );
+                    history_reader = Some(reader.clone());
+                    // PRD §11.3.5: with recall live, the task's earlier turns are its
+                    // semantic and keyword candidates reranked by retention (the
+                    // recall port's `search_task_turns`). The L2 reader's pick by
+                    // retention alone is the fallback: an agent without recall has
+                    // only it, and the assembler keeps it for a turn whose search
+                    // has no usable query vector or finds no turn beyond the recent
+                    // window.
                     (reader.clone(), reader.clone(), reader.clone(), Some(reader))
                 }
                 None => (
@@ -2405,12 +2723,19 @@ pub fn build_context_assembler_for_agent_production(
             // Recall + task routing read the post-processor's SQLite index when
             // the daemon shares it AND a live embedder exists (otherwise the
             // query vector could never match the stored ones); else the
-            // empty-corpus ports (byte-identical-behaviour to the stubs).
+            // empty-corpus search, and a task index that holds no task: routing
+            // does not settle there, and the agent has no current task, so its
+            // turns stay in its default partition.
             let (unified_search, task_index): (Arc<dyn UnifiedSearchPort>, Arc<dyn TaskIndexPort>) =
                 match (&sqlite_index, embedding_live) {
                     (Some(idx), true) => {
                         let recall =
                             SqliteIndexRecall::new(idx.clone(), write_agent_id, query_aliases);
+                        // The turns it finds are scored from their tasks' indexes.
+                        let recall = match &history_reader {
+                            Some(history) => recall.with_task_history(history.clone()),
+                            None => recall,
+                        };
                         // Stored vectors are compared only with a query of the
                         // SAME model (the agent's model follows its chat provider
                         // and can change under a long-lived index): the model of
@@ -2423,7 +2748,7 @@ pub fn build_context_assembler_for_agent_production(
                     }
                     _ => (
                         real_unified_search(query_aliases),
-                        real_task_index(query_aliases),
+                        Arc::new(StubTaskIndex) as Arc<dyn TaskIndexPort>,
                     ),
                 };
             let built = build_impl_with_all_ports(
@@ -2457,7 +2782,9 @@ pub fn build_context_assembler_for_agent_production(
         // No-memory path: the all-stub data ports (byte-identical to
         // `build_context_assembler`'s port set), PLUS the (real-or-stub)
         // skill_summary so a skills-but-no-memory agent still surfaces skills.
-        // The live embedder is kept so task routing still runs (no index → NewTask).
+        // The live embedder is kept, but these ports leave its vector unused: the
+        // task index answers an error, so routing does not settle and, with no
+        // current task, the agent's turns stay in its default partition.
         None => build_impl_with_all_ports(
             event_bus,
             callable_inventory,
@@ -2962,14 +3289,14 @@ mod tests {
         assert_eq!(turn_ids(&res), vec!["t#turn-1"]);
 
         // A vector of unknown model is compared with NOTHING — not with the rows
-        // of a known model, and not with the rows that record none.
+        // of a known model, and not with the rows that record none. Routing cannot
+        // settle then: the agent has task briefs, none of them comparable.
         let res = recall.search("root", "q", &[3.0, 0.0]).await.unwrap();
         assert!(res.turns.is_empty() && res.tasks.is_empty(), "{res:?}");
         assert!(recall
             .top_n_by_similarity("root", &[3.0, 0.0], 5)
             .await
-            .unwrap()
-            .is_empty());
+            .is_err());
         assert!(recall.lookup("root", &[3.0, 0.0]).await.unwrap().is_empty());
 
         // With no model binding at all (a harness index), only the rows that
@@ -3450,9 +3777,11 @@ mod tests {
         );
     }
 
-    /// The unified-search + task-index adapters are real impls but fed an EMPTY
-    /// corpus this slice → byte-identical-behavior to the stubs (empty result /
-    /// no task hit → router degrades to NewTask). Hermetic: no embedding needed.
+    /// The unified-search adapter is a real impl fed an EMPTY corpus this slice →
+    /// byte-identical-behavior to the stub (an empty result). Without the shared index,
+    /// the task index holds no task: routing does not settle (an error), and there is no
+    /// current task, so the turn stays in the default partition. Hermetic: no embedding
+    /// needed.
     #[tokio::test]
     async fn corpus_ports_inert_this_slice() {
         let aliases = vec!["agent:a".to_string(), "root".to_string()];
@@ -3468,12 +3797,12 @@ mod tests {
             "empty corpus → empty source-separated result (inert, ready for a future index slice)"
         );
 
-        let tasks = real_task_index(&aliases);
-        let hits = tasks.top_n_by_similarity("agent:a", &q, 5).await.unwrap();
+        let tasks = StubTaskIndex;
         assert!(
-            hits.is_empty(),
-            "empty task rows → no hits → router → NewTask"
+            tasks.top_n_by_similarity("agent:a", &q, 5).await.is_err(),
+            "no task index → routing does not settle"
         );
+        assert_eq!(tasks.current_task("agent:a").await.unwrap(), None);
     }
 
     /// Wave-16 Lane 2 — `build_recall_unified_search` POPULATES the corpus from
@@ -3798,5 +4127,448 @@ task_syntheses:
             all.len() >= 2,
             "empty task_id returns every synthesis: {all:?}"
         );
+    }
+
+    /// `task`'s turn index, at `<root>/<task>/turn-index.yaml`.
+    fn write_turn_index(root: &std::path::Path, task: &str, turns: Vec<TurnEntry>) {
+        let index = TurnIndex {
+            meta: TurnIndexMeta {
+                last_epoch_turn: 0,
+                last_epoch_at: String::new(),
+            },
+            turns,
+            epochs: vec![],
+        };
+        let dir = root.join(task);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("turn-index.yaml"),
+            serde_yml::to_string(&index).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// PRD §11.3.1 ("task_id != 当前 task"): recall leaves the turn's own task
+    /// out BEFORE it cuts its lists. Six turns of the current task are the most similar to the
+    /// query; the default partition's turn and another task's turn still make the list, and
+    /// three other tasks' briefs fill the related tasks. A turn in no task runs in the default
+    /// partition, which is left out the same way; the plain search leaves nothing out.
+    #[tokio::test]
+    async fn sqlite_index_recall_leaves_the_turns_own_task_out_before_it_cuts() {
+        use advance_context_engine::UnifiedSearchPort as _;
+        let idx = Arc::new(InMemorySqliteIndex::default());
+        for n in 1..=6 {
+            idx.upsert_turn(turn_row(
+                "task-a",
+                n,
+                &format!("a{n}"),
+                &[1.0, 0.0],
+                &format!("2026-11-22T00:00:0{n}Z"),
+            ));
+        }
+        idx.upsert_turn(turn_row(
+            "task-b",
+            1,
+            "b1",
+            &[0.9, 0.1],
+            "2026-11-22T00:00:07Z",
+        ));
+        idx.upsert_turn(turn_row(
+            "_agent-root",
+            1,
+            "a turn no task was settled for",
+            &[1.0, 0.0],
+            "2026-11-22T00:00:08Z",
+        ));
+        for (task, x) in [
+            ("task-a", 1.0),
+            ("task-b", 0.95),
+            ("task-c", 0.9),
+            ("task-d", 0.85),
+        ] {
+            idx.upsert_task(task_row(
+                task,
+                &format!("brief {task}"),
+                &[x, 1.0 - x],
+                None,
+            ));
+        }
+        // The default partition is no related task, however close its brief.
+        idx.upsert_task(task_row(
+            "_agent-root",
+            "its latest digest",
+            &[1.0, 0.0],
+            None,
+        ));
+        let aliases = vec!["root".to_string()];
+        let recall = SqliteIndexRecall::new(idx, "root", &aliases);
+        let ids = |res: &UnifiedSearchResult| {
+            (
+                res.turns.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+                res.tasks
+                    .iter()
+                    .map(|t| t.task_id.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let res = recall
+            .search_other_tasks("root", "q", &[1.0, 0.0], Some("task-a"))
+            .await
+            .unwrap();
+        let (turns, tasks) = ids(&res);
+        assert_eq!(turns, vec!["_agent-root#turn-1", "task-b#turn-1"]);
+        assert_eq!(res.turns[1].turn, Some(1));
+        assert_eq!(tasks, vec!["task-b", "task-c", "task-d"]);
+
+        let res = recall
+            .search_other_tasks("root", "q", &[1.0, 0.0], None)
+            .await
+            .unwrap();
+        let (turns, tasks) = ids(&res);
+        assert_eq!(
+            turns,
+            vec![
+                "task-a#turn-6",
+                "task-a#turn-5",
+                "task-a#turn-4",
+                "task-a#turn-3",
+                "task-a#turn-2"
+            ]
+        );
+        assert_eq!(tasks, vec!["task-a", "task-b", "task-c"]);
+
+        let res = recall.search("root", "q", &[1.0, 0.0]).await.unwrap();
+        let (turns, _) = ids(&res);
+        assert_eq!(
+            turns,
+            vec![
+                "_agent-root#turn-1",
+                "task-a#turn-6",
+                "task-a#turn-5",
+                "task-a#turn-4",
+                "task-a#turn-3"
+            ]
+        );
+    }
+
+    /// The current task is the agent's task with the latest `last_turn_at`: not a default
+    /// partition, not an `auto:` task, not another agent's. An agent with no task has none,
+    /// and so has one the port does not serve.
+    #[tokio::test]
+    async fn sqlite_index_recall_names_the_task_of_the_agents_latest_turn() {
+        let idx = Arc::new(InMemorySqliteIndex::default());
+        let aliases = vec!["root".to_string()];
+        let recall = SqliteIndexRecall::new(idx.clone(), "root", &aliases);
+        assert_eq!(recall.current_task("root").await.unwrap(), None);
+        let at = |task: &str, agent: &str, time: &str| TaskIndexRow {
+            agent_id: agent.into(),
+            last_turn_at: time.into(),
+            ..task_row(task, "a brief", &[1.0, 0.0], None)
+        };
+        idx.upsert_task(at("task-a", "root", "2026-11-22T10:00:00Z"));
+        idx.upsert_task(at("task-b", "root", "2026-11-22T10:05:00Z"));
+        idx.upsert_task(at("task-c", "root", "2026-11-22T09:00:00Z"));
+        // Later, but none a turn runs in by default: a default partition, an auto task,
+        // a row whose time does not parse, another agent's task.
+        idx.upsert_task(at("_agent-root", "root", "2026-11-22T11:00:00Z"));
+        idx.upsert_task(at("auto:root", "root", "2026-11-22T11:00:00Z"));
+        idx.upsert_task(at("task-d", "root", "not a time"));
+        idx.upsert_task(at("task-other", "child", "2026-11-22T12:00:00Z"));
+        assert_eq!(
+            recall.current_task("root").await.unwrap().as_deref(),
+            Some("task-b")
+        );
+        assert_eq!(recall.current_task("stranger").await.unwrap(), None);
+    }
+
+    /// After the agent's embedding model changes, its task briefs are of the old model
+    /// until the upkeep re-embeds them: routing cannot settle (an error, so the turn runs
+    /// in the current task) rather than finding no task and minting one. An agent with no
+    /// task brief vector routes as before: nothing to compare, so a new task. A default
+    /// partition's or an `auto:` task's brief does not count.
+    #[tokio::test]
+    async fn sqlite_index_recall_cannot_route_without_a_brief_of_the_query_model() {
+        let idx = Arc::new(InMemorySqliteIndex::default());
+        let source: QueryVectorModel = Arc::new(|vector: &[f32]| match vector {
+            [x, _] if *x == 1.0 => Some("embed-old".to_string()),
+            [x, _] if *x == 2.0 => Some("embed-new".to_string()),
+            _ => None,
+        });
+        let aliases = vec!["root".to_string()];
+        let recall = SqliteIndexRecall::new(idx.clone(), "root", &aliases).with_query_model(source);
+        let new_query = [2.0, 0.0];
+
+        // No task yet, or only briefs routing never enters: no candidate, no error.
+        assert!(recall
+            .top_n_by_similarity("root", &new_query, 5)
+            .await
+            .unwrap()
+            .is_empty());
+        idx.upsert_task(task_row("_agent-root", "b", &[1.0, 0.0], Some("embed-old")));
+        idx.upsert_task(task_row("auto:root", "b", &[1.0, 0.0], Some("embed-old")));
+        let mut no_vector = task_row("task-blank", "b", &[1.0, 0.0], None);
+        no_vector.brief_embedding = None;
+        idx.upsert_task(no_vector);
+        assert!(recall
+            .top_n_by_similarity("root", &new_query, 5)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // A task whose brief is of the old model: no comparable brief.
+        idx.upsert_task(task_row(
+            "task-a",
+            "brief a",
+            &[1.0, 0.0],
+            Some("embed-old"),
+        ));
+        assert!(recall
+            .top_n_by_similarity("root", &new_query, 5)
+            .await
+            .is_err());
+        // The old model's queries still compare with it.
+        let old = recall
+            .top_n_by_similarity("root", &[1.0, 0.0], 5)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = old.iter().map(|hit| hit.task_id.as_str()).collect();
+        assert_eq!(ids, ["auto:root", "task-a"]);
+
+        // An `auto:` task re-embedded first is no comparable brief: routing never enters it.
+        idx.upsert_task(task_row("auto:root", "b", &[1.0, 0.0], Some("embed-new")));
+        assert!(recall
+            .top_n_by_similarity("root", &new_query, 5)
+            .await
+            .is_err());
+
+        // Once one brief is of the new model, routing compares with it again.
+        idx.upsert_task(task_row(
+            "task-b",
+            "brief b",
+            &[1.0, 0.0],
+            Some("embed-new"),
+        ));
+        let new = recall
+            .top_n_by_similarity("root", &new_query, 5)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = new.iter().map(|hit| hit.task_id.as_str()).collect();
+        assert_eq!(ids, ["auto:root", "task-b"]);
+    }
+
+    /// PRD §11.3.5 "再用 retention_score rerank": with the tasks' turn indexes, every turn recall
+    /// finds is scored by the retention formula from what its task's index records of it — a
+    /// critical, corrected, often referenced turn well above a plain old one — and a turn its
+    /// task's index does not hold stays unscored, as does every turn without the indexes.
+    #[tokio::test]
+    async fn sqlite_index_recall_scores_the_turns_it_finds_by_retention() {
+        use advance_context_engine::UnifiedSearchPort as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut key = entry("task-b", 1, "b1", "2026-11-22T00:00:00Z");
+        key.importance = Importance::Critical;
+        key.has_user_correction = true;
+        key.reference_count = 12;
+        let plain = entry("task-b", 2, "b2", "2026-01-01T00:00:00Z");
+        write_turn_index(tmp.path(), "task-b", vec![key, plain]);
+
+        let idx = Arc::new(InMemorySqliteIndex::default());
+        idx.upsert_turn(turn_row(
+            "task-b",
+            1,
+            "b1",
+            &[1.0, 0.0],
+            "2026-11-22T00:00:01Z",
+        ));
+        idx.upsert_turn(turn_row(
+            "task-b",
+            2,
+            "b2",
+            &[1.0, 0.0],
+            "2026-11-22T00:00:02Z",
+        ));
+        idx.upsert_turn(turn_row(
+            "task-c",
+            1,
+            "c1",
+            &[1.0, 0.0],
+            "2026-11-22T00:00:03Z",
+        ));
+        let aliases = vec!["root".to_string()];
+        let history = Arc::new(CapMemoryHistoryReader::new(
+            tmp.path().to_path_buf(),
+            aliases.clone(),
+        ));
+        let recall =
+            SqliteIndexRecall::new(idx.clone(), "root", &aliases).with_task_history(history);
+        let res = recall
+            .search_other_tasks("root", "q", &[1.0, 0.0], Some("task-a"))
+            .await
+            .unwrap();
+        let score = |id: &str| {
+            res.turns
+                .iter()
+                .find(|t| t.id == id)
+                .and_then(|t| t.retention)
+        };
+        let key = score("task-b#turn-1").expect("scored");
+        let plain = score("task-b#turn-2").expect("scored");
+        assert!(key > plain, "{key} {plain}");
+        assert!(key >= 0.5, "a key turn may load whole: {key}");
+        assert_eq!(score("task-c#turn-1"), None, "task-c keeps no index");
+
+        let bare = SqliteIndexRecall::new(idx, "root", &aliases);
+        let res = bare.search("root", "q", &[1.0, 0.0]).await.unwrap();
+        assert_eq!(res.turns.len(), 3);
+        assert!(res.turns.iter().all(|t| t.retention.is_none()));
+    }
+
+    /// PRD §11.3.5 "同 Task 较早历史": a task's turns are searched two ways — the most similar to
+    /// the query vector (rows of the query's model only) and the ones sharing the query's
+    /// keywords, a keyword weighing less the more of the task's digests carry it — and only
+    /// that task's rows come. An empty task id is the agent's default partition; an unknown
+    /// agent searches nothing.
+    #[tokio::test]
+    async fn sqlite_index_recall_searches_a_tasks_turns_by_meaning_and_by_keyword() {
+        use advance_context_engine::UnifiedSearchPort as _;
+        let idx = Arc::new(InMemorySqliteIndex::default());
+        let rows = [
+            ("task-a", 1, "chose a launch date", [1.0, 0.0], "embed-a"),
+            (
+                "task-a",
+                2,
+                "the pricing tiers are final",
+                [0.0, 1.0],
+                "embed-a",
+            ),
+            ("task-a", 3, "lunch order", [0.0, 1.0], "embed-a"),
+            ("task-a", 4, "an old vector", [1.0, 0.0], "embed-b"),
+            ("task-b", 1, "pricing elsewhere", [1.0, 0.0], "embed-a"),
+            (
+                "_agent-root",
+                1,
+                "pricing by default",
+                [1.0, 0.0],
+                "embed-a",
+            ),
+        ];
+        for (task, turn, digest, vector, model) in rows {
+            let mut row = turn_row(task, turn, digest, &vector, "2026-11-22T00:00:00Z");
+            row.embedding_model = Some(model.into());
+            idx.upsert_turn(row);
+        }
+        let source: QueryVectorModel = Arc::new(|_: &[f32]| Some("embed-a".to_string()));
+        let aliases = vec!["root".to_string(), "agent:root".to_string()];
+        let recall = SqliteIndexRecall::new(idx, "root", &aliases).with_query_model(source);
+        let found = |hits: Option<Vec<TurnHit>>| -> Vec<(String, u64)> {
+            hits.expect("the port searches a task's turns")
+                .into_iter()
+                .map(|h| (h.task_id, h.turn.expect("a turn number")))
+                .collect()
+        };
+        let a = |turn: u64| ("task-a".to_string(), turn);
+
+        // One of each half: turn 1 is the most similar (turn 4 is as close, but of another
+        // model), turn 2 shares the rarest words ("pricing", "the").
+        let hits = recall
+            .search_task_turns(
+                "agent:root",
+                "task-a",
+                "the pricing for the launch",
+                &[1.0, 0.0],
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(found(hits.clone()), vec![a(1), a(2)]);
+        let hits = hits.unwrap();
+        assert_eq!(
+            hits[1].snippet.as_deref(),
+            Some("the pricing tiers are final")
+        );
+        assert_eq!(hits[1].id, "task-a#turn-2");
+
+        // Without a query vector, the keyword half alone — and it reads every row of the task,
+        // whatever model its vector is of.
+        let hits = recall
+            .search_task_turns("root", "task-a", "an old pricing", &[], 5)
+            .await
+            .unwrap();
+        assert_eq!(found(hits), vec![a(4), a(2)]);
+
+        // An empty task id: the default partition. A keyword every digest of the task carries
+        // weighs nothing.
+        let hits = recall
+            .search_task_turns("root", "", "pricing", &[1.0, 0.0], 5)
+            .await
+            .unwrap();
+        assert_eq!(found(hits), vec![("_agent-root".to_string(), 1)]);
+        let hits = recall
+            .search_task_turns("root", "", "pricing", &[], 5)
+            .await
+            .unwrap();
+        assert!(found(hits).is_empty());
+
+        // An unknown agent, or no candidates wanted: nothing.
+        let hits = recall
+            .search_task_turns("agent:other", "task-a", "pricing", &[1.0, 0.0], 5)
+            .await
+            .unwrap();
+        assert!(found(hits).is_empty());
+        let hits = recall
+            .search_task_turns("root", "task-a", "pricing", &[1.0, 0.0], 0)
+            .await
+            .unwrap();
+        assert!(found(hits).is_empty());
+    }
+
+    /// ⑯ beyond the recent window reads a task's turns by their numbers, each whole as the
+    /// window's turns are read; a number the index does not hold, or an unsafe task id,
+    /// reads nothing.
+    #[tokio::test]
+    async fn the_history_reader_reads_turns_by_their_numbers() {
+        use advance_context_engine::RecentTurnsReader as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(advance_shared_types::turn_log::TURN_LOG_FILENAME),
+            concat!(
+                "{\"turn\":1,\"seq\":0,\"ts\":\"t\",\"role\":\"user\",\"content\":\"one\"}\n",
+                "{\"turn\":1,\"seq\":1,\"ts\":\"t\",\"role\":\"assistant\",\"content\":\"done one\"}\n",
+                "{\"turn\":2,\"seq\":0,\"ts\":\"t\",\"role\":\"user\",\"content\":\"two\"}\n",
+                "{\"turn\":2,\"seq\":1,\"ts\":\"t\",\"role\":\"assistant\",\"content\":\"done two\"}\n",
+                "{\"turn\":3,\"seq\":0,\"ts\":\"t\",\"role\":\"user\",\"content\":\"three\"}\n",
+                "{\"turn\":3,\"seq\":1,\"ts\":\"t\",\"role\":\"assistant\",\"content\":\"done three\"}\n",
+            ),
+        )
+        .unwrap();
+        let turns = (1..=3u32)
+            .map(|n| {
+                let mut e = entry("t1", n, &format!("turn {n}"), "2026-11-22T10:00:00Z");
+                e.log_offset = LogOffset {
+                    start_line: 2 * n - 1,
+                    end_line: 2 * n,
+                };
+                e
+            })
+            .collect();
+        write_turn_index(tmp.path(), "t1", turns);
+        let reader =
+            CapMemoryHistoryReader::new(tmp.path().to_path_buf(), vec!["root".to_string()]);
+        let read = reader.read_turns("root", "t1", &[3, 1]).await.unwrap();
+        let got: Vec<(u64, usize)> = read.iter().map(|t| (t.turn_id, t.messages.len())).collect();
+        assert_eq!(got, [(1, 2), (3, 2)]);
+        assert_eq!(read[1].messages[1].content, "done three");
+        assert!(reader
+            .read_turns("root", "t1", &[9])
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(reader
+            .read_turns("root", "../t1", &[1])
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

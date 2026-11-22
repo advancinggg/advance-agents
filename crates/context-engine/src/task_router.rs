@@ -201,14 +201,18 @@ impl TaskRouter {
             if tied.len() >= 2 {
                 // Residual tie (equal/all-None last_turn_at) → light-LLM.
                 let ids: Vec<String> = tied.iter().map(|h| h.task_id.clone()).collect();
-                let picked = self
-                    .light_llm
-                    .pick_one(query, &ids)
-                    .await
-                    .map_err(|e| ContextError::Fallback(e.0))?;
+                // The decision binds the turn to a task, so an answer that is not one
+                // of the tied candidates is not taken: the first of them is. A failed
+                // call takes the first of them too, as the search ranks them: every
+                // one matched the message.
+                let (picked, method) = match self.light_llm.pick_one(query, &ids).await {
+                    Ok(picked) if ids.contains(&picked) => (picked, ROUTING_METHOD_LLM),
+                    Ok(_) => (ids[0].clone(), ROUTING_METHOD_LLM),
+                    Err(_) => (ids[0].clone(), ROUTING_METHOD_SEARCH),
+                };
                 return Ok(TaskRoutingOutcome {
                     decision: TaskRoutingDecision::Existing(picked),
-                    method: ROUTING_METHOD_LLM,
+                    method,
                     confidence: clamp_unit(top),
                 });
             }
@@ -226,6 +230,11 @@ pub const ROUTING_METHOD_SEARCH: &str = "search";
 /// `AssemblyResult.routing_method` value when the residual tie was broken by
 /// the light-LLM fallback.
 pub const ROUTING_METHOD_LLM: &str = "llm";
+/// `AssemblyResult.routing_method` value when the turn runs in the agent's current
+/// task because routing could not settle one (MODULE-010 §1.4.2): a blank prompt, no
+/// usable query embedding, a routing failure (no task brief of the query's embedding
+/// model among them).
+pub const ROUTING_METHOD_CURRENT: &str = "current";
 
 /// The detailed routing outcome: the decision plus the telemetry behind it.
 #[derive(Clone, Debug, PartialEq)]

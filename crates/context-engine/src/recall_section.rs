@@ -1,22 +1,24 @@
-//! Wave-13 Lane C — the omit-when-empty recall renderer (MODULE-010 §3.8
-//! Wave-13 Lane C). Renders a [`UnifiedSearchResult`] into a single Tier-3
-//! `# Recalled Context` section, boundary-marked exactly like the SAT-E
-//! untrusted-digest precedent (`assembler::render_multilevel_digest`).
+//! Wave-13 Lane C — the omit-when-empty recall renderers (MODULE-010 §3.8
+//! Wave-13 Lane C), split by where PRD §11.3.2 puts each source:
 //!
-//! **Omit-when-empty**: returns `None` when all 4 result vecs are empty, so the
-//! caller emits NO message and the assembled output for the no-recall path is
-//! byte-identical (the flip-zero linchpin; same convention as `tier2_skills` /
+//! - ⑮ `# Recalled Context` ([`format_recall_section`]): the contents and
+//!   memories recall found;
+//! - ⑭ `# Related Task Briefs` ([`format_related_task_briefs`]): the briefs of
+//!   other tasks the message resembles (§11.3.1 L5);
+//! - ⑯ the lines of `# Related Turns` ([`related_turn_lines`]): other tasks'
+//!   turns, which the assembler sets in Tier 3 with the ones it loads whole.
+//!
+//! **Omit-when-empty**: a section with nothing to show is `None`, so the caller
+//! emits NO message (the flip-zero linchpin; same convention as `tier2_skills` /
 //! `tier2_decomposition`). Recalled ids are producer-derived but routed through
 //! the shared Trojan-Source [`sanitize_description`] + a module-local byte-cap as
-//! defense-in-depth, and the whole section body is wrapped via the canonical
-//! CONTRACT-114 [`layer2_wrap`] (`TrustLevel::Untrusted`) — so the §3.6
-//! Layer-2-marking sub-clause is genuinely closed and future text-snippet
-//! enrichment inherits a hardened envelope.
+//! defense-in-depth, and every body is wrapped via the canonical CONTRACT-114
+//! [`layer2_wrap`] (`TrustLevel::Untrusted`).
 
 use advance_shared_types::security_validator::{PromptInjectionHelpers, TrustLevel};
 
 use crate::boundary_marker::layer2_wrap;
-use crate::ports::UnifiedSearchResult;
+use crate::ports::{TaskHit, TurnHit, UnifiedSearchResult};
 use crate::tier2::{neutralize_cache_breakpoint_markers, sanitize_description};
 
 /// Per-field byte cap before sanitization (defense-in-depth; mirrors
@@ -32,8 +34,22 @@ const MAX_SNIPPET_LEN: usize = 320;
 /// CONTRACT-114 boundary `source` tag for the recall section.
 const RECALL_SOURCE: &str = "memory:recall";
 
-/// Render the unified-search recall hits into a single Tier-3 `# Recalled
-/// Context` section, or `None` when there are no hits (omit-when-empty →
+/// CONTRACT-114 boundary `source` tag for the related task briefs.
+const RELATED_TASK_BRIEFS_SOURCE: &str = "memory:related_task_briefs";
+
+/// PRD §11.3.1 `RELATED_TASK_MIN_THRESHOLD`: a task's brief is shown as related
+/// only from this similarity up ("防止弱查询噪音").
+pub const RELATED_TASK_MIN_THRESHOLD: f32 = 0.3;
+
+/// PRD §11.3.1 L5: at most this many related task briefs.
+pub const MAX_RELATED_TASK_BRIEFS: usize = 3;
+
+/// The heading of the ⑭ related task briefs section.
+pub(crate) const RELATED_TASK_BRIEFS_HEADER: &str =
+    "# Related Task Briefs\nOther tasks of this agent the message resembles, with what each is about.";
+
+/// ⑮ (PRD §11.3.2): the contents and memories recall found, in one `# Recalled
+/// Context` section, or `None` when there are none (omit-when-empty →
 /// byte-identical empty-state). Each id is byte-capped + `sanitize_description`'d;
 /// the whole body is `layer2_wrap`'d (Untrusted) + cache-breakpoint-neutralized
 /// (so the envelope is present only when a content-bearing `helpers` is
@@ -42,14 +58,9 @@ pub(crate) fn format_recall_section(
     result: &UnifiedSearchResult,
     helpers: &dyn PromptInjectionHelpers,
 ) -> Option<String> {
-    if result.tasks.is_empty()
-        && result.turns.is_empty()
-        && result.contents.is_empty()
-        && result.memories.is_empty()
-    {
+    if result.contents.is_empty() && result.memories.is_empty() {
         return None;
     }
-
     let mut body = String::from("# Recalled Context\n\n");
     if !result.contents.is_empty() {
         body.push_str("## Files\n");
@@ -63,28 +74,61 @@ pub(crate) fn format_recall_section(
             body.push_str(&line(&h.id, h.adjusted_score, h.snippet.as_deref()));
         }
     }
-    if !result.tasks.is_empty() {
-        body.push_str("## Related Tasks\n");
-        for h in &result.tasks {
-            body.push_str(&line(&h.task_id, h.similarity, h.snippet.as_deref()));
-        }
-    }
-    if !result.turns.is_empty() {
-        body.push_str("## Related Turns\n");
-        for h in &result.turns {
-            body.push_str(&line(&h.id, h.similarity, h.snippet.as_deref()));
-        }
-    }
-
     // Boundary-mark the whole untrusted body (CONTRACT-114), then preserve the
     // cache-breakpoint defense — exact SAT-E `render_multilevel_digest` precedent.
-    let wrapped = neutralize_cache_breakpoint_markers(&layer2_wrap(
-        &body,
-        RECALL_SOURCE,
-        TrustLevel::Untrusted,
-        helpers,
-    ));
-    Some(wrapped)
+    Some(wrap(&body, RECALL_SOURCE, helpers))
+}
+
+/// ⑭ L5 (PRD §11.3.1): of `tasks` (other tasks than the turn's own: the coordinator
+/// drops it), the up to [`MAX_RELATED_TASK_BRIEFS`] whose similarity to the message
+/// is at least [`RELATED_TASK_MIN_THRESHOLD`], in the order recall ranked them. A task
+/// with no brief has nothing to show and takes no place.
+pub(crate) fn related_task_briefs(tasks: &[TaskHit]) -> Vec<&TaskHit> {
+    tasks
+        .iter()
+        .filter(|t| t.similarity.is_finite() && t.similarity >= RELATED_TASK_MIN_THRESHOLD)
+        .filter(|t| {
+            t.snippet
+                .as_deref()
+                .is_some_and(|brief| !brief.trim().is_empty())
+        })
+        .take(MAX_RELATED_TASK_BRIEFS)
+        .collect()
+}
+
+/// ⑭ L5: the `# Related Task Briefs` section of `briefs` ([`related_task_briefs`]), or
+/// `None` when there are none.
+pub(crate) fn format_related_task_briefs(
+    briefs: &[&TaskHit],
+    helpers: &dyn PromptInjectionHelpers,
+) -> Option<String> {
+    let lines: String = briefs
+        .iter()
+        .map(|t| line(&t.task_id, t.similarity, t.snippet.as_deref()))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{RELATED_TASK_BRIEFS_HEADER}\n{}",
+        wrap(&lines, RELATED_TASK_BRIEFS_SOURCE, helpers)
+    ))
+}
+
+/// ⑯ (PRD §11.3.5 "跨 Task 历史"): one line per turn of another task loaded as its
+/// digest — `- {task}#turn-{n} ({similarity:.3}) — {digest}` — for the assembler to
+/// wrap with the turns it loads whole.
+pub(crate) fn related_turn_lines(turns: &[&TurnHit]) -> String {
+    turns
+        .iter()
+        .map(|h| line(&h.id, h.similarity, h.snippet.as_deref()))
+        .collect()
+}
+
+/// `body` boundary-marked as untrusted (CONTRACT-114) from `source`, with the
+/// cache-breakpoint defense.
+fn wrap(body: &str, source: &str, helpers: &dyn PromptInjectionHelpers) -> String {
+    neutralize_cache_breakpoint_markers(&layer2_wrap(body, source, TrustLevel::Untrusted, helpers))
 }
 
 /// One recall line: `- {id} ({score:.3})`, plus ` — {snippet}` when the
@@ -145,27 +189,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn empty_returns_none() {
-        assert!(format_recall_section(&UnifiedSearchResult::default(), &FakeWrapHelper).is_none());
+    fn turn(id: &str, task: &str, similarity: f32, snippet: Option<&str>) -> TurnHit {
+        TurnHit {
+            id: id.into(),
+            task_id: task.into(),
+            similarity,
+            timestamp: SystemTime::UNIX_EPOCH,
+            snippet: snippet.map(str::to_string),
+            turn: None,
+            retention: None,
+        }
+    }
+
+    fn task(id: &str, similarity: f32, brief: Option<&str>) -> TaskHit {
+        TaskHit {
+            task_id: id.into(),
+            similarity,
+            last_turn_at: None,
+            snippet: brief.map(str::to_string),
+        }
     }
 
     #[test]
-    fn renders_all_four_arms_inside_untrusted_envelope() {
+    fn empty_returns_none() {
+        assert!(format_recall_section(&UnifiedSearchResult::default(), &FakeWrapHelper).is_none());
+        // Tasks and turns have sections of their own (⑭, ⑯): ⑮ shows neither.
+        let elsewhere = UnifiedSearchResult {
+            tasks: vec![task("task-1", 0.9, Some("a brief"))],
+            turns: vec![turn("task-9#turn-1", "task-9", 0.8, Some("a digest"))],
+            ..Default::default()
+        };
+        assert!(format_recall_section(&elsewhere, &FakeWrapHelper).is_none());
+    }
+
+    #[test]
+    fn renders_contents_and_memories_inside_untrusted_envelope() {
         let result = UnifiedSearchResult {
-            tasks: vec![TaskHit {
-                task_id: "task-1".into(),
-                similarity: 0.5,
-                last_turn_at: None,
-                snippet: None,
-            }],
-            turns: vec![TurnHit {
-                id: "turn-1".into(),
-                task_id: "task-9".into(),
-                similarity: 0.4,
-                timestamp: SystemTime::UNIX_EPOCH,
-                snippet: None,
-            }],
+            tasks: vec![task("task-1", 0.5, None)],
+            turns: vec![turn("turn-1", "task-9", 0.4, None)],
             contents: vec![ContentHit {
                 id: "file-1".into(),
                 adjusted_score: 0.91,
@@ -188,33 +249,28 @@ mod tests {
         assert!(s.contains("- file-1 (0.910)"));
         assert!(s.contains("## Memory"));
         assert!(s.contains("- mem-1 (0.880)"));
-        assert!(s.contains("## Related Tasks"));
-        assert!(s.contains("- task-1 (0.500)"));
-        assert!(s.contains("## Related Turns"));
-        assert!(s.contains("- turn-1 (0.400)"));
+        assert!(!s.contains("task-1"));
+        assert!(!s.contains("turn-1"));
     }
 
     #[test]
     fn renders_snippets_single_line_and_capped() {
         let result = UnifiedSearchResult {
-            turns: vec![TurnHit {
-                id: "turn-7".into(),
-                task_id: "t".into(),
-                similarity: 0.73,
-                timestamp: SystemTime::UNIX_EPOCH,
-                snippet: Some("deployed the\nservice".into()),
+            memories: vec![MemoryHit {
+                id: "mem-7".into(),
+                adjusted_score: 0.73,
+                snippet: Some("prefers the\nshort form".into()),
             }],
-            tasks: vec![TaskHit {
-                task_id: "task-2".into(),
-                similarity: 0.6,
-                last_turn_at: None,
+            contents: vec![ContentHit {
+                id: "file-2".into(),
+                adjusted_score: 0.6,
                 snippet: Some("x".repeat(MAX_SNIPPET_LEN + 40)),
             }],
             ..Default::default()
         };
         let s = format_recall_section(&result, &FakeWrapHelper).expect("Some");
         assert!(
-            s.contains("- turn-7 (0.730) — deployed the service"),
+            s.contains("- mem-7 (0.730) — prefers the short form"),
             "snippet is appended single-line: {s}"
         );
         assert!(!s.contains(&"x".repeat(MAX_SNIPPET_LEN + 1)));
@@ -260,7 +316,72 @@ mod tests {
         let s = format_recall_section(&result, &FakeWrapHelper).expect("Some");
         assert!(s.contains("## Memory"));
         assert!(!s.contains("## Files"));
-        assert!(!s.contains("## Related Tasks"));
-        assert!(!s.contains("## Related Turns"));
+    }
+
+    /// PRD §11.3.1 L5: at most three other tasks, from 0.3 up, each with its brief, in the
+    /// order recall ranked them; the heading is the runtime's, the briefs are wrapped.
+    #[test]
+    fn related_task_briefs_keep_three_tasks_from_the_threshold_up() {
+        let tasks = vec![
+            task("task-a", 0.81, Some("plans the spring garden")),
+            task("task-b", 0.62, None),
+            task("task-c", 0.55, Some("   ")),
+            task("task-d", 0.47, Some("orders seed packets")),
+            task("task-e", 0.30, Some("waters the\nseedlings")),
+            task("task-f", 0.29, Some("below the threshold")),
+            task("task-g", f32::NAN, Some("not a score")),
+        ];
+        let s = format_related_task_briefs(&related_task_briefs(&tasks), &FakeWrapHelper)
+            .expect("Some");
+        assert!(s.starts_with(RELATED_TASK_BRIEFS_HEADER), "{s}");
+        assert!(s.contains("[[WRAP src=memory:related_task_briefs trust=untrusted]]"));
+        assert!(s.contains("- task-a (0.810) — plans the spring garden\n"));
+        assert!(s.contains("- task-d (0.470) — orders seed packets\n"));
+        assert!(s.contains("- task-e (0.300) — waters the seedlings\n"));
+        for left_out in ["task-b", "task-c", "task-f", "task-g"] {
+            assert!(!s.contains(left_out), "{left_out}: {s}");
+        }
+        assert!(s.find("task-a") < s.find("task-d") && s.find("task-d") < s.find("task-e"));
+
+        let four = vec![
+            task("task-1", 0.9, Some("one")),
+            task("task-2", 0.8, Some("two")),
+            task("task-3", 0.7, Some("three")),
+            task("task-4", 0.6, Some("four")),
+        ];
+        let s =
+            format_related_task_briefs(&related_task_briefs(&four), &FakeWrapHelper).expect("Some");
+        assert!(s.contains("task-3") && !s.contains("task-4"), "{s}");
+
+        let none = vec![task("task-x", 0.2, Some("weak")), task("task-y", 0.9, None)];
+        assert!(format_related_task_briefs(&related_task_briefs(&none), &FakeWrapHelper).is_none());
+        assert!(format_related_task_briefs(&[], &FakeWrapHelper).is_none());
+    }
+
+    #[test]
+    fn related_turn_lines_are_single_line_and_capped() {
+        let a = turn(
+            "task-9#turn-7",
+            "task-9",
+            0.73,
+            Some("deployed the\nservice"),
+        );
+        let b = turn(
+            "task-8#turn-2",
+            "task-8",
+            0.41,
+            Some(&"y".repeat(MAX_SNIPPET_LEN + 9)),
+        );
+        let c = turn("task-7#turn-1", "task-7", 0.35, None);
+        let s = related_turn_lines(&[&a, &b, &c]);
+        assert!(
+            s.contains("- task-9#turn-7 (0.730) — deployed the service\n"),
+            "{s}"
+        );
+        assert!(
+            s.contains(&"y".repeat(MAX_SNIPPET_LEN))
+                && !s.contains(&"y".repeat(MAX_SNIPPET_LEN + 1))
+        );
+        assert!(s.ends_with("- task-7#turn-1 (0.350)\n"), "{s}");
     }
 }

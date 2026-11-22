@@ -139,6 +139,7 @@ impl ContextAssembler for ScriptedAssembler {
                 tier2: 0,
                 tier3: 0,
             },
+            task_id: None,
         })
     }
 

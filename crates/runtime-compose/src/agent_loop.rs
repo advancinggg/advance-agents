@@ -780,6 +780,7 @@ impl ContextAssembler for MinimalContextAssembler {
                 tier2: 0,
                 tier3: 0,
             },
+            task_id: None,
         })
     }
     fn inject_tier3_warning(&self, _agent_id: &str, _msg: &str) {}
@@ -828,9 +829,11 @@ impl PublishingContextAssembler {
 impl ContextAssembler for PublishingContextAssembler {
     async fn assemble(&self, ctx: AssemblyContext) -> Result<AssemblyResult, AssemblyError> {
         let result = self.inner.assemble(ctx).await?;
-        // Overwrite each turn (per-turn freshness). Cheap Arc<[..]> from the Vec.
+        // Overwrite each turn (per-turn freshness). Cheap Arc<[..]> from the Vec. The task
+        // the assembly settled goes with it: the turn's model calls are that task's.
         let msgs: Arc<[LlmMessage]> = Arc::from(result.messages.clone());
-        self.gateway.publish_assembled(&self.agent_id, msgs);
+        self.gateway
+            .publish_assembled_in_task(&self.agent_id, msgs, result.task_id.clone());
         Ok(result)
     }
 

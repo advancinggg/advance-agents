@@ -149,6 +149,29 @@ async fn t05b_residual_tie_invokes_llm_fallback() {
     assert_eq!(d, TaskRoutingDecision::Existing("task-y".into()));
 }
 
+/// The decision binds the turn to a task, so a light-model answer that names no
+/// tied candidate is not taken: the first of them is.
+#[tokio::test]
+async fn t05c_residual_tie_never_takes_a_task_that_was_not_offered() {
+    let same = SystemTime::UNIX_EPOCH + Duration::from_secs(42);
+    for answer in ["task-z", "", "task-x, task-y"] {
+        let r = router(
+            Embed(Ok(Q_EMB.to_vec())),
+            Index(vec![
+                hit("task-x", 0.86, Some(same)),
+                hit("task-y", 0.86, Some(same)),
+            ]),
+            Llm(answer.into()),
+        );
+        let d = r.route_task("agent-1", "q").await.unwrap();
+        assert_eq!(
+            d,
+            TaskRoutingDecision::Existing("task-x".into()),
+            "{answer:?}"
+        );
+    }
+}
+
 /// The ONLY legitimate NewTask path: no confident match (all below
 /// threshold) — NOT an error mask.
 #[tokio::test]
@@ -240,4 +263,29 @@ async fn t_router_embedfail_non_finite_hit_similarity_skipped() {
     );
     let d = r.route_task("agent-1", "q").await.unwrap();
     assert_eq!(d, TaskRoutingDecision::Existing("task-good".into()));
+}
+
+struct LlmDown;
+#[async_trait]
+impl LightLlmFallbackPort for LlmDown {
+    async fn pick_one(&self, _q: &str, _c: &[String]) -> Result<String, PortError> {
+        Err(PortError("light model down".into()))
+    }
+}
+
+/// A residual tie whose light-model call fails takes the first tied candidate, as the
+/// search ranks them, as an answer that names none of them does: every one matched.
+#[tokio::test]
+async fn a_failed_tie_break_takes_the_first_tied_candidate() {
+    let r = router(
+        Embed(Ok(Q_EMB.to_vec())),
+        Index(vec![hit("task-x", 0.86, None), hit("task-y", 0.85, None)]),
+        LlmDown,
+    );
+    let outcome = r.route_task_detailed("agent-1", "q").await.unwrap();
+    assert_eq!(
+        outcome.decision,
+        TaskRoutingDecision::Existing("task-x".into())
+    );
+    assert_eq!(outcome.method, "search");
 }

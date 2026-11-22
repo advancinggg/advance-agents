@@ -115,8 +115,19 @@ fn assembly_result_round_trip() {
             tier2: 10,
             tier3: 2,
         },
+        task_id: Some("task-20261121-3f9a1c2b".to_string()),
     };
     let json = serde_json::to_string(&r).unwrap();
     let back: AssemblyResult = serde_json::from_str(&json).unwrap();
     assert_eq!(back, r);
+}
+
+#[test]
+fn assembly_result_without_a_task_reads_and_writes_as_before() {
+    // A result in the default partition writes no `task_id`, and one written before the field
+    // existed still reads.
+    let before = r#"{"messages":[],"routing_method":"search","routing_confidence":0.0,"is_new_task":true,"tier_token_counts":{"tier1a":0,"tier1b":0,"tier2":0,"tier3":0}}"#;
+    let r: AssemblyResult = serde_json::from_str(before).unwrap();
+    assert_eq!(r.task_id, None);
+    assert_eq!(serde_json::to_string(&r).unwrap(), before);
 }

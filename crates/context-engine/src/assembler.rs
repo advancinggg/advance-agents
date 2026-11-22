@@ -30,17 +30,24 @@
 //! recall and the [`crate::task_router::TaskRouter`]. A blank prompt embeds
 //! nothing (no recall, no routing call).
 //!
-//! Routing: when `ctx.task_id.is_none()` (new-task entry path) the assembler
-//! runs the `TaskRouter` over the prompt to refine `is_new_task`, and reports
-//! the real `routing_method` (`search` | `llm`) + `routing_confidence` (top-1
-//! similarity). A routing failure degrades gracefully (§2.8 intent: "fall
-//! back", not "abort assembly") — assembly still returns a valid result with
-//! `is_new_task = true`.
+//! The task comes first (PRD §11.3.1: the task is settled, then the context is
+//! assembled for it). A message that names its task keeps it. A user or agent
+//! message that names none is routed by the `TaskRouter`: to the existing task
+//! it matches, or to a new task minted for it ([`mint_task_id`]). Every reader
+//! (task summary, decomposition, recall, history) then reads that task, and
+//! [`AssemblyResult::task_id`] hands it to the agent loop, which binds it onto
+//! the message. When routing cannot settle a task (a blank prompt, no usable
+//! query embedding, a routing failure: §2.8 "fall back", not "abort assembly"),
+//! the turn runs in the agent's current task ([`TaskIndexPort::current_task`],
+//! `routing_method` `current`), or in its default partition (`task_id: None`,
+//! `is_new_task = true`) when it has none. A control, system or auto message that
+//! names no task stays in the default partition.
 //!
 //! Every successful assembly also produces an [`AssemblyReport`] (per-section
 //! sizes, mode, budget, recall / history telemetry) delivered to the optional
 //! [`AssemblyReportSink`] — the source of the Client API context inspector.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use advance_shared_types::chrono::{DateTime, Utc};
@@ -48,12 +55,14 @@ use advance_shared_types::context::{
     AssemblyContext, AssemblyError, AssemblyResult, ContextAssembler, LlmMessage, TierTokenCounts,
 };
 use advance_shared_types::event::Event;
+use advance_shared_types::mailbox::MessageKind;
 use advance_shared_types::security_validator::{PromptInjectionHelpers, TrustLevel};
 use advance_shared_types::traits::{AgentTreeSnapshot, CallableInventoryReader, EventBusEmit};
 use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::boundary_marker::layer2_wrap;
+use crate::history_select::{select, Granularity, Selected, TASK_TURN_CANDIDATES};
 use crate::inventory::{HostFnInventoryReader, NativeToolsPort, NeverNativeTools};
 use crate::knowledge_map::KNOWLEDGE_MAP_MAX_TOKENS;
 use crate::l0_bridge::compress_turn_buffer;
@@ -63,13 +72,17 @@ use crate::ports::{
     GitBlobReader, KnowledgeMapReader, L2DigestReader, L3EpochReader, L4TaskSummaryReader,
     L5SynthesisReader, L6ConsolidationReader, LightLlmFallbackPort, MultiLevelContextDigest,
     NoRecentTurns, PortError, RecentTurn, RecentTurnsReader, RuntimeInfoReader, RuntimeInfoView,
-    SkillSummaryReader, TaskIndexPort, TurnView, UnifiedSearchPort, UnifiedSearchResult,
+    SkillSummaryReader, TaskIndexPort, TurnHit, TurnView, UnifiedSearchPort, UnifiedSearchResult,
     VectorIndexReader,
 };
 use crate::processing_pipeline::{coordinate_processing, MultiLevelReaders};
-use crate::recall_section::format_recall_section;
+use crate::recall_section::{
+    format_recall_section, format_related_task_briefs, related_task_briefs, related_turn_lines,
+};
 use crate::staleness::check_and_demote;
-use crate::task_router::{TaskRouter, TaskRoutingDecision, ROUTING_METHOD_SEARCH};
+use crate::task_router::{
+    TaskRouter, TaskRoutingDecision, ROUTING_METHOD_CURRENT, ROUTING_METHOD_SEARCH,
+};
 use crate::tier1::{build_tier1a, build_tier1b};
 use crate::tier1_children::format_available_children_section_with_aliases;
 use crate::tier1_runtime::{
@@ -434,6 +447,179 @@ struct ResolvedWindow {
     source: crate::ports::WindowSource,
 }
 
+/// How [`ContextAssemblerImpl::route_turn`] settled the turn's task.
+struct RoutedTask {
+    /// The task the turn runs in; `None`: the agent's default partition.
+    task_id: Option<String>,
+    /// No existing task was chosen: a new one was minted, or the turn stays in
+    /// the default partition.
+    is_new_task: bool,
+    /// [`ROUTING_METHOD_SEARCH`] | [`crate::task_router::ROUTING_METHOD_LLM`] |
+    /// [`ROUTING_METHOD_CURRENT`].
+    method: String,
+    /// The top-1 similarity behind the decision (`0.0` when no routing settled it).
+    confidence: f32,
+    /// Routing ran and settled the task: a new one, or an existing one.
+    routed: bool,
+}
+
+/// The message kinds a turn is routed for: what a user sends, and what another
+/// agent sends (PRD §11.3.1 routes "用户发来一条消息"; a delegation is the
+/// receiving agent's request in the same way). Control and system messages carry
+/// no request of their own, and an auto message names its `auto:` task.
+fn is_routed_kind(kind: &MessageKind) -> bool {
+    matches!(kind, MessageKind::User | MessageKind::Agent)
+}
+
+/// A new task's id (PRD §11.3.1 "新建 Task"): `task-<UTC day>-<8 hex>`, e.g.
+/// `task-20261121-3f9a1c2b`. Ids sort by the day the task began; the 32 random
+/// bits of the tail make a clash with one of the agent's tasks, or with a task id
+/// a message carries from its sender, unlikely.
+pub fn mint_task_id() -> String {
+    let day = DateTime::<Utc>::from(std::time::SystemTime::now()).format("%Y%m%d");
+    let tail = Uuid::new_v4().simple().to_string();
+    format!("task-{day}-{}", &tail[..8])
+}
+
+impl ContextAssemblerImpl {
+    /// PRD §11.3.1: the task an inbound message's turn runs in.
+    /// - A message that names its task keeps it, without routing. An empty or blank
+    ///   name names none.
+    /// - A user or agent message with a usable query embedding is routed: to the
+    ///   existing task it matches, or to a task minted for it. A reply is routed as
+    ///   any message: the task of the message it answers travels as its context
+    ///   (PRD §9.2), when that message named one.
+    /// - A user or agent message routing cannot settle (a blank prompt, no usable
+    ///   embedding, a routing failure — no task brief of the query's embedding model
+    ///   among them: §2.8 "fall back", not "abort") runs in the agent's current task
+    ///   ([`TaskIndexPort::current_task`]), or in the default partition when there is
+    ///   none.
+    /// - A control, system or auto message that names no task stays in the default
+    ///   partition: the runtime cannot tell which task it concerns.
+    async fn route_turn(
+        &self,
+        ctx: &AssemblyContext,
+        memo: &Arc<dyn EmbeddingPort>,
+        embedded: bool,
+    ) -> RoutedTask {
+        let unrouted = |task_id: Option<String>, is_new_task: bool| RoutedTask {
+            task_id,
+            is_new_task,
+            method: ROUTING_METHOD_SEARCH.to_string(),
+            confidence: 0.0,
+            routed: false,
+        };
+        if let Some(task_id) = ctx.task_id.as_deref().filter(|id| !id.trim().is_empty()) {
+            return unrouted(Some(task_id.to_string()), false);
+        }
+        if !is_routed_kind(&ctx.message.kind) {
+            return unrouted(None, true);
+        }
+        if !embedded {
+            return self
+                .in_current_task(&ctx.agent_id)
+                .await
+                .unwrap_or_else(|| unrouted(None, true));
+        }
+        let router = TaskRouter::new(
+            memo.clone(),
+            self.task_index.clone(),
+            self.light_llm.clone(),
+        );
+        match router.route_task_detailed(&ctx.agent_id, &ctx.prompt).await {
+            Ok(outcome) => {
+                let (task_id, is_new_task) = match outcome.decision {
+                    TaskRoutingDecision::Existing(task_id) => (task_id, false),
+                    TaskRoutingDecision::NewTask => (mint_task_id(), true),
+                };
+                RoutedTask {
+                    task_id: Some(task_id),
+                    is_new_task,
+                    method: outcome.method.to_string(),
+                    confidence: outcome.confidence,
+                    routed: true,
+                }
+            }
+            Err(_) => self
+                .in_current_task(&ctx.agent_id)
+                .await
+                .unwrap_or_else(|| unrouted(None, true)),
+        }
+    }
+
+    /// The agent's current task as the turn's task, when the task index names one. No
+    /// routing settled it, so no `task.*` event goes out for it.
+    async fn in_current_task(&self, agent_id: &str) -> Option<RoutedTask> {
+        let task_id = self
+            .task_index
+            .current_task(agent_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|id| !id.trim().is_empty() && !id.starts_with("auto:"))?;
+        Some(RoutedTask {
+            task_id: Some(task_id),
+            is_new_task: false,
+            method: ROUTING_METHOD_CURRENT.to_string(),
+            confidence: 0.0,
+            routed: false,
+        })
+    }
+
+    /// PRD §15.3.4: `task.created` when routing settled a new task (`agent_id`, `task_id`,
+    /// `title` — `Task <id>`, as the post-processor titles a new task's `summary.yaml`),
+    /// `task.routed` when it settled an existing one (`agent_id`,
+    /// `task_id`, `confidence`: the top-1 similarity). Nothing when no routing ran (the
+    /// message named its task, or the turn stays in the default partition). The events
+    /// carry the turn's trace and hang below its chain root.
+    fn emit_task_routing(&self, ctx: &AssemblyContext, routed: &RoutedTask) {
+        let Some(task_id) = routed.task_id.as_deref().filter(|_| routed.routed) else {
+            return;
+        };
+        let (event_type, payload) = if routed.is_new_task {
+            (
+                "task.created",
+                serde_json::json!({
+                    "agent_id": ctx.agent_id,
+                    "task_id": task_id,
+                    "title": format!("Task {task_id}"),
+                }),
+            )
+        } else {
+            (
+                "task.routed",
+                serde_json::json!({
+                    "agent_id": ctx.agent_id,
+                    "task_id": task_id,
+                    "confidence": routed.confidence,
+                }),
+            )
+        };
+        let trace_id = ctx
+            .message
+            .context
+            .as_ref()
+            .and_then(|c| c.trace_id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        self.event_bus.emit(Event {
+            id: Uuid::new_v4().to_string(),
+            timestamp: DateTime::<Utc>::from(std::time::SystemTime::now()),
+            agent_id: ctx.agent_id.clone(),
+            task_id: Some(task_id.to_string()),
+            run_id: None,
+            execution_id: None,
+            trace_id,
+            span_id: Uuid::new_v4().to_string(),
+            parent_span_id: Some(advance_shared_types::event::chain_root_span_id(
+                &ctx.message.id,
+            )),
+            event_type: event_type.into(),
+            payload,
+            duration_ms: None,
+        });
+    }
+}
+
 impl ContextAssemblerImpl {
     /// ⑯ (PRD §11.3.5 "同 Task 近期窗口"): the last `recent_l0_turns(mode)` turns of the task,
     /// newest first into `budget_tokens`. A turn is loaded whole (L0-processed) when the mode
@@ -442,6 +628,7 @@ impl ContextAssemblerImpl {
     async fn load_recent_turns(
         &self,
         ctx: &AssemblyContext,
+        task_id: Option<&str>,
         mode: ProgressiveMode,
         budget_tokens: usize,
     ) -> RecentLoad {
@@ -451,7 +638,7 @@ impl ContextAssemblerImpl {
         }
         let turns = self
             .recent_turns
-            .read_recent_turns(&ctx.agent_id, ctx.task_id.as_deref().unwrap_or(""), count)
+            .read_recent_turns(&ctx.agent_id, task_id.unwrap_or(""), count)
             .await
             .unwrap_or_default();
         let turns = &turns[turns.len().saturating_sub(count)..];
@@ -474,6 +661,7 @@ impl ContextAssemblerImpl {
         }
         whole.reverse();
         digests.reverse();
+        let tokens = budget_tokens - left;
         let messages = if whole.is_empty() {
             Vec::new()
         } else {
@@ -487,7 +675,121 @@ impl ContextAssemblerImpl {
             whole: whole.into_iter().map(|(id, _)| id).collect(),
             digests,
             messages,
+            tokens,
         }
+    }
+
+    /// ⑯ beyond the recent window (PRD §11.3.5): of `earlier` (the task's own turns) and
+    /// `related` (other tasks' turns), each selected to load whole is read and loaded so —
+    /// best score first, the task's own first on a tie — while `budget_tokens` holds it and
+    /// no file it read has changed since; every other selected turn loads as its digest, the
+    /// task's own up to `digest_room` of them, best score first (they share the digest
+    /// section, which shows a bounded number of lines).
+    async fn load_recalled_history(
+        &self,
+        ctx: &AssemblyContext,
+        task_id: Option<&str>,
+        earlier: Vec<Selected>,
+        related: Vec<Selected>,
+        budget_tokens: usize,
+        digest_room: usize,
+    ) -> RecalledHistory {
+        let own_task = task_id.unwrap_or("");
+        // The turns that may load whole, read once per task.
+        let mut wanted: BTreeMap<(bool, String), Vec<u64>> = BTreeMap::new();
+        let whole = |s: &&Selected| s.granularity == Granularity::Whole;
+        for s in earlier.iter().filter(whole) {
+            if let Some(turn) = s.hit.turn {
+                wanted
+                    .entry((true, own_task.to_string()))
+                    .or_default()
+                    .push(turn);
+            }
+        }
+        for s in related.iter().filter(whole) {
+            if let Some(turn) = s.hit.turn {
+                wanted
+                    .entry((false, s.hit.task_id.clone()))
+                    .or_default()
+                    .push(turn);
+            }
+        }
+        let mut fetched: HashMap<(bool, String, u64), RecentTurn> = HashMap::new();
+        for ((own, task), turns) in wanted {
+            let read = self
+                .recent_turns
+                .read_turns(&ctx.agent_id, &task, &turns)
+                .await
+                .unwrap_or_default();
+            for turn in read {
+                if turns.contains(&turn.turn_id) {
+                    fetched.insert((own, task.clone(), turn.turn_id), turn);
+                }
+            }
+        }
+
+        let score = |s: &Selected| {
+            s.hit
+                .retention
+                .filter(|r| r.is_finite())
+                .unwrap_or(f32::MIN)
+        };
+        let mut order: Vec<(bool, &Selected)> = earlier
+            .iter()
+            .map(|s| (true, s))
+            .chain(related.iter().map(|s| (false, s)))
+            .collect();
+        order.sort_by(|(_, a), (_, b)| score(b).total_cmp(&score(a)));
+
+        let helpers = self.prompt_injection.as_ref();
+        let mut left = budget_tokens;
+        let mut out = RecalledHistory::default();
+        for (own, s) in order {
+            let task = if own {
+                own_task
+            } else {
+                s.hit.task_id.as_str()
+            };
+            let read = s
+                .hit
+                .turn
+                .filter(|_| s.granularity == Granularity::Whole)
+                .and_then(|turn| fetched.get(&(own, task.to_string(), turn)));
+            if let Some(turn) = read {
+                if !turn.messages.is_empty() && self.is_fresh(turn).await {
+                    let block = if own {
+                        render_recent_turn(turn, helpers)
+                    } else {
+                        render_related_turn(turn, &s.hit.task_id, helpers)
+                    };
+                    let cost = chars_to_tokens(block.len()) as usize;
+                    if cost <= left {
+                        left -= cost;
+                        if own {
+                            out.earlier_whole.push((turn.turn_id, block));
+                        } else {
+                            out.related_whole.push(block);
+                        }
+                        continue;
+                    }
+                }
+            }
+            if !has_digest(&s.hit) {
+                continue;
+            }
+            if own {
+                if let (Some(turn), Some(digest)) = (s.hit.turn, s.hit.snippet.as_deref()) {
+                    if out.earlier_digests.len() < digest_room {
+                        out.earlier_digests.push((turn, digest.to_string()));
+                    }
+                }
+            } else {
+                out.related_digests.push(s.hit.clone());
+            }
+        }
+        out.earlier_whole.sort_by_key(|(turn, _)| *turn);
+        out.earlier_digests.sort_by_key(|(turn, _)| *turn);
+        out
     }
 
     /// No file `turn` read has changed or gone since. Without a blob reader, every turn is;
@@ -597,6 +899,15 @@ impl ContextAssembler for ContextAssemblerImpl {
             }
         };
 
+        // ── The turn's task, settled before any reader runs (PRD §11.3.1), so the
+        // task summary, the decomposition, recall and the history all read the task
+        // the turn runs in. Routing shares the memoized query embedding.
+        let routed = self
+            .route_turn(&ctx, &memo, query_embedding.is_some())
+            .await;
+        let task_id = routed.task_id.clone();
+        self.emit_task_routing(&ctx, &routed);
+
         // ── L0-L6 multi-source digest (AC-06). L0 runs over the mapped
         // `turn_buffer` (the compressed history is rendered below); L1 gets the
         // shared query embedding (empty when none — the reader then yields no
@@ -612,9 +923,9 @@ impl ContextAssembler for ContextAssemblerImpl {
             l5: self.l5_synthesis.as_ref(),
             l6: self.l6_consolidation.as_ref(),
         };
-        let digest = coordinate_processing(
+        let mut digest = coordinate_processing(
             &ctx.agent_id,
-            ctx.task_id.as_deref().unwrap_or(""),
+            task_id.as_deref().unwrap_or(""),
             &[],
             query_embedding.as_deref().unwrap_or(&[]),
             &readers,
@@ -667,36 +978,67 @@ impl ContextAssembler for ContextAssemblerImpl {
         // task's non-orphaned subtasks. Omitted when empty.
         let decomposition_subtasks = self
             .decomposition
-            .read_active_subtasks(&ctx.agent_id, ctx.task_id.as_deref())
+            .read_active_subtasks(&ctx.agent_id, task_id.as_deref())
             .await;
         if let Some(decomp_content) = format_active_decomposition_section(&decomposition_subtasks) {
             tier2.push(system(decomp_content));
         }
-        // ── Tier 2 ⑭ Task Summary (L4) + Related Task Briefs (L5, max 3):
-        // task-stable, so they live in the session tier (cacheable across the
-        // turns of one task) rather than per-call Tier 3. Untrusted bodies are
-        // boundary-wrapped (CONTRACT-114) + cache-marker-neutralized.
+        // ── Tier 2 ⑭ Task Summary (L4) + the task syntheses: task-stable, so
+        // they live in the session tier (cacheable across the turns of one task)
+        // rather than per-call Tier 3. Untrusted bodies are boundary-wrapped
+        // (CONTRACT-114) + cache-marker-neutralized.
         let session_digest = render_session_digest(&digest, self.prompt_injection.as_ref());
-        let l5_rendered = session_digest.l5_rendered;
+        let syntheses_rendered = session_digest.l5_rendered;
         tier2.extend(session_digest.messages);
 
-        // ── Tier 2 ⑮ (PRD §11.3.2): what recall found for this prompt — the last section
-        // before the 2→3 breakpoint, after the task summary. Degrades to "no section".
+        // What recall found for this prompt (PRD §11.3.1 `unified_search`), split
+        // by where §11.3.2 puts each source: other tasks' briefs in ⑭, contents
+        // and memories in ⑮, other tasks' turns in ⑯. Degrades to "nothing".
         let recall_attempted = query_embedding.is_some();
         let recall: UnifiedSearchResult = if recall_attempted {
             crate::unified_search::UnifiedSearchCoordinator::new(
                 memo.clone(),
                 self.unified_search_port.clone(),
             )
-            .unified_search(&ctx.agent_id, &ctx.prompt, ctx.task_id.as_deref())
+            .unified_search(&ctx.agent_id, &ctx.prompt, task_id.as_deref())
             .await
             .unwrap_or_default()
         } else {
             UnifiedSearchResult::default()
         };
+        // ── Tier 2 ⑭ L5 (PRD §11.3.1): the briefs of up to three other tasks the
+        // message resembles, whether the turn's task is new or not.
+        let briefs = related_task_briefs(&recall.tasks);
+        let briefs_rendered = briefs.len();
+        if let Some(content) = format_related_task_briefs(&briefs, self.prompt_injection.as_ref()) {
+            tier2.push(system(content));
+        }
+        // ── Tier 2 ⑮ (PRD §11.3.2): the contents and memories recall found — the
+        // last section before the 2→3 breakpoint.
         if let Some(content) = format_recall_section(&recall, self.prompt_injection.as_ref()) {
             tier2.push(system(content));
         }
+
+        // ⑯ beyond the recent window (PRD §11.3.5): the task's own turns the
+        // message recalls (semantic and keyword candidates) — `None` when the port
+        // does not search them — and other tasks' turns (recall's `turns`). The
+        // window is not known yet, and its turns are left out of what the search
+        // finds: each half is asked for the widest window's turns more.
+        let task_turns: Option<Vec<TurnHit>> = if prompt_blank {
+            None
+        } else {
+            self.unified_search_port
+                .search_task_turns(
+                    &ctx.agent_id,
+                    task_id.as_deref().unwrap_or(""),
+                    &ctx.prompt,
+                    query_embedding.as_deref().unwrap_or(&[]),
+                    TASK_TURN_CANDIDATES + recent_l0_turns(ProgressiveMode::Wide),
+                )
+                .await
+                .unwrap_or(None)
+        };
+        let earlier_hits: &[TurnHit] = task_turns.as_deref().unwrap_or(&[]);
 
         // ── Tier 3 (per-call): progressive-load mode-select (Slice C,
         // AC-09) → ⑯ history (L2/L3 digests, the recent turns) → ⑰ the bounded
@@ -731,9 +1073,26 @@ impl ContextAssembler for ContextAssemblerImpl {
             approx_tokens_str("user", &ctx.prompt)
         };
 
-        // L2 recent turn digests + L3 epoch summary (Tier 3 history layer).
-        let recent_digest = render_recent_digest(&digest);
-        let digest_tokens = approx_tokens(&recent_digest);
+        // L2 recent turn digests + L3 epoch summary (Tier 3 history layer), and
+        // the digests of every turn the selection beyond the recent window may
+        // load: an estimate, not a bound. The window and the turns loaded whole
+        // leave it, and a lower mode loads fewer. It counts the L2 reader's pick,
+        // which the turns the search finds beyond the window replace once the
+        // mode, and so the window, is chosen. The section keeps its newest
+        // `MAX_L2_RENDERED` lines either way, but the real one may keep other
+        // turns' lines than these (each line is byte-capped).
+        let all_digests = RecalledHistory::digests_of(
+            select(earlier_hits, &HashSet::new(), ProgressiveMode::Wide),
+            select(&recall.turns, &HashSet::new(), ProgressiveMode::Wide),
+        );
+        let mut digest_sections =
+            render_recent_digest_except(&digest, &RecentLoad::default(), &all_digests);
+        digest_sections.extend(
+            all_digests
+                .related_section(self.prompt_injection.as_ref())
+                .map(system),
+        );
+        let digest_tokens = approx_tokens(&digest_sections);
 
         // Everything `used` counts but Tier-2 (saturating sums of non-negative
         // terms, so the order of the additions does not change the total).
@@ -784,6 +1143,7 @@ impl ContextAssembler for ContextAssemblerImpl {
         let mode: ProgressiveMode;
         let history_kept: usize;
         let mut recent = RecentLoad::default();
+        let mut recalled = RecalledHistory::default();
         let (messages, tier_token_counts) = if degraded {
             mode = ProgressiveMode::Extreme;
             history_kept = 0;
@@ -821,16 +1181,66 @@ impl ContextAssembler for ContextAssemblerImpl {
             let remaining = budget.saturating_sub(used as usize);
             mode = select_progressive_mode(remaining);
 
-            // Tier-3 order (PRD §11.3.2): ⑯ history — the L2/L3 digests, then the
-            // task's recent turns, whole while the history share of what is left
-            // (PRD §11.3.5 `turn_budget = remaining * 0.40`) holds them — → ⑰ the
-            // L0-compressed, mode-bounded turn buffer → drained warnings → ⑱ the
-            // current prompt. The Slice-A invariant (warning surfaces AFTER prior
-            // history but BEFORE the current prompt) is preserved.
+            // Tier-3 order (PRD §11.3.2): ⑯ history — other tasks' turns the
+            // message recalls, the L2/L3 digests, the task's earlier turns loaded
+            // whole, then its recent turns — → ⑰ the L0-compressed, mode-bounded
+            // turn buffer → drained warnings → ⑱ the current prompt. The turns
+            // loaded whole share the history part of what is left (PRD §11.3.5
+            // `turn_budget = remaining * 0.40`): the recent window first, then the
+            // recalled turns, best score first. The Slice-A invariant (warning
+            // surfaces AFTER prior history but BEFORE the current prompt) is
+            // preserved.
+            let turn_budget = remaining.saturating_mul(2) / 5;
             recent = self
-                .load_recent_turns(&ctx, mode, remaining.saturating_mul(2) / 5)
+                .load_recent_turns(&ctx, task_id.as_deref(), mode, turn_budget)
                 .await;
-            let mut tier3 = render_recent_digest_except(&digest, &recent);
+            let window: HashSet<u64> = recent
+                .whole
+                .iter()
+                .copied()
+                .chain(recent.digests.iter().map(|(turn, _)| *turn))
+                .collect();
+            // The L2 reader's pick of the task's digests by retention is the fallback
+            // for the task's earlier turns. An agent without recall (no search) keeps
+            // it. So does a turn without a usable query vector, whose search can only
+            // match keywords, and a turn whose search finds no turn beyond the recent
+            // window. Otherwise the turns the search finds take its place.
+            if query_embedding.is_some()
+                && earlier_hits
+                    .iter()
+                    .any(|hit| hit.turn.is_some_and(|turn| !window.contains(&turn)))
+            {
+                digest.l2.clear();
+            }
+            // The digest section shows the newest `MAX_L2_RENDERED` lines: the
+            // window's digests and the L2 reader's come first, and the task's
+            // earlier turns the message recalls take the room left.
+            let digest_room = MAX_L2_RENDERED.saturating_sub(
+                recent.digests.len()
+                    + digest
+                        .l2
+                        .iter()
+                        .filter(|d| !window.contains(&d.turn_id))
+                        .count(),
+            );
+            recalled = self
+                .load_recalled_history(
+                    &ctx,
+                    task_id.as_deref(),
+                    select(earlier_hits, &window, mode),
+                    select(&recall.turns, &HashSet::new(), mode),
+                    turn_budget.saturating_sub(recent.tokens),
+                    digest_room,
+                )
+                .await;
+            let mut tier3: Vec<LlmMessage> = Vec::new();
+            tier3.extend(
+                recalled
+                    .related_section(self.prompt_injection.as_ref())
+                    .map(system),
+            );
+            tier3.extend(render_recent_digest_except(&digest, &recent, &recalled));
+            tier3.extend(recalled.earlier_section().map(system));
             tier3.extend(recent.messages.iter().cloned());
             let bounded = bound_tier3_turns(&compressed_history, mode);
             history_kept = bounded.len();
@@ -878,41 +1288,13 @@ impl ContextAssembler for ContextAssemblerImpl {
             (messages, tier_token_counts)
         };
 
-        // Routing: only the new-task entry path (no task_id) consults the
-        // router, and only with a non-blank prompt (nothing to route on
-        // otherwise). The router shares the memoized query embedding. A routing
-        // failure degrades gracefully (§2.8 "fall back", not "abort") —
-        // assembly still succeeds; is_new_task defaults to true (the safe
-        // default when no task_id was supplied).
-        let (is_new_task, routing_method, routing_confidence) = if ctx.task_id.is_none() {
-            if prompt_blank {
-                (true, ROUTING_METHOD_SEARCH.to_string(), 0.0_f32)
-            } else {
-                let router = TaskRouter::new(
-                    memo.clone(),
-                    self.task_index.clone(),
-                    self.light_llm.clone(),
-                );
-                match router.route_task_detailed(&ctx.agent_id, &ctx.prompt).await {
-                    Ok(outcome) => (
-                        matches!(outcome.decision, TaskRoutingDecision::NewTask),
-                        outcome.method.to_string(),
-                        outcome.confidence,
-                    ),
-                    Err(_) => (true, ROUTING_METHOD_SEARCH.to_string(), 0.0_f32),
-                }
-            }
-        } else {
-            // The caller already bound the turn to a task — no search ran.
-            (false, ROUTING_METHOD_SEARCH.to_string(), 0.0_f32)
-        };
-
         let result = AssemblyResult {
             messages,
-            routing_method,
-            routing_confidence,
-            is_new_task,
+            routing_method: routed.method,
+            routing_confidence: routed.confidence,
+            is_new_task: routed.is_new_task,
             tier_token_counts,
+            task_id: task_id.clone(),
         };
 
         // AC-12: emit the `context.assembled` event AFTER the result is built
@@ -933,7 +1315,7 @@ impl ContextAssembler for ContextAssemblerImpl {
             // the workspace idiom is `SystemTime::now().into()`.
             timestamp: DateTime::<Utc>::from(std::time::SystemTime::now()),
             agent_id: ctx.agent_id.clone(),
-            task_id: ctx.task_id.clone(),
+            task_id: task_id.clone(),
             run_id: None,
             execution_id: None,
             // Stage-F obs SLICE 1: thread the handle-message chain. trace_id reads
@@ -967,7 +1349,7 @@ impl ContextAssembler for ContextAssemblerImpl {
                 .saturating_add(counts.tier3);
             sink.record(AssemblyReport {
                 agent_id: ctx.agent_id.clone(),
-                task_id: ctx.task_id.clone(),
+                task_id: task_id.clone(),
                 message_id: ctx.message.id.clone(),
                 trace_id,
                 model: window.model.clone(),
@@ -1005,9 +1387,14 @@ impl ContextAssembler for ContextAssemblerImpl {
                         .l4
                         .as_ref()
                         .is_some_and(|t| !t.summary.trim().is_empty()),
-                    l5_related_briefs: clamp_u32(l5_rendered),
+                    l5_related_briefs: clamp_u32(briefs_rendered),
+                    task_syntheses: clamp_u32(syntheses_rendered),
                     recent_turns: clamp_u32(recent.whole.len()),
                     recent_turn_digests: clamp_u32(recent.digests.len()),
+                    earlier_turns: clamp_u32(recalled.earlier_whole.len()),
+                    earlier_turn_digests: clamp_u32(recalled.earlier_digests.len()),
+                    related_turns: clamp_u32(recalled.related_whole.len()),
+                    related_turn_digests: clamp_u32(recalled.related_digests.len()),
                 },
                 prompt_bytes: clamp_u32(ctx.prompt.len()),
                 warnings: clamp_u32(drained_warnings.len()),
@@ -1288,6 +1675,12 @@ fn render_recent_digest(digest: &MultiLevelContextDigest) -> Vec<LlmMessage> {
     out
 }
 
+/// The heading of the ⑯ section of other tasks' turns the message recalls.
+const RELATED_TURNS_HEADER: &str = "# Related Turns\nTurns of this agent's other tasks the message recalls: a digest each, or the whole turn as it ran.";
+
+/// The heading of the ⑯ section of the task's earlier turns loaded whole.
+const EARLIER_TURNS_HEADER: &str = "# Earlier Turns\nEarlier turns of this task the message recalls, oldest first, as they ran. A tool result a later step of the same turn superseded or made stale is shortened.";
+
 /// The heading of the ⑯ recent-turns section.
 const RECENT_TURNS_HEADER: &str = "# Recent Turns\nThe latest turns of this task, oldest first, as they ran. A tool result a later step of the same turn superseded or made stale is shortened.";
 
@@ -1306,6 +1699,79 @@ struct RecentLoad {
     digests: Vec<(u64, String)>,
     /// The `# Recent Turns` section (none when no turn is loaded whole).
     messages: Vec<LlmMessage>,
+    /// The part of the turn budget the turns loaded whole take.
+    tokens: usize,
+}
+
+/// What ⑯ loads beyond the recent window (PRD §11.3.5): the task's earlier turns and other
+/// tasks' turns the message recalls.
+#[derive(Default)]
+struct RecalledHistory {
+    /// The task's earlier turns loaded whole, oldest first: (turn, block).
+    earlier_whole: Vec<(u64, String)>,
+    /// The task's earlier turns loaded as their digest, oldest first: (turn, digest).
+    earlier_digests: Vec<(u64, String)>,
+    /// Other tasks' turns loaded whole, best score first.
+    related_whole: Vec<String>,
+    /// Other tasks' turns loaded as their digest, best score first.
+    related_digests: Vec<TurnHit>,
+}
+
+/// Whether a recalled turn has a digest to show (its producer's snippet, not blank).
+fn has_digest(hit: &TurnHit) -> bool {
+    hit.snippet.as_deref().is_some_and(|d| !d.trim().is_empty())
+}
+
+impl RecalledHistory {
+    /// Every turn of `earlier` and `related` as its digest — the most the digest sections
+    /// can hold, for the budget estimate made before the mode is known.
+    fn digests_of(earlier: Vec<Selected>, related: Vec<Selected>) -> Self {
+        let mut earlier_digests: Vec<(u64, String)> = earlier
+            .into_iter()
+            .filter(|s| has_digest(&s.hit))
+            .filter_map(|s| Some((s.hit.turn?, s.hit.snippet?)))
+            .collect();
+        earlier_digests.sort_by_key(|(turn, _)| *turn);
+        Self {
+            earlier_digests,
+            related_digests: related
+                .into_iter()
+                .filter(|s| has_digest(&s.hit))
+                .map(|s| s.hit)
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// The `# Related Turns` section: other tasks' turns as their digests (one wrapped list),
+    /// then the ones loaded whole. `None` when there are none.
+    fn related_section(&self, helpers: &dyn PromptInjectionHelpers) -> Option<String> {
+        let digests: Vec<&TurnHit> = self.related_digests.iter().collect();
+        if digests.is_empty() && self.related_whole.is_empty() {
+            return None;
+        }
+        let mut parts: Vec<String> = vec![RELATED_TURNS_HEADER.to_string()];
+        if !digests.is_empty() {
+            parts.push(neutralize_cache_breakpoint_markers(&layer2_wrap(
+                &related_turn_lines(&digests),
+                "memory:related_turns",
+                TrustLevel::Untrusted,
+                helpers,
+            )));
+        }
+        parts.extend(self.related_whole.iter().cloned());
+        Some(parts.join("\n"))
+    }
+
+    /// The `# Earlier Turns` section: the task's earlier turns loaded whole, oldest first.
+    /// `None` when there are none.
+    fn earlier_section(&self) -> Option<String> {
+        if self.earlier_whole.is_empty() {
+            return None;
+        }
+        let blocks: Vec<&str> = self.earlier_whole.iter().map(|(_, b)| b.as_str()).collect();
+        Some(format!("{EARLIER_TURNS_HEADER}\n{}", blocks.join("\n")))
+    }
 }
 
 /// One recent turn, L0-processed (PRD §11.3.3 "所有加载都经过 L0 处理"): the user's and the
@@ -1315,6 +1781,29 @@ struct RecentLoad {
 /// it is one boundary-wrapped untrusted block; the whole is cache-marker neutralized, and a
 /// message longer than [`MAX_RECENT_MESSAGE_BYTES`] is cut.
 fn render_recent_turn(turn: &RecentTurn, helpers: &dyn PromptInjectionHelpers) -> String {
+    render_turn_block(turn, &format!("Turn {}", turn.turn_id), helpers)
+}
+
+/// A turn of another task, loaded whole (⑯ `# Related Turns`): as [`render_recent_turn`],
+/// under a heading that names its task.
+fn render_related_turn(
+    turn: &RecentTurn,
+    task_id: &str,
+    helpers: &dyn PromptInjectionHelpers,
+) -> String {
+    render_turn_block(
+        turn,
+        &format!("Turn {} of {}", turn.turn_id, sanitize_description(task_id)),
+        helpers,
+    )
+}
+
+/// One turn L0-processed, under `## {title} · {timestamp}`.
+fn render_turn_block(
+    turn: &RecentTurn,
+    title: &str,
+    helpers: &dyn PromptInjectionHelpers,
+) -> String {
     let answered = advance_shared_types::turn_log::answered_calls(&turn.messages);
     let mut body: Vec<String> = Vec::new();
     for (i, message) in turn.messages.iter().enumerate() {
@@ -1356,8 +1845,7 @@ fn render_recent_turn(turn: &RecentTurn, helpers: &dyn PromptInjectionHelpers) -
         helpers,
     );
     neutralize_cache_breakpoint_markers(&format!(
-        "## Turn {} · {}\n{wrapped}",
-        turn.turn_id,
+        "## {title} · {}\n{wrapped}",
         sanitize_description(&turn.timestamp)
     ))
 }
@@ -1375,19 +1863,26 @@ fn cut(text: &str, max: usize) -> String {
 }
 
 /// The ⑯ digest part of Tier 3 — L2 `# Recent Turn Digests` and L3 `# Epoch Summary` — without
-/// the turns ⑯ loaded whole, and with the digest of every recent turn it loaded as one.
+/// the turns ⑯ loaded whole, and with the digest of every recent or earlier turn of the task it
+/// loaded as one (one line per turn).
 fn render_recent_digest_except(
     digest: &MultiLevelContextDigest,
     recent: &RecentLoad,
+    recalled: &RecalledHistory,
 ) -> Vec<LlmMessage> {
-    let whole: std::collections::BTreeSet<u64> = recent.whole.iter().copied().collect();
+    let whole: std::collections::BTreeSet<u64> = recent
+        .whole
+        .iter()
+        .copied()
+        .chain(recalled.earlier_whole.iter().map(|(turn, _)| *turn))
+        .collect();
     let mut l2: Vec<crate::ports::TurnDigestForEmbed> = digest
         .l2
         .iter()
         .filter(|d| !whole.contains(&d.turn_id))
         .cloned()
         .collect();
-    for (turn_id, text) in &recent.digests {
+    for (turn_id, text) in recent.digests.iter().chain(recalled.earlier_digests.iter()) {
         if !l2.iter().any(|d| d.turn_id == *turn_id) {
             l2.push(crate::ports::TurnDigestForEmbed {
                 turn_id: *turn_id,
@@ -1426,17 +1921,23 @@ fn truncate_prompt_to_tokens(prompt: &str, max_tokens: u32) -> String {
 
 #[cfg(test)]
 mod recent_turns_heading_tests {
-    use super::RECENT_TURNS_HEADER;
-    use advance_shared_types::context::{is_tier3_history, RECENT_TURNS_HEADING};
+    use super::{EARLIER_TURNS_HEADER, RECENT_TURNS_HEADER, RELATED_TURNS_HEADER};
+    use advance_shared_types::context::{
+        is_tier3_history, EARLIER_TURNS_HEADING, RECENT_TURNS_HEADING, RELATED_TURNS_HEADING,
+    };
 
     /// The gateway takes the seed's history out of a request that outgrows the model's window
-    /// by its shared headings (MODULE-010 S6): the ⑯ recent-turns block starts with its own.
+    /// by its shared headings (MODULE-010 S6): each ⑯ block of turns starts with its own.
     #[test]
     fn the_recent_turns_block_starts_with_its_shared_heading() {
-        assert!(RECENT_TURNS_HEADER.starts_with(RECENT_TURNS_HEADING));
-        assert!(is_tier3_history(&format!(
-            "{RECENT_TURNS_HEADER}\n## Turn 1"
-        )));
+        for (header, heading) in [
+            (RECENT_TURNS_HEADER, RECENT_TURNS_HEADING),
+            (EARLIER_TURNS_HEADER, EARLIER_TURNS_HEADING),
+            (RELATED_TURNS_HEADER, RELATED_TURNS_HEADING),
+        ] {
+            assert!(header.starts_with(heading), "{header}");
+            assert!(is_tier3_history(&format!("{header}\n## Turn 1")));
+        }
     }
 }
 

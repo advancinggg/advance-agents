@@ -503,28 +503,35 @@ struct FrozenRequestAttribution {
     task_id: Option<String>,
 }
 
+/// The run and the task a guest call is attributed to. The task: the one the guest names,
+/// else the one the turn's message named, else the one the assembly settled for the turn
+/// (`settled_task_id`, MODULE-010 §1.4.2), as the call is made with that task's context. A
+/// detached turn's call keeps only the guest's.
 fn freeze_request_attribution(
     ctx: &HostCallContext,
     explicit_task_id: Option<String>,
+    settled_task_id: Option<String>,
     turn_cost: Option<&dyn TurnCostAttributionReadPort>,
 ) -> Result<FrozenRequestAttribution, HostCallError> {
     let Some(turn_id) = ctx.turn_id.as_deref() else {
         return Ok(FrozenRequestAttribution {
             run_id: ctx.run_id.clone(),
-            task_id: explicit_task_id,
+            task_id: explicit_task_id.or(settled_task_id),
         });
     };
     let Some(turn_cost) = turn_cost else {
         return Ok(FrozenRequestAttribution {
             run_id: ctx.run_id.clone(),
-            task_id: explicit_task_id,
+            task_id: explicit_task_id.or(settled_task_id),
         });
     };
     match turn_cost.cost_attribution(turn_id, &ctx.agent_id) {
         CostAttributionLookup::Tracked(snapshot) => match snapshot.state {
             CostTurnState::Active => Ok(FrozenRequestAttribution {
                 run_id: snapshot.original_run_id,
-                task_id: explicit_task_id.or(snapshot.original_task_id),
+                task_id: explicit_task_id
+                    .or(snapshot.original_task_id)
+                    .or(settled_task_id),
             }),
             CostTurnState::Detached { .. } => Ok(FrozenRequestAttribution {
                 run_id: None,
@@ -536,7 +543,7 @@ fn freeze_request_attribution(
         },
         CostAttributionLookup::Untracked => Ok(FrozenRequestAttribution {
             run_id: ctx.run_id.clone(),
-            task_id: explicit_task_id,
+            task_id: explicit_task_id.or(settled_task_id),
         }),
         CostAttributionLookup::IdentityMismatch => Err(HostCallError::HandlerError(
             "turn-identity-mismatch".to_string(),
@@ -594,7 +601,12 @@ impl HostFunctionHandler for AgentLlmGenerateHandler {
         let turn_cost = self.turn_cost.clone();
         Box::pin(async move {
             let req = decode_llm_request(&params).map_err(HostCallError::HandlerError)?;
-            let attribution = freeze_request_attribution(&ctx, req.task_id, turn_cost.as_deref())?;
+            let attribution = freeze_request_attribution(
+                &ctx,
+                req.task_id,
+                gateway.assembled_task_for(&ctx.agent_id),
+                turn_cost.as_deref(),
+            )?;
             // Slice C (2026-05-09): run_id + iteration now plumbed through
             // HostCallContext (CONTRACT-001 additive extension). They flow from
             // ComponentCtx.run_id / ComponentCtx.iteration via
@@ -684,7 +696,12 @@ impl HostFunctionHandler for AgentLlmStreamHandler {
         Box::pin(async move {
             // Decode error is a host-ABI fault (HandlerError), not an llm-error.
             let req = decode_llm_request(&params).map_err(HostCallError::HandlerError)?;
-            let attribution = freeze_request_attribution(&ctx, req.task_id, turn_cost.as_deref())?;
+            let attribution = freeze_request_attribution(
+                &ctx,
+                req.task_id,
+                gateway.assembled_task_for(&ctx.agent_id),
+                turn_cost.as_deref(),
+            )?;
             // Same seed ++ transcript ++ prompt as generate (ADR 2026-10-24 D4),
             // including the prompt-sent-once rule and the transcript scope.
             let mut guest = gateway.guest_messages(
@@ -2929,16 +2946,73 @@ mod tests {
             },
         ));
 
-        let inherited = freeze_request_attribution(&turn_ctx(), None, Some(&port))
+        let inherited = freeze_request_attribution(&turn_ctx(), None, None, Some(&port))
             .expect("active turn is callable");
         assert_eq!(inherited.run_id.as_deref(), Some("run-original"));
         assert_eq!(inherited.task_id.as_deref(), Some("task-original"));
 
-        let explicit =
-            freeze_request_attribution(&turn_ctx(), Some("task-explicit".into()), Some(&port))
-                .expect("explicit task is permitted");
+        let explicit = freeze_request_attribution(
+            &turn_ctx(),
+            Some("task-explicit".into()),
+            None,
+            Some(&port),
+        )
+        .expect("explicit task is permitted");
         assert_eq!(explicit.run_id.as_deref(), Some("run-original"));
         assert_eq!(explicit.task_id.as_deref(), Some("task-explicit"));
+    }
+
+    /// The task the assembly settled names a call that neither the guest nor the turn's
+    /// message names: a routed turn's calls are its task's. A detached turn's call still
+    /// names only the guest's task.
+    #[test]
+    fn the_settled_task_names_a_call_neither_the_guest_nor_the_message_names() {
+        let tracked = |original: Option<&str>, state: CostTurnState| {
+            FixedTurnCost(CostAttributionLookup::Tracked(
+                advance_shared_types::turn_attribution::CostAttributionSnapshot {
+                    original_task_id: original.map(str::to_string),
+                    original_run_id: Some("run-original".into()),
+                    state,
+                },
+            ))
+        };
+        let task_of = |port: &FixedTurnCost, explicit: Option<&str>| {
+            freeze_request_attribution(
+                &turn_ctx(),
+                explicit.map(str::to_string),
+                Some("task-settled".to_string()),
+                Some(port),
+            )
+            .expect("callable")
+            .task_id
+        };
+        let active = tracked(None, CostTurnState::Active);
+        assert_eq!(task_of(&active, None).as_deref(), Some("task-settled"));
+        assert_eq!(
+            task_of(&active, Some("task-explicit")).as_deref(),
+            Some("task-explicit")
+        );
+        let named = tracked(Some("task-original"), CostTurnState::Active);
+        assert_eq!(task_of(&named, None).as_deref(), Some("task-original"));
+        let untracked = FixedTurnCost(CostAttributionLookup::Untracked);
+        assert_eq!(task_of(&untracked, None).as_deref(), Some("task-settled"));
+        let detached = tracked(
+            None,
+            CostTurnState::Detached {
+                from: advance_shared_types::turn_attribution::DetachOrigin::Running,
+                execution_finished: false,
+            },
+        );
+        assert_eq!(task_of(&detached, None), None);
+        // A call without a trusted turn, too.
+        let unprotected = freeze_request_attribution(
+            &ctx_with_run_id_iter(None, None),
+            None,
+            Some("task-settled".to_string()),
+            None,
+        )
+        .expect("callable");
+        assert_eq!(unprotected.task_id.as_deref(), Some("task-settled"));
     }
 
     #[test]
@@ -2954,9 +3028,13 @@ mod tests {
             },
         ));
 
-        let frozen =
-            freeze_request_attribution(&turn_ctx(), Some("task-explicit".into()), Some(&port))
-                .expect("detached unrelated work remains callable");
+        let frozen = freeze_request_attribution(
+            &turn_ctx(),
+            Some("task-explicit".into()),
+            None,
+            Some(&port),
+        )
+        .expect("detached unrelated work remains callable");
         assert_eq!(frozen.run_id, None);
         assert_eq!(frozen.task_id.as_deref(), Some("task-explicit"));
     }
@@ -2973,13 +3051,13 @@ mod tests {
             },
         ));
         assert!(matches!(
-            freeze_request_attribution(&turn_ctx(), None, Some(&queued)),
+            freeze_request_attribution(&turn_ctx(), None, None, Some(&queued)),
             Err(HostCallError::HandlerError(message)) if message == "turn-not-callable"
         ));
 
         let mismatch = FixedTurnCost(CostAttributionLookup::IdentityMismatch);
         assert!(matches!(
-            freeze_request_attribution(&turn_ctx(), None, Some(&mismatch)),
+            freeze_request_attribution(&turn_ctx(), None, None, Some(&mismatch)),
             Err(HostCallError::HandlerError(message)) if message == "turn-identity-mismatch"
         ));
     }

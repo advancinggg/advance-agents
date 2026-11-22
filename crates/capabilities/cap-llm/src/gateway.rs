@@ -405,6 +405,15 @@ pub trait LlmGatewayInternal: Send + Sync {
 ///    None.
 ///  - `LlmGateway::chat_for_run(messages, params, run_id)` (round-4 C1) with
 ///    `run_id: Some(...)`, other optional fields None.
+/// A turn's host-assembled context as the gateway keeps it for the turn's guest calls: their
+/// seed, and the task the assembly settled for the turn (`None`: the agent's default
+/// partition), which those calls are attributed to.
+#[derive(Clone)]
+struct AssembledSeed {
+    messages: Arc<[LlmMessage]>,
+    task_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LlmRequestContext {
     pub agent_id: String,
@@ -662,7 +671,7 @@ pub struct LlmGateway {
     /// identity prefix). NON-trait inherent side channel (CONTRACT-081 frozen).
     /// `std::sync::Mutex` — only ever lock-copy(Arc-clone)-release, never held
     /// across an await. Default-empty so this is back-compat for all `new` callers.
-    assembled: Arc<Mutex<HashMap<String, Arc<[LlmMessage]>>>>,
+    assembled: Arc<Mutex<HashMap<String, AssembledSeed>>>,
     /// Per-agent host-owned turn transcript (ADR 2026-10-24 D4). Keyed by
     /// `agent_id`; the transcript scope inside the slot (the trusted turn id, or
     /// the key the host minted for one unprotected invocation) detects a new
@@ -3179,11 +3188,31 @@ impl LlmGateway {
     /// poisoned lock is recovered (`into_inner`) — a publish must never panic the
     /// turn; worst case a stale/missing entry degrades to "just the prompt".
     pub fn publish_assembled(&self, agent_id: &str, msgs: Arc<[LlmMessage]>) {
+        self.publish_assembled_in_task(agent_id, msgs, None);
+    }
+
+    /// [`Self::publish_assembled`], with the task the assembly settled for the turn
+    /// (MODULE-010 §1.4.2; `None`: the agent's default partition). The turn's guest calls
+    /// are made with this context, so a call that neither the guest nor the turn's message
+    /// names a task for is attributed to this one (`llm.request`, `llm.response`, the live
+    /// stream's begin frame).
+    pub fn publish_assembled_in_task(
+        &self,
+        agent_id: &str,
+        msgs: Arc<[LlmMessage]>,
+        task_id: Option<String>,
+    ) {
         let mut guard = self
             .assembled
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.insert(agent_id.to_string(), msgs);
+        guard.insert(
+            agent_id.to_string(),
+            AssembledSeed {
+                messages: msgs,
+                task_id,
+            },
+        );
     }
 
     /// Backbone Step 2 — PEEK the published assembled context for `agent_id`
@@ -3197,7 +3226,18 @@ impl LlmGateway {
             .assembled
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.get(agent_id).cloned()
+        guard.get(agent_id).map(|seed| Arc::clone(&seed.messages))
+    }
+
+    /// The task the published assembly of `agent_id`'s turn settled
+    /// ([`Self::publish_assembled_in_task`]); `None` when nothing is published, or when the
+    /// turn runs in the agent's default partition.
+    pub fn assembled_task_for(&self, agent_id: &str) -> Option<String> {
+        let guard = self
+            .assembled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.get(agent_id).and_then(|seed| seed.task_id.clone())
     }
 
     /// ADR 2026-10-24 D4 — request messages for a guest `generate` / `stream`.

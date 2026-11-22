@@ -22,6 +22,10 @@
 //!   before an entry has served it, which is the case again after every restart.
 //! - A turn indexed while its agent could not embed gets its vector at a later turn end,
 //!   once the agent chats on an entry that embeds, and is recalled from then on.
+//! - A turn runs in the task routing settles: an agent's first routed turn starts a task
+//!   (`task.created`) and is logged under it, a turn as close to that task as can be joins
+//!   it (`task.routed`), and a turn far from every task starts its own and recalls the other
+//!   tasks' turns and briefs.
 //! - Deleting an agent removes what the home's index holds under its id, and nothing of
 //!   another agent.
 //! - The prompt budget is the window of the model the agent chats on: the window its entry
@@ -42,6 +46,7 @@
 use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -91,9 +96,13 @@ struct Sent {
 ///   with that prompt's digest, and with the fact scripted for that prompt if there is
 ///   one.
 /// - Every other chat request is answered in text.
-/// - Every embedding request is answered with the SAME vector, so any stored row is as
-///   close as can be to any query: whether a row is recalled depends only on whether a
-///   vector was stored and may be compared, never on ranking.
+/// - Every embedding request is answered with the SAME vector ([`DIGEST_VECTOR`]), so any
+///   stored row is as close as can be to any query, and every turn an agent routes joins
+///   the task its first routed turn started. A peer that embeds digests apart
+///   ([`Self::embed_digests_apart`]) answers every text but a scripted digest with
+///   [`QUERY_VECTOR`] instead: every routed turn then starts a task of its own, and recall
+///   finds the earlier turns as other tasks' turns. Either way, whether a row is recalled
+///   depends only on whether a vector was stored and may be compared, never on ranking.
 /// - The turn of a prompt scripted to read a file calls `read` on it in its first round and
 ///   answers with the scripted conclusion once the result is back.
 struct Peer {
@@ -109,9 +118,22 @@ struct Peer {
     /// The prompts whose turn sees its first request after its last read refused as too
     /// long, as NEAR AI refuses it ([`NEAR_TOO_LONG`]).
     refuse_once: Mutex<Vec<&'static str>>,
+    /// Whether the scripted digests are embedded apart ([`Self::embed_digests_apart`]).
+    apart: AtomicBool,
+    /// Whether every embedding request is refused ([`Self::refuse_embeddings`]).
+    refuse_embeddings: AtomicBool,
     chats: Mutex<Vec<Sent>>,
     embeddings: Mutex<Vec<Sent>>,
 }
+
+/// The vector the peer answers an embedding request with — but a query's, once it embeds
+/// digests apart ([`Peer::embed_digests_apart`]).
+const DIGEST_VECTOR: [f32; 2] = [0.6, 0.8];
+
+/// The vector of every text but a scripted digest, once the peer embeds digests apart: at a
+/// similarity of 0.4 to [`DIGEST_VECTOR`] — below the 0.5 from which routing enters a task,
+/// above the 0.3 from which recall reads.
+const QUERY_VECTOR: [f32; 2] = [0.973_212_1, -0.229_909_08];
 
 impl Peer {
     fn new(turns: &[(&'static str, &'static str)]) -> Arc<Self> {
@@ -143,6 +165,8 @@ impl Peer {
             reads: reads.to_vec(),
             loops: Vec::new(),
             refuse_once: Mutex::new(Vec::new()),
+            apart: AtomicBool::new(false),
+            refuse_embeddings: AtomicBool::new(false),
             chats: Mutex::new(Vec::new()),
             embeddings: Mutex::new(Vec::new()),
         })
@@ -162,6 +186,8 @@ impl Peer {
             reads: reads.to_vec(),
             loops: loops.to_vec(),
             refuse_once: Mutex::new(refuse_once.to_vec()),
+            apart: AtomicBool::new(false),
+            refuse_embeddings: AtomicBool::new(false),
             chats: Mutex::new(Vec::new()),
             embeddings: Mutex::new(Vec::new()),
         })
@@ -194,6 +220,18 @@ impl Peer {
             });
         }
         Some(json_response(200, text_completion(conclusion)))
+    }
+
+    /// From now on, answer every embedding of a text but a scripted digest with
+    /// [`QUERY_VECTOR`]: no routed turn joins an earlier task, and recall still finds the
+    /// earlier turns, as other tasks' turns.
+    fn embed_digests_apart(&self) {
+        self.apart.store(true, Ordering::SeqCst);
+    }
+
+    /// From now on, refuse every embedding request (a 400): no query vector, so no routing.
+    fn refuse_embeddings(&self) {
+        self.refuse_embeddings.store(true, Ordering::SeqCst);
     }
 
     fn chats(&self) -> Vec<Sent> {
@@ -260,9 +298,23 @@ impl HttpExecutor for Peer {
             body: serde_json::from_slice(&req.body).unwrap_or(Value::Null),
         };
         Ok(match path {
-            "v1/embeddings" => {
+            "v1/embeddings" if self.refuse_embeddings.load(Ordering::SeqCst) => {
                 self.embeddings.lock().unwrap().push(sent);
-                json_response(200, json!({ "data": [{ "embedding": [0.6, 0.8] }] }))
+                json_response(
+                    400,
+                    json!({ "error": { "type": "invalid_request_error", "message": "refused" } }),
+                )
+            }
+            "v1/embeddings" => {
+                let input = text_of(&sent.body, "input");
+                let digest = self.turns.iter().any(|(_, digest)| input.contains(digest));
+                let vector = if self.apart.load(Ordering::SeqCst) && !digest {
+                    QUERY_VECTOR
+                } else {
+                    DIGEST_VECTOR
+                };
+                self.embeddings.lock().unwrap().push(sent);
+                json_response(200, json!({ "data": [{ "embedding": vector }] }))
             }
             "v1/chat/completions" => {
                 if let Some(response) = self.read_loop_step(&sent) {
@@ -551,12 +603,14 @@ async fn a_pinned_agent_embeds_only_on_its_own_provider_and_recalls_its_earlier_
         &["provider: main"],
     );
     let peer = &Peer::new(&[(FIRST_PROMPT, FIRST_DIGEST), (SECOND_PROMPT, SECOND_DIGEST)]);
+    // Each routed turn starts a task of its own: the earlier turns are other tasks'.
+    peer.embed_digests_apart();
     serve(&home, peer, |client| async move {
         client.turn(ROOT_MAILBOX, FIRST_PROMPT).await;
         client.context_with_turns(Agent::Root, 1).await;
         let first = peer.turn_prompt(FIRST_PROMPT);
         assert!(
-            !first.contains("# Recalled Context"),
+            recalled_turns(&first).is_empty(),
             "nothing to recall on the first turn: {first}"
         );
 
@@ -640,6 +694,8 @@ async fn a_child_agent_embeds_on_its_own_provider_not_on_its_parents() {
         (HELPER_SECOND_PROMPT, HELPER_SECOND_DIGEST),
         (ROOT_SECOND_PROMPT, ROOT_SECOND_DIGEST),
     ]);
+    // Each routed turn starts a task of its own: the earlier turns are other tasks'.
+    peer.embed_digests_apart();
 
     // A child created over the Client API and pinned to the other entry. A built-in
     // template ships no driver, so the child is served from the next start, once a driver
@@ -743,7 +799,7 @@ async fn a_child_agent_embeds_on_its_own_provider_not_on_its_parents() {
 }
 
 /// Two agents of one home on one entry, and so on one embedding model: every vector of
-/// one may be compared with every vector of the other, and the peer gives every text the
+/// one may be compared with every vector of the other, and the peer gives every digest the
 /// same vector, so the other's rows are as close to a query as the agent's own. Each still
 /// recalls its own turns and none of the other's — recall is the agent's, not only the
 /// model's.
@@ -763,6 +819,8 @@ async fn agents_on_one_embedding_model_recall_only_their_own_turns() {
         (HELPER_SECOND_PROMPT, HELPER_SECOND_DIGEST),
         (ROOT_SECOND_PROMPT, ROOT_SECOND_DIGEST),
     ]);
+    // Each routed turn starts a task of its own: the earlier turns are other tasks'.
+    peer.embed_digests_apart();
     serve(&home, peer, |client| async move {
         client
             .create_child(HELPER, &["fs", "llm", "memory"], MAIN)
@@ -962,7 +1020,7 @@ async fn an_entry_without_an_embedding_model_is_never_sent_an_embedding_request(
             peer.embeddings()
         );
         let second = peer.turn_prompt(SECOND_PROMPT);
-        assert!(!second.contains("# Recalled Context"), "{second}");
+        assert!(recalled_turns(&second).is_empty(), "{second}");
         assert!(second.contains(RECALL_OFF), "{second}");
         assert_eq!(
             context.pointer("/embedding/active"),
@@ -1032,6 +1090,8 @@ async fn an_agent_free_to_chat_on_several_entries_embeds_where_it_is_served() {
         &["model: main-chat"],
     );
     let peer = &Peer::new(&FOUR_TURNS);
+    // Each routed turn starts a task of its own: the earlier turns are other tasks'.
+    peer.embed_digests_apart();
     serve(&home, peer, |client| async move {
         client.turn(ROOT_MAILBOX, FIRST_PROMPT).await;
         client.context_with_turns(Agent::Root, 1).await;
@@ -1107,7 +1167,7 @@ async fn an_agent_free_to_chat_on_several_entries_embeds_where_it_is_served() {
         assert_not_embedded(peer, THIRD_PROMPT);
         let third = peer.turn_prompt(THIRD_PROMPT);
         assert!(third.contains(RECALL_OFF), "{third}");
-        assert!(!third.contains("# Recalled Context"), "{third}");
+        assert!(recalled_turns(&third).is_empty(), "{third}");
 
         client.turn(ROOT_MAILBOX, FOURTH_PROMPT).await;
         let context = client.context_with_turns(Agent::Root, 4).await;
@@ -1149,6 +1209,8 @@ async fn a_turn_indexed_without_a_vector_gets_one_once_the_agent_can_embed() {
         &["provider: other"],
     );
     let peer = &Peer::new(&FOUR_TURNS);
+    // Each routed turn starts a task of its own: the earlier turns are other tasks'.
+    peer.embed_digests_apart();
     serve(&home, peer, |client| async move {
         client.turn(ROOT_MAILBOX, FIRST_PROMPT).await;
         client.context_with_turns(Agent::Root, 1).await;
@@ -1581,6 +1643,286 @@ async fn turns_are_logged_under_their_task_and_indexed_by_line() {
     // Turn 2 names the file turn 1 read: turn 1 gained a reference.
     assert_eq!(first["reference_count"], json!(1), "{first}");
     assert_eq!(second["reference_count"], json!(0), "{second}");
+}
+
+// ---------------------------------------------------------------------------
+// A turn runs in the task routing settles (PRD §11.3.1)
+// ---------------------------------------------------------------------------
+
+const ROUTE_FIRST_PROMPT: &str = "the greenhouse vents open at nine";
+const ROUTE_FIRST_DIGEST: &str = "The user said the greenhouse vents open at nine.";
+const ROUTE_SECOND_PROMPT: &str = "and when do the greenhouse vents close?";
+const ROUTE_SECOND_DIGEST: &str = "The user asked when the greenhouse vents close.";
+const ROUTE_THIRD_PROMPT: &str = "book the van for the market on saturday";
+const ROUTE_FOURTH_PROMPT: &str = "and load the crates the night before";
+const ROUTE_THIRD_DIGEST: &str = "The user asked to book the van for the market.";
+
+/// The events of type `ty` the home has written so far (`.runtime/events/jsonl`, the
+/// production event log), in the order they were written.
+fn home_events(home: &FixtureHome, ty: &str) -> Vec<Value> {
+    let dir = home.home().join(".runtime/events/jsonl");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .flat_map(|path| {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|event| event["event_type"] == json!(ty))
+        .collect()
+}
+
+/// [`home_events`] once the home has written `n` of them.
+async fn wait_home_events(home: &FixtureHome, ty: &str, n: usize) -> Vec<Value> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let events = home_events(home, ty);
+        if events.len() >= n {
+            return events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{n} {ty} event(s) within {WAIT:?}: {events:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Whether `id` is a task id routing mints: `task-<YYYYMMDD>-<8 lowercase hex>`.
+fn is_minted_task_id(id: &str) -> bool {
+    let Some((day, tail)) = id
+        .strip_prefix("task-")
+        .and_then(|rest| rest.split_once('-'))
+    else {
+        return false;
+    };
+    day.len() == 8
+        && day.bytes().all(|b| b.is_ascii_digit())
+        && tail.len() == 8
+        && tail.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The root agent's task directories, by name.
+fn root_task_names(home: &FixtureHome) -> Vec<String> {
+    let active = home.home().join(".agent/tasks/active");
+    let mut names: Vec<String> = std::fs::read_dir(&active)
+        .unwrap_or_else(|e| panic!("{active:?}: {e}"))
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// PRD §11.3.1 and §15.3.4 on the production composition. The root's first
+/// routed turn starts a task: `task.created` names a minted id, the turn's assembly names
+/// it, and the turn is logged under `.agent/tasks/active/<id>/`. A second turn as close to
+/// that task's brief as can be joins it (`task.routed`): it carries the first turn whole in
+/// its recent window and recalls nothing. From then on the peer embeds digests apart: a
+/// third turn, far from every task, starts a task of its own and recalls the first task's
+/// two turns under `# Related Turns` and its brief under `# Related Task Briefs`. A fourth
+/// turn, while the embedder refuses, cannot be routed: it runs in the agent's current task,
+/// the task of its latest turn (the third's), as the index rows the post-processor wrote
+/// name it, with no task event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turn_runs_in_the_task_routing_settles() {
+    // A window the turns fit in whole.
+    let home = memory_home(
+        &[],
+        &[(
+            MAIN,
+            entry(
+                MAIN,
+                MAIN_HOST,
+                &[
+                    "embedding-model: main-embed",
+                    "model-context-windows: { main-chat: 1048576 }",
+                ],
+            ),
+        )],
+        &["provider: main"],
+    );
+    let peer = &Peer::new(&[
+        (ROUTE_FIRST_PROMPT, ROUTE_FIRST_DIGEST),
+        (ROUTE_SECOND_PROMPT, ROUTE_SECOND_DIGEST),
+        (ROUTE_THIRD_PROMPT, ROUTE_THIRD_DIGEST),
+    ]);
+    let at = &home;
+    let tasks = Arc::new(Mutex::new(None));
+    let noted = tasks.clone();
+    serve(&home, peer, |client| async move {
+        client.turn(ROOT_MAILBOX, ROUTE_FIRST_PROMPT).await;
+        let context = client.context_with_turns(Agent::Root, 1).await;
+        let created = wait_home_events(at, "task.created", 1).await;
+        let task = created[0]["payload"]["task_id"]
+            .as_str()
+            .expect("a task id")
+            .to_string();
+        assert!(is_minted_task_id(&task), "{task}");
+        assert_eq!(created[0]["task_id"], json!(task), "{created:#?}");
+        assert_eq!(
+            created[0]["payload"]["title"],
+            json!(format!("Task {task}")),
+            "{created:#?}"
+        );
+        // The event hangs below the turn's chain root, in the turn's trace.
+        let assembled: Vec<Value> = home_events(at, "context.assembled")
+            .into_iter()
+            .filter(|event| event["task_id"] == json!(task))
+            .collect();
+        assert_eq!(assembled.len(), 1, "{assembled:#?}");
+        assert_eq!(created[0]["parent_span_id"], assembled[0]["span_id"]);
+        assert_eq!(created[0]["trace_id"], assembled[0]["trace_id"]);
+        assert_eq!(
+            context.pointer("/latest/task_id"),
+            Some(&json!(task)),
+            "{context}"
+        );
+        assert_eq!(
+            context.pointer("/latest/routing/is_new_task"),
+            Some(&json!(true)),
+            "{context}"
+        );
+        assert_eq!(root_task_names(at), [task.clone()]);
+        // The turn's model calls are the task's: neither the guest nor the message names
+        // one, and the assembly settled it.
+        let requests = wait_home_events(at, "llm.request", 1).await;
+        assert!(
+            requests.iter().any(|event| event["task_id"] == json!(task)),
+            "{requests:#?}"
+        );
+
+        client.turn(ROOT_MAILBOX, ROUTE_SECOND_PROMPT).await;
+        let context = client.context_with_turns(Agent::Root, 2).await;
+        let routed = wait_home_events(at, "task.routed", 1).await;
+        assert_eq!(routed[0]["payload"]["task_id"], json!(task), "{routed:#?}");
+        let confidence = routed[0]["payload"]["confidence"]
+            .as_f64()
+            .expect("a confidence");
+        assert!(confidence > 0.99, "{routed:#?}");
+        assert_eq!(
+            context.pointer("/latest/task_id"),
+            Some(&json!(task)),
+            "{context}"
+        );
+        assert_eq!(
+            context.pointer("/latest/routing/is_new_task"),
+            Some(&json!(false)),
+            "{context}"
+        );
+        let second = peer.turn_prompt(ROUTE_SECOND_PROMPT);
+        assert!(recalled_turns(&second).is_empty(), "{second}");
+        let (_, recent) = second
+            .split_once("# Recent Turns")
+            .unwrap_or_else(|| panic!("the recent window: {second}"));
+        assert!(
+            recent.contains(ROUTE_FIRST_PROMPT),
+            "the first turn, whole: {second}"
+        );
+        assert_eq!(root_task_names(at), [task.clone()], "one task");
+        let log = std::fs::read_to_string(
+            at.home()
+                .join(".agent/tasks/active")
+                .join(&task)
+                .join("llm-turns.jsonl"),
+        )
+        .expect("the task's turn log");
+        assert!(
+            log.contains(ROUTE_FIRST_PROMPT) && log.contains(ROUTE_SECOND_PROMPT),
+            "{log}"
+        );
+
+        peer.embed_digests_apart();
+        client.turn(ROOT_MAILBOX, ROUTE_THIRD_PROMPT).await;
+        let context = client.context_with_turns(Agent::Root, 3).await;
+        let created = wait_home_events(at, "task.created", 2).await;
+        let other = created[1]["payload"]["task_id"]
+            .as_str()
+            .expect("a task id")
+            .to_string();
+        assert!(is_minted_task_id(&other) && other != task, "{created:#?}");
+        assert_eq!(
+            home_events(at, "task.routed").len(),
+            1,
+            "no second routing into a task"
+        );
+        assert_eq!(
+            context.pointer("/latest/task_id"),
+            Some(&json!(other)),
+            "{context}"
+        );
+        let third = peer.turn_prompt(ROUTE_THIRD_PROMPT);
+        let recalled = recalled_turns(&third);
+        assert_eq!(recalled.len(), 2, "the first task's two turns: {third}");
+        assert!(recalled.iter().all(|turn| turn.contains(&task)), "{third}");
+        let (_, briefs) = third
+            .split_once("# Related Task Briefs\n")
+            .unwrap_or_else(|| panic!("the related task briefs: {third}"));
+        let briefs = briefs.split("\n# ").next().unwrap_or_default();
+        assert!(
+            briefs.contains(ROUTE_FIRST_DIGEST),
+            "the first task's brief: {third}"
+        );
+        assert_eq!(
+            context.pointer("/latest/history/l5_related_briefs"),
+            Some(&json!(1)),
+            "{context}"
+        );
+        let history = &context["latest"]["history"];
+        assert_eq!(
+            history["related_turns"].as_u64().unwrap_or(0)
+                + history["related_turn_digests"].as_u64().unwrap_or(0),
+            2,
+            "{context}"
+        );
+
+        peer.refuse_embeddings();
+        client.turn(ROOT_MAILBOX, ROUTE_FOURTH_PROMPT).await;
+        let context = client.context_with_turns(Agent::Root, 4).await;
+        assert_eq!(
+            context.pointer("/latest/task_id"),
+            Some(&json!(other)),
+            "{context}"
+        );
+        assert_eq!(
+            context.pointer("/latest/routing/method"),
+            Some(&json!("current")),
+            "{context}"
+        );
+        assert_eq!(
+            context.pointer("/latest/routing/is_new_task"),
+            Some(&json!(false)),
+            "{context}"
+        );
+        assert_eq!(home_events(at, "task.created").len(), 2, "no new task");
+        assert_eq!(home_events(at, "task.routed").len(), 1, "no routing");
+        let log = std::fs::read_to_string(
+            at.home()
+                .join(".agent/tasks/active")
+                .join(&other)
+                .join("llm-turns.jsonl"),
+        )
+        .expect("the current task's turn log");
+        assert!(log.contains(ROUTE_FOURTH_PROMPT), "{log}");
+        *noted.lock().unwrap() = Some((task, other));
+    })
+    .await;
+
+    let (task, other) = tasks.lock().unwrap().clone().expect("noted");
+    let mut both = vec![task, other];
+    both.sort();
+    assert_eq!(root_task_names(&home), both);
 }
 
 // ---------------------------------------------------------------------------

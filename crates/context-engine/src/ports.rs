@@ -88,10 +88,19 @@ pub struct TurnHit {
     pub task_id: String,
     pub similarity: f32,
     pub timestamp: SystemTime,
-    /// Producer-supplied text (the turn digest) rendered in `# Recalled Context`.
+    /// Producer-supplied text (the turn digest) rendered in `# Related Turns` (⑯).
     /// Untrusted; the renderer byte-caps + sanitizes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+    /// The turn's number in its task, when the producer knows it: ⑯ can then load
+    /// the turn whole ([`RecentTurnsReader::read_turns`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u64>,
+    /// The turn's PRD §11.3.4 retention score at this read, when the producer can
+    /// score it. ⑯ keeps a scored turn by its score (§11.3.5); an unscored one is
+    /// loaded as its digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<f32>,
 }
 
 /// One content-index hit. Minimal mirror — only the fields Slice B needs for
@@ -176,6 +185,38 @@ pub trait UnifiedSearchPort: Send + Sync {
         query: &str,
         query_embedding: &[f32],
     ) -> Result<UnifiedSearchResult, PortError>;
+
+    /// [`Self::search`] for a turn that runs in `current_task_id` (`None`: in no task, that is
+    /// in the agent's default partition): PRD §11.3.1 recalls other tasks' turns and briefs
+    /// ("task_id != 当前 task"). A port that can leave the task out before it cuts its lists
+    /// overrides this, so the task's own turns and its brief take no place in them (for a turn
+    /// in no task, the default partition's); the default runs [`Self::search`], and the
+    /// coordinator drops the task's entries from what it returns.
+    async fn search_other_tasks(
+        &self,
+        agent_id: &str,
+        query: &str,
+        query_embedding: &[f32],
+        _current_task_id: Option<&str>,
+    ) -> Result<UnifiedSearchResult, PortError> {
+        self.search(agent_id, query, query_embedding).await
+    }
+
+    /// PRD §11.3.5 "同 Task 较早历史": the turns of `task_id` (an empty id: the agent's
+    /// default partition) the query recalls — the semantic and the keyword candidates,
+    /// up to `limit` of each — with their retention scores. `None`: the port does not
+    /// search a task's turns (the default), and its earlier turns come from the L2
+    /// reader as they are.
+    async fn search_task_turns(
+        &self,
+        _agent_id: &str,
+        _task_id: &str,
+        _query: &str,
+        _query_embedding: &[f32],
+        _limit: usize,
+    ) -> Result<Option<Vec<TurnHit>>, PortError> {
+        Ok(None)
+    }
 }
 
 /// Stands in for CONTRACT-031/032 task-index top-N-by-similarity (MODULE-004).
@@ -189,6 +230,16 @@ pub trait TaskIndexPort: Send + Sync {
         query_embedding: &[f32],
         n: usize,
     ) -> Result<Vec<TaskHit>, PortError>;
+
+    /// The agent's current task: the task its latest turn ran in, as the one of its tasks
+    /// with the latest `last_turn_at`. A default partition and a task of the `auto:`
+    /// namespace are never the current task. `None` when the agent has none, or the index
+    /// cannot say (the default). A turn routing cannot settle runs in it (MODULE-010
+    /// §1.4.2).
+    async fn current_task(&self, agent_id: &str) -> Result<Option<String>, PortError> {
+        let _ = agent_id;
+        Ok(None)
+    }
 }
 
 /// Stands in for CONTRACT-081 `embed()` (MODULE-009 cap-llm).
@@ -492,6 +543,19 @@ pub trait RecentTurnsReader: Send + Sync {
         task_id: &str,
         count: usize,
     ) -> Result<Vec<RecentTurn>, PortError>;
+
+    /// The turns of `task_id` numbered in `turns` (an empty id: the agent's default
+    /// partition), oldest first; a turn the reader cannot find is left out. ⑯ loads a
+    /// task's earlier turn, or another task's turn, whole with it. Default: none (such
+    /// a turn is loaded as its digest).
+    async fn read_turns(
+        &self,
+        _agent_id: &str,
+        _task_id: &str,
+        _turns: &[u64],
+    ) -> Result<Vec<RecentTurn>, PortError> {
+        Ok(Vec::new())
+    }
 }
 
 /// The reader of an agent without a turn log: no recent turns.
@@ -693,12 +757,23 @@ pub struct AssemblyHistoryReport {
     pub l2_digests: u32,
     pub l3_epoch: bool,
     pub l4_task_summary: bool,
+    /// ⑭ L5: briefs of other tasks the message resembles (PRD §11.3.1, at most 3).
     pub l5_related_briefs: u32,
+    /// ⑭ task syntheses shown with the task summary.
+    pub task_syntheses: u32,
     /// ⑯ recent turns of the task loaded whole (L0-processed).
     pub recent_turns: u32,
     /// ⑯ recent turns loaded as their digest: a file they read has changed since, they did
     /// not fit, or the mode loads digests only.
     pub recent_turn_digests: u32,
+    /// ⑯ earlier turns of the task the message recalls, loaded whole (PRD §11.3.5).
+    pub earlier_turns: u32,
+    /// ⑯ earlier turns of the task the message recalls, loaded as their digest.
+    pub earlier_turn_digests: u32,
+    /// ⑯ turns of other tasks the message recalls, loaded whole.
+    pub related_turns: u32,
+    /// ⑯ turns of other tasks the message recalls, loaded as their digest.
+    pub related_turn_digests: u32,
 }
 
 /// The model an agent chats on, and the context window its provider entry gives for it

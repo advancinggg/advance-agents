@@ -55,13 +55,28 @@ impl UnifiedSearchPort for FixtureSearch {
         _q: &[f32],
     ) -> Result<UnifiedSearchResult, PortError> {
         Ok(UnifiedSearchResult {
-            turns: vec![TurnHit {
-                id: "turn-3".into(),
-                task_id: "old-task".into(),
-                similarity: 0.81,
-                timestamp: SystemTime::UNIX_EPOCH,
-                snippet: Some("User asked to deploy\nthe service".into()),
-            }],
+            turns: vec![
+                TurnHit {
+                    id: "other-task#turn-3".into(),
+                    task_id: "other-task".into(),
+                    similarity: 0.81,
+                    timestamp: SystemTime::UNIX_EPOCH,
+                    snippet: Some("User asked to deploy\nthe service".into()),
+                    turn: Some(3),
+                    retention: None,
+                },
+                // A turn of the task the message routes to is that task's own
+                // history, not another task's: recall leaves it out.
+                TurnHit {
+                    id: "old-task#turn-1".into(),
+                    task_id: "old-task".into(),
+                    similarity: 0.95,
+                    timestamp: SystemTime::UNIX_EPOCH,
+                    snippet: Some("a turn of the routed task".into()),
+                    turn: Some(1),
+                    retention: None,
+                },
+            ],
             ..Default::default()
         })
     }
@@ -285,23 +300,40 @@ async fn prompt_is_embedded_once_and_recall_carries_snippets() {
         1,
         "L1 + recall + routing share ONE query embedding"
     );
-    let recall = &res.messages[idx_of(&res.messages, "# Recalled Context")];
+    // Another task's turn is ⑯ history (PRD §11.3.2), after the 2→3 breakpoint; an
+    // unscored one loads as its digest.
+    let bp2 = idx_of(&res.messages, "<!-- ctx-cache-breakpoint:2->3 -->");
+    let related_at = idx_of(&res.messages, "# Related Turns");
+    let related = &res.messages[related_at];
+    assert!(bp2 < related_at, "other tasks' turns sit in Tier 3");
     assert!(
-        recall
+        related
             .content
-            .contains("- turn-3 (0.810) — User asked to deploy the service"),
+            .contains("- other-task#turn-3 (0.810) — User asked to deploy the service"),
         "snippet rendered single-line: {}",
-        recall.content
+        related.content
     );
+    assert!(!res
+        .messages
+        .iter()
+        .any(|m| m.content.contains("a turn of the routed task")));
+    // Contents and memories are all ⑮ holds: with none, no section.
+    assert!(!res
+        .messages
+        .iter()
+        .any(|m| m.content.starts_with("# Recalled Context")));
     // Routing: the task index matched above threshold → existing task, real
-    // confidence + method.
+    // confidence + method, and the turn runs in it.
     assert!(!res.is_new_task);
+    assert_eq!(res.task_id.as_deref(), Some("old-task"));
     assert_eq!(res.routing_method, ROUTING_METHOD_SEARCH);
     assert!((res.routing_confidence - 0.9).abs() < 1e-6);
 
     let reports = sink.0.lock().unwrap();
     assert!(reports[0].recall.attempted);
     assert_eq!(reports[0].recall.turns, 1);
+    assert_eq!(reports[0].history.related_turn_digests, 1);
+    assert_eq!(reports[0].history.related_turns, 0);
     assert!((reports[0].routing_confidence - 0.9).abs() < 1e-6);
 }
 
@@ -321,10 +353,11 @@ async fn blank_prompt_skips_embedding_and_routing() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(res.is_new_task);
     assert_eq!(res.routing_confidence, 0.0);
-    assert!(!res
-        .messages
-        .iter()
-        .any(|m| m.content.starts_with("# Recalled Context")));
+    assert!(!res.messages.iter().any(|m| {
+        m.content.starts_with("# Recalled Context") || m.content.starts_with("# Related Turns")
+    }));
+    // No routing ran: the turn stays in the agent's default partition.
+    assert_eq!(res.task_id, None);
 }
 
 #[tokio::test]

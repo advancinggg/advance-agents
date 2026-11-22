@@ -1901,10 +1901,11 @@ async fn briefs_of_no_recorded_model_are_embedded_again_from_the_first_turn_end(
     assert_eq!(rig.embedder.requests(), 3);
 }
 
-/// Briefs and digests are caught up together, the most recently written first
-/// whichever table they are in, and share the one allowance of a turn end.
+/// The briefs are caught up before the digests, each the most recently written first,
+/// and both share the one allowance of a turn end: task routing compares a message with
+/// every brief.
 #[tokio::test]
-async fn briefs_and_digests_share_one_allowance_most_recent_first() {
+async fn briefs_go_before_digests_and_share_one_allowance() {
     let rig = rig(Some("embed-a"));
     // Six briefs and six digests written in turn, oldest first.
     for n in 1..=6 {
@@ -1917,20 +1918,20 @@ async fn briefs_and_digests_share_one_allowance_most_recent_first() {
     assert_eq!(
         rig.embedder.requested(),
         [
-            "digest 6\n",
             "brief 6",
-            "digest 5\n",
             "brief 5",
-            "digest 4\n",
             "brief 4",
-            "digest 3\n",
-            "brief 3"
+            "brief 3",
+            "brief 2",
+            "brief 1",
+            "digest 6\n",
+            "digest 5\n"
         ]
     );
     assert_eq!(rig.c.heal_vectors("a").await.unwrap(), 4);
     assert_eq!(
         rig.embedder.requested()[8..],
-        ["digest 2\n", "brief 2", "digest 1\n", "brief 1"]
+        ["digest 4\n", "digest 3\n", "digest 2\n", "digest 1\n"]
     );
     assert_eq!(rig.c.heal_vectors("a").await.unwrap(), 0);
     assert_eq!(rig.embedder.requests(), 12);

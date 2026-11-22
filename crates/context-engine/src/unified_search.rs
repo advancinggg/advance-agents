@@ -10,11 +10,15 @@
 //! 2. Calls [`UnifiedSearchPort`] (CONTRACT-032 stand-in). A port error →
 //!    `AssemblyError::MemoryStoreFailure`.
 //! 3. **Enforces the §1.3.1 cross-task invariant**: `UnifiedSearchResult.turns`
-//!    is documented "cross-task only (task_id != current)", but the
-//!    CONTRACT-032 `search` surface takes no `current_task_id` and applies no
-//!    such filter — the *coordinator* owns dropping any returned turn whose
-//!    `task_id == current_task_id`. Tasks/contents/memories pass through
-//!    source-separated (the 4 typed fields ARE the source separation).
+//!    is documented "cross-task only (task_id != current)". The coordinator asks
+//!    the port for other tasks' entries ([`UnifiedSearchPort::search_other_tasks`],
+//!    which a port that can leave the task out before it cuts its lists
+//!    overrides; CONTRACT-032's `search` takes no `current_task_id`), and still
+//!    drops any returned turn whose `task_id == current_task_id`, and the current
+//!    task itself from the related tasks (§11.3.1 L5: briefs of "非目标 task"
+//!    only).
+//!    Contents/memories pass through source-separated (the 4 typed fields ARE
+//!    the source separation).
 //!
 //! Tier 2 ⑮ assembly-wiring of the result into the prompt (with CONTRACT-114
 //! Layer-2 boundary marking) is a tracked §3.6 future-slice deferral —
@@ -43,7 +47,8 @@ impl UnifiedSearchCoordinator {
 
     /// Run a unified search for `agent_id` / `query`. `current_task_id` is the
     /// task the agent is currently on (if any) — turns from THAT task are
-    /// dropped to honor the §1.3.1 cross-task-only invariant.
+    /// dropped to honor the §1.3.1 cross-task-only invariant, and the task is
+    /// no related task of itself.
     pub async fn unified_search(
         &self,
         agent_id: &str,
@@ -79,15 +84,17 @@ impl UnifiedSearchCoordinator {
         // 2. Delegate to the CONTRACT-032 stand-in.
         let mut result: UnifiedSearchResult = self
             .search
-            .search(agent_id, query, &q)
+            .search_other_tasks(agent_id, query, &q, current_task_id)
             .await
             .map_err(|e| AssemblyError::MemoryStoreFailure(e.0))?;
 
         // 3. Enforce the §1.3.1 cross-task invariant on `turns` (the
         //    coordinator's owned value-add — the port may legitimately return
-        //    same-task turns). Tasks/contents/memories untouched.
+        //    same-task turns), and keep the current task out of the related
+        //    tasks. Contents/memories untouched.
         if let Some(cur) = current_task_id {
             result.turns.retain(|t| t.task_id != cur);
+            result.tasks.retain(|t| t.task_id != cur);
         }
 
         Ok(result)

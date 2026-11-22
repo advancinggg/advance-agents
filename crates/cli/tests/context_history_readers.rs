@@ -122,7 +122,9 @@ async fn t6_readers_project_seeded_fixtures() {
         summary("agent:a", "task-1", "the task brief"),
     );
 
-    let reader = CapMemoryHistoryReader::new(root.to_path_buf(), vec!["agent:a".to_string()]);
+    // The reader takes the directory that holds the task directories; the fixtures sit
+    // under `<root>/tasks`, the layout the history builders read (T7).
+    let reader = CapMemoryHistoryReader::new(root.join("tasks"), vec!["agent:a".to_string()]);
 
     let digests = reader.read_digests("agent:a", "task-1").await.unwrap();
     assert_eq!(digests.len(), 1);
@@ -164,7 +166,9 @@ async fn t6b_path_traversal_and_id_mismatch_rejected() {
         summary("agent:evil", "other-task", "secret brief"),
     );
 
-    let reader = CapMemoryHistoryReader::new(root.to_path_buf(), vec!["agent:a".to_string()]);
+    // The reader takes the directory that holds the task directories; the fixtures sit
+    // under `<root>/tasks`, the layout the history builders read (T7).
+    let reader = CapMemoryHistoryReader::new(root.join("tasks"), vec!["agent:a".to_string()]);
 
     // Embedded id mismatch → records rejected (no cross-task/agent leak), even
     // though the file physically lives under tasks/task-1/.
@@ -193,7 +197,7 @@ async fn t6b_path_traversal_and_id_mismatch_rejected() {
         "L3 is gated on the file genuinely belonging to the task (no matching turn → None)"
     );
 
-    // Path-traversal task_id → refused (no read outside the memory root).
+    // Path-traversal task_id → refused (no read outside the tasks root).
     for evil in ["../escape", "a/b", "..", "with/slash"] {
         assert!(
             reader

@@ -28,11 +28,13 @@
 //! What a scripted peer cannot show, and these do:
 //! - the service takes the requests the engine really makes (the turn, the turn-end
 //!   extraction, the embeddings), with the models the entry names;
-//! - vectors of a real embedding model rank an earlier turn about the question's subject
-//!   above turns about something else, and the model answers from what was recalled —
-//!   also after a restart, from the index on disk;
+//! - vectors of a real embedding model route a question into the task of the earlier turn
+//!   about its subject, and not turns about something else, and the model answers from that
+//!   turn, carried in the question's recent window — also after a restart, from the index on
+//!   disk (PRD §11.3.1); where a short follow-up is routed is reported;
 //! - a turn indexed while its agent could not embed is recalled once it can;
-//! - a child agent recalls its own turns and nothing of its parent's;
+//! - a child agent's question joins its own earlier turn's task, and nothing of its parent's
+//!   reaches it;
 //! - the knowledge a real model extracts from a deleted agent's turn is taken over by its
 //!   parent, as history, and recalled by it;
 //! - when a real model answers a Client API message with a tool call first, the answer of
@@ -491,10 +493,65 @@ fn brief(text: &str, limit: usize) -> String {
     }
 }
 
+/// The similarity a recalled turn's digest line shows: `- {id} ({similarity}) — {digest}`.
+fn similarity(line: &str) -> Option<f32> {
+    let (_, rest) = line.strip_prefix("- ")?.split_once(" (")?;
+    rest.split_once(')')?.0.parse().ok()
+}
+
 /// Whether `text` names one of `words`, whatever the case.
 fn mentions(text: &str, words: &[&str]) -> bool {
     let text = text.to_lowercase();
     words.iter().any(|word| text.contains(&word.to_lowercase()))
+}
+
+/// The task the latest assembly of `context` ran in, routed to a new task or an existing one
+/// as `new` says (PRD §11.3.1).
+fn routed_task(context: &Value, new: bool) -> String {
+    assert_eq!(
+        context.pointer("/latest/routing/is_new_task"),
+        Some(&Value::Bool(new)),
+        "{context}"
+    );
+    context
+        .pointer("/latest/task_id")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("the turn ran in a task: {context}"))
+        .to_string()
+}
+
+/// What an assembled prompt carries from `# Recent Turns` on (MODULE-010 §1.4.3 ⑯): the task's
+/// latest turns, then the turn's own messages. Empty when no turn is carried whole.
+fn from_recent_turns(prompt: &str) -> &str {
+    prompt
+        .split_once("# Recent Turns")
+        .map_or("", |(_, rest)| rest)
+}
+
+/// Report where routing put the turn of `said` (PRD §11.3.1): its task, whether it is
+/// `task`, and the top-1 similarity behind the decision.
+fn report_routing(context: &Value, said: &str, task: &str) {
+    let ran_in = context
+        .pointer("/latest/task_id")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    println!(
+        "LIVE routing of {said:?}: {} task {ran_in} ({}), confidence {}",
+        if context.pointer("/latest/routing/is_new_task") == Some(&Value::Bool(true)) {
+            "a new"
+        } else {
+            "the existing"
+        },
+        if ran_in == task {
+            "the earlier turn's task"
+        } else {
+            "another task"
+        },
+        context
+            .pointer("/latest/routing/confidence")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+    );
 }
 
 /// Run a turn of the root agent to its end and return what crossed the network.
@@ -691,10 +748,12 @@ const CODENAME_QUESTION: &str =
     "What is the internal codename of the autumn release? Answer with the codename only.";
 const CODENAME_QUESTION_AGAIN: &str =
     "Remind me, which codename did I give you for the autumn release? Answer with the codename only.";
+/// Short follow-ups that name no subject of their own: where routing puts them is reported.
+const FOLLOW_UPS: [&str; 2] = ["why?", "继续"];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "calls a real model service; set the ADVANCE_LIVE_LLM_* variables"]
-async fn a_real_model_recalls_an_earlier_turn_by_what_it_means() {
+async fn a_real_model_routes_a_question_into_the_task_of_the_turn_it_is_about() {
     let Some(live) = live() else { return };
     let live = &live;
     let home = memory_home(true, &[], &[live.entry(NEAR, true)], &["provider: near"]);
@@ -704,11 +763,13 @@ async fn a_real_model_recalls_an_earlier_turn_by_what_it_means() {
     let noted = seen.clone();
     serve(&home, tap.security(), WAIT, |client| async move {
         let fact = root_turn(tap, &client, live, CODENAME_FACT).await;
-        client.context_with_turns(Agent::Root, 1).await;
+        let context = client.context_with_turns(Agent::Root, 1).await;
         assert!(
             fact.recalled().is_empty(),
             "nothing to recall on the first turn"
         );
+        // The first routed turn starts a task.
+        let task = routed_task(&context, true);
         // The prompt (query side) and the turn's text (index side) were both embedded.
         let dimensions = fact.assert_embedded();
         assert!(
@@ -721,37 +782,61 @@ async fn a_real_model_recalls_an_earlier_turn_by_what_it_means() {
             "the turn-end extraction was asked for once"
         );
 
-        root_turn(tap, &client, live, PLANTS_NOTE).await;
-        root_turn(tap, &client, live, LUNCH_NOTE).await;
-        client.context_with_turns(Agent::Root, 3).await;
+        // Two notes about something else: neither joins the codename's task.
+        for (turns, note) in [(2, PLANTS_NOTE), (3, LUNCH_NOTE)] {
+            root_turn(tap, &client, live, note).await;
+            let context = client.context_with_turns(Agent::Root, turns).await;
+            report_routing(&context, note, &task);
+            assert_ne!(
+                context.pointer("/latest/task_id").and_then(Value::as_str),
+                Some(task.as_str()),
+                "{note:?} is not about the codename: {context}"
+            );
+        }
 
         let question = root_turn(tap, &client, live, CODENAME_QUESTION).await;
         let context = client.context_with_turns(Agent::Root, 4).await;
         assert_eq!(question.assert_embedded(), dimensions);
-        let recalled = question.recalled();
+        report_routing(&context, CODENAME_QUESTION, &task);
         let prompt = question.prompt();
         assert!(
             prompt.contains("- recall: semantic"),
             "the runtime section reports the live route: {prompt}"
         );
-        // Of the three earlier turns the one about the codename is the closest to the
-        // question — by the vectors of a real embedding model.
-        let best = recalled
-            .first()
-            .unwrap_or_else(|| panic!("the question recalls an earlier turn: {prompt}"));
+        // By the vectors of a real embedding model the question is about the codename: it
+        // runs in the task of the turn that gave the codename, and carries that turn whole.
+        assert_eq!(routed_task(&context, false), task, "{context}");
         assert!(
-            mentions(best, &["bluebird", "codename"]),
-            "the closest turn is the one about the codename: {recalled:#?}"
+            context
+                .pointer("/latest/routing/confidence")
+                .and_then(Value::as_f64)
+                .is_some_and(|confidence| confidence >= 0.5),
+            "{context}"
         );
         assert!(
-            !mentions(best, &["plants", "lunch", "cafe"]),
-            "the closest turn is not one about something else: {recalled:#?}"
+            mentions(from_recent_turns(&prompt), &["bluebird"]),
+            "the codename's turn is in the question's recent window: {prompt}"
+        );
+        assert!(
+            !question
+                .recalled()
+                .iter()
+                .any(|turn| mentions(turn, &["bluebird"])),
+            "the task's own turn is not recalled as another task's: {:#?}",
+            question.recalled()
         );
         assert!(
             mentions(&question.answer(), &["7431"]),
             "the model answers from what the engine gave it: {:?}",
             question.answer()
         );
+
+        // Where routing puts a follow-up that names no subject of its own.
+        for (turns, follow_up) in [(5, FOLLOW_UPS[0]), (6, FOLLOW_UPS[1])] {
+            root_turn(tap, &client, live, follow_up).await;
+            let context = client.context_with_turns(Agent::Root, turns).await;
+            report_routing(&context, follow_up, &task);
+        }
 
         assert_eq!(
             context.pointer("/embedding/active"),
@@ -763,37 +848,30 @@ async fn a_real_model_recalls_an_earlier_turn_by_what_it_means() {
             Some(&serde_json::json!(live.embedding_model)),
             "{context}"
         );
-        assert!(
-            context
-                .pointer("/latest/recall/turns")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                >= 1,
-            "{context}"
-        );
         let root = client.listed_id(Agent::Root).await.expect("the root");
-        *noted.lock().unwrap() = Some((root, dimensions));
+        *noted.lock().unwrap() = Some((root, dimensions, task));
     })
     .await;
 
     // The index on disk: every turn has a text and a vector of the service's model.
-    let (root, dimensions) = seen.lock().unwrap().clone().expect("the first start ran");
+    let (root, dimensions, task) = seen.lock().unwrap().clone().expect("the first start ran");
     let rows = indexed_turns(&home, &root);
-    assert_eq!(rows.len(), 4, "one row for each turn");
+    assert_eq!(rows.len(), 6, "one row for each turn");
     assert_rows_embedded(&rows, live, dimensions);
 
-    // A restart: the agent is pinned, so its first prompt is embedded at once, and the
-    // turns indexed before the restart are recalled from the index on disk.
+    // A restart: the agent is pinned, so its first prompt is embedded at once, and it is
+    // routed by the index on disk into the codename's task, whose turns it carries.
+    let task = &task;
     serve(&home, tap.security(), WAIT, |client| async move {
         let again = root_turn(tap, &client, live, CODENAME_QUESTION_AGAIN).await;
-        client.context_with_turns(Agent::Root, 5).await;
+        let context = client.context_with_turns(Agent::Root, 7).await;
         assert_eq!(again.assert_embedded(), dimensions);
-        let recalled = again.recalled();
+        report_routing(&context, CODENAME_QUESTION_AGAIN, task);
+        assert_eq!(&routed_task(&context, false), task, "{context}");
         assert!(
-            recalled
-                .first()
-                .is_some_and(|best| mentions(best, &["bluebird", "codename"])),
-            "after a restart the closest turn is still one about the codename: {recalled:#?}"
+            mentions(from_recent_turns(&again.prompt()), &["bluebird"]),
+            "after a restart the codename's turn is still in the window: {}",
+            again.prompt()
         );
         assert!(
             mentions(&again.answer(), &["7431"]),
@@ -852,10 +930,17 @@ async fn a_turn_indexed_before_its_agent_could_embed_is_recalled_once_it_can() {
         let question = root_turn(tap, &client, live, WORKSHOP_QUESTION).await;
         client.context_with_turns(Agent::Root, 3).await;
         let recalled = question.recalled();
+        let caught_up = recalled
+            .iter()
+            .find(|turn| mentions(turn, &["juniper", "workshop"]))
+            .and_then(|turn| similarity(turn));
+        // `# Related Turns` goes by retention score (PRD §11.3.5): the turn caught up is
+        // the most similar of the turns recalled, wherever it stands.
         assert!(
-            recalled
-                .first()
-                .is_some_and(|best| mentions(best, &["juniper", "workshop"])),
+            caught_up.is_some_and(|best| recalled
+                .iter()
+                .filter_map(|turn| similarity(turn))
+                .all(|other| other <= best)),
             "the turn indexed without a vector is the closest to the question: {recalled:#?}"
         );
         assert!(
@@ -889,7 +974,7 @@ const ELEVATOR_QUESTION: &str =
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "calls a real model service; set the ADVANCE_LIVE_LLM_* variables"]
-async fn a_child_agent_recalls_its_own_turns_and_nothing_of_its_parents() {
+async fn a_child_agents_question_joins_its_own_turns_task_and_sees_nothing_of_its_parents() {
     let Some(live) = live() else { return };
     let live = &live;
     // A child is served only on a home whose root declares `messaging`.
@@ -919,19 +1004,23 @@ async fn a_child_agent_recalls_its_own_turns_and_nothing_of_its_parents() {
         let dimensions = book.assert_embedded();
 
         let fact = child_turn(tap, &client, live, HELPER_MAILBOX, ELEVATOR_FACT).await;
-        client.context_with_turns(Agent::Child(HELPER), 1).await;
+        let helper = client.context_with_turns(Agent::Child(HELPER), 1).await;
         assert_eq!(fact.assert_embedded(), dimensions);
+        let task = routed_task(&helper, true);
 
         let question = child_turn(tap, &client, live, HELPER_MAILBOX, ELEVATOR_QUESTION).await;
         let helper = client.context_with_turns(Agent::Child(HELPER), 2).await;
-        let recalled = question.recalled();
-        assert!(
-            recalled
-                .first()
-                .is_some_and(|best| mentions(best, &["elevator"])),
-            "the child recalls its own earlier turn: {recalled:#?}"
+        report_routing(&helper, ELEVATOR_QUESTION, &task);
+        assert_eq!(
+            routed_task(&helper, false),
+            task,
+            "the child's question joins its own earlier turn's task: {helper}"
         );
         let prompt = question.prompt();
+        assert!(
+            mentions(from_recent_turns(&prompt), &["thursday"]),
+            "the child's earlier turn is in its question's recent window: {prompt}"
+        );
         assert!(
             !mentions(&prompt, &["maple orchard", "reading club"]),
             "nothing of the parent's turn is in the child's context: {prompt}"

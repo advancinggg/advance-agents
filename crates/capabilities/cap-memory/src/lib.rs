@@ -92,8 +92,8 @@ pub use persistence::{
     MAX_LINE_BYTES,
 };
 pub use post_processor::{
-    default_task_partition, CatchUpError, Components, DescriptionIndexer, IndexedDescription,
-    L6Dispatch, PostProcessor,
+    default_task_partition, is_default_task_partition, CatchUpError, Components,
+    DescriptionIndexer, IndexedDescription, L6Dispatch, PostProcessor,
 };
 pub use reconcile::{
     InMemorySimilarityIndex, MemoryAction, Reconciler, SimilarityIndex, DEFAULT_THRESHOLD,

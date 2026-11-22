@@ -51,7 +51,7 @@ pub struct ClientContextSection {
 /// How the turn was routed.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ClientContextRouting {
-    /// `search` | `llm`.
+    /// `search` | `llm` | `current` (the agent's current task: routing could not settle one).
     pub method: String,
     /// Top-1 task similarity behind the decision (`0` when no task matched / no routing ran).
     pub confidence: f32,
@@ -78,7 +78,11 @@ pub struct ClientContextHistory {
     pub l2_digests: u32,
     pub l3_epoch: bool,
     pub l4_task_summary: bool,
+    /// Briefs of other tasks the message resembles (at most 3).
     pub l5_related_briefs: u32,
+    /// Task syntheses shown with the task summary.
+    #[serde(default)]
+    pub task_syntheses: u32,
     /// Recent turns of the task loaded whole (L0-processed).
     #[serde(default)]
     pub recent_turns: u32,
@@ -86,6 +90,18 @@ pub struct ClientContextHistory {
     /// the mode loads digests only).
     #[serde(default)]
     pub recent_turn_digests: u32,
+    /// Earlier turns of the task the message recalls, loaded whole.
+    #[serde(default)]
+    pub earlier_turns: u32,
+    /// Earlier turns of the task the message recalls, loaded as their digest.
+    #[serde(default)]
+    pub earlier_turn_digests: u32,
+    /// Turns of the agent's other tasks the message recalls, loaded whole.
+    #[serde(default)]
+    pub related_turns: u32,
+    /// Turns of the agent's other tasks the message recalls, loaded as their digest.
+    #[serde(default)]
+    pub related_turn_digests: u32,
 }
 
 /// The latest assembled prompt of an agent.

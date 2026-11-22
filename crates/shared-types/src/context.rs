@@ -50,16 +50,24 @@ pub const RECENT_TURNS_HEADING: &str = "# Recent Turns\n";
 pub const RECENT_TURN_DIGESTS_HEADING: &str = "# Recent Turn Digests\n";
 /// The first line of the section of the task's epoch summary (L3).
 pub const EPOCH_SUMMARY_HEADING: &str = "# Epoch Summary\n";
+/// The first line of the ⑯ section of the task's earlier turns the query recalled, loaded whole.
+pub const EARLIER_TURNS_HEADING: &str = "# Earlier Turns\n";
+/// The first line of the ⑯ section of other tasks' turns the query recalled (PRD §11.3.5
+/// "跨 Task 历史").
+pub const RELATED_TURNS_HEADING: &str = "# Related Turns\n";
 
 /// The first lines of the Tier 3 history sections of an assembled context: the task's recent
-/// turns, their digests and its epoch summary. The context engine opens each of these system
-/// messages with one of them, and no other; the gateway takes these sections out first when a
-/// turn's request outgrows the model's window (MODULE-010 S6), so Tier 1 and Tier 2, the
-/// cache prefix, stay as they were sent.
-pub const TIER3_HISTORY_HEADINGS: [&str; 3] = [
+/// turns, their digests, its epoch summary, its earlier turns and other tasks' turns the query
+/// recalled. The context engine opens each of these system messages with one of them, and no
+/// other; the gateway takes these sections out first when a turn's request outgrows the
+/// model's window (MODULE-010 S6), so Tier 1 and Tier 2, the cache prefix, stay as they were
+/// sent.
+pub const TIER3_HISTORY_HEADINGS: [&str; 5] = [
     RECENT_TURNS_HEADING,
     RECENT_TURN_DIGESTS_HEADING,
     EPOCH_SUMMARY_HEADING,
+    EARLIER_TURNS_HEADING,
+    RELATED_TURNS_HEADING,
 ];
 
 /// Whether `content` is one of the Tier 3 history sections ([`TIER3_HISTORY_HEADINGS`]).
@@ -124,11 +132,18 @@ pub struct AssemblyContext {
 #[serde(deny_unknown_fields)]
 pub struct AssemblyResult {
     pub messages: Vec<LlmMessage>,
-    /// "search" | "llm".
+    /// "search" | "llm" | "current" (the agent's current task: routing could not settle one).
     pub routing_method: String,
     pub routing_confidence: f32,
     pub is_new_task: bool,
     pub tier_token_counts: TierTokenCounts,
+    /// The task the turn runs in (PRD §11.3.1): the one the message names, the one routing
+    /// chose, one minted for a new task, or the agent's current task when routing could not
+    /// settle one. `None`: the agent's default partition (a control, system or auto message
+    /// that names no task, or no current task to fall back to). The agent loop binds it onto
+    /// the message, so the turn is logged and post-processed under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 /// CONTRACT-090 — context-engine trait. MODULE-010 §2.3:309-322.

@@ -36,7 +36,9 @@ use async_trait::async_trait;
 
 use advance_shared_types::agent_tree::{AgentState, AgentStatus};
 use advance_shared_types::context::{AssemblyContext, ContextAssembler};
-use advance_shared_types::mailbox::{AgentActionDispatcher, MailboxReader, MailboxTurnIdentity};
+use advance_shared_types::mailbox::{
+    AgentActionDispatcher, MailboxReader, MailboxTurnIdentity, Message, MessageContext,
+};
 use advance_shared_types::memory::PostProcessorHook;
 use advance_shared_types::traits::EventBusEmit;
 use advance_shared_types::turn_attribution::TurnStartOutcome;
@@ -617,15 +619,23 @@ impl AgentLoopDriverImpl {
                 last_handle_message_at: None,
             },
         };
-        // `AssemblyResult.messages` intentionally discarded (no llm.generate
-        // wiring yet — §3.8 (b)). On error, keep prior state and continue.
-        if let Err(e) = self.context_assembler.assemble(ctx).await {
-            eprintln!(
-                "AgentLoopDriverImpl::run_turn_once: assemble failed for agent_id={:?}: {:?}",
-                agent_id, e
-            );
-            return (state, ended(TurnOutcome::Failed));
-        }
+        // `AssemblyResult.messages` are not read here: the production assembler
+        // publishes them for the guest's model calls (§3.8 (b)). On error, keep
+        // prior state and continue.
+        let assembled = match self.context_assembler.assemble(ctx).await {
+            Ok(assembled) => assembled,
+            Err(e) => {
+                eprintln!(
+                    "AgentLoopDriverImpl::run_turn_once: assemble failed for agent_id={:?}: {:?}",
+                    agent_id, e
+                );
+                return (state, ended(TurnOutcome::Failed));
+            }
+        };
+        // PRD §11.3.1: the turn runs in the task the assembly settled. Bound onto
+        // the message, the guest sees it and the turn is logged and post-processed
+        // under it.
+        bind_turn_task(&mut msg, assembled.task_id);
         // Wave-19 (SYS-AC-028): record the agent territory's pre-turn HEAD BEFORE the guest
         // can write any file, so a mid-turn trap can roll the committed subtree back to it.
         // `None` (every existing caller) = no-op, byte-identical.
@@ -975,6 +985,32 @@ impl AgentLoopDriver for AgentLoopDriverImpl {
 /// `shared-types/src/context.rs`). Mailbox `Message.payload` can be up to ~1 MiB
 /// (MODULE-006 prose), so cap BEFORE materializing the prompt.
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
+
+/// Bind the task the assembly settled onto the turn's message. A message that
+/// names its task keeps it. An empty or blank name names none, as the assembler
+/// reads it: it gives way to the settled task, or goes when the turn runs in the
+/// agent's default partition (`None`), so the turn is logged where it ran.
+fn bind_turn_task(msg: &mut Message, task_id: Option<String>) {
+    let named = msg.context.as_ref().and_then(|c| c.task_id.as_deref());
+    if named.is_some_and(|name| !name.trim().is_empty()) {
+        return;
+    }
+    let Some(task_id) = task_id else {
+        if let Some(context) = msg.context.as_mut() {
+            context.task_id = None;
+        }
+        return;
+    };
+    let context = msg.context.get_or_insert_with(|| MessageContext {
+        task_id: None,
+        run_id: None,
+        execution_id: None,
+        trace_id: None,
+        in_reply_to: None,
+        correlation_id: None,
+    });
+    context.task_id = Some(task_id);
+}
 
 /// Decode `msg.payload` into the turn's user prompt, bounded to ≤ 64 KiB. Byte-cap
 /// FIRST (slice ≤ 64 KiB raw bytes — `from_utf8_lossy` maps any split multibyte
